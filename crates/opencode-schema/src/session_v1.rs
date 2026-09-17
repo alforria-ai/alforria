@@ -37,7 +37,7 @@ pub enum AssistantError {
     #[serde(rename = "UnknownError")]
     Unknown {
         message: String,
-        #[serde(rename = "ref")]
+        #[serde(rename = "ref", default, skip_serializing_if = "Option::is_none")]
         r#ref: Option<String>,
     },
     /// `MessageOutputLengthError`

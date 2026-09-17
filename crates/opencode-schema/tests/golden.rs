@@ -1027,6 +1027,15 @@ fn union_assistant_error_all_variants() {
                 r#ref: Some("r1".to_string()),
             },
         ),
+        // Regression: `ref` is optional and must be omitted when absent
+        // (and must deserialize when the key is missing entirely).
+        (
+            json!({ "name": "UnknownError", "data": { "message": "boom" } }),
+            AssistantError::Unknown {
+                message: "boom".to_string(),
+                r#ref: None,
+            },
+        ),
         (
             json!({ "name": "MessageOutputLengthError", "data": {} }),
             AssistantError::OutputLength {},
