@@ -1,0 +1,13 @@
+[package]
+name = "opencode-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+opencode-schema = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+eventsource-stream = { workspace = true }
+futures = { workspace = true }
+anyhow = { workspace = true }
