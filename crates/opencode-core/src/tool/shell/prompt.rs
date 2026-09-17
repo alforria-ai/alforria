@@ -226,9 +226,11 @@ Usage notes:
         max_bytes = limits.max_bytes,
         chain = chain,
         bad_example = if name == "powershell" {
-            r#"Set-Location -LiteralPath "project{path_sep}subdir"; if ($?) { pytest tests }"#
+            format!(
+                r#"Set-Location -LiteralPath "project{path_sep}subdir"; if ($?) {{ pytest tests }}"#
+            )
         } else {
-            r#"Set-Location -LiteralPath "project{path_sep}subdir" && pytest tests"#
+            format!(r#"Set-Location -LiteralPath "project{path_sep}subdir" && pytest tests"#)
         },
     )
 }
@@ -440,7 +442,7 @@ mod tests {
         assert!(
             description.contains("Use `/tmp/opencode` for temporary work outside the workspace.")
         );
-        assert!(description.contains("git bash commands"));
+        assert!(description.contains("use a single Bash call with '&&' to chain them together"));
         assert!(
             !description.contains("${"),
             "unsubstituted placeholder left: {description}"
@@ -469,9 +471,9 @@ mod tests {
             ),
             "{description}"
         );
-        assert!(
-            description.contains("use a single bash tool call with '&&' to chain them together")
-        );
+        assert!(description.contains(
+            "avoid '&&' in this shell because Windows PowerShell (5.1) does not support it"
+        ));
         assert!(description
             .contains("Set-Location -LiteralPath \"project/subdir\"; if ($?) { pytest tests }"));
         assert!(!description.contains("${"));
@@ -486,7 +488,6 @@ mod tests {
         );
         assert!(description.contains("# cmd.exe shell notes"));
         assert!(description.contains("cd /d \"project\\subdir\" && dir"));
-        assert!(description.contains("git commands"));
         assert!(!description.contains("${"));
     }
 

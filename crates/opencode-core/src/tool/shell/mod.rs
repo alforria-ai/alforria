@@ -771,6 +771,48 @@ async fn run(
                 }
             }
             code = &mut exit => {
+                // The exit status wins the race, but the output pipe may still
+                // hold buffered chunks (TS drains via its forked stream fiber
+                // while the exit race settles) — drain before finishing.
+                while let Ok(chunk) = chunks.try_recv() {
+                            used += chunk.len();
+                            list.push_back(chunk.clone());
+                            while used > keep && list.len() > 1 {
+                                match list.pop_front() {
+                                    Some(item) => {
+                                        used -= item.len();
+                                        cut = true;
+                                    }
+                                    None => break,
+                                }
+                            }
+                            let combined = format!("{last}{chunk}");
+                            last = preview(&combined);
+                            if file.is_some() {
+                                if let Some(sink) = sink.as_mut() {
+                                    use tokio::io::AsyncWriteExt;
+                                    sink.write_all(chunk.as_bytes()).await.map_err(|err| {
+                                        ToolError::Failed(format!("Failed to write output file: {err}"))
+                                    })?;
+                                }
+                            } else {
+                                full.push_str(&chunk);
+                                if full.len() > max_bytes {
+                                    let next = truncate.write(&full).await;
+                                    file = Some(next.clone());
+                                    cut = true;
+                                    let opened = tokio::fs::OpenOptions::new()
+                                        .append(true)
+                                        .open(&next)
+                                        .await
+                                        .map_err(|err| {
+                                            ToolError::Failed(format!("Failed to open output file: {err}"))
+                                        })?;
+                                    sink = Some(opened);
+                                    full.clear();
+                                }
+                            }
+                        }
                 break code;
             }
             _ = &mut timeout => {
@@ -1220,7 +1262,13 @@ mod tests {
         let dir = temp("collect-dynamic");
         let scan = scan_sync("rm -rf $(echo /tmp)", &dir, &dir);
         assert!(scan.dirs.is_empty(), "{scan:?}");
-        assert_eq!(scan.patterns, vec!["rm -rf $(echo /tmp)".to_string()]);
+        // The subshell's `echo /tmp` is also a `command` descendant
+        // (commands() = descendantsOfType("command")), so both sources land in
+        // patterns; only dirs skip dynamic args.
+        assert_eq!(
+            scan.patterns,
+            vec!["rm -rf $(echo /tmp)".to_string(), "echo /tmp".to_string(),]
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1303,15 +1351,29 @@ mod tests {
             let exit = config.exit;
             let killed = Arc::clone(&config.killed);
             Box::pin(async move {
+                // A real process's output streams before its exit status:
+                // resolve the exit future only once every chunk was drained.
                 let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel::<String>(64);
-                for chunk in chunks {
-                    chunk_tx.send(chunk).await.expect("send chunk");
-                }
-                drop(chunk_tx);
-                let exit_fut: BoxFuture<'static, Option<i64>> = match exit {
-                    Some(code) => Box::pin(async move { code }),
-                    None => Box::pin(std::future::pending()),
-                };
+                let (exit_tx, exit_rx) = tokio::sync::oneshot::channel::<Option<i64>>();
+                let _sender = tokio::spawn(async move {
+                    for chunk in chunks {
+                        if chunk_tx.send(chunk).await.is_err() {
+                            return;
+                        }
+                    }
+                    drop(chunk_tx);
+                    // exit == None models a live process: the exit future
+                    // stays pending until the caller is killed.
+                    if let Some(code) = exit {
+                        let _ = exit_tx.send(code);
+                    }
+                });
+                let exit_fut: BoxFuture<'static, Option<i64>> = Box::pin(async move {
+                    match exit_rx.await {
+                        Ok(code) => code,
+                        Err(_) => std::future::pending().await,
+                    }
+                });
                 let killed = Arc::clone(&killed);
                 let kill: KillFn = Arc::new(move |_force_after| {
                     let killed = Arc::clone(&killed);
