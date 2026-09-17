@@ -23,3 +23,12 @@ deviations or future work items — not blockers.
   schema-validated `AnthropicUsage`; shape validation happens at use sites.
 - CONVENTION: f64-typed wire numbers serialize as x.0 vs integer — golden
   comparisons must be numeric-tolerant (applies to all future milestones).
+
+## M3: opencode-core foundation
+
+- MINOR (bus): TS `readAggregate` (paged, manifest-filtered read),
+  `beforeAggregateRead` hook, `allBounded`/`SubscriberOverflowError` not
+  ported — deliberate deferral until a consumer needs them (M5 session engine).
+- MINOR (storage): migration journal seeds all rows with one now_ms() value;
+  TS stamps per row. Not observable in fresh-DB flows.
+- RefreshListener bridge to models.dev catalog implemented (M3.6).
