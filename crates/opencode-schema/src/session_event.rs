@@ -480,8 +480,14 @@ pub struct RevertCommitted {
 }
 
 /// All 32 `session.next.*` event types (durable + live-only deltas).
+///
+/// Wire shape matches TS `Schema.Union(...).pipe(Schema.toTaggedUnion("type"))`:
+/// internally tagged — the discriminant sits alongside the payload fields
+/// (`{"type": "session.next.moved", "timestamp": ..., "sessionID": ...}`).
+/// The envelope unions (`Event`/`V2Event`) are the ones that wrap payloads in
+/// `properties`/`data`; this union serializes inline.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", content = "data")]
+#[serde(tag = "type")]
 pub enum SessionEvent {
     #[serde(rename = "session.next.agent.switched")]
     AgentSwitched(AgentSwitched),
@@ -552,7 +558,7 @@ pub enum SessionEvent {
 /// The durable subset (28 variants): no `TextDelta`, `ReasoningDelta`,
 /// `ToolInputDelta`, `CompactionDelta` (openapi `SessionDurableEvent`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", content = "data")]
+#[serde(tag = "type")]
 pub enum SessionDurableEvent {
     #[serde(rename = "session.next.agent.switched")]
     AgentSwitched(AgentSwitched),
@@ -655,8 +661,7 @@ mod tests {
         let expected = json!({
                 "id": "evt_test",
                 "type": "session.next.retried",
-                "data": {
-                    "timestamp": 1_762_000_000_000i64,
+                "timestamp": 1_762_000_000_000i64,
                 "sessionID": "ses_test",
                 "attempt": 2.0,
                 "error": {
@@ -664,7 +669,6 @@ mod tests {
                     "statusCode": 429.0,
                     "isRetryable": true,
                 },
-            },
         });
         assert_eq!(value, expected);
 
@@ -725,13 +729,11 @@ mod tests {
         // The full union accepts the delta type…
         let delta = json!({
             "type": "session.next.text.delta",
-            "data": {
-                "timestamp": 1,
-                "sessionID": "ses_test",
-                "assistantMessageID": "msg_test",
-                "textID": "text_1",
-                "delta": "hi",
-            },
+            "timestamp": 1,
+            "sessionID": "ses_test",
+            "assistantMessageID": "msg_test",
+            "textID": "text_1",
+            "delta": "hi",
         });
         assert!(serde_json::from_value::<SessionEvent>(delta.clone()).is_ok());
         // …but the durable union does not.

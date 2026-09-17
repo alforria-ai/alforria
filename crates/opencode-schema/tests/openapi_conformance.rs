@@ -323,6 +323,67 @@ where
     }
 }
 
+/// Asserts the inline-tagged shape of the inner `SessionEvent` /
+/// `SessionDurableEvent` unions: the openapi V2 envelope is
+/// `{id, metadata?, type, durable?, location?, data}`, so the in-process
+/// union form merges `type` alongside the `data` fields
+/// (`Schema.toTaggedUnion("type")`).
+fn assert_session_union_inline_type_strings<E>(spec: &Value, entries: &[(&str, &str)])
+where
+    E: DeserializeOwned + serde::Serialize,
+{
+    for (component, wire_type) in entries {
+        let envelope = generate_envelope(spec, component);
+        let mut inline = envelope["data"].clone();
+        inline["type"] = json!(*wire_type);
+        let event: E =
+            serde_json::from_value(inline.clone()).unwrap_or_else(|e| panic!("{component}: {e}"));
+        let back = serde_json::to_value(&event).unwrap();
+        assert_eq!(
+            back["type"],
+            json!(*wire_type),
+            "wire type mismatch for {component}"
+        );
+        for (key, value) in inline.as_object().unwrap().iter() {
+            if key == "type" {
+                continue;
+            }
+            assert!(
+                json_loose_eq(back.get(key), Some(value)),
+                "field {key} drifted for {component}: {:?} != {value:?}",
+                back.get(key)
+            );
+        }
+    }
+}
+
+/// JSON equality that treats numbers numerically: f64-typed fields
+/// serialize `0.0` where the seeded openapi value uses integer `0`
+/// (JSON-equal, but `serde_json::Value` distinguishes them).
+fn json_loose_eq(a: Option<&Value>, b: Option<&Value>) -> bool {
+    match (a, b) {
+        (Some(Value::Number(x)), Some(Value::Number(y))) => match (x.as_f64(), y.as_f64()) {
+            (Some(x), Some(y)) => x == y,
+            _ => x == y,
+        },
+        (Some(Value::Object(x)), Some(Value::Object(y))) => {
+            x.len() == y.len()
+                && x.iter().all(|(k, v)| {
+                    y.get(k)
+                        .map(|w| json_loose_eq(Some(v), Some(w)))
+                        .unwrap_or(false)
+                })
+        }
+        (Some(Value::Array(x)), Some(Value::Array(y))) => {
+            x.len() == y.len()
+                && x.iter()
+                    .zip(y)
+                    .all(|(x, y)| json_loose_eq(Some(x), Some(y)))
+        }
+        _ => a == b,
+    }
+}
+
 /// openapi `Event` union — 89 types (legacy union order).
 const EVENT_TYPES: &[&str] = &[
     "models-dev.refreshed",
@@ -630,7 +691,9 @@ fn session_event_union_type_strings() {
         SESSION_EVENT_TYPES,
         "SessionEvent enum drifted from the openapi contract"
     );
-    assert_v2_union_type_strings::<SessionEvent>(spec, &entries);
+    // The inner union serializes inline (toTaggedUnion("type")), not inside
+    // the V2 envelope's `data` wrapper.
+    assert_session_union_inline_type_strings::<SessionEvent>(spec, &entries);
 }
 
 #[test]
@@ -654,7 +717,7 @@ fn session_durable_event_union_type_strings() {
         wire_types, expected,
         "SessionDurableEvent enum drifted from the openapi contract"
     );
-    assert_v2_union_type_strings::<SessionDurableEvent>(spec, &entries);
+    assert_session_union_inline_type_strings::<SessionDurableEvent>(spec, &entries);
 }
 
 // ---------------------------------------------------------------------
