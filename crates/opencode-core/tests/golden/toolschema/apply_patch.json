@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "patchText": {
+      "type": "string",
+      "description": "The full patch text that describes all changes to be made"
+    }
+  },
+  "required": [
+    "patchText"
+  ]
+}
