@@ -5,6 +5,7 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use rusqlite::Connection;
 use tokio::sync::broadcast;
 
 use opencode_schema::event::DurableRef;
@@ -36,8 +37,12 @@ pub const WAKE_CAPACITY: usize = 32;
 pub type Listener = Arc<dyn Fn(&Payload) + Send + Sync>;
 
 /// Projector callback — runs inside the commit transaction
-/// (`event.ts:615-619`).
-pub type Projector = Arc<dyn Fn(&Payload) -> Result<(), CoreError> + Send + Sync>;
+/// (`event.ts:615-619`). It receives the transaction's connection: TS
+/// projectors run inside `db.transaction` and their `db` calls join the
+/// transaction; the Rust port passes the connection explicitly (the M3
+/// `Storage` mutex is not reentrant, so projectors cannot go through
+/// `Storage`).
+pub type Projector = Arc<dyn Fn(&Connection, &Payload) -> Result<(), CoreError> + Send + Sync>;
 
 /// Local operational projection committed atomically with a durable event
 /// (`event.ts:118-123`). Runs inside the transaction, before the INSERT.
@@ -105,6 +110,26 @@ impl EventBus {
     pub fn new(storage: Storage, manifest: Option<Arc<dyn DurableManifest>>) -> EventBus {
         EventBus {
             storage: Arc::new(storage),
+            manifest: manifest.unwrap_or_else(|| Arc::new(crate::event::definition::EmptyManifest)),
+            state: Arc::new(Mutex::new(BusState {
+                all: broadcast::channel(CHANNEL_CAPACITY).0,
+                typed: HashMap::new(),
+                durable: HashMap::new(),
+                listeners: Vec::new(),
+                projectors: HashMap::new(),
+            })),
+            publish_lock: Mutex::new(()),
+        }
+    }
+
+    /// [`EventBus::new`] over an already-shared storage handle — the session
+    /// services (M5) need the *same* connection for the bus and the stores.
+    pub fn new_shared(
+        storage: Arc<Storage>,
+        manifest: Option<Arc<dyn DurableManifest>>,
+    ) -> EventBus {
+        EventBus {
+            storage,
             manifest: manifest.unwrap_or_else(|| Arc::new(crate::event::definition::EmptyManifest)),
             state: Arc::new(Mutex::new(BusState {
                 all: broadcast::channel(CHANNEL_CAPACITY).0,
@@ -509,7 +534,7 @@ impl EventBus {
                 data: event.data.clone(),
             };
             for projector in &projectors {
-                projector(&committed)?;
+                projector(&tx, &committed)?;
             }
             if let Some(commit) = commit {
                 commit(seq)?;
@@ -922,7 +947,7 @@ mod tests {
         let observed_projector = Arc::clone(&observed);
         bus.project(
             &durable_def(),
-            Arc::new(move |_event| {
+            Arc::new(move |_conn, _event| {
                 observed_projector.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             }),
@@ -937,7 +962,7 @@ mod tests {
 
         bus.project(
             &durable_def(),
-            Arc::new(|_event| Err(CoreError::Storage("projector failed".to_string()))),
+            Arc::new(|_conn, _event| Err(CoreError::Storage("projector failed".to_string()))),
         );
         let result = bus.publish(
             &durable_def(),

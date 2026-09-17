@@ -1503,6 +1503,7 @@ dependencies = [
  "notify",
  "opencode-llm",
  "opencode-schema",
+ "rand 0.8.8",
  "regex",
  "reqwest",
  "rusqlite",

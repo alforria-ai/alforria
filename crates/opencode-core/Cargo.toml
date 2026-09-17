@@ -21,6 +21,7 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 dirs = { workspace = true }
 indexmap = { workspace = true }
+rand = { workspace = true }
 tree-sitter = { workspace = true }
 tree-sitter-bash = { workspace = true }
 similar = { workspace = true }

@@ -34,6 +34,14 @@ pub use format::Formatter;
 pub use jsonc::parse_jsonc;
 pub use merge::{merge_config_concat_arrays, merge_deep};
 pub use paths::GlobalPaths;
+pub use session::{
+    get_forked_title, is_default_title, register_projectors, session_path, AgentRegistry,
+    AgentRegistryInput, BackgroundJobInfo, BackgroundJobStatus, BackgroundJobs, BusyError,
+    CreateInput, Cursor, DefaultAgentError, GlobalInfo, GlobalListInput, Latest, ListInput,
+    MessagePage, MessageStore, NotFoundError, ProjectInfo, Runner, RunnerError, SessionContext,
+    SessionError, SessionServices, SessionStatusService, SessionStore, SetClear, ShellError,
+    WithParts, INSTALLATION_VERSION,
+};
 pub use storage::Storage;
 pub use tool::{
     define, AgentInfo, AgentMode, Agents, Ask, AskRequest, Attachment, BoxFuture, ExecuteFn,
@@ -58,7 +66,7 @@ pub struct SchemaIssue {
 ///
 /// * `Jsonc` — `ConfigJsonError` (JSONC syntax errors).
 /// * `ConfigInvalid` — `ConfigInvalidError` (schema / substitution failures).
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum CoreError {
     /// `ConfigJsonError`: JSONC text failed to parse.
     ///

@@ -237,7 +237,7 @@ fn json_to_string(value: &Value) -> Result<String, CoreError> {
 }
 
 /// Serialize an optional JSON column (`NULL` stays `NULL`).
-fn json_opt_to_string(value: &Option<Value>) -> Result<Option<String>, CoreError> {
+pub(crate) fn json_opt_to_string(value: &Option<Value>) -> Result<Option<String>, CoreError> {
     value.as_ref().map(json_to_string).transpose()
 }
 
@@ -826,7 +826,7 @@ impl Storage {
 
 // ------------------------------------------------------------ row mapping
 
-fn project_from_row(row: &Row<'_>) -> Result<Project, CoreError> {
+pub(crate) fn project_from_row(row: &Row<'_>) -> Result<Project, CoreError> {
     Ok(Project {
         id: row.get(0)?,
         worktree: row.get(1)?,
@@ -856,7 +856,7 @@ fn workspace_from_row(row: &Row<'_>) -> Result<Workspace, CoreError> {
     })
 }
 
-fn session_from_row(row: &Row<'_>) -> Result<Session, CoreError> {
+pub(crate) fn session_from_row(row: &Row<'_>) -> Result<Session, CoreError> {
     Ok(Session {
         id: row.get(0)?,
         project_id: row.get(1)?,
@@ -890,7 +890,7 @@ fn session_from_row(row: &Row<'_>) -> Result<Session, CoreError> {
     })
 }
 
-fn message_from_row(row: &Row<'_>) -> Result<Message, CoreError> {
+pub(crate) fn message_from_row(row: &Row<'_>) -> Result<Message, CoreError> {
     Ok(Message {
         id: row.get(0)?,
         session_id: row.get(1)?,
@@ -900,7 +900,7 @@ fn message_from_row(row: &Row<'_>) -> Result<Message, CoreError> {
     })
 }
 
-fn part_from_row(row: &Row<'_>) -> Result<Part, CoreError> {
+pub(crate) fn part_from_row(row: &Row<'_>) -> Result<Part, CoreError> {
     Ok(Part {
         id: row.get(0)?,
         message_id: row.get(1)?,
