@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "pattern": {
+      "type": "string",
+      "description": "The regex pattern to search for in file contents"
+    },
+    "path": {
+      "type": "string",
+      "description": "The directory to search in. Defaults to the current working directory."
+    },
+    "include": {
+      "type": "string",
+      "description": "File pattern to include in the search (e.g. \"*.js\", \"*.{ts,tsx}\")"
+    }
+  },
+  "required": [
+    "pattern"
+  ]
+}

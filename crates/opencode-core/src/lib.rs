@@ -9,10 +9,12 @@
 pub mod catalog;
 pub mod config;
 pub mod event;
+pub mod format;
 pub mod jsonc;
 pub mod merge;
 pub mod paths;
 pub mod storage;
+pub mod tool;
 
 use std::path::PathBuf;
 
@@ -27,10 +29,16 @@ pub use event::{
     InvalidDurableEventError, Listener, Payload, Projector, PublishOptions, ReplayOpts,
     SerializedEvent, Subscription, Validate, MODELS_DEV_REFRESHED,
 };
+pub use format::Formatter;
 pub use jsonc::parse_jsonc;
 pub use merge::{merge_config_concat_arrays, merge_deep};
 pub use paths::GlobalPaths;
 pub use storage::Storage;
+pub use tool::{
+    define, AgentInfo, AgentMode, Agents, Ask, AskRequest, Attachment, BoxFuture, ExecuteFn,
+    ExecuteResult, Extra, FormatValidationError, InstanceContext, MetadataInput, MetadataSink,
+    ToolCtxRef, ToolDef, ToolError,
+};
 
 /// One schema violation found while decoding a config value.
 ///

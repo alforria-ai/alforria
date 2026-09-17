@@ -1,0 +1,354 @@
+[
+  {
+    "name": "/p/file.txt",
+    "old": "hello\n",
+    "new": "hello\nworld\n",
+    "patch": "Index: /p/file.txt\n===================================================================\n--- /p/file.txt\n+++ /p/file.txt\n@@ -1,1 +1,2 @@\n hello\n+world\n",
+    "lines": [
+      {
+        "added": false,
+        "removed": false,
+        "count": 1,
+        "value": "hello\n"
+      },
+      {
+        "added": true,
+        "removed": false,
+        "count": 1,
+        "value": "world\n"
+      }
+    ]
+  },
+  {
+    "name": "/p/file.txt",
+    "old": "a\nb\nc\n",
+    "new": "a\nc\n",
+    "patch": "Index: /p/file.txt\n===================================================================\n--- /p/file.txt\n+++ /p/file.txt\n@@ -1,3 +1,2 @@\n a\n-b\n c\n",
+    "lines": [
+      {
+        "added": false,
+        "removed": false,
+        "count": 1,
+        "value": "a\n"
+      },
+      {
+        "added": false,
+        "removed": true,
+        "count": 1,
+        "value": "b\n"
+      },
+      {
+        "added": false,
+        "removed": false,
+        "count": 1,
+        "value": "c\n"
+      }
+    ]
+  },
+  {
+    "name": "/p/file.txt",
+    "old": "one\ntwo\nthree\nfour\nfive\nsix\nseven\n",
+    "new": "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\n",
+    "patch": "Index: /p/file.txt\n===================================================================\n--- /p/file.txt\n+++ /p/file.txt\n@@ -4,4 +4,5 @@\n four\n five\n six\n seven\n+eight\n",
+    "lines": [
+      {
+        "added": false,
+        "removed": false,
+        "count": 7,
+        "value": "one\ntwo\nthree\nfour\nfive\nsix\nseven\n"
+      },
+      {
+        "added": true,
+        "removed": false,
+        "count": 1,
+        "value": "eight\n"
+      }
+    ]
+  },
+  {
+    "name": "/p/file.txt",
+    "old": "line1\nline2\nline3\n",
+    "new": "line1\nline4\nline3\nline5\n",
+    "patch": "Index: /p/file.txt\n===================================================================\n--- /p/file.txt\n+++ /p/file.txt\n@@ -1,3 +1,4 @@\n line1\n-line2\n+line4\n line3\n+line5\n",
+    "lines": [
+      {
+        "added": false,
+        "removed": false,
+        "count": 1,
+        "value": "line1\n"
+      },
+      {
+        "added": false,
+        "removed": true,
+        "count": 1,
+        "value": "line2\n"
+      },
+      {
+        "added": true,
+        "removed": false,
+        "count": 1,
+        "value": "line4\n"
+      },
+      {
+        "added": false,
+        "removed": false,
+        "count": 1,
+        "value": "line3\n"
+      },
+      {
+        "added": true,
+        "removed": false,
+        "count": 1,
+        "value": "line5\n"
+      }
+    ]
+  },
+  {
+    "name": "/p/file.txt",
+    "old": "x\n",
+    "new": "y\n",
+    "patch": "Index: /p/file.txt\n===================================================================\n--- /p/file.txt\n+++ /p/file.txt\n@@ -1,1 +1,1 @@\n-x\n+y\n",
+    "lines": [
+      {
+        "added": false,
+        "removed": true,
+        "count": 1,
+        "value": "x\n"
+      },
+      {
+        "added": true,
+        "removed": false,
+        "count": 1,
+        "value": "y\n"
+      }
+    ]
+  },
+  {
+    "name": "/p/file.txt",
+    "old": "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\n",
+    "new": "a\nb\nc\nd\nX\nf\ng\nh\ni\nj\nk\nl\nZ\n",
+    "patch": "Index: /p/file.txt\n===================================================================\n--- /p/file.txt\n+++ /p/file.txt\n@@ -1,12 +1,13 @@\n a\n b\n c\n d\n-e\n+X\n f\n g\n h\n i\n j\n k\n l\n+Z\n",
+    "lines": [
+      {
+        "added": false,
+        "removed": false,
+        "count": 4,
+        "value": "a\nb\nc\nd\n"
+      },
+      {
+        "added": false,
+        "removed": true,
+        "count": 1,
+        "value": "e\n"
+      },
+      {
+        "added": true,
+        "removed": false,
+        "count": 1,
+        "value": "X\n"
+      },
+      {
+        "added": false,
+        "removed": false,
+        "count": 7,
+        "value": "f\ng\nh\ni\nj\nk\nl\n"
+      },
+      {
+        "added": true,
+        "removed": false,
+        "count": 1,
+        "value": "Z\n"
+      }
+    ]
+  },
+  {
+    "name": "/p/file.txt",
+    "old": "same\n",
+    "new": "same\n",
+    "patch": "Index: /p/file.txt\n===================================================================\n--- /p/file.txt\n+++ /p/file.txt\n",
+    "lines": [
+      {
+        "added": false,
+        "removed": false,
+        "count": 1,
+        "value": "same\n"
+      }
+    ]
+  },
+  {
+    "name": "/p/file.txt",
+    "old": "",
+    "new": "created\ncontent\n",
+    "patch": "Index: /p/file.txt\n===================================================================\n--- /p/file.txt\n+++ /p/file.txt\n@@ -0,0 +1,2 @@\n+created\n+content\n",
+    "lines": [
+      {
+        "added": true,
+        "removed": false,
+        "count": 2,
+        "value": "created\ncontent\n"
+      }
+    ]
+  },
+  {
+    "name": "/p/file.txt",
+    "old": "gone\ncontent\n",
+    "new": "",
+    "patch": "Index: /p/file.txt\n===================================================================\n--- /p/file.txt\n+++ /p/file.txt\n@@ -1,2 +0,0 @@\n-gone\n-content\n",
+    "lines": [
+      {
+        "added": false,
+        "removed": true,
+        "count": 2,
+        "value": "gone\ncontent\n"
+      }
+    ]
+  },
+  {
+    "name": "/p/file.txt",
+    "old": "no newline at end",
+    "new": "no newline at end\n",
+    "patch": "Index: /p/file.txt\n===================================================================\n--- /p/file.txt\n+++ /p/file.txt\n@@ -1,1 +1,1 @@\n-no newline at end\n\\ No newline at end of file\n+no newline at end\n",
+    "lines": [
+      {
+        "added": false,
+        "removed": true,
+        "count": 1,
+        "value": "no newline at end"
+      },
+      {
+        "added": true,
+        "removed": false,
+        "count": 1,
+        "value": "no newline at end\n"
+      }
+    ]
+  },
+  {
+    "name": "/p/file.txt",
+    "old": "a\nb\nc\nd\ne\nf\ng\nh\n",
+    "new": "A\nb\nc\nd\ne\nf\ng\nH\n",
+    "patch": "Index: /p/file.txt\n===================================================================\n--- /p/file.txt\n+++ /p/file.txt\n@@ -1,8 +1,8 @@\n-a\n+A\n b\n c\n d\n e\n f\n g\n-h\n+H\n",
+    "lines": [
+      {
+        "added": false,
+        "removed": true,
+        "count": 1,
+        "value": "a\n"
+      },
+      {
+        "added": true,
+        "removed": false,
+        "count": 1,
+        "value": "A\n"
+      },
+      {
+        "added": false,
+        "removed": false,
+        "count": 6,
+        "value": "b\nc\nd\ne\nf\ng\n"
+      },
+      {
+        "added": false,
+        "removed": true,
+        "count": 1,
+        "value": "h\n"
+      },
+      {
+        "added": true,
+        "removed": false,
+        "count": 1,
+        "value": "H\n"
+      }
+    ]
+  },
+  {
+    "name": "/p/file.txt",
+    "old": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n",
+    "new": "x\n2\n3\n4\n5\n6\n7\n8\n9\ny\n",
+    "patch": "Index: /p/file.txt\n===================================================================\n--- /p/file.txt\n+++ /p/file.txt\n@@ -1,10 +1,10 @@\n-1\n+x\n 2\n 3\n 4\n 5\n 6\n 7\n 8\n 9\n-10\n+y\n",
+    "lines": [
+      {
+        "added": false,
+        "removed": true,
+        "count": 1,
+        "value": "1\n"
+      },
+      {
+        "added": true,
+        "removed": false,
+        "count": 1,
+        "value": "x\n"
+      },
+      {
+        "added": false,
+        "removed": false,
+        "count": 8,
+        "value": "2\n3\n4\n5\n6\n7\n8\n9\n"
+      },
+      {
+        "added": false,
+        "removed": true,
+        "count": 1,
+        "value": "10\n"
+      },
+      {
+        "added": true,
+        "removed": false,
+        "count": 1,
+        "value": "y\n"
+      }
+    ]
+  },
+  {
+    "name": "/p/file.txt",
+    "old": "ctx\n1\nctx\n2\nctx\n3\nctx\n4\nctx\n5\n",
+    "new": "ctx\n1\nctx\n2\nctx\n3\nctx\n4\nctx\n6\n",
+    "patch": "Index: /p/file.txt\n===================================================================\n--- /p/file.txt\n+++ /p/file.txt\n@@ -6,5 +6,5 @@\n 3\n ctx\n 4\n ctx\n-5\n+6\n",
+    "lines": [
+      {
+        "added": false,
+        "removed": false,
+        "count": 9,
+        "value": "ctx\n1\nctx\n2\nctx\n3\nctx\n4\nctx\n"
+      },
+      {
+        "added": false,
+        "removed": true,
+        "count": 1,
+        "value": "5\n"
+      },
+      {
+        "added": true,
+        "removed": false,
+        "count": 1,
+        "value": "6\n"
+      }
+    ]
+  },
+  {
+    "name": "/p/file.txt",
+    "old": "a\n\n\nb\n",
+    "new": "a\n\nb\n",
+    "patch": "Index: /p/file.txt\n===================================================================\n--- /p/file.txt\n+++ /p/file.txt\n@@ -1,4 +1,3 @@\n a\n \n-\n b\n",
+    "lines": [
+      {
+        "added": false,
+        "removed": false,
+        "count": 2,
+        "value": "a\n\n"
+      },
+      {
+        "added": false,
+        "removed": true,
+        "count": 1,
+        "value": "\n"
+      },
+      {
+        "added": false,
+        "removed": false,
+        "count": 1,
+        "value": "b\n"
+      }
+    ]
+  }
+]
