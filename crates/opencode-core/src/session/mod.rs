@@ -8,13 +8,16 @@ pub mod from_error;
 pub mod ids;
 pub mod instruction;
 pub mod message;
+pub mod overflow;
 pub mod prompt_input;
 pub mod reminders;
 pub mod render;
+pub mod retry;
 pub mod run_state;
 pub mod status;
 pub mod store;
 pub mod system;
+pub mod usage;
 
 use std::sync::Arc;
 
@@ -25,6 +28,11 @@ use crate::Clock;
 pub use agents::{AgentInfo, AgentRegistry, AgentRegistryInput, DefaultAgentError};
 pub use error::{AuthError, BusyError, NotFoundError, OutputLengthError, SessionError};
 pub use message::{filter_compacted, latest, Cursor, Latest, MessagePage, MessageStore, WithParts};
+pub use overflow::{is_overflow, max_output_tokens, usable, ModelLimits};
+pub use retry::{
+    delay as retry_delay, retryable, Policy as RetryPolicy, PolicyStep as RetryPolicyStep,
+    RetryAction, RetrySet, Retryable as RetryableError,
+};
 pub use run_state::{
     BackgroundJobInfo, BackgroundJobStatus, BackgroundJobs, Latch, Runner, RunnerError,
     SessionRunState, ShellError,
@@ -36,6 +44,7 @@ pub use store::{
     GlobalListInput, ListInput, ProjectInfo, SessionContext, SessionStore, SetClear,
     INSTALLATION_VERSION,
 };
+pub use usage::{get_usage, CacheCost, CostTier, GetUsage, ModelCost, Over200k, UsageCost};
 
 /// The per-instance session services (spec §2.1): TS resolves these from
 /// Effect layers; Rust passes this bundle explicitly.
