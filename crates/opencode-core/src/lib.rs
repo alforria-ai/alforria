@@ -13,6 +13,7 @@ pub mod format;
 pub mod jsonc;
 pub mod merge;
 pub mod paths;
+pub mod session;
 pub mod storage;
 pub mod tool;
 
