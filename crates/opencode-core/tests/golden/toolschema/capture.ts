@@ -236,6 +236,34 @@ const InvalidParameters = Schema.Struct({
   error: Schema.String,
 })
 
+// tool/webfetch.ts
+const WebFetchParameters = Schema.Struct({
+  url: Schema.String.annotate({ description: "The URL to fetch content from" }),
+  format: Schema.Literals(["text", "markdown", "html"]).annotate({
+    description: "The format to return the content in (text, markdown, or html). Defaults to markdown.",
+    default: "markdown",
+  }).pipe(Schema.withDecodingDefault(Effect.succeed("markdown" as const))),
+  timeout: Schema.optional(Schema.Number).annotate({ description: "Optional timeout in seconds (max 120)" }),
+})
+
+// tool/websearch.ts
+const WebSearchParameters = Schema.Struct({
+  query: Schema.String.annotate({ description: "Websearch query" }),
+  numResults: Schema.optional(Schema.Number).annotate({
+    description: "Number of search results to return (default: 8)",
+  }),
+  livecrawl: Schema.optional(Schema.Literals(["fallback", "preferred"])).annotate({
+    description:
+      "Live crawl mode - 'fallback': use live crawling as backup if cached content unavailable, 'preferred': prioritize live crawling (default: 'fallback')",
+  }),
+  type: Schema.optional(Schema.Literals(["auto", "fast", "deep"])).annotate({
+    description: "Search type - 'auto': balanced search (default), 'fast': quick results, 'deep': comprehensive search",
+  }),
+  contextMaxCharacters: Schema.optional(Schema.Number).annotate({
+    description: "Maximum characters for context string optimized for LLMs (default: 10000)",
+  }),
+})
+
 await Bun.write("out-read.json", JSON.stringify(fromSchema(ReadParameters as any), null, 2) + "\n")
 await Bun.write("out-glob.json", JSON.stringify(fromSchema(GlobParameters as any), null, 2) + "\n")
 await Bun.write("out-grep.json", JSON.stringify(fromSchema(GrepParameters as any), null, 2) + "\n")
@@ -243,3 +271,5 @@ await Bun.write("out-todowrite.json", JSON.stringify(fromSchema(TodoWriteParamet
 await Bun.write("out-question.json", JSON.stringify(fromSchema(QuestionParameters as any), null, 2) + "\n")
 await Bun.write("out-skill.json", JSON.stringify(fromSchema(SkillParameters as any), null, 2) + "\n")
 await Bun.write("out-invalid.json", JSON.stringify(fromSchema(InvalidParameters as any), null, 2) + "\n")
+await Bun.write("out-webfetch.json", JSON.stringify(fromSchema(WebFetchParameters as any), null, 2) + "\n")
+await Bun.write("out-websearch.json", JSON.stringify(fromSchema(WebSearchParameters as any), null, 2) + "\n")
