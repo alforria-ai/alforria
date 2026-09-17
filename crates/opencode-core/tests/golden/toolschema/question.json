@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "questions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "question": {
+            "type": "string",
+            "description": "Complete question"
+          },
+          "header": {
+            "type": "string",
+            "description": "Very short label (max 30 chars)"
+          },
+          "options": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "label": {
+                  "type": "string",
+                  "description": "Display text (1-5 words, concise)"
+                },
+                "description": {
+                  "type": "string",
+                  "description": "Explanation of choice"
+                }
+              },
+              "required": [
+                "label",
+                "description"
+              ]
+            },
+            "description": "Available choices"
+          },
+          "multiple": {
+            "type": "boolean",
+            "description": "Allow selecting multiple choices"
+          }
+        },
+        "required": [
+          "question",
+          "header",
+          "options"
+        ]
+      },
+      "description": "Questions to ask"
+    }
+  },
+  "required": [
+    "questions"
+  ]
+}

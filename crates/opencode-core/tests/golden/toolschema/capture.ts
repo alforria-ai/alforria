@@ -1,11 +1,12 @@
 /**
- * Golden-capture script for the M4.2 tool parameter JSON schemas (spec §2.3).
+ * Golden-capture script for the tool parameter JSON schemas (spec §2.3).
  * Run with `bun run capture.ts` from this directory after `bun add
  * effect@4.0.0-beta.83` (see /tmp/opencode-src pinned commit
  * 88c6c7abc7f320b6aabed2634ac0b2d6e6ecea67). It executes the real
  * `ToolJsonSchema.fromSchema` pipeline (tool/json-schema.ts, copied verbatim)
- * against the read/glob/grep `Schema.Struct` parameters and rewrites
- * read.json / glob.json / grep.json in this directory.
+ * against the read/glob/grep (M4.2) and todowrite/question/skill/invalid
+ * (M4.6) `Schema.Struct` parameters and rewrites the corresponding .json
+ * files in this directory.
  */
 import { JsonSchema, Schema } from "effect"
 
@@ -183,10 +184,62 @@ const GrepParameters = Schema.Struct({
     description: "The directory to search in. Defaults to the current working directory.",
   }),
   include: Schema.optional(Schema.String).annotate({
-    description: 'File pattern to include in the search (e.g. "*.js", "*.{ts,tsx}")',
+    description: 'File pattern to include in the search (e.g., "*.js", "*.{ts,tsx}")',
   }),
+})
+
+// ---- M4.6 Parameters (copied from the tool files / schema-src) ----
+
+// schema-src/session-todo.ts — SessionTodo.Info
+const TodoInfo = Schema.Struct({
+  content: Schema.String.annotate({ description: "Brief description of the task" }),
+  status: Schema.String.annotate({
+    description: "Current status of the task: pending, in_progress, completed, cancelled",
+  }),
+  priority: Schema.String.annotate({
+    description: "Priority level of the task: high, medium, low",
+  }),
+}).annotate({ identifier: "Todo" })
+
+// tool/todo.ts
+const TodoWriteParameters = Schema.Struct({
+  todos: Schema.mutable(Schema.Array(TodoInfo)).annotate({ description: "The updated todo list" }),
+})
+
+// schema-src/v1/question.ts — QuestionV1.Option / Prompt
+const QuestionOption = Schema.Struct({
+  label: Schema.String.annotate({ description: "Display text (1-5 words, concise)" }),
+  description: Schema.String.annotate({ description: "Explanation of choice" }),
+}).annotate({ identifier: "QuestionOption" })
+
+const QuestionPromptBase = {
+  question: Schema.String.annotate({ description: "Complete question" }),
+  header: Schema.String.annotate({ description: "Very short label (max 30 chars)" }),
+  options: Schema.Array(QuestionOption).annotate({ description: "Available choices" }),
+  multiple: Schema.optional(Schema.Boolean).annotate({ description: "Allow selecting multiple choices" }),
+}
+const QuestionPrompt = Schema.Struct(QuestionPromptBase).annotate({ identifier: "QuestionPrompt" })
+
+// tool/question.ts
+const QuestionParameters = Schema.Struct({
+  questions: Schema.mutable(Schema.Array(QuestionPrompt)).annotate({ description: "Questions to ask" }),
+})
+
+// tool/skill.ts
+const SkillParameters = Schema.Struct({
+  name: Schema.String.annotate({ description: "The name of the skill from available_skills" }),
+})
+
+// tool/invalid.ts
+const InvalidParameters = Schema.Struct({
+  tool: Schema.String,
+  error: Schema.String,
 })
 
 await Bun.write("out-read.json", JSON.stringify(fromSchema(ReadParameters as any), null, 2) + "\n")
 await Bun.write("out-glob.json", JSON.stringify(fromSchema(GlobParameters as any), null, 2) + "\n")
 await Bun.write("out-grep.json", JSON.stringify(fromSchema(GrepParameters as any), null, 2) + "\n")
+await Bun.write("out-todowrite.json", JSON.stringify(fromSchema(TodoWriteParameters as any), null, 2) + "\n")
+await Bun.write("out-question.json", JSON.stringify(fromSchema(QuestionParameters as any), null, 2) + "\n")
+await Bun.write("out-skill.json", JSON.stringify(fromSchema(SkillParameters as any), null, 2) + "\n")
+await Bun.write("out-invalid.json", JSON.stringify(fromSchema(InvalidParameters as any), null, 2) + "\n")
