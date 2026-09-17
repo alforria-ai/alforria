@@ -13,6 +13,13 @@ tokio = { workspace = true }
 rusqlite = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
+jsonc-parser = { workspace = true }
+fs4 = { workspace = true }
+walkdir = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+dirs = { workspace = true }
+indexmap = { workspace = true }
 notify = { workspace = true }
 globset = { workspace = true }
 ignore = { workspace = true }
