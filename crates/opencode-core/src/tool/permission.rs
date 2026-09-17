@@ -121,6 +121,40 @@ pub fn merge(rulesets: &[&PermissionV1Ruleset]) -> PermissionV1Ruleset {
     rulesets.iter().flat_map(|r| r.iter().cloned()).collect()
 }
 
+/// `disabled` (permission/index.ts:204-211): the tools whose `deny` rule is
+/// a bare `*` pattern under the (remapped) permission key. `edits` tools
+/// share the `edit` permission, MCP resource tools the `read` permission.
+pub fn disabled(
+    tools: &[&str],
+    ruleset: &PermissionV1Ruleset,
+) -> std::collections::HashSet<String> {
+    const EDITS: [&str; 3] = ["edit", "write", "apply_patch"];
+    const READS: [&str; 3] = [
+        "list_mcp_resources",
+        "list_mcp_resource_templates",
+        "read_mcp_resource",
+    ];
+    tools
+        .iter()
+        .filter(|tool| {
+            let tool = **tool;
+            let permission = if EDITS.contains(&tool) {
+                "edit"
+            } else if READS.contains(&tool) {
+                "read"
+            } else {
+                tool
+            };
+            let rule = ruleset
+                .iter()
+                .rev()
+                .find(|rule| wildcard_match(permission, &rule.permission));
+            matches!(rule, Some(rule) if rule.pattern == "*" && rule.action == PermissionV1Action::Deny)
+        })
+        .map(|tool| tool.to_string())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,5 +255,29 @@ mod tests {
             evaluate("bash", "ls", &[&merged]).action,
             PermissionV1Action::Allow
         );
+    }
+
+    #[test]
+    fn disabled_remaps_edits_and_reads() {
+        let ruleset = vec![
+            rule("edit", "*", PermissionV1Action::Deny),
+            rule("read", "*", PermissionV1Action::Deny),
+            rule("skill", "specific", PermissionV1Action::Deny),
+        ];
+        // write maps onto the edit permission; the bare `*` deny applies.
+        assert_eq!(
+            disabled(&["write"], &ruleset),
+            ["write".to_string()].into_iter().collect()
+        );
+        // MCP resource tools map onto read.
+        assert_eq!(
+            disabled(&["read_mcp_resource"], &ruleset),
+            ["read_mcp_resource".to_string()].into_iter().collect()
+        );
+        // A deny that is not `*` does not disable.
+        assert!(disabled(&["skill"], &ruleset).is_empty());
+        // Non-deny rules never disable.
+        let allow_all = vec![rule("skill", "*", PermissionV1Action::Allow)];
+        assert!(disabled(&["skill"], &allow_all).is_empty());
     }
 }
