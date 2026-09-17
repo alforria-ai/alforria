@@ -13,4 +13,6 @@ reqwest = { workspace = true }
 eventsource-stream = { workspace = true }
 futures = { workspace = true }
 thiserror = { workspace = true }
+regex = { workspace = true }
 rust_decimal = { workspace = true }
+sha2 = { workspace = true }
