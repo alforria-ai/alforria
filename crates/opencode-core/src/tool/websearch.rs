@@ -94,7 +94,11 @@ pub fn websearch_model_name(extra: &Value) -> Option<String> {
     let api = model.get("api").and_then(Value::as_object);
     let api_id = api.and_then(|api| api.get("id")).and_then(Value::as_str);
     let id = model.get("id").and_then(Value::as_str);
-    api_id.or(id).map(|value| value.chars().take(100).collect())
+    // TS `.slice(0, 100)` counts UTF-16 code units.
+    let full = api_id.or(id)?;
+    Some(String::from_utf16_lossy(
+        &full.encode_utf16().take(100).collect::<Vec<u16>>(),
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -284,36 +288,41 @@ async fn call_provider(
     match provider {
         WebSearchProvider::Parallel => {
             let headers = parallel_auth_headers(env);
+            let mut args = json!({
+                "objective": params.query,
+                "search_queries": [params.query],
+                "session_id": session_id,
+            });
+            if let Some(model) =
+                websearch_model_name(extra.model.as_ref().unwrap_or(&serde_json::Value::Null))
+            {
+                if let Some(object) = args.as_object_mut() {
+                    object.insert("model_name".to_string(), json!(model));
+                }
+            }
             mcp_websearch::call(
                 http,
                 mcp_websearch::PARALLEL_URL,
                 "web_search",
-                json!({
-                    "objective": params.query,
-                    "search_queries": [params.query],
-                    "session_id": session_id,
-                    "model_name": websearch_model_name(extra.model.as_ref().unwrap_or(&serde_json::Value::Null)),
-                }),
+                args,
                 headers,
             )
             .await
         }
         WebSearchProvider::Exa => {
             let url = mcp_websearch::exa_url(env.exa_api_key.as_deref());
-            mcp_websearch::call(
-                http,
-                &url,
-                "web_search_exa",
-                json!({
-                    "query": params.query,
-                    "type": params.kind.clone().unwrap_or_else(|| "auto".to_string()),
-                    "numResults": wire_number(params.num_results.unwrap_or(8.0)),
-                    "livecrawl": params.livecrawl.clone().unwrap_or_else(|| "fallback".to_string()),
-                    "contextMaxCharacters": params.context_max_characters.map(wire_number),
-                }),
-                vec![],
-            )
-            .await
+            let mut args = json!({
+                "query": params.query,
+                "type": params.kind.clone().unwrap_or_else(|| "auto".to_string()),
+                "numResults": wire_number(params.num_results.unwrap_or(8.0)),
+                "livecrawl": params.livecrawl.clone().unwrap_or_else(|| "fallback".to_string()),
+            });
+            if let Some(max) = params.context_max_characters {
+                if let Some(object) = args.as_object_mut() {
+                    object.insert("contextMaxCharacters".to_string(), json!(wire_number(max)));
+                }
+            }
+            mcp_websearch::call(http, &url, "web_search_exa", args, vec![]).await
         }
     }
 }

@@ -55,6 +55,7 @@ pub trait HttpClient: Send + Sync {
         &'a self,
         url: &'a str,
         headers: Vec<(&'a str, &'a str)>,
+        timeout: std::time::Duration,
     ) -> BoxFuture<'a, Result<HttpResponse, ToolError>>;
 }
 
@@ -67,9 +68,10 @@ impl HttpClient for ReqwestClient {
         &'a self,
         url: &'a str,
         headers: Vec<(&'a str, &'a str)>,
+        timeout: std::time::Duration,
     ) -> BoxFuture<'a, Result<HttpResponse, ToolError>> {
         Box::pin(async move {
-            let mut request = self.client.get(url);
+            let mut request = self.client.get(url).timeout(timeout);
             for (key, value) in headers {
                 request = request.header(key, value);
             }
@@ -186,7 +188,7 @@ async fn run(
 
         let format = params.format.as_deref().unwrap_or("markdown");
         let timeout_secs = params.timeout.unwrap_or((DEFAULT_TIMEOUT_MS / 1000) as f64);
-        let _timeout_ms = ((timeout_secs * 1000.0) as u64).min(MAX_TIMEOUT_MS);
+        let timeout_ms = ((timeout_secs * 1000.0) as u64).min(MAX_TIMEOUT_MS);
 
         ctx.ask
             .ask(AskRequest {
@@ -206,7 +208,13 @@ async fn run(
             ("Accept", accept_header(format)),
             ("Accept-Language", "en-US,en;q=0.9"),
         ];
-        let response = http.get(&params.url, headers).await?;
+        let response = http
+            .get(
+                &params.url,
+                headers,
+                std::time::Duration::from_millis(timeout_ms),
+            )
+            .await?;
 
         // Check content length (webfetch.ts:96-104).
         if let Some(content_length) = response.header("content-length") {
@@ -370,7 +378,7 @@ impl HtmlToMarkdown {
                 self.pre_depth += 1;
                 self.out.push_str("\n```\n");
             }
-            "code" => self.out.push('`'),
+            "code" if self.pre_depth == 0 => self.out.push('`'),
             "em" | "i" => self.out.push('*'),
             "strong" | "b" => self.out.push_str("**"),
             "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
@@ -414,7 +422,7 @@ impl HtmlToMarkdown {
                 self.pre_depth = self.pre_depth.saturating_sub(1);
                 self.out.push_str("\n```\n");
             }
-            "code" => self.out.push('`'),
+            "code" if self.pre_depth == 0 => self.out.push('`'),
             "em" | "i" => self.out.push('*'),
             "strong" | "b" => self.out.push_str("**"),
             "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => self.out.push_str("\n\n"),
@@ -435,7 +443,9 @@ impl HtmlToMarkdown {
 }
 
 fn attr_value(raw: &str, name: &str) -> Option<String> {
-    let lower = raw.to_lowercase();
+    // Attribute names are ASCII; ASCII-lowercasing preserves byte offsets
+    // (full Unicode lowercasing can change UTF-8 length and shift `at`).
+    let lower = raw.to_ascii_lowercase();
     let needle = format!("{name}=");
     if let Some(at) = lower.find(&needle) {
         let rest = &raw[at + needle.len()..];
@@ -566,6 +576,7 @@ mod tests {
             &'a self,
             url: &'a str,
             headers: Vec<(&'a str, &'a str)>,
+            _timeout: std::time::Duration,
         ) -> BoxFuture<'a, Result<HttpResponse, ToolError>> {
             Box::pin(async move {
                 self.calls.lock().unwrap().push((

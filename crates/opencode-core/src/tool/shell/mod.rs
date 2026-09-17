@@ -151,8 +151,12 @@ fn expand(text: &str, cwd: &str, shell: &str) -> String {
     let braced = BRACED.get_or_init(|| regex::Regex::new(r"(?i)\$\{env:([^}]+)\}").expect("regex"));
     let dollar = DOLLAR
         .get_or_init(|| regex::Regex::new(r"(?i)\$env:([A-Za-z_][A-Za-z0-9_]*)").expect("regex"));
-    let auto_re =
-        AUTO.get_or_init(|| regex::Regex::new(r"(?i)\$(HOME|PWD|PSHOME)([\\/])?").expect("regex"));
+    let auto_re = AUTO.get_or_init(|| {
+        // TS: /\$(HOME|PWD|PSHOME)(?=$|[\/])/gi — a lookahead; the Rust
+        // regex crate has none, so consume (and re-append) the separator or
+        // require end-of-input instead.
+        regex::Regex::new(r"(?i)\$(HOME|PWD|PSHOME)(?:([\\/])|$)").expect("regex")
+    });
 
     let text = unquote(text);
     let text = braced.replace_all(text, |caps: &regex::Captures<'_>| env_value(&caps[1]));
@@ -261,13 +265,26 @@ fn path_args(list: &[Part], ps: bool, cmd: bool) -> Vec<String> {
 }
 
 /// `preview` (shell.ts:220-223) — last `MAX_METADATA_LENGTH` bytes.
+fn utf16_len(text: &str) -> usize {
+    text.chars().map(char::len_utf16).sum()
+}
+
 fn preview(text: &str) -> String {
-    if text.len() <= MAX_METADATA_LENGTH {
+    // TS `text.slice(-MAX_METADATA_LENGTH)` truncates UTF-16 code units,
+    // not bytes — a close fit requires an encode_utf16 walk.
+    if utf16_len(text) <= MAX_METADATA_LENGTH {
         return text.to_string();
     }
-    let mut start = text.len() - MAX_METADATA_LENGTH;
-    while !text.is_char_boundary(start) {
-        start += 1;
+    let skip = utf16_len(text) - MAX_METADATA_LENGTH;
+    let mut seen = 0usize;
+    let mut start = 0usize;
+    for (at, ch) in text.char_indices() {
+        if seen >= skip {
+            start = at;
+            break;
+        }
+        seen += ch.len_utf16();
+        start = at + ch.len_utf8();
     }
     format!("...\n\n{}", &text[start..])
 }
@@ -1116,6 +1133,19 @@ mod tests {
         assert_eq!(glob_prefix("/tmp"), Some("/tmp"));
         assert_eq!(glob_prefix("*foo"), None);
         assert_eq!(glob_prefix("a[b"), Some("a"));
+    }
+
+    #[test]
+    fn auto_var_requires_boundary() {
+        // TS lookahead: $HOMEWORK must NOT expand HOME.
+        let home = expand("$HOMEWORK", "/tmp", "bash");
+        assert_eq!(home, "$HOMEWORK");
+        // $HOME alone (end of input) and $HOME/ both expand.
+        assert_eq!(
+            expand("$HOME", "/tmp", "bash"),
+            std::env::var("HOME").unwrap_or_default()
+        );
+        assert!(expand("$HOME/", "/tmp", "bash").ends_with('/'));
     }
 
     #[test]
