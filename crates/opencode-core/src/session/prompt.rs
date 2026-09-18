@@ -165,20 +165,28 @@ impl SessionPrompt {
         let on_interrupt = last_assistant_work(deps.clone(), session_id);
         let session_id = session_id.to_string();
         let ensure_session_id = session_id.clone();
-        let work: Work<WithParts, SessionError> = Arc::new(move || {
-            let deps = deps.clone();
-            let session_id = session_id.clone();
-            Box::pin(async move {
-                let cancel = CancellationToken::new();
-                run_loop(&loop_deps(&deps), &session_id, &cancel)
-                    .await
-                    .map_err(loop_error)
+        // The token is shared with the runner so `cancel` interrupts the
+        // loop cooperatively — the loop's interrupt handlers (interrupted
+        // tool parts, abort error) run before the prompt resolves (TS:
+        // fiber interrupt, prompt.ts:1346).
+        let cancel = CancellationToken::new();
+        let work: Work<WithParts, SessionError> = {
+            let cancel = cancel.clone();
+            Arc::new(move || {
+                let deps = deps.clone();
+                let session_id = session_id.clone();
+                let cancel = cancel.clone();
+                Box::pin(async move {
+                    run_loop(&loop_deps(&deps), &session_id, &cancel)
+                        .await
+                        .map_err(loop_error)
+                })
             })
-        });
+        };
         self.deps
             .services
             .run_state
-            .ensure_running(&ensure_session_id, on_interrupt, work)
+            .ensure_running(&ensure_session_id, cancel, on_interrupt, work)
             .await
     }
 

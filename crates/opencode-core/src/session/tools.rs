@@ -176,8 +176,18 @@ pub async fn resolve(
                     let result = match (tool.execute)(args, ctx).await {
                         Ok(result) => result,
                         // TS: the native runtime surfaces tool failures as
-                        // a ToolFailure message string.
-                        Err(error) => return Err(error.to_string()),
+                        // a ToolFailure value carrying the error class
+                        // (native-runtime.ts:188).
+                        Err(error) => {
+                            return Err(match error {
+                                crate::tool::error::ToolError::Rejected(message) => {
+                                    crate::session::llm::ToolFailure::Rejected(message)
+                                }
+                                other => {
+                                    crate::session::llm::ToolFailure::Message(other.to_string())
+                                }
+                            })
+                        }
                     };
                     let output = LlmToolOutput {
                         title: result.title,
@@ -265,9 +275,8 @@ impl Ask for PermissionAdapter {
 
 fn map_permission_error(error: PermissionAskError) -> crate::tool::error::ToolError {
     match error {
-        PermissionAskError::Rejected(message) | PermissionAskError::Other(message) => {
-            crate::tool::error::ToolError::Permission(message)
-        }
+        PermissionAskError::Rejected(message) => crate::tool::error::ToolError::Rejected(message),
+        PermissionAskError::Other(message) => crate::tool::error::ToolError::Permission(message),
     }
 }
 

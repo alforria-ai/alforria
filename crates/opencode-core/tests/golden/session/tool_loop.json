@@ -1,0 +1,482 @@
+{
+  "comment": "TS: one tool-call step against the real read tool — part running/completed churn and the tool-result feeding the next model request (prompt.ts:1081-1112, tools.ts:41-138)",
+  "events": [
+    {
+      "data": {
+        "info": {
+          "agent": "build",
+          "id": "msg_user1",
+          "model": {
+            "modelID": "claude",
+            "providerID": "anthropic"
+          },
+          "role": "user",
+          "sessionID": "ses_0",
+          "time": {
+            "created": 1761000000000.0
+          }
+        },
+        "sessionID": "ses_0"
+      },
+      "type": "message.updated"
+    },
+    {
+      "data": {
+        "part": {
+          "id": "prt_1",
+          "messageID": "msg_user1",
+          "sessionID": "ses_0",
+          "text": "read the file",
+          "type": "text"
+        },
+        "sessionID": "ses_0",
+        "time": 1761000000000.0
+      },
+      "type": "message.part.updated"
+    },
+    {
+      "data": {
+        "sessionID": "ses_0",
+        "status": {
+          "type": "busy"
+        }
+      },
+      "type": "session.status"
+    },
+    {
+      "data": {
+        "info": {
+          "agent": "build",
+          "cost": 0.0,
+          "id": "msg_2",
+          "mode": "build",
+          "modelID": "claude",
+          "parentID": "msg_user1",
+          "path": {
+            "cwd": "<tmp>/repo",
+            "root": "<tmp>/repo"
+          },
+          "providerID": "anthropic",
+          "role": "assistant",
+          "sessionID": "ses_0",
+          "time": {
+            "created": 1761000000000
+          },
+          "tokens": {
+            "cache": {
+              "read": 0.0,
+              "write": 0.0
+            },
+            "input": 0.0,
+            "output": 0.0,
+            "reasoning": 0.0
+          }
+        },
+        "sessionID": "ses_0"
+      },
+      "type": "message.updated"
+    },
+    {
+      "data": {
+        "sessionID": "ses_0",
+        "status": {
+          "type": "busy"
+        }
+      },
+      "type": "session.status"
+    },
+    {
+      "data": {
+        "part": {
+          "callID": "cal_1",
+          "id": "prt_3",
+          "messageID": "msg_2",
+          "sessionID": "ses_0",
+          "state": {
+            "input": {},
+            "raw": "",
+            "status": "pending"
+          },
+          "tool": "read",
+          "type": "tool"
+        },
+        "sessionID": "ses_0",
+        "time": 1761000000000.0
+      },
+      "type": "message.part.updated"
+    },
+    {
+      "data": {
+        "part": {
+          "callID": "cal_1",
+          "id": "prt_3",
+          "messageID": "msg_2",
+          "sessionID": "ses_0",
+          "state": {
+            "input": {
+              "filePath": "a.txt"
+            },
+            "status": "running",
+            "time": {
+              "start": 1761000000000
+            }
+          },
+          "tool": "read",
+          "type": "tool"
+        },
+        "sessionID": "ses_0",
+        "time": 1761000000000.0
+      },
+      "type": "message.part.updated"
+    },
+    {
+      "data": {
+        "part": {
+          "callID": "cal_1",
+          "id": "prt_3",
+          "messageID": "msg_2",
+          "sessionID": "ses_0",
+          "state": {
+            "input": {
+              "filePath": "a.txt"
+            },
+            "metadata": {
+              "display": {
+                "lineEnd": 1,
+                "lineStart": 1,
+                "path": "<tmp>/repo/a.txt",
+                "text": "file content",
+                "totalLines": 1,
+                "truncated": false,
+                "type": "file"
+              },
+              "loaded": [],
+              "preview": "file content",
+              "truncated": false
+            },
+            "output": "<path><tmp>/repo/a.txt</path>\n<type>file</type>\n<content>\n1: file content\n\n(End of file - total 1 lines)\n</content>",
+            "status": "completed",
+            "time": {
+              "end": 1761000000000,
+              "start": 1761000000000
+            },
+            "title": "a.txt"
+          },
+          "tool": "read",
+          "type": "tool"
+        },
+        "sessionID": "ses_0",
+        "time": 1761000000000.0
+      },
+      "type": "message.part.updated"
+    },
+    {
+      "data": {
+        "part": {
+          "cost": 0.0,
+          "id": "prt_4",
+          "messageID": "msg_2",
+          "reason": "tool-calls",
+          "sessionID": "ses_0",
+          "snapshot": "5b425857f6d4d137e34a2047c679d1c730deddc4f1d908ea66f6d59a5c5f4fc8-1",
+          "tokens": {
+            "cache": {
+              "read": 0.0,
+              "write": 0.0
+            },
+            "input": 0.0,
+            "output": 0.0,
+            "reasoning": 0.0
+          },
+          "type": "step-finish"
+        },
+        "sessionID": "ses_0",
+        "time": 1761000000000.0
+      },
+      "type": "message.part.updated"
+    },
+    {
+      "data": {
+        "info": {
+          "agent": "build",
+          "cost": 0.0,
+          "finish": "tool-calls",
+          "id": "msg_2",
+          "mode": "build",
+          "modelID": "claude",
+          "parentID": "msg_user1",
+          "path": {
+            "cwd": "<tmp>/repo",
+            "root": "<tmp>/repo"
+          },
+          "providerID": "anthropic",
+          "role": "assistant",
+          "sessionID": "ses_0",
+          "time": {
+            "created": 1761000000000
+          },
+          "tokens": {
+            "cache": {
+              "read": 0.0,
+              "write": 0.0
+            },
+            "input": 0.0,
+            "output": 0.0,
+            "reasoning": 0.0
+          }
+        },
+        "sessionID": "ses_0"
+      },
+      "type": "message.updated"
+    },
+    {
+      "data": {
+        "info": {
+          "agent": "build",
+          "cost": 0.0,
+          "finish": "tool-calls",
+          "id": "msg_2",
+          "mode": "build",
+          "modelID": "claude",
+          "parentID": "msg_user1",
+          "path": {
+            "cwd": "<tmp>/repo",
+            "root": "<tmp>/repo"
+          },
+          "providerID": "anthropic",
+          "role": "assistant",
+          "sessionID": "ses_0",
+          "time": {
+            "completed": 1761000000000,
+            "created": 1761000000000
+          },
+          "tokens": {
+            "cache": {
+              "read": 0.0,
+              "write": 0.0
+            },
+            "input": 0.0,
+            "output": 0.0,
+            "reasoning": 0.0
+          }
+        },
+        "sessionID": "ses_0"
+      },
+      "type": "message.updated"
+    },
+    {
+      "data": {
+        "sessionID": "ses_0",
+        "status": {
+          "type": "busy"
+        }
+      },
+      "type": "session.status"
+    },
+    {
+      "data": {
+        "info": {
+          "agent": "build",
+          "cost": 0.0,
+          "id": "msg_5",
+          "mode": "build",
+          "modelID": "claude",
+          "parentID": "msg_user1",
+          "path": {
+            "cwd": "<tmp>/repo",
+            "root": "<tmp>/repo"
+          },
+          "providerID": "anthropic",
+          "role": "assistant",
+          "sessionID": "ses_0",
+          "time": {
+            "created": 1761000000000
+          },
+          "tokens": {
+            "cache": {
+              "read": 0.0,
+              "write": 0.0
+            },
+            "input": 0.0,
+            "output": 0.0,
+            "reasoning": 0.0
+          }
+        },
+        "sessionID": "ses_0"
+      },
+      "type": "message.updated"
+    },
+    {
+      "data": {
+        "sessionID": "ses_0",
+        "status": {
+          "type": "busy"
+        }
+      },
+      "type": "session.status"
+    },
+    {
+      "data": {
+        "part": {
+          "id": "prt_6",
+          "messageID": "msg_5",
+          "sessionID": "ses_0",
+          "text": "",
+          "time": {
+            "start": 1761000000000
+          },
+          "type": "text"
+        },
+        "sessionID": "ses_0",
+        "time": 1761000000000.0
+      },
+      "type": "message.part.updated"
+    },
+    {
+      "data": {
+        "delta": "all done",
+        "field": "text",
+        "messageID": "msg_5",
+        "partID": "prt_6",
+        "sessionID": "ses_0"
+      },
+      "type": "message.part.delta"
+    },
+    {
+      "data": {
+        "part": {
+          "id": "prt_6",
+          "messageID": "msg_5",
+          "sessionID": "ses_0",
+          "text": "all done",
+          "time": {
+            "end": 1761000000000,
+            "start": 1761000000000
+          },
+          "type": "text"
+        },
+        "sessionID": "ses_0",
+        "time": 1761000000000.0
+      },
+      "type": "message.part.updated"
+    },
+    {
+      "data": {
+        "part": {
+          "cost": 0.0,
+          "id": "prt_7",
+          "messageID": "msg_5",
+          "reason": "stop",
+          "sessionID": "ses_0",
+          "snapshot": "5b425857f6d4d137e34a2047c679d1c730deddc4f1d908ea66f6d59a5c5f4fc8-3",
+          "tokens": {
+            "cache": {
+              "read": 0.0,
+              "write": 0.0
+            },
+            "input": 0.0,
+            "output": 0.0,
+            "reasoning": 0.0
+          },
+          "type": "step-finish"
+        },
+        "sessionID": "ses_0",
+        "time": 1761000000000.0
+      },
+      "type": "message.part.updated"
+    },
+    {
+      "data": {
+        "info": {
+          "agent": "build",
+          "cost": 0.0,
+          "finish": "stop",
+          "id": "msg_5",
+          "mode": "build",
+          "modelID": "claude",
+          "parentID": "msg_user1",
+          "path": {
+            "cwd": "<tmp>/repo",
+            "root": "<tmp>/repo"
+          },
+          "providerID": "anthropic",
+          "role": "assistant",
+          "sessionID": "ses_0",
+          "time": {
+            "created": 1761000000000
+          },
+          "tokens": {
+            "cache": {
+              "read": 0.0,
+              "write": 0.0
+            },
+            "input": 0.0,
+            "output": 0.0,
+            "reasoning": 0.0
+          }
+        },
+        "sessionID": "ses_0"
+      },
+      "type": "message.updated"
+    },
+    {
+      "data": {
+        "info": {
+          "agent": "build",
+          "cost": 0.0,
+          "finish": "stop",
+          "id": "msg_5",
+          "mode": "build",
+          "modelID": "claude",
+          "parentID": "msg_user1",
+          "path": {
+            "cwd": "<tmp>/repo",
+            "root": "<tmp>/repo"
+          },
+          "providerID": "anthropic",
+          "role": "assistant",
+          "sessionID": "ses_0",
+          "time": {
+            "completed": 1761000000000,
+            "created": 1761000000000
+          },
+          "tokens": {
+            "cache": {
+              "read": 0.0,
+              "write": 0.0
+            },
+            "input": 0.0,
+            "output": 0.0,
+            "reasoning": 0.0
+          }
+        },
+        "sessionID": "ses_0"
+      },
+      "type": "message.updated"
+    },
+    {
+      "data": {
+        "sessionID": "ses_0",
+        "status": {
+          "type": "busy"
+        }
+      },
+      "type": "session.status"
+    },
+    {
+      "data": {
+        "sessionID": "ses_0",
+        "status": {
+          "type": "idle"
+        }
+      },
+      "type": "session.status"
+    },
+    {
+      "data": {
+        "sessionID": "ses_0"
+      },
+      "type": "session.idle"
+    }
+  ]
+}

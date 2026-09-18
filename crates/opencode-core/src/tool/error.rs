@@ -30,6 +30,12 @@ pub enum ToolError {
     #[error("{0}")]
     Permission(String),
 
+    /// `ctx.ask()` failed with `PermissionV1.RejectedError` /
+    /// `Question.RejectedError` (processor.ts:200-201 blocks the loop only
+    /// for these).
+    #[error("{0}")]
+    Rejected(String),
+
     /// The abort signal fired mid-execution.
     #[error("Aborted")]
     Aborted,

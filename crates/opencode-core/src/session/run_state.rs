@@ -26,6 +26,7 @@ use crate::session::error::{BusyError, SessionError};
 use crate::session::message::WithParts;
 use crate::session::status::SessionStatusService;
 use crate::CoreError;
+use tokio_util::sync::CancellationToken;
 
 use crate::tool::def::BoxFuture;
 
@@ -155,7 +156,11 @@ type Done<A, E> = Result<A, RunnerError<E>>;
 struct RunHandle<A, E> {
     id: u64,
     done: Arc<Deferred<Done<A, E>>>,
-    abort: tokio::task::AbortHandle,
+    /// The run's abort signal. Cancelling it lets the work observe the
+    /// interrupt cooperatively and run its interrupt handlers (TS: the
+    /// fiber interrupt runs `Effect.onInterrupt` finalizers) instead of
+    /// being dropped mid-flight.
+    cancel: CancellationToken,
 }
 
 struct PendingHandle<A, E> {
@@ -164,6 +169,7 @@ struct PendingHandle<A, E> {
     #[allow(dead_code)]
     id: u64,
     done: Arc<Deferred<Done<A, E>>>,
+    cancel: CancellationToken,
     work: Work<A, E>,
 }
 
@@ -206,7 +212,7 @@ pub struct RunnerOptions<A, E> {
 enum CancelAction<A, E> {
     Nothing,
     Running {
-        abort: tokio::task::AbortHandle,
+        cancel: CancellationToken,
         done: Arc<Deferred<Done<A, E>>>,
     },
     Shell(ShellHandle),
@@ -293,24 +299,29 @@ impl<A: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static> Runner<
 
     /// `startRun` (runner.ts:96-106): fork the work with an `onExit` that
     /// runs `finishRun`.
-    fn start_run(&self, work: Work<A, E>, done: Arc<Deferred<Done<A, E>>>) -> RunHandle<A, E> {
+    fn start_run(
+        &self,
+        work: Work<A, E>,
+        done: Arc<Deferred<Done<A, E>>>,
+        cancel: CancellationToken,
+    ) -> RunHandle<A, E> {
         let id = self.next_id();
         let runner = self.clone();
         let task_done = done.clone();
-        let task = tokio::spawn(async move {
+        tokio::spawn(async move {
             let exit = (work)().await;
             // Effect.onExit → finishRun
             runner.finish_run(id, task_done, exit).await;
         });
-        RunHandle {
-            id,
-            done,
-            abort: task.abort_handle(),
-        }
+        RunHandle { id, done, cancel }
     }
 
     /// `ensureRunning` (runner.ts:108-136).
-    pub async fn ensure_running(&self, work: Work<A, E>) -> Result<A, RunnerError<E>> {
+    pub async fn ensure_running(
+        &self,
+        cancel: CancellationToken,
+        work: Work<A, E>,
+    ) -> Result<A, RunnerError<E>> {
         let done = {
             let mut state = self.inner.lock_state();
             match &mut *state {
@@ -321,6 +332,7 @@ impl<A: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static> Runner<
                     let run = PendingHandle {
                         id: self.next_id(),
                         done: done.clone(),
+                        cancel,
                         work,
                     };
                     if let RunnerState::Shell(shell) =
@@ -332,7 +344,7 @@ impl<A: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static> Runner<
                 }
                 RunnerState::Idle => {
                     let done = Arc::new(Deferred::new());
-                    let run = self.start_run(work, done.clone());
+                    let run = self.start_run(work, done.clone(), cancel);
                     *state = RunnerState::Running(run);
                     done
                 }
@@ -391,7 +403,7 @@ impl<A: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static> Runner<
             match std::mem::replace(&mut *state, RunnerState::Idle) {
                 RunnerState::Shell(shell) if shell.id == id => true,
                 RunnerState::ShellThenRun(shell, run) if shell.id == id => {
-                    let handle = self.start_run(run.work, run.done);
+                    let handle = self.start_run(run.work, run.done, run.cancel);
                     *state = RunnerState::Running(handle);
                     false
                 }
@@ -422,7 +434,7 @@ impl<A: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static> Runner<
             match std::mem::replace(&mut *state, RunnerState::Idle) {
                 RunnerState::Idle => CancelAction::Nothing,
                 RunnerState::Running(run) => CancelAction::Running {
-                    abort: run.abort,
+                    cancel: run.cancel,
                     done: run.done,
                 },
                 RunnerState::Shell(shell) => CancelAction::Shell(shell),
@@ -434,8 +446,8 @@ impl<A: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static> Runner<
         };
         match action {
             CancelAction::Nothing => {}
-            CancelAction::Running { abort, done } => {
-                abort.abort();
+            CancelAction::Running { cancel, done } => {
+                cancel.cancel();
                 done.complete(Err(RunnerError::Cancelled(Cancelled)));
                 self.run_idle().await;
             }
@@ -669,11 +681,12 @@ impl SessionRunState {
     pub async fn ensure_running(
         self: &Arc<Self>,
         session_id: &str,
+        cancel: CancellationToken,
         on_interrupt: Work<WithParts, SessionError>,
         work: Work<WithParts, SessionError>,
     ) -> Result<WithParts, RunnerError<SessionError>> {
         let runner = self.runner(session_id, on_interrupt);
-        runner.ensure_running(work).await
+        runner.ensure_running(cancel, work).await
     }
 
     /// `startShell` (run-state.ts:78-92) — `RunnerBusy` maps to
@@ -730,7 +743,7 @@ mod tests {
             on_interrupt: None,
         });
         let result = runner
-            .ensure_running(box_work("hello".to_string()))
+            .ensure_running(CancellationToken::new(), box_work("hello".to_string()))
             .await
             .unwrap();
         assert_eq!(result, "hello");
@@ -757,8 +770,8 @@ mod tests {
         let first = runner.clone();
         let second = runner.clone();
         let (a, b) = tokio::join!(
-            first.ensure_running(work.clone()),
-            second.ensure_running(work),
+            first.ensure_running(CancellationToken::new(), work.clone()),
+            second.ensure_running(CancellationToken::new(), work),
         );
         assert_eq!(a.unwrap(), "shared");
         assert_eq!(b.unwrap(), "shared");
@@ -787,7 +800,7 @@ mod tests {
             on_interrupt: None,
         });
         runner
-            .ensure_running(box_work("work".to_string()))
+            .ensure_running(CancellationToken::new(), box_work("work".to_string()))
             .await
             .unwrap();
         assert_eq!(idle.load(Ordering::Relaxed), 1);
@@ -855,7 +868,7 @@ mod tests {
         let second = runner.clone();
         let (shell, run) = tokio::join!(
             first.start_shell(work, None),
-            second.ensure_running(box_work("run".to_string())),
+            second.ensure_running(CancellationToken::new(), box_work("run".to_string())),
         );
         assert_eq!(shell.unwrap(), "shell");
         assert_eq!(run.unwrap(), "run");
@@ -889,7 +902,7 @@ mod tests {
                 runner.cancel().await;
             })
         };
-        let result = runner.ensure_running(work).await;
+        let result = runner.ensure_running(CancellationToken::new(), work).await;
         cancel_handle.await.unwrap();
         assert_eq!(result.unwrap(), "interrupted");
         assert!(!runner.busy());
@@ -933,7 +946,7 @@ mod tests {
                 runner.cancel().await;
             })
         };
-        let result = runner.ensure_running(work).await;
+        let result = runner.ensure_running(CancellationToken::new(), work).await;
         handle.await.unwrap();
         assert!(matches!(result, Err(RunnerError::Cancelled(_))));
     }
@@ -1086,7 +1099,7 @@ mod tests {
             let on_interrupt = on_interrupt_never();
             tokio::spawn(async move {
                 run_state
-                    .ensure_running("ses_01", on_interrupt, work)
+                    .ensure_running("ses_01", CancellationToken::new(), on_interrupt, work)
                     .await
                     .unwrap()
             })
@@ -1106,6 +1119,7 @@ mod tests {
         run_state
             .ensure_running(
                 "ses_01",
+                CancellationToken::new(),
                 on_interrupt_never(),
                 box_work(user_message("msg_01")),
             )

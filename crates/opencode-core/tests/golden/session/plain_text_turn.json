@@ -1,0 +1,252 @@
+{
+  "comment": "TS: one text-only assistant turn through prompt()/runLoop — message.updated churn, part lifecycle (message.part.updated / message.part.delta), session.status busy + idle (prompt.ts:1052-1071, processor.ts:609-645)",
+  "events": [
+    {
+      "data": {
+        "info": {
+          "agent": "build",
+          "id": "msg_user1",
+          "model": {
+            "modelID": "claude",
+            "providerID": "anthropic"
+          },
+          "role": "user",
+          "sessionID": "ses_0",
+          "time": {
+            "created": 1761000000000.0
+          }
+        },
+        "sessionID": "ses_0"
+      },
+      "type": "message.updated"
+    },
+    {
+      "data": {
+        "part": {
+          "id": "prt_1",
+          "messageID": "msg_user1",
+          "sessionID": "ses_0",
+          "text": "say hi",
+          "type": "text"
+        },
+        "sessionID": "ses_0",
+        "time": 1761000000000.0
+      },
+      "type": "message.part.updated"
+    },
+    {
+      "data": {
+        "sessionID": "ses_0",
+        "status": {
+          "type": "busy"
+        }
+      },
+      "type": "session.status"
+    },
+    {
+      "data": {
+        "info": {
+          "agent": "build",
+          "cost": 0.0,
+          "id": "msg_2",
+          "mode": "build",
+          "modelID": "claude",
+          "parentID": "msg_user1",
+          "path": {
+            "cwd": "<tmp>/repo",
+            "root": "<tmp>/repo"
+          },
+          "providerID": "anthropic",
+          "role": "assistant",
+          "sessionID": "ses_0",
+          "time": {
+            "created": 1761000000000
+          },
+          "tokens": {
+            "cache": {
+              "read": 0.0,
+              "write": 0.0
+            },
+            "input": 0.0,
+            "output": 0.0,
+            "reasoning": 0.0
+          }
+        },
+        "sessionID": "ses_0"
+      },
+      "type": "message.updated"
+    },
+    {
+      "data": {
+        "sessionID": "ses_0",
+        "status": {
+          "type": "busy"
+        }
+      },
+      "type": "session.status"
+    },
+    {
+      "data": {
+        "part": {
+          "id": "prt_3",
+          "messageID": "msg_2",
+          "sessionID": "ses_0",
+          "text": "",
+          "time": {
+            "start": 1761000000000
+          },
+          "type": "text"
+        },
+        "sessionID": "ses_0",
+        "time": 1761000000000.0
+      },
+      "type": "message.part.updated"
+    },
+    {
+      "data": {
+        "delta": "hello world",
+        "field": "text",
+        "messageID": "msg_2",
+        "partID": "prt_3",
+        "sessionID": "ses_0"
+      },
+      "type": "message.part.delta"
+    },
+    {
+      "data": {
+        "part": {
+          "id": "prt_3",
+          "messageID": "msg_2",
+          "sessionID": "ses_0",
+          "text": "hello world",
+          "time": {
+            "end": 1761000000000,
+            "start": 1761000000000
+          },
+          "type": "text"
+        },
+        "sessionID": "ses_0",
+        "time": 1761000000000.0
+      },
+      "type": "message.part.updated"
+    },
+    {
+      "data": {
+        "part": {
+          "cost": 0.0,
+          "id": "prt_4",
+          "messageID": "msg_2",
+          "reason": "stop",
+          "sessionID": "ses_0",
+          "snapshot": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855-1",
+          "tokens": {
+            "cache": {
+              "read": 0.0,
+              "write": 0.0
+            },
+            "input": 0.0,
+            "output": 0.0,
+            "reasoning": 0.0
+          },
+          "type": "step-finish"
+        },
+        "sessionID": "ses_0",
+        "time": 1761000000000.0
+      },
+      "type": "message.part.updated"
+    },
+    {
+      "data": {
+        "info": {
+          "agent": "build",
+          "cost": 0.0,
+          "finish": "stop",
+          "id": "msg_2",
+          "mode": "build",
+          "modelID": "claude",
+          "parentID": "msg_user1",
+          "path": {
+            "cwd": "<tmp>/repo",
+            "root": "<tmp>/repo"
+          },
+          "providerID": "anthropic",
+          "role": "assistant",
+          "sessionID": "ses_0",
+          "time": {
+            "created": 1761000000000
+          },
+          "tokens": {
+            "cache": {
+              "read": 0.0,
+              "write": 0.0
+            },
+            "input": 0.0,
+            "output": 0.0,
+            "reasoning": 0.0
+          }
+        },
+        "sessionID": "ses_0"
+      },
+      "type": "message.updated"
+    },
+    {
+      "data": {
+        "info": {
+          "agent": "build",
+          "cost": 0.0,
+          "finish": "stop",
+          "id": "msg_2",
+          "mode": "build",
+          "modelID": "claude",
+          "parentID": "msg_user1",
+          "path": {
+            "cwd": "<tmp>/repo",
+            "root": "<tmp>/repo"
+          },
+          "providerID": "anthropic",
+          "role": "assistant",
+          "sessionID": "ses_0",
+          "time": {
+            "completed": 1761000000000,
+            "created": 1761000000000
+          },
+          "tokens": {
+            "cache": {
+              "read": 0.0,
+              "write": 0.0
+            },
+            "input": 0.0,
+            "output": 0.0,
+            "reasoning": 0.0
+          }
+        },
+        "sessionID": "ses_0"
+      },
+      "type": "message.updated"
+    },
+    {
+      "data": {
+        "sessionID": "ses_0",
+        "status": {
+          "type": "busy"
+        }
+      },
+      "type": "session.status"
+    },
+    {
+      "data": {
+        "sessionID": "ses_0",
+        "status": {
+          "type": "idle"
+        }
+      },
+      "type": "session.status"
+    },
+    {
+      "data": {
+        "sessionID": "ses_0"
+      },
+      "type": "session.idle"
+    }
+  ]
+}

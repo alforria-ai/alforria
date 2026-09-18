@@ -33,6 +33,8 @@ pub mod tools;
 pub mod usage;
 
 #[cfg(test)]
+pub(crate) mod e2e;
+#[cfg(test)]
 pub(crate) mod test_support;
 
 use std::sync::Arc;

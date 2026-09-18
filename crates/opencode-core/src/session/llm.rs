@@ -70,12 +70,50 @@ pub struct LlmTool {
     pub description: String,
     /// The (provider-transformed) JSON Schema.
     pub input_schema: Value,
-    /// `(args, toolCallId)` → tool result. The error string is the
-    /// `ToolFailure` message (native-runtime.ts:188).
+    /// `(args, toolCallId)` → tool result.
     #[allow(clippy::type_complexity)]
     pub execute: Arc<
-        dyn Fn(Value, String) -> BoxFuture<'static, Result<LlmToolOutput, String>> + Send + Sync,
+        dyn Fn(Value, String) -> BoxFuture<'static, Result<LlmToolOutput, ToolFailure>>
+            + Send
+            + Sync,
     >,
+}
+
+/// The thrown value the runtime surfaces on `tool-error`
+/// (native-runtime.ts:188-127): TS carries the raw error instance so the
+/// processor can `instanceof` `PermissionV1.RejectedError` /
+/// `Question.RejectedError` (processor.ts:200-201); the Rust seam
+/// serializes the class into the event's `error` JSON instead
+/// (documented divergence, spec §2.6).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ToolFailure {
+    /// A plain `Error` — `errorMessage(error)` is the part error text.
+    Message(String),
+    /// `PermissionV1.RejectedError` / `Question.RejectedError`.
+    Rejected(String),
+}
+
+impl ToolFailure {
+    pub fn message(&self) -> String {
+        match self {
+            ToolFailure::Message(message) | ToolFailure::Rejected(message) => message.clone(),
+        }
+    }
+
+    /// The `tool-error` event's `error` payload — `{name, data}` per the
+    /// `errorMessage` convention (util/error.ts).
+    pub fn error_value(&self) -> Value {
+        match self {
+            ToolFailure::Message(message) => serde_json::json!({
+                "name": "Error",
+                "data": { "message": message },
+            }),
+            ToolFailure::Rejected(message) => serde_json::json!({
+                "name": "RejectedError",
+                "data": { "message": message },
+            }),
+        }
+    }
 }
 
 impl std::fmt::Debug for LlmTool {
@@ -712,25 +750,28 @@ async fn dispatch_one(tools: &[LlmTool], id: &str, name: &str, input: Value) -> 
                 provider_metadata: None,
             }]
         }
-        Err(message) => vec![
-            LlmEvent::ToolError {
-                id: id.to_string(),
-                name: name.to_string(),
-                message: message.clone(),
-                error: None,
-                provider_metadata: None,
-            },
-            LlmEvent::ToolResult {
-                id: id.to_string(),
-                name: name.to_string(),
-                result: ToolResultValue::Error {
-                    value: Value::String(message),
+        Err(failure) => {
+            let message = failure.message();
+            vec![
+                LlmEvent::ToolError {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    message: message.clone(),
+                    error: Some(failure.error_value()),
+                    provider_metadata: None,
                 },
-                output: None,
-                provider_executed: None,
-                provider_metadata: None,
-            },
-        ],
+                LlmEvent::ToolResult {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    result: ToolResultValue::Error {
+                        value: Value::String(message),
+                    },
+                    output: None,
+                    provider_executed: None,
+                    provider_metadata: None,
+                },
+            ]
+        }
     }
 }
 

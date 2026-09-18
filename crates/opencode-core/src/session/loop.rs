@@ -32,7 +32,7 @@ use crate::session::agents::AgentRegistry;
 use crate::session::error::SessionError;
 use crate::session::event_definitions::SESSION_ERROR;
 use crate::session::instruction::Instruction;
-use crate::session::llm::{LlmModel, LlmStream, LlmTool, LlmToolOutput, StreamInput};
+use crate::session::llm::{LlmModel, LlmStream, LlmTool, LlmToolOutput, StreamInput, ToolFailure};
 use crate::session::message::{filter_compacted, latest, MessageStore, WithParts};
 use crate::session::overflow::{is_overflow, IsOverflowInput, ModelLimits};
 use crate::session::processor::{
@@ -299,7 +299,6 @@ pub async fn run_loop(
 
         let msgs = filter_compacted(deps.messages.stream(session_id)?);
         let latest = latest(&msgs);
-
         let last_user = latest.user.clone().ok_or_else(|| {
             LoopError::Unknown(
                 "No user message found in stream. This should never happen.".to_string(),
@@ -940,7 +939,7 @@ pub fn create_structured_output_tool(
                     output: "Structured output captured successfully.".to_string(),
                     attachments: None,
                 })
-            }) as BoxFuture<'static, Result<LlmToolOutput, String>>
+            }) as BoxFuture<'static, Result<LlmToolOutput, ToolFailure>>
         }),
     }
 }
@@ -2258,7 +2257,7 @@ mod tests {
                         output: "echoed".to_string(),
                         attachments: None,
                     })
-                }) as BoxFuture<'static, Result<LlmToolOutput, String>>
+                }) as BoxFuture<'static, Result<LlmToolOutput, ToolFailure>>
             }),
         }
     }

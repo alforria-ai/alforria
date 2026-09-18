@@ -545,6 +545,22 @@ fn payload_message(error: Option<&Value>) -> String {
     }
 }
 
+/// The `error instanceof PermissionV1.RejectedError ||
+/// error instanceof Question.RejectedError` check (processor.ts:200-201):
+/// the runtime serializes those classes as
+/// `{name: "RejectedError", data: {message}}`.
+fn rejected_error(error: Option<&Value>) -> Option<String> {
+    let error = error?;
+    if error.get("name") == Some(&Value::String("RejectedError".to_string())) {
+        return error
+            .get("data")
+            .and_then(|data| data.get("message"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+    }
+    None
+}
+
 /// Convert a storage/event defect into the `parse()` channel the
 /// retry/halt pipeline understands.
 fn storage_failure(error: SessionError) -> SourceError {
@@ -855,10 +871,20 @@ impl Handle {
             LlmEvent::ToolError {
                 id, error, message, ..
             } => {
-                let error = error.as_ref().cloned().unwrap_or(Value::String(message));
-                let message = payload_message(Some(&error));
-                self.fail_tool_call_shared(&id, FailError::Error { message })
-                    .await?;
+                // processor.ts:200-201 — only `PermissionV1.RejectedError` /
+                // `Question.RejectedError` block the loop; the runtime
+                // serializes the class into the event's `error` value
+                // (see `ToolFailure`).
+                let error = match rejected_error(error.as_ref()) {
+                    Some(message) => FailError::Rejected { message },
+                    None => {
+                        let value = error.clone().unwrap_or(Value::String(message.clone()));
+                        FailError::Error {
+                            message: payload_message(Some(&value)),
+                        }
+                    }
+                };
+                self.fail_tool_call_shared(&id, error).await?;
                 Ok(())
             }
             LlmEvent::ProviderError { message, .. } => Err(SourceError::Error { message }),

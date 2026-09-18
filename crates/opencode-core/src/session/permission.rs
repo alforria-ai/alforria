@@ -379,7 +379,14 @@ fn json_map(value: &Value) -> opencode_schema::schema::JsonMap {
 }
 
 fn ask_tool_error(error: PermissionError) -> ToolError {
-    ToolError::Permission(error.to_string())
+    match error {
+        // processor.ts:200-201 blocks the loop only on RejectedError.
+        PermissionError::Rejected => ToolError::Rejected(error.to_string()),
+        PermissionError::Corrected { .. }
+        | PermissionError::Denied { .. }
+        | PermissionError::NotFound { .. }
+        | PermissionError::Publish(_) => ToolError::Permission(error.to_string()),
+    }
 }
 
 impl crate::tool::def::Ask for SessionAsk {

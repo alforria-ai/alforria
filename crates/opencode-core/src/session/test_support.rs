@@ -421,6 +421,9 @@ impl DispatchLlm {
 }
 
 /// Emulate the runtime's tool dispatch (loop.rs mock_dispatch).
+/// Emulate the runtime's tool dispatch (llm.rs `dispatch_one`): failures
+/// surface as `tool-error` (with the serialized error class) followed by
+/// an error `tool-result` (llm.rs:715-769).
 async fn dispatch_one(
     tools: &[crate::session::llm::LlmTool],
     id: &str,
@@ -428,10 +431,6 @@ async fn dispatch_one(
     input: Value,
 ) -> Vec<LlmEvent> {
     use opencode_llm::schema::events::LlmEvent;
-    let _ = LlmEvent::TextStart {
-        id: String::new(),
-        provider_metadata: None,
-    };
     let Some(tool) = tools.iter().find(|tool| tool.name == name) else {
         let message = format!("Unknown tool: {name}");
         return vec![
@@ -454,48 +453,99 @@ async fn dispatch_one(
             },
         ];
     };
-    let Ok(output) = (tool.execute)(input, id.to_string()).await else {
-        return Vec::new();
-    };
-    let mut value = serde_json::json!({
-        "output": output.output,
-        "title": output.title,
-        "metadata": output.metadata,
-    });
-    if let Some(attachments) = output.attachments {
-        value["attachments"] = serde_json::to_value(&attachments).unwrap_or(Value::Null);
+    match (tool.execute)(input, id.to_string()).await {
+        Ok(output) => {
+            let mut value = serde_json::json!({
+                "output": output.output,
+                "title": output.title,
+                "metadata": output.metadata,
+            });
+            if let Some(attachments) = output.attachments {
+                value["attachments"] = serde_json::to_value(&attachments).unwrap_or(Value::Null);
+            }
+            vec![LlmEvent::ToolResult {
+                id: id.to_string(),
+                name: name.to_string(),
+                result: opencode_llm::schema::messages::ToolResultValue::Json { value },
+                output: None,
+                provider_executed: None,
+                provider_metadata: None,
+            }]
+        }
+        Err(failure) => {
+            let message = failure.message();
+            vec![
+                LlmEvent::ToolError {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    message: message.clone(),
+                    error: Some(failure.error_value()),
+                    provider_metadata: None,
+                },
+                LlmEvent::ToolResult {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    result: opencode_llm::schema::messages::ToolResultValue::Error {
+                        value: Value::String(message),
+                    },
+                    output: None,
+                    provider_executed: None,
+                    provider_metadata: None,
+                },
+            ]
+        }
     }
-    vec![LlmEvent::ToolResult {
-        id: id.to_string(),
-        name: name.to_string(),
-        result: opencode_llm::schema::messages::ToolResultValue::Json { value },
-        output: None,
-        provider_executed: None,
-        provider_metadata: None,
-    }]
 }
 
+/// The stream state: Pending provider events, in-flight settlements and
+/// settled events.
+///
+/// Tool calls are dispatched EAGERLY with the provider event yielded
+/// FIRST, exactly like the TS native runtime
+/// (`FiberSet.run(settlements, { startImmediately: true })` + result
+/// queue, native-runtime.ts:107-127): the processor sees the `tool-call`
+/// event (creating the part) before the settlement executes, and the
+/// settlement events are delivered while the remaining provider events
+/// stream. Eager execution is what makes step-finish snapshots observe
+/// tool edits (patch parts).
 fn dispatch_stream(
-    calls: VecDeque<(String, String, Value)>,
+    provider: VecDeque<Result<LlmEvent, LlmError>>,
     tools: Vec<crate::session::llm::LlmTool>,
     hang: bool,
 ) -> LlmEventStream {
+    type Pending = Option<(String, String, Value)>;
     futures::stream::unfold(
-        (calls, tools, VecDeque::new(), hang),
-        |(mut calls, tools, mut queue, hang)| async move {
+        (provider, tools, VecDeque::new(), Pending::None, hang),
+        |(mut provider, tools, mut queue, pending, hang)| async move {
             if let Some(event) = queue.pop_front() {
-                return Some((Ok(event), (calls, tools, queue, hang)));
+                return Some((Ok(event), (provider, tools, queue, pending, hang)));
             }
-            let Some((id, name, input)) = calls.pop_front() else {
+            if let Some((id, name, input)) = pending {
+                let events = dispatch_one(&tools, &id, &name, input).await;
+                queue.extend(events);
+                let event = queue.pop_front().expect("dispatch produced events");
+                return Some((Ok(event), (provider, tools, queue, None, hang)));
+            }
+            let Some(item) = provider.pop_front() else {
                 if hang {
                     futures::future::pending::<()>().await;
                 }
                 return None;
             };
-            let mut events = dispatch_one(&tools, &id, &name, input).await;
-            let first = events.remove(0);
-            queue.extend(events);
-            Some((Ok(first), (calls, tools, queue, hang)))
+            let mut pending: Pending = None;
+            if let Ok(LlmEvent::ToolCall {
+                id,
+                name,
+                input,
+                provider_executed,
+                ..
+            }) = &item
+            {
+                if *provider_executed != Some(true) {
+                    pending = Some((id.clone(), name.clone(), input.clone()));
+                }
+            }
+            Some((item, (provider, tools, queue, pending, hang)))
         },
     )
     .boxed()
@@ -505,27 +555,8 @@ impl LlmStream for DispatchLlm {
     fn stream(&self, input: StreamInput) -> LlmEventStream {
         self.inputs.lock().unwrap().push(input.clone());
         let events = self.script.lock().unwrap().pop_front().unwrap_or_default();
-        let mut calls = Vec::new();
-        for item in &events {
-            if let Ok(LlmEvent::ToolCall {
-                id,
-                name,
-                input,
-                provider_executed,
-                ..
-            }) = item
-            {
-                if provider_executed.unwrap_or(false) {
-                    continue;
-                }
-                calls.push((id.clone(), name.clone(), input.clone()));
-            }
-        }
-        let provider = futures::stream::iter(events);
         let hang = self.hang.load(std::sync::atomic::Ordering::SeqCst);
-        provider
-            .chain(dispatch_stream(calls.into(), input.tools, hang))
-            .boxed()
+        dispatch_stream(events.into(), input.tools, hang)
     }
 }
 
@@ -545,26 +576,32 @@ pub(crate) struct Engine {
     pub(crate) worktree: std::path::PathBuf,
     pub(crate) ops: Arc<ProductionTaskOps>,
     pub(crate) prompt: Arc<SessionPrompt>,
+    pub(crate) revert: Arc<crate::session::revert::SessionRevert>,
     pub(crate) models: Arc<dyn crate::session::r#loop::ModelSource>,
     pub(crate) registry: crate::tool::registry::ToolRegistry,
     pub(crate) instance: crate::tool::def::InstanceContext,
 }
 
-/// A `read` tool stub (the registry requires one).
-fn stub_def(id: &'static str) -> crate::tool::def::ToolDef {
+/// The `read` tool variants the engine harness can register.
+pub(crate) enum EngineDefs {
+    /// The real M4 `read` tool.
+    Real,
+    /// A `read` tool whose execution never resolves — the abort tests'
+    /// cancellation seam.
+    HangingRead,
+}
+
+/// A tool def whose execution never resolves.
+fn hanging_def(id: &'static str) -> crate::tool::def::ToolDef {
     crate::tool::def::ToolDef {
         id,
-        description: "stub".into(),
+        description: "hanging".into(),
         parameters: serde_json::json!({ "type": "object" }),
         format_validation_error: None,
         execute: Arc::new(|_args, _ctx| {
             Box::pin(async {
-                Ok(crate::tool::def::ExecuteResult {
-                    title: "stub".to_string(),
-                    metadata: serde_json::json!({}),
-                    output: "ok".to_string(),
-                    attachments: None,
-                })
+                std::future::pending::<()>().await;
+                unreachable!()
             })
         }),
     }
@@ -579,6 +616,63 @@ pub(crate) fn engine_with_flags(
     script: MockScript,
     config: Value,
     session_permission: Option<Value>,
+) -> Engine {
+    engine_build(name, script, config, session_permission, EngineDefs::Real)
+}
+
+/// An engine whose compaction summary turn runs its own script (the
+/// compaction `DispatchLlm` script is otherwise a copy of the main one).
+pub(crate) fn engine_with_compaction_script(
+    name: &str,
+    script: MockScript,
+    compaction_script: MockScript,
+) -> Engine {
+    engine_build_with(
+        name,
+        script,
+        compaction_script,
+        serde_json::json!({}),
+        None,
+        EngineDefs::Real,
+    )
+}
+
+/// An engine whose `read` tool never resolves — the mid-flight
+/// cancellation seam (spec M5.8 scenario 10).
+pub(crate) fn engine_hanging_read(name: &str, script: MockScript) -> Engine {
+    engine_build(
+        name,
+        script,
+        serde_json::json!({}),
+        None,
+        EngineDefs::HangingRead,
+    )
+}
+
+fn engine_build(
+    name: &str,
+    script: MockScript,
+    config: Value,
+    session_permission: Option<Value>,
+    defs: EngineDefs,
+) -> Engine {
+    engine_build_with(
+        name,
+        script.clone(),
+        script,
+        config,
+        session_permission,
+        defs,
+    )
+}
+
+fn engine_build_with(
+    name: &str,
+    script: MockScript,
+    compaction_script: MockScript,
+    config: Value,
+    session_permission: Option<Value>,
+    defs: EngineDefs,
 ) -> Engine {
     let temp = crate::storage::test_support::TempDir::new(name);
     let worktree = temp.path().join("repo");
@@ -629,25 +723,32 @@ pub(crate) fn engine_with_flags(
     let input_models: Arc<dyn crate::session::prompt_input::Models> = Arc::new(FixedInputModels);
     let snapshot = InMemorySnapshot::new(worktree.clone());
 
-    // Production TaskOps + registry (task tool + read stub).
+    // Production TaskOps + registry (task tool + real file tools).
     let ops = ProductionTaskOps::new(
         services.sessions.clone(),
         services.messages.clone(),
         services.agents.clone(),
         context,
     );
+    let truncate = Arc::new(crate::tool::truncate::TruncateService::default_limits(
+        temp.path().to_path_buf(),
+    ));
+    let agents = crate::tool::ripgrep::test_support::fixed_agents();
     let task = crate::tool::task::task_tool(
-        Arc::new(crate::tool::truncate::TruncateService::default_limits(
-            temp.path().to_path_buf(),
-        )),
-        crate::tool::ripgrep::test_support::fixed_agents(),
+        truncate.clone(),
+        agents.clone(),
         ops.clone(),
         1,
         Vec::new(),
         crate::tool::task::BackgroundMode::Disabled,
     );
+    let read = match defs {
+        EngineDefs::Real => crate::tool::read::read_tool(truncate.clone(), agents.clone(), None),
+        EngineDefs::HangingRead => hanging_def("read"),
+    };
+    let write = crate::tool::write::write_tool(truncate.clone(), agents, None, None, None);
     let registry = crate::tool::registry::ToolRegistry::new(
-        vec![task, stub_def("read")],
+        vec![task, read, write],
         Vec::new(),
         crate::tool::registry::RuntimeFlags::default(),
         Arc::new(RegistryStubAgents),
@@ -695,7 +796,7 @@ pub(crate) fn engine_with_flags(
                 status: services.status.clone(),
                 agents: services.agents.clone(),
                 snapshot: snapshot.clone(),
-                llm: DispatchLlm::new(script.clone()),
+                llm: DispatchLlm::new(compaction_script),
                 permission: services.permission.clone(),
                 summary: summary.clone(),
                 models: models.clone(),
@@ -737,7 +838,7 @@ pub(crate) fn engine_with_flags(
         instruction,
         systems: Arc::new(crate::session::r#loop::NoSystemPrompts),
         registry: registry.clone(),
-        revert,
+        revert: revert.clone(),
         prompt_ops: ops.clone(),
         config: config.clone(),
         clock,
@@ -761,6 +862,7 @@ pub(crate) fn engine_with_flags(
         worktree,
         ops,
         prompt,
+        revert,
         models: models.clone(),
         registry: registry.clone(),
         instance: instance.clone(),
@@ -947,4 +1049,65 @@ impl crate::tool::def::Agents for RegistryStubAgents {
 fn _unused(e: &Engine, input: &ShellInput) -> Option<&'static str> {
     let _ = (input, COMMAND_EXECUTED);
     None
+}
+
+// ---------------------------------------------------------------------------
+// M5.8 permission answerer — the scripted "user" behind the real
+// permission service (the only scripted seam besides the LLM, spec §6.6)
+// ---------------------------------------------------------------------------
+
+/// A scripted replier for `permission.asked` events: every ask pops the
+/// next reply (falling back to `once`) and is answered through the real
+/// [`PermissionService`], so the ask/reply event pair and the
+/// once/always/reject semantics are exercised end-to-end.
+pub(crate) struct PermissionAnswerer {
+    asks: Mutex<Vec<opencode_schema::permission_v1::PermissionV1Request>>,
+    replies: Mutex<std::collections::VecDeque<opencode_schema::permission_v1::PermissionV1Reply>>,
+}
+
+impl PermissionAnswerer {
+    pub(crate) fn new(
+        replies: Vec<opencode_schema::permission_v1::PermissionV1Reply>,
+    ) -> Arc<Self> {
+        Arc::new(PermissionAnswerer {
+            asks: Mutex::new(Vec::new()),
+            replies: Mutex::new(replies.into_iter().collect()),
+        })
+    }
+
+    /// The observed `permission.asked` payloads.
+    pub(crate) fn asks(&self) -> Vec<opencode_schema::permission_v1::PermissionV1Request> {
+        self.asks.lock().unwrap().clone()
+    }
+
+    /// Serve asks until `count` replies have been sent. Spawn as a task
+    /// alongside the prompt future.
+    pub(crate) async fn serve(
+        self: Arc<Self>,
+        service: Arc<crate::session::permission::PermissionService>,
+        mut asked: tokio::sync::broadcast::Receiver<crate::event::definition::Payload>,
+        count: usize,
+    ) {
+        let mut sent = 0;
+        while sent < count {
+            let event = asked.recv().await.expect("permission.asked event");
+            let request: opencode_schema::permission_v1::PermissionV1Request =
+                serde_json::from_value(event.data.clone()).expect("asked payload shape");
+            self.asks.lock().unwrap().push(request.clone());
+            let reply = self
+                .replies
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(opencode_schema::permission_v1::PermissionV1Reply::Once);
+            service
+                .reply(opencode_schema::permission_v1::PermissionV1ReplyInput {
+                    request_id: request.id,
+                    reply,
+                    message: None,
+                })
+                .expect("reply is valid");
+            sent += 1;
+        }
+    }
 }
