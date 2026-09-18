@@ -55,7 +55,7 @@ pub fn truncate_tool_output(text: &str, max_chars: Option<usize>) -> String {
 }
 
 /// `isMedia` (util/media.ts): `image/*` or `application/pdf`.
-fn is_media(mime: &str) -> bool {
+pub fn is_media(mime: &str) -> bool {
     mime.starts_with("image/") || mime == "application/pdf"
 }
 

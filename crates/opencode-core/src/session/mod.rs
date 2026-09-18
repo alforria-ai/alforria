@@ -2,6 +2,7 @@
 //! (spec §2.1) replacing TS's Effect layers.
 
 pub mod agents;
+pub mod compaction;
 pub mod error;
 pub mod event_definitions;
 pub mod from_error;
@@ -18,13 +19,18 @@ pub mod question;
 pub mod reminders;
 pub mod render;
 pub mod retry;
+pub mod revert;
 pub mod run_state;
 pub mod snapshot;
 pub mod status;
 pub mod store;
+pub mod summary;
 pub mod system;
 pub mod tools;
 pub mod usage;
+
+#[cfg(test)]
+pub(crate) mod test_support;
 
 use std::sync::Arc;
 
@@ -33,6 +39,13 @@ use crate::storage::Storage;
 use crate::Clock;
 
 pub use agents::{AgentInfo, AgentRegistry, AgentRegistryInput, DefaultAgentError};
+pub use compaction::{
+    build_prompt, completed_compactions, preserve_recent_budget, select, serialize, summary_text,
+    token_estimate, turns, BuildPrompt, CompactionDeps, CompactionOutcome, CompletedCompaction,
+    SelectInput, Selected, SessionCompaction, Tail, Turn, MAX_PRESERVE_RECENT_TOKENS,
+    MIN_PRESERVE_RECENT_TOKENS, PRUNE_MINIMUM, PRUNE_PROTECT, PRUNE_PROTECTED_TOOLS,
+    SUMMARY_TEMPLATE, SUMMARY_UPDATE_INSTRUCTIONS, TOOL_OUTPUT_MAX_CHARS,
+};
 pub use error::{AuthError, BusyError, NotFoundError, OutputLengthError, SessionError};
 pub use message::{filter_compacted, latest, Cursor, Latest, MessagePage, MessageStore, WithParts};
 pub use overflow::{is_overflow, max_output_tokens, usable, ModelLimits};
@@ -46,6 +59,7 @@ pub use retry::{
     delay as retry_delay, retryable, Policy as RetryPolicy, PolicyStep as RetryPolicyStep,
     RetryAction, RetrySet, Retryable as RetryableError,
 };
+pub use revert::{write_session_diff, RevertDeps, RevertInput, SessionRevert};
 pub use run_state::{
     BackgroundJobInfo, BackgroundJobStatus, BackgroundJobs, Latch, Runner, RunnerError,
     SessionRunState, ShellError,
@@ -57,6 +71,7 @@ pub use store::{
     GlobalListInput, ListInput, ProjectInfo, SessionContext, SessionStore, SetClear,
     INSTALLATION_VERSION,
 };
+pub use summary::{unquote_git_path, SessionSummary, SummaryDeps};
 pub use usage::{get_usage, CacheCost, CostTier, GetUsage, ModelCost, Over200k, UsageCost};
 
 /// The per-instance session services (spec §2.1): TS resolves these from

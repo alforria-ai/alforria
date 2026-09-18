@@ -204,6 +204,12 @@ impl InMemorySnapshot {
             }
         }
         files.sort();
+        // TS `patch()` hands out absolute worktree paths
+        // (`path.join(state.worktree, x)`).
+        let files = files
+            .into_iter()
+            .map(|path| self.worktree.join(&path).to_string_lossy().into_owned())
+            .collect();
         (id.to_string(), Ok(files))
     }
 

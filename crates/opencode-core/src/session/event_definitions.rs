@@ -64,6 +64,10 @@ pub const SESSION_DIFF: Definition = Definition::ephemeral("session.diff");
 /// `Error` (session.ts:652-658) — no `...options`: ephemeral.
 pub const SESSION_ERROR: Definition = Definition::ephemeral("session.error");
 
+/// `SessionCompactionEvent.Compacted`
+/// (`schema/src/session-compaction-event.ts:8-12`) — ephemeral.
+pub const SESSION_COMPACTED: Definition = Definition::ephemeral("session.compacted");
+
 /// `SessionV1.Event.Definitions` (session.ts:654-677) — all ten, in order.
 pub const DEFINITIONS: [Definition; 10] = [
     SESSION_CREATED,
