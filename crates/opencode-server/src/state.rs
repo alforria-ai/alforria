@@ -26,11 +26,12 @@ impl AuthConfig {
     }
 
     pub fn from_env() -> AuthConfig {
+        // Effect's `withDefault("opencode")` applies only when the env var is
+        // absent — a set-but-empty `OPENCODE_SERVER_USERNAME` stays empty
+        // (ConfigProvider.js:639-641).
         AuthConfig {
             username: std::env::var("OPENCODE_SERVER_USERNAME")
-                .ok()
-                .filter(|v| !v.is_empty())
-                .unwrap_or_else(|| "opencode".to_string()),
+                .unwrap_or_else(|_| "opencode".to_string()),
             password: std::env::var("OPENCODE_SERVER_PASSWORD").ok(),
         }
     }
@@ -174,9 +175,14 @@ impl ServerContext {
     /// always fails — M6.1 routes never load instances; M6.3 replaces the
     /// factory.
     pub fn for_tests() -> ServerContext {
+        Self::for_tests_with_auth(AuthConfig::new("opencode", None))
+    }
+
+    /// `for_tests` with an explicit auth config (M6.2 auth-middleware tests).
+    pub fn for_tests_with_auth(auth: AuthConfig) -> ServerContext {
         let storage = Arc::new(Storage::open_in_memory().expect("in-memory storage"));
         ServerContext::new(
-            AuthConfig::new("opencode", None),
+            auth,
             InstanceStore::new(Arc::new(|_directory| {
                 Err(ServerError::Core(opencode_core::CoreError::Storage(
                     "instance factory not wired (M6.3)".to_string(),
