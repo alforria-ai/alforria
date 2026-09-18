@@ -560,6 +560,7 @@ mod tests {
                 config: root.join("config"),
                 data: root.join("data"),
                 cache: root.join("cache"),
+                state: root.join("state"),
             });
         let (config, _) = ConfigLoader.load(&params).unwrap();
 

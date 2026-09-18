@@ -6,6 +6,8 @@ pub mod engine;
 pub mod error;
 pub mod middleware;
 pub mod openapi;
+pub mod provider;
+pub mod provider_runtime;
 pub mod pty;
 pub mod routes;
 pub mod sse;
@@ -142,8 +144,19 @@ pub fn production_context(
     // M7.2: per-instance engines land in the store keyed by the services
     // the LocationContext carries; the engine seam resolves through it.
     let engines = Arc::new(engine::EngineStore::default());
-    let instances =
-        production_instance_factory(storage.clone(), paths.clone(), engines.clone(), seams);
+    // M7.7: the provider-runtime inputs — the models-dev catalog and the
+    // `auth.json` store shared by the routes and every instance engine.
+    let runtime = engine::EngineRuntime {
+        catalog: state::default_catalog(),
+        auth: Arc::new(state::FileAuthStore::new(paths.data.join("auth.json"))),
+    };
+    let instances = production_instance_factory(
+        storage.clone(),
+        paths.clone(),
+        engines.clone(),
+        runtime.clone(),
+        seams,
+    );
     let mut ctx = ServerContext::new(
         AuthConfig::from_env(),
         instances,
@@ -156,6 +169,8 @@ pub fn production_context(
     ctx.tools = engines.tools();
     ctx.mcp = engines.mcp_source();
     ctx.vcs = Arc::new(state::CoreVcs::default());
+    ctx.catalog = runtime.catalog;
+    ctx.auth_store = runtime.auth;
     Ok(Arc::new(ctx))
 }
 
@@ -167,6 +182,7 @@ fn production_instance_factory(
     storage: Arc<Storage>,
     paths: opencode_core::GlobalPaths,
     engines: Arc<engine::EngineStore>,
+    runtime: engine::EngineRuntime,
     seams: engine::EngineSeams,
 ) -> InstanceStore {
     let factory: state::InstanceFactory = Arc::new(move |directory: &std::path::Path| {
@@ -174,6 +190,7 @@ fn production_instance_factory(
             storage.clone(),
             paths.clone(),
             engines.clone(),
+            runtime.clone(),
             seams.clone(),
             directory,
         )
@@ -188,6 +205,7 @@ fn instance_for_directory(
     storage: Arc<Storage>,
     paths: opencode_core::GlobalPaths,
     engines: Arc<engine::EngineStore>,
+    runtime: engine::EngineRuntime,
     seams: engine::EngineSeams,
     directory: &std::path::Path,
 ) -> Result<Arc<opencode_core::SessionServices>, ServerError> {
@@ -309,6 +327,7 @@ fn instance_for_directory(
         directory: directory.to_path_buf(),
         worktree: worktree.clone(),
         paths,
+        runtime: runtime.clone(),
         seams,
     })?;
     Ok(services)
@@ -448,6 +467,10 @@ mod tests {
             storage.clone(),
             paths,
             Arc::new(engine::EngineStore::default()),
+            engine::EngineRuntime {
+                catalog: crate::state::default_catalog(),
+                auth: Arc::new(crate::state::MemoryAuthStore::default()),
+            },
             engine::EngineSeams::default(),
         );
 

@@ -21,7 +21,7 @@ use opencode_core::session::prompt::SessionPromptDeps;
 use opencode_core::session::prompt::{CommandInput, ShellInput};
 use opencode_core::session::prompt_input::Models as InputModels;
 use opencode_core::session::prompt_input::{PromptError, PromptInput};
-use opencode_core::session::r#loop::{LoopError, ModelSource, ResolvedModel};
+use opencode_core::session::r#loop::ModelSource;
 use opencode_core::session::revert::{RevertDeps, RevertInput, SessionRevert};
 use opencode_core::session::run_state::RunnerError;
 use opencode_core::session::snapshot::Snapshot;
@@ -65,72 +65,10 @@ pub fn background_subagents_enabled() -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// M7.7 seams — the provider runtime (model resolution + LLM request
-// routing) lands with the provider-completion chunk. The production engine
-// binds erroring seams so every HTTP surface fails loudly (and uniformly)
-// until then.
+// M7.7 — the provider runtime (crate::provider_runtime) supplies the
+// model resolution + LLM request routing; the e2e tests script mock
+// seams here.
 // ---------------------------------------------------------------------------
-
-const UNWIRED_PROVIDER_RUNTIME: &str = "provider runtime not wired (M7.7)";
-
-struct UnwiredModels;
-
-impl ModelSource for UnwiredModels {
-    fn get_model<'a>(
-        &'a self,
-        _provider_id: &'a str,
-        _model_id: &'a str,
-        _session_id: &'a str,
-    ) -> BoxFuture<'a, Result<ResolvedModel, LoopError>> {
-        Box::pin(async {
-            Err(LoopError::Session(SessionError::Core(CoreError::Storage(
-                UNWIRED_PROVIDER_RUNTIME.to_string(),
-            ))))
-        })
-    }
-
-    fn get_small_model<'a>(
-        &'a self,
-        _provider_id: &'a str,
-    ) -> BoxFuture<'a, Option<ResolvedModel>> {
-        Box::pin(async { None })
-    }
-}
-
-struct UnwiredInputModels;
-
-impl InputModels for UnwiredInputModels {
-    fn get_model<'a>(
-        &'a self,
-        _provider_id: &'a str,
-        _model_id: &'a str,
-    ) -> opencode_core::tool::def::BoxFuture<'a, Result<opencode_schema::model::ModelInfo, CoreError>>
-    {
-        Box::pin(async { Err(CoreError::Storage(UNWIRED_PROVIDER_RUNTIME.to_string())) })
-    }
-
-    fn default_model(
-        &self,
-    ) -> opencode_core::tool::def::BoxFuture<
-        'static,
-        Result<opencode_schema::model::ModelInfo, CoreError>,
-    > {
-        Box::pin(async { Err(CoreError::Storage(UNWIRED_PROVIDER_RUNTIME.to_string())) })
-    }
-}
-
-struct UnwiredLlm;
-
-impl LlmStream for UnwiredLlm {
-    fn stream(
-        &self,
-        _input: opencode_core::session::llm::StreamInput,
-    ) -> opencode_core::session::llm::LlmEventStream {
-        Box::pin(futures::stream::once(async move {
-            Err(opencode_llm::LlmError::invalid(UNWIRED_PROVIDER_RUNTIME))
-        }))
-    }
-}
 
 /// The engine's MCP resource seam — the real service (M7.6).
 #[derive(Clone)]
@@ -462,9 +400,19 @@ pub struct EngineInput {
     pub directory: PathBuf,
     pub worktree: PathBuf,
     pub paths: opencode_core::GlobalPaths,
-    /// Injectable provider-runtime seams — production leaves them unwired
-    /// (M7.7); the e2e tests script a mock LLM here.
+    /// The provider runtime inputs — the models-dev catalog and the
+    /// `auth.json` store (M7.7).
+    pub runtime: EngineRuntime,
+    /// Injectable provider-runtime seams — production runs the M7.7
+    /// runtime; the e2e tests script a mock LLM here.
     pub seams: EngineSeams,
+}
+
+/// The M7.7 provider-runtime inputs.
+#[derive(Clone)]
+pub struct EngineRuntime {
+    pub catalog: crate::state::CatalogSource,
+    pub auth: Arc<dyn crate::state::AuthStore>,
 }
 
 /// Provider-runtime + share seams: `None` falls back to the unwired M7.7
@@ -525,22 +473,29 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
         workspace_id: None,
     };
 
-    // Provider-runtime seams — unwired until M7.7 unless injected.
+    // Provider-runtime seams — the M7.7 production runtime (models +
+    // route sender) unless the e2e tests script a mock LLM here.
+    let runtime_models = crate::provider_runtime::RuntimeModels::new(
+        &crate::provider::load_catalog(&input.runtime.catalog)?,
+        &input.config,
+        input.runtime.auth.as_ref(),
+        &input.paths,
+    )?;
     let models: Arc<dyn ModelSource> = input
         .seams
         .models
         .clone()
-        .unwrap_or_else(|| Arc::new(UnwiredModels));
+        .unwrap_or_else(|| Arc::new(runtime_models.clone()));
     let input_models: Arc<dyn InputModels> = input
         .seams
         .input_models
         .clone()
-        .unwrap_or_else(|| Arc::new(UnwiredInputModels));
-    let llm: Arc<dyn LlmStream> = input
-        .seams
-        .llm
-        .clone()
-        .unwrap_or_else(|| Arc::new(UnwiredLlm));
+        .unwrap_or_else(|| Arc::new(runtime_models.clone()));
+    let llm: Arc<dyn LlmStream> = input.seams.llm.clone().unwrap_or_else(|| {
+        Arc::new(opencode_core::session::llm::LlmStreamImpl::new(Arc::new(
+            crate::provider_runtime::RouteLlmSender,
+        )))
+    });
     // M7.3: the production git snapshot behind the M5 `Snapshot` seam
     // (`snapshot/index.ts`) — non-git instances fall back to the no-op.
     let snapshot: Arc<dyn Snapshot> = services
@@ -761,7 +716,7 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
             config: input.config.clone(),
             clock: clock.clone(),
             instance: instance.clone(),
-            output_token_max: None,
+            output_token_max: crate::provider_runtime::output_token_max(),
             project_id: None,
             client: client_env(),
         }));
@@ -832,7 +787,7 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
             .clone()
             .unwrap_or_else(|| Arc::new(opencode_core::share::HttpShareClient)),
         account: Arc::new(opencode_core::share::NoAccount),
-        models: Arc::new(opencode_core::share::NoModels), // TODO(M7.7)
+        models: Arc::new(runtime_models.clone()),
         flush_delay: opencode_core::share::FLUSH_DELAY,
     });
     share_next.init();

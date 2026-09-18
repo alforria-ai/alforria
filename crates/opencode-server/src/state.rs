@@ -366,13 +366,15 @@ impl UiBackend for EmptyUiBackend {}
 // ---------------------------------------------------------------------------
 
 /// `Auth.Service` seam — auth credentials per provider. TS persists to
-/// `~/.local/share/opencode/auth.json`; the M6 default keeps credentials in
-/// process memory. TODO(M7): file-backed store.
+/// `~/.local/share/opencode/auth.json` (`auth/index.ts`); the file-backed
+/// [`FileAuthStore`] is the production store.
 pub trait AuthStore: Send + Sync {
     fn set(&self, provider_id: &str, info: serde_json::Value) -> Result<(), ServerError>;
     fn remove(&self, provider_id: &str) -> Result<(), ServerError>;
     fn has(&self, provider_id: &str) -> bool;
     fn ids(&self) -> Vec<String>;
+    /// `Auth.all()` (auth/index.ts:58-67) — the decoded `Info` entries.
+    fn all(&self) -> Result<std::collections::BTreeMap<String, serde_json::Value>, ServerError>;
 }
 
 /// In-memory default [`AuthStore`].
@@ -412,6 +414,162 @@ impl AuthStore for MemoryAuthStore {
             .keys()
             .cloned()
             .collect()
+    }
+
+    fn all(&self) -> Result<std::collections::BTreeMap<String, serde_json::Value>, ServerError> {
+        Ok(self
+            .entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone())
+    }
+}
+
+/// The `Auth.Info` union (auth/index.ts:14-37) — entries that fail the
+/// decode are dropped (`Record.filterMap`).
+fn decode_auth_info(value: &serde_json::Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    let string = |key: &str| {
+        object
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .is_some()
+    };
+    match object.get("type").and_then(serde_json::Value::as_str) {
+        Some("oauth") => string("refresh") && string("access"),
+        Some("api") => string("key"),
+        Some("wellknown") => string("key") && string("token"),
+        _ => false,
+    }
+}
+
+/// File-backed `Auth.Service` (`auth/index.ts`): reads/writes
+/// `<data>/auth.json` with the `OPENCODE_AUTH_CONTENT` env override
+/// (auth/index.ts:52-93).
+pub struct FileAuthStore {
+    file: PathBuf,
+    lock: Mutex<()>,
+}
+
+impl FileAuthStore {
+    pub fn new(file: PathBuf) -> FileAuthStore {
+        FileAuthStore {
+            file,
+            lock: Mutex::new(()),
+        }
+    }
+
+    fn all_unlocked(
+        &self,
+    ) -> Result<std::collections::BTreeMap<String, serde_json::Value>, ServerError> {
+        if let Ok(content) = std::env::var("OPENCODE_AUTH_CONTENT") {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) {
+                return Ok(value
+                    .as_object()
+                    .map(|object| {
+                        object
+                            .iter()
+                            .map(|(key, value)| (key.clone(), value.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default());
+            }
+        }
+        let data = std::fs::read_to_string(&self.file)
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .filter(|value| value.is_object())
+            .unwrap_or_else(|| serde_json::json!({}));
+        let mut out = std::collections::BTreeMap::new();
+        for (key, value) in data.as_object().unwrap_or(&serde_json::Map::new()) {
+            if decode_auth_info(value) {
+                out.insert(key.clone(), value.clone());
+            }
+        }
+        Ok(out)
+    }
+
+    fn write(&self, data: &serde_json::Value) -> Result<(), ServerError> {
+        if let Some(parent) = self.file.parent() {
+            std::fs::create_dir_all(parent).map_err(|err| {
+                ServerError::Core(opencode_core::CoreError::Storage(format!(
+                    "Failed to write auth data: {err}"
+                )))
+            })?;
+        }
+        let text = serde_json::to_string(data).map_err(|err| {
+            ServerError::Core(opencode_core::CoreError::Storage(format!(
+                "Failed to write auth data: {err}"
+            )))
+        })?;
+        std::fs::write(&self.file, text).map_err(|err| {
+            ServerError::Core(opencode_core::CoreError::Storage(format!(
+                "Failed to write auth data: {err}"
+            )))
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.file, std::fs::Permissions::from_mode(0o600));
+        }
+        Ok(())
+    }
+}
+
+impl AuthStore for FileAuthStore {
+    fn set(&self, provider_id: &str, info: serde_json::Value) -> Result<(), ServerError> {
+        let _guard = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+        let norm = provider_id.trim_end_matches('/');
+        let mut data = serde_json::Value::Object(
+            self.all_unlocked()?
+                .into_iter()
+                .collect::<serde_json::Map<String, serde_json::Value>>(),
+        );
+        let object = data
+            .as_object_mut()
+            .expect("auth entries are always an object");
+        if norm != provider_id {
+            object.remove(provider_id);
+        }
+        let slash_key = format!("{norm}/");
+        object.remove(&slash_key);
+        object.insert(norm.to_string(), info);
+        self.write(&data)
+    }
+
+    fn remove(&self, provider_id: &str) -> Result<(), ServerError> {
+        let _guard = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+        let norm = provider_id.trim_end_matches('/');
+        let mut data = serde_json::Value::Object(
+            self.all_unlocked()?
+                .into_iter()
+                .collect::<serde_json::Map<String, serde_json::Value>>(),
+        );
+        let object = data
+            .as_object_mut()
+            .expect("auth entries are always an object");
+        object.remove(provider_id);
+        object.remove(norm);
+        self.write(&data)
+    }
+
+    fn has(&self, provider_id: &str) -> bool {
+        self.all()
+            .map(|all| all.contains_key(provider_id))
+            .unwrap_or(false)
+    }
+
+    fn ids(&self) -> Vec<String> {
+        self.all()
+            .map(|all| all.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    fn all(&self) -> Result<std::collections::BTreeMap<String, serde_json::Value>, ServerError> {
+        let _guard = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+        self.all_unlocked()
     }
 }
 
@@ -741,23 +899,34 @@ impl McpSource for UnwiredMcp {
 /// wire shape (`groups/provider.ts:14-32`).
 #[derive(Debug, Clone)]
 pub enum ProviderAuthError {
-    OauthMissing { provider_id: String },
-    OauthCodeMissing { provider_id: String },
+    OauthMissing {
+        provider_id: String,
+    },
+    OauthCodeMissing {
+        provider_id: String,
+    },
     OauthCallbackFailed,
-    ValidationFailed { field: String, message: String },
+    ValidationFailed {
+        field: String,
+        message: String,
+    },
     BadRequest,
+    /// A TS `Effect` defect — authorize on a provider without a plugin
+    /// hook throws (auth.ts:166-167); it renders as the defect-500.
+    Defect,
 }
 
 /// `ProviderAuth.Service` seam (`provider/auth.ts`) — the OAuth machinery is
-/// plugin-driven in TS; M6 ships the no-plugin default (`methods` empty,
-/// authorize/callback defect) until M7 wires real hooks.
+/// plugin-driven in TS; without a plugin runtime the hook registry ships
+/// empty (M7 §7.4), so `methods()` is `{}`, `authorize` defects and
+/// `callback` reports the missing pending flow.
 pub trait ProviderAuth: Send + Sync {
     /// `methods()` (auth.ts:131-158) — `Record<providerID, Method[]>`.
     fn methods(&self) -> Result<serde_json::Value, ServerError> {
         Ok(serde_json::json!({}))
     }
 
-    /// `authorize` (auth.ts:160-180) — `Ok(None)` resolves without a result.
+    /// `authorize` (auth.ts:160-186) — `Ok(None)` resolves without a result.
     fn authorize(
         &self,
         provider_id: &str,
@@ -768,7 +937,7 @@ pub trait ProviderAuth: Send + Sync {
         Err(ProviderAuthError::BadRequest)
     }
 
-    /// `callback` (auth.ts:182-213).
+    /// `callback` (auth.ts:188-221).
     fn callback(
         &self,
         provider_id: &str,
@@ -786,6 +955,58 @@ pub trait ProviderAuth: Send + Sync {
 pub struct UnwiredProviderAuth;
 
 impl ProviderAuth for UnwiredProviderAuth {}
+
+/// The production `ProviderAuth.Service` (provider/auth.ts:109-223) with an
+/// empty plugin-hook registry: the pending-oauth map and the authorize/
+/// callback error mapping.
+#[derive(Default)]
+pub struct ProviderAuthService {
+    pending: Mutex<HashMap<String, serde_json::Value>>,
+}
+
+impl ProviderAuthService {
+    pub fn new() -> ProviderAuthService {
+        ProviderAuthService::default()
+    }
+}
+
+impl ProviderAuth for ProviderAuthService {
+    fn methods(&self) -> Result<serde_json::Value, ServerError> {
+        Ok(serde_json::json!({}))
+    }
+
+    fn authorize(
+        &self,
+        provider_id: &str,
+        _method: i64,
+        _inputs: Option<std::collections::BTreeMap<String, String>>,
+    ) -> Result<Option<serde_json::Value>, ProviderAuthError> {
+        // `hooks[input.providerID].methods[input.method]` — the no-plugin
+        // registry dereferences undefined and throws (auth.ts:166-167).
+        let _ = provider_id;
+        Err(ProviderAuthError::Defect)
+    }
+
+    fn callback(
+        &self,
+        provider_id: &str,
+        _method: i64,
+        _code: Option<String>,
+    ) -> Result<(), ProviderAuthError> {
+        let pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !pending.contains_key(provider_id) {
+            return Err(ProviderAuthError::OauthMissing {
+                provider_id: provider_id.to_string(),
+            });
+        }
+        // A registered pending flow requires a plugin hook to complete
+        // (match.callback); hooks are empty, so the exchange fails.
+        Err(ProviderAuthError::OauthCallbackFailed)
+    }
+}
 
 /// models.dev catalog source (`ModelsDev.Service.get`). The M6 default reads
 /// the disk cache and never fetches — the HTTP fetcher is an core seam M6
@@ -808,7 +1029,7 @@ impl opencode_core::catalog::Fetcher for NeverFetch {
     }
 }
 
-fn default_catalog() -> CatalogSource {
+pub fn default_catalog() -> CatalogSource {
     let paths = opencode_core::GlobalPaths::from_env();
     let cfg = opencode_core::CatalogConfig::from_env();
     let service = opencode_core::CatalogService::new(
@@ -1018,7 +1239,11 @@ impl ServerContext {
             heartbeat: HeartbeatConfig::default(),
             engine_factory: Arc::new(unwired_engine_factory),
             installation: Arc::new(UnknownInstallation),
-            auth_store: Arc::new(MemoryAuthStore::default()),
+            auth_store: Arc::new(FileAuthStore::new(
+                opencode_core::GlobalPaths::from_env()
+                    .data
+                    .join("auth.json"),
+            )),
             vcs: Arc::new(NoVcs),
             worktree: opencode_core::worktree::Worktree::default(),
             worktree_deps: Arc::new(WorktreeDeps {
@@ -1034,7 +1259,7 @@ impl ServerContext {
             tools: Arc::new(UnwiredTools),
             mcp: Arc::new(UnwiredMcp),
             catalog: default_catalog(),
-            provider_auth: Arc::new(UnwiredProviderAuth),
+            provider_auth: Arc::new(ProviderAuthService::new()),
             v2_permissions: Arc::new(crate::routes::v2::permission::PermissionRegistry::default()),
             pty_tickets: crate::pty::ticket::TicketCache::default(),
             ptys: crate::pty::PtyRegistry::default(),

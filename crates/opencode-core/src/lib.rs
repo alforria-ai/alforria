@@ -17,6 +17,7 @@ pub mod mcp;
 pub mod merge;
 pub mod paths;
 pub mod project;
+pub mod provider;
 pub mod repository;
 pub mod session;
 pub mod share;

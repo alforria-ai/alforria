@@ -26,6 +26,7 @@ pub struct GlobalPaths {
     pub config: PathBuf,
     pub data: PathBuf,
     pub cache: PathBuf,
+    pub state: PathBuf,
 }
 
 impl GlobalPaths {
@@ -48,6 +49,7 @@ impl GlobalPaths {
             config: xdg_or(env::var_os("XDG_CONFIG_HOME"), &home, ".config").join("opencode"),
             data: xdg_or(env::var_os("XDG_DATA_HOME"), &home, ".local/share").join("opencode"),
             cache: xdg_or(env::var_os("XDG_CACHE_HOME"), &home, ".cache").join("opencode"),
+            state: xdg_or(env::var_os("XDG_STATE_HOME"), &home, ".local/state").join("opencode"),
             home,
         }
     }
@@ -76,6 +78,10 @@ mod tests {
             PathBuf::from("/home/user/.local/share/opencode")
         );
         assert_eq!(paths.cache, PathBuf::from("/home/user/.cache/opencode"));
+        assert_eq!(
+            paths.state,
+            PathBuf::from("/home/user/.local/state/opencode")
+        );
     }
 
     #[test]

@@ -782,6 +782,7 @@ mod tests {
                     config: root.join("config"),
                     data: root.join("data"),
                     cache: root.join("cache"),
+                    state: root.join("state"),
                 });
             Fixture { root, params }
         }
@@ -840,6 +841,7 @@ mod tests {
                 config: root.join("config"),
                 data: root.clone(),
                 cache: root.clone(),
+                state: root.clone(),
             })
             .flags(ConfigFlags {
                 config: Some(root.join("custom.json").display().to_string()),

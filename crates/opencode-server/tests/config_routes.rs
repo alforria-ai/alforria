@@ -316,7 +316,8 @@ async fn provider_oauth_authorize_and_callback_map_errors() {
         r#"{"name":"BadRequest","data":{}}"#
     );
 
-    // The unwired ProviderAuth seam answers the callback with BadRequest.
+    // The production ProviderAuth service has no pending OAuth flow for
+    // the provider — the callback reports OauthMissing (auth.ts:188-221).
     let response = send(
         &router,
         "POST",
@@ -327,6 +328,6 @@ async fn provider_oauth_authorize_and_callback_map_errors() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
         body_string(response).await,
-        r#"{"name":"BadRequest","data":{}}"#
+        r#"{"name":"ProviderAuthOauthMissing","data":{"providerID":"anthropic"}}"#
     );
 }
