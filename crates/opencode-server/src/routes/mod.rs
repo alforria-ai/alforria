@@ -70,6 +70,20 @@ fn register_stub(
     if handled {
         return router;
     }
+    // M6.6 owns the config/permission/question, provider and
+    // global/control/instance/file/experimental/tui families.
+    let (router, handled) = v1::config_permission_question::register(router, method, path);
+    if handled {
+        return router;
+    }
+    let (router, handled) = v1::provider::register(router, method, path);
+    if handled {
+        return router;
+    }
+    let (router, handled) = v1::global_control::register(router, method, path);
+    if handled {
+        return router;
+    }
     match method {
         "GET" => router.route(path, get(stub)),
         "POST" => router.route(path, post(stub)),

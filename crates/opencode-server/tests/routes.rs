@@ -37,10 +37,13 @@ async fn every_v1_route_is_registered_and_reachable() {
             .body(Body::empty())
             .unwrap();
         let response = router.clone().oneshot(request).await.unwrap();
-        assert_eq!(
-            response.status(),
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "{method} {path} must resolve to the stub, not the UI fallback"
+        // Since M6.5 the route families answer for real: some stubs still
+        // carry the defect-500 envelope, live handlers reject empty inputs
+        // with 4xx errors. Both must differ from the UI fallback body.
+        let body = body(response).await;
+        assert!(
+            body != "{\"error\":\"Not Found\"}",
+            "{method} {path} must resolve to a registered handler, not the UI fallback"
         );
     }
 }

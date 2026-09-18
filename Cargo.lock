@@ -1558,6 +1558,7 @@ dependencies = [
  "base64",
  "flate2",
  "futures",
+ "ignore",
  "opencode-core",
  "opencode-schema",
  "regex",

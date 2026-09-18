@@ -314,6 +314,322 @@ pub struct EmptyUiBackend;
 
 impl UiBackend for EmptyUiBackend {}
 
+// ---------------------------------------------------------------------------
+// M6.6 service seams
+// ---------------------------------------------------------------------------
+
+/// `Auth.Service` seam — auth credentials per provider. TS persists to
+/// `~/.local/share/opencode/auth.json`; the M6 default keeps credentials in
+/// process memory. TODO(M7): file-backed store.
+pub trait AuthStore: Send + Sync {
+    fn set(&self, provider_id: &str, info: serde_json::Value) -> Result<(), ServerError>;
+    fn remove(&self, provider_id: &str) -> Result<(), ServerError>;
+    fn has(&self, provider_id: &str) -> bool;
+    fn ids(&self) -> Vec<String>;
+}
+
+/// In-memory default [`AuthStore`].
+#[derive(Default)]
+pub struct MemoryAuthStore {
+    entries: Mutex<std::collections::BTreeMap<String, serde_json::Value>>,
+}
+
+impl AuthStore for MemoryAuthStore {
+    fn set(&self, provider_id: &str, info: serde_json::Value) -> Result<(), ServerError> {
+        self.entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(provider_id.to_string(), info);
+        Ok(())
+    }
+
+    fn remove(&self, provider_id: &str) -> Result<(), ServerError> {
+        self.entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(provider_id);
+        Ok(())
+    }
+
+    fn has(&self, provider_id: &str) -> bool {
+        self.entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(provider_id)
+    }
+
+    fn ids(&self) -> Vec<String> {
+        self.entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .keys()
+            .cloned()
+            .collect()
+    }
+}
+
+/// `Installation.Service` seam (`installation/index.ts`). The M6 default is
+/// the unknown installation method.
+pub trait Installation: Send + Sync {
+    /// `method()` — one of `curl|npm|yarn|pnpm|bun|brew|scoop|choco|unknown`.
+    fn method(&self) -> &'static str;
+    fn upgrade(&self, target: &str) -> Result<(), String>;
+}
+
+/// The unwired installation (`method === "unknown"`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UnknownInstallation;
+
+impl Installation for UnknownInstallation {
+    fn method(&self) -> &'static str {
+        "unknown"
+    }
+
+    fn upgrade(&self, _target: &str) -> Result<(), String> {
+        Err("Unknown installation method".to_string())
+    }
+}
+
+/// `Vcs.Service` seam — the instance vcs routes (`project/vcs.ts`).
+pub trait VcsService: Send + Sync {
+    fn info(&self, directory: &Path) -> Result<serde_json::Value, ServerError>;
+    fn status(&self, directory: &Path) -> Result<Vec<serde_json::Value>, ServerError>;
+    fn diff(
+        &self,
+        directory: &Path,
+        mode: &str,
+        context: Option<i64>,
+    ) -> Result<Vec<serde_json::Value>, ServerError>;
+    fn diff_raw(&self, directory: &Path) -> Result<String, ServerError>;
+    fn apply(
+        &self,
+        directory: &Path,
+        patch: &serde_json::Value,
+    ) -> Result<serde_json::Value, ServerError>;
+}
+
+/// The unwired vcs seam — empty status shapes (`vcs.ts:235-248`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoVcs;
+
+impl VcsService for NoVcs {
+    fn info(&self, _directory: &Path) -> Result<serde_json::Value, ServerError> {
+        Ok(serde_json::json!({
+            "branch": "",
+            "default_branch": "",
+        }))
+    }
+
+    fn status(&self, _directory: &Path) -> Result<Vec<serde_json::Value>, ServerError> {
+        Ok(Vec::new())
+    }
+
+    fn diff(
+        &self,
+        _directory: &Path,
+        _mode: &str,
+        _context: Option<i64>,
+    ) -> Result<Vec<serde_json::Value>, ServerError> {
+        Ok(Vec::new())
+    }
+
+    fn diff_raw(&self, _directory: &Path) -> Result<String, ServerError> {
+        Ok(String::new())
+    }
+
+    fn apply(
+        &self,
+        _directory: &Path,
+        _patch: &serde_json::Value,
+    ) -> Result<serde_json::Value, ServerError> {
+        Err(ServerError::Core(opencode_core::CoreError::Storage(
+            "vcs seam not wired (M6.6)".to_string(),
+        )))
+    }
+}
+
+/// `Skill.Service.all` / `LSP.Service.status` / `Format.Service.status` seams
+/// — the M6 defaults are empty status lists.
+pub trait StatusSeam: Send + Sync {
+    fn status(&self, directory: &Path) -> Result<Vec<serde_json::Value>, ServerError>;
+}
+
+/// The empty default — no skills/LSP servers/formatters registered.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EmptyStatus;
+
+impl StatusSeam for EmptyStatus {
+    fn status(&self, _directory: &Path) -> Result<Vec<serde_json::Value>, ServerError> {
+        Ok(Vec::new())
+    }
+}
+
+/// The `tui-control` queue seam (`shared/tui-control.ts`): two unbounded
+/// async queues — the server pops Tui requests (`GET /tui/control/next`) and
+/// pushes control responses (`POST /tui/control/response`). M9 wires the
+/// ratatui side through `push_request` / `next_response`.
+///
+/// The receivers sit behind a tokio mutex (not std) because the guard is
+/// held across the `recv().await` — a std guard would make every handler
+/// future non-Send.
+#[derive(Clone)]
+pub struct TuiControl {
+    requests: Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>>>,
+    request_tx: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
+    responses: Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>>>,
+    response_tx: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
+}
+
+impl TuiControl {
+    /// `submitTuiRequest` (`tui-control.ts:23-25`).
+    pub fn push_request(&self, request: serde_json::Value) {
+        let _ = self.request_tx.send(request);
+    }
+
+    /// `nextTuiRequest` (`tui-control.ts:19-21`).
+    pub async fn next_request(&self) -> Option<serde_json::Value> {
+        self.requests.lock().await.recv().await
+    }
+
+    /// `submitTuiResponse` (`tui-control.ts:27-29`).
+    pub fn push_response(&self, response: serde_json::Value) {
+        let _ = self.response_tx.send(response);
+    }
+
+    /// `nextTuiResponse` (`tui-control.ts:31-33`) — the TUI side.
+    pub async fn next_response(&self) -> Option<serde_json::Value> {
+        self.responses.lock().await.recv().await
+    }
+}
+
+impl Default for TuiControl {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TuiControl {
+    /// Create the seam with fresh queues.
+    pub fn new() -> TuiControl {
+        let (request_tx, requests) = tokio::sync::mpsc::unbounded_channel();
+        let (response_tx, responses) = tokio::sync::mpsc::unbounded_channel();
+        TuiControl {
+            requests: Arc::new(tokio::sync::Mutex::new(requests)),
+            request_tx,
+            responses: Arc::new(tokio::sync::Mutex::new(responses)),
+            response_tx,
+        }
+    }
+}
+
+/// `ToolRegistry.Service` access seam — the production registry wiring (which
+/// builtins, code-mode describer) lands with the M7 engine wiring.
+pub trait ToolRegistrySource: Send + Sync {
+    fn registry(
+        &self,
+        location: &LocationContext,
+    ) -> Result<Arc<opencode_core::tool::registry::ToolRegistry>, ServerError>;
+}
+
+struct UnwiredTools;
+
+impl ToolRegistrySource for UnwiredTools {
+    fn registry(
+        &self,
+        _location: &LocationContext,
+    ) -> Result<Arc<opencode_core::tool::registry::ToolRegistry>, ServerError> {
+        Err(ServerError::Core(opencode_core::CoreError::Storage(
+            "tool registry not wired (M6.6)".to_string(),
+        )))
+    }
+}
+
+/// `ProviderAuth.Service` error surface mapped onto the `ProviderAuthError`
+/// wire shape (`groups/provider.ts:14-32`).
+#[derive(Debug, Clone)]
+pub enum ProviderAuthError {
+    OauthMissing { provider_id: String },
+    OauthCodeMissing { provider_id: String },
+    OauthCallbackFailed,
+    ValidationFailed { field: String, message: String },
+    BadRequest,
+}
+
+/// `ProviderAuth.Service` seam (`provider/auth.ts`) — the OAuth machinery is
+/// plugin-driven in TS; M6 ships the no-plugin default (`methods` empty,
+/// authorize/callback defect) until M7 wires real hooks.
+pub trait ProviderAuth: Send + Sync {
+    /// `methods()` (auth.ts:131-158) — `Record<providerID, Method[]>`.
+    fn methods(&self) -> Result<serde_json::Value, ServerError> {
+        Ok(serde_json::json!({}))
+    }
+
+    /// `authorize` (auth.ts:160-180) — `Ok(None)` resolves without a result.
+    fn authorize(
+        &self,
+        provider_id: &str,
+        method: i64,
+        inputs: Option<std::collections::BTreeMap<String, String>>,
+    ) -> Result<Option<serde_json::Value>, ProviderAuthError> {
+        let _ = (provider_id, method, inputs);
+        Err(ProviderAuthError::BadRequest)
+    }
+
+    /// `callback` (auth.ts:182-213).
+    fn callback(
+        &self,
+        provider_id: &str,
+        method: i64,
+        code: Option<String>,
+    ) -> Result<(), ProviderAuthError> {
+        let _ = (provider_id, method, code);
+        Err(ProviderAuthError::BadRequest)
+    }
+}
+
+/// The unwired default — `hooks[providerID]` access without plugin hooks is
+/// a defect in TS (auth.ts:166-167).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UnwiredProviderAuth;
+
+impl ProviderAuth for UnwiredProviderAuth {}
+
+/// models.dev catalog source (`ModelsDev.Service.get`). The M6 default reads
+/// the disk cache and never fetches — the HTTP fetcher is an core seam M6
+/// does not fill.
+pub type CatalogSource = Arc<
+    dyn Fn() -> Result<opencode_core::catalog::Providers, opencode_core::CoreError> + Send + Sync,
+>;
+
+struct NeverFetch;
+
+impl opencode_core::catalog::Fetcher for NeverFetch {
+    fn get(
+        &self,
+        _url: &str,
+        _user_agent: &str,
+    ) -> Result<String, opencode_core::catalog::FetchError> {
+        Err(opencode_core::catalog::FetchError::Permanent(
+            "catalog fetch not wired".to_string(),
+        ))
+    }
+}
+
+fn default_catalog() -> CatalogSource {
+    let paths = opencode_core::GlobalPaths::from_env();
+    let cfg = opencode_core::CatalogConfig::from_env();
+    let service = opencode_core::CatalogService::new(
+        paths.cache,
+        opencode_core::CatalogConfig {
+            disable_fetch: true,
+            ..cfg
+        },
+        Arc::new(opencode_core::catalog::SystemClock),
+        Arc::new(NeverFetch),
+    );
+    Arc::new(move || service.get())
+}
+
 /// SSE heartbeat intervals. TS bakes `Stream.tick("10 seconds")` /
 /// `Stream.tick("15 seconds")` into the stream handlers
 /// (`handlers/event.ts:63`, `handlers/global.ts:35`,
@@ -358,6 +674,26 @@ pub struct ServerContext {
     /// Per-directory [`SessionEngine`] lookup for the session route family
     /// (unwired until M7).
     pub engine_factory: EngineFactory,
+    /// M6.6 seams — `Installation.Service`.
+    pub installation: Arc<dyn Installation>,
+    /// `Auth.Service`.
+    pub auth_store: Arc<dyn AuthStore>,
+    /// `Vcs.Service`.
+    pub vcs: Arc<dyn VcsService>,
+    /// `Skill.Service` status list.
+    pub skills: Arc<dyn StatusSeam>,
+    /// `LSP.Service.status`.
+    pub lsp: Arc<dyn StatusSeam>,
+    /// `Format.Service.status`.
+    pub formatter: Arc<dyn StatusSeam>,
+    /// `shared/tui-control.ts` queues.
+    pub tui: TuiControl,
+    /// The M4 tool registry for `/experimental/tool` (unwired until M7).
+    pub tools: Arc<dyn ToolRegistrySource>,
+    /// models.dev catalog (`ModelsDev.Service.get`).
+    pub catalog: CatalogSource,
+    /// `ProviderAuth.Service`.
+    pub provider_auth: Arc<dyn ProviderAuth>,
 }
 
 impl ServerContext {
@@ -393,6 +729,16 @@ impl ServerContext {
             global_bus,
             heartbeat: HeartbeatConfig::default(),
             engine_factory: Arc::new(unwired_engine_factory),
+            installation: Arc::new(UnknownInstallation),
+            auth_store: Arc::new(MemoryAuthStore::default()),
+            vcs: Arc::new(NoVcs),
+            skills: Arc::new(EmptyStatus),
+            lsp: Arc::new(EmptyStatus),
+            formatter: Arc::new(EmptyStatus),
+            tui: TuiControl::new(),
+            tools: Arc::new(UnwiredTools),
+            catalog: default_catalog(),
+            provider_auth: Arc::new(UnwiredProviderAuth),
         }
     }
 

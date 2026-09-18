@@ -153,6 +153,14 @@ pub enum ApiError {
     PtyForbidden { message: String },
     /// `ProjectNotFoundError` (404, tagged).
     ProjectNotFound { project_id: String, message: String },
+    /// `ProviderAuthApiError` (400, `groups/provider.ts:14-32`) —
+    /// `ErrorClass` with `{name, data}` fields.
+    ProviderAuth {
+        name: &'static str,
+        provider_id: Option<String>,
+        field: Option<String>,
+        message: Option<String>,
+    },
     /// `ApiNotFoundError` (`errors.ts:178-186`) — `ErrorClass("NotFoundError")`,
     /// wire `{"name":"NotFoundError","data":{"message":...}}`.
     NotFound { message: String },
@@ -201,6 +209,7 @@ impl ApiError {
             | ApiError::PtyNotFound { .. }
             | ApiError::ProjectNotFound { .. }
             | ApiError::NotFound { .. } => StatusCode::NOT_FOUND,
+            ApiError::ProviderAuth { .. } => StatusCode::BAD_REQUEST,
             ApiError::InvalidCursor { .. } => StatusCode::BAD_REQUEST,
             ApiError::SessionBusy { .. } => StatusCode::CONFLICT,
             ApiError::PtyForbidden { .. } => StatusCode::FORBIDDEN,
@@ -375,6 +384,22 @@ impl ApiError {
                     ("message", str_field(message)),
                 ],
             ),
+            ApiError::ProviderAuth {
+                name,
+                provider_id,
+                field,
+                message,
+            } => {
+                let data = opt_fields(
+                    &[],
+                    &[
+                        ("providerID", opt_str_field(provider_id)),
+                        ("field", opt_str_field(field)),
+                        ("message", opt_str_field(message)),
+                    ],
+                );
+                object(&[("name", str_field(name)), ("data", object(&data))])
+            }
             // `ErrorClass` shapes — `{name, data}` on the wire.
             ApiError::NotFound { message } => {
                 named_body("NotFoundError", vec![("message", str_field(message))])

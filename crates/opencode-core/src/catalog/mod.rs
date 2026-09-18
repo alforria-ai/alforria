@@ -14,5 +14,5 @@ pub use service::{
 pub use types::{
     Catalog, CatalogModelStatus, ContextOver200k, ContextTierType, Cost, CostTier, CostTierType,
     Experimental, ExperimentalMode, ExperimentalProvider, Interleaved, InterleavedField,
-    Modalities, Modality, Model, ModelLimit, Provider, ProviderInfo, ReasoningOption,
+    Modalities, Modality, Model, ModelLimit, Provider, ProviderInfo, Providers, ReasoningOption,
 };
