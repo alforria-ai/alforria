@@ -76,3 +76,19 @@ Panel: glm-5.3-thinking (agentic, self-directed review with subagents) + deepsee
 - **`localeCompare` sorting (MINOR)**: references/skills sort byte-order vs TS `localeCompare` — exact parity needs ICU collation; divergence only for non-ASCII names in prompt content, not wire shape.
 - **HTTP-date parsing subset of `Date.parse` (MINOR)**: offset-less ISO strings fall back to exponential backoff; TS behavior is timezone-dependent (local time), so exact parity is under-specified. Recorded divergence.
 - **check_message_error content-filter BLOCKER**: withdrawn by the reviewer itself — the Rust guard mirrors `finished && !error` (prompt.ts:1295-1296).
+
+## Milestone 6 (server) review panel
+
+Panel: glm-3.3-thinking (agentic) + deepseek-v4.1-flash-thinking (agentic pass, budget-limited).
+
+### Accepted & fixed
+- **Compression middleware hangs v2 SSE streams (BLOCKER)**: the port buffered every body up to 16MB — SSE responses never completed. Fixed with the TS `body._tag !== "Uint8Array"` passthrough equivalent: streaming bodies (no exact size hint) are never collected (compression.ts:39-40).
+- **Payload-400 vs session-404 precedence (MAJOR)**: six v1 handlers (prompt, prompt-async, command, shell, init, revert) checked the session before parsing the payload; TS decodes payloads in middleware first. Reordered; branded-id checks moved up too (schema-error decode-time semantics).
+- **v2 ID-prefix checks used `msg_`/`ses_` (MAJOR, deepseek)**: TS `Schema.isStartsWith` checks the bare prefix (`msg`, `session/schema.ts:10,19`). Fixed to bare prefixes.
+- **`truncate_reason` counts chars, not UTF-16 (MINOR)**: now `encode_utf16` like TS `reason.length` (schema-error.ts:10-13).
+- **PTY-connect bypass accepted empty pty id (MINOR)**: `[^/]+` requires non-empty (pty-ticket.ts:9-11).
+- **v1 disposed-terminator matched Injected frames (MINOR)**: TS only inspects the standard GlobalBus event shape (handlers/event.ts:42-62).
+
+### Recorded divergences (not fixed)
+- **Env-flag snapshots at construction** (FenceLayer, LocationLayer, AuthConfig): TS reads per-request; CLI usage unaffected — recorded as known divergence.
+- **InstanceStore holds the entries lock across factory config I/O** — scalability TODO added in state.rs, no wire divergence.

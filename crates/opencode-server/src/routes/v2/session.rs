@@ -443,9 +443,9 @@ async fn create(
 ) -> Result<Response, ServerError> {
     let payload: CreatePayload = parse_payload(&body)?;
     if let Some(id) = &payload.id {
-        if !id.starts_with("ses_") {
+        if !id.starts_with("ses") {
             return Err(payload_error(format!(
-                "Expected a string starting with \"ses_\", got {id:?}"
+                "Expected a string starting with \"ses\", got {id:?}"
             )));
         }
     }
@@ -644,9 +644,9 @@ async fn prompt(
 ) -> Result<Response, ServerError> {
     let payload: PromptPayload = parse_payload(&body)?;
     if let Some(id) = &payload.id {
-        if !id.starts_with("msg_") {
+        if !id.starts_with("msg") {
             return Err(payload_error(format!(
-                "Expected a string starting with \"msg_\", got {id:?}"
+                "Expected a string starting with \"msg\", got {id:?}"
             )));
         }
     }
@@ -770,7 +770,7 @@ async fn revert_stage(
     body: Bytes,
 ) -> Result<Response, ServerError> {
     let payload: RevertStagePayload = parse_payload(&body)?;
-    if !payload.message_id.starts_with("msg_") {
+    if !payload.message_id.starts_with("msg") {
         return Err(payload_error(format!(
             "Expected a string starting with \"msg_\", got {:?}",
             payload.message_id
@@ -1049,7 +1049,7 @@ async fn message(
     axum::Extension(location): axum::Extension<LocationContext>,
     Path((session_id, message_id)): Path<(String, String)>,
 ) -> Result<Response, ServerError> {
-    if !message_id.starts_with("msg_") {
+    if !message_id.starts_with("msg") {
         return Err(params_error(format!(
             "Expected a string starting with \"msg_\", got {message_id:?}"
         )));
@@ -1086,7 +1086,7 @@ fn decode_message_cursor(input: &str) -> Result<(String, String, String), ()> {
         return Err(());
     };
     let id = match map.get("id") {
-        Some(Value::String(id)) if id.starts_with("msg_") => id.clone(),
+        Some(Value::String(id)) if id.starts_with("msg") => id.clone(),
         _ => return Err(()),
     };
     let order = match map.get("order") {

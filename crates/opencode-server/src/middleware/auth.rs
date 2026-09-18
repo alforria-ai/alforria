@@ -244,10 +244,11 @@ fn is_pty_connect_path(path: &str, prefix: &str) -> bool {
     let Some(rest) = path.strip_prefix(prefix) else {
         return false;
     };
-    let Some((_, tail)) = rest.split_once('/') else {
+    let Some((pty_id, tail)) = rest.split_once('/') else {
         return false;
     };
-    tail == "connect"
+    // `^/pty/[^/]+/connect$` — the id must be non-empty.
+    !pty_id.is_empty() && tail == "connect"
 }
 
 /// `isPublicUIPath` (`shared/public-ui.ts:10-12`).

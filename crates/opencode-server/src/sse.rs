@@ -279,12 +279,7 @@ fn v1_disposed_frame(event: &GlobalEvent, directory: &str) -> Option<String> {
             r#type,
             properties,
         } => (id, r#type, properties),
-        GlobalPayload::Injected {
-            id,
-            r#type,
-            properties,
-        } => (id, r#type, properties),
-        GlobalPayload::Sync { .. } => return None,
+        GlobalPayload::Injected { .. } | GlobalPayload::Sync { .. } => return None,
     };
     if payload_type != INSTANCE_DISPOSED_TYPE {
         return None;

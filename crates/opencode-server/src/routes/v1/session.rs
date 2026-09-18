@@ -875,9 +875,9 @@ pub async fn init(
     Path(session_id): Path<String>,
     body: Bytes,
 ) -> Result<Response, ServerError> {
-    require_session(&location, &session_id)?;
     let payload: InitPayload = parse_payload(&body)?;
     require_payload_id("msg", &payload.message_id)?;
+    require_session(&location, &session_id)?;
     let engine = engine(&ctx, &location)?;
     match engine
         .command(CommandInput {
@@ -1009,11 +1009,11 @@ pub async fn prompt(
     Path(session_id): Path<String>,
     body: Bytes,
 ) -> Result<Response, ServerError> {
-    require_session(&location, &session_id)?;
     let payload: PromptPayload = parse_payload(&body)?;
     if let Some(message_id) = &payload.message_id {
         require_payload_id("msg", message_id)?;
     }
+    require_session(&location, &session_id)?;
     let engine = engine(&ctx, &location)?;
     let message = match engine
         .prompt(PromptInput {
@@ -1051,11 +1051,11 @@ pub async fn prompt_async(
     Path(session_id): Path<String>,
     body: Bytes,
 ) -> Result<Response, ServerError> {
-    require_session(&location, &session_id)?;
     let payload: PromptPayload = parse_payload(&body)?;
     if let Some(message_id) = &payload.message_id {
         require_payload_id("msg", message_id)?;
     }
+    require_session(&location, &session_id)?;
     let engine = engine(&ctx, &location)?;
     let services = location.services.clone();
     let input = PromptInput {
@@ -1104,11 +1104,11 @@ pub async fn command(
     Path(session_id): Path<String>,
     body: Bytes,
 ) -> Result<Response, ServerError> {
-    require_session(&location, &session_id)?;
     let payload: CommandPayload = parse_payload(&body)?;
     if let Some(message_id) = &payload.message_id {
         require_payload_id("msg", message_id)?;
     }
+    require_session(&location, &session_id)?;
     let engine = engine(&ctx, &location)?;
     let message = match engine
         .command(CommandInput {
@@ -1144,11 +1144,11 @@ pub async fn shell(
     Path(session_id): Path<String>,
     body: Bytes,
 ) -> Result<Response, ServerError> {
-    require_session(&location, &session_id)?;
     let payload: ShellPayload = parse_payload(&body)?;
     if let Some(message_id) = &payload.message_id {
         require_payload_id("msg", message_id)?;
     }
+    require_session(&location, &session_id)?;
     let engine = engine(&ctx, &location)?;
     match engine
         .shell(ShellInput {
@@ -1176,9 +1176,9 @@ pub async fn revert(
     Path(session_id): Path<String>,
     body: Bytes,
 ) -> Result<Response, ServerError> {
-    require_session(&location, &session_id)?;
     let payload: RevertPayload = parse_payload(&body)?;
     require_payload_id("msg", &payload.message_id)?;
+    require_session(&location, &session_id)?;
     let engine = engine(&ctx, &location)?;
     match engine
         .revert(RevertInput {

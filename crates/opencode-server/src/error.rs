@@ -432,11 +432,13 @@ impl IntoResponse for ApiError {
 const REASON_LIMIT: usize = 1024;
 
 fn truncate_reason(reason: &str) -> String {
-    if reason.chars().count() <= REASON_LIMIT {
+    // TS `reason.length` counts UTF-16 code units (schema-error.ts:10-13).
+    let units: Vec<u16> = reason.encode_utf16().collect();
+    if units.len() <= REASON_LIMIT {
         return reason.to_string();
     }
-    let prefix: String = reason.chars().take(REASON_LIMIT).collect();
-    let extra = reason.chars().count() - REASON_LIMIT;
+    let prefix = String::from_utf16_lossy(&units[..REASON_LIMIT]).to_string();
+    let extra = units.len() - REASON_LIMIT;
     format!("{prefix}\u{2026} ({extra} more chars)")
 }
 

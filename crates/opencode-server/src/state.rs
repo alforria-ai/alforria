@@ -186,6 +186,9 @@ impl InstanceStore {
     /// Load (and cache) the services for a directory. The cache is keyed by
     /// the `FSUtil.resolve`d directory (`InstanceStore.load`,
     /// `project/instance-store.ts:130-137`).
+    // TODO(M7): the entries lock is held across the factory call
+    // (config I/O) — serialize on demand with per-key locks if instance
+    // creation shows up in profiles.
     pub fn load(&self, directory: &Path) -> Result<Arc<SessionServices>, ServerError> {
         let directory = resolve_directory(directory);
         let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());

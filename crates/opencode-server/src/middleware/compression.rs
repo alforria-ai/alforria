@@ -182,6 +182,13 @@ async fn compress_if_eligible(
     }
 
     let (mut parts, body) = response.into_parts();
+    // `body._tag !== "Uint8Array" -> return response` (compression.ts:39-40):
+    // only already-buffered bodies are compressed — stream bodies (SSE,
+    // chunked uploads) pass through untouched. A bounded body reports an
+    // exact size hint; streaming bodies do not.
+    if http_body::Body::size_hint(&body).exact().is_none() {
+        return Response::from_parts(parts, body);
+    }
     let path = path_of(full_url);
     // compression.ts:47-49
     if STREAMING_PATHS.contains(&path) {
