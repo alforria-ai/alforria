@@ -30,7 +30,9 @@ use crate::schema::messages::LlmRequest;
 pub type Headers = Vec<(String, String)>;
 
 /// A credential loader: resolves the secret at request time.
-pub type Credential = Box<dyn Fn() -> Result<String, LlmError>>;
+// The `Send + Sync` bounds keep `Auth` (and through it `RouteHandle`)
+// usable inside `Send` request streams.
+pub type Credential = Box<dyn Fn() -> Result<String, LlmError> + Send + Sync>;
 
 const VALUE_SOURCE: &str = "value";
 
@@ -99,7 +101,7 @@ fn set_all(headers: &mut Headers, additions: &[(String, String)]) {
     headers.extend(additions.iter().cloned());
 }
 
-type ApplyFn = Arc<dyn Fn(&AuthInput<'_>) -> Result<Headers, LlmError>>;
+type ApplyFn = Arc<dyn Fn(&AuthInput<'_>) -> Result<Headers, LlmError> + Send + Sync>;
 
 fn auth(apply: ApplyFn) -> Auth {
     Auth { apply }

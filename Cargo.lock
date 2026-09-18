@@ -1491,6 +1491,7 @@ dependencies = [
  "chrono",
  "dirs",
  "fs4",
+ "futures",
  "globset",
  "gray_matter",
  "grep-regex",

@@ -439,6 +439,7 @@ pub struct CreateInput {
 }
 
 /// `Session.Service` (session.ts:486-985).
+#[derive(Clone)]
 pub struct SessionStore {
     events: Arc<EventBus>,
     storage: Arc<Storage>,

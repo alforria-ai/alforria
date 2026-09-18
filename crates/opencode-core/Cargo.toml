@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 opencode-schema = { workspace = true }
 opencode-llm = { workspace = true }
+futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
