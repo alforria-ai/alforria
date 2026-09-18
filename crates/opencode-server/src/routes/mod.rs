@@ -27,7 +27,7 @@ pub fn build_router(ctx: Arc<ServerContext>) -> Router {
     }
     router = router
         .route("/doc", get(doc::doc))
-        .route("/openapi.json", get(doc::doc));
+        .route("/openapi.json", get(doc::openapi_json));
 
     let router = router
         .fallback(ui::serve_ui_handler)

@@ -222,7 +222,8 @@ async fn doc_and_openapi_json_are_registered() {
             StatusCode::NOT_FOUND,
             "{path} must be registered"
         );
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        // M6.9: both surfaces serve the frozen OpenAPI documents.
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }
 

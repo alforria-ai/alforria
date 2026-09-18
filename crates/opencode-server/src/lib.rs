@@ -4,6 +4,7 @@
 
 pub mod error;
 pub mod middleware;
+pub mod openapi;
 pub mod pty;
 pub mod routes;
 pub mod sse;

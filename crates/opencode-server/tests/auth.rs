@@ -388,7 +388,9 @@ async fn openapi_json_bypasses_auth() {
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    // M6.9: `/openapi.json` serves the frozen v2 document even with a
+    // password configured.
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 #[tokio::test]
