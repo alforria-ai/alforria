@@ -10,9 +10,11 @@ pub mod catalog;
 pub mod config;
 pub mod event;
 pub mod format;
+pub mod git;
 pub mod jsonc;
 pub mod merge;
 pub mod paths;
+pub mod project;
 pub mod session;
 pub mod storage;
 pub mod tool;
@@ -31,17 +33,20 @@ pub use event::{
     SerializedEvent, Subscription, Validate, MODELS_DEV_REFRESHED,
 };
 pub use format::Formatter;
+pub use git::{GitResult, GitRunner, Repository, SubprocessGit};
 pub use jsonc::parse_jsonc;
 pub use merge::{merge_config_concat_arrays, merge_deep};
 pub use paths::GlobalPaths;
+pub use project::registry::{ProjectRegistry, RegistryError as ProjectRegistryError};
+pub use project::GLOBAL_ID;
 pub use session::{
     get_forked_title, is_default_title, register_projectors, session_path, AgentRegistry,
     AgentRegistryInput, BackgroundJobInfo, BackgroundJobStatus, BackgroundJobs, BusyError,
-    CreateInput, Cursor, DefaultAgentError, GlobalInfo, GlobalListInput, Latest, ListInput,
-    MessagePage, MessageStore, NotFoundError, PermissionError, PermissionService, ProjectInfo,
-    QuestionError, QuestionService, Runner, RunnerError, SessionAsk, SessionContext, SessionError,
-    SessionServices, SessionStatusService, SessionStore, SetClear, ShellError, WithParts,
-    INSTALLATION_VERSION,
+    CreateInput, Cursor, DefaultAgentError, GlobalInfo, GlobalListInput, InstanceLocation, Latest,
+    ListInput, MessagePage, MessageStore, NotFoundError, PermissionError, PermissionService,
+    ProjectInfo, QuestionError, QuestionService, Runner, RunnerError, SessionAsk, SessionContext,
+    SessionError, SessionServices, SessionStatusService, SessionStore, SetClear, ShellError,
+    WithParts, INSTALLATION_VERSION,
 };
 pub use storage::Storage;
 pub use tool::{

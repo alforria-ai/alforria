@@ -83,6 +83,7 @@ impl PtyService {
             location: LocationRef {
                 directory: directory.to_string(),
                 workspace_id: None,
+                project: None,
             },
             directory: PathBuf::from(directory),
             inner: Arc::new(Mutex::new(Inner::default())),
@@ -600,6 +601,7 @@ impl PtyRegistry {
             location: LocationRef {
                 directory: location.directory.display().to_string(),
                 workspace_id: location.workspace_id.clone(),
+                project: None,
             },
             directory: location.directory.clone(),
             inner: Arc::new(Mutex::new(Inner::default())),

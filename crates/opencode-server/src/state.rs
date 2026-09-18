@@ -196,7 +196,29 @@ impl InstanceStore {
             return Ok(existing.clone());
         }
         let services = (self.factory)(&directory)?;
+        // M7.1: the instance bus feeds the global bus so per-instance
+        // events reach `/global/event` and `/event` with their location
+        // (`event-v2-bridge.ts:26-62`).
+        let global_bus = self.global_bus.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(global_bus) = global_bus.as_ref() {
+            global_bus.chain(services.events.clone());
+        }
         entries.insert(directory.clone(), services.clone());
+        // M7.1: every instance boot emits `project.updated` with directory
+        // "global" (`project.ts:305` → `GlobalEvents.publish`). The
+        // production factory resolves the project with a no-op sink, so
+        // the boot frame is emitted here, where the global bus is known.
+        if let (Some(global_bus), Some(location)) =
+            (global_bus.as_ref(), services.instance_location())
+        {
+            global_bus.emit(GlobalEvent::injected(
+                Some("global".to_string()),
+                Some(location.project.id.clone()),
+                None,
+                "project.updated",
+                serde_json::to_value(&location.project).unwrap_or_default(),
+            ));
+        }
         Ok(services)
     }
 
@@ -776,6 +798,9 @@ pub struct ServerContext {
     pub ptys: crate::pty::PtyRegistry,
     /// `WebSocketTracker` — live PTY sockets closed on server stop.
     pub websockets: WebSocketTracker,
+    /// `Project.Service` (M7.1) — the project registry over the shared
+    /// storage; its `project.updated` emissions feed the GlobalBus.
+    pub projects: Arc<opencode_core::project::registry::ProjectRegistry>,
 }
 
 impl ServerContext {
@@ -794,6 +819,25 @@ impl ServerContext {
         opencode_core::register_projectors(&bus);
         let global_bus = GlobalBus::bridged(Arc::clone(&bus));
         instances.set_global_bus(global_bus.clone());
+        // `emitUpdated` — the registry's `project.updated` frames
+        // (`project.ts:133-140`).
+        let projects = Arc::new(opencode_core::project::registry::ProjectRegistry::new(
+            storage.clone(),
+            Arc::new(opencode_core::git::SubprocessGit),
+            Arc::new(opencode_core::catalog::SystemClock),
+            {
+                let global_bus = global_bus.clone();
+                Arc::new(move |info: &opencode_schema::project::ProjectInfo| {
+                    global_bus.emit(GlobalEvent::injected(
+                        Some("global".to_string()),
+                        Some(info.id.clone()),
+                        None,
+                        "project.updated",
+                        serde_json::to_value(info).unwrap_or_default(),
+                    ));
+                })
+            },
+        ));
         let sessions = SessionStore::new(
             bus.clone(),
             storage.clone(),
@@ -825,6 +869,7 @@ impl ServerContext {
             pty_tickets: crate::pty::ticket::TicketCache::default(),
             ptys: crate::pty::PtyRegistry::default(),
             websockets: WebSocketTracker::default(),
+            projects,
         }
     }
 

@@ -88,20 +88,19 @@ pub fn parse_payload<T: serde::de::DeserializeOwned>(body: &Bytes) -> Result<T, 
 // ---------------------------------------------------------------------------
 
 /// `Location.Info` for a resolved location (`location.ts:29-47`): the
-/// project row is the M5 project table entry for the directory.
-/// (`packages/core/src/location.ts:18-27`.)
+/// project is resolved from the directory through the project registry
+/// (`packages/core/src/location.ts:18-27`).
 pub fn location_info(location: &LocationContext) -> Result<LocationInfo, ServerError> {
-    let id = location
+    let context = location
         .services
-        .sessions
-        .ensure_project(&location.directory)
+        .instance(&location.directory)
         .map_err(defect)?;
     Ok(LocationInfo {
         directory: location.directory.to_string_lossy().into_owned(),
         workspace_id: location.workspace_id.clone(),
         project: LocationProject {
-            id,
-            directory: location.directory.to_string_lossy().into_owned(),
+            id: context.project.id,
+            directory: context.worktree.to_string_lossy().into_owned(),
         },
     })
 }
@@ -166,6 +165,7 @@ pub fn session_from_v1(info: &V1SessionInfo) -> SessionInfo {
         location: LocationRef {
             directory: info.directory.clone(),
             workspace_id: info.workspace_id.clone(),
+            project: None,
         },
         subpath: info.path.clone().filter(|path| !path.is_empty()),
         revert,

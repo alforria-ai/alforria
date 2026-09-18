@@ -245,6 +245,7 @@ mod tests {
             location: Some(LocationRef {
                 directory: "/repo".to_string(),
                 workspace_id: None,
+                project: None,
             }),
             data: serde_json::json!({"sessionID": "ses_1"}),
         };

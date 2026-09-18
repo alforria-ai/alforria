@@ -92,6 +92,7 @@ fn publish(ctx: &ServerContext, directory: Option<&str>, workspace: Option<Strin
                 location: directory.map(|directory| LocationRef {
                     directory: directory.to_string(),
                     workspace_id: workspace,
+                    project: None,
                 }),
                 ..Default::default()
             },
@@ -479,4 +480,123 @@ async fn client_disconnect_releases_the_subscription() {
     publish(&ctx, Some("/repo"), None);
     tokio::time::sleep(HEARTBEAT * 4).await;
     assert_eq!(ctx.global_bus.receiver_count(), baseline);
+}
+
+// ------------------------------------------------- M7.1 instance chaining
+
+/// A fixture whose factory mirrors the production instance boot: services
+/// with the shared storage, stamped with an instance location
+/// (`project/instance-store.ts:45-61`).
+fn located_fixture() -> Arc<ServerContext> {
+    let storage = Arc::new(Storage::open_in_memory().unwrap());
+    let manifest = Arc::new(opencode_core::session::event_definitions::SessionManifest::new());
+    let bus = Arc::new(EventBus::new_shared(storage.clone(), Some(manifest)));
+    let factory_storage = storage.clone();
+    let factory: InstanceFactory = Arc::new(move |directory: &Path| {
+        let agent_input = opencode_core::AgentRegistryInput {
+            config: serde_json::from_value(serde_json::json!({})).unwrap(),
+            skill_dirs: Vec::new(),
+            reference_dirs: Vec::new(),
+            worktree: directory.to_path_buf(),
+            data_dir: std::env::temp_dir(),
+            tmp_dir: std::env::temp_dir(),
+            home: std::env::temp_dir(),
+        };
+        let services = Arc::new(SessionServices::new(
+            factory_storage.clone(),
+            Arc::new(NoJobs),
+            Arc::new(FixedClock),
+            &agent_input,
+        ));
+        services.set_instance_location(opencode_core::InstanceLocation {
+            directory: directory.to_path_buf(),
+            worktree: directory.to_path_buf(),
+            project: opencode_schema::project::ProjectInfo {
+                id: "prj_test".to_string(),
+                worktree: directory.display().to_string(),
+                vcs: None,
+                name: None,
+                icon: None,
+                commands: None,
+                time: opencode_schema::project::ProjectTime {
+                    created: 0,
+                    updated: 0,
+                    initialized: None,
+                },
+                sandboxes: Vec::new(),
+            },
+            workspace_id: None,
+        });
+        Ok(services)
+    });
+    let mut ctx = ServerContext::new(
+        AuthConfig::new("opencode", None),
+        InstanceStore::new(factory),
+        storage,
+        bus,
+        Vec::new(),
+        Arc::new(EmptyUiBackend),
+    );
+    ctx.heartbeat = HeartbeatConfig {
+        v1: HEARTBEAT,
+        v2: HEARTBEAT,
+    };
+    Arc::new(ctx)
+}
+
+#[tokio::test]
+async fn v1_event_sees_instance_bus_events() {
+    let ctx = located_fixture();
+    let (_status, _headers, mut frames) = open(&ctx, "/event?directory=/repo").await;
+    let _ = frames.next().await; // server.connected
+
+    // Booting the instance chains its bus into the global bus
+    // (`event-v2-bridge.ts:26-62`). The publish carries no explicit
+    // location — the ambient instance location fills it in.
+    let services = ctx.instances.load(Path::new("/repo")).unwrap();
+    services
+        .events
+        .publish(
+            &opencode_core::MODELS_DEV_REFRESHED,
+            serde_json::json!({}),
+            PublishOptions::default(),
+        )
+        .unwrap();
+    let frame = frames.next_event().await.unwrap();
+    assert_eq!(
+        normalize(&frame),
+        "data: {\"id\":\"evt_X\",\"type\":\"models-dev.refreshed\",\"properties\":{}}\n\n"
+    );
+
+    // A non-matching instance stays invisible.
+    let other = ctx.instances.load(Path::new("/other")).unwrap();
+    other
+        .events
+        .publish(
+            &opencode_core::MODELS_DEV_REFRESHED,
+            serde_json::json!({}),
+            PublishOptions::default(),
+        )
+        .unwrap();
+    let frame = frames.next().await.unwrap();
+    assert!(
+        frame.contains("\"type\":\"server.heartbeat\""),
+        "other-directory publishes must not frame"
+    );
+}
+
+#[tokio::test]
+async fn global_event_receives_project_updated_on_boot() {
+    let ctx = located_fixture();
+    let (_status, _headers, mut frames) = open(&ctx, "/global/event").await;
+    let _ = frames.next().await; // server.connected
+
+    // Every instance boot emits `project.updated` with directory "global"
+    // (`project.ts:133-140` + `fromDirectory`, `project.ts:305`).
+    ctx.instances.load(Path::new("/repo")).unwrap();
+    let frame = frames.next_event().await.unwrap();
+    assert_eq!(
+        normalize(&frame),
+        "data: {\"directory\":\"global\",\"project\":\"prj_test\",\"payload\":{\"type\":\"project.updated\",\"properties\":{\"id\":\"prj_test\",\"sandboxes\":[],\"time\":{\"created\":0,\"updated\":0},\"worktree\":\"/repo\"},\"id\":\"evt_X\"}}\n\n"
+    );
 }

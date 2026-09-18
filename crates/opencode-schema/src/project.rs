@@ -57,6 +57,17 @@ pub struct ProjectTime {
     pub initialized: Option<u64>,
 }
 
+/// `project.directories` list entries — openapi `ProjectDirectories` items
+/// (`core/src/project/directories.ts:12-15`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectDirectory {
+    /// AbsolutePath
+    pub directory: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy: Option<String>,
+}
+
 /// `project.updated` payload — identical to `ProjectInfo` on the wire
 /// (openapi `EventProjectUpdated.properties`).
 pub type ProjectUpdatedData = ProjectInfo;

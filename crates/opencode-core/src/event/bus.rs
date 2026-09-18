@@ -88,6 +88,9 @@ struct BusState {
     listeners: Vec<Listener>,
     /// Keyed by unversioned type.
     projectors: HashMap<String, Vec<Projector>>,
+    /// Ambient location injected into publishes without an explicit one
+    /// — the `Location.Service` fallback (`event.ts:419-423`).
+    ambient_location: Option<LocationRef>,
 }
 
 /// The EventV2 bus over a [`Storage`] connection.
@@ -117,6 +120,7 @@ impl EventBus {
                 durable: HashMap::new(),
                 listeners: Vec::new(),
                 projectors: HashMap::new(),
+                ambient_location: None,
             })),
             publish_lock: Mutex::new(()),
         }
@@ -137,6 +141,7 @@ impl EventBus {
                 durable: HashMap::new(),
                 listeners: Vec::new(),
                 projectors: HashMap::new(),
+                ambient_location: None,
             })),
             publish_lock: Mutex::new(()),
         }
@@ -148,6 +153,13 @@ impl EventBus {
         self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Set the ambient location (`Location.Service`) used when a publish
+    /// carries no explicit one (`event.ts:419-423`). Only one instance
+    /// context exists per bus in practice; a second call overwrites.
+    pub fn set_ambient_location(&self, location: LocationRef) {
+        self.lock_state().ambient_location = Some(location);
     }
 
     /// `latestSequence` (`event.ts:21-32`): the aggregate's last committed
@@ -169,12 +181,16 @@ impl EventBus {
         data: serde_json::Value,
         opts: PublishOptions,
     ) -> Result<Payload, CoreError> {
+        let location = match opts.location {
+            Some(location) => Some(location),
+            None => self.lock_state().ambient_location.clone(),
+        };
         let mut event = Payload {
             id: opts.id.unwrap_or_else(new_event_id),
             metadata: opts.metadata,
             r#type: definition.r#type.to_string(),
             durable: None,
-            location: opts.location,
+            location,
             data,
         };
         if definition.durable.is_none() {
@@ -853,6 +869,7 @@ mod tests {
                     location: Some(LocationRef {
                         directory: "/repo".to_string(),
                         workspace_id: None,
+                        project: None,
                     }),
                     ..Default::default()
                 },

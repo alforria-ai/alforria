@@ -151,7 +151,9 @@ fn production_instance_factory(
     InstanceStore::new(factory)
 }
 
-/// One instance boot: config load + service wiring.
+/// One instance boot: config load + project resolution + service wiring
+/// (TS `InstanceStore.boot` + `InstanceBootstrap.run`,
+/// `project/instance-store.ts:45-61`).
 fn instance_for_directory(
     storage: Arc<Storage>,
     paths: opencode_core::GlobalPaths,
@@ -182,23 +184,44 @@ fn instance_for_directory(
         }
     }
 
+    // M7.1 project resolution — the instance worktree is the project
+    // sandbox: the git worktree root when a repo exists, else the
+    // directory (`instance-store.ts:54-57`).
+    let registry = opencode_core::project::registry::ProjectRegistry::new(
+        storage.clone(),
+        Arc::new(opencode_core::git::SubprocessGit),
+        Arc::new(opencode_core::catalog::SystemClock),
+        Arc::new(|_| {}),
+    );
+    let (project, worktree) = registry
+        .from_directory(directory)
+        .map_err(|err| ServerError::Core(opencode_core::CoreError::Storage(err.to_string())))?;
+
     let agent_input = opencode_core::AgentRegistryInput {
         config,
         skill_dirs,
         reference_dirs,
-        // TODO(M7): project sandbox detection — the worktree is the
-        // directory itself until git worktree support lands.
-        worktree: directory.to_path_buf(),
+        worktree: worktree.clone(),
         data_dir: paths.data.clone(),
         tmp_dir: std::env::temp_dir().join("opencode"),
         home: paths.home.clone(),
     };
-    Ok(Arc::new(opencode_core::SessionServices::new(
+    let services = Arc::new(opencode_core::SessionServices::new(
         storage,
         Arc::new(state::NoBackgroundJobs),
         Arc::new(opencode_core::catalog::SystemClock),
         &agent_input,
-    )))
+    ));
+    // Stamp the instance context + the ambient publish location
+    // (`event-v2-bridge.ts:19-33`).
+    let instance_location = opencode_core::InstanceLocation {
+        directory: directory.to_path_buf(),
+        worktree: worktree.clone(),
+        project,
+        workspace_id: None,
+    };
+    services.set_instance_location(instance_location);
+    Ok(services)
 }
 
 /// The `serve` stdout lines (`cli/cmd/serve.ts:15-20`): the password

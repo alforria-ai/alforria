@@ -419,19 +419,13 @@ fn try_parse_json(body: &Bytes) -> Result<Value, ()> {
 }
 
 /// `InstanceState.context` — project/directory/worktree/workspace resolved
-/// for the instance (M6: worktree == directory; TODO(M7) git worktrees).
+/// for the instance through the project registry
+/// (`project/instance-context.ts:5-9`).
 fn session_ctx(location: &LocationContext) -> Result<SessionContext, ServerError> {
-    let project_id = location
+    location
         .services
-        .sessions
-        .ensure_project(&location.directory)
-        .map_err(session_error)?;
-    Ok(SessionContext {
-        project_id,
-        directory: location.directory.clone(),
-        worktree: location.directory.clone(),
-        workspace_id: location.workspace_id.clone(),
-    })
+        .instance_context(&location.directory, location.workspace_id.clone())
+        .map_err(session_error)
 }
 
 fn with_parts_json(message: &session::WithParts) -> Value {

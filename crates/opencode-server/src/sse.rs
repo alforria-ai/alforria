@@ -117,6 +117,8 @@ pub struct GlobalBus {
     tx: broadcast::Sender<GlobalEvent>,
     /// Keeps the core-bus bridge listener alive while any handle exists.
     bridge: Option<Arc<Subscription>>,
+    /// Retained subscriptions of chained per-instance buses (M7.1).
+    chains: Arc<std::sync::Mutex<Vec<Arc<Subscription>>>>,
 }
 
 impl Default for GlobalBus {
@@ -130,6 +132,7 @@ impl GlobalBus {
         GlobalBus {
             tx: broadcast::channel(opencode_core::event::bus::CHANNEL_CAPACITY).0,
             bridge: None,
+            chains: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -148,6 +151,22 @@ impl GlobalBus {
         global
     }
 
+    /// Bridge an additional (per-instance) EventV2 bus into the global bus
+    /// — every instance publishes onto its own bus in the Rust port, and
+    /// the bridge listener is the TS process-wide EventV2's listener.
+    pub fn chain(&self, bus: Arc<EventBus>) {
+        let chained = self.clone();
+        let subscription = bus.listen(Arc::new(move |event| {
+            for frame in bridge_frames(event) {
+                chained.emit(frame);
+            }
+        }));
+        self.chains
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(Arc::new(subscription));
+    }
+
     /// `GlobalBus.emit` (global.ts:9-17) — ids are assigned at construction
     /// (see `GlobalPayload`), so this only fans out.
     pub fn emit(&self, event: GlobalEvent) {
@@ -163,16 +182,20 @@ impl GlobalBus {
     }
 }
 
-/// The `EventV2Bridge` listener body (`event-v2-bridge.ts:26-62`): directory
-/// comes from the event location (TS falls back to the ambient instance
-/// context, which has no Rust equivalent — events published without a
-/// location carry no directory), `project` needs the project registry (M7).
+/// The `EventV2Bridge` listener body (`event-v2-bridge.ts:26-62`): the
+/// directory comes from the event location (TS falls back to the ambient
+/// instance context — Rust instances always inject the ambient location at
+/// publish time), the project from the location's project field.
 fn bridge_frames(event: &Payload) -> Vec<GlobalEvent> {
     let directory = event.location.as_ref().map(|l| l.directory.clone());
     let workspace = event.location.as_ref().and_then(|l| l.workspace_id.clone());
+    let project = event
+        .location
+        .as_ref()
+        .and_then(|l| l.project.as_ref().map(|p| p.id.clone()));
     let mut out = vec![GlobalEvent {
         directory: directory.clone(),
-        project: None,
+        project,
         workspace: workspace.clone(),
         payload: GlobalPayload::Event {
             id: event.id.clone(),
@@ -190,7 +213,10 @@ fn bridge_frames(event: &Payload) -> Vec<GlobalEvent> {
         };
         out.push(GlobalEvent {
             directory,
-            project: None,
+            project: event
+                .location
+                .as_ref()
+                .and_then(|l| l.project.as_ref().map(|p| p.id.clone())),
             workspace,
             payload: GlobalPayload::Sync {
                 r#type: "sync".to_string(),
@@ -253,14 +279,11 @@ fn sse_response(rx: mpsc::Receiver<Bytes>) -> Response {
 /// The v1 `/event` filter (handlers/event.ts:36-41): the event location
 /// must match the instance directory, and an event workspaceID must match
 /// the resolved workspace.
-fn v1_event_matches(event: &Payload, directory: &str, workspace_id: &Option<String>) -> bool {
-    let Some(location) = &event.location else {
-        return false;
-    };
-    if location.directory != directory {
+fn v1_event_matches(event: &GlobalEvent, directory: &str, workspace_id: &Option<String>) -> bool {
+    if event.directory.as_deref() != Some(directory) {
         return false;
     }
-    match &location.workspace_id {
+    match &event.workspace {
         None => true,
         Some(workspace) => Some(workspace) == workspace_id.as_ref(),
     }
@@ -279,7 +302,12 @@ fn v1_disposed_frame(event: &GlobalEvent, directory: &str) -> Option<String> {
             r#type,
             properties,
         } => (id, r#type, properties),
-        GlobalPayload::Injected { .. } | GlobalPayload::Sync { .. } => return None,
+        GlobalPayload::Injected {
+            id,
+            r#type,
+            properties,
+        } => (id, r#type, properties),
+        GlobalPayload::Sync { .. } => return None,
     };
     if payload_type != INSTANCE_DISPOSED_TYPE {
         return None;
@@ -295,8 +323,11 @@ pub async fn v1_event(
     // Listener registration is eager, so events published after this point
     // cannot be lost while the HTTP body fiber is starting or emitting
     // server.connected (handlers/event.ts:30-33).
-    let mut events = ctx.bus.all();
-    let mut disposed = ctx.global_bus.subscribe();
+    //
+    // The stream consumes the global bus, which mirrors every EventV2
+    // publish — the server bus and each per-instance bus — with
+    // `directory` and `project` filled from the publish location (M7.1).
+    let mut events = ctx.global_bus.subscribe();
     let directory = resolve_directory(&location.directory).display().to_string();
     let workspace_id = location.workspace_id;
     let interval = ctx.heartbeat.v1;
@@ -319,22 +350,20 @@ pub async fn v1_event(
             tokio::select! {
                 received = events.recv() => match received {
                     Ok(event) => {
-                        if v1_event_matches(&event, &directory, &workspace_id) {
-                            let frame = sse_frame(&legacy_frame(
-                                &event.id,
-                                &event.r#type,
-                                event.data,
-                            ));
+                        if !v1_event_matches(&event, &directory, &workspace_id) {
+                            continue;
+                        }
+                        if let GlobalPayload::Event {
+                            id,
+                            r#type,
+                            properties,
+                        } = &event.payload
+                        {
+                            let frame = sse_frame(&legacy_frame(id, r#type, properties.clone()));
                             if tx.send(frame.into()).await.is_err() {
                                 return;
                             }
                         }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(broadcast::error::RecvError::Closed) => return,
-                },
-                received = disposed.recv() => match received {
-                    Ok(event) => {
                         if let Some(frame) = v1_disposed_frame(&event, &directory) {
                             if tx.send(sse_frame(&frame).into()).await.is_err() {
                                 return;

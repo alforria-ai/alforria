@@ -84,6 +84,11 @@ fn register_stub(
     if handled {
         return router;
     }
+    // M7.1 owns the v1 project family.
+    let (router, handled) = v1::project::register(router, method, path);
+    if handled {
+        return router;
+    }
     // M6.7 owns the v2 /api families.
     let (router, handled) = v2::session::register(router, method, path);
     if handled {

@@ -19,6 +19,7 @@ jsonc-parser = { workspace = true }
 fs4 = { workspace = true }
 walkdir = { workspace = true }
 sha2 = { workspace = true }
+sha1 = { workspace = true }
 hex = { workspace = true }
 dirs = { workspace = true }
 indexmap = { workspace = true }

@@ -215,11 +215,14 @@ async fn saved_list(
 ) -> Result<Response, ServerError> {
     let project_id = match query_param(uri.query(), "projectID") {
         Some(project) => project,
-        None => location
-            .services
-            .sessions
-            .ensure_project(&location.directory)
-            .map_err(defect)?,
+        None => {
+            location
+                .services
+                .instance(&location.directory)
+                .map_err(defect)?
+                .project
+                .id
+        }
     };
     let rows = saved_list_sql(&ctx, &project_id)?;
     Ok(super::util::json_ok(serde_json::json!({ "data": rows })))
@@ -335,9 +338,10 @@ async fn permission_ask(
         })?;
     let project_id = location
         .services
-        .sessions
-        .ensure_project(&location.directory)
-        .map_err(defect)?;
+        .instance(&location.directory)
+        .map_err(defect)?
+        .project
+        .id;
     let rules = configured(&location, &session_id, payload.agent.as_deref())?;
     let saved = saved_rules(&ctx, &project_id)?;
     let all_rules: Vec<PermissionRule> = rules.iter().chain(saved.iter()).cloned().collect();
@@ -437,9 +441,10 @@ async fn permission_reply(
     owned_request(&ctx, &session_id, &request_id)?;
     let project_id = location
         .services
-        .sessions
-        .ensure_project(&location.directory)
-        .map_err(defect)?;
+        .instance(&location.directory)
+        .map_err(defect)?
+        .project
+        .id;
 
     let entry = ctx
         .v2_permissions

@@ -341,6 +341,7 @@ impl SessionRow {
             location: opencode_schema::location::LocationRef {
                 directory: self.directory.clone(),
                 workspace_id: self.workspace_id.clone(),
+                project: None,
             },
             subpath: self.path.clone().filter(|path| !path.is_empty()),
             revert,
@@ -480,16 +481,9 @@ async fn create(
         .location
         .as_ref()
         .and_then(|location| location.workspace_id.clone());
-    let project_id = services
-        .sessions
-        .ensure_project(std::path::Path::new(&directory))
+    let session_ctx = services
+        .instance_context(std::path::Path::new(&directory), workspace_id)
         .map_err(session_error)?;
-    let session_ctx = opencode_core::SessionContext {
-        project_id,
-        directory: std::path::PathBuf::from(&directory),
-        worktree: std::path::PathBuf::from(&directory),
-        workspace_id,
-    };
     let input = opencode_core::session::CreateInput {
         id: payload.id.clone(),
         agent: payload.agent.clone(),

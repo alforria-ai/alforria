@@ -76,18 +76,20 @@ fn envelope(
     location: &LocationContext,
     data: &impl serde::Serialize,
 ) -> Result<Response, ServerError> {
-    let project = location
+    let defect = |err: opencode_core::SessionError| {
+        ServerError::Core(opencode_core::CoreError::Storage(err.to_string()))
+    };
+    let context = location
         .services
-        .sessions
-        .ensure_project(&location.directory)
-        .map_err(|err| ServerError::Core(opencode_core::CoreError::Storage(err.to_string())))?;
+        .instance(&location.directory)
+        .map_err(defect)?;
     let body = serde_json::json!({
         "location": {
             "directory": location.directory.display().to_string(),
             "workspaceID": location.workspace_id,
             "project": {
-                "id": project,
-                "directory": location.directory.display().to_string(),
+                "id": context.project.id,
+                "directory": context.worktree.display().to_string(),
             },
         },
         "data": serde_json::to_value(data).map_err(|err| {
