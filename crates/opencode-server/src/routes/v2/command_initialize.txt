@@ -26,6 +26,7 @@ Look for the highest-signal facts for an agent working in this repo:
 - required command order when it matters, such as `lint -> typecheck -> test`
 - monorepo or multi-package boundaries, ownership of major directories, and the real app/library entrypoints
 - framework or toolchain quirks: generated code, migrations, codegen, build artifacts, special env loading, dev servers, infra deploy flow
+- repo-specific style or workflow conventions that differ from defaults
 - testing quirks: fixtures, integration test prerequisites, snapshot workflows, required services, flaky or expensive suites
 - important constraints from existing instruction files worth preserving
 

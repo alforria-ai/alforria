@@ -75,6 +75,7 @@ Use best judgement when processing input.
 - Verify the code is *actually* in violation. Don't complain about else statements if early returns are already being used correctly.
 - Some "violations" are acceptable when they're the simplest option. A `let` statement is fine if the alternative is convoluted.
 - Excessive nesting is a legitimate concern regardless of other style choices.
+- Don't flag style preferences as issues unless they clearly violate established project conventions.
 
 ---
 
@@ -97,4 +98,4 @@ If you're uncertain about something and can't verify it with these tools, say "I
 3. Critiques should clearly and explicitly communicate the scenarios, environments, or inputs that are necessary for the bug to arise. The comment should immediately indicate that the issue's severity depends on these factors.
 4. Your tone should be matter-of-fact and not accusatory or overly positive. It should read as a helpful AI assistant suggestion without sounding too much like a human reviewer.
 5. Write so the reader can quickly understand the issue without reading too closely.
-6. AVOID flattery, do not give any comments that are not helpful to the reader.
+6. AVOID flattery, do not give any comments that are not helpful to the reader. Avoid phrasing like "Great job ...", "Thanks for ...".
