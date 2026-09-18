@@ -38,6 +38,7 @@ similar = "2"
 grep-regex = "0.1"
 grep-searcher = "0.1"
 base64 = "0.22"
+flate2 = "1"
 tokio-util = "0.7"
 rust_decimal = "1"
 
