@@ -500,8 +500,26 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
         .llm
         .clone()
         .unwrap_or_else(|| Arc::new(UnwiredLlm));
-    // M7.3 wires the production git snapshot.
-    let snapshot: Arc<dyn Snapshot> = Arc::new(opencode_core::session::snapshot::DisabledSnapshot);
+    // M7.3: the production git snapshot behind the M5 `Snapshot` seam
+    // (`snapshot/index.ts`) — non-git instances fall back to the no-op.
+    let snapshot: Arc<dyn Snapshot> = services
+        .instance_location()
+        .map(|location| {
+            opencode_core::session::snapshot::GitSnapshot::new(
+                opencode_core::session::snapshot::GitSnapshotInput {
+                    directory: input.directory.clone(),
+                    worktree: input.worktree.clone(),
+                    project_id: location.project.id.clone(),
+                    vcs_is_git: matches!(
+                        location.project.vcs,
+                        Some(opencode_schema::project::ProjectVcs::Git)
+                    ),
+                    snapshot_enabled: input.config.snapshot != Some(false),
+                    data: input.paths.data.clone(),
+                },
+            ) as Arc<dyn Snapshot>
+        })
+        .unwrap_or_else(|| Arc::new(opencode_core::session::snapshot::DisabledSnapshot));
 
     // Production TaskOps + the full tool registry (registry.ts:240-249).
     let ops = ProductionTaskOps::new(

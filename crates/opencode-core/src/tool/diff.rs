@@ -284,6 +284,10 @@ pub fn diff_lines(old: &str, new: &str) -> Vec<Change> {
     unreachable!("myers diff exceeded max edit length");
 }
 
+/// `Number.MAX_SAFE_INTEGER` — the infinite-context value the snapshot
+/// `diffFull` patches pass (`structuredPatch(..., { context })`).
+pub const MAX_SAFE_INTEGER: usize = 9007199254740991;
+
 /// `structuredPatch` hunk (before the 0-line start fixup).
 #[derive(Debug, Clone, Serialize)]
 pub struct Hunk {
@@ -401,6 +405,30 @@ pub fn create_two_files_patch(name: &str, old: &str, new: &str) -> String {
     out.push("===================================================================".to_string());
     out.push(format!("--- {name}"));
     out.push(format!("+++ {name}"));
+    push_hunks(hunks, &mut out);
+    out.join("\n") + "\n"
+}
+
+/// `formatPatch(structuredPatch(name, name, old, new, "", "", { context }))`
+/// (diff@8 patch/create.js). Unlike `createTwoFilesPatch` the headers are
+/// the empty-string `oldHeader`/`newHeader`, so `formatPatch` appends the
+/// `\t` separator for both file lines.
+pub fn format_patch(name: &str, old: &str, new: &str, context: usize) -> String {
+    let diff = diff_lines(old, new);
+    let hunks = structured_hunks(&diff, context);
+
+    let mut out: Vec<String> = Vec::new();
+    out.push(format!("Index: {name}"));
+    out.push("===================================================================".to_string());
+    out.push(format!("--- {name}\t"));
+    out.push(format!("+++ {name}\t"));
+    push_hunks(hunks, &mut out);
+    out.join("\n") + "\n"
+}
+
+/// The `formatPatch` hunk loop — 0-size ranges start one lower.
+/// (`Index:` already pushed by the callers.)
+fn push_hunks(hunks: Vec<Hunk>, out: &mut Vec<String>) {
     for mut hunk in hunks {
         if hunk.old_lines == 0 {
             hunk.old_start -= 1;
@@ -414,7 +442,6 @@ pub fn create_two_files_patch(name: &str, old: &str, new: &str) -> String {
         ));
         out.extend(hunk.lines);
     }
-    out.join("\n") + "\n"
 }
 
 /// Counts of added / removed lines over the whole line diff — the sum over
@@ -480,6 +507,24 @@ mod tests {
                 create_two_files_patch(&case.name, &case.old, &case.new),
                 case.patch,
                 "fuzz case {i}"
+            );
+        }
+    }
+
+    fn snapshot_goldens() -> Vec<Golden> {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/diff/npm-diff-snapshot.json");
+        let raw = std::fs::read_to_string(path).unwrap();
+        serde_json::from_str(&raw).unwrap()
+    }
+
+    #[test]
+    fn format_patch_infinite_context_matches_npm_goldens() {
+        for (i, case) in snapshot_goldens().iter().enumerate() {
+            assert_eq!(
+                format_patch(&case.name, &case.old, &case.new, MAX_SAFE_INTEGER),
+                case.patch,
+                "snapshot golden case {i}"
             );
         }
     }

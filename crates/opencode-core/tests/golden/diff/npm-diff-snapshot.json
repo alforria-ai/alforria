@@ -1,0 +1,56 @@
+[
+  {
+    "name": "src/a.txt",
+    "patch": "Index: src/a.txt\n===================================================================\n--- src/a.txt\t\n+++ src/a.txt\t\n@@ -1,2 +1,3 @@\n line1\n line2\n+line3\n",
+    "old": "line1\nline2\n",
+    "new": "line1\nline2\nline3\n"
+  },
+  {
+    "name": "src/b.txt",
+    "patch": "Index: src/b.txt\n===================================================================\n--- src/b.txt\t\n+++ src/b.txt\t\n@@ -0,0 +1,2 @@\n+new file\n+content\n",
+    "old": "",
+    "new": "new file\ncontent\n"
+  },
+  {
+    "name": "src/c.txt",
+    "patch": "Index: src/c.txt\n===================================================================\n--- src/c.txt\t\n+++ src/c.txt\t\n@@ -1,2 +0,0 @@\n-gone\n-content\n",
+    "old": "gone\ncontent\n",
+    "new": ""
+  },
+  {
+    "name": "src/d.txt",
+    "patch": "Index: src/d.txt\n===================================================================\n--- src/d.txt\t\n+++ src/d.txt\t\n",
+    "old": "same\nsame\n",
+    "new": "same\nsame\n"
+  },
+  {
+    "name": "src/e.txt",
+    "patch": "Index: src/e.txt\n===================================================================\n--- src/e.txt\t\n+++ src/e.txt\t\n@@ -1,3 +1,3 @@\n-a\n-b\n c\n+b\n+a\n",
+    "old": "a\nb\nc\n",
+    "new": "c\nb\na\n"
+  },
+  {
+    "name": "src/f.txt",
+    "patch": "Index: src/f.txt\n===================================================================\n--- src/f.txt\t\n+++ src/f.txt\t\n@@ -1,1 +1,1 @@\n-no newline\n\\ No newline at end of file\n+no newline\n",
+    "old": "no newline",
+    "new": "no newline\n"
+  },
+  {
+    "name": "src/g.txt",
+    "patch": "Index: src/g.txt\n===================================================================\n--- src/g.txt\t\n+++ src/g.txt\t\n@@ -1,2 +1,2 @@\n x\r\n-y\r\n+z\r\n",
+    "old": "x\r\ny\r\n",
+    "new": "x\r\nz\r\n"
+  },
+  {
+    "name": "src/h deep/i.txt",
+    "patch": "Index: src/h deep/i.txt\n===================================================================\n--- src/h deep/i.txt\t\n+++ src/h deep/i.txt\t\n@@ -1,2 +1,4 @@\n one\n+three\n+four\n two\n",
+    "old": "one\ntwo\n",
+    "new": "one\nthree\nfour\ntwo\n"
+  },
+  {
+    "name": "src/i.txt",
+    "patch": "Index: src/i.txt\n===================================================================\n--- src/i.txt\t\n+++ src/i.txt\t\n@@ -1,9 +1,10 @@\n keep1\n keep2\n keep3\n chg1\n keep4\n keep5\n keep6\n keep7\n keep8\n+new\n",
+    "old": "keep1\nkeep2\nkeep3\nchg1\nkeep4\nkeep5\nkeep6\nkeep7\nkeep8\n",
+    "new": "keep1\nkeep2\nkeep3\nchg1\nkeep4\nkeep5\nkeep6\nkeep7\nkeep8\nnew\n"
+  }
+]
