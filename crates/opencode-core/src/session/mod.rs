@@ -11,8 +11,10 @@ pub mod llm;
 pub mod r#loop;
 pub mod message;
 pub mod overflow;
+pub mod permission;
 pub mod processor;
 pub mod prompt_input;
+pub mod question;
 pub mod reminders;
 pub mod render;
 pub mod retry;
@@ -34,6 +36,12 @@ pub use agents::{AgentInfo, AgentRegistry, AgentRegistryInput, DefaultAgentError
 pub use error::{AuthError, BusyError, NotFoundError, OutputLengthError, SessionError};
 pub use message::{filter_compacted, latest, Cursor, Latest, MessagePage, MessageStore, WithParts};
 pub use overflow::{is_overflow, max_output_tokens, usable, ModelLimits};
+pub use permission::{
+    PermissionError, PermissionService, SessionAsk, PERMISSION_ASKED, PERMISSION_REPLIED,
+};
+pub use question::{
+    QuestionError, QuestionService, QUESTION_ASKED, QUESTION_REJECTED, QUESTION_REPLIED,
+};
 pub use retry::{
     delay as retry_delay, retryable, Policy as RetryPolicy, PolicyStep as RetryPolicyStep,
     RetryAction, RetrySet, Retryable as RetryableError,
@@ -61,6 +69,8 @@ pub struct SessionServices {
     pub status: Arc<SessionStatusService>,
     pub run_state: Arc<SessionRunState>,
     pub agents: AgentRegistry,
+    pub permission: Arc<PermissionService>,
+    pub question: Arc<QuestionService>,
 }
 
 impl SessionServices {
@@ -85,6 +95,8 @@ impl SessionServices {
         let messages = MessageStore::new(storage.clone());
         let status = Arc::new(SessionStatusService::new(events.clone()));
         let run_state = SessionRunState::new(background, status.clone());
+        let permission = Arc::new(PermissionService::new(events.clone()));
+        let question = Arc::new(QuestionService::new(events.clone()));
         SessionServices {
             storage,
             events,
@@ -93,6 +105,8 @@ impl SessionServices {
             status,
             run_state,
             agents: AgentRegistry::new(agent_input),
+            permission,
+            question,
         }
     }
 }
