@@ -8,6 +8,7 @@
 
 pub mod catalog;
 pub mod config;
+pub mod control_plane;
 pub mod event;
 pub mod format;
 pub mod git;
@@ -15,9 +16,13 @@ pub mod jsonc;
 pub mod merge;
 pub mod paths;
 pub mod project;
+pub mod repository;
 pub mod session;
+pub mod skill;
 pub mod storage;
 pub mod tool;
+pub mod vcs;
+pub mod worktree;
 
 use std::path::PathBuf;
 

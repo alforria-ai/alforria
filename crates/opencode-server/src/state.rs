@@ -491,6 +491,130 @@ impl VcsService for NoVcs {
     }
 }
 
+/// The production vcs service over the core GitCli (`project/vcs.ts`).
+/// `NoVcs` stays as the unwired seam default; `production_context` installs
+/// this one.
+#[derive(Default)]
+pub struct CoreVcs {
+    inner: opencode_core::vcs::Vcs,
+}
+
+impl CoreVcs {
+    fn patch_apply_error(err: opencode_core::vcs::PatchApplyError) -> ServerError {
+        crate::error::ApiError::VcsApply {
+            message: err.message,
+            reason: err.reason,
+        }
+        .into()
+    }
+}
+
+impl VcsService for CoreVcs {
+    fn info(&self, directory: &Path) -> Result<serde_json::Value, ServerError> {
+        Ok(serde_json::to_value(self.inner.info(directory)).unwrap_or_default())
+    }
+
+    fn status(&self, directory: &Path) -> Result<Vec<serde_json::Value>, ServerError> {
+        Ok(self
+            .inner
+            .status(directory)
+            .into_iter()
+            .map(|row| serde_json::to_value(row).unwrap_or_default())
+            .collect())
+    }
+
+    fn diff(
+        &self,
+        directory: &Path,
+        mode: &str,
+        context: Option<i64>,
+    ) -> Result<Vec<serde_json::Value>, ServerError> {
+        Ok(self
+            .inner
+            .diff(directory, mode, context)
+            .into_iter()
+            .map(|row| serde_json::to_value(row).unwrap_or_default())
+            .collect())
+    }
+
+    fn diff_raw(&self, directory: &Path) -> Result<String, ServerError> {
+        Ok(self.inner.diff_raw(directory))
+    }
+
+    fn apply(
+        &self,
+        directory: &Path,
+        patch: &serde_json::Value,
+    ) -> Result<serde_json::Value, ServerError> {
+        let patch = patch
+            .get("patch")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| {
+                ServerError::Core(opencode_core::CoreError::Storage(format!(
+                    "vcs.apply payload is not a string: {patch:?}"
+                )))
+            })?;
+        let result = self
+            .inner
+            .apply(directory, patch)
+            .map_err(Self::patch_apply_error)?;
+        Ok(serde_json::to_value(result).unwrap_or_default())
+    }
+}
+
+/// The server-side [`opencode_core::worktree::Deps`] — the project
+/// registry, the instance store and the GlobalBus behind the worktree
+/// service.
+#[derive(Clone)]
+pub struct WorktreeDeps {
+    /// `Global.Path.data` — the worktree root base (`worktree/index.ts:208`).
+    pub data_dir: PathBuf,
+    pub global_bus: GlobalBus,
+    pub instances: InstanceStore,
+    pub projects: Arc<opencode_core::project::registry::ProjectRegistry>,
+}
+
+impl opencode_core::worktree::Deps for WorktreeDeps {
+    fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
+    fn add_sandbox(&self, project_id: &str, directory: &Path) {
+        let _ = self
+            .projects
+            .add_sandbox(project_id, &directory.to_string_lossy());
+    }
+
+    fn dispose_directory(&self, directory: &Path) {
+        self.instances.dispose_directory(directory);
+    }
+
+    fn load_instance(&self, directory: &Path) -> Result<(), String> {
+        self.instances
+            .load(directory)
+            .map(|_| ())
+            .map_err(|err| format!("{err:?}"))
+    }
+
+    fn start_command(&self, project_id: &str) -> Option<String> {
+        self.projects
+            .get(project_id)
+            .ok()
+            .flatten()
+            .and_then(|project| project.commands.and_then(|commands| commands.start))
+    }
+
+    fn emit(&self, frame: &opencode_core::worktree::Frame) {
+        self.global_bus.emit(GlobalEvent::injected(
+            Some(frame.directory.to_string_lossy().into_owned()),
+            Some(frame.project_id.clone()),
+            frame.workspace_id.clone(),
+            frame.event_type,
+            frame.properties.clone(),
+        ));
+    }
+}
+
 /// `Skill.Service.all` / `LSP.Service.status` / `Format.Service.status` seams
 /// — the M6 defaults are empty status lists.
 pub trait StatusSeam: Send + Sync {
@@ -780,6 +904,9 @@ pub struct ServerContext {
     pub auth_store: Arc<dyn AuthStore>,
     /// `Vcs.Service`.
     pub vcs: Arc<dyn VcsService>,
+    /// The worktree service (`worktree/index.ts`) + its dependencies.
+    pub worktree: opencode_core::worktree::Worktree,
+    pub worktree_deps: Arc<dyn opencode_core::worktree::Deps>,
     /// `Skill.Service` status list.
     pub skills: Arc<dyn StatusSeam>,
     /// `LSP.Service.status`.
@@ -825,6 +952,7 @@ impl ServerContext {
         opencode_core::register_projectors(&bus);
         let global_bus = GlobalBus::bridged(Arc::clone(&bus));
         instances.set_global_bus(global_bus.clone());
+        let (global_bus_clone, instances_clone) = (global_bus.clone(), instances.clone());
         // `emitUpdated` — the registry's `project.updated` frames
         // (`project.ts:133-140`).
         let projects = Arc::new(opencode_core::project::registry::ProjectRegistry::new(
@@ -864,6 +992,13 @@ impl ServerContext {
             installation: Arc::new(UnknownInstallation),
             auth_store: Arc::new(MemoryAuthStore::default()),
             vcs: Arc::new(NoVcs),
+            worktree: opencode_core::worktree::Worktree::default(),
+            worktree_deps: Arc::new(WorktreeDeps {
+                data_dir: opencode_core::GlobalPaths::from_env().data,
+                global_bus: global_bus_clone,
+                instances: instances_clone,
+                projects: projects.clone(),
+            }),
             skills: Arc::new(EmptyStatus),
             lsp: Arc::new(EmptyStatus),
             formatter: Arc::new(EmptyStatus),

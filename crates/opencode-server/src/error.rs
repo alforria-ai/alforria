@@ -170,6 +170,18 @@ pub enum ApiError {
         message: String,
         kind: Option<String>,
     },
+    /// `ApiVcsApplyError` (400, `groups/instance.ts:32-41`) —
+    /// `{"name":"VcsApplyError","data":{"message":...,"reason":...}}`.
+    VcsApply {
+        message: String,
+        reason: &'static str,
+    },
+    /// `WorktreeApiError` (400, `groups/experimental.ts:70-77`) —
+    /// `{"name":<tag>,"data":{"message":...}}`.
+    Worktree { tag: &'static str, message: String },
+    /// `ApiMoveSessionError` (400, `groups/control-plane.ts:9-17`) —
+    /// `{"name":"MoveSessionError","data":{"message":...}}`.
+    MoveSession { message: String },
 }
 
 impl ApiError {
@@ -214,6 +226,9 @@ impl ApiError {
             ApiError::SessionBusy { .. } => StatusCode::CONFLICT,
             ApiError::PtyForbidden { .. } => StatusCode::FORBIDDEN,
             ApiError::BadRequest { .. } => StatusCode::BAD_REQUEST,
+            ApiError::VcsApply { .. }
+            | ApiError::Worktree { .. }
+            | ApiError::MoveSession { .. } => StatusCode::BAD_REQUEST,
         }
     }
 
@@ -411,6 +426,19 @@ impl ApiError {
                     &[("kind", opt_str_field(kind))],
                 ),
             ),
+            ApiError::VcsApply { message, reason } => named_body(
+                "VcsApplyError",
+                vec![
+                    ("message", str_field(message)),
+                    ("reason", str_field(reason)),
+                ],
+            ),
+            ApiError::Worktree { tag, message } => {
+                named_body(tag, vec![("message", str_field(message))])
+            }
+            ApiError::MoveSession { message } => {
+                named_body("MoveSessionError", vec![("message", str_field(message))])
+            }
         }
     }
 }

@@ -154,6 +154,7 @@ pub fn production_context(
     );
     ctx.engine_factory = engines.factory();
     ctx.tools = engines.tools();
+    ctx.vcs = Arc::new(state::CoreVcs::default());
     Ok(Arc::new(ctx))
 }
 
@@ -193,23 +194,66 @@ fn instance_for_directory(
     let (config, _opencode_dirs) = opencode_core::ConfigLoader::new().load(&params)?;
 
     // `skill.dirs()` — directory sources from the config (`skills.paths`);
-    // URL sources are plugin machinery (M7).
-    let skill_dirs = config
+    // http(s) entries are URL sources materialized through the discovery
+    // cache (`config/plugin/skill.ts:31-45`, `skill/discovery.ts`).
+    let mut skill_dirs: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(skills) = config
         .skills
         .as_ref()
         .and_then(|skills| skills.paths.clone())
-        .unwrap_or_default()
-        .into_iter()
-        .map(std::path::PathBuf::from)
-        .collect();
+    {
+        let mut items: Vec<String> = Vec::new();
+        for item in skills {
+            if let Some(url) = http_url(&item) {
+                items.push(url);
+            } else {
+                skill_dirs.push(std::path::PathBuf::from(item));
+            }
+        }
+        if !items.is_empty() {
+            let discovery = opencode_core::skill::SkillDiscovery::new(
+                paths.cache.clone(),
+                Arc::new(opencode_core::skill::ReqwestFetcher),
+            );
+            for url in items {
+                skill_dirs.extend(discovery.pull(&url));
+            }
+        }
+    }
 
-    // `reference.list()` — local sources; git sources need the repository
-    // cache (M7).
+    // `reference.list()` — local sources land directly; git sources
+    // materialize to the repository cache path (`reference.ts:60-96`).
     let mut reference_dirs = Vec::new();
     if let Some(references) = config.references.as_ref().or(config.reference.as_ref()) {
-        for entry in references.values() {
-            if let opencode_core::config::schema::ReferenceEntry::Local(local) = entry {
-                reference_dirs.push(std::path::PathBuf::from(&local.path));
+        for (name, entry) in references {
+            if !valid_alias(name) {
+                continue;
+            }
+            match entry {
+                opencode_core::config::schema::ReferenceEntry::Local(local) => {
+                    reference_dirs.push(std::path::PathBuf::from(&local.path));
+                }
+                opencode_core::config::schema::ReferenceEntry::Repository(repository) => {
+                    // A string entry is local when it starts with `.`, `/`
+                    // or `~`; anything else is a git repository
+                    // (`config/plugin/reference.ts:31-38`).
+                    if repository.starts_with(['.', '/', '~']) {
+                        reference_dirs.push(expand_reference_path(&paths.home, repository));
+                    } else if let Some(path) =
+                        materialize_git_reference(&paths.data.join("repos"), repository, None)
+                    {
+                        reference_dirs.push(path);
+                    }
+                }
+                opencode_core::config::schema::ReferenceEntry::Git(git_entry) => {
+                    if let Some(path) = materialize_git_reference(
+                        &paths.data.join("repos"),
+                        &git_entry.repository,
+                        git_entry.branch.as_deref(),
+                    ) {
+                        reference_dirs.push(path);
+                    }
+                }
             }
         }
     }
@@ -280,6 +324,79 @@ pub fn write_warning(out: &mut impl std::io::Write) {
 
 pub fn write_listening(out: &mut impl std::io::Write, hostname: &str, port: u16) {
     let _ = writeln!(out, "opencode server listening on http://{hostname}:{port}");
+}
+
+/// `URL.canParse(item) && /^(https?:)$/.test(new URL(item).protocol)`
+/// (`config/plugin/skill.ts:31-34`) — the `http:`/`https:` scheme prefix,
+/// case-insensitive like the WHATWG URL parser.
+fn http_url(item: &str) -> Option<String> {
+    let (scheme, rest) = item.split_once(':')?;
+    if (scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
+        && !rest.is_empty()
+    {
+        return Some(item.to_string());
+    }
+    None
+}
+
+/// `validAlias` (`config/plugin/reference.ts:42-44`) — non-empty, without
+/// `/`, whitespace, backtick or comma.
+fn valid_alias(name: &str) -> bool {
+    !name.is_empty() && !name.chars().any(|c| matches!(c, '/' | ' ' | '`' | ','))
+}
+
+/// `~/` expands against the home directory (`localPath`,
+/// `config/plugin/reference.ts:46-49`); other shapes keep the raw value,
+/// matching the `Local` entry handling.
+fn expand_reference_path(home: &std::path::Path, value: &str) -> std::path::PathBuf {
+    if let Some(rest) = value.strip_prefix("~/") {
+        return home.join(rest);
+    }
+    std::path::PathBuf::from(value)
+}
+
+/// One git reference materialization — the cache path is returned
+/// immediately, the tracking `ensure` runs in the background with its
+/// failures logged (`reference.ts:86-96`).
+fn materialize_git_reference(
+    repos_dir: &std::path::Path,
+    repository: &str,
+    branch: Option<&str>,
+) -> Option<std::path::PathBuf> {
+    let reference = opencode_core::repository::parse(repository)?;
+    if !opencode_core::repository::is_remote(&reference) {
+        return None;
+    }
+    let opencode_core::repository::Reference::Remote(reference) = reference else {
+        return None;
+    };
+    if let Some(branch) = branch {
+        if opencode_core::repository::validate_branch(branch).is_err() {
+            return None;
+        }
+    }
+    let path = opencode_core::repository::cache_path(
+        repos_dir,
+        &opencode_core::repository::Reference::Remote(reference.clone()),
+        branch,
+    );
+    let repos_dir = repos_dir.to_path_buf();
+    let repository = repository.to_string();
+    let branch = branch.map(str::to_string);
+    std::thread::spawn(move || {
+        let cache = opencode_core::repository::RepositoryCache::new(
+            Arc::new(opencode_core::SubprocessGit),
+            repos_dir,
+        );
+        if let Err(cause) = cache.ensure(opencode_core::repository::EnsureInput {
+            reference: &reference,
+            refresh: true,
+            branch: branch.as_deref(),
+        }) {
+            tracing::warn!(repository, cause = %cause, "failed to materialize reference");
+        }
+    });
+    Some(path)
 }
 
 /// `opencode serve` — print the banner and run until stopped.

@@ -646,3 +646,339 @@ async fn tui_control_queue_roundtrip() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(body_string(response).await, "true");
 }
+
+// -----------------------------------------------------------------------
+// vcs family (`handlers/instance.ts:34-65`)
+// -----------------------------------------------------------------------
+
+fn git(dir: &std::path::Path, args: &[&str]) {
+    let ok = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    assert!(ok, "git {args:?} failed in {}", dir.display());
+}
+
+fn git_fixture(_tag: &str) -> Fixture {
+    let dir = tempfile::tempdir().unwrap();
+    let worktree = dir.path().join("repo");
+    std::fs::create_dir_all(&worktree).unwrap();
+    git(&worktree, &["init", "--quiet", "-b", "main"]);
+    git(&worktree, &["config", "user.email", "test@opencode.test"]);
+    git(&worktree, &["config", "user.name", "Test"]);
+    std::fs::write(worktree.join("tracked.txt"), "one\n").unwrap();
+    git(&worktree, &["add", "."]);
+    git(&worktree, &["commit", "--quiet", "-m", "root"]);
+
+    let storage = Arc::new(Storage::open(dir.path().join("db.sqlite")).unwrap());
+    let agent_input = opencode_core::AgentRegistryInput {
+        config: serde_json::from_value(serde_json::json!({})).unwrap(),
+        skill_dirs: Vec::new(),
+        reference_dirs: Vec::new(),
+        worktree: worktree.clone(),
+        data_dir: dir.path().to_path_buf(),
+        tmp_dir: dir.path().to_path_buf(),
+        home: dir.path().to_path_buf(),
+    };
+    let services = Arc::new(SessionServices::new(
+        storage.clone(),
+        Arc::new(NoJobs),
+        Arc::new(FixedClock),
+        &agent_input,
+    ));
+    let services_for_factory = services.clone();
+    let instances =
+        InstanceStore::new(Arc::new(move |_directory| Ok(services_for_factory.clone())));
+    let mut ctx = ServerContext::new(
+        AuthConfig::new("opencode", None),
+        instances,
+        storage.clone(),
+        Arc::new(EventBus::new_shared(storage, None)),
+        Vec::new(),
+        Arc::new(EmptyUiBackend),
+    );
+    ctx.vcs = Arc::new(opencode_server::state::CoreVcs::default());
+    Fixture {
+        _dir: dir,
+        ctx: Arc::new(ctx),
+        worktree,
+    }
+}
+
+#[tokio::test]
+async fn vcs_routes_report_git_state() {
+    let f = git_fixture("vcs-routes");
+    std::fs::write(f.worktree.join("tracked.txt"), "changed\n").unwrap();
+    std::fs::write(f.worktree.join("created.txt"), "created\n").unwrap();
+    let router = routes::build_router(f.ctx.clone());
+
+    let response = send(&router, "GET", &instance_uri(&f.worktree, "vcs"), "").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let value: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+    assert_eq!(value["branch"], "main");
+    assert_eq!(value["default_branch"], "main");
+
+    let response = send(&router, "GET", &instance_uri(&f.worktree, "vcs/status"), "").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let rows: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+    let created = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["file"] == "created.txt")
+        .unwrap();
+    assert_eq!(created["status"], "added");
+    assert_eq!(created["additions"], 1);
+
+    // mode is required and validated
+    let response = send(&router, "GET", &instance_uri(&f.worktree, "vcs/diff"), "").await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let response = send(
+        &router,
+        "GET",
+        &format!("{}&mode=bogus", instance_uri(&f.worktree, "vcs/diff")),
+        "",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let response = send(
+        &router,
+        "GET",
+        &format!("{}&mode=git", instance_uri(&f.worktree, "vcs/diff")),
+        "",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let diffs: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+    assert_eq!(diffs.as_array().unwrap().len(), 2);
+
+    let response = send(
+        &router,
+        "GET",
+        &instance_uri(&f.worktree, "vcs/diff/raw"),
+        "",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "text/x-diff; charset=utf-8"
+    );
+    let raw = body_string(response).await;
+    assert!(raw.contains("tracked.txt"));
+    assert!(raw.contains("created.txt"));
+}
+
+#[tokio::test]
+async fn vcs_apply_route_round_trips_and_errors() {
+    let f = git_fixture("vcs-apply-routes");
+    let router = routes::build_router(f.ctx.clone());
+
+    let patch = "diff --git a/tracked.txt b/tracked.txt\n\
+                 --- a/tracked.txt\n\
+                 +++ b/tracked.txt\n\
+                 @@ -1 +1 @@\n\
+                 -one\n\
+                 +applied\n";
+    let response = send(
+        &router,
+        "POST",
+        &instance_uri(&f.worktree, "vcs/apply"),
+        &format!(r#"{{"patch":{}}}"#, serde_json::to_string(patch).unwrap()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_string(response).await, r#"{"applied":true}"#);
+    assert_eq!(
+        std::fs::read_to_string(f.worktree.join("tracked.txt")).unwrap(),
+        "applied\n"
+    );
+
+    // Re-applying conflicts (not clean).
+    let response = send(
+        &router,
+        "POST",
+        &instance_uri(&f.worktree, "vcs/apply"),
+        &format!(r#"{{"patch":{}}}"#, serde_json::to_string(patch).unwrap()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let value: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+    assert_eq!(value["name"], "VcsApplyError");
+    assert_eq!(value["data"]["reason"], "not-clean");
+
+    // A non-git directory surfaces the non-git reason.
+    let plain = f._dir.path().join("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+    let response = send(
+        &router,
+        "POST",
+        &instance_uri(&plain, "vcs/apply"),
+        &format!(r#"{{"patch":{}}}"#, serde_json::to_string(patch).unwrap()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let value: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+    assert_eq!(value["name"], "VcsApplyError");
+    assert_eq!(value["data"]["reason"], "non-git");
+}
+
+// -----------------------------------------------------------------------
+// worktree + move-session (`handlers/experimental.ts`, `handlers/control-plane.ts`)
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn experimental_worktree_routes() {
+    std::env::set_var("OPENCODE_TEST_HOME", tempfile::tempdir().unwrap().path());
+    let f = git_fixture("worktree-routes");
+    let router = routes::build_router(f.ctx.clone());
+
+    let response = send(
+        &router,
+        "GET",
+        &instance_uri(&f.worktree, "experimental/worktree"),
+        "",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_string(response).await, "[]");
+
+    let response = send(
+        &router,
+        "POST",
+        &instance_uri(&f.worktree, "experimental/worktree"),
+        r#"{"name":"Route Worktree"}"#,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let info: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+    assert_eq!(info["name"], "route-worktree");
+    assert_eq!(info["branch"], "opencode/route-worktree");
+    assert!(info["directory"]
+        .as_str()
+        .unwrap()
+        .contains("route-worktree"));
+
+    let response = send(
+        &router,
+        "GET",
+        &instance_uri(&f.worktree, "experimental/worktree"),
+        "",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let listed: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+    assert_eq!(listed.as_array().unwrap().len(), 1);
+
+    let response = send(
+        &router,
+        "POST",
+        &instance_uri(&f.worktree, "experimental/worktree/reset"),
+        &format!(
+            r#"{{"directory":{}}}"#,
+            serde_json::to_string(info["directory"].as_str().unwrap()).unwrap()
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_string(response).await, "true");
+
+    let response = send(
+        &router,
+        "DELETE",
+        &instance_uri(&f.worktree, "experimental/worktree"),
+        &format!(
+            r#"{{"directory":{}}}"#,
+            serde_json::to_string(info["directory"].as_str().unwrap()).unwrap()
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_string(response).await, "true");
+
+    let response = send(
+        &router,
+        "GET",
+        &instance_uri(&f.worktree, "experimental/worktree"),
+        "",
+    )
+    .await;
+    assert_eq!(body_string(response).await, "[]");
+}
+
+#[tokio::test]
+async fn experimental_move_session_route() {
+    let f = git_fixture("move-session-routes");
+    let router = routes::build_router(f.ctx.clone());
+
+    let response = send(&router, "POST", &instance_uri(&f.worktree, "session"), "").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let session: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+
+    // A nested directory inside the same checkout moves the session.
+    let nested = f.worktree.join("packages");
+    std::fs::create_dir_all(&nested).unwrap();
+    let response = send(
+        &router,
+        "POST",
+        "/experimental/control-plane/move-session",
+        &format!(
+            r#"{{"sessionID":"{}","destination":{{"directory":{}}},"moveChanges":false}}"#,
+            session["id"].as_str().unwrap(),
+            serde_json::to_string(nested.to_string_lossy().as_ref()).unwrap()
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(body_string(response).await, "");
+
+    // Unknown sessions surface the MoveSessionError wire shape.
+    let response = send(
+        &router,
+        "POST",
+        "/experimental/control-plane/move-session",
+        r#"{"sessionID":"ses_missing","destination":{"directory":"/tmp"}}"#,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let value: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+    assert_eq!(value["name"], "MoveSessionError");
+    assert_eq!(value["data"]["message"], "Session not found: ses_missing");
+
+    // Non `ses` ids are rejected before the store lookup.
+    let response = send(
+        &router,
+        "POST",
+        "/experimental/control-plane/move-session",
+        r#"{"sessionID":"nope","destination":{"directory":"/tmp"}}"#,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // A destination outside the project is a known error.
+    let elsewhere = f._dir.path().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let response = send(
+        &router,
+        "POST",
+        "/experimental/control-plane/move-session",
+        &format!(
+            r#"{{"sessionID":"{}","destination":{{"directory":{}}}}}"#,
+            session["id"].as_str().unwrap(),
+            serde_json::to_string(elsewhere.to_string_lossy().as_ref()).unwrap()
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let value: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+    assert_eq!(value["name"], "MoveSessionError");
+    assert_eq!(
+        value["data"]["message"],
+        "Destination directory belongs to another project"
+    );
+}

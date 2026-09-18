@@ -1591,6 +1591,26 @@ pub fn register_projectors(events: &EventBus) {
         }),
     );
 
+    // session.next.moved (projector.ts:241-253)
+    events.project(
+        &crate::control_plane::SESSION_NEXT_MOVED,
+        Arc::new(|conn, payload| {
+            let data: opencode_schema::session_event::Moved =
+                serde_json::from_value(payload.data.clone()).map_err(invalid_payload)?;
+            conn.execute(
+                "UPDATE session SET directory = ?2, path = ?3, workspace_id = ?4, time_updated = ?5 WHERE id = ?1",
+                rusqlite::params![
+                    data.session_id,
+                    data.location.directory,
+                    data.subdirectory,
+                    data.location.workspace_id,
+                    data.timestamp,
+                ],
+            )?;
+            Ok(())
+        }),
+    );
+
     // session.deleted (projector.ts:236-238)
     events.project(
         &event_definitions::SESSION_DELETED,

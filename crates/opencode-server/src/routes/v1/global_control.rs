@@ -890,6 +890,173 @@ pub async fn experimental_tool_ids(
     Ok(json_ok(registry.ids()))
 }
 
+// ---------------------------------------------------------------------------
+// worktree (`handlers/experimental.ts:106-130` + `worktree/index.ts`)
+// ---------------------------------------------------------------------------
+
+/// `WorktreeApiError` mapping (`handlers/experimental.ts:15-18`).
+fn worktree_error(err: opencode_core::worktree::Error) -> ServerError {
+    crate::error::ApiError::Worktree {
+        tag: err.tag,
+        message: err.message,
+    }
+    .into()
+}
+
+/// The `InstanceState.context` bits the worktree service reads.
+fn worktree_context(
+    location: &LocationContext,
+) -> Result<opencode_core::worktree::Context, ServerError> {
+    let instance = location
+        .services
+        .instance(&location.directory)
+        .map_err(defect)?;
+    Ok(opencode_core::worktree::Context {
+        project_id: instance.project.id.clone(),
+        project_worktree: PathBuf::from(&instance.project.worktree),
+        worktree: instance.worktree.clone(),
+        workspace_id: location.workspace_id.clone(),
+        is_git: instance.project.vcs == Some(opencode_schema::project::ProjectVcs::Git),
+    })
+}
+
+/// `worktree` (`handlers/experimental.ts:106-109`) — the project's
+/// sandboxes.
+pub async fn worktree_list(
+    State(ctx): State<Arc<ServerContext>>,
+    axum::Extension(location): axum::Extension<LocationContext>,
+) -> Result<Response, ServerError> {
+    let instance = location
+        .services
+        .instance(&location.directory)
+        .map_err(defect)?;
+    let sandboxes = ctx
+        .projects
+        .sandboxes(&instance.project.id)
+        .map_err(|err| defect(err.to_string()))?;
+    Ok(json_ok(sandboxes))
+}
+
+#[derive(serde::Deserialize, Default)]
+struct WorktreeCreatePayload {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default, rename = "startCommand")]
+    start_command: Option<String>,
+}
+
+/// `worktreeCreate` (`handlers/experimental.ts:111-115`).
+pub async fn worktree_create(
+    State(ctx): State<Arc<ServerContext>>,
+    axum::Extension(location): axum::Extension<LocationContext>,
+    body: Bytes,
+) -> Result<Response, ServerError> {
+    let input = if body.is_empty() {
+        None
+    } else {
+        let payload: WorktreeCreatePayload = parse_payload(&body)?;
+        Some(opencode_core::worktree::CreateInput {
+            name: payload.name,
+            start_command: payload.start_command,
+        })
+    };
+    let worktree_context = worktree_context(&location)?;
+    let info = ctx
+        .worktree
+        .create(&*ctx.worktree_deps, &worktree_context, input.as_ref())
+        .map_err(worktree_error)?;
+    Ok(json_ok(info))
+}
+
+#[derive(serde::Deserialize)]
+struct WorktreeDirectoryPayload {
+    directory: String,
+}
+
+/// `worktreeRemove` (`handlers/experimental.ts:117-126`).
+pub async fn worktree_remove(
+    State(ctx): State<Arc<ServerContext>>,
+    axum::Extension(location): axum::Extension<LocationContext>,
+    body: Bytes,
+) -> Result<Response, ServerError> {
+    let payload: WorktreeDirectoryPayload = parse_payload(&body)?;
+    let worktree_context = worktree_context(&location)?;
+    ctx.worktree
+        .remove(&*ctx.worktree_deps, &worktree_context, &payload.directory)
+        .map_err(worktree_error)?;
+    let instance = location
+        .services
+        .instance(&location.directory)
+        .map_err(defect)?;
+    ctx.projects
+        .remove_sandbox(&instance.project.id, &payload.directory)
+        .map_err(|err| defect(err.to_string()))?;
+    Ok(json_ok(true))
+}
+
+/// `worktreeReset` (`handlers/experimental.ts:128-132`).
+pub async fn worktree_reset(
+    State(ctx): State<Arc<ServerContext>>,
+    axum::Extension(location): axum::Extension<LocationContext>,
+    body: Bytes,
+) -> Result<Response, ServerError> {
+    let payload: WorktreeDirectoryPayload = parse_payload(&body)?;
+    let worktree_context = worktree_context(&location)?;
+    ctx.worktree
+        .reset(&*ctx.worktree_deps, &worktree_context, &payload.directory)
+        .map_err(worktree_error)?;
+    Ok(json_ok(true))
+}
+
+// ---------------------------------------------------------------------------
+// control-plane (`handlers/control-plane.ts`)
+
+/// `moveSession` (`handlers/control-plane.ts:12-27`).
+pub async fn control_plane_move_session(
+    State(ctx): State<Arc<ServerContext>>,
+    body: Bytes,
+) -> Result<Response, ServerError> {
+    #[derive(serde::Deserialize)]
+    struct Destination {
+        directory: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct MovePayload {
+        #[serde(rename = "sessionID")]
+        session_id: String,
+        destination: Destination,
+        #[serde(default, rename = "moveChanges")]
+        move_changes: bool,
+    }
+    let payload: MovePayload = parse_payload(&body)?;
+    if !payload.session_id.starts_with("ses") {
+        return Err(payload_error("Expected a string starting with \"ses\""));
+    }
+    let move_session = opencode_core::control_plane::MoveSession::new(
+        ctx.sessions.clone(),
+        Arc::new(opencode_core::SubprocessGit),
+        ctx.bus.clone(),
+        Arc::new(opencode_core::catalog::SystemClock),
+    );
+    match move_session.move_session(&opencode_core::control_plane::Input {
+        session_id: payload.session_id,
+        destination: payload.destination.directory,
+        move_changes: payload.move_changes,
+    }) {
+        Ok(()) => Ok(Response::builder()
+            .status(StatusCode::NO_CONTENT)
+            .body(Body::empty())
+            .expect("static response parts are valid")),
+        Err(opencode_core::control_plane::MoveSessionError::Known(err)) => {
+            Err(crate::error::ApiError::MoveSession {
+                message: err.message(),
+            }
+            .into())
+        }
+        Err(opencode_core::control_plane::MoveSessionError::Defect(err)) => Err(defect(err)),
+    }
+}
+
 /// `session` (`handlers/experimental.ts:157-176`).
 pub async fn experimental_session(
     axum::Extension(location): axum::Extension<LocationContext>,
@@ -1272,11 +1439,18 @@ pub fn register(
         ("GET", "/experimental/capabilities") => router.route(path, get(experimental_capabilities)),
         ("GET", "/experimental/tool") => router.route(path, get(experimental_tool)),
         ("GET", "/experimental/tool/ids") => router.route(path, get(experimental_tool_ids)),
+        ("GET", "/experimental/worktree") => router.route(path, get(worktree_list)),
+        ("POST", "/experimental/worktree") => router.route(path, post(worktree_create)),
+        ("DELETE", "/experimental/worktree") => router.route(path, delete(worktree_remove)),
+        ("POST", "/experimental/worktree/reset") => router.route(path, post(worktree_reset)),
+        ("POST", "/experimental/control-plane/move-session") => {
+            router.route(path, post(control_plane_move_session))
+        }
         ("GET", "/experimental/session") => router.route(path, get(experimental_session)),
+        ("GET", "/experimental/resource") => router.route(path, get(experimental_resource)),
         ("POST", "/experimental/session/{sessionID}/background") => {
             router.route(path, post(experimental_session_background))
         }
-        ("GET", "/experimental/resource") => router.route(path, get(experimental_resource)),
         // ---- tui ----
         ("POST", "/tui/append-prompt") => router.route(path, post(tui_append_prompt)),
         ("POST", "/tui/open-help") => router.route(path, post(tui_open_help)),
