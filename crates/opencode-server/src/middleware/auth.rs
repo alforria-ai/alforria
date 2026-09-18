@@ -113,7 +113,7 @@ fn is_js_whitespace(c: char) -> bool {
 
 /// `url.searchParams.get(name)` — WHATWG `application/x-www-form-urlencoded`:
 /// first value wins, `+` decodes to space, percent-escapes decode lossily.
-fn query_param(query: Option<&str>, name: &str) -> Option<String> {
+pub(crate) fn query_param(query: Option<&str>, name: &str) -> Option<String> {
     for pair in query?.split('&') {
         if pair.is_empty() {
             continue;
@@ -198,14 +198,14 @@ fn surface(method: &Method, path: &str) -> Surface {
     }
 }
 
-fn routes(table: &[(&str, &str)], method: &str, path: &str) -> bool {
+pub(crate) fn routes(table: &[(&str, &str)], method: &str, path: &str) -> bool {
     table
         .iter()
         .any(|(route_method, route)| *route_method == method && route_matches(route, path))
 }
 
 /// Segment-wise match against an axum `{param}` / `{*wildcard}` route pattern.
-fn route_matches(pattern: &str, path: &str) -> bool {
+pub(crate) fn route_matches(pattern: &str, path: &str) -> bool {
     if let Some(wild) = pattern.find("{*") {
         // Wildcard segments ({*path}) always appear last; the literal prefix
         // up to (and including) the trailing '/' must match, the remainder

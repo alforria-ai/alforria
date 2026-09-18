@@ -51,10 +51,14 @@ async fn every_v2_route_is_registered_and_reachable() {
             .body(Body::empty())
             .unwrap();
         let response = router.clone().oneshot(request).await.unwrap();
-        assert_eq!(
-            response.status(),
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "{method} {path} must resolve to the stub, not the UI fallback"
+        // Location middleware (M6.3) runs before the stub handlers: the
+        // session-scoped routes reject with SessionNotFoundError, everything
+        // else reaches the defect-500 stub. Both differ from the UI
+        // fallback's `{"error":"Not Found"}` body.
+        let body = body(response).await;
+        assert!(
+            body != "{\"error\":\"Not Found\"}",
+            "{method} {path} must resolve past the UI fallback"
         );
     }
 }

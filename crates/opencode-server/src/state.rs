@@ -2,10 +2,11 @@
 //! `InstanceStore` and the `UiBackend` seam.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::ffi::OsString;
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use opencode_core::{EventBus, SessionServices, Storage};
+use opencode_core::{BackgroundJobs, EventBus, SessionServices, SessionStore, Storage};
 
 use crate::error::ServerError;
 
@@ -87,25 +88,87 @@ impl InstanceStore {
         }
     }
 
-    /// Load (and cache) the services for a directory.
+    /// Load (and cache) the services for a directory. The cache is keyed by
+    /// the `FSUtil.resolve`d directory (`InstanceStore.load`,
+    /// `project/instance-store.ts:130-137`).
     pub fn load(&self, directory: &Path) -> Result<Arc<SessionServices>, ServerError> {
+        let directory = resolve_directory(directory);
         let mut entries = self.entries.lock().unwrap();
-        if let Some(existing) = entries.get(directory) {
+        if let Some(existing) = entries.get(&directory) {
             return Ok(existing.clone());
         }
-        let services = (self.factory)(directory)?;
-        entries.insert(directory.to_path_buf(), services.clone());
+        let services = (self.factory)(&directory)?;
+        entries.insert(directory, services.clone());
         Ok(services)
     }
 
     /// Drop the cached instance for a directory (TS `disposeDirectory`).
     pub fn dispose_directory(&self, directory: &Path) {
-        self.entries.lock().unwrap().remove(directory);
+        let directory = resolve_directory(directory);
+        self.entries.lock().unwrap().remove(&directory);
     }
 
     /// Drop every cached instance (TS `disposeAll`).
     pub fn dispose_all(&self) {
         self.entries.lock().unwrap().clear();
+    }
+}
+
+/// `FSUtil.resolve` (`core/src/fs-util.ts:247-258`): `path.resolve` against
+/// the process cwd, then realpath normalization; a directory that does not
+/// exist keeps its lexically normalized form.
+pub fn resolve_directory(p: &Path) -> PathBuf {
+    let resolved = if p.is_absolute() {
+        lexical_normalize(p)
+    } else {
+        lexical_normalize(&cwd().join(p))
+    };
+    match std::fs::canonicalize(&resolved) {
+        Ok(real) => real,
+        Err(_) => resolved,
+    }
+}
+
+/// `process.cwd()`.
+pub fn cwd() -> PathBuf {
+    std::env::current_dir().unwrap_or_default()
+}
+
+/// `path.resolve`-style lexical normalization — collapse `.`/`..` without
+/// touching the filesystem; `..` above the root clamps to the root.
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut parts: Vec<OsString> = Vec::new();
+    let mut root = PathBuf::new();
+    for component in path.components() {
+        match component {
+            c @ (Component::Prefix(_) | Component::RootDir) => {
+                root.push(c.as_os_str());
+                parts.clear();
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                parts.pop();
+            }
+            Component::Normal(part) => parts.push(part.to_os_string()),
+        }
+    }
+    for part in parts {
+        root.push(part);
+    }
+    root
+}
+
+/// No-op `BackgroundJob.Service` — background jobs are a per-session runner
+/// concept (M5.7); the server has no job registry to expose.
+pub struct NoBackgroundJobs;
+
+impl BackgroundJobs for NoBackgroundJobs {
+    fn list(&self) -> Result<Vec<opencode_core::BackgroundJobInfo>, opencode_core::CoreError> {
+        Ok(Vec::new())
+    }
+
+    fn cancel(&self, _id: &str) -> Result<(), opencode_core::CoreError> {
+        Ok(())
     }
 }
 
@@ -144,6 +207,9 @@ impl UiBackend for EmptyUiBackend {}
 pub struct ServerContext {
     pub auth: AuthConfig,
     pub instances: InstanceStore,
+    /// `Session.Service` lookups for workspace routing (`/session/:id/...`
+    /// resolves the session's directory; `shared/workspace-routing.ts:20-29`).
+    pub sessions: SessionStore,
     pub storage: Arc<Storage>,
     pub bus: Arc<EventBus>,
     /// Additional allowed CORS origins (CLI `--cors` list).
@@ -161,9 +227,20 @@ impl ServerContext {
         cors: Vec<String>,
         ui: Arc<dyn UiBackend>,
     ) -> ServerContext {
+        // TS Session.Service is a global DB-backed layer (session.ts:474,
+        // :540-546) — its bridge carries the session projectors, so the
+        // store both writes and reads the session table.
+        opencode_core::register_projectors(&bus);
+        let sessions = SessionStore::new(
+            bus.clone(),
+            storage.clone(),
+            Arc::new(NoBackgroundJobs),
+            Arc::new(opencode_core::catalog::SystemClock),
+        );
         ServerContext {
             auth,
             instances,
+            sessions,
             storage,
             bus,
             cors,
@@ -286,6 +363,49 @@ mod tests {
         let ctx = ServerContext::for_tests();
         assert!(ctx.ui.get("/").is_none());
         assert!(ctx.ui.index().is_none());
+    }
+
+    #[test]
+    fn resolve_directory_matches_fsutil_resolve() {
+        assert_eq!(
+            resolve_directory(Path::new("/repo/../other")),
+            PathBuf::from("/other")
+        );
+        assert_eq!(
+            resolve_directory(Path::new("/repo/./x/")),
+            PathBuf::from("/repo/x")
+        );
+        // `..` above the root clamps to the root (path.resolve).
+        assert_eq!(resolve_directory(Path::new("/..")), PathBuf::from("/"));
+        // Relative paths resolve against the cwd.
+        assert!(resolve_directory(Path::new("some/dir")).is_absolute());
+        // An existing directory resolves through its real path.
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            resolve_directory(&dir.path().join("sub/../")),
+            dir.path().canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn instance_store_keys_by_the_resolved_directory() {
+        let counter = Arc::new(Mutex::new(0));
+        let counter_clone = counter.clone();
+        let store = InstanceStore::new(Arc::new(move |_directory| {
+            *counter_clone.lock().unwrap() += 1;
+            Ok(Arc::new(test_services()))
+        }));
+
+        store.load(Path::new("/repo")).unwrap();
+        // Trailing slashes and `..` segments resolve to the same instance
+        // (FSUtil.resolve keys the cache).
+        store.load(Path::new("/repo/")).unwrap();
+        store.load(Path::new("/repo/x/../")).unwrap();
+        assert_eq!(*counter.lock().unwrap(), 1);
+
+        store.dispose_directory(Path::new("/repo/./"));
+        store.load(Path::new("/repo")).unwrap();
+        assert_eq!(*counter.lock().unwrap(), 2);
     }
 
     fn test_services() -> SessionServices {

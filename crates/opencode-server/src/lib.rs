@@ -111,13 +111,7 @@ fn default_context(opts: &ListenOptions) -> io::Result<Arc<ServerContext>> {
         .map_err(|err| io::Error::other(format!("storage open failed: {err}")))?;
     let storage = Arc::new(storage);
     let bus = Arc::new(opencode_core::EventBus::new_shared(storage.clone(), None));
-    // TODO(M6.3): the real per-directory instance factory (config loading +
-    // storage bootstrap); no M6.1 route loads instances.
-    let instances = InstanceStore::new(Arc::new(|_| {
-        Err(ServerError::Core(opencode_core::CoreError::Storage(
-            "instance factory not wired (M6.3)".to_string(),
-        )))
-    }));
+    let instances = production_instance_factory(storage.clone(), paths.clone());
     Ok(Arc::new(ServerContext::new(
         AuthConfig::from_env(),
         instances,
@@ -125,6 +119,70 @@ fn default_context(opts: &ListenOptions) -> io::Result<Arc<ServerContext>> {
         bus,
         opts.cors.clone(),
         Arc::new(state::EmptyUiBackend),
+    )))
+}
+
+/// The per-directory instance factory (TS `InstanceStore.boot` +
+/// `InstanceBootstrap.run`, `project/instance-store.ts:46-56`): load the
+/// directory's merged config, wire the agent registry and build the M5
+/// service graph over the shared storage.
+fn production_instance_factory(
+    storage: Arc<Storage>,
+    paths: opencode_core::GlobalPaths,
+) -> InstanceStore {
+    let factory: state::InstanceFactory = Arc::new(move |directory: &std::path::Path| {
+        instance_for_directory(storage.clone(), paths.clone(), directory)
+    });
+    InstanceStore::new(factory)
+}
+
+/// One instance boot: config load + service wiring.
+fn instance_for_directory(
+    storage: Arc<Storage>,
+    paths: opencode_core::GlobalPaths,
+    directory: &std::path::Path,
+) -> Result<Arc<opencode_core::SessionServices>, ServerError> {
+    let params = opencode_core::LoadParams::new(directory.to_path_buf()).paths(paths.clone());
+    let (config, _opencode_dirs) = opencode_core::ConfigLoader::new().load(&params)?;
+
+    // `skill.dirs()` — directory sources from the config (`skills.paths`);
+    // URL sources are plugin machinery (M7).
+    let skill_dirs = config
+        .skills
+        .as_ref()
+        .and_then(|skills| skills.paths.clone())
+        .unwrap_or_default()
+        .into_iter()
+        .map(std::path::PathBuf::from)
+        .collect();
+
+    // `reference.list()` — local sources; git sources need the repository
+    // cache (M7).
+    let mut reference_dirs = Vec::new();
+    if let Some(references) = config.references.as_ref().or(config.reference.as_ref()) {
+        for entry in references.values() {
+            if let opencode_core::config::schema::ReferenceEntry::Local(local) = entry {
+                reference_dirs.push(std::path::PathBuf::from(&local.path));
+            }
+        }
+    }
+
+    let agent_input = opencode_core::AgentRegistryInput {
+        config,
+        skill_dirs,
+        reference_dirs,
+        // TODO(M7): project sandbox detection — the worktree is the
+        // directory itself until git worktree support lands.
+        worktree: directory.to_path_buf(),
+        data_dir: paths.data.clone(),
+        tmp_dir: std::env::temp_dir().join("opencode"),
+        home: paths.home.clone(),
+    };
+    Ok(Arc::new(opencode_core::SessionServices::new(
+        storage,
+        Arc::new(state::NoBackgroundJobs),
+        Arc::new(opencode_core::catalog::SystemClock),
+        &agent_input,
     )))
 }
 
@@ -177,5 +235,25 @@ mod tests {
         write_listening(&mut out, "0.0.0.0", 1234);
         let out = String::from_utf8(out).unwrap();
         assert_eq!(out, "opencode server listening on http://0.0.0.0:1234\n");
+    }
+
+    #[test]
+    fn production_factory_builds_services_and_maps_config_errors() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = opencode_core::GlobalPaths::resolve(root.path().join("home"));
+        std::fs::create_dir_all(root.path().join("data")).unwrap();
+        let storage = Arc::new(Storage::open(root.path().join("data/db.sqlite")).unwrap());
+        let store = production_instance_factory(storage.clone(), paths);
+
+        store.load(root.path()).expect("empty directory boots");
+
+        let bad = root.path().join("bad");
+        std::fs::create_dir_all(&bad).unwrap();
+        std::fs::write(bad.join("opencode.json"), "{ not json").unwrap();
+        let err = store.load(&bad).err().expect("invalid config must fail");
+        assert!(matches!(
+            err,
+            ServerError::Core(opencode_core::CoreError::Jsonc { .. })
+        ));
     }
 }
