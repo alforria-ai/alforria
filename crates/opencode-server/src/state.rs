@@ -118,10 +118,14 @@ pub trait SessionEngine: Send + Sync {
         session_id: &str,
         message_id: Option<&str>,
     ) -> Result<Vec<SnapshotFileDiff>, SessionError>;
-    /// `SessionShare.share` / `unshare` (share/session.ts:56-72) — persist
+    /// `SessionShare.share` / `unshare` (share/session.ts:26-37) — persist
     /// the share on the session (the service owns `session.setShare`).
     fn share(&self, session: &V1SessionInfo) -> Result<(), String>;
     fn unshare(&self, session_id: &str) -> Result<(), String>;
+    /// `SessionShare.create`'s auto-share fork (share/session.ts:39-46):
+    /// parentless sessions when `flags.autoShare || config.share == "auto"`,
+    /// failures ignored.
+    fn auto_share(&self, _session: &V1SessionInfo) {}
     /// `sessionBackground` (handlers/experimental.ts:178-193): promote the
     /// session's running, non-background task jobs; `true` when any
     /// promoted. `false` when background subagents are disabled.

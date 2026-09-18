@@ -18,6 +18,7 @@ pub mod paths;
 pub mod project;
 pub mod repository;
 pub mod session;
+pub mod share;
 pub mod skill;
 pub mod storage;
 pub mod tool;
@@ -52,6 +53,10 @@ pub use session::{
     PermissionService, ProjectInfo, QuestionError, QuestionService, Runner, RunnerError,
     SessionAsk, SessionContext, SessionError, SessionServices, SessionStatusService, SessionStore,
     SetClear, ShellError, WithParts, INSTALLATION_VERSION,
+};
+pub use share::{
+    ActiveAccount, HttpShareClient, NoAccount, NoModels, SessionShare, Share, ShareAccounts,
+    ShareHttp, ShareItem, ShareModels, ShareNext, ShareReq, DEFAULT_BASE_URL, FLUSH_DELAY,
 };
 pub use storage::Storage;
 pub use tool::{

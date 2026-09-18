@@ -696,6 +696,7 @@ pub async fn message(
 /// `createRaw` (`handlers/session.ts:155-176`) — empty body = defaults,
 /// invalid JSON or schema = 400.
 pub async fn create(
+    State(state): State<Arc<ServerContext>>,
     axum::Extension(location): axum::Extension<LocationContext>,
     body: Bytes,
 ) -> Result<Response, ServerError> {
@@ -727,8 +728,11 @@ pub async fn create(
         .sessions
         .create(&ctx, &input)
         .map_err(session_error)?;
-    // TODO(M7): `SessionShare.create`'s auto-share fork
-    // (share/session.ts:43-51) — the share service is engine-scoped.
+    // `SessionShare.create`'s auto-share fork (share/session.ts:39-46) —
+    // failures ignored, including a missing engine for the instance.
+    if let Ok(engine) = engine(&state, &location) {
+        engine.auto_share(&info);
+    }
     Ok(json_ok(info))
 }
 

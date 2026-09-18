@@ -258,7 +258,7 @@ pub struct ProductionEngine {
     /// The production tool registry — `/experimental/tool` reads this.
     registry: Arc<ToolRegistry>,
     background: Arc<BackgroundJobService>,
-    config: Arc<opencode_core::config::schema::Config>,
+    share: Arc<opencode_core::share::SessionShare>,
 }
 
 /// The [`SessionEngine`] surface (`state.rs`) over the M5 services. The
@@ -315,17 +315,16 @@ impl SessionEngine for ProductionEngine {
         self.summary.diff(session_id, message_id)
     }
 
-    fn share(&self, _session: &V1SessionInfo) -> Result<(), String> {
-        // TS `enabled` gate (share/session.ts:58-60).
-        if self.config.share == Some(opencode_core::config::schema::Share::Disabled) {
-            Err("Sharing is disabled in configuration".to_string())
-        } else {
-            Err("share service not wired".to_string())
-        }
+    fn share(&self, session: &V1SessionInfo) -> Result<(), String> {
+        self.share.share(&session.id)
     }
 
-    fn unshare(&self, _session_id: &str) -> Result<(), String> {
-        Err("share service not wired".to_string())
+    fn unshare(&self, session_id: &str) -> Result<(), String> {
+        self.share.unshare(session_id)
+    }
+
+    fn auto_share(&self, session: &V1SessionInfo) {
+        self.share.auto_share(session);
     }
 
     fn session_background<'a>(&'a self, session_id: &'a str) -> BoxFuture<'a, bool> {
@@ -428,12 +427,14 @@ pub struct EngineInput {
     pub seams: EngineSeams,
 }
 
-/// Provider-runtime seams: `None` falls back to the unwired M7.7 stubs.
+/// Provider-runtime + share seams: `None` falls back to the unwired M7.7
+/// stubs / the real HTTP share client.
 #[derive(Clone, Default)]
 pub struct EngineSeams {
     pub llm: Option<Arc<dyn LlmStream>>,
     pub models: Option<Arc<dyn ModelSource>>,
     pub input_models: Option<Arc<dyn InputModels>>,
+    pub share_http: Option<Arc<dyn opencode_core::share::ShareHttp>>,
 }
 
 /// `Shell.preferred` (core/shell.ts:205-208) — config value, else `$SHELL`,
@@ -754,13 +755,46 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
     });
     ops.bind(prompt.clone());
 
+    // M7.5: the share network service (share-next.ts) behind its HTTP +
+    // account seams, wrapped in the SessionShare gate/auto-share service
+    // (share/session.ts). The account seam defaults to no active account;
+    // the model seam is the provider runtime (M7.7).
+    let share_next = opencode_core::share::ShareNext::new(opencode_core::share::ShareInput {
+        storage: services.storage.clone(),
+        sessions: services.sessions.clone(),
+        events: services.events.clone(),
+        base_url: input
+            .config
+            .enterprise
+            .as_ref()
+            .and_then(|enterprise| enterprise.url.clone())
+            .unwrap_or_else(|| opencode_core::share::DEFAULT_BASE_URL.to_string()),
+        disabled: opencode_core::share::share_disabled(),
+        directory: input.directory.to_string_lossy().into_owned(),
+        http: input
+            .seams
+            .share_http
+            .clone()
+            .unwrap_or_else(|| Arc::new(opencode_core::share::HttpShareClient)),
+        account: Arc::new(opencode_core::share::NoAccount),
+        models: Arc::new(opencode_core::share::NoModels), // TODO(M7.7)
+        flush_delay: opencode_core::share::FLUSH_DELAY,
+    });
+    share_next.init();
+    let share = Arc::new(opencode_core::share::SessionShare::new(
+        share_next,
+        services.sessions.clone(),
+        input.config.share,
+        bool_env("OPENCODE_AUTO_SHARE"),
+    ));
+
     Ok(Arc::new(ProductionEngine {
         prompt,
         revert,
         summary,
         registry,
         background: input.background.clone(),
-        config: input.config.clone(),
+        share,
     }))
 }
 

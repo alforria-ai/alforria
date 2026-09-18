@@ -201,6 +201,7 @@ fn fixture(llm_text: &str) -> Fixture {
         })),
         models: Some(Arc::new(FixedModels)),
         input_models: Some(Arc::new(FixedInputModels)),
+        share_http: None,
     };
     let ctx = opencode_server::production_context(&ListenOptions::default(), paths, seams).unwrap();
     Fixture {
@@ -394,4 +395,105 @@ async fn session_background_disabled_by_default() {
     assert_eq!(response.status(), StatusCode::OK);
     let promoted: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
     assert_eq!(promoted, serde_json::Value::Bool(false));
+}
+
+// -----------------------------------------------------------------------
+// M7.5 — share auto-share through the production engine
+// -----------------------------------------------------------------------
+
+/// A recording [`ShareHttp`] stub — the share REST API never touches the
+/// network in tests (spec §6.2).
+#[derive(Default)]
+struct RecordingShareHttp {
+    posts: std::sync::Mutex<Vec<(String, String)>>,
+}
+
+impl opencode_core::share::ShareHttp for RecordingShareHttp {
+    fn post(
+        &self,
+        url: &str,
+        _headers: &[(String, String)],
+        body: &str,
+    ) -> Result<opencode_core::share::ShareHttpResponse, String> {
+        self.posts
+            .lock()
+            .unwrap()
+            .push((url.to_string(), body.to_string()));
+        if url.ends_with("/sync") {
+            return Ok(opencode_core::share::ShareHttpResponse {
+                status: 200,
+                body: String::new(),
+            });
+        }
+        Ok(opencode_core::share::ShareHttpResponse {
+            status: 200,
+            body: r#"{"id":"shr_1","url":"https://shr.test/1","secret":"s3cret"}"#.to_string(),
+        })
+    }
+
+    fn delete(
+        &self,
+        _url: &str,
+        _headers: &[(String, String)],
+        _body: &str,
+    ) -> Result<opencode_core::share::ShareHttpResponse, String> {
+        Ok(opencode_core::share::ShareHttpResponse {
+            status: 200,
+            body: String::new(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn session_create_auto_shares_when_config_auto() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("repo")).unwrap();
+    // config.share == "auto" turns on the create auto-share fork.
+    std::fs::write(
+        dir.path().join("repo").join("opencode.json"),
+        r#"{"share": "auto"}"#,
+    )
+    .unwrap();
+    let share_http = Arc::new(RecordingShareHttp::default());
+    let paths = opencode_core::GlobalPaths::resolve(dir.path().to_path_buf());
+    let seams = EngineSeams {
+        llm: None,
+        models: None,
+        input_models: None,
+        share_http: Some(share_http.clone()),
+    };
+    let ctx = opencode_server::production_context(&ListenOptions::default(), paths, seams).unwrap();
+    let router = routes::build_router(ctx);
+
+    let response = send(
+        &router,
+        "POST",
+        &format!(
+            "/session?directory={}",
+            urlencode(&dir.path().join("repo").display().to_string())
+        ),
+        "",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let session: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+    let session_id = session["id"].as_str().unwrap();
+
+    // The auto-share fork posts the legacy create endpoint
+    // (`{"sessionID": …}`) and persists the share url on the session.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let posts = share_http.posts.lock().unwrap();
+        if posts.len() >= 2 || std::time::Instant::now() > deadline {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let posts = share_http.posts.lock().unwrap().clone();
+    let create = posts
+        .iter()
+        .find(|(url, _)| url.ends_with("/api/share"))
+        .expect("auto-share fired");
+    let expected = format!("{{\"sessionID\":\"{session_id}\"}}");
+    assert_eq!(create.1, expected);
 }
