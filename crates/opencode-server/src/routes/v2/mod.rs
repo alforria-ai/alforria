@@ -3,6 +3,11 @@
 //! root is the *un-prefixed* `/experimental/project/:projectID/copy`
 //! (`protocol/groups/project-copy.ts:14`).
 
+pub mod misc;
+pub mod permission;
+pub mod session;
+mod util;
+
 /// `(method, path)` pairs in registration order. 61 endpoints.
 pub const ROUTES: &[(&str, &str)] = &[
     // ---- health (`protocol/groups/health.ts`); handlers in M6.7 ----

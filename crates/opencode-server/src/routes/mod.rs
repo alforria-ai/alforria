@@ -84,6 +84,19 @@ fn register_stub(
     if handled {
         return router;
     }
+    // M6.7 owns the v2 /api families.
+    let (router, handled) = v2::session::register(router, method, path);
+    if handled {
+        return router;
+    }
+    let (router, handled) = v2::permission::register(router, method, path);
+    if handled {
+        return router;
+    }
+    let (router, handled) = v2::misc::register(router, method, path);
+    if handled {
+        return router;
+    }
     match method {
         "GET" => router.route(path, get(stub)),
         "POST" => router.route(path, post(stub)),

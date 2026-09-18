@@ -197,6 +197,18 @@ impl InstanceStore {
         Ok(services)
     }
 
+    /// The cached instances (`/api/session/active` scans every instance's
+    /// status map — the process-wide approximation of the V2
+    /// `SessionExecution.active` set).
+    pub fn cached(&self) -> Vec<Arc<SessionServices>> {
+        self.entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .cloned()
+            .collect()
+    }
+
     /// Drop the cached instance for a directory (TS `disposeDirectory`).
     pub fn dispose_directory(&self, directory: &Path) {
         let directory = resolve_directory(directory);
@@ -694,6 +706,10 @@ pub struct ServerContext {
     pub catalog: CatalogSource,
     /// `ProviderAuth.Service`.
     pub provider_auth: Arc<dyn ProviderAuth>,
+    /// The V2 pending-permission registry (`PermissionV2.Service`). TS owns
+    /// one per location node; the M6 adapter keeps it process-wide, filtered
+    /// by directory (M6.7).
+    pub v2_permissions: Arc<crate::routes::v2::permission::PermissionRegistry>,
 }
 
 impl ServerContext {
@@ -739,6 +755,7 @@ impl ServerContext {
             tools: Arc::new(UnwiredTools),
             catalog: default_catalog(),
             provider_auth: Arc::new(UnwiredProviderAuth),
+            v2_permissions: Arc::new(crate::routes::v2::permission::PermissionRegistry::default()),
         }
     }
 

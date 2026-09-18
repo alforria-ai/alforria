@@ -793,7 +793,7 @@ pub async fn file_content(
 }
 
 /// A reduced `mime-types` lookup for the binary branch of `fs.read`.
-fn mime_type(path: &Path) -> String {
+pub(crate) fn mime_type(path: &Path) -> String {
     match path
         .extension()
         .and_then(|e| e.to_str())
