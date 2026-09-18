@@ -295,15 +295,13 @@ impl MetadataSink for MetadataAdapter {
         input: MetadataInput,
     ) -> crate::tool::def::BoxFuture<'a, Result<(), crate::tool::error::ToolError>> {
         Box::pin(async move {
-            let title = input.title.unwrap_or_default();
-            let metadata = input
-                .metadata
-                .unwrap_or_else(|| Value::Object(Default::default()));
+            let title = input.title;
+            let metadata = input.metadata;
             let args = self.args.clone();
             let now = self.clock.now_ms();
             self.processor
                 .update_tool_call(&self.call_id, move |part| {
-                    update_running_state(part, &title, &metadata, &args, now)
+                    update_running_state(part, title, metadata.as_ref(), &args, now)
                 })
                 .await
                 .map(|_| ())
@@ -316,8 +314,8 @@ impl MetadataSink for MetadataAdapter {
 /// transition to running with the new title/metadata.
 fn update_running_state(
     part: V1Part,
-    title: &str,
-    metadata: &Value,
+    title: Option<String>,
+    metadata: Option<&Value>,
     args: &Value,
     now: u64,
 ) -> V1Part {
@@ -347,17 +345,20 @@ fn update_running_state(
             metadata: part_metadata,
         };
     }
+    // `title: val.title, metadata: val.metadata` — written through
+    // unmodified (tools.ts:70-78); absent keys stay absent.
+    let metadata = metadata.map(json_map);
     let state = match state {
         V1ToolState::Running { time, .. } => V1ToolState::Running {
             input: json_map(args),
-            title: Some(title.to_string()),
-            metadata: Some(json_map(metadata)),
+            title,
+            metadata,
             time,
         },
         _ => V1ToolState::Running {
             input: json_map(args),
-            title: Some(title.to_string()),
-            metadata: Some(json_map(metadata)),
+            title,
+            metadata,
             time: opencode_schema::session_v1::ToolStateRunningTime { start: now },
         },
     };

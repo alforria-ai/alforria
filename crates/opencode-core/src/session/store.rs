@@ -344,7 +344,7 @@ pub struct PartialTime {
 /// spreads; `share`/`summary`/`revert`/`permission` are tri-state.
 #[derive(Debug, Clone, Default)]
 pub struct SessionPatch {
-    pub workspace_id: Option<String>,
+    pub workspace_id: SetClear<String>,
     pub parent_id: Option<String>,
     pub directory: Option<String>,
     pub path: Option<String>,
@@ -751,6 +751,21 @@ impl SessionStore {
     /// children recursively, publish `Deleted`.
     pub fn remove(&self, session_id: &str) -> Result<(), SessionError> {
         let session = self.get(session_id)?;
+        // `remove` needs to work in all cases, such as broken sessions that
+        // run cleanup without instance state (session.ts:606-627) — errors
+        // after the initial get soft-fail to a log.
+        let result = self.remove_guts(session_id, session);
+        if let Err(error) = result {
+            tracing::error!("failed to remove session {session_id}: {error}");
+        }
+        Ok(())
+    }
+
+    fn remove_guts(
+        &self,
+        session_id: &str,
+        session: opencode_schema::session_v1::V1SessionInfo,
+    ) -> Result<(), SessionError> {
         cancel_session_background_jobs(self.background.as_ref(), session_id)?;
         let children = self.children(session_id)?;
         for child in children {
@@ -763,6 +778,7 @@ impl SessionStore {
                 info: session,
             })?,
         )?;
+        self.events.remove(session_id)?;
         Ok(())
     }
 
@@ -950,7 +966,8 @@ impl SessionStore {
         )
     }
 
-    /// `setWorkspace` (session.ts:814-821).
+    /// `setWorkspace` (session.ts:814-821): the spread in `patch` clears
+    /// the key when the input is undefined.
     pub fn set_workspace(
         &self,
         session_id: &str,
@@ -959,7 +976,10 @@ impl SessionStore {
         self.patch(
             session_id,
             SessionPatch {
-                workspace_id,
+                workspace_id: match workspace_id {
+                    Some(workspace) => SetClear::Set(workspace),
+                    None => SetClear::Clear,
+                },
                 time: Some(self.patch_time()),
                 ..Default::default()
             },
@@ -1176,7 +1196,7 @@ impl SessionStore {
             let info = clone_message_with(&msg.info, &session.id, &new_id, &id_map);
             self.update_message(&info)?;
             for part in &msg.parts {
-                let new_part = clone_part(part, &session.id, message::message_id(&info), &id_map);
+                let new_part = clone_part(part, &session.id, message::message_id(&info), &id_map)?;
                 self.update_part(&new_part)?;
             }
         }
@@ -1186,8 +1206,10 @@ impl SessionStore {
 
 /// `patch` spread semantics (session.ts:734-747).
 fn apply_patch(mut info: V1SessionInfo, patch: SessionPatch) -> V1SessionInfo {
-    if let Some(v) = patch.workspace_id {
-        info.workspace_id = Some(v);
+    match patch.workspace_id {
+        SetClear::Set(v) => info.workspace_id = Some(v),
+        SetClear::Clear => info.workspace_id = None,
+        SetClear::Keep => {}
     }
     if let Some(v) = patch.parent_id {
         info.parent_id = Some(v);
@@ -1310,8 +1332,8 @@ fn clone_part(
     session_id: &str,
     message_id: &str,
     id_map: &std::collections::HashMap<String, String>,
-) -> V1Part {
-    let new_id = PartId::ascending(None).unwrap_or_default();
+) -> Result<V1Part, SessionError> {
+    let new_id = PartId::ascending(None)?;
     let mut value = serde_json::to_value(part).unwrap_or_default();
     if let Some(object) = value.as_object_mut() {
         object.insert("id".to_string(), Value::String(new_id));
@@ -1331,7 +1353,7 @@ fn clone_part(
             }
         }
     }
-    serde_json::from_value(value).unwrap_or_else(|_| part.clone())
+    Ok(serde_json::from_value(value).unwrap_or_else(|_| part.clone()))
 }
 
 // ---------------------------------------------------------------------------

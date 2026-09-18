@@ -144,7 +144,7 @@ pub struct CompactionCreate {
     pub agent: String,
     pub model: V1UserModel,
     pub auto: bool,
-    pub overflow: bool,
+    pub overflow: Option<bool>,
 }
 
 /// `compaction.process` input (prompt.ts:1149-1157).
@@ -404,7 +404,7 @@ pub async fn run_loop(
                 })
             {
                 deps.compaction
-                    .create(compaction_create(session_id, &last_user, true, false))
+                    .create(compaction_create(session_id, &last_user, true, None))
                     .await?;
                 continue;
             }
@@ -669,7 +669,7 @@ pub async fn run_loop(
                                     session_id,
                                     &last_user,
                                     true,
-                                    finish.is_none(),
+                                    Some(finish.is_none()),
                                 ))
                                 .await?;
                             Outcome::Continue
@@ -711,7 +711,7 @@ fn compaction_create(
     session_id: &str,
     last_user: &V1Message,
     auto: bool,
-    overflow: bool,
+    overflow: Option<bool>,
 ) -> CompactionCreate {
     let (agent, model) = match last_user {
         V1Message::User { agent, model, .. } => (agent.clone(), model.clone()),
@@ -2143,7 +2143,11 @@ mod tests {
         let creates = h.compaction.creates.lock().unwrap();
         assert_eq!(creates.len(), 1, "expected one compaction create");
         assert!(creates[0].auto);
-        assert!(!creates[0].overflow, "finish is set — not overflow");
+        assert_eq!(
+            creates[0].overflow,
+            Some(false),
+            "finish is set — not overflow"
+        );
     }
 
     #[tokio::test]

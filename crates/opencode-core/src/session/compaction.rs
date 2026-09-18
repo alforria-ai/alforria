@@ -1048,7 +1048,7 @@ impl SessionCompaction {
             session_id: input.session_id.clone(),
             message_id: message_id(&msg).to_string(),
             auto: input.auto,
-            overflow: Some(input.overflow),
+            overflow: input.overflow,
             tail_start_id: None,
         };
         self.deps.sessions.update_part(&part)?;
@@ -1571,7 +1571,7 @@ mod tests {
                     variant: None,
                 },
                 auto,
-                overflow,
+                overflow: Some(overflow),
             })
             .await
             .unwrap();

@@ -82,6 +82,21 @@ pub struct QuestionService {
     pending: Mutex<Vec<PendingEntry>>,
 }
 
+/// Removes the pending entry when the ask future is dropped
+/// (question/index.ts:106-112 — `Effect.ensuring(pending.delete(id))`).
+struct PendingCleanup<'a> {
+    service: &'a QuestionService,
+    id: String,
+}
+
+impl Drop for PendingCleanup<'_> {
+    fn drop(&mut self) {
+        self.service
+            .lock_pending()
+            .retain(|entry| entry.info.id != self.id);
+    }
+}
+
 impl QuestionService {
     pub fn new(events: Arc<EventBus>) -> QuestionService {
         QuestionService {
@@ -146,6 +161,10 @@ impl QuestionService {
         .map_err(|err| QuestionError::Publish(err.to_string()))?;
         self.publish(&QUESTION_ASKED, data)?;
 
+        let guard = PendingCleanup {
+            service: self,
+            id: info.id.clone(),
+        };
         let result = match rx.await {
             Ok(result) => result,
             // The service went away with the ask still pending — the TS
@@ -153,8 +172,7 @@ impl QuestionService {
             // (question/index.ts:74-81).
             Err(_) => Err(QuestionError::Rejected),
         };
-        let mut pending = self.lock_pending();
-        pending.retain(|entry| entry.info.id != info.id);
+        drop(guard);
         result
     }
 
@@ -173,6 +191,7 @@ impl QuestionService {
                 request_id: request_id.to_string(),
             })?;
         let existing = pending.remove(position);
+        drop(pending);
         let data = serde_json::to_value(QuestionRepliedData {
             session_id: existing.info.session_id.clone(),
             request_id: existing.info.id.clone(),
@@ -195,6 +214,7 @@ impl QuestionService {
                 request_id: request_id.to_string(),
             })?;
         let existing = pending.remove(position);
+        drop(pending);
         let data = serde_json::to_value(QuestionRejectedData {
             session_id: existing.info.session_id.clone(),
             request_id: existing.info.id.clone(),

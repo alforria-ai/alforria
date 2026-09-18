@@ -66,8 +66,15 @@ impl Snapshot for DisabledSnapshot {
         Box::pin(async { None })
     }
 
-    fn patch(&self, _id: &str) -> BoxFuture<'static, Result<SnapshotPatch, CoreError>> {
-        Box::pin(async { Err(CoreError::Storage("snapshots are disabled".to_string())) })
+    fn patch(&self, id: &str) -> BoxFuture<'static, Result<SnapshotPatch, CoreError>> {
+        // Soft-fail like the git snapshot (snapshot/index.ts:349-361).
+        let hash = id.to_string();
+        Box::pin(async move {
+            Ok(SnapshotPatch {
+                hash,
+                files: Vec::new(),
+            })
+        })
     }
 
     fn restore(&self, _id: &str) -> BoxFuture<'static, Result<(), CoreError>> {
@@ -149,8 +156,14 @@ impl Snapshot for InMemorySnapshot {
     }
 
     fn patch(&self, id: &str) -> BoxFuture<'static, Result<SnapshotPatch, CoreError>> {
+        // Soft-fail to an empty patch when the snapshot is unknown —
+        // the git snapshot logs a warning and returns `{hash, files: []}`
+        // (snapshot/index.ts:349-361).
         let (id, patch) = self.compute_patch(id);
-        Box::pin(async move { patch.map(|files| SnapshotPatch { hash: id, files }) })
+        Box::pin(async move {
+            let files = patch.unwrap_or_default();
+            Ok(SnapshotPatch { hash: id, files })
+        })
     }
 
     fn restore(&self, id: &str) -> BoxFuture<'static, Result<(), CoreError>> {

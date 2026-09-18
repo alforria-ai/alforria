@@ -217,8 +217,15 @@ impl AgentRegistry {
     /// Construct the registry (agent.ts:88-311).
     pub fn new(input: &AgentRegistryInput) -> AgentRegistry {
         let cfg = &input.config;
-        let glob = truncation_glob(&input.data_dir);
-        let mut whitelisted_dirs = vec![glob.clone(), join_glob(&input.tmp_dir)];
+        // Empty dirs (e.g. a `Default` input) must not become a `/*` glob
+        // that whitelists every absolute path.
+        let mut whitelisted_dirs = Vec::new();
+        if !input.data_dir.as_os_str().is_empty() {
+            whitelisted_dirs.push(truncation_glob(&input.data_dir));
+        }
+        if !input.tmp_dir.as_os_str().is_empty() {
+            whitelisted_dirs.push(join_glob(&input.tmp_dir));
+        }
         for dir in input.skill_dirs.iter().chain(input.reference_dirs.iter()) {
             whitelisted_dirs.push(join_glob(dir));
         }
@@ -535,6 +542,7 @@ impl AgentRegistry {
 
         // Ensure Truncate.GLOB is allowed unless explicitly configured
         // (agent.ts:297-310).
+        let glob = truncation_glob(&input.data_dir);
         let names: Vec<String> = agents.keys().cloned().collect();
         for name in names {
             let explicit = agents

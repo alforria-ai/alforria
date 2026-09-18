@@ -300,9 +300,15 @@ impl SessionSubtask {
             }
             Err(error) => {
                 let current = shared_part.lock().unwrap().clone();
+                let message = error.to_string();
+                let message = if message.is_empty() {
+                    "Tool execution failed".to_string()
+                } else {
+                    format!("Tool execution failed: {message}")
+                };
                 self.deps.sessions.update_part(&failed_part(
                     &current,
-                    error.to_string(),
+                    message,
                     self.deps.clock.now_ms(),
                 ))?;
             }
@@ -491,25 +497,26 @@ fn failed_part(part: &V1Part, error: String, now: u64) -> V1Part {
     let V1Part::Tool { state, .. } = part else {
         return part.clone();
     };
-    let V1ToolState::Running {
-        input,
-        metadata,
-        time,
-        ..
-    } = state
-    else {
-        return part.clone();
+    // Any non-result state converts; `start` falls back to now unless the
+    // part was still running, and pending parts drop their metadata
+    // (prompt.ts:413-428).
+    let (input, metadata, start) = match state {
+        V1ToolState::Running {
+            input,
+            metadata,
+            time,
+            ..
+        } => (input.clone(), metadata.clone(), time.start),
+        V1ToolState::Pending { input, .. } => (input.clone(), None, now),
+        _ => return part.clone(),
     };
     match_tool_state(
         part,
         V1ToolState::Error {
-            input: input.clone(),
+            input,
             error,
-            metadata: metadata.clone(),
-            time: ToolStateErrorTime {
-                start: time.start,
-                end: now,
-            },
+            metadata,
+            time: ToolStateErrorTime { start, end: now },
         },
     )
 }

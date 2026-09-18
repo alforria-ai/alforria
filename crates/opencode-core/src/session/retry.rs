@@ -427,7 +427,7 @@ impl Policy {
                 attempt,
                 message: retry.message,
                 action: retry.action,
-                next: now_ms + wait as u64,
+                next: (now_ms as f64 + wait) as u64,
             },
             wait_ms: wait,
         }

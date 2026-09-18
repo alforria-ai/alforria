@@ -118,6 +118,19 @@ pub struct PermissionService {
     state: Mutex<State>,
 }
 
+/// Removes the pending entry when the ask future is dropped
+/// (permission/index.ts:101-108 — `Effect.ensuring(pending.delete(id))`).
+struct PendingCleanup<'a> {
+    service: &'a PermissionService,
+    id: String,
+}
+
+impl Drop for PendingCleanup<'_> {
+    fn drop(&mut self) {
+        self.service.remove_pending(&self.id);
+    }
+}
+
 impl PermissionService {
     pub fn new(events: Arc<EventBus>) -> PermissionService {
         PermissionService {
@@ -130,6 +143,15 @@ impl PermissionService {
         self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// `Effect.ensuring(pending.delete(id))` (permission/index.ts:101-108) —
+    /// the ask future may be dropped (tool abort, cancellation) while parked;
+    /// remove the pending entry then too.
+    fn remove_pending(&self, id: &str) {
+        self.lock_state()
+            .pending
+            .retain(|entry| entry.info.id != id);
     }
 
     fn publish_asked(&self, request: &PermissionV1Request) -> Result<(), PermissionError> {
@@ -230,6 +252,10 @@ impl PermissionService {
             });
         }
         self.publish_asked(&request)?;
+        let guard = PendingCleanup {
+            service: self,
+            id: request.id.clone(),
+        };
         let result = match rx.await {
             Ok(result) => result,
             // The service went away with the ask still pending — the TS
@@ -237,12 +263,14 @@ impl PermissionService {
             // (permission/index.ts:54-60).
             Err(_) => Err(PermissionError::Rejected),
         };
-        let mut state = self.lock_state();
-        state.pending.retain(|entry| entry.info.id != request.id);
+        drop(guard);
         result
     }
 
-    /// `reply` (permission/index.ts:109-167 — binding).
+    /// `reply` (permission/index.ts:109-167 — binding). State mutation
+    /// happens under the lock; publishes run after it is released — the
+    /// bus invokes listeners synchronously, so publishing while holding
+    /// the state lock can deadlock re-entrant callers.
     pub fn reply(&self, input: PermissionV1ReplyInput) -> Result<(), PermissionError> {
         let mut state = self.lock_state();
         let position = state
@@ -253,7 +281,12 @@ impl PermissionService {
                 request_id: input.request_id.clone(),
             })?;
         let existing = state.pending.remove(position);
-        self.publish_replied(&existing.info.session_id, &existing.info.id, input.reply)?;
+        let mut publishes = vec![(existing.info.clone(), input.reply)];
+        let mut sends: Vec<(
+            PermissionError,
+            oneshot::Sender<Result<(), PermissionError>>,
+        )> = Vec::new();
+        let mut ok_sends: Vec<oneshot::Sender<Result<(), PermissionError>>> = Vec::new();
 
         if input.reply == PermissionV1Reply::Reject {
             let failure = match &input.message {
@@ -262,7 +295,7 @@ impl PermissionService {
                 },
                 None => PermissionError::Rejected,
             };
-            let _ = existing.done.send(Err(failure));
+            sends.push((failure, existing.done));
             // Reject every other pending request of the same session
             // (129-138), publishing `reply: "reject"` per request.
             let session_id = existing.info.session_id.clone();
@@ -279,59 +312,60 @@ impl PermissionService {
                     .position(|entry| entry.info.id == request_id)
                     .expect("position computed under the state lock");
                 let entry = state.pending.remove(position);
-                self.publish_replied(
-                    &entry.info.session_id,
-                    &entry.info.id,
-                    PermissionV1Reply::Reject,
-                )?;
-                let _ = entry.done.send(Err(PermissionError::Rejected));
+                publishes.push((entry.info.clone(), PermissionV1Reply::Reject));
+                sends.push((PermissionError::Rejected, entry.done));
             }
-            return Ok(());
+        } else {
+            ok_sends.push(existing.done);
+            if input.reply == PermissionV1Reply::Once {
+                // no auto-approval
+            } else {
+                // `always`: append `allow` rules for the request's `always`
+                // patterns (145-151), then auto-approve every other pending
+                // request of the same session whose patterns are all allowed
+                // now (153-166) — evaluated against `approved` only.
+                for pattern in &existing.info.always {
+                    state.approved.push(PermissionV1Rule {
+                        permission: existing.info.permission.clone(),
+                        pattern: pattern.clone(),
+                        action: PermissionV1Action::Allow,
+                    });
+                }
+                let approved = state.approved.clone();
+                let session_id = existing.info.session_id.clone();
+                let satisfied: Vec<String> = state
+                    .pending
+                    .iter()
+                    .filter(|entry| entry.info.session_id == session_id)
+                    .filter(|entry| {
+                        entry.info.patterns.iter().all(|pattern| {
+                            evaluate(&entry.info.permission, pattern, &[&approved]).action
+                                == PermissionV1Action::Allow
+                        })
+                    })
+                    .map(|entry| entry.info.id.clone())
+                    .collect();
+                for request_id in satisfied {
+                    let position = state
+                        .pending
+                        .iter()
+                        .position(|entry| entry.info.id == request_id)
+                        .expect("position computed under the state lock");
+                    let entry = state.pending.remove(position);
+                    publishes.push((entry.info.clone(), PermissionV1Reply::Always));
+                    ok_sends.push(entry.done);
+                }
+            }
         }
-
-        let _ = existing.done.send(Ok(()));
-        if input.reply == PermissionV1Reply::Once {
-            return Ok(());
+        drop(state);
+        for (info, reply) in publishes {
+            self.publish_replied(&info.session_id, &info.id, reply)?;
         }
-
-        // `always`: append `allow` rules for the request's `always`
-        // patterns (145-151), then auto-approve every other pending
-        // request of the same session whose patterns are all allowed now
-        // (153-166) — evaluated against `approved` only.
-        for pattern in &existing.info.always {
-            state.approved.push(PermissionV1Rule {
-                permission: existing.info.permission.clone(),
-                pattern: pattern.clone(),
-                action: PermissionV1Action::Allow,
-            });
+        for (failure, done) in sends {
+            let _ = done.send(Err(failure));
         }
-        let approved = state.approved.clone();
-        let session_id = existing.info.session_id.clone();
-        let satisfied: Vec<String> = state
-            .pending
-            .iter()
-            .filter(|entry| entry.info.session_id == session_id)
-            .filter(|entry| {
-                entry.info.patterns.iter().all(|pattern| {
-                    evaluate(&entry.info.permission, pattern, &[&approved]).action
-                        == PermissionV1Action::Allow
-                })
-            })
-            .map(|entry| entry.info.id.clone())
-            .collect();
-        for request_id in satisfied {
-            let position = state
-                .pending
-                .iter()
-                .position(|entry| entry.info.id == request_id)
-                .expect("position computed under the state lock");
-            let entry = state.pending.remove(position);
-            self.publish_replied(
-                &entry.info.session_id,
-                &entry.info.id,
-                PermissionV1Reply::Always,
-            )?;
-            let _ = entry.done.send(Ok(()));
+        for done in ok_sends {
+            let _ = done.send(Ok(()));
         }
         Ok(())
     }

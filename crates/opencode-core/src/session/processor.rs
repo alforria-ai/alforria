@@ -849,8 +849,18 @@ impl Handle {
                 provider_metadata,
                 ..
             } => self.reasoning_start(&id, provider_metadata).await,
-            LlmEvent::ReasoningDelta { id, text, .. } => self.reasoning_delta(&id, &text).await,
-            LlmEvent::ReasoningEnd { id, .. } => self.reasoning_end(&id).await,
+            LlmEvent::ReasoningDelta {
+                id,
+                text,
+                provider_metadata,
+            } => {
+                self.reasoning_delta(&id, &text, provider_metadata.as_ref())
+                    .await
+            }
+            LlmEvent::ReasoningEnd {
+                id,
+                provider_metadata,
+            } => self.reasoning_end(&id, provider_metadata.as_ref()).await,
             LlmEvent::ToolInputStart { id, name, .. } => self.tool_input_start(&id, &name).await,
             LlmEvent::ToolInputDelta { id, name, .. } => self.tool_input(&id, &name).await,
             LlmEvent::ToolInputEnd { id, name, .. } => self.tool_input(&id, &name).await,
@@ -943,7 +953,12 @@ impl Handle {
             .map_err(storage_failure)
     }
 
-    async fn reasoning_delta(&self, id: &str, text: &str) -> Result<(), SourceError> {
+    async fn reasoning_delta(
+        &self,
+        id: &str,
+        text: &str,
+        provider_metadata: Option<&opencode_llm::schema::ids::ProviderMetadata>,
+    ) -> Result<(), SourceError> {
         let inner = &self.inner;
         let (session_id, message_id, part_id) = {
             let mut ctx = self.lock_ctx();
@@ -957,10 +972,15 @@ impl Handle {
                 part_id(part).to_string(),
             );
             if let V1Part::Reasoning {
-                text: part_text, ..
+                text: part_text,
+                metadata: metadata_slot,
+                ..
             } = part
             {
                 part_text.push_str(text);
+                if let Some(metadata) = provider_metadata {
+                    *metadata_slot = provider_metadata_to_map(&Some(metadata.clone()));
+                }
             }
             (session_id, message_id, part_id)
         };
@@ -971,13 +991,25 @@ impl Handle {
             .map_err(storage_failure)
     }
 
-    async fn reasoning_end(&self, id: &str) -> Result<(), SourceError> {
+    async fn reasoning_end(
+        &self,
+        id: &str,
+        provider_metadata: Option<&opencode_llm::schema::ids::ProviderMetadata>,
+    ) -> Result<(), SourceError> {
         let inner = &self.inner;
         let part = {
             let mut ctx = self.lock_ctx();
             let Some(part) = ctx.reasoning_map.remove(id) else {
                 return Ok(());
             };
+            let mut part = part;
+            if let (Some(metadata), V1Part::Reasoning { metadata: slot, .. }) =
+                (provider_metadata, &mut part)
+            {
+                if let Some(map) = provider_metadata_to_map(&Some(metadata.clone())) {
+                    *slot = Some(map);
+                }
+            }
             let now = inner.deps.clock.now_ms();
             finish_time(part, now)
         };

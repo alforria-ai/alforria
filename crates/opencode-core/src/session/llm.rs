@@ -15,7 +15,6 @@
 //! `invalid`-tool fallbacks live in the M4 registry/invalid tool.
 
 use std::collections::BTreeMap;
-use std::collections::VecDeque;
 use std::sync::Arc;
 
 use futures::StreamExt;
@@ -586,124 +585,91 @@ fn schema_map(value: &Value) -> opencode_schema::schema::JsonMap {
     }
 }
 
-/// A queued tool-call settlement: `(id, name, input)`.
-type PendingCall = (String, String, Value);
-
 /// Unfold state for [`dispatch_tool_calls`].
 enum Dispatch {
+    /// The provider stream is live; `tx` keeps the settlements queue open.
     Streaming {
         stream: LlmEventStream,
-        calls: Vec<PendingCall>,
-        tools: Vec<LlmTool>,
+        tx: tokio::sync::mpsc::UnboundedSender<Result<LlmEvent, LlmError>>,
+        rx: tokio::sync::mpsc::UnboundedReceiver<Result<LlmEvent, LlmError>>,
     },
-    Draining {
-        queue: VecDeque<LlmEvent>,
-        calls: VecDeque<PendingCall>,
-        tools: Vec<LlmTool>,
+    /// The provider stream ended; drain the settlements queue until every
+    /// forked dispatch has completed (and dropped its sender).
+    Settlements {
+        rx: tokio::sync::mpsc::UnboundedReceiver<Result<LlmEvent, LlmError>>,
     },
+    /// The provider stream errored; the scope interrupted the settlements.
+    Done,
 }
 
 /// The native-runtime tool-call dispatch: every `tool-call` event that the
-/// provider did not execute itself is dispatched after the provider
-/// stream, and its settlement is appended as `tool-error` (then)
-/// `tool-result` events (native-runtime.ts:103-140, tool-runtime.ts).
+/// provider did not execute itself is forked immediately —
+/// `FiberSet.run(settlements, { startImmediately: true })` — so tool calls
+/// run concurrently with the ongoing provider stream and each other; the
+/// settlements queue is concatenated after the provider stream
+/// (native-runtime.ts:103-140, tool-runtime.ts).
 fn dispatch_tool_calls(stream: LlmEventStream, tools: Vec<LlmTool>) -> LlmEventStream {
-    futures::stream::unfold(
-        Dispatch::Streaming {
-            stream,
-            calls: Vec::new(),
-            tools,
-        },
-        dispatch_next,
-    )
-    .boxed()
-}
-
-async fn dispatch_next(state: Dispatch) -> Option<(Result<LlmEvent, LlmError>, Dispatch)> {
-    match state {
-        Dispatch::Streaming {
-            mut stream,
-            mut calls,
-            tools,
-        } => match stream.next().await {
-            Some(Ok(event)) => {
-                if let LlmEvent::ToolCall {
-                    id,
-                    name,
-                    input,
-                    provider_executed,
-                    ..
-                } = &event
-                {
-                    if *provider_executed != Some(true) {
-                        calls.push((id.clone(), name.clone(), input.clone()));
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let state = Dispatch::Streaming { stream, tx, rx };
+    let tools = std::sync::Arc::new(tools);
+    futures::stream::unfold(state, move |state| {
+        let tools = tools.clone();
+        async move {
+            match state {
+                Dispatch::Streaming { mut stream, tx, rx } => match stream.next().await {
+                    Some(Ok(event)) => {
+                        if let LlmEvent::ToolCall {
+                            id,
+                            name,
+                            input,
+                            provider_executed,
+                            ..
+                        } = &event
+                        {
+                            if *provider_executed != Some(true) {
+                                let id = id.clone();
+                                let name = name.clone();
+                                let input = input.clone();
+                                let tx = tx.clone();
+                                let tools = tools.clone();
+                                // Fork the dispatch (FiberSet.run): the tool
+                                // executes concurrently with the stream and
+                                // its settlement events join the queue.
+                                tokio::spawn(async move {
+                                    let events = dispatch_one(&tools, &id, &name, input).await;
+                                    for event in events {
+                                        if tx.send(Ok(event)).is_err() {
+                                            break;
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                        Some((Ok(event), Dispatch::Streaming { stream, tx, rx }))
                     }
-                }
-                Some((
-                    Ok(event),
-                    Dispatch::Streaming {
-                        stream,
-                        calls,
-                        tools,
-                    },
-                ))
-            }
-            Some(Err(error)) => {
-                // The provider stream errored: surface it and end.
-                Some((
-                    Err(error),
-                    Dispatch::Draining {
-                        queue: VecDeque::new(),
-                        calls: VecDeque::new(),
-                        tools,
-                    },
-                ))
-            }
-            None => {
-                // Provider stream complete — dispatch queued tool calls.
-                drain_next(VecDeque::new(), calls.into(), tools).await
-            }
-        },
-        Dispatch::Draining {
-            queue,
-            calls,
-            tools,
-        } => drain_next(queue, calls, tools).await,
-    }
-}
-
-async fn drain_next(
-    mut queue: VecDeque<LlmEvent>,
-    mut calls: VecDeque<PendingCall>,
-    tools: Vec<LlmTool>,
-) -> Option<(Result<LlmEvent, LlmError>, Dispatch)> {
-    if let Some(event) = queue.pop_front() {
-        return Some((
-            Ok(event),
-            Dispatch::Draining {
-                queue,
-                calls,
-                tools,
-            },
-        ));
-    }
-    match calls.pop_front() {
-        Some((id, name, input)) => {
-            let events = dispatch_one(&tools, &id, &name, input).await;
-            let mut iter = events.into_iter();
-            let first = iter.next().expect("dispatch_one yields at least one event");
-            queue.extend(iter);
-            Some((
-                Ok(first),
-                Dispatch::Draining {
-                    queue,
-                    calls,
-                    tools,
+                    // The provider stream errored: surface it and end (the
+                    // TS scope interrupts the settlement fibers).
+                    Some(Err(error)) => Some((Err(error), Dispatch::Done)),
+                    // Provider stream complete — drop our sender so the
+                    // queue ends once every settlement has finished, then
+                    // drain it (Stream.concat(fromQueue(results))).
+                    None => {
+                        drop(tx);
+                        let mut rx = rx;
+                        rx.recv()
+                            .await
+                            .map(|item| (item, Dispatch::Settlements { rx }))
+                    }
                 },
-            ))
+                Dispatch::Settlements { mut rx } => rx
+                    .recv()
+                    .await
+                    .map(|item| (item, Dispatch::Settlements { rx })),
+                Dispatch::Done => None,
+            }
         }
-        None => None,
-    }
+    })
+    .boxed()
 }
 
 /// The `ToolRuntime.dispatch` port (tool-runtime.ts:23-76) for one call.

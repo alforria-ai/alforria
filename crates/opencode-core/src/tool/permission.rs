@@ -33,7 +33,7 @@ pub fn wildcard_match(input: &str, pattern: &str) -> bool {
     if let Some(prefix) = escaped.strip_suffix(" .*") {
         escaped = format!("{prefix}( .*)?");
     }
-    match regex::Regex::new(&format!("^{escaped}$")) {
+    match regex::Regex::new(&format!("(?s)^{escaped}$")) {
         Ok(re) => re.is_match(&normalized),
         Err(_) => false,
     }
