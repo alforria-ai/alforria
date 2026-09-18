@@ -5,6 +5,7 @@
 pub mod error;
 pub mod middleware;
 pub mod routes;
+pub mod sse;
 pub mod state;
 
 use std::io;
@@ -13,7 +14,7 @@ use std::sync::Arc;
 use opencode_core::Storage;
 
 pub use error::{ApiError, ServerError};
-pub use state::{AuthConfig, InstanceStore, ServerContext, UiBackend};
+pub use state::{AuthConfig, HeartbeatConfig, InstanceStore, ServerContext, UiBackend};
 
 /// `resolveNetworkOptions` defaults (`cli/network.ts:6-19`).
 pub const DEFAULT_PORT: u16 = 0;
@@ -110,7 +111,13 @@ fn default_context(opts: &ListenOptions) -> io::Result<Arc<ServerContext>> {
     let storage = Storage::open_default(&paths.data)
         .map_err(|err| io::Error::other(format!("storage open failed: {err}")))?;
     let storage = Arc::new(storage);
-    let bus = Arc::new(opencode_core::EventBus::new_shared(storage.clone(), None));
+    // The session durable manifest — required by the durable streams
+    // (`/api/session/:id/event`, `/api/session/:id/history`).
+    let manifest = Arc::new(opencode_core::session::event_definitions::SessionManifest::new());
+    let bus = Arc::new(opencode_core::EventBus::new_shared(
+        storage.clone(),
+        Some(manifest),
+    ));
     let instances = production_instance_factory(storage.clone(), paths.clone());
     Ok(Arc::new(ServerContext::new(
         AuthConfig::from_env(),

@@ -5,10 +5,12 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use opencode_core::{BackgroundJobs, EventBus, SessionServices, SessionStore, Storage};
 
 use crate::error::ServerError;
+use crate::sse::{GlobalBus, GlobalEvent, INSTANCE_DISPOSED_TYPE};
 
 /// `OPENCODE_SERVER_PASSWORD` / `OPENCODE_SERVER_USERNAME` config
 /// (`server/auth.ts:17-20`).
@@ -78,6 +80,9 @@ pub type InstanceFactory =
 pub struct InstanceStore {
     factory: InstanceFactory,
     entries: Arc<Mutex<HashMap<PathBuf, Arc<SessionServices>>>>,
+    /// Disposal emissions feed the GlobalBus (`disposeContext`,
+    /// `instance-store.ts:78-93`).
+    global_bus: Arc<Mutex<Option<GlobalBus>>>,
 }
 
 impl InstanceStore {
@@ -85,6 +90,31 @@ impl InstanceStore {
         InstanceStore {
             factory,
             entries: Arc::new(Mutex::new(HashMap::new())),
+            global_bus: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// The GlobalBus to emit `server.instance.disposed` events into — wired
+    /// by [`ServerContext::new`].
+    pub fn set_global_bus(&self, global_bus: GlobalBus) {
+        *self.global_bus.lock().unwrap_or_else(|p| p.into_inner()) = Some(global_bus);
+    }
+
+    /// `emitDisposed` (`instance-store.ts:79-93`): a
+    /// `{type, properties: {directory}}` payload — the emitter assigns the
+    /// id. TS also carries the instance project id and the ambient
+    /// workspace, which need the project registry / workspace context
+    /// (M7).
+    fn emit_disposed(&self, directory: &str) {
+        let global_bus = self.global_bus.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(global_bus) = global_bus.as_ref() {
+            global_bus.emit(GlobalEvent::injected(
+                Some(directory.to_string()),
+                None,
+                None,
+                INSTANCE_DISPOSED_TYPE,
+                serde_json::json!({ "directory": directory }),
+            ));
         }
     }
 
@@ -93,24 +123,42 @@ impl InstanceStore {
     /// `project/instance-store.ts:130-137`).
     pub fn load(&self, directory: &Path) -> Result<Arc<SessionServices>, ServerError> {
         let directory = resolve_directory(directory);
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(existing) = entries.get(&directory) {
             return Ok(existing.clone());
         }
         let services = (self.factory)(&directory)?;
-        entries.insert(directory, services.clone());
+        entries.insert(directory.clone(), services.clone());
         Ok(services)
     }
 
     /// Drop the cached instance for a directory (TS `disposeDirectory`).
     pub fn dispose_directory(&self, directory: &Path) {
         let directory = resolve_directory(directory);
-        self.entries.lock().unwrap().remove(&directory);
+        let removed = self
+            .entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&directory)
+            .is_some();
+        if removed {
+            self.emit_disposed(&directory.display().to_string());
+        }
     }
 
-    /// Drop every cached instance (TS `disposeAll`).
+    /// Drop every cached instance (TS `disposeAll`) — each disposed instance
+    /// emits its own disposed event.
     pub fn dispose_all(&self) {
-        self.entries.lock().unwrap().clear();
+        let removed: Vec<PathBuf> = self
+            .entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .drain()
+            .map(|(directory, _)| directory)
+            .collect();
+        for directory in removed {
+            self.emit_disposed(&directory.display().to_string());
+        }
     }
 }
 
@@ -201,6 +249,29 @@ pub struct EmptyUiBackend;
 
 impl UiBackend for EmptyUiBackend {}
 
+/// SSE heartbeat intervals. TS bakes `Stream.tick("10 seconds")` /
+/// `Stream.tick("15 seconds")` into the stream handlers
+/// (`handlers/event.ts:63`, `handlers/global.ts:35`,
+/// `packages/server/src/handlers/event.ts:37`); the Rust port injects them
+/// through the context so tests need not sleep for real intervals.
+#[derive(Debug, Clone)]
+pub struct HeartbeatConfig {
+    /// v1 streams (`/event`, `/global/event`): a `server.heartbeat` event
+    /// every 10 s.
+    pub v1: Duration,
+    /// `/api/event`: an SSE comment every 15 s.
+    pub v2: Duration,
+}
+
+impl Default for HeartbeatConfig {
+    fn default() -> Self {
+        HeartbeatConfig {
+            v1: Duration::from_secs(10),
+            v2: Duration::from_secs(15),
+        }
+    }
+}
+
 /// Shared per-server state (spec §2.2): the auth config, the per-directory
 /// instance cache and the global bus/storage handle.
 #[derive(Clone)]
@@ -215,6 +286,10 @@ pub struct ServerContext {
     /// Additional allowed CORS origins (CLI `--cors` list).
     pub cors: Vec<String>,
     pub ui: Arc<dyn UiBackend>,
+    /// The GlobalBus feeding `/global/event` + the v1 `/event` disposal
+    /// terminator, bridged onto `bus` (`bus/global.ts`, `event-v2-bridge.ts`).
+    pub global_bus: GlobalBus,
+    pub heartbeat: HeartbeatConfig,
 }
 
 impl ServerContext {
@@ -231,6 +306,8 @@ impl ServerContext {
         // :540-546) — its bridge carries the session projectors, so the
         // store both writes and reads the session table.
         opencode_core::register_projectors(&bus);
+        let global_bus = GlobalBus::bridged(Arc::clone(&bus));
+        instances.set_global_bus(global_bus.clone());
         let sessions = SessionStore::new(
             bus.clone(),
             storage.clone(),
@@ -245,6 +322,8 @@ impl ServerContext {
             bus,
             cors,
             ui,
+            global_bus,
+            heartbeat: HeartbeatConfig::default(),
         }
     }
 

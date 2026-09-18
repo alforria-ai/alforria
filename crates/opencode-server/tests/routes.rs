@@ -27,6 +27,10 @@ async fn body(response: axum::http::Response<Body>) -> String {
 async fn every_v1_route_is_registered_and_reachable() {
     let router = router();
     for (method, path) in routes::v1::ROUTES {
+        // M6.4 owns the SSE streams; both are infinite 200 responses now.
+        if *path == "/event" || *path == "/global/event" {
+            continue;
+        }
         let request = Request::builder()
             .method(*method)
             .uri(path.replace(['{', '}', '*'], ""))
@@ -45,6 +49,11 @@ async fn every_v1_route_is_registered_and_reachable() {
 async fn every_v2_route_is_registered_and_reachable() {
     let router = router();
     for (method, path) in routes::v2::ROUTES {
+        // M6.4: `/api/event` is an infinite SSE stream — reading it to
+        // completion would hang.
+        if *path == "/api/event" {
+            continue;
+        }
         let request = Request::builder()
             .method(*method)
             .uri(path.replace(['{', '}', '*'], ""))

@@ -39,7 +39,7 @@ pub fn build_router(ctx: Arc<ServerContext>) -> Router {
 }
 
 /// Every registered route responds with the defect-500 envelope until its
-/// chunk lands (M6.4-M6.9).
+/// chunk lands (M6.5-M6.9).
 async fn stub() -> axum::response::Response {
     crate::error::defect_response()
 }
@@ -49,6 +49,22 @@ fn register_stub(
     method: &str,
     path: &'static str,
 ) -> Router<Arc<ServerContext>> {
+    // M6.4 owns the four SSE streams.
+    match (method, path) {
+        ("GET", "/event") => {
+            return router.route(path, get(crate::sse::v1_event));
+        }
+        ("GET", "/global/event") => {
+            return router.route(path, get(crate::sse::global_event));
+        }
+        ("GET", "/api/event") => {
+            return router.route(path, get(crate::sse::api_event));
+        }
+        ("GET", "/api/session/{sessionID}/event") => {
+            return router.route(path, get(crate::sse::api_session_event));
+        }
+        _ => {}
+    }
     match method {
         "GET" => router.route(path, get(stub)),
         "POST" => router.route(path, post(stub)),
