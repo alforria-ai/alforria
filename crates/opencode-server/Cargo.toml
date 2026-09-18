@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+opencode-llm = { workspace = true }
 opencode-schema = { workspace = true }
 opencode-core = { workspace = true }
 serde = { workspace = true }
@@ -24,6 +25,7 @@ uuid = { workspace = true }
 rusqlite = { workspace = true }
 portable-pty = { workspace = true }
 ulid = { workspace = true }
+reqwest = { workspace = true }
 
 http-body.workspace = true
 

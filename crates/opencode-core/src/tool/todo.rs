@@ -138,12 +138,12 @@ fn run(
 /// The db-backed `Todo.Service` default (session/todo.ts:23-70): M3 storage
 /// `todo` table + EventV2 bridge.
 pub struct TodoService {
-    storage: Storage,
+    storage: std::sync::Arc<Storage>,
     events: Option<Arc<EventBus>>,
 }
 
 impl TodoService {
-    pub fn new(storage: Storage) -> TodoService {
+    pub fn new(storage: std::sync::Arc<Storage>) -> TodoService {
         TodoService {
             storage,
             events: None,
@@ -295,7 +295,7 @@ mod tests {
         // The bus owns its own connection to the same database file.
         let bus_storage = Storage::open(dir.path().join("db.sqlite")).unwrap();
         let bus = Arc::new(EventBus::new(bus_storage, None));
-        let service = TodoService::new(storage).with_events(Arc::clone(&bus));
+        let service = TodoService::new(Arc::new(storage)).with_events(Arc::clone(&bus));
         Setup { service, bus, dir }
     }
 

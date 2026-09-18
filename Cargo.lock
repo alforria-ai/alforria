@@ -1603,6 +1603,7 @@ dependencies = [
  "http-body",
  "ignore",
  "opencode-core",
+ "opencode-llm",
  "opencode-schema",
  "portable-pty",
  "regex",

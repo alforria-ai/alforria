@@ -834,7 +834,9 @@ pub async fn file_status() -> Result<Response, ServerError> {
 
 /// `capabilities` (`handlers/experimental.ts:48-50`).
 pub async fn experimental_capabilities() -> Result<Response, ServerError> {
-    Ok(json_ok(json!({ "backgroundSubagents": false })))
+    Ok(json_ok(
+        json!({ "backgroundSubagents": crate::engine::background_subagents_enabled() }),
+    ))
 }
 
 /// `tool` (`handlers/experimental.ts:89-99`).
@@ -933,13 +935,21 @@ pub async fn experimental_session(
         .expect("static response parts are valid"))
 }
 
-/// `sessionBackground` (`handlers/experimental.ts:178-193`).
+/// `sessionBackground` (`handlers/experimental.ts:178-193`): promote the
+/// session's running, non-background task jobs; `true` when any promoted.
 pub async fn experimental_session_background(
-    PathParam(_session_id): PathParam<String>,
+    State(ctx): State<Arc<ServerContext>>,
+    axum::Extension(location): axum::Extension<LocationContext>,
+    PathParam(session_id): PathParam<String>,
 ) -> Result<Response, ServerError> {
-    // `flags.experimentalBackgroundSubagents` defaults to false; the
-    // background-job promotion path is TODO(M7).
-    Ok(json_ok(false))
+    // `if (!flags.experimentalBackgroundSubagents) return false` — before
+    // any service resolution (experimental.ts:180).
+    if !crate::engine::background_subagents_enabled() {
+        return Ok(json_ok(false));
+    }
+    let engine = (ctx.engine_factory)(&location)?;
+    let promoted = engine.session_background(&session_id).await;
+    Ok(json_ok(promoted))
 }
 
 /// `resource` (`handlers/experimental.ts:195-197`).

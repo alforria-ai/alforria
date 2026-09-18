@@ -122,6 +122,12 @@ pub trait SessionEngine: Send + Sync {
     /// the share on the session (the service owns `session.setShare`).
     fn share(&self, session: &V1SessionInfo) -> Result<(), String>;
     fn unshare(&self, session_id: &str) -> Result<(), String>;
+    /// `sessionBackground` (handlers/experimental.ts:178-193): promote the
+    /// session's running, non-background task jobs; `true` when any
+    /// promoted. `false` when background subagents are disabled.
+    fn session_background<'a>(&'a self, _session_id: &'a str) -> BoxFuture<'a, bool> {
+        Box::pin(async { false })
+    }
 }
 
 /// Resolves the per-directory [`SessionEngine`]. The default (unwired)

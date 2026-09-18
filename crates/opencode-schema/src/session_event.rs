@@ -691,6 +691,7 @@ mod tests {
             location: crate::location::LocationRef {
                 directory: "/tmp".to_string(),
                 workspace_id: None,
+                project: None,
             },
             subdirectory: None,
         };

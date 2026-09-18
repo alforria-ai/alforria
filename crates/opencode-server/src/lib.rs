@@ -2,6 +2,7 @@
 //! tagged-error wire envelopes, the CORS/compression/fence middleware quirks
 //! and the `serve` listener bootstrap.
 
+pub mod engine;
 pub mod error;
 pub mod middleware;
 pub mod openapi;
@@ -116,6 +117,18 @@ pub async fn listen(opts: &ListenOptions) -> io::Result<Listener> {
 
 fn default_context(opts: &ListenOptions) -> io::Result<Arc<ServerContext>> {
     let paths = opencode_core::GlobalPaths::from_env();
+    production_context(opts, paths, engine::EngineSeams::default())
+}
+
+/// The production server context: shared storage + bus and the per-directory
+/// instance factory that builds the M7.2 production engines. Tests inject
+/// the engine [`engine::EngineSeams`] (mock LLM); production passes the
+/// default (unwired until M7.7).
+pub fn production_context(
+    opts: &ListenOptions,
+    paths: opencode_core::GlobalPaths,
+    seams: engine::EngineSeams,
+) -> io::Result<Arc<ServerContext>> {
     let storage = Storage::open_default(&paths.data)
         .map_err(|err| io::Error::other(format!("storage open failed: {err}")))?;
     let storage = Arc::new(storage);
@@ -126,15 +139,22 @@ fn default_context(opts: &ListenOptions) -> io::Result<Arc<ServerContext>> {
         storage.clone(),
         Some(manifest),
     ));
-    let instances = production_instance_factory(storage.clone(), paths.clone());
-    Ok(Arc::new(ServerContext::new(
+    // M7.2: per-instance engines land in the store keyed by the services
+    // the LocationContext carries; the engine seam resolves through it.
+    let engines = Arc::new(engine::EngineStore::default());
+    let instances =
+        production_instance_factory(storage.clone(), paths.clone(), engines.clone(), seams);
+    let mut ctx = ServerContext::new(
         AuthConfig::from_env(),
         instances,
         storage,
         bus,
         opts.cors.clone(),
         Arc::new(state::EmptyUiBackend),
-    )))
+    );
+    ctx.engine_factory = engines.factory();
+    ctx.tools = engines.tools();
+    Ok(Arc::new(ctx))
 }
 
 /// The per-directory instance factory (TS `InstanceStore.boot` +
@@ -144,9 +164,17 @@ fn default_context(opts: &ListenOptions) -> io::Result<Arc<ServerContext>> {
 fn production_instance_factory(
     storage: Arc<Storage>,
     paths: opencode_core::GlobalPaths,
+    engines: Arc<engine::EngineStore>,
+    seams: engine::EngineSeams,
 ) -> InstanceStore {
     let factory: state::InstanceFactory = Arc::new(move |directory: &std::path::Path| {
-        instance_for_directory(storage.clone(), paths.clone(), directory)
+        instance_for_directory(
+            storage.clone(),
+            paths.clone(),
+            engines.clone(),
+            seams.clone(),
+            directory,
+        )
     });
     InstanceStore::new(factory)
 }
@@ -157,6 +185,8 @@ fn production_instance_factory(
 fn instance_for_directory(
     storage: Arc<Storage>,
     paths: opencode_core::GlobalPaths,
+    engines: Arc<engine::EngineStore>,
+    seams: engine::EngineSeams,
     directory: &std::path::Path,
 ) -> Result<Arc<opencode_core::SessionServices>, ServerError> {
     let params = opencode_core::LoadParams::new(directory.to_path_buf()).paths(paths.clone());
@@ -198,7 +228,7 @@ fn instance_for_directory(
         .map_err(|err| ServerError::Core(opencode_core::CoreError::Storage(err.to_string())))?;
 
     let agent_input = opencode_core::AgentRegistryInput {
-        config,
+        config: config.clone(),
         skill_dirs,
         reference_dirs,
         worktree: worktree.clone(),
@@ -206,9 +236,12 @@ fn instance_for_directory(
         tmp_dir: std::env::temp_dir().join("opencode"),
         home: paths.home.clone(),
     };
+    // M7.2: the background-job service backs the run-state cancel seam.
+    let background =
+        opencode_core::BackgroundJobService::new(Arc::new(opencode_core::catalog::SystemClock));
     let services = Arc::new(opencode_core::SessionServices::new(
         storage,
-        Arc::new(state::NoBackgroundJobs),
+        background.clone(),
         Arc::new(opencode_core::catalog::SystemClock),
         &agent_input,
     ));
@@ -221,6 +254,18 @@ fn instance_for_directory(
         workspace_id: None,
     };
     services.set_instance_location(instance_location);
+    // M7.2: the production engine for this instance — prompt facade,
+    // revert/summary and the tool registry (`/experimental/tool`).
+    engines.boot(&engine::EngineInput {
+        services: services.clone(),
+        background,
+        config: Arc::new(config),
+        config_dirs: _opencode_dirs,
+        directory: directory.to_path_buf(),
+        worktree: worktree.clone(),
+        paths,
+        seams,
+    })?;
     Ok(services)
 }
 
@@ -281,7 +326,12 @@ mod tests {
         let paths = opencode_core::GlobalPaths::resolve(root.path().join("home"));
         std::fs::create_dir_all(root.path().join("data")).unwrap();
         let storage = Arc::new(Storage::open(root.path().join("data/db.sqlite")).unwrap());
-        let store = production_instance_factory(storage.clone(), paths);
+        let store = production_instance_factory(
+            storage.clone(),
+            paths,
+            Arc::new(engine::EngineStore::default()),
+            engine::EngineSeams::default(),
+        );
 
         store.load(root.path()).expect("empty directory boots");
 

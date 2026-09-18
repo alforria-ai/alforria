@@ -80,6 +80,7 @@ id_type!(MessageId, "msg_", "`msg_` IDs (`message` prefix).");
 id_type!(PartId, "prt_", "`prt_` IDs (`part` prefix).");
 id_type!(PermissionId, "per_", "`per_` IDs (`permission` prefix).");
 id_type!(QuestionId, "que_", "`que_` IDs (`question` prefix).");
+id_type!(JobId, "job_", "`job_` IDs (`job` prefix).");
 
 #[cfg(test)]
 mod tests {

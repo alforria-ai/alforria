@@ -2,6 +2,7 @@
 //! (spec §2.1) replacing TS's Effect layers.
 
 pub mod agents;
+pub mod background;
 pub mod compaction;
 pub mod error;
 pub mod event_definitions;
@@ -50,6 +51,7 @@ use crate::storage::Storage;
 use crate::Clock;
 
 pub use agents::{AgentInfo, AgentRegistry, AgentRegistryInput, DefaultAgentError};
+pub use background::BackgroundJobService;
 pub use compaction::{
     build_prompt, completed_compactions, preserve_recent_budget, select, serialize, summary_text,
     token_estimate, turns, BuildPrompt, CompactionDeps, CompactionOutcome, CompletedCompaction,
