@@ -93,6 +93,13 @@ pub trait TaskOps: Send + Sync {
         -> BoxFuture<'a, Result<Option<SubagentInfo>, ToolError>>;
     /// Look up an existing session by task id.
     fn session_exists<'a>(&'a self, session_id: &'a str) -> BoxFuture<'a, bool>;
+    /// The parent session's permission ruleset (`parent.permission ?? []`,
+    /// task.ts:138) — the production data path for
+    /// [`derive_subagent_session_permission`]. Defaults to the M4
+    /// test-double behavior (empty).
+    fn session_permission<'a>(&'a self, _session_id: &'a str) -> BoxFuture<'a, Vec<Rule>> {
+        Box::pin(async { Vec::new() })
+    }
     /// Create the child session; returns the new session id.
     fn create_session<'a>(
         &'a self,
@@ -317,7 +324,9 @@ async fn run(
     let session_id = match existing_session {
         Some(session) => session,
         None => {
-            let child_permission = derive_subagent_session_permission(&[], &next.permission);
+            let parent_permission = ops.session_permission(ctx.session_id).await;
+            let child_permission =
+                derive_subagent_session_permission(&parent_permission, &next.permission);
             ops.create_session(
                 ctx.session_id,
                 &format!("{} (@{} subagent)", params.description, next.name),

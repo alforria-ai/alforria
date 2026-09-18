@@ -14,6 +14,7 @@ pub mod message;
 pub mod overflow;
 pub mod permission;
 pub mod processor;
+pub mod prompt;
 pub mod prompt_input;
 pub mod question;
 pub mod reminders;
@@ -24,8 +25,10 @@ pub mod run_state;
 pub mod snapshot;
 pub mod status;
 pub mod store;
+pub mod subtask;
 pub mod summary;
 pub mod system;
+pub mod task_ops;
 pub mod tools;
 pub mod usage;
 
@@ -52,6 +55,10 @@ pub use overflow::{is_overflow, max_output_tokens, usable, ModelLimits};
 pub use permission::{
     PermissionError, PermissionService, SessionAsk, PERMISSION_ASKED, PERMISSION_REPLIED,
 };
+pub use prompt::{
+    parse_model, shell_impl, CommandFilePart, CommandInput, SessionPrompt, SessionPromptDeps,
+    ShellInput, COMMAND_EXECUTED,
+};
 pub use question::{
     QuestionError, QuestionService, QUESTION_ASKED, QUESTION_REJECTED, QUESTION_REPLIED,
 };
@@ -71,11 +78,14 @@ pub use store::{
     GlobalListInput, ListInput, ProjectInfo, SessionContext, SessionStore, SetClear,
     INSTALLATION_VERSION,
 };
+pub use subtask::{SessionSubtask, SubtaskDeps};
 pub use summary::{unquote_git_path, SessionSummary, SummaryDeps};
+pub use task_ops::{ProductionTaskOps, PromptFacade};
 pub use usage::{get_usage, CacheCost, CostTier, GetUsage, ModelCost, Over200k, UsageCost};
 
 /// The per-instance session services (spec §2.1): TS resolves these from
 /// Effect layers; Rust passes this bundle explicitly.
+#[derive(Clone)]
 pub struct SessionServices {
     pub storage: Arc<Storage>,
     pub events: Arc<EventBus>,

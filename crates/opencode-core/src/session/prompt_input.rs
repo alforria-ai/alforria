@@ -33,7 +33,7 @@ use crate::session::message::WithParts;
 use crate::session::store::SessionStore;
 use crate::tool::def::{Ask, AskRequest, ExecuteResult, Extra, MetadataSink, ToolCtxRef, ToolDef};
 use crate::tool::error::ToolError;
-use crate::tool::lsp::LspServer;
+pub use crate::tool::lsp::LspServer;
 use crate::tool::permission::evaluate;
 use crate::CoreError;
 
@@ -125,6 +125,7 @@ pub struct PromptInput {
     pub message_id: Option<String>,
     pub model: Option<ModelRef>,
     pub agent: Option<String>,
+    pub no_reply: Option<bool>,
     pub tools: Option<BTreeMap<String, bool>>,
     pub format: Option<OutputFormat>,
     pub system: Option<String>,
@@ -581,16 +582,16 @@ pub fn resolve_prompt_parts(
 
 /// The resolved `model` for the message: `input.model ?? ag.model ?? currentModel()`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ResolvedModel {
-    provider_id: String,
-    model_id: String,
+pub(crate) struct ResolvedModel {
+    pub(crate) provider_id: String,
+    pub(crate) model_id: String,
     #[allow(dead_code)]
     variant: Option<String>,
 }
 
 /// `currentModel` (prompt.ts:614-633): the session's model, else the model
 /// of the first user message, else the provider default.
-async fn current_model(
+pub(crate) async fn current_model(
     deps: &PromptDeps<'_>,
     session_id: &str,
 ) -> Result<ResolvedModel, PromptError> {
@@ -1653,6 +1654,7 @@ mod tests {
                 model_id: "claude-sonnet-4-5".to_string(),
             }),
             agent: Some("build".to_string()),
+            no_reply: None,
             tools: None,
             format: None,
             system: None,

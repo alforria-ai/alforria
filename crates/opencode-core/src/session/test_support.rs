@@ -365,10 +365,586 @@ pub(crate) fn text_stream(text: &str) -> Vec<Result<LlmEvent, LlmError>> {
             id: "t1".to_string(),
             provider_metadata: None,
         }),
+        Ok(LlmEvent::StepFinish {
+            index: 0.0,
+            reason: FinishReason::Stop,
+            usage: None,
+            provider_metadata: None,
+        }),
         Ok(LlmEvent::Finish {
             reason: FinishReason::Stop,
             usage: None,
             provider_metadata: None,
         }),
     ]
+}
+
+// ---------------------------------------------------------------------------
+// M5.7 production engine harness
+// ---------------------------------------------------------------------------
+
+use crate::session::prompt::{SessionPrompt, SessionPromptDeps, ShellInput, COMMAND_EXECUTED};
+use crate::session::subtask::{SessionSubtask, SubtaskDeps};
+use crate::session::task_ops::ProductionTaskOps;
+
+/// A scripted [`LlmStream`] that emulates the runtime's tool dispatch:
+/// queued tool calls execute after the provider events end, and the
+/// results flow back as `ToolResult`/`ToolError` events.
+pub(crate) struct DispatchLlm {
+    script: Mutex<VecDeque<Vec<Result<LlmEvent, LlmError>>>>,
+    inputs: Mutex<Vec<StreamInput>>,
+    hang: std::sync::atomic::AtomicBool,
+}
+
+impl DispatchLlm {
+    pub(crate) fn new(script: MockScript) -> Arc<Self> {
+        Arc::new(DispatchLlm {
+            script: Mutex::new(script.into_iter().collect()),
+            inputs: Mutex::new(Vec::new()),
+            hang: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    // M5.8 (mock-LLM full-loop E2E) exercises the abort path.
+    #[allow(dead_code)]
+    pub(crate) fn lock_hang(&self) {
+        self.hang.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn calls(&self) -> usize {
+        self.inputs.lock().unwrap().len()
+    }
+
+    pub(crate) fn input(&self, index: usize) -> StreamInput {
+        self.inputs.lock().unwrap()[index].clone()
+    }
+}
+
+/// Emulate the runtime's tool dispatch (loop.rs mock_dispatch).
+async fn dispatch_one(
+    tools: &[crate::session::llm::LlmTool],
+    id: &str,
+    name: &str,
+    input: Value,
+) -> Vec<LlmEvent> {
+    use opencode_llm::schema::events::LlmEvent;
+    let _ = LlmEvent::TextStart {
+        id: String::new(),
+        provider_metadata: None,
+    };
+    let Some(tool) = tools.iter().find(|tool| tool.name == name) else {
+        let message = format!("Unknown tool: {name}");
+        return vec![
+            LlmEvent::ToolError {
+                id: id.to_string(),
+                name: name.to_string(),
+                message: message.clone(),
+                error: None,
+                provider_metadata: None,
+            },
+            LlmEvent::ToolResult {
+                id: id.to_string(),
+                name: name.to_string(),
+                result: opencode_llm::schema::messages::ToolResultValue::Error {
+                    value: Value::String(message),
+                },
+                output: None,
+                provider_executed: None,
+                provider_metadata: None,
+            },
+        ];
+    };
+    let Ok(output) = (tool.execute)(input, id.to_string()).await else {
+        return Vec::new();
+    };
+    let mut value = serde_json::json!({
+        "output": output.output,
+        "title": output.title,
+        "metadata": output.metadata,
+    });
+    if let Some(attachments) = output.attachments {
+        value["attachments"] = serde_json::to_value(&attachments).unwrap_or(Value::Null);
+    }
+    vec![LlmEvent::ToolResult {
+        id: id.to_string(),
+        name: name.to_string(),
+        result: opencode_llm::schema::messages::ToolResultValue::Json { value },
+        output: None,
+        provider_executed: None,
+        provider_metadata: None,
+    }]
+}
+
+fn dispatch_stream(
+    calls: VecDeque<(String, String, Value)>,
+    tools: Vec<crate::session::llm::LlmTool>,
+    hang: bool,
+) -> LlmEventStream {
+    futures::stream::unfold(
+        (calls, tools, VecDeque::new(), hang),
+        |(mut calls, tools, mut queue, hang)| async move {
+            if let Some(event) = queue.pop_front() {
+                return Some((Ok(event), (calls, tools, queue, hang)));
+            }
+            let Some((id, name, input)) = calls.pop_front() else {
+                if hang {
+                    futures::future::pending::<()>().await;
+                }
+                return None;
+            };
+            let mut events = dispatch_one(&tools, &id, &name, input).await;
+            let first = events.remove(0);
+            queue.extend(events);
+            Some((Ok(first), (calls, tools, queue, hang)))
+        },
+    )
+    .boxed()
+}
+
+impl LlmStream for DispatchLlm {
+    fn stream(&self, input: StreamInput) -> LlmEventStream {
+        self.inputs.lock().unwrap().push(input.clone());
+        let events = self.script.lock().unwrap().pop_front().unwrap_or_default();
+        let mut calls = Vec::new();
+        for item in &events {
+            if let Ok(LlmEvent::ToolCall {
+                id,
+                name,
+                input,
+                provider_executed,
+                ..
+            }) = item
+            {
+                if provider_executed.unwrap_or(false) {
+                    continue;
+                }
+                calls.push((id.clone(), name.clone(), input.clone()));
+            }
+        }
+        let provider = futures::stream::iter(events);
+        let hang = self.hang.load(std::sync::atomic::Ordering::SeqCst);
+        provider
+            .chain(dispatch_stream(calls.into(), input.tools, hang))
+            .boxed()
+    }
+}
+
+/// The full M5.7 production engine: production `TaskOps`, the subtask
+/// driver, compaction/summary/revert services and the prompt facade
+/// wired over a mock LLM.
+///
+/// `temp` must stay alive for the engine's lifetime (it owns the
+/// sqlite worktree); the remaining fields are M5.8 harness surface.
+#[allow(dead_code)]
+pub(crate) struct Engine {
+    pub(crate) temp: crate::storage::test_support::TempDir,
+    pub(crate) services: SessionServices,
+    pub(crate) config: Arc<crate::config::schema::Config>,
+    pub(crate) llm: Arc<DispatchLlm>,
+    pub(crate) snapshot: Arc<InMemorySnapshot>,
+    pub(crate) worktree: std::path::PathBuf,
+    pub(crate) ops: Arc<ProductionTaskOps>,
+    pub(crate) prompt: Arc<SessionPrompt>,
+    pub(crate) models: Arc<dyn crate::session::r#loop::ModelSource>,
+    pub(crate) registry: crate::tool::registry::ToolRegistry,
+    pub(crate) instance: crate::tool::def::InstanceContext,
+}
+
+/// A `read` tool stub (the registry requires one).
+fn stub_def(id: &'static str) -> crate::tool::def::ToolDef {
+    crate::tool::def::ToolDef {
+        id,
+        description: "stub".into(),
+        parameters: serde_json::json!({ "type": "object" }),
+        format_validation_error: None,
+        execute: Arc::new(|_args, _ctx| {
+            Box::pin(async {
+                Ok(crate::tool::def::ExecuteResult {
+                    title: "stub".to_string(),
+                    metadata: serde_json::json!({}),
+                    output: "ok".to_string(),
+                    attachments: None,
+                })
+            })
+        }),
+    }
+}
+
+pub(crate) fn engine_with_config(name: &str, script: MockScript, config: Value) -> Engine {
+    engine_with_flags(name, script, config, None)
+}
+
+pub(crate) fn engine_with_flags(
+    name: &str,
+    script: MockScript,
+    config: Value,
+    session_permission: Option<Value>,
+) -> Engine {
+    let temp = crate::storage::test_support::TempDir::new(name);
+    let worktree = temp.path().join("repo");
+    std::fs::create_dir_all(&worktree).unwrap();
+    let config: crate::config::schema::Config =
+        serde_json::from_value(config).expect("valid config");
+    let agent_input = AgentRegistryInput {
+        config: config.clone(),
+        skill_dirs: Vec::new(),
+        reference_dirs: Vec::new(),
+        worktree: worktree.clone(),
+        data_dir: temp.path().to_path_buf(),
+        tmp_dir: temp.path().to_path_buf(),
+        home: temp.path().to_path_buf(),
+    };
+    let services = SessionServices::new(
+        Arc::new(crate::storage::Storage::open(temp.path().join("db.sqlite")).unwrap()),
+        Arc::new(NoJobs),
+        Arc::new(FixedClock),
+        &agent_input,
+    );
+    services
+        .storage
+        .with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO project (id, worktree, sandboxes, time_created, time_updated)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params!["global", "/repo", "[]", 1, 1],
+            )
+        })
+        .unwrap();
+
+    let config = Arc::new(config);
+    let clock: Arc<dyn Clock> = Arc::new(FixedClock);
+    let instance = crate::tool::def::InstanceContext {
+        directory: worktree.clone(),
+        worktree: worktree.clone(),
+    };
+    let context = crate::session::store::SessionContext {
+        project_id: "global".to_string(),
+        directory: worktree.clone(),
+        worktree: worktree.clone(),
+        workspace_id: None,
+    };
+    let models: Arc<dyn crate::session::r#loop::ModelSource> = Arc::new(StaticModels {
+        model: test_model(),
+    });
+    let input_models: Arc<dyn crate::session::prompt_input::Models> = Arc::new(FixedInputModels);
+    let snapshot = InMemorySnapshot::new(worktree.clone());
+
+    // Production TaskOps + registry (task tool + read stub).
+    let ops = ProductionTaskOps::new(
+        services.sessions.clone(),
+        services.messages.clone(),
+        services.agents.clone(),
+        context,
+    );
+    let task = crate::tool::task::task_tool(
+        Arc::new(crate::tool::truncate::TruncateService::default_limits(
+            temp.path().to_path_buf(),
+        )),
+        crate::tool::ripgrep::test_support::fixed_agents(),
+        ops.clone(),
+        1,
+        Vec::new(),
+        crate::tool::task::BackgroundMode::Disabled,
+    );
+    let registry = crate::tool::registry::ToolRegistry::new(
+        vec![task, stub_def("read")],
+        Vec::new(),
+        crate::tool::registry::RuntimeFlags::default(),
+        Arc::new(RegistryStubAgents),
+    )
+    .expect("valid registry");
+
+    // Subtask driver.
+    let subtasks: Arc<dyn crate::session::r#loop::Subtasks> =
+        Arc::new(SessionSubtask::new(SubtaskDeps {
+            sessions: services.sessions.clone(),
+            events: services.events.clone(),
+            agents: services.agents.clone(),
+            models: models.clone(),
+            registry: registry.clone(),
+            permission: services.permission.clone(),
+            clock: clock.clone(),
+            instance: instance.clone(),
+        }));
+
+    // Summary + revert + compaction.
+    let summary = Arc::new(crate::session::summary::SessionSummary::new(
+        crate::session::summary::SummaryDeps {
+            sessions: services.sessions.clone(),
+            snapshot: snapshot.clone(),
+            events: services.events.clone(),
+            config: config.clone(),
+        },
+    ));
+    let revert = Arc::new(crate::session::revert::SessionRevert::new(
+        crate::session::revert::RevertDeps {
+            sessions: services.sessions.clone(),
+            events: services.events.clone(),
+            snapshot: snapshot.clone(),
+            summary: summary.clone(),
+            state: services.run_state.clone(),
+            data_dir: temp.path().to_path_buf(),
+        },
+    ));
+    let compaction: Arc<dyn crate::session::r#loop::Compaction> =
+        Arc::new(crate::session::compaction::SessionCompaction::new(
+            crate::session::compaction::CompactionDeps {
+                sessions: services.sessions.clone(),
+                messages: services.messages.clone(),
+                events: services.events.clone(),
+                status: services.status.clone(),
+                agents: services.agents.clone(),
+                snapshot: snapshot.clone(),
+                llm: DispatchLlm::new(script.clone()),
+                permission: services.permission.clone(),
+                summary: summary.clone(),
+                models: models.clone(),
+                config: config.clone(),
+                clock: clock.clone(),
+                instance: instance.clone(),
+                output_token_max: None,
+                project_id: None,
+                client: "cli".to_string(),
+            },
+        ));
+
+    let instruction = Arc::new(crate::session::instruction::Instruction::new(
+        crate::session::instruction::InstructionFlags {
+            disable_claude_code_prompt: true,
+            disable_project_config: true,
+        },
+        crate::session::instruction::InstructionPaths {
+            config: temp.path().to_path_buf(),
+            home: temp.path().to_path_buf(),
+            directory: worktree.clone(),
+            worktree: worktree.clone(),
+        },
+        Vec::new(),
+        Arc::new(crate::session::instruction::NoRemoteInstructions),
+    ));
+
+    let llm = DispatchLlm::new(script);
+    let _ = session_permission;
+    let prompt = SessionPrompt::new(SessionPromptDeps {
+        services: services.clone(),
+        models: models.clone(),
+        input_models,
+        llm: llm.clone(),
+        snapshot: snapshot.clone(),
+        compaction,
+        subtasks,
+        summary,
+        instruction,
+        systems: Arc::new(crate::session::r#loop::NoSystemPrompts),
+        registry: registry.clone(),
+        revert,
+        prompt_ops: ops.clone(),
+        config: config.clone(),
+        clock,
+        instance: instance.clone(),
+        mcp: Arc::new(EmptyMcp),
+        lsp: Arc::new(EmptyLsp),
+        images: Arc::new(crate::session::prompt_input::NoResize),
+        data_dir: temp.path().to_path_buf(),
+        project_id: None,
+        client: "cli".to_string(),
+        experimental_plan_mode: false,
+        vcs: false,
+    });
+    ops.bind(prompt.clone());
+    Engine {
+        temp,
+        services,
+        config,
+        llm,
+        snapshot,
+        worktree,
+        ops,
+        prompt,
+        models: models.clone(),
+        registry: registry.clone(),
+        instance: instance.clone(),
+    }
+}
+
+pub(crate) fn engine(name: &str, script: MockScript) -> Engine {
+    engine_with_config(name, script, serde_json::json!({}))
+}
+
+/// Create a session in the engine and set a non-default title (title
+/// generation is forked on step 1 and would consume mock scripts).
+pub(crate) fn create_engine_session(e: &Engine) -> opencode_schema::session_v1::V1SessionInfo {
+    let session = create_session(&e.services.sessions, &e.worktree);
+    e.services
+        .sessions
+        .set_title(&session.id, "Custom")
+        .unwrap();
+    session
+}
+
+pub(crate) struct FixedInputModels;
+
+impl crate::session::prompt_input::Models for FixedInputModels {
+    fn get_model<'a>(
+        &'a self,
+        provider_id: &'a str,
+        model_id: &'a str,
+    ) -> crate::tool::def::BoxFuture<'a, Result<opencode_schema::model::ModelInfo, crate::CoreError>>
+    {
+        Box::pin(async move { Ok(input_model_info(provider_id, model_id)) })
+    }
+    fn default_model(
+        &self,
+    ) -> crate::tool::def::BoxFuture<
+        'static,
+        Result<opencode_schema::model::ModelInfo, crate::CoreError>,
+    > {
+        Box::pin(async { Ok(input_model_info("anthropic", "claude")) })
+    }
+}
+
+fn input_model_info(provider_id: &str, model_id: &str) -> opencode_schema::model::ModelInfo {
+    use opencode_schema::model::{
+        ModelApi, ModelCapabilities, ModelLimit, ModelRequest, ModelStatus, ModelTime,
+    };
+    opencode_schema::model::ModelInfo {
+        id: model_id.to_string(),
+        provider_id: provider_id.to_string(),
+        family: None,
+        name: model_id.to_string(),
+        api: ModelApi::Aisdk {
+            id: model_id.to_string(),
+            package: "@ai-sdk/anthropic".to_string(),
+            url: None,
+            settings: None,
+        },
+        capabilities: ModelCapabilities {
+            tools: true,
+            input: Vec::new(),
+            output: Vec::new(),
+        },
+        request: ModelRequest {
+            headers: std::collections::BTreeMap::new(),
+            body: serde_json::Map::new(),
+            variant: None,
+        },
+        variants: Vec::new(),
+        time: ModelTime { released: 0.0 },
+        cost: Vec::new(),
+        status: ModelStatus::Active,
+        enabled: true,
+        limit: ModelLimit {
+            context: 1000,
+            input: None,
+            output: 100,
+        },
+    }
+}
+
+/// Empty MCP seam (M5 has no MCP client).
+pub(crate) struct EmptyMcp;
+
+impl crate::session::prompt_input::McpResources for EmptyMcp {
+    fn read_resource<'a>(
+        &'a self,
+        _client_name: &'a str,
+        _uri: &'a str,
+    ) -> crate::tool::def::BoxFuture<
+        'a,
+        Result<crate::session::prompt_input::McpReadResource, String>,
+    > {
+        Box::pin(async { Err("connection refused".to_string()) })
+    }
+}
+
+/// Empty LSP seam.
+pub(crate) struct EmptyLsp;
+
+impl crate::session::prompt_input::LspServer for EmptyLsp {
+    fn has_clients<'a>(&'a self, _file: &'a str) -> crate::tool::def::BoxFuture<'a, bool> {
+        Box::pin(async { false })
+    }
+    fn touch_file<'a>(&'a self, _file: &'a str) -> crate::tool::def::BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
+    fn definition<'a>(
+        &'a self,
+        _position: crate::tool::lsp::Position,
+    ) -> crate::tool::def::BoxFuture<'a, Vec<Value>> {
+        Box::pin(async { Vec::new() })
+    }
+    fn references<'a>(
+        &'a self,
+        _position: crate::tool::lsp::Position,
+    ) -> crate::tool::def::BoxFuture<'a, Vec<Value>> {
+        Box::pin(async { Vec::new() })
+    }
+    fn hover<'a>(
+        &'a self,
+        _position: crate::tool::lsp::Position,
+    ) -> crate::tool::def::BoxFuture<'a, Vec<Value>> {
+        Box::pin(async { Vec::new() })
+    }
+    fn document_symbol<'a>(&'a self, _uri: &'a str) -> crate::tool::def::BoxFuture<'a, Vec<Value>> {
+        Box::pin(async { Vec::new() })
+    }
+    fn workspace_symbol<'a>(
+        &'a self,
+        _query: &'a str,
+    ) -> crate::tool::def::BoxFuture<'a, Vec<Value>> {
+        Box::pin(async { Vec::new() })
+    }
+    fn implementation<'a>(
+        &'a self,
+        _position: crate::tool::lsp::Position,
+    ) -> crate::tool::def::BoxFuture<'a, Vec<Value>> {
+        Box::pin(async { Vec::new() })
+    }
+    fn prepare_call_hierarchy<'a>(
+        &'a self,
+        _position: crate::tool::lsp::Position,
+    ) -> crate::tool::def::BoxFuture<'a, Vec<Value>> {
+        Box::pin(async { Vec::new() })
+    }
+    fn incoming_calls<'a>(
+        &'a self,
+        _position: crate::tool::lsp::Position,
+    ) -> crate::tool::def::BoxFuture<'a, Vec<Value>> {
+        Box::pin(async { Vec::new() })
+    }
+    fn outgoing_calls<'a>(
+        &'a self,
+        _position: crate::tool::lsp::Position,
+    ) -> crate::tool::def::BoxFuture<'a, Vec<Value>> {
+        Box::pin(async { Vec::new() })
+    }
+}
+
+/// Registry agents stub for `ToolRegistry::new`.
+pub(crate) struct RegistryStubAgents;
+
+impl crate::tool::def::Agents for RegistryStubAgents {
+    fn get<'a>(
+        &'a self,
+        _agent: &'a str,
+    ) -> crate::tool::def::BoxFuture<
+        'a,
+        Result<crate::tool::def::AgentInfo, crate::tool::error::ToolError>,
+    > {
+        Box::pin(async {
+            Err(crate::tool::error::ToolError::Failed(
+                "no agents".to_string(),
+            ))
+        })
+    }
+    fn list<'a>(&'a self) -> crate::tool::def::BoxFuture<'a, Vec<crate::tool::def::AgentInfo>> {
+        Box::pin(async { Vec::new() })
+    }
+}
+
+// Keep the unused-import lint honest for optional extensions.
+#[allow(unused)]
+fn _unused(e: &Engine, input: &ShellInput) -> Option<&'static str> {
+    let _ = (input, COMMAND_EXECUTED);
+    None
 }

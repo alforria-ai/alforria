@@ -175,11 +175,14 @@ pub struct SubtaskInput {
     pub session_id: String,
     pub session: V1SessionInfo,
     pub messages: Vec<WithParts>,
+    /// The loop's abort signal — drives the `Effect.onInterrupt` path
+    /// (`part.state.status === "running"` → error part `Cancelled`).
+    pub cancel: CancellationToken,
 }
 
 /// The M5.7 subtask driver seam.
 pub trait Subtasks: Send + Sync {
-    fn handle<'a>(&'a self, input: SubtaskInput) -> BoxFuture<'a, Result<(), SessionError>>;
+    fn handle<'a>(&'a self, input: SubtaskInput) -> BoxFuture<'a, Result<(), LoopError>>;
 }
 
 /// `sys.environment` / `sys.skills` / `sys.mcp` (the M5.2 prompt-input
@@ -365,6 +368,7 @@ pub async fn run_loop(
                         session_id: session_id.to_string(),
                         session: session.clone(),
                         messages: msgs.clone(),
+                        cancel: cancel.clone(),
                     })
                     .await?;
                 continue;
@@ -793,7 +797,10 @@ async fn check_message_error(
 }
 
 /// `lastAssistant` (prompt.ts:1339-1349).
-async fn last_assistant(deps: &LoopDeps, session_id: &str) -> Result<WithParts, LoopError> {
+pub(crate) async fn last_assistant(
+    deps: &LoopDeps,
+    session_id: &str,
+) -> Result<WithParts, LoopError> {
     // `findMessage` — the newest non-user message.
     if let Some(msg) = deps.sessions.find_message(session_id, &|msg: &WithParts| {
         !matches!(msg.info, V1Message::User { .. })
@@ -1400,7 +1407,7 @@ mod tests {
     }
 
     impl Subtasks for RecordingSubtasks {
-        fn handle<'a>(&'a self, input: SubtaskInput) -> BoxFuture<'a, Result<(), SessionError>> {
+        fn handle<'a>(&'a self, input: SubtaskInput) -> BoxFuture<'a, Result<(), LoopError>> {
             Box::pin(async move {
                 self.handled.lock().unwrap().push(input);
                 Ok(())
