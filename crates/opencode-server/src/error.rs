@@ -182,6 +182,9 @@ pub enum ApiError {
     /// `ApiMoveSessionError` (400, `groups/control-plane.ts:9-17`) —
     /// `{"name":"MoveSessionError","data":{"message":...}}`.
     MoveSession { message: String },
+    /// `McpUnsupportedOAuthError` (400, `groups/mcp.ts:35-37`) — a plain
+    /// `Schema.ErrorClass`, serializing FLAT: `{"error": "..."}`.
+    McpUnsupportedOAuth { error: String },
 }
 
 impl ApiError {
@@ -228,7 +231,8 @@ impl ApiError {
             ApiError::BadRequest { .. } => StatusCode::BAD_REQUEST,
             ApiError::VcsApply { .. }
             | ApiError::Worktree { .. }
-            | ApiError::MoveSession { .. } => StatusCode::BAD_REQUEST,
+            | ApiError::MoveSession { .. }
+            | ApiError::McpUnsupportedOAuth { .. } => StatusCode::BAD_REQUEST,
         }
     }
 
@@ -439,6 +443,8 @@ impl ApiError {
             ApiError::MoveSession { message } => {
                 named_body("MoveSessionError", vec![("message", str_field(message))])
             }
+            // `Schema.ErrorClass` shapes — flat fields, no wrapper.
+            ApiError::McpUnsupportedOAuth { error } => object(&[("error", str_field(error))]),
         }
     }
 }

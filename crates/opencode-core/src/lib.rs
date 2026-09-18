@@ -13,6 +13,7 @@ pub mod event;
 pub mod format;
 pub mod git;
 pub mod jsonc;
+pub mod mcp;
 pub mod merge;
 pub mod paths;
 pub mod project;

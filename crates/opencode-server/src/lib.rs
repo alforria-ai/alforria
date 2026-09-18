@@ -154,6 +154,7 @@ pub fn production_context(
     );
     ctx.engine_factory = engines.factory();
     ctx.tools = engines.tools();
+    ctx.mcp = engines.mcp_source();
     ctx.vcs = Arc::new(state::CoreVcs::default());
     Ok(Arc::new(ctx))
 }

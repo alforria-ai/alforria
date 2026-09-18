@@ -63,6 +63,7 @@ pub mod ide_event;
 pub mod installation_event;
 pub mod legacy_event;
 pub mod lsp_event;
+pub mod mcp;
 pub mod mcp_event;
 pub mod models_dev;
 pub mod plugin;

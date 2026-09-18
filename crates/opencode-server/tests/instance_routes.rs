@@ -60,7 +60,7 @@ fn fixture() -> Fixture {
     let services_for_factory = services.clone();
     let instances =
         InstanceStore::new(Arc::new(move |_directory| Ok(services_for_factory.clone())));
-    let ctx = ServerContext::new(
+    let mut ctx = ServerContext::new(
         AuthConfig::new("opencode", None),
         instances,
         storage.clone(),
@@ -68,10 +68,33 @@ fn fixture() -> Fixture {
         Vec::new(),
         Arc::new(EmptyUiBackend),
     );
+    // M7.6: `/experimental/resource` reads the MCP service.
+    ctx.mcp = Arc::new(FixedMcp);
     Fixture {
         _dir: dir,
         ctx: Arc::new(ctx),
         worktree,
+    }
+}
+
+/// An MCP source over an empty config — no configured servers, so
+/// `resources()` is the empty map.
+struct FixedMcp;
+
+impl opencode_server::state::McpSource for FixedMcp {
+    fn service(
+        &self,
+        _location: &opencode_server::middleware::location::LocationContext,
+    ) -> Result<Arc<opencode_core::mcp::McpService>, opencode_server::ServerError> {
+        Ok(Arc::new(opencode_core::mcp::McpService::new(
+            opencode_core::mcp::McpServiceInput {
+                directory: std::path::PathBuf::from("/tmp"),
+                data_dir: std::env::temp_dir(),
+                mcp: std::collections::BTreeMap::new(),
+                mcp_timeout: None,
+                events: None,
+            },
+        )))
     }
 }
 

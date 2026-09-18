@@ -6,6 +6,7 @@
 
 pub mod config_permission_question;
 pub mod global_control;
+pub mod mcp;
 pub mod project;
 pub mod provider;
 pub mod session;

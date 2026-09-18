@@ -89,6 +89,11 @@ fn register_stub(
     if handled {
         return router;
     }
+    // M7.6 owns the v1 /mcp family.
+    let (router, handled) = v1::mcp::register(router, method, path);
+    if handled {
+        return router;
+    }
     // M6.7 owns the v2 /api families.
     let (router, handled) = v2::session::register(router, method, path);
     if handled {

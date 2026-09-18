@@ -1120,8 +1120,12 @@ pub async fn experimental_session_background(
 }
 
 /// `resource` (`handlers/experimental.ts:195-197`).
-pub async fn experimental_resource() -> Result<Response, ServerError> {
-    Ok(json_ok(json!({})))
+pub async fn experimental_resource(
+    State(ctx): State<Arc<ServerContext>>,
+    axum::Extension(location): axum::Extension<LocationContext>,
+) -> Result<Response, ServerError> {
+    let mcp = ctx.mcp.service(&location)?;
+    Ok(json_ok(mcp.resources(None).await))
 }
 
 // ---------------------------------------------------------------------------

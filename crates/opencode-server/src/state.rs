@@ -715,6 +715,28 @@ impl ToolRegistrySource for UnwiredTools {
     }
 }
 
+/// `MCP.Service` access seam — resolves the per-instance MCP service for
+/// the `/mcp` route family and `GET /experimental/resource` (M7.6).
+pub trait McpSource: Send + Sync {
+    fn service(
+        &self,
+        location: &LocationContext,
+    ) -> Result<Arc<opencode_core::mcp::McpService>, ServerError>;
+}
+
+struct UnwiredMcp;
+
+impl McpSource for UnwiredMcp {
+    fn service(
+        &self,
+        _location: &LocationContext,
+    ) -> Result<Arc<opencode_core::mcp::McpService>, ServerError> {
+        Err(ServerError::Core(opencode_core::CoreError::Storage(
+            "mcp service not wired (M7.6)".to_string(),
+        )))
+    }
+}
+
 /// `ProviderAuth.Service` error surface mapped onto the `ProviderAuthError`
 /// wire shape (`groups/provider.ts:14-32`).
 #[derive(Debug, Clone)]
@@ -921,6 +943,8 @@ pub struct ServerContext {
     pub tui: TuiControl,
     /// The M4 tool registry for `/experimental/tool` (unwired until M7).
     pub tools: Arc<dyn ToolRegistrySource>,
+    /// `MCP.Service` for the `/mcp` route family (unwired until M7.6).
+    pub mcp: Arc<dyn McpSource>,
     /// models.dev catalog (`ModelsDev.Service.get`).
     pub catalog: CatalogSource,
     /// `ProviderAuth.Service`.
@@ -1008,6 +1032,7 @@ impl ServerContext {
             formatter: Arc::new(EmptyStatus),
             tui: TuiControl::new(),
             tools: Arc::new(UnwiredTools),
+            mcp: Arc::new(UnwiredMcp),
             catalog: default_catalog(),
             provider_auth: Arc::new(UnwiredProviderAuth),
             v2_permissions: Arc::new(crate::routes::v2::permission::PermissionRegistry::default()),

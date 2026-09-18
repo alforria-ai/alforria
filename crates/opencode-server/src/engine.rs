@@ -132,20 +132,58 @@ impl LlmStream for UnwiredLlm {
     }
 }
 
-/// No-op MCP seam — the MCP client is later M7 surface
-/// (`EmptyMcp` mirrors the M5 test-support stub).
-struct NoMcp;
+/// The engine's MCP resource seam — the real service (M7.6).
+#[derive(Clone)]
+struct EngineMcp(Arc<opencode_core::mcp::McpService>);
 
-impl opencode_core::session::prompt_input::McpResources for NoMcp {
+impl opencode_core::session::prompt_input::McpResources for EngineMcp {
     fn read_resource<'a>(
         &'a self,
-        _client_name: &'a str,
-        _uri: &'a str,
+        client_name: &'a str,
+        uri: &'a str,
     ) -> opencode_core::tool::def::BoxFuture<
         'a,
         Result<opencode_core::session::prompt_input::McpReadResource, String>,
     > {
-        Box::pin(async { Err("connection refused".to_string()) })
+        Box::pin(async move {
+            let Some(value) = self.0.read_resource(client_name, uri).await? else {
+                return Ok(opencode_core::session::prompt_input::McpReadResource::NotFound);
+            };
+            let contents = value
+                .get("contents")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let items = contents
+                .into_iter()
+                .filter_map(|item| {
+                    let text = item
+                        .get("text")
+                        .and_then(serde_json::Value::as_str)
+                        .map(String::from);
+                    let blob = item
+                        .get("blob")
+                        .and_then(serde_json::Value::as_str)
+                        .map(String::from);
+                    if text.is_none() && blob.is_none() {
+                        return None;
+                    }
+                    Some(opencode_core::session::prompt_input::McpResourceItem {
+                        text,
+                        blob,
+                        mime_type: item
+                            .get("mimeType")
+                            .and_then(serde_json::Value::as_str)
+                            .map(String::from),
+                        uri: item
+                            .get("uri")
+                            .and_then(serde_json::Value::as_str)
+                            .map(String::from),
+                    })
+                })
+                .collect();
+            Ok(opencode_core::session::prompt_input::McpReadResource::Contents(items))
+        })
     }
 }
 
@@ -259,6 +297,8 @@ pub struct ProductionEngine {
     registry: Arc<ToolRegistry>,
     background: Arc<BackgroundJobService>,
     share: Arc<opencode_core::share::SessionShare>,
+    /// The MCP service — the `/mcp` route family reads this (M7.6).
+    mcp: Arc<opencode_core::mcp::McpService>,
 }
 
 /// The [`SessionEngine`] surface (`state.rs`) over the M5 services. The
@@ -573,11 +613,26 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
                 .with_events(services.events.clone()),
         ),
     );
+    // M7.6: the per-instance MCP service (mcp/index.ts MCP.Service).
+    let mcp_service = Arc::new(opencode_core::mcp::McpService::new(
+        opencode_core::mcp::McpServiceInput {
+            directory: input.directory.clone(),
+            data_dir: input.paths.data.clone(),
+            mcp: input.config.mcp.clone().unwrap_or_default(),
+            mcp_timeout: input
+                .config
+                .experimental
+                .as_ref()
+                .and_then(|experimental| experimental.mcp_timeout)
+                .map(|timeout| timeout.get()),
+            events: Some(services.events.clone()),
+        },
+    ));
     // Websearch env keys are read once at boot (WebSearchEnv::default).
     let websearch = opencode_core::tool::websearch::websearch_tool(
         truncate.clone(),
         agents.clone(),
-        Arc::new(UnwiredMcpHttpClient),
+        Arc::new(ReqwestMcpHttpClient),
         opencode_core::tool::websearch::WebSearchFlags {
             exa: bool_env("OPENCODE_ENABLE_EXA") || experimental_env("OPENCODE_EXPERIMENTAL_EXA"),
             parallel: bool_env("OPENCODE_ENABLE_PARALLEL")
@@ -744,7 +799,7 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
         config: input.config.clone(),
         clock,
         instance,
-        mcp: Arc::new(NoMcp),
+        mcp: Arc::new(EngineMcp(mcp_service.clone())),
         lsp: Arc::new(NoLsp),
         images: Arc::new(opencode_core::session::prompt_input::NoResize),
         data_dir: input.paths.data.clone(),
@@ -795,6 +850,7 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
         registry,
         background: input.background.clone(),
         share,
+        mcp: mcp_service,
     }))
 }
 
@@ -864,6 +920,13 @@ impl EngineStore {
         Arc::new(StoreTools(Arc::clone(self)))
     }
 
+    /// The `McpSource` seam — the `/mcp` route family and
+    /// `GET /experimental/resource` resolve the instance's MCP service
+    /// (M7.6).
+    pub fn mcp_source(self: &Arc<Self>) -> Arc<dyn crate::state::McpSource> {
+        Arc::new(StoreMcp(Arc::clone(self)))
+    }
+
     /// Build the engine for a booted instance and register it.
     pub fn boot(self: &Arc<Self>, input: &EngineInput) -> Result<(), ServerError> {
         let engine = build_engine(input)?;
@@ -889,16 +952,30 @@ impl ToolRegistrySource for StoreTools {
     }
 }
 
-/// Production MCP HTTP client for the websearch tool — the real MCP client
-/// is later M7 surface; the tool's HTTP seam stays stubbed.
-struct UnwiredMcpHttpClient;
+struct StoreMcp(Arc<EngineStore>);
 
-impl opencode_core::tool::mcp_websearch::McpHttpClient for UnwiredMcpHttpClient {
+impl crate::state::McpSource for StoreMcp {
+    fn service(
+        &self,
+        location: &LocationContext,
+    ) -> Result<Arc<opencode_core::mcp::McpService>, ServerError> {
+        self.0
+            .engine(&location.services)
+            .map(|engine| engine.mcp.clone())
+            .ok_or_else(|| engine_missing(&location.directory))
+    }
+}
+
+/// Production MCP HTTP client for the websearch tool (M7.6) — a plain
+/// reqwest POST, mirroring TS's Effect `HttpClient`.
+struct ReqwestMcpHttpClient;
+
+impl opencode_core::tool::mcp_websearch::McpHttpClient for ReqwestMcpHttpClient {
     fn post<'a>(
         &'a self,
-        _url: &'a str,
-        _headers: Vec<(String, String)>,
-        _body: &'a str,
+        url: &'a str,
+        headers: Vec<(String, String)>,
+        body: &'a str,
     ) -> opencode_core::tool::def::BoxFuture<
         'a,
         Result<
@@ -906,10 +983,27 @@ impl opencode_core::tool::mcp_websearch::McpHttpClient for UnwiredMcpHttpClient 
             opencode_core::tool::error::ToolError,
         >,
     > {
-        Box::pin(async {
-            Err(opencode_core::tool::error::ToolError::Failed(
-                "MCP client not wired".to_string(),
-            ))
+        Box::pin(async move {
+            let client = reqwest::Client::new();
+            let mut request = client.post(url).body(body.to_string());
+            for (key, value) in headers {
+                request = request.header(&key, value);
+            }
+            let response = request
+                .send()
+                .await
+                .map_err(|err| opencode_core::tool::error::ToolError::Failed(err.to_string()))?;
+            let status = response.status().as_u16();
+            let text = response
+                .text()
+                .await
+                .map_err(|err| opencode_core::tool::error::ToolError::Failed(err.to_string()))?;
+            if !(200..300).contains(&status) {
+                return Err(opencode_core::tool::error::ToolError::Failed(format!(
+                    "MCP request failed with status {status}"
+                )));
+            }
+            Ok(opencode_core::tool::mcp_websearch::McpHttpResponse { body: text })
         })
     }
 }
