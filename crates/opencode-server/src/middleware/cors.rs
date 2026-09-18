@@ -43,6 +43,51 @@ pub fn is_allowed_cors_origin(input: Option<&str>, opts: &[String]) -> bool {
     opts.iter().any(|origin| origin == input)
 }
 
+/// `isAllowedRequestOrigin` (`cors.ts:22-31`): a same-host origin passes
+/// even when not allowlisted.
+pub fn is_allowed_request_origin(input: Option<&str>, host: Option<&str>, opts: &[String]) -> bool {
+    // TS `if (!input) return true` — an empty Origin header is falsy too.
+    let Some(input) = input.filter(|input| !input.is_empty()) else {
+        return true;
+    };
+    if let Some(host) = host {
+        if same_host(input, host) {
+            return true;
+        }
+    }
+    is_allowed_cors_origin(Some(input), opts)
+}
+
+/// `sameHost` (`cors.ts:33-38`) — `new URL(origin).host === host`. The port
+/// must be present on both sides; `URL.host` keeps an explicit port and
+/// drops a default one.
+fn same_host(origin: &str, host: &str) -> bool {
+    let Some(rest) = origin.split_once("://") else {
+        return false;
+    };
+    if rest.0.is_empty() || rest.0.contains(' ') {
+        return false;
+    }
+    let Some(authority) = rest.1.split(['/', '?', '#']).next() else {
+        return false;
+    };
+    let origin_host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    origin_host == host
+}
+
+/// Request-header form of [`is_allowed_request_origin`].
+pub fn request_origin_allowed(headers: &axum::http::HeaderMap, opts: &[String]) -> bool {
+    let origin = headers
+        .get(axum::http::header::ORIGIN)
+        .and_then(|value| value.to_str().ok());
+    let host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|value| value.to_str().ok());
+    is_allowed_request_origin(origin, host, opts)
+}
+
 /// effect `compressionInternal.varyWith` (`internal/compression.ts:9-15`).
 pub fn vary_with(vary: Option<&HeaderValue>, dimension: &str) -> String {
     match vary {

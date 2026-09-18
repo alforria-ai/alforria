@@ -4,6 +4,7 @@
 
 pub mod error;
 pub mod middleware;
+pub mod pty;
 pub mod routes;
 pub mod sse;
 pub mod state;
@@ -51,15 +52,17 @@ pub struct Listener {
     pub hostname: String,
     pub port: u16,
     pub url: String,
+    websockets: state::WebSocketTracker,
     shutdown: tokio::sync::watch::Sender<bool>,
     task: tokio::task::JoinHandle<io::Result<()>>,
 }
 
 impl Listener {
     /// Graceful stop: stop accepting, close HTTP sockets and websockets
-    /// (`websocket-tracker.ts:17-45` semantics; no PTY websockets until
-    /// M6.8).
+    /// (`websocket-tracker.ts:17-45` semantics; the tracker close runs
+    /// before the listener shuts down so live sockets observe 1001).
     pub async fn stop(self) -> io::Result<()> {
+        self.websockets.close_all();
         self.shutdown
             .send(true)
             .map_err(|_| io::Error::other("server task already stopped"))?;
@@ -86,7 +89,7 @@ pub async fn listen_with(opts: &ListenOptions, ctx: Arc<ServerContext>) -> io::R
     let port = listener.local_addr()?.port();
     let url = format!("http://{}:{}", opts.hostname, port);
 
-    let router = routes::build_router(ctx);
+    let router = routes::build_router(ctx.clone());
     let (shutdown, mut shutdown_rx) = tokio::sync::watch::channel(false);
     let serve = axum::serve(listener, router).with_graceful_shutdown(async move {
         let _ = shutdown_rx.changed().await;
@@ -98,6 +101,7 @@ pub async fn listen_with(opts: &ListenOptions, ctx: Arc<ServerContext>) -> io::R
         hostname,
         port,
         url,
+        websockets: ctx.websockets.clone(),
         shutdown,
         task,
     })

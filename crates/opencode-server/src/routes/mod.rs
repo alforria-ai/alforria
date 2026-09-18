@@ -89,6 +89,11 @@ fn register_stub(
     if handled {
         return router;
     }
+    // M6.8 owns the PTY family (v1 + v2 + connect websockets).
+    let (router, handled) = crate::pty::routes::register(router, method, path);
+    if handled {
+        return router;
+    }
     let (router, handled) = v2::permission::register(router, method, path);
     if handled {
         return router;

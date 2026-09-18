@@ -665,6 +665,63 @@ impl Default for HeartbeatConfig {
     }
 }
 
+/// `WebSocketTracker` (`httpapi/websocket-tracker.ts:17-45`): registered
+/// PTY sockets receive the server-closing event when the server stops.
+#[derive(Clone, Default)]
+pub struct WebSocketTracker {
+    inner: Arc<Mutex<TrackerInner>>,
+}
+
+impl std::fmt::Debug for WebSocketTracker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        f.debug_struct("WebSocketTracker")
+            .field("closing", &inner.closing)
+            .field("sockets", &inner.sockets.len())
+            .finish()
+    }
+}
+
+#[derive(Default)]
+struct TrackerInner {
+    closing: bool,
+    next: u64,
+    sockets: HashMap<u64, Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl WebSocketTracker {
+    /// `add` — `None` once the server is closing.
+    pub fn register(&self, close: Box<dyn Fn() + Send + Sync>) -> Option<u64> {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if inner.closing {
+            return None;
+        }
+        let id = inner.next;
+        inner.next += 1;
+        inner.sockets.insert(id, Arc::from(close));
+        Some(id)
+    }
+
+    /// `remove`.
+    pub fn unregister(&self, id: u64) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .sockets
+            .remove(&id);
+    }
+
+    /// `closeAll` — send `SERVER_CLOSING_EVENT` to every live socket.
+    pub fn close_all(&self) {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        inner.closing = true;
+        let sockets = inner.sockets.drain().collect::<Vec<_>>();
+        for (_, close) in sockets {
+            close();
+        }
+    }
+}
+
 /// Shared per-server state (spec §2.2): the auth config, the per-directory
 /// instance cache and the global bus/storage handle.
 #[derive(Clone)]
@@ -710,6 +767,12 @@ pub struct ServerContext {
     /// one per location node; the M6 adapter keeps it process-wide, filtered
     /// by directory (M6.7).
     pub v2_permissions: Arc<crate::routes::v2::permission::PermissionRegistry>,
+    /// `PtyTicket.Service` — the PTY connect-ticket cache (M6.8).
+    pub pty_tickets: crate::pty::ticket::TicketCache,
+    /// The per-location `Pty.Service` registry (M6.8).
+    pub ptys: crate::pty::PtyRegistry,
+    /// `WebSocketTracker` — live PTY sockets closed on server stop.
+    pub websockets: WebSocketTracker,
 }
 
 impl ServerContext {
@@ -756,6 +819,9 @@ impl ServerContext {
             catalog: default_catalog(),
             provider_auth: Arc::new(UnwiredProviderAuth),
             v2_permissions: Arc::new(crate::routes::v2::permission::PermissionRegistry::default()),
+            pty_tickets: crate::pty::ticket::TicketCache::default(),
+            ptys: crate::pty::PtyRegistry::default(),
+            websockets: WebSocketTracker::default(),
         }
     }
 
