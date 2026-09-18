@@ -7,9 +7,19 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use opencode_core::{BackgroundJobs, EventBus, SessionServices, SessionStore, Storage};
+use futures::future::BoxFuture;
+use opencode_core::session::prompt::{CommandInput, ShellInput};
+use opencode_core::session::prompt_input::{PromptError, PromptInput};
+use opencode_core::session::revert::RevertInput;
+use opencode_core::{
+    BackgroundJobs, CoreError, EventBus, RunnerError, SessionError, SessionServices, SessionStore,
+    Storage, WithParts,
+};
+use opencode_schema::file_diff::SnapshotFileDiff;
+use opencode_schema::session_v1::V1SessionInfo;
 
 use crate::error::ServerError;
+use crate::middleware::location::LocationContext;
 use crate::sse::{GlobalBus, GlobalEvent, INSTANCE_DISPOSED_TYPE};
 
 /// `OPENCODE_SERVER_PASSWORD` / `OPENCODE_SERVER_USERNAME` config
@@ -73,6 +83,61 @@ impl AuthConfig {
 /// real factory (config loading + storage bootstrap); tests inject their own.
 pub type InstanceFactory =
     Arc<dyn Fn(&Path) -> Result<Arc<SessionServices>, ServerError> + Send + Sync>;
+
+/// The per-directory prompt-engine surface the v1 session family drives
+/// (TS resolves `SessionPrompt`, `SessionRevert`, `SessionSummary` and
+/// `SessionShare` from Effect layers, session.ts:50-62).
+///
+/// M5 ships the engine pieces but not the per-directory production assembly
+/// (LLM stream, instruction, tool registry, share network service) — the
+/// server binds them through this seam instead. TODO(M7): production wiring.
+pub trait SessionEngine: Send + Sync {
+    /// `SessionPrompt.prompt` (prompt.ts:1052-1071).
+    fn prompt(&self, input: PromptInput) -> BoxFuture<'static, Result<WithParts, PromptError>>;
+    /// `SessionPrompt.loop` (prompt.ts:1350-1354).
+    fn loop_(
+        &self,
+        session_id: String,
+    ) -> BoxFuture<'static, Result<WithParts, RunnerError<SessionError>>>;
+    /// `SessionPrompt.command` (prompt.ts:1361-1481).
+    fn command(&self, input: CommandInput) -> BoxFuture<'static, Result<WithParts, PromptError>>;
+    /// `SessionPrompt.shell` (prompt.ts:452-459).
+    fn shell(&self, input: ShellInput) -> BoxFuture<'static, Result<WithParts, SessionError>>;
+    /// `SessionRevert.revert` / `unrevert` (revert.ts:38-89, 96-99).
+    fn revert(&self, input: RevertInput)
+        -> BoxFuture<'static, Result<V1SessionInfo, SessionError>>;
+    fn unrevert(
+        &self,
+        session_id: String,
+    ) -> BoxFuture<'static, Result<V1SessionInfo, SessionError>>;
+    /// `SessionRevert.cleanup` (revert.ts:101-124).
+    fn cleanup(&self, session: &V1SessionInfo) -> Result<(), SessionError>;
+    /// `SessionSummary.diff` (summary.ts:129-142).
+    fn diff(
+        &self,
+        session_id: &str,
+        message_id: Option<&str>,
+    ) -> Result<Vec<SnapshotFileDiff>, SessionError>;
+    /// `SessionShare.share` / `unshare` (share/session.ts:56-72) — persist
+    /// the share on the session (the service owns `session.setShare`).
+    fn share(&self, session: &V1SessionInfo) -> Result<(), String>;
+    fn unshare(&self, session_id: &str) -> Result<(), String>;
+}
+
+/// Resolves the per-directory [`SessionEngine`]. The default (unwired)
+/// factory fails every lookup with a defect-500.
+pub type EngineFactory =
+    Arc<dyn Fn(&LocationContext) -> Result<Arc<dyn SessionEngine>, ServerError> + Send + Sync>;
+
+/// TODO(M7): production engine wiring (LLM stream, instruction, tool
+/// registry, share service).
+fn unwired_engine_factory(
+    _location: &LocationContext,
+) -> Result<Arc<dyn SessionEngine>, ServerError> {
+    Err(ServerError::Core(CoreError::Storage(
+        "session engine factory not wired (M6.5)".to_string(),
+    )))
+}
 
 /// Cached directory → `Arc<SessionServices>` map (TS `InstanceStore`,
 /// `project/instance-store.ts:17-29`).
@@ -290,6 +355,9 @@ pub struct ServerContext {
     /// terminator, bridged onto `bus` (`bus/global.ts`, `event-v2-bridge.ts`).
     pub global_bus: GlobalBus,
     pub heartbeat: HeartbeatConfig,
+    /// Per-directory [`SessionEngine`] lookup for the session route family
+    /// (unwired until M7).
+    pub engine_factory: EngineFactory,
 }
 
 impl ServerContext {
@@ -324,6 +392,7 @@ impl ServerContext {
             ui,
             global_bus,
             heartbeat: HeartbeatConfig::default(),
+            engine_factory: Arc::new(unwired_engine_factory),
         }
     }
 

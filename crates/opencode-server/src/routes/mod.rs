@@ -65,6 +65,11 @@ fn register_stub(
         }
         _ => {}
     }
+    // M6.5 owns the v1 session family.
+    let (router, handled) = v1::session::register(router, method, path);
+    if handled {
+        return router;
+    }
     match method {
         "GET" => router.route(path, get(stub)),
         "POST" => router.route(path, post(stub)),

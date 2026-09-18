@@ -730,6 +730,40 @@ impl SessionStore {
         Ok(infos)
     }
 
+    /// Minimal project resolution for the HTTP surface: resolve-or-create
+    /// the `project` row for a directory (TS `Project.resolve` +
+    /// `Project.commit` during instance bootstrap,
+    /// `packages/core/src/project.ts:101-119`). TODO(M7): git
+    /// remote/root-commit ids and the full project registry.
+    pub fn ensure_project(&self, worktree: &Path) -> Result<String, SessionError> {
+        let key = worktree.to_string_lossy().to_string();
+        let existing = self.storage.with_connection(|conn| {
+            match conn.query_row(
+                "SELECT id FROM project WHERE worktree = ?1",
+                [&key],
+                |row| row.get::<_, String>(0),
+            ) {
+                Ok(id) => Ok(Some(id)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(err) => Err(CoreError::from(err)),
+            }
+        });
+        if let Some(id) = existing? {
+            return Ok(id);
+        }
+        let id = format!("prj_{}", ulid::Ulid::new());
+        let now = self.now() as i64;
+        self.storage.with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO project (id, worktree, sandboxes, time_created, time_updated)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![id, key, "[]", now, now],
+            )?;
+            Ok::<(), CoreError>(())
+        })?;
+        Ok(id)
+    }
+
     /// `children` (session.ts:596-604).
     pub fn children(&self, parent_id: &str) -> Result<Vec<V1SessionInfo>, SessionError> {
         let rows = self

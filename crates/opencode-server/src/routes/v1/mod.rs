@@ -4,6 +4,8 @@
 //! Route inventory source: the TS group files, cross-checked against the
 //! frozen OpenAPI fixture (`fixtures/openapi/openapi.json`).
 
+pub mod session;
+
 /// `(method, path)` pairs in registration order
 /// (`httpapi/api.ts:54-77`). 127 endpoints.
 pub const ROUTES: &[(&str, &str)] = &[

@@ -14,7 +14,10 @@ use std::sync::Arc;
 use opencode_core::Storage;
 
 pub use error::{ApiError, ServerError};
-pub use state::{AuthConfig, HeartbeatConfig, InstanceStore, ServerContext, UiBackend};
+pub use state::{
+    AuthConfig, EngineFactory, HeartbeatConfig, InstanceStore, ServerContext, SessionEngine,
+    UiBackend,
+};
 
 /// `resolveNetworkOptions` defaults (`cli/network.ts:6-19`).
 pub const DEFAULT_PORT: u16 = 0;
