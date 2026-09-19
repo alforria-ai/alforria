@@ -70,6 +70,8 @@ fn fixture() -> Fixture {
     );
     // M7.6: `/experimental/resource` reads the MCP service.
     ctx.mcp = Arc::new(FixedMcp);
+    // M7.9: `GET /lsp` reads the LSP service.
+    ctx.lsp = Arc::new(FixedLsp);
     Fixture {
         _dir: dir,
         ctx: Arc::new(ctx),
@@ -80,6 +82,18 @@ fn fixture() -> Fixture {
 /// An MCP source over an empty config — no configured servers, so
 /// `resources()` is the empty map.
 struct FixedMcp;
+
+/// An empty LSP status list — no connected servers.
+struct FixedLsp;
+
+impl opencode_server::state::LspSource for FixedLsp {
+    fn status(
+        &self,
+        _location: &opencode_server::middleware::location::LocationContext,
+    ) -> Result<Vec<serde_json::Value>, opencode_server::ServerError> {
+        Ok(Vec::new())
+    }
+}
 
 impl opencode_server::state::McpSource for FixedMcp {
     fn service(

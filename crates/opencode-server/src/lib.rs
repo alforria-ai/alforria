@@ -169,6 +169,7 @@ pub fn production_context(
     ctx.engine_factory = engines.factory();
     ctx.tools = engines.tools();
     ctx.mcp = engines.mcp_source();
+    ctx.lsp = engines.lsp_source();
     ctx.vcs = Arc::new(state::CoreVcs::default());
     ctx.catalog = runtime.catalog;
     ctx.auth_store = runtime.auth;

@@ -125,73 +125,7 @@ impl opencode_core::session::prompt_input::McpResources for EngineMcp {
     }
 }
 
-/// No-op LSP server seam — the LSP service is M7.9.
-struct NoLsp;
-
-impl opencode_core::session::prompt_input::LspServer for NoLsp {
-    fn has_clients<'a>(&'a self, _file: &'a str) -> opencode_core::tool::def::BoxFuture<'a, bool> {
-        Box::pin(async { false })
-    }
-    fn touch_file<'a>(&'a self, _file: &'a str) -> opencode_core::tool::def::BoxFuture<'a, ()> {
-        Box::pin(async {})
-    }
-    fn definition<'a>(
-        &'a self,
-        _position: opencode_core::tool::lsp::Position,
-    ) -> opencode_core::tool::def::BoxFuture<'a, Vec<serde_json::Value>> {
-        Box::pin(async { Vec::new() })
-    }
-    fn references<'a>(
-        &'a self,
-        _position: opencode_core::tool::lsp::Position,
-    ) -> opencode_core::tool::def::BoxFuture<'a, Vec<serde_json::Value>> {
-        Box::pin(async { Vec::new() })
-    }
-    fn hover<'a>(
-        &'a self,
-        _position: opencode_core::tool::lsp::Position,
-    ) -> opencode_core::tool::def::BoxFuture<'a, Vec<serde_json::Value>> {
-        Box::pin(async { Vec::new() })
-    }
-    fn document_symbol<'a>(
-        &'a self,
-        _uri: &'a str,
-    ) -> opencode_core::tool::def::BoxFuture<'a, Vec<serde_json::Value>> {
-        Box::pin(async { Vec::new() })
-    }
-    fn workspace_symbol<'a>(
-        &'a self,
-        _query: &'a str,
-    ) -> opencode_core::tool::def::BoxFuture<'a, Vec<serde_json::Value>> {
-        Box::pin(async { Vec::new() })
-    }
-    fn implementation<'a>(
-        &'a self,
-        _position: opencode_core::tool::lsp::Position,
-    ) -> opencode_core::tool::def::BoxFuture<'a, Vec<serde_json::Value>> {
-        Box::pin(async { Vec::new() })
-    }
-    fn prepare_call_hierarchy<'a>(
-        &'a self,
-        _position: opencode_core::tool::lsp::Position,
-    ) -> opencode_core::tool::def::BoxFuture<'a, Vec<serde_json::Value>> {
-        Box::pin(async { Vec::new() })
-    }
-    fn incoming_calls<'a>(
-        &'a self,
-        _position: opencode_core::tool::lsp::Position,
-    ) -> opencode_core::tool::def::BoxFuture<'a, Vec<serde_json::Value>> {
-        Box::pin(async { Vec::new() })
-    }
-    fn outgoing_calls<'a>(
-        &'a self,
-        _position: opencode_core::tool::lsp::Position,
-    ) -> opencode_core::tool::def::BoxFuture<'a, Vec<serde_json::Value>> {
-        Box::pin(async { Vec::new() })
-    }
-}
-
-/// Production remote-instruction fetch — `https://` config instruction
+/// Production remote-instruction fetch/// Production remote-instruction fetch — `https://` config instruction
 /// entries fetched with a 5 s timeout (instruction.ts:95-103). The trait is
 /// sync and reqwest has no blocking feature here, so fetch on a thread.
 struct HttpRemoteInstructions;
@@ -237,6 +171,8 @@ pub struct ProductionEngine {
     share: Arc<opencode_core::share::SessionShare>,
     /// The MCP service — the `/mcp` route family reads this (M7.6).
     mcp: Arc<opencode_core::mcp::McpService>,
+    /// The LSP service — `GET /lsp` reads this (M7.9).
+    lsp: Arc<opencode_core::lsp::LspService>,
     /// The provider model resolution + LLM seam — the project-copy
     /// generate-name stream (M7.8).
     models: Arc<dyn opencode_core::session::r#loop::ModelSource>,
@@ -662,6 +598,17 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
         .unwrap_or_else(|| Arc::new(opencode_core::session::snapshot::DisabledSnapshot));
 
     // Production TaskOps + the full tool registry (registry.ts:240-249).
+    // M7.9: the production LSP service (lsp/lsp.ts) — one per instance.
+    let lsp = opencode_core::lsp::LspService::new(opencode_core::lsp::LspInput {
+        lsp: input.config.lsp.clone(),
+        directory: input.directory.clone(),
+        worktree: input.worktree.clone(),
+        paths: input.paths.clone(),
+        events: Some(services.events.clone()),
+        flags: opencode_core::lsp::server::Flags::from_env(),
+    });
+    let edit_lsp: Arc<dyn opencode_core::tool::edit::Lsp> = lsp.clone();
+    let read_lsp: Arc<dyn opencode_core::tool::read::ReadLsp> = lsp.clone();
     let ops = ProductionTaskOps::new(
         services.sessions.clone(),
         services.messages.clone(),
@@ -755,11 +702,27 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
         opencode_core::tool::invalid::invalid_tool(truncate.clone(), agents.clone()),
         question,
         shell,
-        opencode_core::tool::read::read_tool(truncate.clone(), agents.clone(), None),
+        opencode_core::tool::read::read_tool(
+            truncate.clone(),
+            agents.clone(),
+            Some(read_lsp.clone()),
+        ),
         opencode_core::tool::glob::glob_tool(truncate.clone(), agents.clone(), ripgrep.clone()),
         opencode_core::tool::grep::grep_tool(truncate.clone(), agents.clone(), ripgrep.clone()),
-        opencode_core::tool::edit::edit_tool(truncate.clone(), agents.clone(), None, None, None),
-        opencode_core::tool::write::write_tool(truncate.clone(), agents.clone(), None, None, None),
+        opencode_core::tool::edit::edit_tool(
+            truncate.clone(),
+            agents.clone(),
+            Some(edit_lsp.clone()),
+            None,
+            None,
+        ),
+        opencode_core::tool::write::write_tool(
+            truncate.clone(),
+            agents.clone(),
+            Some(edit_lsp.clone()),
+            None,
+            None,
+        ),
         task,
         opencode_core::tool::webfetch::webfetch_tool(
             truncate.clone(),
@@ -789,7 +752,7 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
         opencode_core::tool::apply_patch::apply_patch_tool(
             truncate.clone(),
             agents.clone(),
-            None,
+            Some(edit_lsp.clone()),
             None,
             None,
         ),
@@ -899,7 +862,7 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
         clock,
         instance,
         mcp: Arc::new(EngineMcp(mcp_service.clone())),
-        lsp: Arc::new(NoLsp),
+        lsp: lsp.clone(),
         images: Arc::new(opencode_core::session::prompt_input::NoResize),
         data_dir: input.paths.data.clone(),
         project_id: None,
@@ -951,6 +914,7 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
         background: input.background.clone(),
         share,
         mcp: mcp_service,
+        lsp,
         models,
         defaults: Arc::new(runtime_models),
         llm,
@@ -1030,6 +994,12 @@ impl EngineStore {
         Arc::new(StoreMcp(Arc::clone(self)))
     }
 
+    /// The `LspSource` seam — `GET /lsp` resolves the instance's LSP
+    /// service (M7.9).
+    pub fn lsp_source(self: &Arc<Self>) -> Arc<dyn crate::state::LspSource> {
+        Arc::new(StoreLsp(Arc::clone(self)))
+    }
+
     /// Build the engine for a booted instance and register it.
     pub fn boot(self: &Arc<Self>, input: &EngineInput) -> Result<(), ServerError> {
         let engine = build_engine(input)?;
@@ -1051,6 +1021,17 @@ impl ToolRegistrySource for StoreTools {
         self.0
             .engine(&location.services)
             .map(|engine| engine.registry.clone())
+            .ok_or_else(|| engine_missing(&location.directory))
+    }
+}
+
+struct StoreLsp(Arc<EngineStore>);
+
+impl crate::state::LspSource for StoreLsp {
+    fn status(&self, location: &LocationContext) -> Result<Vec<serde_json::Value>, ServerError> {
+        self.0
+            .engine(&location.services)
+            .map(|engine| engine.lsp.status())
             .ok_or_else(|| engine_missing(&location.directory))
     }
 }

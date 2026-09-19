@@ -900,6 +900,22 @@ impl McpSource for UnwiredMcp {
     }
 }
 
+/// `LSP.Service.status` access seam — resolves the per-instance LSP
+/// service for `GET /lsp` (M7.9).
+pub trait LspSource: Send + Sync {
+    fn status(&self, location: &LocationContext) -> Result<Vec<serde_json::Value>, ServerError>;
+}
+
+struct UnwiredLsp;
+
+impl LspSource for UnwiredLsp {
+    fn status(&self, _location: &LocationContext) -> Result<Vec<serde_json::Value>, ServerError> {
+        Err(ServerError::Core(opencode_core::CoreError::Storage(
+            "lsp service not wired (M7.9)".to_string(),
+        )))
+    }
+}
+
 /// `ProviderAuth.Service` error surface mapped onto the `ProviderAuthError`
 /// wire shape (`groups/provider.ts:14-32`).
 #[derive(Debug, Clone)]
@@ -1162,7 +1178,7 @@ pub struct ServerContext {
     /// `Skill.Service` status list.
     pub skills: Arc<dyn StatusSeam>,
     /// `LSP.Service.status`.
-    pub lsp: Arc<dyn StatusSeam>,
+    pub lsp: Arc<dyn LspSource>,
     /// `Format.Service.status`.
     pub formatter: Arc<dyn StatusSeam>,
     /// `shared/tui-control.ts` queues.
@@ -1258,7 +1274,7 @@ impl ServerContext {
                 projects: projects.clone(),
             }),
             skills: Arc::new(EmptyStatus),
-            lsp: Arc::new(EmptyStatus),
+            lsp: Arc::new(UnwiredLsp),
             formatter: Arc::new(EmptyStatus),
             tui: TuiControl::new(),
             tools: Arc::new(UnwiredTools),

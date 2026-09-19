@@ -2,15 +2,41 @@
 //! `session/schema.ts`.
 //!
 //! TS composes `<prefix>_<48-bit hex time><14 chars base62>` from a
-//! `timestamp << 12 + counter`; the Rust port (per spec §2.2) uses a ULID
-//! per call — ascending keeps the ULID timestamp, descending inverts it.
-//! Both are lexicographically sortable, `prefix_`-tagged, and opaque on
-//! the wire. Given IDs are validated for the prefix, else
+//! `timestamp << 12 + counter` — the counter makes ids created in the
+//! same millisecond monotonically ordered (id/id.ts:49-70). The Rust
+//! port keeps the ULID string format (`prefix_` + 26 Crockford chars)
+//! but embeds the same `timestamp << 12 + counter` in the ULID's 48-bit
+//! time field, so same-millisecond ordering matches TS. Given IDs are
+//! validated for the prefix, else
 //! `ID {given} does not start with {prefix}` (id/id.ts:64-68).
 
 use ulid::Ulid;
 
 use crate::CoreError;
+
+/// `lastTimestamp`/`counter` (id/id.ts:15-17) — the per-process monotonic
+/// id state.
+static ID_STATE: std::sync::Mutex<(u64, u64)> = std::sync::Mutex::new((0, 0));
+
+/// `create`'s time computation (id/id.ts:49-55): reset the counter when
+/// the millisecond changes, then embed `timestamp * 0x1000 + counter`.
+fn monotonic_time(now_ms: u64) -> u64 {
+    let mut state = ID_STATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if state.0 != now_ms {
+        *state = (now_ms, 0);
+    }
+    state.1 += 1;
+    now_ms * 0x1000 + state.1
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_default()
+}
 
 /// `prefixes` (id/id.ts:3-13) — the prefixes M5 needs. Aliases of the
 /// generated `PREFIX` consts below.
@@ -33,13 +59,13 @@ fn create(prefix: &str, direction: Direction, given: Option<&str>) -> Result<Str
         return Ok(given.to_string());
     }
     let value = Ulid::new().0;
-    let time = value >> 80;
     let random = value & ((1u128 << 80) - 1);
+    let time = monotonic_time(now_ms()) & 0xFFFF_FFFF_FFFF;
     let time = match direction {
         Direction::Ascending => time,
         Direction::Descending => !time & 0xFFFF_FFFF_FFFF,
     };
-    let combined = (time << 80) | random;
+    let combined = ((time as u128) << 80) | random;
     Ok(format!("{prefix}{}", Ulid(combined)))
 }
 
@@ -107,6 +133,17 @@ mod tests {
         let b = MessageId::ascending(None).unwrap();
         assert!(a < b, "{a} should sort before {b}");
         assert!(a.starts_with("msg_"));
+    }
+
+    #[test]
+    fn ascending_is_monotonic_within_a_millisecond() {
+        let a = MessageId::ascending(None).unwrap();
+        let b = MessageId::ascending(None).unwrap();
+        let c = MessageId::ascending(None).unwrap();
+        assert!(
+            a < b && b < c,
+            "same-millisecond ids sort in creation order"
+        );
     }
 
     #[test]

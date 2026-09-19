@@ -203,7 +203,12 @@ fn fixture(llm_text: &str) -> Fixture {
         input_models: Some(Arc::new(FixedInputModels)),
         share_http: None,
     };
-    let ctx = opencode_server::production_context(&ListenOptions::default(), paths, seams).unwrap();
+    let mut ctx =
+        opencode_server::production_context(&ListenOptions::default(), paths, seams).unwrap();
+    // Ambient auth env (a shell exporting OPENCODE_SERVER_PASSWORD) must not
+    // leak into the fixture — these tests exercise unauthenticated routes.
+    Arc::get_mut(&mut ctx).expect("sole owner").auth =
+        opencode_server::state::AuthConfig::new("opencode", None);
     Fixture {
         directory: dir.path().join("repo"),
         _dir: dir,
@@ -462,7 +467,11 @@ async fn session_create_auto_shares_when_config_auto() {
         input_models: None,
         share_http: Some(share_http.clone()),
     };
-    let ctx = opencode_server::production_context(&ListenOptions::default(), paths, seams).unwrap();
+    let mut ctx =
+        opencode_server::production_context(&ListenOptions::default(), paths, seams).unwrap();
+    // Ambient auth env must not leak into the fixture (see `fixture`).
+    Arc::get_mut(&mut ctx).expect("sole owner").auth =
+        opencode_server::state::AuthConfig::new("opencode", None);
     let router = routes::build_router(ctx);
 
     let response = send(

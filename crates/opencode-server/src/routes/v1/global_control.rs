@@ -515,7 +515,7 @@ pub async fn lsp_status(
     State(ctx): State<Arc<ServerContext>>,
     axum::Extension(location): axum::Extension<LocationContext>,
 ) -> Result<Response, ServerError> {
-    let lsp = ctx.lsp.status(&location.directory)?;
+    let lsp = ctx.lsp.status(&location)?;
     Ok(json_ok(lsp))
 }
 

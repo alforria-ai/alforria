@@ -1572,4 +1572,65 @@ mod tests {
         assert_eq!(max_seen.load(Ordering::SeqCst), 1);
         std::fs::remove_dir_all(temp.path()).ok();
     }
+
+    #[tokio::test]
+    async fn lsp_service_gates_the_edit_tool() {
+        let temp = crate::storage::test_support::TempDir::new("edit-lsp-service");
+        let file = write(temp.path(), "a.rs", "fn main() {}\n");
+        let file_str = file.to_string_lossy().to_string();
+        let command = vec![
+            "python3".to_string(),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/lsp_double.py").to_string(),
+            temp.path()
+                .join("double.log")
+                .to_string_lossy()
+                .into_owned(),
+            "--no-pull".to_string(),
+        ];
+        let mut entries = std::collections::BTreeMap::new();
+        entries.insert(
+            "rust".to_string(),
+            crate::config::schema::LspEntry::Disabled {
+                disabled: crate::config::schema::TrueLiteral,
+            },
+        );
+        entries.insert(
+            "double".to_string(),
+            crate::config::schema::LspEntry::Server {
+                command,
+                extensions: Some(vec![".rs".to_string()]),
+                disabled: None,
+                env: None,
+                initialization: None,
+            },
+        );
+        let input = crate::lsp::LspInput {
+            lsp: Some(crate::config::schema::LspInfo::Entries(entries)),
+            directory: temp.path().to_path_buf(),
+            worktree: temp.path().to_path_buf(),
+            paths: crate::paths::GlobalPaths::resolve(temp.path().to_path_buf()),
+            events: None,
+            flags: crate::lsp::server::Flags::default(),
+        };
+        let lsp: Arc<dyn Lsp> = crate::lsp::LspService::new(input);
+        let (result, _, _) = call(
+            temp.path(),
+            Some(lsp),
+            events(),
+            json!({
+                "filePath": file_str,
+                "oldString": "fn main()",
+                "newString": "fn newmain",
+            }),
+        )
+        .await;
+
+        let output = result.unwrap().output;
+        assert!(
+            output.contains("LSP errors detected in this file, please fix:"),
+            "{output}"
+        );
+        assert!(output.contains("double error"), "{output}");
+        std::fs::remove_dir_all(temp.path()).ok();
+    }
 }
