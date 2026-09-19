@@ -394,6 +394,11 @@ impl ModelSource for RuntimeModels {
                 let (provider_id, model_id) = parse_model(small);
                 return self.resolve(&provider_id, &model_id).ok();
             }
+            // TODO: Remove these provider-specific assumptions once model
+            // syncing reliably reports available deployments (provider.ts:1963-1966).
+            if provider_id == "azure" || provider_id == "azure-cognitive-services" {
+                return None;
+            }
             let provider = self.0.state.providers.get(provider_id)?;
             let priority: Vec<&str> = if provider_id.starts_with("opencode") {
                 vec!["gpt-nano"]

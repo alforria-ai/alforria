@@ -92,3 +92,21 @@ Panel: glm-3.3-thinking (agentic) + deepseek-v4.1-flash-thinking (agentic pass, 
 ### Recorded divergences (not fixed)
 - **Env-flag snapshots at construction** (FenceLayer, LocationLayer, AuthConfig): TS reads per-request; CLI usage unaffected — recorded as known divergence.
 - **InstanceStore holds the entries lock across factory config I/O** — scalability TODO added in state.rs, no wire divergence.
+
+## Milestone 7 (deferred subsystems) review panel
+
+Panel: glm-5.3-thinking (agentic, 50% budget) + deepseek-v4.1-flash-thinking (agentic, complete).
+
+### Accepted & fixed
+- **`getSmallModel` omits the azure short-circuit (MAJOR, deepseek)**: azure/azure-cognitive-services now return None before model selection (provider.ts:1963-1966).
+- **VCS `file_from_git_header` char-index-as-byte-index (MAJOR, deepseek)**: `parse_quoted_path` now returns byte offsets — panicked on multibyte quoted paths (vcs.rs vs project/vcs.ts:33-76).
+- **Worktree remove/reset leaked `WorktreeListFailedError` (MAJOR, deepseek)**: the list call wraps under its caller's tag — `RemoveFailedError`/`ResetFailedError` (worktree/index.ts:400-402, 541-543). Plus the reset message colon (:602).
+- **GitSnapshot blocking git subprocesses on the async runtime (MAJOR, agentic)**: all trait methods now run their sync bodies via `spawn_blocking` (TS Effect fibers).
+- **LSP `end_position` counted Unicode scalars, not UTF-16 units (MINOR, deepseek)** (client.ts:87).
+- **`RepositoryCache::keyed_lock` leaked an Arc per call (MINOR, deepseek)**: leaks once per unique path, reused from the map.
+- **engine.rs `.expect("ses id")` production unwraps (MINOR, agentic)**: now fall through to the `Slug.create()` fallback.
+
+### Recorded divergences (not fixed)
+- **MCP stdio `recv_until` is single-consumer** (responses mutex held across recv; non-matching responses consumed). Latent only — single `call_tool` call site; TS SDK correlates per pending-id. Noted in transport.rs.
+- **MCP/LSP stdin writes** happen with concurrent reader tasks on stdout (deadlock neutralized); adversarial servers that reply before reading stdin are out of scope.
+- The agentic reviewer's ~50%-budget handoff listed `background.rs` cancel/spawn race and EngineStore `Arc::as_ptr` eviction as *candidates* to verify — neither verified against TS, not fixed; re-check in the M8 pre-TUI audit.

@@ -680,18 +680,17 @@ fn resolve_local(path: &Path) -> PathBuf {
 }
 
 /// Per-cache-path lock (`EffectFlock.withLock`) — process-wide keyed mutex.
+/// The leaked handle is created once per unique path and reused for every
+/// call, so growth is bounded by the number of distinct cache paths.
 fn keyed_lock(path: &Path) -> std::sync::MutexGuard<'static, ()> {
-    static LOCKS: std::sync::LazyLock<Mutex<std::collections::HashMap<PathBuf, Arc<Mutex<()>>>>> =
-        std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+    static LOCKS: std::sync::LazyLock<
+        Mutex<std::collections::HashMap<PathBuf, &'static Mutex<()>>>,
+    > = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
     let mut locks = LOCKS.lock().unwrap_or_else(|p| p.into_inner());
     let lock = locks
         .entry(path.to_path_buf())
-        .or_insert_with(|| Arc::new(Mutex::new(())))
-        .clone();
-    drop(locks);
-    // Cache paths live for the process, so leaking the handle is fine.
-    let leaked: &'static mut Arc<Mutex<()>> = Box::leak(Box::new(lock));
-    leaked.lock().unwrap_or_else(|p| p.into_inner())
+        .or_insert_with(|| Box::leak(Box::new(Mutex::new(()))));
+    lock.lock().unwrap_or_else(|p| p.into_inner())
 }
 #[cfg(test)]
 mod tests {

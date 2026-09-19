@@ -151,6 +151,10 @@ impl StdioTransport {
         .map_err(|_| McpError::failed("transport closed"))
     }
 
+    // NOTE(review M7): the responses receiver is single-consumer with a
+    // single call site; concurrent correlated readers (TS SDK per-id pending
+    // map) would need a broadcast inbox. Recorded in review-findings.md.
+    ///
     /// Read messages until the callback accepts one (request
     /// correlation); notifications are skipped.
     pub async fn recv_until(&self, accept: impl Fn(&Value) -> bool) -> Result<Value, McpError> {

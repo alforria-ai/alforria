@@ -204,11 +204,11 @@ impl Worktree {
         self.git.run(Some(cwd), args)
     }
 
-    fn list_porcelain(&self, ctx: &Context) -> Result<Vec<ListEntry>, Error> {
+    fn list_porcelain(&self, ctx: &Context, tag: &'static str) -> Result<Vec<ListEntry>, Error> {
         let result = self.git(&ctx.worktree, &["worktree", "list", "--porcelain"]);
         if result.exit_code != 0 {
             return Err(Error::new(
-                "WorktreeListFailedError",
+                tag,
                 failure_message(&result.stderr, &result.text, "Failed to read git worktrees"),
             ));
         }
@@ -378,7 +378,7 @@ impl Worktree {
         if !ctx.is_git {
             return Ok(Vec::new());
         }
-        let entries = self.list_porcelain(ctx)?;
+        let entries = self.list_porcelain(ctx, "WorktreeListFailedError")?;
         let primary = canonical(&ctx.project_worktree);
         let primary_name = file_name(&primary).to_lowercase();
         let mut out = Vec::new();
@@ -445,7 +445,7 @@ impl Worktree {
             // (`directory` is normalized on Windows).
             deps.dispose_directory(Path::new(input));
         }
-        let entries = self.list_porcelain(ctx)?;
+        let entries = self.list_porcelain(ctx, "WorktreeRemoveFailedError")?;
         let entry = locate_worktree(&entries, &directory);
         let Some(entry) = entry.filter(|entry| entry.path.is_some()) else {
             if directory.exists() {
@@ -467,7 +467,7 @@ impl Worktree {
             ],
         );
         if removed.exit_code != 0 {
-            let next = self.list_porcelain(ctx)?;
+            let next = self.list_porcelain(ctx, "WorktreeRemoveFailedError")?;
             if locate_worktree(&next, &directory).is_some_and(|item| item.path.is_some()) {
                 return Err(Error::new(
                     "WorktreeRemoveFailedError",
@@ -543,7 +543,7 @@ impl Worktree {
                 "Cannot reset the primary workspace",
             ));
         }
-        let entries = self.list_porcelain(ctx)?;
+        let entries = self.list_porcelain(ctx, "WorktreeResetFailedError")?;
         let Some(entry) = locate_worktree(&entries, &directory) else {
             return Err(Error::new("WorktreeResetFailedError", "Worktree not found"));
         };
@@ -655,7 +655,7 @@ impl Worktree {
         if !status.text.trim().is_empty() {
             return Err(Error::new(
                 "WorktreeResetFailedError",
-                format!("Worktree reset left local changes\n{}", status.text.trim()),
+                format!("Worktree reset left local changes:\n{}", status.text.trim()),
             ));
         }
 

@@ -233,8 +233,9 @@ fn lock_for(gitdir: &Path) -> Arc<Mutex<()>> {
 /// The git-backed [`Snapshot`] — a line-for-line port of
 /// `snapshot/index.ts` (only the error channels differ: soft git failures
 /// are logged, never thrown).
+#[derive(Clone)]
 pub struct GitSnapshot {
-    runner: Box<dyn SnapshotRunner>,
+    runner: std::sync::Arc<dyn SnapshotRunner>,
     directory: PathBuf,
     worktree: PathBuf,
     gitdir: PathBuf,
@@ -273,7 +274,7 @@ impl GitSnapshot {
         let cleanup = Arc::new((Mutex::new(false), Condvar::new()));
         let lock = lock_for(&gitdir);
         let snapshot = Arc::new(GitSnapshot {
-            runner: Box::new(SubprocessSnapshotRunner),
+            runner: std::sync::Arc::new(SubprocessSnapshotRunner),
             directory: input.directory,
             worktree: input.worktree,
             gitdir,
@@ -1154,29 +1155,62 @@ impl GitSnapshot {
 }
 
 impl Snapshot for GitSnapshot {
+    // Multi-second `git` subprocesses run under Effect fibers in TS; here
+    // they are sync fns moved onto the blocking pool so a slow `git add`
+    // never stalls a tokio worker.
+
     fn track(&self) -> BoxFuture<'static, Option<String>> {
-        let result = self.track_impl();
-        Box::pin(async move { result })
+        let snapshot = self.clone();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || snapshot.track_impl())
+                .await
+                .unwrap_or_default()
+        })
     }
 
     fn patch(&self, id: &str) -> BoxFuture<'static, Result<SnapshotPatch, CoreError>> {
-        let result = self.patch_impl(id);
-        Box::pin(async move { Ok(result) })
+        let snapshot = self.clone();
+        let id = id.to_string();
+        Box::pin(async move {
+            let hash = id.clone();
+            Ok(
+                tokio::task::spawn_blocking(move || snapshot.patch_impl(&id))
+                    .await
+                    .unwrap_or_else(|_| SnapshotPatch {
+                        hash,
+                        files: Vec::new(),
+                    }),
+            )
+        })
     }
 
     fn restore(&self, id: &str) -> BoxFuture<'static, Result<(), CoreError>> {
-        self.restore_impl(id);
-        Box::pin(async { Ok(()) })
+        let snapshot = self.clone();
+        let id = id.to_string();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || snapshot.restore_impl(&id))
+                .await
+                .map_err(|_| CoreError::Storage("snapshot task failed".to_string()))
+        })
     }
 
     fn revert(&self, patches: Vec<PatchPart>) -> BoxFuture<'static, Result<(), CoreError>> {
-        self.revert_impl(patches);
-        Box::pin(async { Ok(()) })
+        let snapshot = self.clone();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || snapshot.revert_impl(patches))
+                .await
+                .map_err(|_| CoreError::Storage("snapshot task failed".to_string()))
+        })
     }
 
     fn diff(&self, id: &str) -> BoxFuture<'static, Result<String, CoreError>> {
-        let result = self.diff_impl(id);
-        Box::pin(async move { Ok(result) })
+        let snapshot = self.clone();
+        let id = id.to_string();
+        Box::pin(async move {
+            Ok(tokio::task::spawn_blocking(move || snapshot.diff_impl(&id))
+                .await
+                .unwrap_or_default())
+        })
     }
 
     fn diff_full(
@@ -1184,8 +1218,16 @@ impl Snapshot for GitSnapshot {
         from: &str,
         to: &str,
     ) -> BoxFuture<'static, Result<Vec<FileDiff>, CoreError>> {
-        let result = self.diff_full_impl(from, to);
-        Box::pin(async move { Ok(result) })
+        let snapshot = self.clone();
+        let from = from.to_string();
+        let to = to.to_string();
+        Box::pin(async move {
+            Ok(
+                tokio::task::spawn_blocking(move || snapshot.diff_full_impl(&from, &to))
+                    .await
+                    .unwrap_or_default(),
+            )
+        })
     }
 }
 

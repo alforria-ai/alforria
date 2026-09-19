@@ -634,13 +634,16 @@ struct Batch {
 /// `fileFromDiffPath` + `parsePathToken` + `parseQuotedPath`
 /// (`project/vcs.ts:33-76`).
 fn parse_quoted_path(value: &str) -> Option<(String, usize)> {
-    let chars: Vec<char> = value.chars().collect();
+    // Byte-indexed (the returned offset is used for byte slicing; JS string
+    // indices are UTF-16 units, but slicing is on ASCII quotes/backslashes
+    // so byte offsets match the TS remainder semantics exactly).
+    let chars: Vec<(usize, char)> = value.char_indices().collect();
     let mut out = String::new();
     let mut idx = 1;
     while idx < chars.len() {
-        let char = chars[idx];
+        let (offset, char) = chars[idx];
         if char == '"' {
-            return Some((out, idx + 1));
+            return Some((out, offset + char.len_utf8()));
         }
         if char != '\\' {
             out.push(char);
@@ -649,12 +652,12 @@ fn parse_quoted_path(value: &str) -> Option<(String, usize)> {
         }
         idx += 1;
         match chars.get(idx) {
-            Some('t') => out.push('\t'),
-            Some('n') => out.push('\n'),
-            Some('r') => out.push('\r'),
-            Some('"') => out.push('"'),
-            Some('\\') => out.push('\\'),
-            Some(next) => out.push(*next),
+            Some((_, 't')) => out.push('\t'),
+            Some((_, 'n')) => out.push('\n'),
+            Some((_, 'r')) => out.push('\r'),
+            Some((_, '"')) => out.push('"'),
+            Some((_, '\\')) => out.push('\\'),
+            Some((_, next)) => out.push(*next),
             None => {}
         }
         idx += 1;

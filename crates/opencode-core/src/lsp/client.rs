@@ -137,7 +137,7 @@ fn end_position(text: &str) -> Value {
         .collect();
     json!({
         "line": lines.len().saturating_sub(1),
-        "character": lines.last().map(|l| l.chars().count()).unwrap_or(0),
+        "character": lines.last().map(|l| l.encode_utf16().count()).unwrap_or(0),
     })
 }
 

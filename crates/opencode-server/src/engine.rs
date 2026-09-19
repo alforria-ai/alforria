@@ -354,8 +354,12 @@ async fn generate_copy_name(
                 .await
                 .map_err(|_| ())?,
         };
-        let session_id = opencode_core::session::ids::SessionId::descending(None).expect("ses id");
-        let message_id = opencode_core::session::ids::MessageId::ascending(None).expect("msg id");
+        let Ok(session_id) = opencode_core::session::ids::SessionId::descending(None) else {
+            return Err(());
+        };
+        let Ok(message_id) = opencode_core::session::ids::MessageId::ascending(None) else {
+            return Err(());
+        };
         let user = opencode_schema::session_v1::V1Message::User {
             id: message_id.clone(),
             session_id: session_id.clone(),
