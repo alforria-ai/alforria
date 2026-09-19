@@ -117,6 +117,9 @@ pub struct SessionServices {
     pub agents: AgentRegistry,
     pub permission: Arc<PermissionService>,
     pub question: Arc<QuestionService>,
+    pub credentials: Arc<crate::credential::CredentialStore>,
+    pub integrations: Arc<crate::integration::IntegrationService>,
+    pub project_copy: Arc<crate::project_copy::ProjectCopy>,
     clock: Arc<dyn Clock>,
     location: Arc<Mutex<Option<InstanceLocation>>>,
 }
@@ -149,6 +152,16 @@ impl SessionServices {
         let run_state = SessionRunState::new(background, status.clone());
         let permission = Arc::new(PermissionService::new(events.clone()));
         let question = Arc::new(QuestionService::new(events.clone()));
+        let credentials = Arc::new(crate::credential::CredentialStore::new(
+            storage.clone(),
+            clock.clone(),
+        ));
+        let integrations = Arc::new(crate::integration::IntegrationService::new(
+            credentials.clone(),
+            events.clone(),
+            clock.clone(),
+        ));
+        let project_copy = crate::project_copy::ProjectCopy::new(storage.clone(), events.clone());
         SessionServices {
             storage,
             events,
@@ -159,6 +172,9 @@ impl SessionServices {
             agents: AgentRegistry::new(agent_input),
             permission,
             question,
+            credentials,
+            integrations,
+            project_copy,
             clock,
             location: Arc::new(Mutex::new(None)),
         }

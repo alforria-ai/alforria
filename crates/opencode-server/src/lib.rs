@@ -12,6 +12,7 @@ pub mod pty;
 pub mod routes;
 pub mod sse;
 pub mod state;
+pub mod workspace;
 
 use std::io;
 use std::sync::Arc;

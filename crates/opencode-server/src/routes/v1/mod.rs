@@ -8,9 +8,12 @@ pub mod config_permission_question;
 pub mod global_control;
 pub mod mcp;
 pub mod project;
+pub mod project_copy;
 pub mod provider;
 pub mod session;
+pub mod sync;
 pub mod util;
+pub mod workspace;
 
 /// `(method, path)` pairs in registration order
 /// (`httpapi/api.ts:54-77`). 127 endpoints.

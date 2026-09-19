@@ -237,6 +237,11 @@ pub struct ProductionEngine {
     share: Arc<opencode_core::share::SessionShare>,
     /// The MCP service — the `/mcp` route family reads this (M7.6).
     mcp: Arc<opencode_core::mcp::McpService>,
+    /// The provider model resolution + LLM seam — the project-copy
+    /// generate-name stream (M7.8).
+    models: Arc<dyn opencode_core::session::r#loop::ModelSource>,
+    defaults: Arc<dyn opencode_core::session::prompt_input::Models>,
+    llm: Arc<dyn LlmStream>,
 }
 
 /// The [`SessionEngine`] surface (`state.rs`) over the M5 services. The
@@ -308,6 +313,18 @@ impl SessionEngine for ProductionEngine {
     fn session_background<'a>(&'a self, session_id: &'a str) -> BoxFuture<'a, bool> {
         Box::pin(async move { self.session_background_impl(session_id).await })
     }
+
+    fn generate_copy_name<'a>(&'a self, context: &'a str) -> BoxFuture<'a, String> {
+        Box::pin(async move {
+            generate_copy_name(
+                self.models.clone(),
+                self.defaults.clone(),
+                self.llm.clone(),
+                context,
+            )
+            .await
+        })
+    }
 }
 
 impl ProductionEngine {
@@ -343,6 +360,133 @@ impl ProductionEngine {
 // ---------------------------------------------------------------------------
 // Assembly
 // ---------------------------------------------------------------------------
+
+/// The hidden `project-copy-name` agent (`handlers/project-copy.ts:7-14`).
+fn copy_name_agent() -> opencode_core::session::agents::AgentInfo {
+    opencode_core::session::agents::AgentInfo {
+        name: "project-copy-name".to_string(),
+        description: None,
+        mode: opencode_core::tool::def::AgentMode::Primary,
+        native: Some(true),
+        hidden: Some(true),
+        top_p: None,
+        temperature: None,
+        color: None,
+        permission: Default::default(),
+        model: None,
+        variant: None,
+        prompt: Some(String::new()),
+        options: Default::default(),
+        steps: None,
+    }
+}
+
+/// `slugify` (`handlers/project-copy.ts:71-78`).
+fn copy_name_slugify(input: &str) -> String {
+    let mut out = String::new();
+    for char in input.trim().to_lowercase().chars() {
+        if char.is_ascii_lowercase() || char.is_ascii_digit() {
+            out.push(char);
+        } else {
+            out.push('-');
+        }
+    }
+    out.trim_matches('-').to_string()
+}
+
+/// `generateName` (`handlers/project-copy.ts:22-69`) — the one-shot LLM
+/// stream; every failure path degrades to `Slug.create()`.
+async fn generate_copy_name(
+    models: Arc<dyn opencode_core::session::r#loop::ModelSource>,
+    defaults: Arc<dyn opencode_core::session::prompt_input::Models>,
+    llm: Arc<dyn LlmStream>,
+    context: &str,
+) -> String {
+    let text = context.trim();
+    if text.is_empty() {
+        return opencode_core::session::agents::slug_create();
+    }
+    let agent = copy_name_agent();
+    let resolve = async {
+        // `provider.defaultModel()` — the catch swallows errors into the
+        // `Slug.create()` fallback.
+        let fallback = defaults.default_model().await.map_err(|_| ())?;
+        let model = match models.get_small_model(&fallback.provider_id).await {
+            Some(model) => model,
+            None => models
+                .get_model(&fallback.provider_id, &fallback.id, "")
+                .await
+                .map_err(|_| ())?,
+        };
+        let session_id = opencode_core::session::ids::SessionId::descending(None).expect("ses id");
+        let message_id = opencode_core::session::ids::MessageId::ascending(None).expect("msg id");
+        let user = opencode_schema::session_v1::V1Message::User {
+            id: message_id.clone(),
+            session_id: session_id.clone(),
+            time: opencode_schema::session_v1::UserTime {
+                created: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or_default() as f64,
+            },
+            format: None,
+            summary: None,
+            agent: agent.name.clone(),
+            model: opencode_schema::session_v1::V1UserModel {
+                provider_id: model.llm.provider_id.clone(),
+                model_id: model.llm.id.clone(),
+                variant: None,
+            },
+            system: None,
+            tools: None,
+        };
+        let input = opencode_core::session::llm::StreamInput {
+            user,
+            session_id,
+            parent_session_id: None,
+            project_id: None,
+            client: "cli".to_string(),
+            model: model.llm.clone(),
+            agent: agent.clone(),
+            permission: None,
+            system: Vec::new(),
+            messages: vec![opencode_llm::schema::messages::Message::user(format!(
+                "Generate a short 2-3 word name that describes this task:\n{text}"
+            ))],
+            small: true,
+            tools: Vec::new(),
+            retries: Some(2),
+            tool_choice: None,
+        };
+        Ok::<_, ()>((
+            llm.stream(input),
+            model.llm.id.clone(),
+            model.llm.provider_id.clone(),
+        ))
+    };
+    let Ok((stream, _, _)) = resolve.await else {
+        return opencode_core::session::agents::slug_create();
+    };
+    // `Stream.filter(LLMEvent.is.textDelta).map((e) => e.text).mkString`
+    let mut result = String::new();
+    let mut stream = stream;
+    use futures::StreamExt;
+    while let Some(event) = stream.next().await {
+        match event {
+            Ok(opencode_llm::schema::events::LlmEvent::TextDelta { text, .. }) => {
+                result.push_str(&text);
+            }
+            Err(_) => return opencode_core::session::agents::slug_create(),
+            _ => {}
+        }
+    }
+    let output = result.trim();
+    if output.is_empty() {
+        return opencode_core::session::agents::slug_create();
+    }
+    let words: Vec<&str> = output.split_whitespace().take(3).collect();
+    copy_name_slugify(&words.join(" "))
+}
 
 /// `Agent.Service` access for tools — the registry knows the full
 /// `Agent.Info` records; the tool system needs the reduced slice
@@ -741,7 +885,7 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
         services: (**services).clone(),
         models: models.clone(),
         input_models,
-        llm,
+        llm: llm.clone(),
         snapshot,
         compaction,
         subtasks,
@@ -763,6 +907,7 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
         experimental_plan_mode: false,
         vcs: false,
     });
+
     ops.bind(prompt.clone());
 
     // M7.5: the share network service (share-next.ts) behind its HTTP +
@@ -799,13 +944,16 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
     ));
 
     Ok(Arc::new(ProductionEngine {
-        prompt,
-        revert,
-        summary,
-        registry,
+        prompt: prompt.clone(),
+        revert: revert.clone(),
+        summary: summary.clone(),
+        registry: registry.clone(),
         background: input.background.clone(),
         share,
         mcp: mcp_service,
+        models,
+        defaults: Arc::new(runtime_models),
+        llm,
     }))
 }
 
@@ -960,5 +1108,156 @@ impl opencode_core::tool::mcp_websearch::McpHttpClient for ReqwestMcpHttpClient 
             }
             Ok(opencode_core::tool::mcp_websearch::McpHttpResponse { body: text })
         })
+    }
+}
+
+#[cfg(test)]
+mod generate_name_tests {
+    use super::*;
+    use opencode_core::session::llm::{LlmEventStream, LlmModel, StreamInput};
+    use opencode_core::session::prompt_input::Models;
+    use opencode_core::session::r#loop::{ModelSource, ResolvedModel};
+    use opencode_schema::model::ModelInfo;
+
+    struct FixedModels;
+
+    impl Models for FixedModels {
+        fn get_model<'a>(
+            &'a self,
+            _provider_id: &'a str,
+            _model_id: &'a str,
+        ) -> opencode_core::tool::def::BoxFuture<'a, Result<ModelInfo, CoreError>> {
+            unreachable!("default_model drives resolution")
+        }
+
+        fn default_model(
+            &self,
+        ) -> opencode_core::tool::def::BoxFuture<'static, Result<ModelInfo, CoreError>> {
+            Box::pin(async {
+                Ok(serde_json::from_value(serde_json::json!({
+                    "id": "model",
+                    "providerID": "prov",
+                    "name": "model",
+                    "api": { "id": "", "type": "native", "settings": {} },
+                    "capabilities": { "tools": false, "input": [], "output": [] },
+                    "request": { "headers": {}, "body": {} },
+                    "variants": [],
+                    "time": { "released": 0 },
+                    "cost": [],
+                    "status": "active",
+                    "enabled": true,
+                    "limit": { "context": 1000, "output": 1000 },
+                }))
+                .expect("ModelInfo"))
+            })
+        }
+    }
+
+    struct FixedSource;
+
+    impl ModelSource for FixedSource {
+        fn get_model<'a>(
+            &'a self,
+            _provider_id: &'a str,
+            _model_id: &'a str,
+            _session_id: &'a str,
+        ) -> futures::future::BoxFuture<
+            'a,
+            Result<ResolvedModel, opencode_core::session::r#loop::LoopError>,
+        > {
+            unreachable!("small model drives resolution")
+        }
+
+        fn get_small_model<'a>(
+            &'a self,
+            _provider_id: &'a str,
+        ) -> futures::future::BoxFuture<'a, Option<ResolvedModel>> {
+            Box::pin(async { Some(resolved()) })
+        }
+    }
+
+    fn resolved() -> ResolvedModel {
+        ResolvedModel {
+            llm: LlmModel {
+                id: "model".to_string(),
+                provider_id: "prov".to_string(),
+                api_id: String::new(),
+                api_npm: String::new(),
+                temperature_capable: false,
+                headers: Default::default(),
+                options: Default::default(),
+                context_limit: 1000.0,
+                output_limit: 1000.0,
+                output_token_max: None,
+            },
+            cost: opencode_core::session::usage::ModelCost::free(),
+            limits: opencode_core::session::overflow::ModelLimits {
+                context: 1000.0,
+                input: None,
+                output: 1000.0,
+            },
+            output_token_max: None,
+        }
+    }
+
+    struct TextLlm;
+
+    impl LlmStream for TextLlm {
+        fn stream(&self, input: StreamInput) -> LlmEventStream {
+            let prompt = input
+                .messages
+                .first()
+                .and_then(|message| {
+                    message.content.first().and_then(|part| match part {
+                        opencode_llm::schema::messages::ContentPart::Text { text, .. } => {
+                            Some(text.clone())
+                        }
+                        _ => None,
+                    })
+                })
+                .unwrap_or_default();
+            Box::pin(futures::stream::iter(vec![
+                Ok(opencode_llm::schema::events::LlmEvent::TextStart {
+                    id: "c1".to_string(),
+                    provider_metadata: None,
+                }),
+                Ok(opencode_llm::schema::events::LlmEvent::TextDelta {
+                    id: "c1".to_string(),
+                    text: format!(" {prompt}"),
+                    provider_metadata: None,
+                }),
+                Ok(opencode_llm::schema::events::LlmEvent::TextEnd {
+                    id: "c1".to_string(),
+                    provider_metadata: None,
+                }),
+            ]))
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_context_falls_back_to_slug() {
+        let name = generate_copy_name(
+            Arc::new(FixedSource),
+            Arc::new(FixedModels),
+            Arc::new(TextLlm),
+            "   ",
+        )
+        .await;
+        assert!(!name.is_empty());
+    }
+
+    #[tokio::test]
+    async fn three_words_slugified() {
+        let name = generate_copy_name(
+            Arc::new(FixedSource),
+            Arc::new(FixedModels),
+            Arc::new(TextLlm),
+            "do the thing now",
+        )
+        .await;
+        // The mock echoes the prompt as the stream text: "Generate a short
+        // 2-3 word name that describes this task:\n do the thing now" —
+        // the first 3 whitespace words after the trim, slugified.
+        assert_eq!(name, "generate-a-short");
     }
 }

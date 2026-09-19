@@ -79,6 +79,11 @@ id_type!(SessionId, "ses_", "`ses_` IDs (`session` prefix).");
 id_type!(MessageId, "msg_", "`msg_` IDs (`message` prefix).");
 id_type!(PartId, "prt_", "`prt_` IDs (`part` prefix).");
 id_type!(PermissionId, "per_", "`per_` IDs (`permission` prefix).");
+
+/// `generateID` for prefixes without a dedicated type (id/id.ts:31-40).
+pub fn generate_id(prefix: &str) -> String {
+    create(prefix, Direction::Ascending, None).expect("generated id is prefix-valid")
+}
 id_type!(QuestionId, "que_", "`que_` IDs (`question` prefix).");
 id_type!(JobId, "job_", "`job_` IDs (`job` prefix).");
 

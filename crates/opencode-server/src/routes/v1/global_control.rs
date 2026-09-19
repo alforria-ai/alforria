@@ -599,7 +599,8 @@ fn read_line(path: &Path, line: u64) -> Option<(usize, String)> {
     None
 }
 
-/// `findFile` (`handlers/file.ts:41-60`) — fuzzy file/directory name search.
+/// `findFile` (`handlers/file.ts:41-60`) — fuzzy file/directory name search
+/// over the ripgrep-backed find state (`filesystem/search.ts`).
 pub async fn find_file(
     axum::Extension(location): axum::Extension<LocationContext>,
     uri: Uri,
@@ -634,59 +635,21 @@ pub async fn find_file(
     if type_filter.is_none() && query_param(uri.query(), "dirs").as_deref() == Some("false") {
         type_filter = Some("file".to_string());
     }
-    let (mut files, mut directories) = (Vec::new(), Vec::new());
-    collect_paths(
-        &location.directory,
-        &location.directory,
-        &mut files,
-        &mut directories,
-    );
-    let items: Vec<String> = match type_filter.as_deref() {
-        Some("file") => files,
-        Some("directory") => directories,
-        _ => {
-            let mut both = files;
-            both.extend(directories);
-            both
-        }
+    let vcs = location
+        .services
+        .instance(&location.directory)
+        .map_err(|_| defect("instance context"))?
+        .project
+        .vcs
+        .is_some();
+    let state = opencode_core::filesystem::FindState::build(&location.directory, vcs);
+    let find_type = match type_filter.as_deref() {
+        Some("file") => Some(opencode_core::filesystem::FindType::File),
+        Some("directory") => Some(opencode_core::filesystem::FindType::Directory),
+        _ => None,
     };
-    let query_chars: Vec<char> = query.to_lowercase().chars().collect();
-    let matches: Vec<String> = items
-        .into_iter()
-        .filter(|path| {
-            let lowered: Vec<char> = path.to_lowercase().chars().collect();
-            let mut i = 0;
-            for c in lowered {
-                if i < query_chars.len() && query_chars[i] == c {
-                    i += 1;
-                }
-            }
-            i == query_chars.len()
-        })
-        .take(limit)
-        .collect();
+    let matches = opencode_core::filesystem::find(&state, &query, find_type, Some(limit));
     Ok(json_ok(matches))
-}
-
-/// Walk a directory collecting cwd-relative file and directory paths
-/// (files first, mirroring the TS `state.files`/`state.directories` lists).
-fn collect_paths(base: &Path, dir: &Path, files: &mut Vec<String>, directories: &mut Vec<String>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let relative = entry
-            .path()
-            .strip_prefix(base)
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            directories.push(format!("{relative}/"));
-            collect_paths(base, &entry.path(), files, directories);
-        } else {
-            files.push(relative);
-        }
-    }
 }
 
 /// `findSymbol` (`handlers/file.ts:62-64`).

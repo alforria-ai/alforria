@@ -182,9 +182,24 @@ pub enum ApiError {
     /// `ApiMoveSessionError` (400, `groups/control-plane.ts:9-17`) —
     /// `{"name":"MoveSessionError","data":{"message":...}}`.
     MoveSession { message: String },
+    /// `ProjectCopyError` (400, `groups/project-copy.ts:16-25`) —
+    /// `{"name":"ProjectCopyError","data":{"message":...,"forceRequired"?}}`.
+    ProjectCopy {
+        message: String,
+        force_required: Option<bool>,
+    },
     /// `McpUnsupportedOAuthError` (400, `groups/mcp.ts:35-37`) — a plain
     /// `Schema.ErrorClass`, serializing FLAT: `{"error": "..."}`.
     McpUnsupportedOAuth { error: String },
+    /// `HttpApiError.BadRequest` (400) — Effect's bare tagged error, wire
+    /// `{"_tag": "BadRequest"}`.
+    TaggedBadRequest,
+    /// `ApiWorkspaceCreateError` (400, `groups/workspace.ts:18-26`) —
+    /// `{"name":"WorkspaceCreateError","data":{"message":...}}`.
+    WorkspaceCreate { message: String },
+    /// `ApiWorkspaceWarpError` (400, `groups/workspace.ts:9-16`) —
+    /// `{"name":"WorkspaceWarpError","data":{"message":...}}`.
+    WorkspaceWarp { message: String },
 }
 
 impl ApiError {
@@ -231,8 +246,12 @@ impl ApiError {
             ApiError::BadRequest { .. } => StatusCode::BAD_REQUEST,
             ApiError::VcsApply { .. }
             | ApiError::Worktree { .. }
+            | ApiError::ProjectCopy { .. }
             | ApiError::MoveSession { .. }
-            | ApiError::McpUnsupportedOAuth { .. } => StatusCode::BAD_REQUEST,
+            | ApiError::McpUnsupportedOAuth { .. }
+            | ApiError::TaggedBadRequest
+            | ApiError::WorkspaceCreate { .. }
+            | ApiError::WorkspaceWarp { .. } => StatusCode::BAD_REQUEST,
         }
     }
 
@@ -443,8 +462,31 @@ impl ApiError {
             ApiError::MoveSession { message } => {
                 named_body("MoveSessionError", vec![("message", str_field(message))])
             }
+            ApiError::ProjectCopy {
+                message,
+                force_required,
+            } => {
+                let data = match force_required {
+                    Some(force_required) => {
+                        serde_json::json!({"message": message, "forceRequired": force_required})
+                    }
+                    None => serde_json::json!({"message": message}),
+                };
+                object(&[
+                    ("name", str_field("ProjectCopyError")),
+                    ("data", ser(&data)),
+                ])
+            }
             // `Schema.ErrorClass` shapes — flat fields, no wrapper.
             ApiError::McpUnsupportedOAuth { error } => object(&[("error", str_field(error))]),
+            ApiError::TaggedBadRequest => tagged_body("BadRequest", vec![]),
+            ApiError::WorkspaceCreate { message } => named_body(
+                "WorkspaceCreateError",
+                vec![("message", str_field(message))],
+            ),
+            ApiError::WorkspaceWarp { message } => {
+                named_body("WorkspaceWarpError", vec![("message", str_field(message))])
+            }
         }
     }
 }

@@ -69,8 +69,9 @@ fn sort_model_ids(mut models: Vec<String>) -> Vec<String> {
     models
 }
 
-/// `modelSuggestions` (provider.ts:1359-1378) — the fuzzysort leg is
-/// TODO(M7.8); the split-query fallback matches TS.
+/// `modelSuggestions` (provider.ts:1359-1378) — the fuzzysort leg over the
+/// non-deprecated (and non-alpha, without the experimental flag) model ids,
+/// then the split-query fallback.
 fn model_suggestions(provider: Option<&Value>, model_id: &str) -> Vec<String> {
     let Some(models) = provider.map(|p| &p["models"]) else {
         return Vec::new();
@@ -78,16 +79,43 @@ fn model_suggestions(provider: Option<&Value>, model_id: &str) -> Vec<String> {
     let Some(models) = models.as_object() else {
         return Vec::new();
     };
-    // TODO(M7.8): `fuzzysort.go(modelID, available, {limit: 3, threshold:
-    // -10000})` runs before the split-query fallback.
+    let enable_experimental = crate::engine::bool_env("OPENCODE_ENABLE_EXPERIMENTAL_MODELS");
+    let available = models
+        .iter()
+        .filter(|(_, model)| {
+            let status = model["status"].as_str();
+            if status == Some("deprecated") {
+                return false;
+            }
+            if status == Some("alpha") && !enable_experimental {
+                return false;
+            }
+            true
+        })
+        .map(|(id, _)| id.clone())
+        .collect::<Vec<String>>();
+    let fuzzy = opencode_core::fuzzysort::go(
+        model_id,
+        &available,
+        &opencode_core::fuzzysort::Options {
+            limit: Some(3),
+            threshold: Some(-10000.0),
+        },
+    );
+    if !fuzzy.is_empty() {
+        return fuzzy
+            .into_iter()
+            .map(|index| available[index].clone())
+            .collect();
+    }
     let query: Vec<String> = model_id
         .to_lowercase()
         .split(|c: char| !c.is_ascii_alphanumeric())
         .filter(|part| part.len() > 1)
         .map(String::from)
         .collect();
-    let mut scored: Vec<(String, usize)> = models
-        .keys()
+    let mut scored: Vec<(String, usize)> = available
+        .iter()
         .map(|id| {
             let lower = id.to_lowercase();
             (
@@ -105,10 +133,23 @@ fn model_suggestions(provider: Option<&Value>, model_id: &str) -> Vec<String> {
 }
 
 /// Provider suggestions when the provider itself is missing
-/// (provider.ts:1880-1885) — the fuzzysort leg is TODO(M7.8).
+/// (provider.ts:1880-1885) — `fuzzysort.go(providerID, keys({...catalog,
+/// ...providers}), {limit: 3, threshold: -10000})`.
 fn provider_suggestions(state: &ProviderState, provider_id: &str) -> Vec<String> {
-    let _ = (state, provider_id);
-    Vec::new()
+    let mut keys = state.database.keys().cloned().collect::<Vec<String>>();
+    keys.extend(state.providers.keys().cloned());
+    let indices = opencode_core::fuzzysort::go(
+        provider_id,
+        &keys,
+        &opencode_core::fuzzysort::Options {
+            limit: Some(3),
+            threshold: Some(-10000.0),
+        },
+    );
+    indices
+        .into_iter()
+        .map(|index| keys[index].clone())
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

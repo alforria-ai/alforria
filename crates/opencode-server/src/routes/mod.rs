@@ -94,8 +94,39 @@ fn register_stub(
     if handled {
         return router;
     }
+    // M7.8 owns the v1 sync, workspace and project-copy families.
+    let (router, handled) = v1::sync::register(router, method, path);
+    if handled {
+        return router;
+    }
+    let (router, handled) = v1::workspace::register(router, method, path);
+    if handled {
+        return router;
+    }
+    let (router, handled) = v1::project_copy::register(router, method, path);
+    if handled {
+        return router;
+    }
     // M6.7 owns the v2 /api families.
     let (router, handled) = v2::session::register(router, method, path);
+    if handled {
+        return router;
+    }
+    // M7.8 owns the v2 integration/credential/reference/project-copy
+    // families.
+    let (router, handled) = v2::integration::register(router, method, path);
+    if handled {
+        return router;
+    }
+    let (router, handled) = v2::credential::register(router, method, path);
+    if handled {
+        return router;
+    }
+    let (router, handled) = v2::reference::register(router, method, path);
+    if handled {
+        return router;
+    }
+    let (router, handled) = v2::project_copy::register(router, method, path);
     if handled {
         return router;
     }

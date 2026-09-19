@@ -834,8 +834,8 @@ async fn fs_list(
     envelope(&location, data)
 }
 
-/// `fs.find` — the ripgrep-layer fuzzy fallback over a directory walk
-/// (`core/src/filesystem/search.ts:20-66`); the fff native index is M7.
+/// `fs.find` — the ripgrep-layer fuzzy search (`filesystem/search.ts`);
+/// the fff native index is out of scope.
 async fn fs_find(
     axum::Extension(location): axum::Extension<LocationContext>,
     uri: axum::http::Uri,
@@ -868,37 +868,22 @@ async fn fs_find(
         None => 50,
     };
 
-    let mut files: Vec<String> = Vec::new();
-    let mut directories: Vec<String> = Vec::new();
-    collect_paths(
-        &location.directory,
-        &location.directory,
-        &mut files,
-        &mut directories,
-    );
-    let items: Vec<String> = match type_filter {
-        Some("file") => files,
-        Some("directory") => directories,
-        _ => {
-            let mut both = files;
-            both.extend(directories);
-            both
-        }
+    let vcs = location
+        .services
+        .instance(&location.directory)
+        .map_err(|_| super::util::defect("instance context"))?
+        .project
+        .vcs
+        .is_some();
+    let state = opencode_core::filesystem::FindState::build(&location.directory, vcs);
+    let find_type = match type_filter {
+        Some("file") => Some(opencode_core::filesystem::FindType::File),
+        Some("directory") => Some(opencode_core::filesystem::FindType::Directory),
+        _ => None,
     };
-    let query_chars: Vec<char> = query.to_lowercase().chars().collect();
-    let matches: Vec<serde_json::Value> = items
+    let matches = opencode_core::filesystem::find(&state, &query, find_type, Some(limit));
+    let data: Vec<serde_json::Value> = matches
         .into_iter()
-        .filter(|path| {
-            let lowered: Vec<char> = path.to_lowercase().chars().collect();
-            let mut i = 0;
-            for c in lowered {
-                if i < query_chars.len() && query_chars[i] == c {
-                    i += 1;
-                }
-            }
-            i == query_chars.len()
-        })
-        .take(limit)
         .map(|path| {
             let is_dir = path.ends_with('/');
             serde_json::json!({
@@ -907,25 +892,5 @@ async fn fs_find(
             })
         })
         .collect();
-    envelope(&location, matches)
-}
-
-fn collect_paths(base: &Path, dir: &Path, files: &mut Vec<String>, directories: &mut Vec<String>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let relative = path.strip_prefix(base).ok();
-        let Some(relative) = relative else {
-            continue;
-        };
-        let relative = relative.to_string_lossy().replace('\\', "/");
-        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            directories.push(format!("{relative}/"));
-            collect_paths(base, &entry.path(), files, directories);
-        } else {
-            files.push(relative);
-        }
-    }
+    envelope(&location, data)
 }

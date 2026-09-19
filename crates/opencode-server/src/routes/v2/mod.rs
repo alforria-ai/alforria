@@ -3,8 +3,12 @@
 //! root is the *un-prefixed* `/experimental/project/:projectID/copy`
 //! (`protocol/groups/project-copy.ts:14`).
 
+pub mod credential;
+pub mod integration;
 pub mod misc;
 pub mod permission;
+pub mod project_copy;
+pub mod reference;
 pub mod session;
 mod util;
 

@@ -132,6 +132,11 @@ pub trait SessionEngine: Send + Sync {
     fn session_background<'a>(&'a self, _session_id: &'a str) -> BoxFuture<'a, bool> {
         Box::pin(async { false })
     }
+    /// `projectCopy.generateName` (handlers/project-copy.ts:22-69) — the
+    /// one-shot LLM copy-name stream with `Slug.create()` fallbacks.
+    fn generate_copy_name<'a>(&'a self, _context: &'a str) -> BoxFuture<'a, String> {
+        Box::pin(async { opencode_core::session::agents::slug_create() })
+    }
 }
 
 /// Resolves the per-directory [`SessionEngine`]. The default (unwired)
