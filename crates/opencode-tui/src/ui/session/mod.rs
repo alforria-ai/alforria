@@ -5,7 +5,13 @@
 
 pub mod footer;
 pub mod parts;
+pub mod permission;
+#[cfg(test)]
+mod permission_tests;
 pub mod prompt;
+pub mod question;
+#[cfg(test)]
+mod question_tests;
 pub mod transcript;
 
 use ratatui::layout::Rect;
@@ -174,10 +180,29 @@ pub fn render(app: &mut App, frame: &mut ratatui::Frame, theme: &Theme, area: Re
         height: column.height.saturating_sub(1),
     };
 
-    // The bottom stack: permission > question > subagent footer > prompt
-    // (TODO(M8.7): permission + question; TODO(M8.8): subagent footer)
-    // + the footer bar.
-    let prompt_height = prompt::height(app, column, area.height);
+    // The bottom stack: permission > question > prompt
+    // (`session/index.tsx:1296-1313`); the prompt only renders on
+    // parentless sessions without pending requests.
+    // TODO(M8.8): subagent footer.
+    let permission_visible = permission::visible(app).is_some();
+    let question_visible = !permission_visible && question::visible(app).is_some();
+    let prompt_visible = !permission_visible
+        && !question_visible
+        && app
+            .state
+            .sync
+            .session(&session_id)
+            .map(|session| session.parent_id.is_none())
+            .unwrap_or(true);
+    let prompt_height = if permission_visible {
+        permission::height(app)
+    } else if question_visible {
+        question::height(app)
+    } else if prompt_visible {
+        prompt::height(app, column, area.height)
+    } else {
+        0
+    };
     let footer_height = 1;
     let vertical = ratatui::layout::Layout::vertical([
         ratatui::layout::Constraint::Fill(1),
@@ -187,7 +212,13 @@ pub fn render(app: &mut App, frame: &mut ratatui::Frame, theme: &Theme, area: Re
     .split(column);
 
     transcript::render(app, frame, theme, vertical[0], &session_id, content_width);
-    prompt::render(app, frame, theme, vertical[1]);
+    if permission_visible {
+        permission::render(app, frame, theme, vertical[1]);
+    } else if question_visible {
+        question::render(app, frame, theme, vertical[1]);
+    } else if prompt_visible {
+        prompt::render(app, frame, theme, vertical[1]);
+    }
     footer::render(app, frame, theme, vertical[2], &session_id);
 
     if sidebar_visible && !sidebar_area.is_empty() {

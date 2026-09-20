@@ -124,7 +124,7 @@ impl LocalState {
     // -------------------------------------------------------- agent
 
     /// Non-subagent, non-hidden agents (`local.tsx:78`).
-    fn agent_values(sync: &SyncState) -> Vec<&Value> {
+    pub fn agent_values(sync: &SyncState) -> Vec<&Value> {
         sync.agent
             .iter()
             .filter(|a| agent_mode(a) != "subagent" && !agent_hidden(a))

@@ -110,7 +110,10 @@ pub fn post_update(app: &mut App) -> Vec<Effect> {
     let provider_empty =
         app.state.sync.status == Some(SyncStatus::Complete) && app.state.sync.provider.is_empty();
     if provider_empty && !app.ui.provider_empty {
-        app.ui.dialog = Some(PendingDialog::ProviderConnect);
+        effects.extend(crate::ui::dialogs::open(
+            app,
+            PendingDialog::ProviderConnect,
+        ));
     }
     app.ui.provider_empty = provider_empty;
 
@@ -130,7 +133,33 @@ pub fn post_update(app: &mut App) -> Vec<Effect> {
 
     // The prompt loses focus while a dialog is open and reclaims it
     // after (`prompt/index.tsx:635-645`).
-    app.ui.prompt_focused = app.ui.dialog.is_none();
+    app.ui.prompt_focused = app.ui.dialogs.is_empty();
+
+    // While a dialog is open the keymap's modal mode is pushed
+    // (`ui/dialog.tsx:79-90`); while a question is pending the question
+    // mode is pushed (`question.tsx:129-133`). Both push tokens are
+    // reconciled here every update.
+    if app.ui.dialogs.is_empty() {
+        if let Some(token) = app.ui.modal_token.take() {
+            app.keymap.modes.pop(token);
+        }
+    } else if app.ui.modal_token.is_none() {
+        app.ui.modal_token = Some(app.keymap.modes.push(crate::keymap::MODAL_MODE));
+    }
+    let question_open =
+        crate::ui::session::question::visible(app).is_some() && app.ui.dialogs.is_empty();
+    if question_open {
+        if app.ui.question_mode_token.is_none() {
+            app.ui.question_mode_token = Some(app.keymap.modes.push(crate::keymap::QUESTION_MODE));
+        }
+    } else if let Some(token) = app.ui.question_mode_token.take() {
+        app.keymap.modes.pop(token);
+    }
+
+    // Reset the permission/question prompt state machines when the
+    // head request changes.
+    crate::ui::session::permission::observe(app);
+    crate::ui::session::question::observe(app);
 
     effects
 }
@@ -216,9 +245,12 @@ pub fn on_bus_event(app: &mut App, bus_event: BusEvent) -> Vec<Effect> {
                 None => false,
             };
             if !skip {
-                app.ui.dialog = Some(PendingDialog::UpdateAvailable {
-                    version: evt.version.clone(),
-                });
+                return crate::ui::dialogs::open(
+                    app,
+                    PendingDialog::UpdateAvailable {
+                        version: evt.version.clone(),
+                    },
+                );
             }
         }
         Event::MessagePartUpdated(evt) => {
@@ -703,18 +735,24 @@ mod tests {
         let mut app = app_with(Args::default());
         app.state.sync.status = Some(SyncStatus::Complete);
         post_update(&mut app);
-        assert_eq!(app.ui.dialog, Some(PendingDialog::ProviderConnect));
+        assert!(matches!(
+            app.ui.dialogs.top_kind(),
+            Some(PendingDialog::ProviderConnect)
+        ));
 
         // The dialog is only opened on the transition into empty.
-        app.ui.dialog = None;
+        crate::ui::dialogs::clear(&mut app);
         post_update(&mut app);
-        assert_eq!(app.ui.dialog, None);
+        assert!(app.ui.dialogs.is_empty());
 
         app.state.sync.provider = vec![serde_json::json!({"id": "anthropic"})];
         post_update(&mut app);
         app.state.sync.provider.clear();
         post_update(&mut app);
-        assert_eq!(app.ui.dialog, Some(PendingDialog::ProviderConnect));
+        assert!(matches!(
+            app.ui.dialogs.top_kind(),
+            Some(PendingDialog::ProviderConnect)
+        ));
     }
 
     #[test]

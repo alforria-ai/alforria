@@ -28,9 +28,13 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 
 use crate::clipboard::Clipboard as _;
+use crate::state::local::McpAction;
 use crate::state::route::Route;
+use crate::state::sync::object_of;
 use crate::state::{App, Args, Effect, Msg, Toast, ToastVariant};
-use crate::transport::api::{HttpClientConfig, HttpServerApi, Location, ServerApi};
+use crate::transport::api::{
+    HttpClientConfig, HttpServerApi, Location, MoveSession, MoveSessionDestination, ServerApi,
+};
 use crate::transport::events::{spawn_event_loop, EventSource, SseEventSource, TokioClock};
 use crate::ui::view;
 
@@ -264,6 +268,128 @@ async fn execute_effect(app: &mut App, api: Arc<dyn ServerApi>, effect: Effect) 
             let _ = api
                 .session_unrevert(&Location::default(), &session_id)
                 .await;
+        }
+        Effect::PermissionReply {
+            request_id,
+            reply,
+            message,
+        } => {
+            let _ = api
+                .permission_reply(&Location::default(), &request_id, reply, message.as_deref())
+                .await;
+        }
+        Effect::QuestionReply {
+            request_id,
+            answers,
+        } => {
+            let _ = api
+                .question_reply(&Location::default(), &request_id, answers)
+                .await;
+        }
+        Effect::QuestionReject { request_id } => {
+            let _ = api.question_reject(&Location::default(), &request_id).await;
+        }
+        Effect::SessionRename { session_id, title } => {
+            if let Err(error) = api
+                .session_rename(&Location::default(), &session_id, &title)
+                .await
+            {
+                app.show_toast(Toast {
+                    title: None,
+                    variant: ToastVariant::Error,
+                    message: format!("{error:#}"),
+                    duration_ms: 5000,
+                });
+            }
+        }
+        Effect::SessionDelete { session_id } => {
+            if let Err(error) = api.session_delete(&Location::default(), &session_id).await {
+                app.show_toast(Toast {
+                    title: None,
+                    variant: ToastVariant::Error,
+                    message: format!("{error:#}"),
+                    duration_ms: 5000,
+                });
+            }
+        }
+        Effect::McpToggle { name } => {
+            // `dialog-mcp.tsx:49-66`: toggle then refresh the MCP
+            // status from the server.
+            let action = app.state.local.mcp_toggle(&app.state.sync, &name);
+            let result = match action {
+                McpAction::Connect(name) => api.mcp_connect(&Location::default(), &name).await,
+                McpAction::Disconnect(name) => {
+                    api.mcp_disconnect(&Location::default(), &name).await
+                }
+            };
+            if result.is_ok() {
+                if let Ok(status) = api.mcp_status(&Location::default()).await {
+                    app.state.sync.mcp = object_of(status);
+                }
+            }
+        }
+        Effect::GlobalUpgrade { target } => {
+            let _ = api.global_upgrade(&Location::default(), &target).await;
+        }
+        Effect::SessionMove {
+            session_id,
+            directory,
+        } => {
+            let _ = api
+                .experimental_move_session(
+                    &Location::default(),
+                    MoveSession {
+                        session_id: session_id.clone(),
+                        destination: MoveSessionDestination {
+                            directory: directory.clone(),
+                        },
+                        move_changes: None,
+                    },
+                )
+                .await;
+        }
+        Effect::ProjectDirectories { project_id } => {
+            // `dialog-move-session.tsx:60-78`.
+            if let Ok(value) = api
+                .project_directories(&Location::default(), &project_id)
+                .await
+            {
+                app.ui.move_directories = Some(match value {
+                    serde_json::Value::Array(items) => items,
+                    _ => Vec::new(),
+                });
+            }
+        }
+        Effect::SessionForkFromMessage {
+            session_id,
+            message_id,
+            seed_prompt,
+        } => {
+            match api
+                .session_fork(&Location::default(), &session_id, message_id.as_deref())
+                .await
+            {
+                Ok(info) => {
+                    app.state.route.navigate(Route::Session {
+                        session_id: info.id.clone(),
+                        prompt: None,
+                    });
+                    if seed_prompt {
+                        // TODO(M8.8): seed the prompt from the forked
+                        // message parts (`dialog-fork-from-timeline.tsx`).
+                    }
+                }
+                Err(error) => app.show_toast(Toast {
+                    title: None,
+                    variant: ToastVariant::Error,
+                    message: format!("{error:#}"),
+                    duration_ms: 5000,
+                }),
+            }
+        }
+        Effect::SessionExport { .. } => {
+            // TODO(M8.8): formatTranscript + file write + `$EDITOR`
+            // (`session/index.tsx:946-1020`).
         }
         Effect::SessionRefresh => {
             let sessions = state::sync::list_sessions(

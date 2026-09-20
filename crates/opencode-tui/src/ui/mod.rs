@@ -1,6 +1,7 @@
 //! `ui/` — ratatui views. Each route renders into the full frame; redraws
 //! are full-frame on every [`crate::state::App`] version bump.
 
+pub mod dialogs;
 pub mod diff;
 pub mod home;
 pub mod locale;
@@ -40,6 +41,9 @@ pub fn view(app: &mut App, frame: &mut ratatui::Frame) {
         Route::Session { .. } => session::render(app, frame, &theme, area),
         Route::Plugin { id, .. } => render_plugin_missing(frame, &theme, area, id),
     }
+    // The dialog stack overlays the route (`ui/dialog.tsx`); toasts
+    // stay on top (their container is rendered after the dialog root).
+    dialogs::render(app, frame, &theme, area);
     if let Some(toast) = app.ui.toasts.last() {
         render_toast(frame, &theme, area, toast);
     }

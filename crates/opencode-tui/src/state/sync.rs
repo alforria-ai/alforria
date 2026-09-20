@@ -607,7 +607,7 @@ fn array_of(value: Value) -> Vec<Value> {
     }
 }
 
-fn object_of(value: Value) -> BTreeMap<String, Value> {
+pub(crate) fn object_of(value: Value) -> BTreeMap<String, Value> {
     match value {
         Value::Object(map) => map.into_iter().collect(),
         _ => BTreeMap::new(),

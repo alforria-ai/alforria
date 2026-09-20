@@ -1214,7 +1214,7 @@ pub fn submit(app: &mut App) -> Vec<crate::state::Effect> {
             duration_ms: 3000,
         });
         if app.state.sync.provider.is_empty() {
-            app.ui.dialog = Some(crate::state::PendingDialog::ProviderConnect);
+            let _ = crate::ui::dialogs::open(app, crate::state::PendingDialog::ProviderConnect);
         }
         return Vec::new();
     };
@@ -1235,7 +1235,10 @@ pub fn submit(app: &mut App) -> Vec<crate::state::Effect> {
                 .map(String::as_str)
                 .unwrap_or("error");
             if status != "connected" {
-                app.ui.dialog = Some(crate::state::PendingDialog::WorkspaceUnavailable);
+                let _ = crate::ui::dialogs::open(
+                    app,
+                    crate::state::PendingDialog::WorkspaceUnavailable,
+                );
                 return Vec::new();
             }
         }
@@ -1905,7 +1908,7 @@ pub fn handle_command(app: &mut App, name: &str) -> bool {
 /// inline bindings — `!` shell-mode entry, escape shell-mode exit —
 /// live here (`prompt/index.tsx:816-860`).
 pub fn text_input(app: &mut App, key: &crossterm::event::KeyEvent) -> bool {
-    if !app.ui.prompt_focused || app.ui.dialog.is_some() {
+    if !app.ui.prompt_focused || !app.ui.dialogs.is_empty() {
         return false;
     }
     use crossterm::event::{KeyCode, KeyModifiers};

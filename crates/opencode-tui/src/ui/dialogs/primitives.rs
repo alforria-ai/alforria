@@ -1,0 +1,346 @@
+//! `ui/dialog-select.tsx` — the list + filter primitive (`DialogSelect`)
+//! plus the confirm/alert/prompt state machines
+//! (`ui/dialog-confirm.tsx`, `ui/dialog-alert.tsx`, `ui/dialog-prompt.tsx`).
+
+use ratatui::layout::Rect;
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Paragraph, Widget};
+
+use super::super::theme::Theme;
+
+/// `Math.floor(dimensions().height / 2) - 6` — the scrollbox window
+/// (`dialog-select.tsx:213`); the port keeps a fixed visible window.
+pub const MAX_VISIBLE_OPTIONS: usize = 8;
+
+/// One `DialogSelectOption` — the option subset the port renders.
+#[derive(Debug, Clone, Default)]
+pub struct SelectOption {
+    pub title: String,
+    /// Identity used for the `●` current marker and select actions.
+    pub value: Option<String>,
+    pub description: Option<String>,
+    pub category: Option<String>,
+    pub footer: Option<String>,
+    pub gutter: Option<String>,
+    /// The error background of the delete-confirm rows.
+    pub bg_error: bool,
+}
+
+impl SelectOption {
+    pub fn new(title: impl Into<String>) -> SelectOption {
+        SelectOption {
+            title: title.into(),
+            ..SelectOption::default()
+        }
+    }
+
+    pub fn with_value(self, value: impl Into<String>) -> SelectOption {
+        let mut option = self;
+        option.value = Some(value.into());
+        option
+    }
+
+    pub fn with_description(self, description: impl Into<String>) -> SelectOption {
+        let mut option = self;
+        option.description = Some(description.into());
+        option
+    }
+
+    pub fn with_category(self, category: impl Into<String>) -> SelectOption {
+        let mut option = self;
+        option.category = Some(category.into());
+        option
+    }
+
+    pub fn with_footer(self, footer: impl Into<String>) -> SelectOption {
+        let mut option = self;
+        option.footer = Some(footer.into());
+        option
+    }
+}
+
+/// A fuzzysort-style score for a case-insensitive subsequence match
+/// (`dialog-select.tsx:154-173`). Earlier + tighter matches score higher.
+/// The TS library scores are not ported verbatim — this is the hand-rolled
+/// equivalent (a recorded divergence; the palette goldens pin the
+/// ordering).
+pub fn fuzzy_score(needle: &str, haystack: &str) -> Option<i32> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    let needle: Vec<char> = needle.to_lowercase().chars().collect();
+    let haystack: Vec<char> = haystack.to_lowercase().chars().collect();
+    let mut score = 0i32;
+    let mut hi = 0usize;
+    let mut last_match = 0usize;
+    for (index, char) in needle.iter().enumerate() {
+        let offset = haystack[hi..].iter().position(|c| c == char)?;
+        let position = hi + offset;
+        if index == 0 {
+            score -= offset as i32;
+        } else if position != last_match + 1 {
+            score -= (position - last_match) as i32;
+        }
+        last_match = position;
+        hi = position + 1;
+    }
+    Some(score)
+}
+
+/// Filter the options like `fuzzysort.go(needle, options, { keys:
+/// ["title", "category"], scoreFn: r => r[0] * 2 + r[1] })` — title
+/// matches weigh double. Stable on input order for ties.
+pub fn filter_options(needle: &str, options: Vec<SelectOption>) -> Vec<SelectOption> {
+    if needle.is_empty() {
+        return options;
+    }
+    let mut scored: Vec<(i32, usize, SelectOption)> = options
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, option)| {
+            let title = fuzzy_score(needle, &option.title);
+            let category = option
+                .category
+                .as_deref()
+                .and_then(|category| fuzzy_score(needle, category));
+            let score = match (title, category) {
+                (Some(title), Some(category)) => Some(title * 2 + category),
+                (Some(title), None) => Some(title * 2),
+                (None, Some(category)) => Some(category),
+                (None, None) => None,
+            };
+            score.map(|score| (score, index, option))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    scored.into_iter().map(|(_, _, option)| option).collect()
+}
+
+/// The `DialogSelect` interaction state: `selected`, the filter input and
+/// the scrollbox offset (`dialog-select.tsx:90-94`).
+#[derive(Debug, Default, Clone)]
+pub struct SelectState {
+    pub selected: usize,
+    pub filter: String,
+    pub scroll: usize,
+}
+
+impl SelectState {
+    /// `move()` (`dialog-select.tsx:290-297`) — wrap-around.
+    pub fn move_by(&mut self, direction: i64, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let next = self.selected as i64 + direction;
+        self.selected = if next < 0 {
+            len - 1
+        } else if next >= len as i64 {
+            0
+        } else {
+            next as usize
+        };
+        self.clamp_scroll();
+    }
+
+    /// `moveTo()` (`dialog-select.tsx:299-309`).
+    pub fn move_to(&mut self, index: usize) {
+        self.selected = index;
+        self.clamp_scroll();
+    }
+
+    /// Keep the selection inside the scrollbox window
+    /// (`scrollToSelection`, `dialog-select.tsx:311-342`).
+    fn clamp_scroll(&mut self) {
+        if self.selected < self.scroll {
+            self.scroll = self.selected;
+        } else if self.selected >= self.scroll + MAX_VISIBLE_OPTIONS {
+            self.scroll = self.selected + 1 - MAX_VISIBLE_OPTIONS;
+        }
+    }
+}
+
+/// What the generic select renderer draws for one dialog — the pre-built
+/// option list plus its chrome.
+pub struct SelectView {
+    pub title: String,
+    /// `renderFilter === false` hides the search input.
+    pub filter: bool,
+    pub options: Vec<SelectOption>,
+    /// The `actions`/`footerHints` — `(title, label)` pairs.
+    pub actions: Vec<(String, String)>,
+}
+
+/// The shared header row: bold title left, muted hint right.
+pub fn header_line(theme: &Theme, title: &str, hint: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            title.to_string(),
+            Style::new()
+                .fg(theme.text.to_color())
+                .add_modifier(ratatui::style::Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            hint.to_string(),
+            Style::new().fg(theme.text_muted.to_color()),
+        ),
+    ])
+}
+
+/// One option row (`dialog-select.tsx:732-791`): the `●` current marker,
+/// the gutter, title + description, footer right.
+fn option_line(theme: &Theme, option: &SelectOption, active: bool, width: u16) -> Line<'static> {
+    let selected_fg = super::super::theme::selected_foreground(theme, Some(theme.primary));
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    if active {
+        let bg = if option.bg_error {
+            theme.error
+        } else {
+            theme.primary
+        };
+        spans.push(Span::styled("  ", Style::new().bg(bg.to_color())));
+    } else {
+        spans.push(Span::raw("  "));
+    }
+    if let Some(gutter) = &option.gutter {
+        spans.push(Span::raw(format!("{gutter} ")));
+    }
+    let fg = if active { selected_fg } else { theme.text };
+    spans.push(Span::styled(
+        option.title.clone(),
+        Style::new().fg(fg.to_color()).add_modifier(if active {
+            ratatui::style::Modifier::BOLD
+        } else {
+            ratatui::style::Modifier::empty()
+        }),
+    ));
+    if let Some(description) = &option.description {
+        spans.push(Span::styled(
+            format!(" {description}"),
+            Style::new().fg(if active {
+                selected_fg
+            } else {
+                theme.text_muted
+            }
+            .to_color()),
+        ));
+    }
+    if let Some(footer) = &option.footer {
+        let used: usize = spans.iter().map(|span| span.content.chars().count()).sum();
+        let padding = width.saturating_sub((used + footer.chars().count()) as u16);
+        if padding > 0 {
+            if active {
+                spans.push(Span::styled(
+                    " ".repeat(padding as usize),
+                    Style::new().bg(theme.primary.to_color()),
+                ));
+            } else {
+                spans.push(Span::raw(" ".repeat(padding as usize)));
+            }
+        }
+        spans.push(Span::styled(
+            footer.clone(),
+            Style::new().fg(theme.text_muted.to_color()),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// Render the filtered option window (plus category headers) into `lines`.
+pub fn render_options(
+    select: &SelectState,
+    view: &SelectView,
+    theme: &Theme,
+    lines: &mut Vec<Line<'static>>,
+    width: u16,
+) {
+    let options = filter_options(&select.filter, view.options.clone());
+    if options.is_empty() {
+        lines.push(Line::styled(
+            "    No results found",
+            Style::new().fg(theme.text_muted.to_color()),
+        ));
+        return;
+    }
+    let mut category = String::new();
+    for (index, option) in options.iter().enumerate() {
+        if index >= MAX_VISIBLE_OPTIONS {
+            break;
+        }
+        if let Some(group) = &option.category {
+            if group != &category && !group.is_empty() {
+                category = group.clone();
+                lines.push(Line::styled(
+                    format!("   {group}"),
+                    Style::new()
+                        .fg(theme.accent.to_color())
+                        .add_modifier(ratatui::style::Modifier::BOLD),
+                ));
+            }
+        }
+        lines.push(option_line(theme, option, index == select.selected, width));
+    }
+}
+
+/// The footer action row (`dialog-select.tsx:717-728`): `title label`
+/// pairs with a muted label.
+pub fn render_actions(theme: &Theme, actions: &[(String, String)]) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (index, (title, label)) in actions.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(
+            title.clone(),
+            Style::new().fg(theme.text.to_color()),
+        ));
+        spans.push(Span::styled(
+            format!(" {label}"),
+            Style::new().fg(theme.text_muted.to_color()),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// The filter input row (`<input placeholder="Search">`, `dialog-select.tsx:570-597`).
+pub fn filter_line(theme: &Theme, select: &SelectState, placeholder: &str) -> Line<'static> {
+    if select.filter.is_empty() {
+        Line::from(Span::styled(
+            format!("  {placeholder}"),
+            Style::new().fg(theme.text_muted.to_color()),
+        ))
+    } else {
+        Line::from(Span::styled(
+            format!("  {}", select.filter),
+            Style::new().fg(theme.text_muted.to_color()),
+        ))
+    }
+}
+
+/// Word-wrap `text` into `lines` at `width` columns.
+pub fn wrap_text(text: &str, width: u16, lines: &mut Vec<Line<'static>>, style: Style) {
+    let max = width.max(4) as usize;
+    for raw in text.split('\n') {
+        let mut current = String::new();
+        for word in raw.split(' ') {
+            if current.is_empty() {
+                current = word.to_string();
+            } else if current.chars().count() + 1 + word.chars().count() <= max {
+                current.push(' ');
+                current.push_str(word);
+            } else {
+                lines.push(Line::styled(current.clone(), style));
+                current = word.to_string();
+            }
+        }
+        lines.push(Line::styled(current, style));
+    }
+}
+
+/// Paint a padded block of `lines` over `area`.
+pub fn paint(lines: &[Line<'static>], theme: &Theme, area: Rect, frame: &mut ratatui::Frame) {
+    Paragraph::new(lines.to_vec())
+        .style(Style::new().bg(theme.background_panel.to_color()))
+        .render(area, frame.buffer_mut());
+}

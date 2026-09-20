@@ -22,6 +22,8 @@ pub const BASE_MODE: &str = "base";
 pub const COMMAND_PALETTE_COMMAND: &str = "command.palette.show";
 /// The mode pushed by the dialog stack (`ui/dialog.tsx` — M8.7).
 pub const MODAL_MODE: &str = "modal";
+/// `QUESTION_MODE` (`question.tsx:12`).
+pub const QUESTION_MODE: &str = "question";
 
 /// The gather-site scopes, in dispatch priority order (highest first).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

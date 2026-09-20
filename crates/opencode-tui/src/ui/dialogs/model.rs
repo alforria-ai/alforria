@@ -1,0 +1,380 @@
+//! `component/dialog-model.tsx`, `dialog-agent.tsx`,
+//! `dialog-variant.tsx` and `dialog-provider.tsx` — the model/agent/
+//! variant/provider option lists.
+
+use serde_json::Value;
+
+use super::primitives::SelectOption;
+use crate::state::local::ModelRef;
+use crate::state::route::Route;
+use crate::state::{App, Effect};
+
+/// `sortModelOptions` (`dialog-model.tsx:159-175`).
+fn sort_model_options(options: Vec<SelectOption>, release: Vec<i64>) -> Vec<SelectOption> {
+    let mut keyed: Vec<(i64, String, usize, SelectOption)> = options
+        .into_iter()
+        .enumerate()
+        .zip(release)
+        .map(|((index, option), release)| (release, option.title.clone(), index, option))
+        .collect();
+    keyed.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    keyed.into_iter().map(|(_, _, _, option)| option).collect()
+}
+
+fn provider_models(provider: &Value) -> Vec<(String, Value)> {
+    provider
+        .get("models")
+        .and_then(Value::as_object)
+        .map(|models| {
+            models
+                .iter()
+                .map(|(id, info)| (id.clone(), info.clone()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn model_option(
+    provider: &Value,
+    model_id: &str,
+    info: &Value,
+    favorites: &[ModelRef],
+) -> SelectOption {
+    let provider_id = provider
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let option = SelectOption::new(info.get("name").and_then(Value::as_str).unwrap_or(model_id))
+        .with_value(format!("{provider_id}/{model_id}"));
+    let option = if favorites
+        .iter()
+        .any(|favorite| favorite.provider_id == provider_id && favorite.model_id == model_id)
+    {
+        option.with_description("(Favorite)")
+    } else {
+        option
+    };
+    if info
+        .get("cost")
+        .and_then(|cost| cost.get("input"))
+        .and_then(Value::as_f64)
+        == Some(0.0)
+        && provider_id == "opencode"
+    {
+        return option.with_footer("Free");
+    }
+    option
+}
+
+/// `DialogModel.options` (`dialog-model.tsx:26-135`).
+pub fn model_options(app: &App) -> Vec<SelectOption> {
+    let connected = crate::state::connected(app);
+    let favorites = app.state.local.model_favorite().to_vec();
+    let recents = app.state.local.model_recent().to_vec();
+
+    let mut options: Vec<SelectOption> = Vec::new();
+    // Favorites + Recent sections (`toOptions`).
+    if connected {
+        let mut recent_only: Vec<ModelRef> = Vec::new();
+        for item in &recents {
+            if !favorites.iter().any(|favorite| {
+                favorite.model_id == item.model_id && favorite.provider_id == item.provider_id
+            }) {
+                recent_only.push(item.clone());
+            }
+        }
+        for (category, items) in [("Favorites", favorites.clone()), ("Recent", recent_only)] {
+            for item in items {
+                let Some(provider) = app.state.sync.provider.iter().find(|provider| {
+                    provider.get("id").and_then(Value::as_str) == Some(&item.provider_id)
+                }) else {
+                    continue;
+                };
+                let Some((model_id, info)) = provider_models(provider)
+                    .into_iter()
+                    .find(|(id, _)| *id == item.model_id)
+                else {
+                    continue;
+                };
+                options.push(
+                    model_option(provider, &model_id, &info, &favorites).with_category(category),
+                );
+            }
+        }
+    }
+
+    let mut provider_options: Vec<SelectOption> = Vec::new();
+    let mut release: Vec<i64> = Vec::new();
+    for provider in &app.state.sync.provider {
+        let provider_id = provider
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        for (model_id, info) in provider_models(provider) {
+            if info.get("status").and_then(Value::as_str) == Some("deprecated") {
+                continue;
+            }
+            if provider_id == "opencode" && model_id.contains("-nano") {
+                continue;
+            }
+            if connected {
+                let known = favorites
+                    .iter()
+                    .chain(recents.iter())
+                    .any(|item| item.provider_id == provider_id && item.model_id == model_id);
+                if known {
+                    continue;
+                }
+            }
+            provider_options.push(if connected {
+                model_option(provider, &model_id, &info, &favorites).with_category(
+                    provider
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or(provider_id)
+                        .to_string(),
+                )
+            } else {
+                model_option(provider, &model_id, &info, &favorites)
+            });
+            release.push(
+                info.get("release_date")
+                    .and_then(Value::as_i64)
+                    .or_else(|| {
+                        info.get("release_date")
+                            .and_then(Value::as_str)
+                            .and_then(|v| v.parse().ok())
+                    })
+                    .unwrap_or(0),
+            );
+        }
+    }
+    options.extend(sort_model_options(provider_options, release));
+    options
+}
+
+/// `DialogModel.onSelect` (`dialog-model.tsx:138-153`) — set the model,
+/// then follow the variant chain.
+pub fn select_model(app: &mut App, value: &str) -> Vec<Effect> {
+    let Some((provider_id, model_id)) = value.split_once('/') else {
+        return Vec::new();
+    };
+    let model = ModelRef {
+        provider_id: provider_id.to_string(),
+        model_id: model_id.to_string(),
+    };
+    let sync = std::mem::take(&mut app.state.sync);
+    let args = app.state.args.clone();
+    let current = app.state.local.variant_selected(&sync, &args);
+    let list = app.state.local.variant_list(&sync, &args);
+    if let Some(toast) = app.state.local.model_set(&sync, model, true) {
+        app.show_toast(toast);
+    }
+    app.state.sync = sync;
+    let keep = current.as_deref() == Some("default")
+        || current.as_ref().is_some_and(|cur| list.contains(cur));
+    if keep {
+        crate::ui::dialogs::clear(app);
+        return Vec::new();
+    }
+    if !list.is_empty() {
+        return crate::ui::dialogs::open(app, crate::state::PendingDialog::Variant);
+    }
+    crate::ui::dialogs::clear(app);
+    Vec::new()
+}
+
+/// The favorite toggle (`dialog-model.tsx:96-99`).
+pub fn toggle_favorite(app: &mut App, value: &str) {
+    let Some((provider_id, model_id)) = value.split_once('/') else {
+        return;
+    };
+    let model = ModelRef {
+        provider_id: provider_id.to_string(),
+        model_id: model_id.to_string(),
+    };
+    let sync = std::mem::take(&mut app.state.sync);
+    if let Some(toast) = app.state.local.model_toggle_favorite(&sync, &model) {
+        app.show_toast(toast);
+    }
+    app.state.sync = sync;
+}
+
+/// `DialogAgent` (`dialog-agent.tsx`).
+pub fn agent_options(app: &App) -> Vec<SelectOption> {
+    crate::state::local::LocalState::agent_values(&app.state.sync)
+        .iter()
+        .map(|agent| {
+            let name = agent
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let description = agent
+                .get("description")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    if agent.get("mode").and_then(Value::as_str) == Some("primary") {
+                        "native".to_string()
+                    } else {
+                        String::new()
+                    }
+                });
+            let option = SelectOption::new(name.clone()).with_value(name);
+            if description.is_empty() {
+                option
+            } else {
+                option.with_description(description)
+            }
+        })
+        .collect()
+}
+
+/// `DialogVariant` (`dialog-variant.tsx`).
+pub fn variant_options(app: &App) -> Vec<SelectOption> {
+    let mut options = vec![SelectOption::new("Default").with_value("default")];
+    let list = app
+        .state
+        .local
+        .variant_list(&app.state.sync, &app.state.args);
+    for variant in list {
+        options.push(SelectOption::new(variant.clone()).with_value(variant));
+    }
+    options
+}
+
+const PROVIDER_PRIORITY: &[(&str, i32)] = &[
+    ("opencode", 0),
+    ("opencode-go", 1),
+    ("openai", 2),
+    ("github-copilot", 3),
+    ("anthropic", 4),
+    ("google", 5),
+];
+
+const CUSTOM_PROVIDER_OPTION_VALUE: &str = "__opencode_custom_provider__";
+
+/// `providerOptions` (`dialog-provider.tsx:51-118`).
+pub fn provider_options(app: &App) -> Vec<SelectOption> {
+    let all = app
+        .state
+        .sync
+        .provider_next
+        .get("all")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut providers: Vec<Value> = all;
+    providers.sort_by(|a, b| {
+        let priority = |provider: &Value| {
+            let id = provider
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            PROVIDER_PRIORITY
+                .iter()
+                .find(|(name, _)| *name == id)
+                .map(|(_, priority)| *priority)
+                .unwrap_or(99)
+        };
+        priority(a)
+            .cmp(&priority(b))
+            .then_with(|| {
+                a.get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_lowercase()
+                    .cmp(
+                        &b.get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_lowercase(),
+                    )
+            })
+            .then_with(|| {
+                a.get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .cmp(b.get("id").and_then(Value::as_str).unwrap_or_default())
+            })
+    });
+    let mut options = Vec::new();
+    for provider in providers {
+        let id = provider
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let description = match id.as_str() {
+            "opencode" => Some("(Recommended)"),
+            "anthropic" => Some("(API key)"),
+            "openai" => Some("(ChatGPT Plus/Pro or API key)"),
+            "opencode-go" => Some("Low cost subscription for everyone"),
+            _ => None,
+        };
+        let option = SelectOption::new(
+            provider
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        )
+        .with_value(id.clone())
+        .with_category(if PROVIDER_PRIORITY.iter().any(|(name, _)| *name == id) {
+            "Popular"
+        } else {
+            "Providers"
+        });
+        let option = match description {
+            Some(description) => option.with_description(description),
+            None => option,
+        };
+        options.push(option);
+    }
+    options.push(
+        SelectOption::new("Other")
+            .with_value(CUSTOM_PROVIDER_OPTION_VALUE)
+            .with_description("Custom provider")
+            .with_category("Providers"),
+    );
+    options
+}
+
+/// `Select auth method` (`dialog-provider.tsx:166-175`). The
+/// oauth/credential submission is a recorded seam gap — the list is
+/// informational.
+pub fn auth_method_options(app: &App, provider_id: &str) -> Vec<SelectOption> {
+    let methods = app
+        .state
+        .sync
+        .provider_auth
+        .get(provider_id)
+        .cloned()
+        .unwrap_or_default();
+    if methods.is_empty() {
+        return vec![SelectOption::new("API key").with_value("api")];
+    }
+    methods
+        .iter()
+        .enumerate()
+        .map(|(index, method)| {
+            SelectOption::new(
+                method
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .unwrap_or("API key")
+                    .to_string(),
+            )
+            .with_value(index.to_string())
+        })
+        .collect()
+}
+
+/// The route session id (used by the export dialog default filename).
+pub fn route_session_id(app: &App) -> Option<&str> {
+    match &app.state.route.data {
+        Route::Session { session_id, .. } => Some(session_id),
+        _ => None,
+    }
+}

@@ -64,12 +64,15 @@ fn route_is_session(app: &App) -> bool {
     matches!(app.state.route.data, Route::Session { .. })
 }
 
+/// `dialog.replace(...)` — the opened dialog's effects are dropped here
+/// (`open` only returns effects for the move-session fetch, which
+/// opens via its own arm below).
 fn show_dialog(app: &mut App, dialog: PendingDialog) {
-    app.ui.dialog = Some(dialog);
+    let _ = crate::ui::dialogs::open(app, dialog);
 }
 
 fn clear_dialog(app: &mut App) {
-    app.ui.dialog = None;
+    crate::ui::dialogs::clear(app);
 }
 
 fn toast(app: &mut App, variant: ToastVariant, message: impl Into<String>, duration_ms: u64) {
@@ -1148,7 +1151,8 @@ pub fn run(app: &mut App, name: &str) -> Vec<Effect> {
         "session.interrupt" => return interrupt(app),
         "prompt.skills" => show_dialog(app, PendingDialog::Skill),
         "workspace.set" => show_dialog(app, PendingDialog::WorkspaceSet),
-        "session.move" => show_dialog(app, PendingDialog::MoveSession),
+        // Needs the effect returned (project.directories fetch).
+        "session.move" => return crate::ui::dialogs::open(app, PendingDialog::MoveSession),
         "prompt.stash" => {
             if app.ui.prompt.input().is_empty() {
                 return Vec::new();
@@ -1176,7 +1180,11 @@ pub fn run(app: &mut App, name: &str) -> Vec<Effect> {
 
         // ---- session commands
         "session.share" => return session_share(app),
-        "session.rename" => show_dialog(app, PendingDialog::SessionRename),
+        "session.rename" => {
+            if let Some(session_id) = session_id(app) {
+                show_dialog(app, PendingDialog::SessionRename { session_id });
+            }
+        }
         "session.timeline" => show_dialog(app, PendingDialog::Timeline),
         "session.fork" => show_dialog(app, PendingDialog::ForkFromTimeline),
         "session.compact" => return session_compact(app),

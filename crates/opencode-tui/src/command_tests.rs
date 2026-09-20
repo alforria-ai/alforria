@@ -340,12 +340,11 @@ fn share_needs_consent_then_shares() {
     navigate_to_session(&mut app);
     let effects = run(&mut app, "session.share");
     assert!(effects.is_empty());
-    assert_eq!(
-        app.ui.dialog,
-        Some(PendingDialog::ShareConsent {
-            session_id: "ses_1".into(),
-        })
-    );
+    assert!(matches!(
+        app.ui.dialogs.top_kind(),
+        Some(PendingDialog::ShareConsent { session_id })
+            if session_id == "ses_1"
+    ));
     app.state.kv.set(keys::SHARE_CONSENT, json!(true));
     let effects = run(&mut app, "session.share");
     assert_eq!(
@@ -456,7 +455,7 @@ fn undo_reverts_to_last_user_message_and_repopulates_prompt() {
         ]
     );
     assert_eq!(app.ui.prompt.input(), "revert me");
-    assert_eq!(app.ui.dialog, None);
+    assert!(app.ui.dialogs.is_empty());
 }
 
 #[test]
@@ -666,7 +665,10 @@ fn key_dispatch_runs_the_first_enabled_command() {
 fn key_dispatch_palette_and_leader_compact() {
     let mut app = new_app();
     press_ctrl(&mut app, 'p');
-    assert_eq!(app.ui.dialog, Some(PendingDialog::CommandPalette));
+    assert!(matches!(
+        app.ui.dialogs.top_kind(),
+        Some(PendingDialog::CommandPalette)
+    ));
 
     let mut app = new_app();
     navigate_to_session(&mut app);
@@ -685,8 +687,8 @@ fn input_layer_swallows_ctrl_d_when_focused() {
     navigate_to_session(&mut app);
     app.ui.prompt_focused = true;
     press_ctrl(&mut app, 'd');
-    assert_eq!(
-        app.ui.dialog, None,
+    assert!(
+        app.ui.dialogs.is_empty(),
         "input.delete runs (no-op until M8.6); session.delete must not"
     );
 }

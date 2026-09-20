@@ -148,13 +148,20 @@ impl State {
     }
 }
 
-/// A dialog awaiting the dialog stack (TODO(M8.7) renders/interacts).
-/// The variants opened by command dispatch (`dialog.replace(...)`) carry
-/// the target dialog; M8.7 will turn this into the real stack.
+/// One dialog on the stack — the `dialog.replace(...)` payloads. The
+/// stack itself lives in [`UiState::dialogs`] (M8.7).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PendingDialog {
     /// `dialog.replace(DialogProviderList)` (`app.tsx:542-551`).
     ProviderConnect,
+    /// The `Other` → custom provider id prompt
+    /// (`dialog-provider.tsx:129-141`).
+    ProviderCustomId,
+    /// `Select auth method` (`dialog-provider.tsx:166-175`) — the
+    /// oauth/credential submission is a recorded seam gap.
+    ProviderAuthMethod {
+        provider_id: String,
+    },
     /// `DialogConfirm.show` on `installation.update-available`
     /// (`app.tsx:1033-1079`).
     UpdateAvailable {
@@ -171,7 +178,9 @@ pub enum PendingDialog {
     Debug,
     ConsoleOrg,
     Variant,
-    SessionRename,
+    SessionRename {
+        session_id: String,
+    },
     Timeline,
     ForkFromTimeline,
     Skill,
@@ -182,10 +191,44 @@ pub enum PendingDialog {
     MoveSession,
     /// `DialogWorkspaceUnavailable` (`prompt/index.tsx:978-987`).
     WorkspaceUnavailable,
-    /// The `Share Session` confirm (`session/index.tsx:489-493`) —
-    /// M8.7 wires the answer.
+    /// The `Share Session` confirm (`session/index.tsx:489-493`).
     ShareConsent {
         session_id: String,
+    },
+    /// `DialogAlert.show` (`ui/dialog-alert.tsx`) — the update-complete
+    /// alert exits on confirm (`app.tsx:1067-1073`).
+    Alert {
+        title: String,
+        message: String,
+        exit_on_confirm: bool,
+    },
+    /// `DialogSessionDeleteFailed` — session-list delete recovery
+    /// (`component/dialog-session-delete-failed.tsx`).
+    SessionDeleteFailed {
+        session_id: String,
+        workspace: String,
+    },
+    /// `DialogMessage` — per-message actions
+    /// (`routes/session/dialog-message.tsx`).
+    Message {
+        session_id: String,
+        message_id: String,
+    },
+    /// `DialogSubagent` (`routes/session/dialog-subagent.tsx`).
+    Subagent {
+        session_id: String,
+    },
+    /// `DialogTag` — the `@`-mention file autocomplete.
+    Tag,
+    /// `DialogRetryAction` (go-upsell; kv gating
+    /// `session/index.tsx:87-113`). `kv_key` is the `dontShow` kv key
+    /// written when dismissed.
+    RetryAction {
+        title: String,
+        message: String,
+        label: String,
+        link: Option<String>,
+        kv_key: Option<String>,
     },
 }
 
@@ -270,7 +313,21 @@ pub struct UiState {
     pub forked: bool,
     /// `wasEmpty` of the provider-empty transition (`app.tsx:542-551`).
     pub provider_empty: bool,
-    pub dialog: Option<PendingDialog>,
+    /// The dialog stack (`ui/dialog.tsx` — M8.7).
+    pub dialogs: crate::ui::dialogs::DialogStack,
+    /// The `modeStack.push("modal")` token while a dialog is open
+    /// (`ui/dialog.tsx:81-85`).
+    pub modal_token: Option<u64>,
+    /// The `modeStack.push("question")` token while a question is
+    /// visible (`question.tsx:128-131`).
+    pub question_mode_token: Option<u64>,
+    /// The permission prompt state machine (M8.7).
+    pub permission: crate::ui::session::permission::PermissionState,
+    /// The question prompt state machine (M8.7).
+    pub question: crate::ui::session::question::QuestionState,
+    /// The move-session dialog's `project.directories` fetch
+    /// (`dialog-move-session.tsx:60-78`).
+    pub move_directories: Option<Vec<serde_json::Value>>,
     /// Exit was requested; `exit_reason` becomes stderr + exit code 1.
     pub exit: bool,
     pub exit_reason: Option<String>,
@@ -287,6 +344,9 @@ pub struct UiState {
     /// Terminal width — the `>120` sidebar boundary. Updated on
     /// `Msg::Resize`.
     pub terminal_width: u16,
+    /// Terminal height — the dialog backdrop geometry
+    /// (`paddingTop={height / 4}`, `dialog.tsx:45`).
+    pub terminal_height: u16,
     /// `store.interrupt` (`prompt/index.tsx:396-421`).
     pub interrupt: u32,
     pub interrupt_reset_at: Option<u64>,
@@ -469,6 +529,52 @@ pub enum Effect {
     PromptSubmit {
         payload: Box<crate::state::prompt::SubmitPayload>,
     },
+    /// `permission.reply` from the UI prompt (`permission.tsx:165-174`).
+    PermissionReply {
+        request_id: String,
+        reply: opencode_schema::permission_v1::PermissionV1Reply,
+        message: Option<String>,
+    },
+    /// `question.reply` (`question.tsx:48-55`).
+    QuestionReply {
+        request_id: String,
+        answers: Vec<opencode_schema::question_v1::QuestionV1Answer>,
+    },
+    /// `question.reject` (`question.tsx:57-62`).
+    QuestionReject { request_id: String },
+    /// `session.update` title (`DialogSessionRename`).
+    SessionRename { session_id: String, title: String },
+    /// `session.delete` (`dialog-session-list.tsx:248-262`).
+    SessionDelete { session_id: String },
+    /// `local.mcp.toggle(name)` + `mcp.status` refresh
+    /// (`dialog-mcp.tsx:49-66`).
+    McpToggle { name: String },
+    /// `global.upgrade` (`app.tsx:1051`).
+    GlobalUpgrade { target: String },
+    /// `experimental.moveSession` (`component/prompt/move.tsx`).
+    SessionMove {
+        session_id: String,
+        directory: String,
+    },
+    /// `project.directories` fetch for the move-session dialog
+    /// (`dialog-move-session.tsx:60-78`).
+    ProjectDirectories { project_id: String },
+    /// `session.fork` (+ optional `messageID`) with a prompt seeded
+    /// from the forked message parts (`dialog-fork-from-timeline.tsx`).
+    SessionForkFromMessage {
+        session_id: String,
+        message_id: Option<String>,
+        seed_prompt: bool,
+    },
+    /// The export-options confirm — the file write + `$EDITOR` open is
+    /// TODO(M8.8) (`session/index.tsx:946-1020`).
+    SessionExport {
+        filename: String,
+        thinking: bool,
+        tool_details: bool,
+        assistant_metadata: bool,
+        open_without_saving: bool,
+    },
 }
 
 pub struct App {
@@ -529,47 +635,57 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             }
         }
         Msg::Key(key) => {
-            let context = crate::keymap::DispatchContext {
-                route_is_session: matches!(app.state.route.data, Route::Session { .. }),
-                prompt_focused: app.ui.prompt_focused,
-                foreground_tasks: crate::command::foreground_tasks(app) > 0,
-            };
-            let commands = app.keymap.dispatch(&context, &key, app.ui.tick_ms);
-            // While the autocomplete is open it takes the keyboard
-            // (§5.2 escape priority).
-            let mut handled = prompt::autocomplete_key(app, &key);
-            // TS dispatch evaluates every layer's `enabled()` gate before
-            // running handlers, then fires ALL enabled bindings
-            // (`keymap.tsx:229-232` + `app.tsx:975-985`) — snapshot the
-            // gates first so a handler's side effects can't flip a later
-            // gate (ctrl+c clears AND `app.exit` stays disabled).
-            let enabled: Vec<bool> = commands
-                .iter()
-                .map(|name| {
-                    if name.starts_with("input.") {
-                        app.ui.prompt_focused && app.ui.dialog.is_none()
-                    } else {
-                        crate::command::is_enabled(app, name)
+            // Dialogs take the keyboard while the stack is open (the
+            // pushed `modal` mode, `ui/dialog.tsx:105-137`).
+            if !app.ui.dialogs.is_empty() {
+                effects.extend(crate::ui::dialogs::handle_key(app, &key));
+            } else if let Some(handled) = crate::ui::session::permission::handle_key(app, &key) {
+                effects.extend(handled);
+            } else if let Some(handled) = crate::ui::session::question::handle_key(app, &key) {
+                effects.extend(handled);
+            } else {
+                let context = crate::keymap::DispatchContext {
+                    route_is_session: matches!(app.state.route.data, Route::Session { .. }),
+                    prompt_focused: app.ui.prompt_focused,
+                    foreground_tasks: crate::command::foreground_tasks(app) > 0,
+                };
+                let commands = app.keymap.dispatch(&context, &key, app.ui.tick_ms);
+                // While the autocomplete is open it takes the keyboard
+                // (§5.2 escape priority).
+                let mut handled = prompt::autocomplete_key(app, &key);
+                // TS dispatch evaluates every layer's `enabled()` gate before
+                // running handlers, then fires ALL enabled bindings
+                // (`keymap.tsx:229-232` + `app.tsx:975-985`) — snapshot the
+                // gates first so a handler's side effects can't flip a later
+                // gate (ctrl+c clears AND `app.exit` stays disabled).
+                let enabled: Vec<bool> = commands
+                    .iter()
+                    .map(|name| {
+                        if name.starts_with("input.") {
+                            app.ui.prompt_focused && app.ui.dialogs.is_empty()
+                        } else {
+                            crate::command::is_enabled(app, name)
+                        }
+                    })
+                    .collect();
+                for (name, enabled) in commands.iter().zip(enabled) {
+                    if !enabled {
+                        continue;
                     }
-                })
-                .collect();
-            for (name, enabled) in commands.iter().zip(enabled) {
-                if !enabled {
-                    continue;
-                }
-                if prompt::handle_command(app, name) {
+                    if prompt::handle_command(app, name) {
+                        handled = true;
+                        continue;
+                    }
+                    effects.extend(crate::command::run(app, name));
                     handled = true;
-                    continue;
                 }
-                effects.extend(crate::command::run(app, name));
-                handled = true;
-            }
-            if !handled && commands.is_empty() {
-                prompt::text_input(app, &key);
+                if !handled && commands.is_empty() {
+                    prompt::text_input(app, &key);
+                }
             }
         }
         Msg::Mouse(mouse) => match mouse.kind {
-            // TODO(M8.5): dialog-scroll and hover handling; the
+            // TODO(M8.5), dialog-scroll and hover handling; the
             // transcript wheel uses the config `scroll_speed`.
             crossterm::event::MouseEventKind::ScrollUp => {
                 app.ui.session_scroll.scroll_by(-(scroll_speed(app) as i64));
@@ -577,12 +693,23 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             crossterm::event::MouseEventKind::ScrollDown => {
                 app.ui.session_scroll.scroll_by(scroll_speed(app) as i64);
             }
+            // Backdrop click-through (`dialog.tsx:30-38`): a release
+            // outside the frame pops the top dialog. The port has no
+            // mouse text selection (recorded divergence §7.8), so a
+            // selection never blocks the close.
+            crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left)
+                if !app.ui.dialogs.is_empty()
+                    && !crate::ui::dialogs::hit_test(app, mouse.column, mouse.row) =>
+            {
+                crate::ui::dialogs::pop(app);
+            }
             _ => {}
         },
-        Msg::Resize(columns, _) => {
+        Msg::Resize(columns, rows) => {
             // Layout is recomputed on every draw; the sidebar boundary
-            // needs the width.
+            // needs the width, the dialog frames the height.
             app.ui.terminal_width = columns;
+            app.ui.terminal_height = rows;
         }
         Msg::Paste(text) => {
             // Bracketed-paste normalization happens at the boundary
