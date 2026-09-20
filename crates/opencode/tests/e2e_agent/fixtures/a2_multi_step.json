@@ -1,0 +1,57 @@
+{
+  "comment": "A2 — three steps: read a.txt, read a.txt and b.txt in parallel, final text",
+  "turns": [
+    {
+      "frames": [
+        {
+          "tool_call": {
+            "id": "cal_1",
+            "name": "read",
+            "arguments": { "filePath": "a.txt" }
+          }
+        },
+        {
+          "finish": {
+            "reason": "tool_calls",
+            "usage": { "input": 50, "output": 5 }
+          }
+        }
+      ]
+    },
+    {
+      "frames": [
+        {
+          "tool_call": {
+            "id": "cal_2",
+            "name": "read",
+            "arguments": { "filePath": "a.txt" }
+          }
+        },
+        {
+          "tool_call": {
+            "id": "cal_3",
+            "name": "read",
+            "arguments": { "filePath": "b.txt" }
+          }
+        },
+        {
+          "finish": {
+            "reason": "tool_calls",
+            "usage": { "input": 70, "output": 5 }
+          }
+        }
+      ]
+    },
+    {
+      "frames": [
+        { "text": "read both files" },
+        {
+          "finish": {
+            "reason": "stop",
+            "usage": { "input": 90, "output": 3 }
+          }
+        }
+      ]
+    }
+  ]
+}
