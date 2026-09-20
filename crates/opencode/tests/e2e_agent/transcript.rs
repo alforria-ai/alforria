@@ -165,6 +165,20 @@ impl Transcript {
                 _ => None,
             })
     }
+
+    /// The concatenated `text` frames of one turn (fixture-derived
+    /// expectations, e.g. the compaction summary marker).
+    pub fn turn_text(&self, index: usize) -> String {
+        self.turns[index]
+            .frames
+            .iter()
+            .filter_map(|frame| match frame {
+                Frame::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    }
 }
 
 /// The canned response served to summarizer/title requests: those fork on

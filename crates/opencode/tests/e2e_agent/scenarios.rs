@@ -14,7 +14,10 @@ use crate::wire::{pump_until, Api, EventLog};
 pub const A1_FILE_MUTATION: &str = "a1_file_mutation";
 pub const A2_MULTI_STEP: &str = "a2_multi_step";
 pub const A3_PERMISSION_GATE: &str = "a3_permission_gate";
+pub const A4_SUBAGENT: &str = "a4_subagent";
 pub const A5_DOOM_LOOP: &str = "a5_doom_loop";
+pub const A6_COMPACTION: &str = "a6_compaction";
+pub const A7_REVERT: &str = "a7_revert";
 pub const A8_CANCEL_MID_STREAM: &str = "a8_cancel_mid_stream";
 
 /// One driven scenario: the process output plus the parsed `--format
@@ -228,6 +231,10 @@ pub struct WireSession {
 }
 
 impl WireSession {
+    pub fn project_dir(&self) -> PathBuf {
+        self._env.project_dir()
+    }
+
     /// The tool parts of every assistant message, in message order.
     fn tool_parts(&self, messages: &[Value]) -> Vec<Value> {
         messages
@@ -303,9 +310,19 @@ fn wire_prompt_body(backend: &impl LlmBackend, text: &str) -> Value {
 async fn drive(
     sess: &WireSession,
     prompt: Value,
-    mut policy: impl FnMut(usize, &Value) -> Option<&'static str>,
+    policy: impl FnMut(usize, &Value) -> Option<&'static str>,
 ) -> Vec<Value> {
     sess.api.prompt_async(&sess.session_id, prompt).await;
+    pump(sess, policy).await
+}
+
+/// Pump the SSE stream after the prompt is in flight: reply to every
+/// `permission.asked` through `policy` (ask index is 1-based) until the
+/// session goes idle. Returns the asks seen, in order.
+async fn pump(
+    sess: &WireSession,
+    mut policy: impl FnMut(usize, &Value) -> Option<&'static str>,
+) -> Vec<Value> {
     let mut asks: Vec<Value> = Vec::new();
     let mut cursor = 0;
     let mut busy = false;
@@ -510,4 +527,181 @@ pub async fn a8_cancel_mid_stream(backend: &impl LlmBackend) -> Vec<Value> {
         "no resumed text\n{resumed}"
     );
     sess.api.messages(&sess.session_id).await
+}
+
+/// A4 — the subagent over the wire: a `task` tool call spawns a child
+/// session whose answer flows back into the parent. Returns
+/// `(parent_id, child_id)` for request-capture assertions.
+pub async fn a4_subagent(backend: &impl LlmBackend) -> (String, String) {
+    let sess = start_wire(backend, A4_SUBAGENT, |_| {}).await;
+    drive(
+        &sess,
+        wire_prompt_body(backend, "spawn a subagent"),
+        |_, _| None,
+    )
+    .await;
+
+    // The task tool part carries parentSessionId metadata and the
+    // wrapped result XML (task tool, tools.ts).
+    let messages = sess.api.messages(&sess.session_id).await;
+    let task = messages
+        .iter()
+        .flat_map(|message| {
+            message["parts"]
+                .as_array()
+                .map(|parts| parts.to_vec())
+                .unwrap_or_default()
+        })
+        .find(|part| part["type"] == "tool" && part["tool"] == "task")
+        .expect("task tool part");
+    assert_eq!(task["state"]["status"], json!("completed"), "{task}");
+    assert_eq!(
+        task["state"]["metadata"]["parentSessionId"],
+        json!(sess.session_id),
+        "{task}"
+    );
+    let child_id = task["state"]["metadata"]["sessionId"]
+        .as_str()
+        .expect("child session id")
+        .to_string();
+    let output = task["state"]["output"].as_str().expect("task output");
+    assert!(
+        output.contains(&format!("<task id=\"{child_id}\" state=\"completed\">")),
+        "got {output}"
+    );
+    assert!(output.contains("subagent answer"), "got {output}");
+
+    // The child session row is listed with the parent link.
+    let list = sess.api.session_list().await;
+    let child = list
+        .iter()
+        .find(|item| item["id"] == json!(child_id))
+        .expect("child session in the session list");
+    assert_eq!(child["parentID"], json!(sess.session_id), "{child}");
+    assert_eq!(child["agent"], json!("general"), "{child}");
+    (sess.session_id.clone(), child_id)
+}
+
+/// A6 — compaction over the wire: usage overflow triggers the compaction
+/// fork (served from the transcript slot after the overflowing turn), the
+/// loop continues on the compacted history and publishes
+/// `session.compacted`.
+pub async fn a6_compaction(backend: &impl LlmBackend) {
+    let sess = start_wire(backend, A6_COMPACTION, |project| {
+        std::fs::write(project.join("a.txt"), "x\n").expect("seed a.txt");
+    })
+    .await;
+    drive(
+        &sess,
+        wire_prompt_body(backend, "trigger overflow"),
+        |_, _| None,
+    )
+    .await;
+
+    let events = sess.log.events();
+    assert!(
+        events
+            .iter()
+            .any(|event| event["type"] == json!("session.compacted")
+                && event["properties"]["sessionID"] == json!(sess.session_id)),
+        "no session.compacted event\n{}",
+        serde_json::to_string_pretty(&events).expect("events")
+    );
+    let messages = sess.api.messages(&sess.session_id).await;
+    let continued = messages
+        .iter()
+        .filter(|message| message["info"]["role"] == json!("assistant"))
+        .any(|message| WireSession::text_of(message).contains("after compaction"));
+    assert!(
+        continued,
+        "no continuation on the compacted history\n{messages:?}"
+    );
+}
+
+/// A7 — revert/unrevert over a real git worktree (not `InMemorySnapshot`):
+/// a `write` tool edit rolls back through the git snapshot restore and the
+/// diff summary numbers land on the session.
+fn git(project: &Path, args: &[&str]) {
+    let status = std::process::Command::new("git")
+        .args(args)
+        .current_dir(project)
+        .status()
+        .expect("git spawns");
+    assert!(status.success(), "git {args:?} failed");
+}
+
+pub async fn a7_revert(backend: &impl LlmBackend) {
+    let sess = start_wire(backend, A7_REVERT, |project| {
+        git(project, &["init", "--quiet"]);
+        git(project, &["config", "user.email", "e2e@opencode.test"]);
+        git(project, &["config", "user.name", "E2E"]);
+        std::fs::write(project.join("a.txt"), "v1\n").expect("seed a.txt");
+        git(project, &["add", "-A"]);
+        git(project, &["commit", "--quiet", "-m", "init"]);
+    })
+    .await;
+    // The forked write races the step-finish patch (native-runtime
+    // settlements concatenate after the provider stream, so the edit can
+    // land after the patch walk). The fixture stalls the stream so the
+    // edit is placed deterministically inside the step — after the
+    // step-start snapshot, before the stream ends — while the real tool
+    // dispatch still executes.
+    sess.api
+        .prompt_async(&sess.session_id, wire_prompt_body(backend, "edit the file"))
+        .await;
+    let session_id = sess.session_id.clone();
+    pump_until(&sess.log, |events| {
+        events.iter().any(|event| {
+            event["type"] == json!("message.part.updated")
+                && event["properties"]["sessionID"] == json!(session_id)
+                && event["properties"]["part"]["type"] == json!("step-start")
+        })
+    })
+    .await;
+    std::fs::write(sess.project_dir().join("a.txt"), "v2\n").expect("seed edit");
+    pump(&sess, |_, _| None).await;
+
+    let a_txt = sess.project_dir().join("a.txt");
+    assert_eq!(
+        std::fs::read_to_string(&a_txt).expect("a.txt"),
+        "v2\n",
+        "the write tool must land the edit"
+    );
+
+    // Revert at the user message: the edit rolls back through the git
+    // snapshot (revert.ts:38-89) and the session records the diff
+    // summary numbers.
+    let messages = sess.api.messages(&sess.session_id).await;
+    let user_id = messages
+        .iter()
+        .find(|message| message["info"]["role"] == json!("user"))
+        .map(|message| {
+            message["info"]["id"]
+                .as_str()
+                .expect("user message id")
+                .to_string()
+        })
+        .expect("user message");
+    let reverted = sess.api.revert(&sess.session_id, &user_id).await;
+    assert_eq!(
+        reverted["revert"]["messageID"],
+        json!(user_id),
+        "{reverted}"
+    );
+    let summary = reverted.get("summary").expect("diff summary recorded");
+    assert_eq!(summary["files"], json!(1.0), "{reverted}");
+    assert_eq!(summary["additions"], json!(1.0), "{reverted}");
+    assert_eq!(summary["deletions"], json!(1.0), "{reverted}");
+    assert_eq!(
+        std::fs::read_to_string(&a_txt).expect("a.txt"),
+        "v1\n",
+        "revert must roll the edit back on disk"
+    );
+
+    let _ = sess.api.unrevert(&sess.session_id).await;
+    assert_eq!(
+        std::fs::read_to_string(&a_txt).expect("a.txt"),
+        "v2\n",
+        "unrevert must restore the edit"
+    );
 }

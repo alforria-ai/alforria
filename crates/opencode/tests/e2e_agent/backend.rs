@@ -38,6 +38,11 @@ pub trait LlmBackend {
     fn live(&self) -> bool;
 }
 
+/// The compaction fork rides the same endpoint tool-less (compaction.rs
+/// `build_prompt`): its summary request is served from the scenario
+/// transcript, so the fork consumes slot N+1 (spec E2E §2.4 A6).
+const COMPACTION_MARKER: &str = "Create a new anchored summary from the conversation history";
+
 /// An axum SSE server speaking the real OpenAI-compatible wire protocol:
 /// one transcript turn is popped and streamed per HTTP request, and every
 /// request body is recorded for post-hoc assertions.
@@ -62,11 +67,15 @@ impl MockBackend {
                 let turns = turns.clone();
                 async move {
                     let value = serde_json::from_str::<Value>(&body).expect("request body");
-                    // Tool-bearing requests are the agent loop's; the
-                    // title/summary fork carries no tools and gets a canned
-                    // response so it cannot consume scenario turns.
-                    let turn = if value.get("tools").is_some() {
-                        requests.lock().unwrap().push(value);
+                    // Three keys: agent-loop requests carry `tools`; the
+                    // compaction fork carries the summary prompt marker;
+                    // the title/summary fork carries neither and gets a
+                    // canned response so it cannot consume scenario turns.
+                    let compaction = body.contains(COMPACTION_MARKER);
+                    let turn = if value.get("tools").is_some() || compaction {
+                        if value.get("tools").is_some() {
+                            requests.lock().unwrap().push(value);
+                        }
                         turns.lock().unwrap().pop_front()
                     } else {
                         Some(summarizer_turn())

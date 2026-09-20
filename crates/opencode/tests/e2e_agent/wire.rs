@@ -150,6 +150,36 @@ impl Api {
         );
     }
 
+    /// `POST /session/{id}/revert` — returns the session info with the
+    /// revert state and diff summary (`handlers/session.ts:349-355`).
+    pub async fn revert(&self, session_id: &str, message_id: &str) -> Value {
+        self.json(
+            reqwest::Method::POST,
+            &format!("/session/{session_id}/revert"),
+            Some(json!({ "messageID": message_id })),
+        )
+        .await
+    }
+
+    /// `POST /session/{id}/unrevert` (`handlers/session.ts:357-360`).
+    pub async fn unrevert(&self, session_id: &str) -> Value {
+        self.json(
+            reqwest::Method::POST,
+            &format!("/session/{session_id}/unrevert"),
+            Some(json!({})),
+        )
+        .await
+    }
+
+    /// `GET /session` — the session list.
+    pub async fn session_list(&self) -> Vec<Value> {
+        self.json(reqwest::Method::GET, "/session", None)
+            .await
+            .as_array()
+            .cloned()
+            .expect("session list")
+    }
+
     /// `GET /session/{id}/message` — the message store with parts.
     pub async fn messages(&self, session_id: &str) -> Vec<Value> {
         self.json(

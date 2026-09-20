@@ -5,7 +5,7 @@ mod e2e_agent {
 
     use serde_json::json;
 
-    use crate::backend::MockBackend;
+    use crate::backend::{LlmBackend, MockBackend};
     use crate::scenarios;
 
     #[test]
@@ -125,6 +125,35 @@ mod e2e_agent {
     }
 
     // -------------------------------------------------------------------
+    // A4 — subagent over the wire
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a4_subagent_spawns_child_session() {
+        let backend = MockBackend::new(scenarios::A4_SUBAGENT);
+        let (_, child_id) = scenarios::a4_subagent(&backend).await;
+
+        // Parent step, child turn, parent continuation.
+        let requests = backend.requests();
+        assert_eq!(requests.len(), 3, "one request per loop turn");
+        let child = serde_json::to_string(&backend.request(1)).expect("request body");
+        assert!(
+            child.contains("do the research"),
+            "the child prompt must reach the model: {child}"
+        );
+        let results = tool_results(backend.request(2));
+        assert_eq!(results.len(), 1, "one task result: {results:?}");
+        assert_eq!(results[0]["tool_call_id"], json!("cal_1"));
+        assert!(
+            results[0]["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(&format!("<task id=\"{child_id}\" state=\"completed\">")),
+            "the parent continuation must carry the task result: {results:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------
     // A5 — doom-loop over the wire
     // -------------------------------------------------------------------
 
@@ -137,6 +166,42 @@ mod e2e_agent {
         assert_eq!(backend.requests().len(), 2, "one request per step");
         let results = tool_results(backend.request(1));
         assert_eq!(results.len(), 3, "three read results: {results:?}");
+    }
+
+    // -------------------------------------------------------------------
+    // A6 — compaction over the wire
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a6_compaction_continues_on_the_compacted_history() {
+        let backend = MockBackend::new(scenarios::A6_COMPACTION);
+        scenarios::a6_compaction(&backend).await;
+
+        // The overflowing step and the compacted continuation; the
+        // compaction fork consumed the transcript's summary turn.
+        assert_eq!(backend.requests().len(), 2, "one request per loop turn");
+        let summary = backend
+            .transcript(scenarios::A6_COMPACTION)
+            .expect("transcript")
+            .turn_text(1);
+        let continued = serde_json::to_string(&backend.request(1)).expect("request body");
+        assert!(continued.contains(&summary), "{continued}");
+        assert!(
+            !continued.contains("trigger overflow"),
+            "the pruned tail must not reach the model: {continued}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // A7 — revert/unrevert over the wire
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a7_revert_unrevert_with_git_worktree() {
+        let backend = MockBackend::new(scenarios::A7_REVERT);
+        scenarios::a7_revert(&backend).await;
+
+        assert_eq!(backend.requests().len(), 2, "one model request per step");
     }
 
     // -------------------------------------------------------------------

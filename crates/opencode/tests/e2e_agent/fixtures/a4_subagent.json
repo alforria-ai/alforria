@@ -1,0 +1,48 @@
+{
+  "comment": "A4 — the parent issues a task tool call; the child session answers; the parent continues",
+  "turns": [
+    {
+      "frames": [
+        {
+          "tool_call": {
+            "id": "cal_1",
+            "name": "task",
+            "arguments": {
+              "description": "Research",
+              "prompt": "do the research",
+              "subagent_type": "general"
+            }
+          }
+        },
+        {
+          "finish": {
+            "reason": "tool_calls",
+            "usage": { "input": 50, "output": 5 }
+          }
+        }
+      ]
+    },
+    {
+      "frames": [
+        { "text": "subagent answer" },
+        {
+          "finish": {
+            "reason": "stop",
+            "usage": { "input": 60, "output": 3 }
+          }
+        }
+      ]
+    },
+    {
+      "frames": [
+        { "text": "parent continues" },
+        {
+          "finish": {
+            "reason": "stop",
+            "usage": { "input": 60, "output": 3 }
+          }
+        }
+      ]
+    }
+  ]
+}

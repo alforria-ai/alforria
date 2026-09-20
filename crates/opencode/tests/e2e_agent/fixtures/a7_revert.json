@@ -1,0 +1,34 @@
+{
+  "comment": "A7 — a write tool edits a.txt; the test then drives revert/unrevert through the API against the real git worktree",
+  "turns": [
+        {
+          "frames": [
+            {
+              "tool_call": {
+                "id": "cal_1",
+                "name": "write",
+                "arguments": { "filePath": "a.txt", "content": "v2\n" }
+              }
+            },
+            { "sleep_ms": 1000 },
+            {
+              "finish": {
+                "reason": "tool_calls",
+                "usage": { "input": 50, "output": 5 }
+              }
+            }
+          ]
+        },
+    {
+      "frames": [
+        { "text": "edited" },
+        {
+          "finish": {
+            "reason": "stop",
+            "usage": { "input": 60, "output": 3 }
+          }
+        }
+      ]
+    }
+  ]
+}
