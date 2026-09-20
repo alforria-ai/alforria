@@ -5,7 +5,11 @@ use clap::error::ErrorKind;
 use clap::{Arg, ArgAction, ArgMatches, Command};
 
 use crate::error::{CliError, TypedError};
+use crate::network;
 use crate::ui::Ui;
+
+pub mod serve;
+pub mod web;
 
 pub fn cli() -> Command {
     Command::new("opencode")
@@ -58,8 +62,12 @@ pub fn cli() -> Command {
         .subcommand(
             Command::new("uninstall").about("uninstall opencode and remove all related files"),
         )
-        .subcommand(Command::new("serve").about("starts a headless opencode server"))
-        .subcommand(Command::new("web").about("start opencode server and open web interface"))
+        .subcommand(network::with_network_options(
+            Command::new("serve").about("starts a headless opencode server"),
+        ))
+        .subcommand(network::with_network_options(
+            Command::new("web").about("start opencode server and open web interface"),
+        ))
         .subcommand(
             Command::new("models")
                 .about("list all available models")
@@ -368,17 +376,30 @@ fn stub(name: &str) -> TypedError {
     TypedError::Cli(CliError::new(format!("{name} is not implemented yet")))
 }
 
+/// The tokio runtime the embedded server listener runs on.
+pub(crate) fn runtime() -> Result<tokio::runtime::Runtime, TypedError> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| TypedError::Unknown {
+            raw: err.to_string(),
+        })
+}
+
 /// Dispatch a parsed command line. The `$0` default command routes to the TUI.
-pub fn route(matches: &ArgMatches) -> Result<(), TypedError> {
+pub fn route(matches: &ArgMatches, ui: &mut Ui, raw: &[OsString]) -> Result<(), TypedError> {
     let name = matches.subcommand_name().unwrap_or("tui");
-    // TODO(C2): serve, web
-    // TODO(C3/C4): run
-    // TODO(C5): models, providers
-    // TODO(C6): agent, session, db, debug
-    // TODO(C7): mcp
-    // TODO(C8): tui ($0), attach, acp, pr
-    // TODO(C9): stats, export, import, generate
-    Err(stub(name))
+    match name {
+        "serve" => serve::run(matches.subcommand_matches("serve").expect("serve"), ui, raw),
+        "web" => web::run(matches.subcommand_matches("web").expect("web"), ui, raw),
+        // TODO(C3/C4): run
+        // TODO(C5): models, providers
+        // TODO(C6): agent, session, db, debug
+        // TODO(C7): mcp
+        // TODO(C8): tui ($0), attach, acp, pr
+        // TODO(C9): stats, export, import, generate
+        _ => Err(stub(name)),
+    }
 }
 
 #[cfg(test)]
@@ -467,7 +488,8 @@ mod tests {
     #[test]
     fn no_args_routes_to_default_tui() {
         let matches = cli().try_get_matches_from(["opencode"]).unwrap();
-        let err = route(&matches).unwrap_err();
+        let (mut ui, _captured) = Ui::capture(false);
+        let err = route(&matches, &mut ui, &[]).unwrap_err();
         assert!(format_error_needed(&err).contains("tui is not implemented yet"));
     }
 
@@ -485,8 +507,6 @@ mod tests {
             ("agent", vec!["agent", "list"]),
             ("upgrade", vec!["upgrade"]),
             ("uninstall", vec!["uninstall"]),
-            ("serve", vec!["serve"]),
-            ("web", vec!["web"]),
             ("models", vec!["models"]),
             ("stats", vec!["stats"]),
             ("export", vec!["export"]),
@@ -505,13 +525,65 @@ mod tests {
             let matches = cli()
                 .try_get_matches_from(invocation)
                 .unwrap_or_else(|err| panic!("parse failed for {name}: {err}"));
-            let err = route(&matches).unwrap_err();
+            let (mut ui, _captured) = Ui::capture(false);
+            let raw: Vec<OsString> = argv.iter().map(OsString::from).collect();
+            let err = route(&matches, &mut ui, &raw).unwrap_err();
             assert!(
                 format_error_needed(&err).contains(&format!("{name} is not implemented yet")),
                 "{name}: {}",
                 format_error_needed(&err)
             );
         }
+    }
+
+    #[test]
+    fn serve_parses_network_options() {
+        let matches = cli()
+            .try_get_matches_from([
+                "opencode",
+                "serve",
+                "--port",
+                "9000",
+                "--hostname",
+                "0.0.0.0",
+                "--mdns",
+                "--mdns-domain",
+                "dev.local",
+                "--cors",
+                "https://a",
+                "--cors",
+                "https://b",
+            ])
+            .unwrap();
+        let opts =
+            network::NetworkOptions::from_matches(matches.subcommand_matches("serve").unwrap());
+        assert_eq!(opts.port, 9000);
+        assert_eq!(opts.hostname, "0.0.0.0");
+        assert!(opts.mdns);
+        assert_eq!(opts.mdns_domain, "dev.local");
+        assert_eq!(opts.cors, vec!["https://a", "https://b"]);
+    }
+
+    #[test]
+    fn web_parses_network_option_defaults() {
+        let matches = cli().try_get_matches_from(["opencode", "web"]).unwrap();
+        let opts =
+            network::NetworkOptions::from_matches(matches.subcommand_matches("web").unwrap());
+        assert_eq!(opts.port, 0);
+        assert_eq!(opts.hostname, "127.0.0.1");
+        assert!(!opts.mdns);
+        assert_eq!(opts.mdns_domain, "opencode.local");
+        assert!(opts.cors.is_empty());
+    }
+
+    #[test]
+    fn mdns_flag_accepts_explicit_false() {
+        let matches = cli()
+            .try_get_matches_from(["opencode", "serve", "--mdns=false"])
+            .unwrap();
+        let opts =
+            network::NetworkOptions::from_matches(matches.subcommand_matches("serve").unwrap());
+        assert!(!opts.mdns);
     }
 
     #[test]

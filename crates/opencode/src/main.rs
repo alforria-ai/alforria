@@ -1,5 +1,6 @@
 pub mod cmd;
 pub mod error;
+pub mod network;
 pub mod ui;
 
 use std::ffi::OsString;
@@ -20,7 +21,7 @@ fn run(ui: &mut Ui, args: &[OsString]) -> i32 {
         Err(code) => return code,
     };
     cmd::apply_middleware(&matches);
-    match cmd::route(&matches) {
+    match cmd::route(&matches, ui, args) {
         Ok(()) => 0,
         Err(typed) => report(ui, &typed),
     }
@@ -53,10 +54,10 @@ mod tests {
     #[test]
     fn stub_command_exits_one_with_error_line() {
         let (mut ui, captured) = Ui::capture(false);
-        let code = run(&mut ui, &args(&["serve"]));
+        let code = run(&mut ui, &args(&["run", "hello"]));
         assert_eq!(code, 1);
         let stderr = captured.stderr();
-        assert!(stderr.contains("serve is not implemented yet"), "{stderr}");
+        assert!(stderr.contains("run is not implemented yet"), "{stderr}");
     }
 
     #[test]
