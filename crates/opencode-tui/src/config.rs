@@ -29,6 +29,12 @@ pub struct TuiConfig {
     /// The `ResolveOptions.terminalSuspend` flag (`config/index.tsx:86-89`)
     /// — `process.platform !== "win32"`.
     pub terminal_suspend_supported: bool,
+    /// `scroll_speed` (`config/index.tsx:70`) — default 3.
+    pub scroll_speed: f64,
+    /// `scroll_acceleration.enabled` (`config/index.tsx:71`).
+    pub scroll_acceleration_enabled: bool,
+    /// `diff_style` (`config/index.tsx:72`): `"auto" | "stacked"`.
+    pub diff_style: String,
 }
 
 impl Default for TuiConfig {
@@ -40,6 +46,9 @@ impl Default for TuiConfig {
             keybinds: std::collections::BTreeMap::new(),
             leader_timeout_ms: None,
             terminal_suspend_supported: cfg!(not(target_os = "windows")),
+            scroll_speed: 3.0,
+            scroll_acceleration_enabled: false,
+            diff_style: "auto".to_string(),
         }
     }
 }

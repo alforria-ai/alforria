@@ -81,20 +81,56 @@ fn toast(app: &mut App, variant: ToastVariant, message: impl Into<String>, durat
     });
 }
 
-/// `useConnected()` (`component/use-connected.tsx`).
+// --------------------------------------------------- transcript scroll
+
+/// `scroll.scrollBy(±scroll.height / 2)` — a page is half the
+/// viewport (`session/index.tsx:756-759`).
+fn scroll_by_half(app: &mut App, sign: i64) {
+    let step = (app.ui.session_scroll.viewport_height as i64 / 4).max(1);
+    app.ui.session_scroll.scroll_by(step * sign);
+}
+
+/// `scrollToMessage` + `findNextVisibleMessage`
+/// (`session/index.tsx:378-421`): only messages with a non-synthetic
+/// non-ignored text part count, ±10px threshold.
+fn scroll_to_next_visible_message(app: &mut App, direction: i64) {
+    let scroll = &app.ui.session_scroll;
+    let top = scroll.effective_y() as i64;
+    let threshold = 10;
+    let target = if direction > 0 {
+        scroll
+            .children
+            .iter()
+            .find(|(_, y)| (*y as i64) > top + threshold)
+    } else {
+        scroll
+            .children
+            .iter()
+            .rev()
+            .find(|(_, y)| (*y as i64) < top - threshold)
+    };
+    match target {
+        Some((_, y)) => app.ui.session_scroll.scroll_by(*y as i64 - top - 1),
+        None => app
+            .ui
+            .session_scroll
+            .scroll_by(direction * scroll.viewport_height as i64),
+    }
+}
+
+/// `session.messages_last_user` (`session/index.tsx:832-861`).
+fn scroll_to_last_user(app: &mut App) {
+    let Some((_, y)) = app.ui.session_scroll.children.last().cloned() else {
+        return;
+    };
+    let top = app.ui.session_scroll.effective_y() as i64;
+    app.ui.session_scroll.scroll_by(y as i64 - top - 1);
+}
+
+/// `useConnected()` (`component/use-connected.tsx`) — see
+/// `state::connected`.
 fn connected(app: &App) -> bool {
-    app.state.sync.provider.iter().any(|provider| {
-        provider.get("id").and_then(Value::as_str) != Some("opencode")
-            || provider
-                .get("models")
-                .and_then(Value::as_object)
-                .map(|models| {
-                    models.values().any(|model| {
-                        model.get("cost").and_then(|c| c.get("input")) != Some(&json!(0))
-                    })
-                })
-                .unwrap_or(false)
-    })
+    crate::state::connected(app)
 }
 
 /// `sidebarVisible()` (`routes/session/index.tsx:271-276`).
@@ -1176,18 +1212,52 @@ pub fn run(app: &mut App, name: &str) -> Vec<Effect> {
                 .set(keys::GENERIC_TOOL_OUTPUT_VISIBILITY, json!(next));
             clear_dialog(app);
         }
-        // TODO(M8.5): transcript scroll commands.
-        "session.page.up"
-        | "session.page.down"
-        | "session.line.up"
-        | "session.line.down"
-        | "session.half.page.up"
-        | "session.half.page.down"
-        | "session.first"
-        | "session.last"
-        | "session.messages_last_user"
-        | "session.message.next"
-        | "session.message.previous" => clear_dialog(app),
+        // Transcript scroll commands (`session/index.tsx:752-860`).
+        "session.page.up" => {
+            scroll_by_half(app, -2);
+            clear_dialog(app);
+        }
+        "session.page.down" => {
+            scroll_by_half(app, 2);
+            clear_dialog(app);
+        }
+        "session.line.up" => {
+            app.ui.session_scroll.scroll_by(-1);
+            clear_dialog(app);
+        }
+        "session.line.down" => {
+            app.ui.session_scroll.scroll_by(1);
+            clear_dialog(app);
+        }
+        "session.half.page.up" => {
+            scroll_by_half(app, -1);
+            clear_dialog(app);
+        }
+        "session.half.page.down" => {
+            scroll_by_half(app, 1);
+            clear_dialog(app);
+        }
+        "session.first" => {
+            app.ui.session_scroll.y = 0;
+            app.ui.session_scroll.sticky = false;
+            clear_dialog(app);
+        }
+        "session.last" => {
+            app.ui.session_scroll.snap_to_bottom();
+            clear_dialog(app);
+        }
+        "session.messages_last_user" => {
+            scroll_to_last_user(app);
+            clear_dialog(app);
+        }
+        "session.message.next" => {
+            scroll_to_next_visible_message(app, 1);
+            clear_dialog(app);
+        }
+        "session.message.previous" => {
+            scroll_to_next_visible_message(app, -1);
+            clear_dialog(app);
+        }
         "messages.copy" => return messages_copy(app),
         "session.copy" => {
             clear_dialog(app);

@@ -114,6 +114,20 @@ pub fn post_update(app: &mut App) -> Vec<Effect> {
     }
     app.ui.provider_empty = provider_empty;
 
+    // The session mount effect (`session/index.tsx:286-324`): fires once
+    // per route sessionID — `session.get`, 404 → toast + home, workspace
+    // mismatch → non-fatal re-bootstrap, then the session hydrate.
+    if let Route::Session { session_id, .. } = &app.state.route.data {
+        if app.ui.session_mounted.as_deref() != Some(session_id.as_str()) {
+            let previous_workspace = app.state.project.workspace.current.clone();
+            app.ui.session_mounted = Some(session_id.clone());
+            effects.push(Effect::SessionMount {
+                session_id: session_id.clone(),
+                previous_workspace,
+            });
+        }
+    }
+
     effects
 }
 
@@ -200,9 +214,53 @@ pub fn on_bus_event(app: &mut App, bus_event: BusEvent) -> Vec<Effect> {
                 });
             }
         }
+        Event::MessagePartUpdated(evt) => {
+            plan_switch(app, &evt);
+        }
         _ => {}
     }
     Vec::new()
+}
+
+/// The `plan_enter`/`plan_exit` tool switch (`session/index.tsx:326-341`):
+/// a completed part in the current session flips the local agent between
+/// build and plan, once per part id (`lastSwitch`).
+fn plan_switch(app: &mut App, evt: &opencode_schema::session_v1::MessagePartUpdatedData) {
+    use opencode_schema::session_v1::{V1Part, V1ToolState};
+    let V1Part::Tool {
+        id,
+        session_id,
+        tool,
+        state,
+        ..
+    } = &evt.part
+    else {
+        return;
+    };
+    if !matches!(state, V1ToolState::Completed { .. }) {
+        return;
+    }
+    let Route::Session {
+        session_id: current,
+        ..
+    } = &app.state.route.data
+    else {
+        return;
+    };
+    if session_id != current || app.ui.plan_switch_part.as_deref() == Some(id.as_str()) {
+        return;
+    }
+    let agent = match tool.as_str() {
+        "plan_exit" => "build",
+        "plan_enter" => "plan",
+        _ => return,
+    };
+    let sync = std::mem::take(&mut app.state.sync);
+    if let Some(toast) = app.state.local.agent_set(agent, &sync) {
+        app.show_toast(toast);
+    }
+    app.state.sync = sync;
+    app.ui.plan_switch_part = Some(id.clone());
 }
 
 /// `errorMessage` (`app.tsx:154-167`): `error.data.message`, falling back
@@ -563,7 +621,12 @@ mod tests {
             session("ses_c", "C", 20, None),
         ];
         let effects = post_update(&mut app);
-        assert!(effects.is_empty());
+        // The route change to a session fires its mount effect
+        // (`session/index.tsx:286-324`).
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::SessionMount { session_id, .. }] if session_id == "ses_c"
+        ));
         assert_eq!(
             app.state.route.data,
             Route::Session {
@@ -593,7 +656,9 @@ mod tests {
         app.state.sync.status = Some(SyncStatus::Partial);
         app.state.sync.session = vec![session("ses_a", "A", 10, None)];
         let effects = post_update(&mut app);
-        assert_eq!(effects.len(), 1);
+        // The fork effect, plus the mount effect for the `--continue`
+        // dummy session the route sits on.
+        assert_eq!(effects.len(), 2);
         assert!(matches!(
             effects[0],
             Effect::SessionFork { session_id: ref s, navigate: true } if s == "ses_a"

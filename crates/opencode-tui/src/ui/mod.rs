@@ -1,7 +1,11 @@
 //! `ui/` — ratatui views. Each route renders into the full frame; redraws
 //! are full-frame on every [`crate::state::App`] version bump.
 
+pub mod diff;
 pub mod home;
+pub mod locale;
+pub mod markdown;
+pub mod session;
 pub mod theme;
 
 pub use logo::{LOGO, SPINNER_FRAMES};
@@ -32,8 +36,7 @@ pub fn view(app: &mut App, frame: &mut ratatui::Frame) {
         .render(area, frame.buffer_mut());
     match &app.state.route.data {
         Route::Home { .. } => home::render(app, frame, &theme, area),
-        // TODO(M8.5): the session transcript view.
-        Route::Session { .. } => {}
+        Route::Session { .. } => session::render(app, frame, &theme, area),
         Route::Plugin { id, .. } => render_plugin_missing(frame, &theme, area, id),
     }
     if let Some(toast) = app.ui.toasts.last() {

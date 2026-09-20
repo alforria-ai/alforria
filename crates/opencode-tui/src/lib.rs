@@ -282,6 +282,38 @@ async fn execute_effect(app: &mut App, api: Arc<dyn ServerApi>, effect: Effect) 
         Effect::SessionCopyTranscript { .. } => {
             // TODO(M8.8): formatTranscript + clipboard write.
         }
+        Effect::SessionMount {
+            session_id,
+            previous_workspace,
+        } => {
+            // `createEffect` (`session/index.tsx:286-324`).
+            match api.session_get(&Location::default(), &session_id).await {
+                Ok(info) => {
+                    if info.workspace_id != previous_workspace {
+                        app.state.project.workspace.current = info.workspace_id.clone();
+                        // Non-fatal: the workspace may no longer exist —
+                        // the session still renders, non-interactive.
+                        let _ = state::sync::bootstrap(&mut app.state, api.as_ref(), false).await;
+                    }
+                    let _ =
+                        state::sync::session_sync(&mut app.state, api.as_ref(), &session_id).await;
+                    // `scroll.scrollBy(100_000)` — snap to bottom.
+                    app.ui.session_scroll.snap_to_bottom();
+                }
+                Err(_) => {
+                    app.show_toast(Toast {
+                        title: None,
+                        variant: ToastVariant::Error,
+                        message: format!("Session not found: {session_id}"),
+                        duration_ms: 5000,
+                    });
+                    app.state.route.navigate(Route::Home { prompt: None });
+                }
+            }
+        }
+        Effect::SessionHydrate { session_id } => {
+            let _ = state::sync::session_sync(&mut app.state, api.as_ref(), &session_id).await;
+        }
         Effect::ClipboardWrite {
             text,
             success,

@@ -11,6 +11,7 @@ pub mod local;
 pub mod route;
 pub mod sync;
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -185,6 +186,67 @@ pub enum PendingDialog {
     },
 }
 
+/// Explicit transcript scroll state (spec §7.2) — the TS `scrollbox`
+/// becomes an offset + a stickiness bit. `sticky` is the OpenTUI
+/// `stickyScroll` + `stickyStart="bottom"` pair: a view pinned to the
+/// bottom stays glued while content grows.
+#[derive(Debug, Default)]
+pub struct SessionScroll {
+    /// `scroll.y` — the top content row rendered.
+    pub y: usize,
+    /// Pinned to the bottom (scrollbox end).
+    pub sticky: bool,
+    /// The route session at the last snap — `createEffect(on(() =>
+    /// route.sessionID, toBottom))` (`session/index.tsx:1155`).
+    pub session: Option<String>,
+    /// The last rendered content height (clamps `y`).
+    pub content_height: usize,
+    pub viewport_height: usize,
+    /// `scroll.getChildren()` — (messageID, top row) per message, for
+    /// the message-nav commands.
+    pub children: Vec<(String, usize)>,
+}
+
+impl SessionScroll {
+    /// The effective top row — the bottom edge when sticky.
+    pub fn effective_y(&self) -> usize {
+        if self.sticky {
+            self.content_height.saturating_sub(self.viewport_height)
+        } else {
+            self.y
+        }
+    }
+
+    pub fn max_y(&self) -> usize {
+        self.content_height.saturating_sub(self.viewport_height)
+    }
+
+    /// `scroll.scrollBy(delta)` — down at the bottom stays at the
+    /// bottom; reaching the end re-sticks.
+    pub fn scroll_by(&mut self, delta: i64) {
+        if self.sticky && delta >= 0 {
+            return;
+        }
+        let max = self.max_y() as i64;
+        let next = (self.y as i64) + delta;
+        self.y = next.clamp(0, max).max(0) as usize;
+        self.sticky = self.y as i64 >= max;
+    }
+
+    /// `scroll.scrollTo(y)`.
+    pub fn scroll_to(&mut self, y: usize) {
+        let max = self.max_y();
+        self.y = y.min(max);
+        self.sticky = self.y >= max;
+    }
+
+    /// `scroll.scrollTo(scroll.scrollHeight)` — the `toBottom()`
+    /// effect and the post-mount `scrollBy(100_000)`.
+    pub fn snap_to_bottom(&mut self) {
+        self.sticky = true;
+    }
+}
+
 /// Keymap modes and focus (M8.4), dialog stack (TODO(M8.7)) plus
 /// the app-shell bookkeeping of M8.3.
 #[derive(Debug, Default)]
@@ -231,6 +293,22 @@ pub struct UiState {
     /// `docs.open` etc. print their URL instead of opening a browser
     /// (spec §6 N6) — collected by the runtime after the loop.
     pub opened_urls: Vec<String>,
+    /// The transcript scrollbox (spec §7.2).
+    pub session_scroll: SessionScroll,
+    /// `session_mounted` — the sessionID whose mount effect already
+    /// fired (`session/index.tsx:286-324`).
+    pub session_mounted: Option<String>,
+    /// `lastSwitch` of the plan_enter/plan_exit handler
+    /// (`session/index.tsx:326-341`).
+    pub plan_switch_part: Option<String>,
+    /// Expanded tool outputs / reasoning bodies / shell blocks — per
+    /// part id (the TS per-component signals collapse into a set).
+    pub expanded: HashSet<String>,
+    /// Expanded error rows (`errorExpanded` per part).
+    pub expanded_errors: HashSet<String>,
+    /// The footer's `welcome` state machine (`routes/session/footer.tsx`).
+    pub footer_welcome: bool,
+    pub footer_flip_at: Option<u64>,
 }
 
 /// `StartupLoading` timers (`component/startup-loading.tsx:26-63`) as a
@@ -369,6 +447,15 @@ pub enum Effect {
     },
     /// §6 N6: `docs.open` prints the URL instead of opening a browser.
     OpenUrl { url: String },
+    /// `session.get` on mount + 404 toast/home + workspace re-bootstrap
+    /// + hydrate + snap-to-bottom (`session/index.tsx:286-324`).
+    SessionMount {
+        session_id: String,
+        previous_workspace: Option<String>,
+    },
+    /// `sync.session.sync(sessionID)` — the `task` tool hydrates its
+    /// child session on mount (`session/index.tsx:2221-2224`).
+    SessionHydrate { session_id: String },
 }
 
 pub struct App {
@@ -441,9 +528,17 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                 }
             }
         }
-        Msg::Mouse(_) => {
-            // TODO(M8.5): scroll + click handling (util/scroll.ts).
-        }
+        Msg::Mouse(mouse) => match mouse.kind {
+            // TODO(M8.5): dialog-scroll and hover handling; the
+            // transcript wheel uses the config `scroll_speed`.
+            crossterm::event::MouseEventKind::ScrollUp => {
+                app.ui.session_scroll.scroll_by(-(scroll_speed(app) as i64));
+            }
+            crossterm::event::MouseEventKind::ScrollDown => {
+                app.ui.session_scroll.scroll_by(scroll_speed(app) as i64);
+            }
+            _ => {}
+        },
         Msg::Resize(columns, _) => {
             // Layout is recomputed on every draw; the sidebar boundary
             // needs the width.
@@ -463,11 +558,52 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                     app.ui.interrupt_reset_at = None;
                 }
             }
+            // The footer's `welcome` rotation (`routes/session/footer.tsx:31-45`).
+            if !connected(app) {
+                if let Some(flip_at) = app.ui.footer_flip_at {
+                    if now_ms >= flip_at {
+                        app.ui.footer_welcome = !app.ui.footer_welcome;
+                        app.ui.footer_flip_at =
+                            Some(now_ms + if app.ui.footer_welcome { 5000 } else { 10000 });
+                    }
+                } else {
+                    app.ui.footer_flip_at = Some(now_ms + 10000);
+                }
+            } else {
+                app.ui.footer_welcome = false;
+                app.ui.footer_flip_at = None;
+            }
         }
     }
     app.version += 1;
     effects.extend(crate::app::post_update(app));
     effects
+}
+
+/// `useConnected()` (`component/use-connected.tsx`): some provider
+/// other than `opencode`, or an `opencode` model with a nonzero input
+/// cost.
+pub fn connected(app: &App) -> bool {
+    app.state.sync.provider.iter().any(|provider| {
+        provider.get("id").and_then(Value::as_str) != Some("opencode")
+            || provider
+                .get("models")
+                .and_then(Value::as_object)
+                .and_then(|models| models.values().next())
+                .and_then(|model| model.get("cost"))
+                .and_then(|cost| cost.get("input"))
+                .and_then(Value::as_f64)
+                .map(|input| input != 0.0)
+                .unwrap_or(false)
+    })
+}
+
+/// `getScrollAcceleration(tuiConfig)` (`util/scroll.ts`): the default
+/// is a fixed `scroll_speed` of 3. The macOS acceleration curve lives
+/// in `@opentui/core` and cannot be ported verbatim — when enabled the
+/// port keeps the fixed speed (recorded as a documented divergence).
+fn scroll_speed(app: &App) -> u32 {
+    app.config.scroll_speed.round().max(1.0) as u32
 }
 
 #[cfg(test)]
