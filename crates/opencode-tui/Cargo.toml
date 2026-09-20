@@ -11,3 +11,9 @@ reqwest = { workspace = true }
 eventsource-stream = { workspace = true }
 futures = { workspace = true }
 anyhow = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }
