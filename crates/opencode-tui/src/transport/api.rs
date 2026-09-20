@@ -137,12 +137,22 @@ pub struct ProviderModel {
     pub model_id: String,
 }
 
-/// `session.prompt` body (`prompt/index.tsx:1073-1089`).
+/// `session.prompt` body (`prompt/index.tsx:1073-1089`) —
+/// `{...selectedModel, model: selectedModel, …}` carries the model both
+/// top-level and nested.
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionPrompt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    #[serde(
+        rename = "providerID",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub provider_id: Option<String>,
+    #[serde(rename = "modelID", default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<ProviderModel>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

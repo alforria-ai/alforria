@@ -26,7 +26,7 @@ pub struct ModelRef {
 }
 
 impl ModelRef {
-    fn key(&self) -> String {
+    pub fn key(&self) -> String {
         format!("{}/{}", self.provider_id, self.model_id)
     }
 }

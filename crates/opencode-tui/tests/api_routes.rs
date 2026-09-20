@@ -394,6 +394,8 @@ async fn request_shapes_match_frozen_routes() {
         "ses_1",
         SessionPrompt {
             agent: Some("build".to_string()),
+            model_id: None,
+            provider_id: None,
             model: None,
             variant: None,
             parts: vec![json!({"type": "text", "text": "hi"})],
@@ -672,6 +674,8 @@ async fn request_bodies_match_the_openapi_shapes() {
         "ses_1",
         SessionPrompt {
             agent: Some("build".to_string()),
+            model_id: Some("claude".to_string()),
+            provider_id: Some("anthropic".to_string()),
             model: Some(opencode_tui::transport::api::ProviderModel {
                 provider_id: "anthropic".to_string(),
                 model_id: "claude".to_string(),
@@ -721,9 +725,13 @@ async fn request_bodies_match_the_openapi_shapes() {
         .iter()
         .find(|request| request.path == "/session/ses_1/message")
         .expect("prompt recorded");
+    // `...selectedModel` spreads `providerID`/`modelID` top-level
+    // (`prompt/index.tsx:1098`) in addition to the nested `model`.
     assert_eq!(
         prompt.body,
         json!({
+            "providerID": "anthropic",
+            "modelID": "claude",
             "agent": "build",
             "model": {"providerID": "anthropic", "modelID": "claude"},
             "variant": "thinking",

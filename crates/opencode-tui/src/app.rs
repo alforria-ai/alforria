@@ -128,6 +128,10 @@ pub fn post_update(app: &mut App) -> Vec<Effect> {
         }
     }
 
+    // The prompt loses focus while a dialog is open and reclaims it
+    // after (`prompt/index.tsx:635-645`).
+    app.ui.prompt_focused = app.ui.dialog.is_none();
+
     effects
 }
 
@@ -152,6 +156,9 @@ pub fn on_bus_event(app: &mut App, bus_event: BusEvent) -> Vec<Effect> {
     match event {
         Event::TuiCommandExecute(evt) if workspace_matches => {
             return crate::command::run(app, &evt.command);
+        }
+        Event::TuiPromptAppend(evt) if workspace_matches => {
+            crate::state::prompt::prompt_append(app, &evt.text);
         }
         Event::TuiToastShow(evt) if workspace_matches => {
             app.show_toast(Toast {

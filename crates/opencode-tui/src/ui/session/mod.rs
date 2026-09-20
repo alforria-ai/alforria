@@ -5,6 +5,7 @@
 
 pub mod footer;
 pub mod parts;
+pub mod prompt;
 pub mod transcript;
 
 use ratatui::layout::Rect;
@@ -174,9 +175,9 @@ pub fn render(app: &mut App, frame: &mut ratatui::Frame, theme: &Theme, area: Re
     };
 
     // The bottom stack: permission > question > subagent footer > prompt
-    // (TODO(M8.7): permission + question; TODO(M8.8): subagent footer;
-    // TODO(M8.6): the prompt editor) + the footer bar.
-    let prompt_height = 3;
+    // (TODO(M8.7): permission + question; TODO(M8.8): subagent footer)
+    // + the footer bar.
+    let prompt_height = prompt::height(app, column, area.height);
     let footer_height = 1;
     let vertical = ratatui::layout::Layout::vertical([
         ratatui::layout::Constraint::Fill(1),
@@ -186,7 +187,7 @@ pub fn render(app: &mut App, frame: &mut ratatui::Frame, theme: &Theme, area: Re
     .split(column);
 
     transcript::render(app, frame, theme, vertical[0], &session_id, content_width);
-    render_prompt_frame(app, frame, theme, vertical[1], content_width);
+    prompt::render(app, frame, theme, vertical[1]);
     footer::render(app, frame, theme, vertical[2], &session_id);
 
     if sidebar_visible && !sidebar_area.is_empty() {
@@ -212,38 +213,6 @@ fn render_sidebar_placeholder(frame: &mut ratatui::Frame, theme: &Theme, area: R
         Style::new().fg(theme.text_muted.to_color()),
     ))];
     ratatui::widgets::Paragraph::new(lines).render(area, frame.buffer_mut());
-}
-
-/// The prompt frame — the border + `backgroundElement` box of
-/// `component/prompt/index.tsx:1352-1401`. The editor lands with
-/// TODO(M8.6).
-fn render_prompt_frame(
-    app: &App,
-    frame: &mut ratatui::Frame,
-    theme: &Theme,
-    area: Rect,
-    width: u16,
-) {
-    let max_width = app.config.prompt_max_width(width).min(area.width);
-    let centered = Rect {
-        x: area.x + area.width.saturating_sub(max_width) / 2,
-        width: max_width,
-        ..area
-    };
-    ratatui::widgets::Paragraph::new(ratatui::text::Text::default())
-        .block(
-            ratatui::widgets::Block::new()
-                .borders(ratatui::widgets::Borders::LEFT)
-                .border_style(theme.border.to_color())
-                .style(Style::new().bg(theme.background_element.to_color()))
-                .padding(ratatui::widgets::Padding {
-                    left: 2,
-                    right: 2,
-                    top: 1,
-                    bottom: 0,
-                }),
-        )
-        .render(centered, frame.buffer_mut());
 }
 
 /// Memoize the transcript geometry back into the scroll state so the

@@ -395,6 +395,22 @@ impl Keymap {
         }
     }
 
+    /// Whether `key` triggers the (single-stroke) binding `keybind`.
+    pub fn matches(&self, keybind: &str, key: &KeyEvent) -> bool {
+        if key.kind == crossterm::event::KeyEventKind::Release {
+            return false;
+        }
+        let Some(BindingValue::Alternatives(alternatives)) = self.bindings.get(keybind) else {
+            return false;
+        };
+        let Some(stroke) = event_to_stroke(key) else {
+            return false;
+        };
+        alternatives
+            .iter()
+            .any(|sequence| sequence.len() == 1 && sequence[0] == stroke)
+    }
+
     fn clear_pending(&mut self) {
         self.pending.clear();
         self.pending_since = None;

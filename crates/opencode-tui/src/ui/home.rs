@@ -96,34 +96,48 @@ fn center_horizontally(area: Rect, width: u16) -> Rect {
 }
 
 /// `Prompt` frame (`prompt/index.tsx:1352-1401`): left border +
-/// `backgroundElement` fill + 2-col padding. The editor lands with
-/// TODO(M8.6); the prompt input carries over the route's `PromptInfo`.
+/// `backgroundElement` fill + 2-col padding. The textarea contents
+/// render over the seeded --prompt input (M8.6).
 fn render_prompt(app: &App, frame: &mut ratatui::Frame, theme: &Theme, area: Rect) {
     let max_width = app
         .config
         .prompt_max_width(area.width.saturating_sub(4))
         .min(area.width);
-    // TODO(M8.6): the seeded --prompt input renders as content.
+    // The seeded --prompt input renders as content.
     let text = match &app.state.route.data {
         Route::Home {
-            prompt: Some(_), ..
-        } => String::new(),
-        _ => placeholder_text(app),
+            prompt: Some(prompt),
+            ..
+        } => prompt.input.clone(),
+        _ => String::new(),
     };
-    Paragraph::new(Span::styled(text, theme.text_muted.to_color()))
-        .block(
-            Block::new()
-                .borders(ratatui::widgets::Borders::LEFT)
-                .border_style(theme.border.to_color())
-                .style(Style::new().bg(theme.background_element.to_color()))
-                .padding(ratatui::widgets::Padding {
-                    left: 2,
-                    right: 2,
-                    top: 1,
-                    bottom: 0,
-                }),
-        )
-        .render(center_horizontally(area, max_width), frame.buffer_mut());
+    let placeholder = text.is_empty();
+    let text = if placeholder {
+        placeholder_text(app)
+    } else {
+        text
+    };
+    Paragraph::new(Span::styled(
+        text,
+        if placeholder {
+            theme.text_muted.to_color()
+        } else {
+            theme.text.to_color()
+        },
+    ))
+    .block(
+        Block::new()
+            .borders(ratatui::widgets::Borders::LEFT)
+            .border_style(theme.border.to_color())
+            .style(Style::new().bg(theme.background_element.to_color()))
+            .padding(ratatui::widgets::Padding {
+                left: 2,
+                right: 2,
+                top: 1,
+                bottom: 0,
+            }),
+    )
+    .render(center_horizontally(area, max_width), frame.buffer_mut());
 }
 
 #[cfg(test)]

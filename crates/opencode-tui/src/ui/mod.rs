@@ -6,6 +6,7 @@ pub mod home;
 pub mod locale;
 pub mod markdown;
 pub mod session;
+pub mod textarea;
 pub mod theme;
 
 pub use logo::{LOGO, SPINNER_FRAMES};

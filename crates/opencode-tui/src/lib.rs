@@ -14,13 +14,14 @@ pub mod app;
 pub mod clipboard;
 pub mod command;
 pub mod config;
+pub mod editor;
 pub mod keymap;
 pub mod state;
 pub mod transport;
 pub mod ui;
 
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -334,6 +335,57 @@ async fn execute_effect(app: &mut App, api: Arc<dyn ServerApi>, effect: Effect) 
             // §6 N6: no browser from a TUI — the URL prints on exit.
             app.ui.opened_urls.push(url);
         }
+        Effect::PromptPaste => match crate::clipboard::system_clipboard().read() {
+            Ok(crate::clipboard::ClipboardContent::Text(text)) => {
+                crate::state::prompt::paste_input_text(app, &text);
+            }
+            Ok(crate::clipboard::ClipboardContent::Image { mime, data_base64 }) => {
+                crate::state::prompt::paste_attachment(
+                    app,
+                    &crate::state::prompt::Attachment {
+                        filename: Some("clipboard".to_string()),
+                        filepath: None,
+                        mime,
+                        content: data_base64.into_bytes(),
+                    },
+                );
+            }
+            Ok(crate::clipboard::ClipboardContent::Pdf { data_base64 }) => {
+                crate::state::prompt::paste_attachment(
+                    app,
+                    &crate::state::prompt::Attachment {
+                        filename: Some("clipboard".to_string()),
+                        filepath: None,
+                        mime: "application/pdf".to_string(),
+                        content: data_base64.into_bytes(),
+                    },
+                );
+            }
+            Err(_) => {}
+        },
+        Effect::OpenPromptEditor { value } => {
+            // `openEditor` suspends the renderer around the child
+            // process (`editor.ts:40`).
+            let cwd = app
+                .state
+                .project
+                .instance_path
+                .worktree
+                .clone()
+                .or_else(|| app.state.project.instance_path.directory.clone());
+            crossterm::terminal::disable_raw_mode().ok();
+            crossterm::execute!(io::stdout(), crossterm::terminal::LeaveAlternateScreen).ok();
+            let edited = editor::open_editor(&value, cwd.as_deref().map(Path::new));
+            crossterm::terminal::enable_raw_mode().ok();
+            crossterm::execute!(io::stdout(), crossterm::terminal::EnterAlternateScreen).ok();
+            if let Some(content) = edited {
+                let normalized = editor::normalize_prompt_content(&content);
+                crate::state::prompt::apply_editor_content(app, &normalized);
+            }
+        }
+        Effect::PromptSubmit { payload } => {
+            crate::state::prompt::execute_submit(app, api.as_ref(), *payload).await;
+        }
     }
     Ok(())
 }
@@ -406,7 +458,12 @@ fn spawn_input_pump(messages: tokio::sync::mpsc::UnboundedSender<Msg>) {
                     return;
                 }
             }
-            // TODO(M8.6): bracketed paste (Event::Paste).
+            // Bracketed paste (`prompt/index.tsx:1396-1420`).
+            Ok(crossterm::event::Event::Paste(text)) => {
+                if messages.send(Msg::Paste(text)).is_err() {
+                    return;
+                }
+            }
             Ok(_) => {}
             Err(_) => return,
         }
@@ -451,6 +508,7 @@ impl TerminalGuard {
     fn enter(mouse: bool) -> Result<TerminalGuard> {
         crossterm::terminal::enable_raw_mode()?;
         crossterm::execute!(io::stdout(), crossterm::terminal::EnterAlternateScreen)?;
+        let _ = crossterm::execute!(io::stdout(), crossterm::event::EnableBracketedPaste);
         let mut mouse = mouse;
         if mouse_disabled_from_env() {
             mouse = false;
@@ -472,6 +530,7 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = write_ansi("\x1b]2;\x07");
+        let _ = crossterm::execute!(io::stdout(), crossterm::event::DisableBracketedPaste);
         #[cfg(unix)]
         let _ = crossterm::execute!(io::stdout(), crossterm::event::PopKeyboardEnhancementFlags);
         if self.mouse {

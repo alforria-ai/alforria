@@ -455,7 +455,7 @@ fn undo_reverts_to_last_user_message_and_repopulates_prompt() {
             },
         ]
     );
-    assert_eq!(app.ui.prompt_input, "revert me");
+    assert_eq!(app.ui.prompt.input(), "revert me");
     assert_eq!(app.ui.dialog, None);
 }
 
@@ -502,7 +502,7 @@ fn redo_unreverts_when_no_later_user_message() {
             session_id: "ses_1".into(),
         }]
     );
-    assert_eq!(app.ui.prompt_input, "");
+    assert_eq!(app.ui.prompt.input(), "");
 }
 
 #[test]
@@ -570,13 +570,13 @@ fn interrupt_requires_two_presses() {
 #[test]
 fn stash_round_trip() {
     let mut app = new_app();
-    app.ui.prompt_input = "draft".into();
+    app.ui.prompt.textarea.set_text("draft");
     assert!(is_enabled(&app, "prompt.stash"));
     run(&mut app, "prompt.stash");
-    assert_eq!(app.ui.prompt_input, "");
+    assert_eq!(app.ui.prompt.input(), "");
     assert!(is_enabled(&app, "prompt.stash.pop"));
     run(&mut app, "prompt.stash.pop");
-    assert_eq!(app.ui.prompt_input, "draft");
+    assert_eq!(app.ui.prompt.input(), "draft");
 }
 
 #[test]
@@ -653,10 +653,10 @@ fn tui_command_execute_dispatches_the_command() {
 fn key_dispatch_runs_the_first_enabled_command() {
     let mut app = new_app();
     app.ui.prompt_focused = true;
-    app.ui.prompt_input = "typing".into();
+    app.ui.prompt.textarea.set_text("typing");
     press_ctrl(&mut app, 'c');
     assert!(!app.ui.exit, "ctrl+c clears the prompt instead");
-    assert_eq!(app.ui.prompt_input, "");
+    assert_eq!(app.ui.prompt.input(), "");
 
     press_ctrl(&mut app, 'c');
     assert!(app.ui.exit, "empty input: ctrl+c exits");

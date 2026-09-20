@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 
 use crate::keymap::COMMAND_PALETTE_COMMAND;
 use crate::state::kv::keys;
-use crate::state::route::{PromptInfo, Route};
+use crate::state::route::Route;
 use crate::state::{App, Effect, PendingDialog, Toast, ToastVariant};
 use crate::ui::theme::Mode as ThemeMode;
 
@@ -257,7 +257,9 @@ fn set_prompt_from_parts(app: &mut App, target: &str) {
             }
             V1Part::File { .. } => {
                 if let Ok(value) = serde_json::to_value(part) {
-                    parts.push(value);
+                    if let Some(part) = crate::state::prompt::PromptPart::from_value(&value) {
+                        parts.push(part);
+                    }
                 }
             }
             _ => {}
@@ -266,9 +268,11 @@ fn set_prompt_from_parts(app: &mut App, target: &str) {
     set_prompt(app, input, parts);
 }
 
-fn set_prompt(app: &mut App, input: String, parts: Vec<Value>) {
-    app.ui.prompt_input = input;
-    app.ui.prompt_parts = parts;
+fn set_prompt(app: &mut App, input: String, parts: Vec<crate::state::prompt::PromptPart>) {
+    app.ui.prompt.textarea.set_text(&input);
+    app.ui.prompt.parts = parts;
+    app.ui.prompt.restore_extmarks_from_parts();
+    app.ui.prompt.textarea.buffer_end(false);
 }
 
 fn set_mode(app: &mut App, mode: ThemeMode) {
@@ -552,7 +556,7 @@ pub fn registry(app: &App) -> Vec<CommandInfo> {
         command.slash_aliases = &["quit", "q"];
         // The re-registered `app_exit` gate (`app.tsx:977-985`): exit is
         // disabled while the prompt is focused and non-empty.
-        command.enabled = !app.ui.prompt_focused || app.ui.prompt_input.is_empty();
+        command.enabled = !app.ui.prompt_focused || app.ui.prompt.input().is_empty();
         command
     });
     commands.push(CommandInfo::new(
@@ -656,7 +660,7 @@ pub fn registry(app: &App) -> Vec<CommandInfo> {
         let mut command = CommandInfo::new("prompt.clear", "Clear prompt", "Prompt");
         command.hidden = true;
         // The `prompt.clear` binding gate (`prompt/index.tsx:810-814`).
-        command.enabled = app.ui.prompt_focused && !app.ui.prompt_input.is_empty();
+        command.enabled = app.ui.prompt_focused && !app.ui.prompt.input().is_empty();
         command
     });
     commands.push({
@@ -710,17 +714,17 @@ pub fn registry(app: &App) -> Vec<CommandInfo> {
     // ---- stash commands (`component/prompt/index.tsx:736-798`)
     commands.push({
         let mut command = CommandInfo::new("prompt.stash", "Stash prompt", "Prompt");
-        command.enabled = !app.ui.prompt_input.is_empty();
+        command.enabled = !app.ui.prompt.input().is_empty();
         command
     });
     commands.push({
         let mut command = CommandInfo::new("prompt.stash.pop", "Stash pop", "Prompt");
-        command.enabled = !app.ui.stash.is_empty();
+        command.enabled = !app.ui.prompt.stash.is_empty();
         command
     });
     commands.push({
         let mut command = CommandInfo::new("prompt.stash.list", "Stash list", "Prompt");
-        command.enabled = !app.ui.stash.is_empty();
+        command.enabled = !app.ui.prompt.stash.is_empty();
         command
     });
 
@@ -1120,32 +1124,51 @@ pub fn run(app: &mut App, name: &str) -> Vec<Effect> {
 
         // ---- prompt commands
         "prompt.clear" => {
-            set_prompt(app, String::new(), Vec::new());
+            crate::state::prompt::clear_prompt(app);
             clear_dialog(app);
         }
-        // TODO(M8.6): submit pipeline, clipboard paste, $EDITOR bridge.
-        "prompt.submit" | "prompt.paste" | "prompt.editor" => {}
+        "prompt.submit" | "input.submit" if app.ui.prompt_focused => {
+            return crate::state::prompt::submit(app);
+        }
+        "prompt.paste" => {
+            clear_dialog(app);
+            return vec![Effect::PromptPaste];
+        }
+        "prompt.editor" => {
+            clear_dialog(app);
+            // Seed the editor with the virtual texts expanded inline
+            // (`prompt/index.tsx:430-439`).
+            let value = crate::state::prompt::expand_pasted_text_placeholders(
+                app.ui.prompt.input(),
+                &app.ui.prompt.parts,
+            );
+            return vec![Effect::OpenPromptEditor { value }];
+        }
         "prompt.editor_context.clear" => clear_dialog(app),
         "session.interrupt" => return interrupt(app),
         "prompt.skills" => show_dialog(app, PendingDialog::Skill),
         "workspace.set" => show_dialog(app, PendingDialog::WorkspaceSet),
         "session.move" => show_dialog(app, PendingDialog::MoveSession),
         "prompt.stash" => {
-            if app.ui.prompt_input.is_empty() {
+            if app.ui.prompt.input().is_empty() {
                 return Vec::new();
             }
-            let entry = PromptInfo {
-                input: app.ui.prompt_input.clone(),
+            // `stash.push({ input, parts })` — no mode (`prompt/index.tsx:743-748`).
+            let entry = crate::state::prompt::PromptEntry {
+                input: app.ui.prompt.input().to_string(),
                 mode: None,
-                parts: app.ui.prompt_parts.clone(),
+                parts: app.ui.prompt.parts.clone(),
             };
-            app.ui.stash.push(entry);
-            set_prompt(app, String::new(), Vec::new());
+            app.ui.prompt.stash.push(entry);
+            app.ui.prompt.reset();
             clear_dialog(app);
         }
         "prompt.stash.pop" => {
-            if let Some(entry) = app.ui.stash.pop() {
-                set_prompt(app, entry.input, entry.parts);
+            if let Some(entry) = app.ui.prompt.stash.pop() {
+                app.ui.prompt.textarea.set_text(&entry.entry.input);
+                app.ui.prompt.parts = entry.entry.parts;
+                app.ui.prompt.restore_extmarks_from_parts();
+                app.ui.prompt.textarea.buffer_end(false);
             }
             clear_dialog(app);
         }

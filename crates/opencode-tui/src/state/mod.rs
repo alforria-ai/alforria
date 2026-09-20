@@ -8,6 +8,7 @@
 
 pub mod kv;
 pub mod local;
+pub mod prompt;
 pub mod route;
 pub mod sync;
 
@@ -19,7 +20,7 @@ use serde_json::Value;
 use crate::keymap::Keymap;
 use crate::state::kv::Kv;
 use crate::state::local::LocalState;
-use crate::state::route::{PromptInfo, Route, RouteStore};
+use crate::state::route::{Route, RouteStore};
 use crate::state::sync::SyncState;
 use crate::transport::events::{BusEvent, EventMetadata};
 use crate::ui::theme::ThemeStore;
@@ -179,6 +180,8 @@ pub enum PendingDialog {
     WorkspaceSet,
     ExportOptions,
     MoveSession,
+    /// `DialogWorkspaceUnavailable` (`prompt/index.tsx:978-987`).
+    WorkspaceUnavailable,
     /// The `Share Session` confirm (`session/index.tsx:489-493`) —
     /// M8.7 wires the answer.
     ShareConsent {
@@ -274,9 +277,8 @@ pub struct UiState {
     /// The prompt textarea's focus — the managed-textarea layer is
     /// enabled while focused (`keymap.tsx:229-232`).
     pub prompt_focused: bool,
-    /// The prompt editor buffer (TODO(M8.6): the real textarea).
-    pub prompt_input: String,
-    pub prompt_parts: Vec<Value>,
+    /// The prompt editor (`component/prompt/index.tsx`) — M8.6.
+    pub prompt: crate::state::prompt::PromptState,
     /// `conceal` signal (`session/index.tsx:258`) — per-session, not
     /// persisted.
     pub conceal: bool,
@@ -288,8 +290,6 @@ pub struct UiState {
     /// `store.interrupt` (`prompt/index.tsx:396-421`).
     pub interrupt: u32,
     pub interrupt_reset_at: Option<u64>,
-    /// `prompt/stash.tsx`.
-    pub stash: Vec<PromptInfo>,
     /// `docs.open` etc. print their URL instead of opening a browser
     /// (spec §6 N6) — collected by the runtime after the loop.
     pub opened_urls: Vec<String>,
@@ -385,6 +385,8 @@ pub enum Msg {
     Key(crossterm::event::KeyEvent),
     Mouse(crossterm::event::MouseEvent),
     Resize(u16, u16),
+    /// Bracketed paste (`onPaste`, `prompt/index.tsx:1396-1420`).
+    Paste(String),
     /// 40 ms frame tick (`app.tsx:196` `targetFps: 60`).
     Tick(std::time::Duration),
 }
@@ -456,6 +458,17 @@ pub enum Effect {
     /// `sync.session.sync(sessionID)` — the `task` tool hydrates its
     /// child session on mount (`session/index.tsx:2221-2224`).
     SessionHydrate { session_id: String },
+    /// `prompt.paste` — read the clipboard, run the paste pipeline
+    /// (`prompt/index.tsx:374-391`).
+    PromptPaste,
+    /// `prompt.editor` — suspend the terminal, open `$EDITOR` seeded
+    /// with `value`, apply the edited content
+    /// (`prompt/index.tsx:424-514`).
+    OpenPromptEditor { value: String },
+    /// The submit pipeline dispatch (`prompt/index.tsx:947-1147`).
+    PromptSubmit {
+        payload: Box<crate::state::prompt::SubmitPayload>,
+    },
 }
 
 pub struct App {
@@ -473,6 +486,7 @@ impl App {
         let keymap = Keymap::resolve(&config);
         let mut state = State::new(args, state_dir);
         let ui = UiState {
+            prompt: crate::state::prompt::PromptState::new(state_dir),
             theme: ThemeStore::init(&mut state.kv, config.theme.as_deref()),
             conceal: true,
             prompt_focused: true,
@@ -521,11 +535,37 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                 foreground_tasks: crate::command::foreground_tasks(app) > 0,
             };
             let commands = app.keymap.dispatch(&context, &key, app.ui.tick_ms);
-            for name in commands {
-                if crate::command::is_enabled(app, name) {
-                    effects.extend(crate::command::run(app, name));
-                    break;
+            // While the autocomplete is open it takes the keyboard
+            // (§5.2 escape priority).
+            let mut handled = prompt::autocomplete_key(app, &key);
+            // TS dispatch evaluates every layer's `enabled()` gate before
+            // running handlers, then fires ALL enabled bindings
+            // (`keymap.tsx:229-232` + `app.tsx:975-985`) — snapshot the
+            // gates first so a handler's side effects can't flip a later
+            // gate (ctrl+c clears AND `app.exit` stays disabled).
+            let enabled: Vec<bool> = commands
+                .iter()
+                .map(|name| {
+                    if name.starts_with("input.") {
+                        app.ui.prompt_focused && app.ui.dialog.is_none()
+                    } else {
+                        crate::command::is_enabled(app, name)
+                    }
+                })
+                .collect();
+            for (name, enabled) in commands.iter().zip(enabled) {
+                if !enabled {
+                    continue;
                 }
+                if prompt::handle_command(app, name) {
+                    handled = true;
+                    continue;
+                }
+                effects.extend(crate::command::run(app, name));
+                handled = true;
+            }
+            if !handled && commands.is_empty() {
+                prompt::text_input(app, &key);
             }
         }
         Msg::Mouse(mouse) => match mouse.kind {
@@ -543,6 +583,17 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             // Layout is recomputed on every draw; the sidebar boundary
             // needs the width.
             app.ui.terminal_width = columns;
+        }
+        Msg::Paste(text) => {
+            // Bracketed-paste normalization happens at the boundary
+            // (`prompt/index.tsx:1402-1405`); an empty paste falls back
+            // to the clipboard-paste command (the win32 image quirk).
+            let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+            if normalized.trim().is_empty() {
+                effects.extend(crate::command::run(app, "prompt.paste"));
+            } else {
+                prompt::paste_input_text(app, &normalized);
+            }
         }
         Msg::Tick(elapsed) => {
             let now_ms = elapsed.as_millis() as u64;
@@ -672,7 +723,7 @@ mod tests {
         // A focused non-empty prompt: ctrl+c clears the input instead
         // (§5.2 — the app.exit gate).
         let mut app = App::new(crate::config::TuiConfig::default(), Args::default(), None);
-        app.ui.prompt_input = "typing".into();
+        app.ui.prompt.textarea.set_text("typing");
         update(
             &mut app,
             Msg::Key(crossterm::event::KeyEvent::new(
@@ -681,7 +732,7 @@ mod tests {
             )),
         );
         assert!(!app.ui.exit);
-        assert_eq!(app.ui.prompt_input, "");
+        assert_eq!(app.ui.prompt.input(), "");
 
         let mut app = App::new(crate::config::TuiConfig::default(), Args::default(), None);
         update(
