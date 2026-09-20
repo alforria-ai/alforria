@@ -2,6 +2,7 @@ pub mod catalog;
 pub mod client;
 pub mod cmd;
 pub mod error;
+pub mod instance;
 pub mod network;
 pub mod ui;
 
@@ -12,6 +13,7 @@ use error::TypedError;
 use ui::Ui;
 
 fn main() -> ExitCode {
+    cmd::debug::mark_startup();
     let mut ui = Ui::production();
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     ExitCode::from(run(&mut ui, &args) as u8)

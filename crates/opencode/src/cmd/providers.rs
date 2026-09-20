@@ -734,8 +734,14 @@ mod tests {
     // list
     // ------------------------------------------------------------------
 
+    /// `std::env` is process-global; the env-var assertions below must
+    /// not interleave (the C6 chunk fixed the pre-existing race).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn list_prints_credentials_and_path() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("OCPROVIDERS_TEST_ENV_KEY");
         let dir = tempfile::tempdir().unwrap();
         let paths = GlobalPaths::resolve(PathBuf::from(dir.path()).join("home"));
         let auth = FileAuthStore::new(paths.data.join("auth.json"));
@@ -801,6 +807,7 @@ mod tests {
 
     #[test]
     fn list_prints_environment_section_for_set_env_vars() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let auth = auth_store(dir.path());
         std::env::set_var("OCPROVIDERS_TEST_ENV_KEY", "1");
@@ -828,6 +835,8 @@ mod tests {
 
     #[test]
     fn list_without_env_vars_has_no_environment_section() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("OCPROVIDERS_TEST_ENV_KEY");
         let dir = tempfile::tempdir().unwrap();
         let auth = auth_store(dir.path());
         let catalog = fixture_catalog(dir.path());

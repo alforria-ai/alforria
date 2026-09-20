@@ -8,6 +8,9 @@ use crate::error::{CliError, TypedError};
 use crate::network;
 use crate::ui::Ui;
 
+pub mod agent;
+pub mod db;
+pub mod debug;
 pub mod models;
 pub mod providers;
 pub mod run;
@@ -15,6 +18,7 @@ pub mod run_events;
 pub mod run_files;
 pub mod run_output;
 pub mod serve;
+pub mod session;
 pub mod web;
 
 pub fn cli() -> Command {
@@ -359,11 +363,42 @@ fn debug() -> Command {
             Command::new("rg")
                 .about("ripgrep debugging utilities")
                 .subcommand_required(true)
-                .subcommand(Command::new("files").about("list files using ripgrep"))
+                .subcommand(
+                    Command::new("files")
+                        .about("list files using ripgrep")
+                        .arg(
+                            Arg::new("query")
+                                .long("query")
+                                .help("Filter files by query"),
+                        )
+                        .arg(
+                            Arg::new("glob")
+                                .long("glob")
+                                .help("Glob pattern to match files"),
+                        )
+                        .arg(
+                            Arg::new("limit")
+                                .long("limit")
+                                .help("Limit number of results")
+                                .value_parser(clap::value_parser!(usize)),
+                        ),
+                )
                 .subcommand(
                     Command::new("search")
                         .about("search file contents using ripgrep")
-                        .arg(Arg::new("pattern").required(true)),
+                        .arg(Arg::new("pattern").required(true))
+                        .arg(
+                            Arg::new("glob")
+                                .long("glob")
+                                .help("File glob patterns")
+                                .action(ArgAction::Append),
+                        )
+                        .arg(
+                            Arg::new("limit")
+                                .long("limit")
+                                .help("Limit number of results")
+                                .value_parser(clap::value_parser!(usize)),
+                        ),
                 ),
         )
         .subcommand(
@@ -407,7 +442,13 @@ fn debug() -> Command {
         .subcommand(
             Command::new("agent")
                 .about("show agent configuration details")
-                .arg(Arg::new("name").required(true)),
+                .arg(Arg::new("name").required(true).help("Agent name"))
+                .arg(Arg::new("tool").long("tool").help("Tool id to execute"))
+                .arg(
+                    Arg::new("params")
+                        .long("params")
+                        .help("Tool params as JSON or a JS object literal"),
+                ),
         )
         .subcommand(Command::new("startup").about("print startup timing"))
         .subcommand(Command::new("v2").about("debug v2 catalog and built-in plugins"))
@@ -465,7 +506,38 @@ fn agent() -> Command {
     Command::new("agent")
         .about("manage agents")
         .subcommand_required(true)
-        .subcommand(Command::new("create").about("create a new agent"))
+        .subcommand(
+            Command::new("create")
+                .about("create a new agent")
+                .arg(
+                    Arg::new("path")
+                        .long("path")
+                        .help("directory path to generate the agent file"),
+                )
+                .arg(
+                    Arg::new("description")
+                        .long("description")
+                        .help("what the agent should do"),
+                )
+                .arg(
+                    Arg::new("mode")
+                        .long("mode")
+                        .help("agent mode")
+                        .value_parser(["all", "primary", "subagent"]),
+                )
+                .arg(
+                    Arg::new("permissions")
+                        .long("permissions")
+                        .alias("tools")
+                        .help("comma-separated list of permissions to allow (default: all)"),
+                )
+                .arg(
+                    Arg::new("model")
+                        .long("model")
+                        .short('m')
+                        .help("model to use in the format of provider/model"),
+                ),
+        )
         .subcommand(Command::new("list").about("list all available agents"))
 }
 
@@ -488,7 +560,24 @@ fn session() -> Command {
                     .help("session ID to delete"),
             ),
         )
-        .subcommand(Command::new("list").about("list sessions"))
+        .subcommand(
+            Command::new("list")
+                .about("list sessions")
+                .arg(
+                    Arg::new("max-count")
+                        .long("max-count")
+                        .short('n')
+                        .help("limit to N most recent sessions")
+                        .value_parser(clap::value_parser!(i64)),
+                )
+                .arg(
+                    Arg::new("format")
+                        .long("format")
+                        .help("output format")
+                        .value_parser(["table", "json"])
+                        .default_value("table"),
+                ),
+        )
 }
 
 fn plug() -> Command {
@@ -502,6 +591,13 @@ fn db() -> Command {
     Command::new("db")
         .about("database tools")
         .arg(Arg::new("query").help("open an interactive sqlite3 shell or run a query"))
+        .arg(
+            Arg::new("format")
+                .long("format")
+                .help("Output format")
+                .value_parser(["json", "tsv"])
+                .default_value("tsv"),
+        )
         .subcommand(Command::new("path").about("print the database path"))
 }
 
@@ -585,7 +681,10 @@ pub fn route(matches: &ArgMatches, ui: &mut Ui, raw: &[OsString]) -> Result<(), 
             ui,
         ),
         "models" => models::run(matches.subcommand_matches("models").expect("models"), ui),
-        // TODO(C6): agent, session, db, debug
+        "agent" => agent::run(matches.subcommand_matches("agent").expect("agent"), ui),
+        "session" => session::run(matches.subcommand_matches("session").expect("session"), ui),
+        "db" => db::run(matches.subcommand_matches("db").expect("db"), ui),
+        "debug" => debug::run(matches.subcommand_matches("debug").expect("debug"), ui),
         // TODO(C7): mcp
         // TODO(C8): tui ($0), attach, acp, pr
         // TODO(C9): stats, export, import, generate
@@ -691,9 +790,7 @@ mod tests {
             ("mcp", vec!["mcp", "list"]),
             ("attach", vec!["attach", "http://localhost:4096"]),
             ("generate", vec!["generate"]),
-            ("debug", vec!["debug", "info"]),
             ("console", vec!["console", "orgs"]),
-            ("agent", vec!["agent", "list"]),
             ("upgrade", vec!["upgrade"]),
             ("uninstall", vec!["uninstall"]),
             ("stats", vec!["stats"]),
@@ -701,10 +798,8 @@ mod tests {
             ("import", vec!["import", "file.json"]),
             ("github", vec!["github", "install"]),
             ("pr", vec!["pr", "42"]),
-            ("session", vec!["session", "list"]),
             ("plugin", vec!["plugin", "module"]),
             ("plugin", vec!["plug", "module"]),
-            ("db", vec!["db"]),
         ];
         for (name, argv) in cases {
             let invocation: Vec<&str> = std::iter::once("opencode")
@@ -798,6 +893,133 @@ mod tests {
         assert!(!opts.mdns);
         assert_eq!(opts.mdns_domain, "opencode.local");
         assert!(opts.cors.is_empty());
+    }
+
+    #[test]
+    fn c6_flags_parse_their_surface() {
+        let matches = cli()
+            .try_get_matches_from([
+                "opencode",
+                "agent",
+                "create",
+                "--path",
+                "/tmp",
+                "--description",
+                "reviewer",
+                "--mode",
+                "subagent",
+                "--tools",
+                "read,edit",
+                "-m",
+                "anthropic/claude-4",
+            ])
+            .unwrap();
+        let create = matches
+            .subcommand_matches("agent")
+            .unwrap()
+            .subcommand_matches("create")
+            .unwrap();
+        assert_eq!(
+            create.get_one::<String>("permissions").map(String::as_str),
+            Some("read,edit")
+        );
+        assert_eq!(
+            create.get_one::<String>("model").map(String::as_str),
+            Some("anthropic/claude-4")
+        );
+
+        let matches = cli()
+            .try_get_matches_from(["opencode", "session", "list", "-n", "5", "--format", "json"])
+            .unwrap();
+        let list = matches
+            .subcommand_matches("session")
+            .unwrap()
+            .subcommand_matches("list")
+            .unwrap();
+        assert_eq!(list.get_one::<i64>("max-count"), Some(&5));
+        assert_eq!(
+            list.get_one::<String>("format").map(String::as_str),
+            Some("json")
+        );
+
+        let matches = cli()
+            .try_get_matches_from(["opencode", "db", "--format", "json", "SELECT 1"])
+            .unwrap();
+        let db = matches.subcommand_matches("db").unwrap();
+        assert_eq!(
+            db.get_one::<String>("query").map(String::as_str),
+            Some("SELECT 1")
+        );
+        assert_eq!(
+            db.get_one::<String>("format").map(String::as_str),
+            Some("json")
+        );
+
+        let matches = cli()
+            .try_get_matches_from(["opencode", "db", "path"])
+            .unwrap();
+        assert!(matches
+            .subcommand_matches("db")
+            .unwrap()
+            .subcommand_matches("path")
+            .is_some());
+
+        let matches = cli()
+            .try_get_matches_from([
+                "opencode", "debug", "rg", "search", "pattern", "--glob", "*.rs", "--limit", "10",
+            ])
+            .unwrap();
+        let search = matches
+            .subcommand_matches("debug")
+            .unwrap()
+            .subcommand_matches("rg")
+            .unwrap()
+            .subcommand_matches("search")
+            .unwrap();
+        assert_eq!(
+            search.get_one::<String>("pattern").map(String::as_str),
+            Some("pattern")
+        );
+        assert_eq!(search.get_one::<usize>("limit"), Some(&10));
+
+        let matches = cli()
+            .try_get_matches_from(["opencode", "debug", "agent", "build", "--tool", "read"])
+            .unwrap();
+        let agent = matches
+            .subcommand_matches("debug")
+            .unwrap()
+            .subcommand_matches("agent")
+            .unwrap();
+        assert_eq!(
+            agent.get_one::<String>("name").map(String::as_str),
+            Some("build")
+        );
+        assert_eq!(
+            agent.get_one::<String>("tool").map(String::as_str),
+            Some("read")
+        );
+    }
+
+    #[test]
+    fn agent_create_mode_is_validated() {
+        let (mut ui, _captured) = Ui::capture(false);
+        assert!(parse(
+            cli(),
+            &args(&[
+                "agent",
+                "create",
+                "--mode",
+                "bogus",
+                "--path",
+                "x",
+                "--description",
+                "d",
+                "--permissions",
+                "read"
+            ]),
+            &mut ui
+        )
+        .is_err());
     }
 
     #[test]

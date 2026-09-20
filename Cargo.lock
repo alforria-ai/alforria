@@ -1932,6 +1932,7 @@ name = "opencode"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "futures",
  "libc",
@@ -1941,6 +1942,8 @@ dependencies = [
  "opencode-server",
  "opencode-tui",
  "reqwest",
+ "rusqlite",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
