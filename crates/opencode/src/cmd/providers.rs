@@ -65,10 +65,19 @@ pub trait Prompter {
         -> Result<String, TypedError>;
     fn text(&mut self, message: &str) -> Result<String, TypedError>;
     fn password(&mut self, message: &str) -> Result<String, TypedError>;
+
+    /// `prompts.confirm` — the default answers come from [`Prompter::text`]
+    /// (`y`/`yes`/`true`/`1` are true).
+    fn confirm(&mut self, message: &str) -> Result<bool, TypedError> {
+        Ok(matches!(
+            self.text(message)?.to_lowercase().as_str(),
+            "y" | "yes" | "true" | "1"
+        ))
+    }
 }
 
 /// The interactive fallback: prompts go to stderr, answers come from stdin.
-struct StdinPrompter;
+pub struct StdinPrompter;
 
 fn read_line(message: &str) -> Result<String, TypedError> {
     eprintln!("{message}");

@@ -151,6 +151,18 @@ impl Ui {
         self.tty
     }
 
+    /// A second handle over the same sinks (fresh blank state) — used by
+    /// seams that print from inside service callbacks (the MCP OAuth
+    /// browser redirect).
+    pub fn share(&self) -> Ui {
+        Ui {
+            stdout: self.stdout.clone(),
+            stderr: self.stderr.clone(),
+            tty: self.tty,
+            blank: false,
+        }
+    }
+
     pub fn print(&mut self, message: &str) {
         self.blank = false;
         self.stderr.write(message.as_bytes());

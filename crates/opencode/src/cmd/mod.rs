@@ -11,6 +11,7 @@ use crate::ui::Ui;
 pub mod agent;
 pub mod db;
 pub mod debug;
+pub mod mcp;
 pub mod models;
 pub mod providers;
 pub mod run;
@@ -321,7 +322,30 @@ fn mcp() -> Command {
         .subcommand(
             Command::new("add")
                 .about("add an MCP server")
-                .arg(Arg::new("name").help("name of the MCP server")),
+                .arg(Arg::new("name").help("name of the MCP server"))
+                .arg(
+                    Arg::new("url")
+                        .long("url")
+                        .help("URL for a remote MCP server"),
+                )
+                .arg(
+                    Arg::new("env")
+                        .long("env")
+                        .help("environment variable for a local MCP server (KEY=VALUE)")
+                        .action(ArgAction::Append),
+                )
+                .arg(
+                    Arg::new("header")
+                        .long("header")
+                        .help("HTTP header for a remote MCP server (KEY=VALUE)")
+                        .action(ArgAction::Append),
+                )
+                .arg(
+                    Arg::new("command")
+                        .num_args(0..)
+                        .last(true)
+                        .help("command to run for a local MCP server (after --)"),
+                ),
         )
         .subcommand(
             Command::new("debug")
@@ -685,7 +709,7 @@ pub fn route(matches: &ArgMatches, ui: &mut Ui, raw: &[OsString]) -> Result<(), 
         "session" => session::run(matches.subcommand_matches("session").expect("session"), ui),
         "db" => db::run(matches.subcommand_matches("db").expect("db"), ui),
         "debug" => debug::run(matches.subcommand_matches("debug").expect("debug"), ui),
-        // TODO(C7): mcp
+        "mcp" => mcp::run(matches.subcommand_matches("mcp").expect("mcp"), ui),
         // TODO(C8): tui ($0), attach, acp, pr
         // TODO(C9): stats, export, import, generate
         _ => Err(stub(name)),
@@ -787,7 +811,6 @@ mod tests {
     fn routes_registered_commands_to_stubs() {
         let cases: Vec<(&str, Vec<&str>)> = vec![
             ("acp", vec!["acp"]),
-            ("mcp", vec!["mcp", "list"]),
             ("attach", vec!["attach", "http://localhost:4096"]),
             ("generate", vec!["generate"]),
             ("console", vec!["console", "orgs"]),
