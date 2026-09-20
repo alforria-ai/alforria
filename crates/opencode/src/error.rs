@@ -72,6 +72,12 @@ pub enum TypedError {
     },
 }
 
+impl From<CliError> for TypedError {
+    fn from(error: CliError) -> Self {
+        TypedError::Cli(error)
+    }
+}
+
 impl TypedError {
     pub fn exit_code(&self) -> i32 {
         match self {

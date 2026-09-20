@@ -8,6 +8,9 @@ use crate::error::{CliError, TypedError};
 use crate::network;
 use crate::ui::Ui;
 
+pub mod run;
+pub mod run_events;
+pub mod run_output;
 pub mod serve;
 pub mod web;
 
@@ -113,6 +116,163 @@ fn run() -> Command {
     Command::new("run")
         .about("run opencode with a message")
         .arg(Arg::new("message").num_args(0..).help("message to send"))
+        .arg(
+            Arg::new("command")
+                .long("command")
+                .help("the command to run, use message for args"),
+        )
+        .arg(
+            Arg::new("continue")
+                .long("continue")
+                .short('c')
+                .help("continue the last session")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("session")
+                .long("session")
+                .short('s')
+                .help("session id to continue"),
+        )
+        .arg(
+            Arg::new("fork")
+                .long("fork")
+                .help("fork the session before continuing (requires --continue or --session)")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("share")
+                .long("share")
+                .help("share the session")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("model")
+                .long("model")
+                .short('m')
+                .help("model to use in the format of provider/model"),
+        )
+        .arg(Arg::new("agent").long("agent").help("agent to use"))
+        .arg(
+            Arg::new("format")
+                .long("format")
+                .help("format: default (formatted) or json (raw JSON events)")
+                .value_parser(["default", "json"])
+                .default_value("default"),
+        )
+        .arg(
+            Arg::new("file")
+                .long("file")
+                .short('f')
+                .help("file(s) to attach to message")
+                .action(ArgAction::Append),
+        )
+        .arg(
+            Arg::new("title")
+                .long("title")
+                .help("title for the session (uses truncated prompt if no value provided)"),
+        )
+        .arg(
+            Arg::new("attach")
+                .long("attach")
+                .help("attach to a running opencode server (e.g., http://localhost:4096)"),
+        )
+        .arg(
+            Arg::new("password")
+                .long("password")
+                .short('p')
+                .help("basic auth password (defaults to OPENCODE_SERVER_PASSWORD)"),
+        )
+        .arg(
+            Arg::new("username")
+                .long("username")
+                .short('u')
+                .help("basic auth username (defaults to OPENCODE_SERVER_USERNAME or 'opencode')"),
+        )
+        .arg(
+            Arg::new("dir")
+                .long("dir")
+                .help("directory to run in, path on remote server if attaching"),
+        )
+        .arg(
+            Arg::new("port")
+                .long("port")
+                .help("port for the local server (defaults to random port if no value provided)")
+                .value_parser(clap::value_parser!(u16))
+                .default_value("0"),
+        )
+        .arg(
+            Arg::new("variant").long("variant").help(
+                "model variant (provider-specific reasoning effort, e.g., high, max, minimal)",
+            ),
+        )
+        .arg(
+            Arg::new("thinking")
+                .long("thinking")
+                .help("show thinking blocks")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("mini")
+                .long("mini")
+                .help("run in direct interactive split-footer mode")
+                .action(ArgAction::SetTrue)
+                .hide(true),
+        )
+        .arg(
+            Arg::new("replay")
+                .long("replay")
+                .help("replay interactive session history on resume and after resize")
+                .action(ArgAction::SetTrue)
+                .hide(true),
+        )
+        .arg(
+            Arg::new("no-replay")
+                .long("no-replay")
+                .help("disable replay of interactive session history")
+                .action(ArgAction::SetTrue)
+                .hide(true),
+        )
+        .arg(
+            Arg::new("replay-limit")
+                .long("replay-limit")
+                .help("cap visible interactive replay to the newest N messages")
+                .value_parser(clap::value_parser!(f64))
+                .hide(true),
+        )
+        .arg(
+            Arg::new("interactive")
+                .long("interactive")
+                .short('i')
+                .help("run in direct interactive split-footer mode")
+                .action(ArgAction::SetTrue)
+                .hide(true),
+        )
+        .arg(
+            Arg::new("auto")
+                .long("auto")
+                .help("auto-approve permissions that are not explicitly denied (dangerous!)")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("yolo")
+                .long("yolo")
+                .action(ArgAction::SetTrue)
+                .hide(true),
+        )
+        .arg(
+            Arg::new("dangerously-skip-permissions")
+                .long("dangerously-skip-permissions")
+                .action(ArgAction::SetTrue)
+                .hide(true),
+        )
+        .arg(
+            Arg::new("demo")
+                .long("demo")
+                .help("enable direct interactive demo slash commands")
+                .action(ArgAction::SetTrue)
+                .hide(true),
+        )
 }
 
 fn mcp() -> Command {
@@ -392,7 +552,7 @@ pub fn route(matches: &ArgMatches, ui: &mut Ui, raw: &[OsString]) -> Result<(), 
     match name {
         "serve" => serve::run(matches.subcommand_matches("serve").expect("serve"), ui, raw),
         "web" => web::run(matches.subcommand_matches("web").expect("web"), ui, raw),
-        // TODO(C3/C4): run
+        "run" => run::run(matches.subcommand_matches("run").expect("run"), ui),
         // TODO(C5): models, providers
         // TODO(C6): agent, session, db, debug
         // TODO(C7): mcp
@@ -499,7 +659,6 @@ mod tests {
             ("acp", vec!["acp"]),
             ("mcp", vec!["mcp", "list"]),
             ("attach", vec!["attach", "http://localhost:4096"]),
-            ("run", vec!["run", "hello"]),
             ("generate", vec!["generate"]),
             ("debug", vec!["debug", "info"]),
             ("console", vec!["console", "orgs"]),

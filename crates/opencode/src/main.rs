@@ -1,3 +1,4 @@
+pub mod client;
 pub mod cmd;
 pub mod error;
 pub mod network;
@@ -52,12 +53,13 @@ mod tests {
     }
 
     #[test]
-    fn stub_command_exits_one_with_error_line() {
+    fn run_command_exits_one_with_error_line() {
         let (mut ui, captured) = Ui::capture(false);
-        let code = run(&mut ui, &args(&["run", "hello"]));
+        let code = run(&mut ui, &args(&["run", "--demo"]));
         assert_eq!(code, 1);
         let stderr = captured.stderr();
-        assert!(stderr.contains("run is not implemented yet"), "{stderr}");
+        assert!(stderr.contains("Error: "), "{stderr}");
+        assert!(stderr.contains("--demo requires --mini"), "{stderr}");
     }
 
     #[test]
