@@ -76,6 +76,52 @@ pub fn current_utc_day() -> i64 {
     now.div_euclid(86_400_000)
 }
 
+/// `new Date(ms).toLocaleString()` — the default en-US shape
+/// (`M/D/YYYY, H:MM:SS AM`). The TS output is timezone/locale-dependent;
+/// this port renders UTC (same divergence as
+/// [`today_time_or_date_time`]).
+pub fn to_locale_string(ms: u64) -> String {
+    let days = (ms as i64).div_euclid(86_400_000);
+    let rest = ms.rem_euclid(86_400_000);
+    let (hour, minute, second) = (
+        rest / 3_600_000,
+        (rest % 3_600_000) / 60_000,
+        (rest % 60_000) / 1_000,
+    );
+    let (year, month, day) = civil_from_days(days);
+    let (hour12, suffix) = match hour {
+        0 => (12, "AM"),
+        h if h < 12 => (h, "AM"),
+        12 => (12, "PM"),
+        h => (h - 12, "PM"),
+    };
+    format!("{month}/{day}/{year}, {hour12}:{minute:02}:{second:02} {suffix}")
+}
+
+/// `Locale.number` / `Intl.NumberFormat` (`util/locale.ts`) — thousands
+/// separators, en-US grouping.
+pub fn number(input: i64) -> String {
+    let digits = input.unsigned_abs().to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    if input < 0 {
+        format!("-{grouped}")
+    } else {
+        grouped
+    }
+}
+
+/// `Intl.NumberFormat("en-US", {style: "currency", currency: "USD"})` —
+/// `$X.YZ`.
+pub fn usd(input: f64) -> String {
+    format!("${input:.2}")
+}
+
 /// Days since the unix epoch → `(year, month, day)`.
 fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
@@ -352,5 +398,36 @@ mod tests {
             web_search_provider_label(&serde_json::json!(null)),
             "Web Search"
         );
+    }
+
+    #[test]
+    fn to_locale_string_matches_the_default_shape() {
+        assert_eq!(to_locale_string(0), "1/1/1970, 12:00:00 AM");
+        // 2023-10-31 12:00:00 UTC → 12:00 PM.
+        assert_eq!(
+            to_locale_string(1_698_753_600_000),
+            "10/31/2023, 12:00:00 PM"
+        );
+        // 2023-10-31 23:59:59 UTC → 11:59:59 PM.
+        assert_eq!(
+            to_locale_string(1_698_796_799_000),
+            "10/31/2023, 11:59:59 PM"
+        );
+    }
+
+    #[test]
+    fn number_groups_thousands() {
+        assert_eq!(number(0), "0");
+        assert_eq!(number(999), "999");
+        assert_eq!(number(1_234), "1,234");
+        assert_eq!(number(12_345_678), "12,345,678");
+        assert_eq!(number(-4_567), "-4,567");
+    }
+
+    #[test]
+    fn usd_formats_currency() {
+        assert_eq!(usd(0.0), "$0.00");
+        assert_eq!(usd(0.05), "$0.05");
+        assert_eq!(usd(1.5), "$1.50");
     }
 }

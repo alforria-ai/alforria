@@ -8,15 +8,17 @@
 //! The terminal runtime (this file) owns the three long-lived task
 //! families of spec §2.2: the SSE loop (`transport::events`), the input
 //! pump (crossterm) and the 40 ms tick; effects returned by `update`
-//! execute against the server seam between messages.
+//! execute as spawned tasks (spec §2.1) — the driver executor.
 
 pub mod app;
+pub mod attention;
 pub mod clipboard;
 pub mod command;
 pub mod config;
 pub mod editor;
 pub mod keymap;
 pub mod state;
+pub mod transcript;
 pub mod transport;
 pub mod ui;
 
@@ -77,8 +79,13 @@ async fn run_inner(input: TuiInput) -> Result<Exit> {
     let api: Arc<dyn ServerApi> = Arc::new(HttpServerApi::new(http_config.clone())?);
     let source: Arc<dyn EventSource> = Arc::new(SseEventSource::new(http_config)?);
 
-    let mut app = App::new(input.config, input.args.clone(), input.state_dir.as_deref());
+    let mut app = App::new(
+        input.config.clone(),
+        input.args.clone(),
+        input.state_dir.as_deref(),
+    );
     app::apply_args(&mut app);
+    let app = Arc::new(tokio::sync::Mutex::new(app));
 
     let (msg_tx, msg_rx) = tokio::sync::mpsc::unbounded_channel::<Msg>();
     spawn_sse(source, msg_tx.clone());
@@ -88,69 +95,225 @@ async fn run_inner(input: TuiInput) -> Result<Exit> {
 
     let mut terminal =
         ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(io::stdout()))?;
-    let exit = event_loop(&mut app, api, msg_rx, &mut terminal).await;
+    let exit = event_loop(&app, api, msg_rx, &mut terminal).await;
 
     // §6 N6: `docs.open` prints the URL instead of opening a browser —
     // after the alternate screen is gone.
+    let app = app.lock().await;
+    let mut app = app;
     let opened_urls = std::mem::take(&mut app.ui.opened_urls);
     drop(_guard);
     for url in opened_urls {
         println!("{url}");
     }
+    drop(app);
 
     let exit = exit?;
     print_exit(&exit);
     Ok(exit)
 }
 
-/// One `update` pass per message; effects execute between messages (the
-/// TS handlers fire-and-forget `sdk.client.*` calls — HTTP latency is the
-/// same bound as the SSE reconnect).
+/// One `update` pass per message. Effects run as spawned tasks
+/// (spec §2.1 — "a driver executor turns each into a task"): a turn
+/// that blocks on a permission/question reply keeps the message pump
+/// running, exactly like the TS fire-and-forget `sdk.client.*` calls.
 async fn event_loop(
-    app: &mut App,
+    app: &Arc<tokio::sync::Mutex<App>>,
     api: Arc<dyn ServerApi>,
     mut messages: tokio::sync::mpsc::UnboundedReceiver<Msg>,
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
 ) -> Result<Exit> {
     let title_disabled = app::terminal_title_disabled_from_env();
     let mut last_title: Option<String> = None;
-    let mut effects = vec![Effect::Bootstrap { fatal: true }];
+    let mut pending = vec![Effect::Bootstrap { fatal: true }];
 
     loop {
-        execute_effects(app, api.clone(), &mut effects).await?;
-        if app.ui.exit {
+        for effect in pending.drain(..) {
+            let app = Arc::clone(app);
+            let api = Arc::clone(&api);
+            tokio::spawn(async move {
+                execute_effect(&app, api, effect).await;
+            });
+        }
+        let exited = {
+            let mut app = app.lock().await;
+            if app.ui.exit {
+                true
+            } else {
+                terminal.draw(|frame| view(&mut app, frame))?;
+                apply_title(&app, title_disabled, &mut last_title)?;
+                false
+            }
+        };
+        if exited {
             break;
         }
-        terminal.draw(|frame| view(app, frame))?;
-        apply_title(app, title_disabled, &mut last_title)?;
 
         let Some(msg) = messages.recv().await else {
-            app.exit(None);
+            app.lock().await.exit(None);
             break;
         };
-        effects = state::update(app, msg);
+        pending = {
+            let mut app = app.lock().await;
+            state::update(&mut app, msg)
+        };
     }
 
+    let app = app.lock().await;
     Ok(Exit {
-        epilogue: app::epilogue(app),
+        epilogue: app::epilogue(&app),
         reason: app.ui.exit_reason.clone(),
     })
 }
 
-async fn execute_effects(
-    app: &mut App,
-    api: Arc<dyn ServerApi>,
-    effects: &mut Vec<Effect>,
-) -> Result<()> {
-    for effect in effects.drain(..) {
-        execute_effect(app, api.clone(), effect).await?;
-    }
-    Ok(())
+/// The formatted transcript of the route session — the
+/// `session.copy`/`session.export` input (`session/index.tsx:923-1014`).
+fn route_transcript(app: &App, options: &transcript::TranscriptOptions) -> Option<String> {
+    let Route::Session { session_id, .. } = &app.state.route.data else {
+        return None;
+    };
+    let session = app.state.sync.session(session_id)?;
+    let messages = app
+        .state
+        .sync
+        .message
+        .get(session_id)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let messages = messages
+        .iter()
+        .map(|info| {
+            let parts = app
+                .state
+                .sync
+                .part
+                .get(match info {
+                    opencode_schema::session_v1::V1Message::User { id, .. }
+                    | opencode_schema::session_v1::V1Message::Assistant { id, .. } => id,
+                })
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            transcript::MessageParts {
+                info: info.clone(),
+                parts: parts.to_vec(),
+            }
+        })
+        .collect::<Vec<_>>();
+    Some(transcript::format_transcript(
+        session,
+        &messages,
+        options,
+        &app.state.sync.provider,
+    ))
 }
 
-async fn execute_effect(app: &mut App, api: Arc<dyn ServerApi>, effect: Effect) -> Result<()> {
+/// `session.copy` (`session/index.tsx:916-947`): clipboard write of the
+/// formatted transcript with the fixed success/failure toasts.
+async fn copy_transcript(
+    app: &Arc<tokio::sync::Mutex<App>>,
+    options: transcript::TranscriptOptions,
+) {
+    let (text, clipboard) = {
+        let app = app.lock().await;
+        (
+            route_transcript(&app, &options),
+            clipboard::system_clipboard(),
+        )
+    };
+    let copied = text.is_some_and(|text| clipboard.write(&text).is_ok());
+    let mut app = app.lock().await;
+    app.show_toast(Toast {
+        title: None,
+        variant: if copied {
+            ToastVariant::Success
+        } else {
+            ToastVariant::Error
+        },
+        message: if copied {
+            "Session transcript copied to clipboard!".to_string()
+        } else {
+            "Failed to copy session transcript".to_string()
+        },
+        duration_ms: 5000,
+    });
+}
+
+/// `session.export` (`session/index.tsx:946-1020`): the export-options
+/// confirm — `writeExport` + the `$EDITOR` open (the renderer suspends
+/// around the child process).
+async fn export_transcript(
+    app: &Arc<tokio::sync::Mutex<App>>,
+    filename: String,
+    options: transcript::TranscriptOptions,
+    open_without_saving: bool,
+) {
+    let text = {
+        let app = app.lock().await;
+        route_transcript(&app, &options)
+    };
+    let Some(text) = text else {
+        return;
+    };
+    // `paths.cwd` — the export directory.
+    let export_dir = std::env::current_dir()
+        .ok()
+        .unwrap_or_else(|| PathBuf::from("."));
+    let cwd = {
+        let app = app.lock().await;
+        app.state
+            .project
+            .instance_path
+            .worktree
+            .clone()
+            .filter(|worktree| worktree != "/")
+            .or_else(|| app.state.project.instance_path.directory.clone())
+    };
+    let cwd = cwd
+        .filter(|cwd| Path::new(cwd).exists())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| export_dir.clone());
+
+    if open_without_saving {
+        let _ = editor::open_editor(&text, Some(&cwd));
+        return;
+    }
+
+    let filename = filename.trim().to_string();
+    let filepath = export_dir.join(&filename);
+    let write_result = std::fs::write(&filepath, &text);
+    let edited = editor::open_editor(&text, Some(&cwd));
+    let mut app = app.lock().await;
+    if write_result.is_err() {
+        app.show_toast(Toast {
+            title: None,
+            variant: ToastVariant::Error,
+            message: "Failed to export session".to_string(),
+            duration_ms: 5000,
+        });
+        return;
+    }
+    if let Some(edited) = edited {
+        let _ = std::fs::write(&filepath, edited);
+    }
+    app.show_toast(Toast {
+        title: None,
+        variant: ToastVariant::Success,
+        message: format!("Session exported to {filename}"),
+        duration_ms: 5000,
+    });
+}
+
+/// Execute one effect against the server seam. Effects that can block
+/// on a user reply (the submit pipeline) release the app lock across
+/// their awaits; the rest hold it for the duration.
+pub async fn execute_effect(
+    app: &Arc<tokio::sync::Mutex<App>>,
+    api: Arc<dyn ServerApi>,
+    effect: Effect,
+) {
     match effect {
         Effect::Bootstrap { fatal } => {
+            let mut app = app.lock().await;
             if let Err(error) = state::sync::bootstrap(&mut app.state, api.as_ref(), fatal).await {
                 if fatal {
                     app.exit(Some(format!("{error:#}")));
@@ -174,6 +337,7 @@ async fn execute_effect(app: &mut App, api: Arc<dyn ServerApi>, effect: Effect) 
                 workspace,
             };
             if let Ok(status) = api.lsp_status(&loc).await {
+                let mut app = app.lock().await;
                 app.state.sync.lsp = match status {
                     serde_json::Value::Array(items) => items,
                     _ => Vec::new(),
@@ -184,10 +348,11 @@ async fn execute_effect(app: &mut App, api: Arc<dyn ServerApi>, effect: Effect) 
             session_id,
             navigate,
         } => {
-            match api
+            let result = api
                 .session_fork(&Location::default(), &session_id, None)
-                .await
-            {
+                .await;
+            let mut app = app.lock().await;
+            match result {
                 Ok(session) => {
                     if navigate {
                         app.state.route.navigate(Route::Session {
@@ -196,19 +361,23 @@ async fn execute_effect(app: &mut App, api: Arc<dyn ServerApi>, effect: Effect) 
                         });
                     }
                 }
-                Err(_) => app.show_toast(Toast {
-                    title: None,
-                    variant: ToastVariant::Error,
-                    message: "Failed to fork session".to_string(),
-                    duration_ms: 5000,
-                }),
+                Err(_) => {
+                    app.show_toast(Toast {
+                        title: None,
+                        variant: ToastVariant::Error,
+                        message: "Failed to fork session".to_string(),
+                        duration_ms: 5000,
+                    });
+                }
             }
         }
         Effect::SuspendTerminal => {
             suspend::terminal_suspend_and_resume().await;
         }
         Effect::SessionShare { session_id } => {
-            match api.session_share(&Location::default(), &session_id).await {
+            let result = api.session_share(&Location::default(), &session_id).await;
+            let mut app = app.lock().await;
+            match result {
                 Ok(session) => {
                     if let Some(share) = session.share {
                         let _ = clipboard::system_clipboard().write(&share.url);
@@ -220,29 +389,33 @@ async fn execute_effect(app: &mut App, api: Arc<dyn ServerApi>, effect: Effect) 
                         });
                     }
                 }
-                Err(_) => app.show_toast(Toast {
-                    title: None,
-                    variant: ToastVariant::Error,
-                    message: "Failed to share session".to_string(),
-                    duration_ms: 5000,
-                }),
+                Err(_) => {
+                    app.show_toast(Toast {
+                        title: None,
+                        variant: ToastVariant::Error,
+                        message: "Failed to share session".to_string(),
+                        duration_ms: 5000,
+                    });
+                }
             }
         }
         Effect::SessionUnshare { session_id } => {
-            match api.session_unshare(&Location::default(), &session_id).await {
-                Ok(_) => app.show_toast(Toast {
+            let result = api.session_unshare(&Location::default(), &session_id).await;
+            let mut app = app.lock().await;
+            app.show_toast(match result {
+                Ok(_) => Toast {
                     title: None,
                     variant: ToastVariant::Success,
                     message: "Session unshared successfully".to_string(),
                     duration_ms: 5000,
-                }),
-                Err(_) => app.show_toast(Toast {
+                },
+                Err(_) => Toast {
                     title: None,
                     variant: ToastVariant::Error,
                     message: "Failed to unshare session".to_string(),
                     duration_ms: 5000,
-                }),
-            }
+                },
+            });
         }
         Effect::SessionSummarize {
             session_id,
@@ -290,10 +463,12 @@ async fn execute_effect(app: &mut App, api: Arc<dyn ServerApi>, effect: Effect) 
             let _ = api.question_reject(&Location::default(), &request_id).await;
         }
         Effect::SessionRename { session_id, title } => {
-            if let Err(error) = api
+            let error = api
                 .session_rename(&Location::default(), &session_id, &title)
                 .await
-            {
+                .err();
+            if let Some(error) = error {
+                let mut app = app.lock().await;
                 app.show_toast(Toast {
                     title: None,
                     variant: ToastVariant::Error,
@@ -303,7 +478,12 @@ async fn execute_effect(app: &mut App, api: Arc<dyn ServerApi>, effect: Effect) 
             }
         }
         Effect::SessionDelete { session_id } => {
-            if let Err(error) = api.session_delete(&Location::default(), &session_id).await {
+            let error = api
+                .session_delete(&Location::default(), &session_id)
+                .await
+                .err();
+            if let Some(error) = error {
+                let mut app = app.lock().await;
                 app.show_toast(Toast {
                     title: None,
                     variant: ToastVariant::Error,
@@ -315,12 +495,11 @@ async fn execute_effect(app: &mut App, api: Arc<dyn ServerApi>, effect: Effect) 
         Effect::McpToggle { name } => {
             // `dialog-mcp.tsx:49-66`: toggle then refresh the MCP
             // status from the server.
+            let mut app = app.lock().await;
             let action = app.state.local.mcp_toggle(&app.state.sync, &name);
-            let result = match action {
-                McpAction::Connect(name) => api.mcp_connect(&Location::default(), &name).await,
-                McpAction::Disconnect(name) => {
-                    api.mcp_disconnect(&Location::default(), &name).await
-                }
+            let result = match &action {
+                McpAction::Connect(name) => api.mcp_connect(&Location::default(), name).await,
+                McpAction::Disconnect(name) => api.mcp_disconnect(&Location::default(), name).await,
             };
             if result.is_ok() {
                 if let Ok(status) = api.mcp_status(&Location::default()).await {
@@ -354,10 +533,12 @@ async fn execute_effect(app: &mut App, api: Arc<dyn ServerApi>, effect: Effect) 
                 .project_directories(&Location::default(), &project_id)
                 .await
             {
-                app.ui.move_directories = Some(match value {
+                let directories = match value {
                     serde_json::Value::Array(items) => items,
                     _ => Vec::new(),
-                });
+                };
+                let mut app = app.lock().await;
+                app.ui.move_directories = Some(directories);
             }
         }
         Effect::SessionForkFromMessage {
@@ -365,10 +546,11 @@ async fn execute_effect(app: &mut App, api: Arc<dyn ServerApi>, effect: Effect) 
             message_id,
             seed_prompt,
         } => {
-            match api
+            let result = api
                 .session_fork(&Location::default(), &session_id, message_id.as_deref())
-                .await
-            {
+                .await;
+            let mut app = app.lock().await;
+            match result {
                 Ok(info) => {
                     app.state.route.navigate(Route::Session {
                         session_id: info.id.clone(),
@@ -387,11 +569,27 @@ async fn execute_effect(app: &mut App, api: Arc<dyn ServerApi>, effect: Effect) 
                 }),
             }
         }
-        Effect::SessionExport { .. } => {
-            // TODO(M8.8): formatTranscript + file write + `$EDITOR`
-            // (`session/index.tsx:946-1020`).
+        Effect::SessionExport {
+            filename,
+            thinking,
+            tool_details,
+            assistant_metadata,
+            open_without_saving,
+        } => {
+            export_transcript(
+                app,
+                filename,
+                transcript::TranscriptOptions {
+                    thinking,
+                    tool_details,
+                    assistant_metadata,
+                },
+                open_without_saving,
+            )
+            .await;
         }
         Effect::SessionRefresh => {
+            let mut app = app.lock().await;
             let sessions = state::sync::list_sessions(
                 api.as_ref(),
                 &Location::default(),
@@ -406,15 +604,29 @@ async fn execute_effect(app: &mut App, api: Arc<dyn ServerApi>, effect: Effect) 
                 .experimental_session_background(&Location::default(), &session_id)
                 .await;
         }
-        Effect::SessionCopyTranscript { .. } => {
-            // TODO(M8.8): formatTranscript + clipboard write.
+        Effect::SessionCopyTranscript {
+            thinking,
+            tool_details,
+            assistant_metadata,
+        } => {
+            copy_transcript(
+                app,
+                transcript::TranscriptOptions {
+                    thinking,
+                    tool_details,
+                    assistant_metadata,
+                },
+            )
+            .await;
         }
         Effect::SessionMount {
             session_id,
             previous_workspace,
         } => {
             // `createEffect` (`session/index.tsx:286-324`).
-            match api.session_get(&Location::default(), &session_id).await {
+            let info = api.session_get(&Location::default(), &session_id).await;
+            let mut app = app.lock().await;
+            match info {
                 Ok(info) => {
                     if info.workspace_id != previous_workspace {
                         app.state.project.workspace.current = info.workspace_id.clone();
@@ -439,6 +651,7 @@ async fn execute_effect(app: &mut App, api: Arc<dyn ServerApi>, effect: Effect) 
             }
         }
         Effect::SessionHydrate { session_id } => {
+            let mut app = app.lock().await;
             let _ = state::sync::session_sync(&mut app.state, api.as_ref(), &session_id).await;
         }
         Effect::ClipboardWrite {
@@ -448,57 +661,66 @@ async fn execute_effect(app: &mut App, api: Arc<dyn ServerApi>, effect: Effect) 
         } => match clipboard::system_clipboard().write(&text) {
             Ok(()) => {
                 if let Some(toast) = success {
+                    let mut app = app.lock().await;
                     app.show_toast(toast);
                 }
             }
             Err(_) => {
                 if let Some(toast) = failure {
+                    let mut app = app.lock().await;
                     app.show_toast(toast);
                 }
             }
         },
         Effect::OpenUrl { url } => {
             // §6 N6: no browser from a TUI — the URL prints on exit.
+            let mut app = app.lock().await;
             app.ui.opened_urls.push(url);
         }
-        Effect::PromptPaste => match crate::clipboard::system_clipboard().read() {
-            Ok(crate::clipboard::ClipboardContent::Text(text)) => {
-                crate::state::prompt::paste_input_text(app, &text);
+        Effect::PromptPaste => {
+            let pasted = crate::clipboard::system_clipboard().read();
+            let mut app = app.lock().await;
+            match pasted {
+                Ok(crate::clipboard::ClipboardContent::Text(text)) => {
+                    crate::state::prompt::paste_input_text(&mut app, &text);
+                }
+                Ok(crate::clipboard::ClipboardContent::Image { mime, data_base64 }) => {
+                    crate::state::prompt::paste_attachment(
+                        &mut app,
+                        &crate::state::prompt::Attachment {
+                            filename: Some("clipboard".to_string()),
+                            filepath: None,
+                            mime,
+                            content: data_base64.into_bytes(),
+                        },
+                    );
+                }
+                Ok(crate::clipboard::ClipboardContent::Pdf { data_base64 }) => {
+                    crate::state::prompt::paste_attachment(
+                        &mut app,
+                        &crate::state::prompt::Attachment {
+                            filename: Some("clipboard".to_string()),
+                            filepath: None,
+                            mime: "application/pdf".to_string(),
+                            content: data_base64.into_bytes(),
+                        },
+                    );
+                }
+                Err(_) => {}
             }
-            Ok(crate::clipboard::ClipboardContent::Image { mime, data_base64 }) => {
-                crate::state::prompt::paste_attachment(
-                    app,
-                    &crate::state::prompt::Attachment {
-                        filename: Some("clipboard".to_string()),
-                        filepath: None,
-                        mime,
-                        content: data_base64.into_bytes(),
-                    },
-                );
-            }
-            Ok(crate::clipboard::ClipboardContent::Pdf { data_base64 }) => {
-                crate::state::prompt::paste_attachment(
-                    app,
-                    &crate::state::prompt::Attachment {
-                        filename: Some("clipboard".to_string()),
-                        filepath: None,
-                        mime: "application/pdf".to_string(),
-                        content: data_base64.into_bytes(),
-                    },
-                );
-            }
-            Err(_) => {}
-        },
+        }
         Effect::OpenPromptEditor { value } => {
             // `openEditor` suspends the renderer around the child
             // process (`editor.ts:40`).
-            let cwd = app
-                .state
-                .project
-                .instance_path
-                .worktree
-                .clone()
-                .or_else(|| app.state.project.instance_path.directory.clone());
+            let cwd = {
+                let app = app.lock().await;
+                app.state
+                    .project
+                    .instance_path
+                    .worktree
+                    .clone()
+                    .or_else(|| app.state.project.instance_path.directory.clone())
+            };
             crossterm::terminal::disable_raw_mode().ok();
             crossterm::execute!(io::stdout(), crossterm::terminal::LeaveAlternateScreen).ok();
             let edited = editor::open_editor(&value, cwd.as_deref().map(Path::new));
@@ -506,14 +728,32 @@ async fn execute_effect(app: &mut App, api: Arc<dyn ServerApi>, effect: Effect) 
             crossterm::execute!(io::stdout(), crossterm::terminal::EnterAlternateScreen).ok();
             if let Some(content) = edited {
                 let normalized = editor::normalize_prompt_content(&content);
-                crate::state::prompt::apply_editor_content(app, &normalized);
+                let mut app = app.lock().await;
+                crate::state::prompt::apply_editor_content(&mut app, &normalized);
             }
         }
         Effect::PromptSubmit { payload } => {
-            crate::state::prompt::execute_submit(app, api.as_ref(), *payload).await;
+            crate::state::prompt::run_submit(app, api.as_ref(), *payload).await;
+        }
+        Effect::Attention {
+            title,
+            message,
+            notification,
+            bell,
+        } => {
+            let app = app.lock().await;
+            crate::attention::notify(
+                &crate::attention::NotifyRequest {
+                    title,
+                    message,
+                    notification,
+                    bell,
+                },
+                &app.config.attention,
+                app.attention.as_ref(),
+            );
         }
     }
-    Ok(())
 }
 
 /// The terminal title effect (`app.tsx:455-478`): set on change, cleared
@@ -692,7 +932,6 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::Value;
 
-    use crate::app::fast_boot_from_env;
     use crate::state;
     use crate::state::route::Route;
     use crate::state::{App, Args, Effect, ToastVariant};
@@ -706,9 +945,9 @@ mod tests {
     #[test]
     fn fast_boot_env_flag_defaults_off() {
         std::env::remove_var("OPENCODE_FAST_BOOT");
-        assert!(!fast_boot_from_env());
+        assert!(!crate::app::fast_boot_from_env());
         std::env::set_var("OPENCODE_FAST_BOOT", "1");
-        assert!(fast_boot_from_env());
+        assert!(crate::app::fast_boot_from_env());
         std::env::remove_var("OPENCODE_FAST_BOOT");
     }
 
@@ -719,8 +958,8 @@ mod tests {
         assert!(!app.ui.startup_loading.visible());
     }
 
-    /// A `FakeApi` scripting the fork endpoint and (optionally) failing the
-    /// first bootstrap call (`spec §8.1`).
+    /// A `FakeApi` scripting the fork endpoint and (optionally) failing
+    /// the first bootstrap call (spec §8.1).
     struct FakeApi {
         fork_result: Result<opencode_schema::session_v1::V1SessionInfo, String>,
         fail_bootstrap: bool,
@@ -1010,21 +1249,21 @@ mod tests {
 
     #[tokio::test]
     async fn session_fork_effect_navigates_on_success() {
-        let mut app = fake_app();
-        let api = FakeApi {
+        let app = Arc::new(tokio::sync::Mutex::new(fake_app()));
+        let api: Arc<dyn ServerApi> = Arc::new(FakeApi {
             fork_result: Ok(forked_session()),
             fail_bootstrap: false,
-        };
+        });
         execute_effect(
-            &mut app,
-            Arc::new(api),
+            &app,
+            api,
             Effect::SessionFork {
                 session_id: "ses_a".into(),
                 navigate: true,
             },
         )
-        .await
-        .unwrap();
+        .await;
+        let app = app.lock().await;
         assert_eq!(
             app.state.route.data,
             Route::Session {
@@ -1037,21 +1276,21 @@ mod tests {
 
     #[tokio::test]
     async fn session_fork_effect_toasts_on_failure() {
-        let mut app = fake_app();
-        let api = FakeApi {
+        let app = Arc::new(tokio::sync::Mutex::new(fake_app()));
+        let api: Arc<dyn ServerApi> = Arc::new(FakeApi {
             fork_result: Err("fork failed".into()),
             fail_bootstrap: false,
-        };
+        });
         execute_effect(
-            &mut app,
-            Arc::new(api),
+            &app,
+            api,
             Effect::SessionFork {
                 session_id: "ses_a".into(),
                 navigate: true,
             },
         )
-        .await
-        .unwrap();
+        .await;
+        let app = app.lock().await;
         assert_eq!(
             app.state.route.data,
             Route::Home { prompt: None },
@@ -1066,14 +1305,13 @@ mod tests {
     async fn bootstrap_fatal_failure_exits_with_reason() {
         // `app.tsx:546-551`: a fatal phase-1 error exits the TUI with the
         // error as the exit reason.
-        let mut app = fake_app();
-        let api = FakeApi {
+        let app = Arc::new(tokio::sync::Mutex::new(fake_app()));
+        let api: Arc<dyn ServerApi> = Arc::new(FakeApi {
             fork_result: Ok(forked_session()),
             fail_bootstrap: true,
-        };
-        execute_effect(&mut app, Arc::new(api), Effect::Bootstrap { fatal: true })
-            .await
-            .unwrap();
+        });
+        execute_effect(&app, api, Effect::Bootstrap { fatal: true }).await;
+        let app = app.lock().await;
         assert!(app.ui.exit);
         assert!(app
             .ui

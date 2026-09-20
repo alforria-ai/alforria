@@ -23,4 +23,7 @@ rand = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }
+opencode-core = { workspace = true }
+opencode-llm = { workspace = true }
+opencode-server = { workspace = true }
 tempfile = "3"

@@ -910,17 +910,29 @@ fn session_commands(app: &App) -> Vec<CommandInfo> {
         command.enabled = foreground_tasks(app) > 0;
         command
     });
-    for (name, title) in [
-        ("session.child.first", "Go to child session"),
-        ("session.parent", "Go to parent session"),
-        ("session.child.next", "Next child session"),
-        ("session.child.previous", "Previous child session"),
+    // `session.child.first` has no `enabled` predicate; the other three
+    // are `enabled: !!session()?.parentID` (`session/index.tsx:1039-1083`).
+    commands.push(CommandInfo::new(
+        "session.child.first",
+        "Go to child session",
+        "Session",
+    ));
+    let child_enabled = current_session(app)
+        .and_then(|session| session.parent_id.as_deref())
+        .is_some();
+    for name in [
+        "session.parent",
+        "session.child.next",
+        "session.child.previous",
     ] {
+        let title = match name {
+            "session.parent" => "Go to parent session",
+            "session.child.next" => "Next child session",
+            _ => "Previous child session",
+        };
         let mut command = CommandInfo::new(name, title, "Session");
         command.hidden = true;
-        command.enabled = current_session(app)
-            .and_then(|session| session.parent_id.as_deref())
-            .is_some();
+        command.enabled = child_enabled;
         commands.push(command);
     }
     commands
@@ -1330,7 +1342,12 @@ pub fn run(app: &mut App, name: &str) -> Vec<Effect> {
             if let Some(parent_id) =
                 current_session(app).and_then(|session| session.parent_id.clone())
             {
-                enter_child(app, &parent_id);
+                // `session.parent` navigates directly — no retry alert
+                // (`session/index.tsx:1051-1061`).
+                app.state.route.navigate(Route::Session {
+                    session_id: parent_id,
+                    prompt: None,
+                });
                 clear_dialog(app);
             }
         }
@@ -1405,19 +1422,34 @@ fn move_child(app: &mut App, direction: i32) {
     }
 }
 
-/// `enterChild` (`session/index.tsx:418-424`) — the retry alert is
-/// TODO(M8.8).
+/// `enterChild` (`session/index.tsx:418-424`): navigate, then the
+/// retry-status alert.
 fn enter_child(app: &mut App, session_id: &str) {
     app.state.route.navigate(Route::Session {
         session_id: session_id.to_string(),
         prompt: None,
     });
+    if let Some(SessionStatusInfo::Retry { message, .. }) =
+        app.state.sync.session_status.get(session_id)
+    {
+        let _ = crate::ui::dialogs::open(
+            app,
+            PendingDialog::Alert {
+                title: "Retry Error".to_string(),
+                message: message.clone(),
+                exit_on_confirm: false,
+            },
+        );
+    }
 }
 
+/// `childSessionHandler` (`session/index.tsx:458-462`): the parent/prev/
+/// next handlers only run on child sessions with no dialog open.
 fn child_session_enabled(app: &App) -> bool {
     current_session(app)
         .and_then(|session| session.parent_id.as_deref())
         .is_some()
+        && app.ui.dialogs.is_empty()
 }
 
 fn session_share(app: &mut App) -> Vec<Effect> {

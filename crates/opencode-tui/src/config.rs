@@ -12,6 +12,29 @@ pub enum PromptMaxWidth {
     Fixed(u16),
 }
 
+/// `attention` (`config/index.tsx:113-122`): defaults
+/// `{enabled: false, notifications: true, sound: true, volume: 0.4}`.
+/// `volume` only scales sound-pack playback — a non-goal (spec §6 N5) —
+/// so the field is carried for parity but never read.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AttentionConfig {
+    pub enabled: bool,
+    pub notifications: bool,
+    pub sound: bool,
+    pub volume: f64,
+}
+
+impl Default for AttentionConfig {
+    fn default() -> AttentionConfig {
+        AttentionConfig {
+            enabled: false,
+            notifications: true,
+            sound: true,
+            volume: 0.4,
+        }
+    }
+}
+
 /// `TuiConfig.Resolved` (the subset the runtime needs).
 #[derive(Debug, Clone)]
 pub struct TuiConfig {
@@ -35,6 +58,8 @@ pub struct TuiConfig {
     pub scroll_acceleration_enabled: bool,
     /// `diff_style` (`config/index.tsx:72`): `"auto" | "stacked"`.
     pub diff_style: String,
+    /// `attention` (`config/index.tsx:113-122`).
+    pub attention: AttentionConfig,
 }
 
 impl Default for TuiConfig {
@@ -49,6 +74,7 @@ impl Default for TuiConfig {
             scroll_speed: 3.0,
             scroll_acceleration_enabled: false,
             diff_style: "auto".to_string(),
+            attention: AttentionConfig::default(),
         }
     }
 }

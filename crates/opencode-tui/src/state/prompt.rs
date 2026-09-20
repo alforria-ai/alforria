@@ -1354,10 +1354,14 @@ fn session_id(app: &App) -> Option<String> {
 /// The runtime half of the submit pipeline — `session.create` when on
 /// the home route, then the dispatch, then the deferred post-submit
 /// state changes. Executed by the effect loop against the server seam.
-pub async fn execute_submit(
-    app: &mut App,
+///
+/// The HTTP awaits run **without** holding the app lock: a turn that
+/// blocks on a permission/question reply must not stop the message
+/// pump (spec §2.1 — the driver executor runs each effect as a task).
+pub async fn run_submit(
+    app: &std::sync::Arc<tokio::sync::Mutex<App>>,
     api: &dyn crate::transport::api::ServerApi,
-    payload: SubmitPayload,
+    mut payload: SubmitPayload,
 ) {
     use crate::transport::api::{
         Location, ProviderModel, SessionCommand, SessionCreate, SessionPrompt, SessionShell,
@@ -1383,6 +1387,7 @@ pub async fn execute_submit(
             match create {
                 Ok(session) => session.id,
                 Err(_) => {
+                    let mut app = app.lock().await;
                     app.show_toast(Toast {
                         title: None,
                         variant: ToastVariant::Error,
@@ -1396,6 +1401,25 @@ pub async fn execute_submit(
             }
         }
     };
+    // The home-route state changes (`prompt/index.tsx:1122-1144`) —
+    // `history.append`, the input reset and the navigate are independent
+    // of the prompt response (TS navigates from a `setTimeout` while the
+    // prompt call is fire-and-forget). They must run BEFORE the dispatch:
+    // the prompt HTTP call blocks on permission/question replies, and
+    // the permission/question prompts only render on the session route.
+    {
+        let mut app = app.lock().await;
+        if let Some(entry) = payload.post_submit.take() {
+            app.ui.prompt.history.append(entry);
+            app.ui.prompt.reset();
+            app.state.route.navigate(Route::Session {
+                session_id: session_id.clone(),
+                prompt: None,
+            });
+            app.ui.prompt.submitting = false;
+        }
+    }
+
     let model = ProviderModel {
         provider_id: payload.model.provider_id.clone(),
         model_id: payload.model.model_id.clone(),
@@ -1414,6 +1438,7 @@ pub async fn execute_submit(
                     },
                 )
                 .await;
+            let mut app = app.lock().await;
             app.ui.prompt.mode = PromptMode::Normal;
         }
         SubmitDispatch::Command {
@@ -1440,7 +1465,7 @@ pub async fn execute_submit(
                 .await;
         }
         SubmitDispatch::Prompt { parts } => {
-            if let Err(error) = api
+            let result = api
                 .session_prompt(
                     &loc,
                     &session_id,
@@ -1453,8 +1478,9 @@ pub async fn execute_submit(
                         parts: parts.clone(),
                     },
                 )
-                .await
-            {
+                .await;
+            if let Err(error) = result {
+                let mut app = app.lock().await;
                 app.show_toast(Toast {
                     title: Some("Failed to send prompt".to_string()),
                     variant: ToastVariant::Error,
@@ -1464,15 +1490,6 @@ pub async fn execute_submit(
             }
         }
     }
-    if let Some(entry) = payload.post_submit {
-        app.ui.prompt.history.append(entry);
-        app.ui.prompt.reset();
-        app.state.route.navigate(Route::Session {
-            session_id,
-            prompt: None,
-        });
-    }
-    app.ui.prompt.submitting = false;
 }
 
 // ------------------------------------------------------------- key input

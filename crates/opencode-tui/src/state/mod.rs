@@ -293,12 +293,27 @@ impl SessionScroll {
     }
 }
 
+/// The dedup + bookkeeping sets of the `internal:notifications` plugin
+/// (`feature-plugins/system/notifications.ts:44-52`) — session ids
+/// that were active since the last idle, ids that errored, and the
+/// seen question/permission request ids.
+#[derive(Debug, Default)]
+pub struct AttentionSets {
+    pub active: HashSet<String>,
+    pub errored: HashSet<String>,
+    pub questions: HashSet<String>,
+    pub permissions: HashSet<String>,
+}
+
 /// Keymap modes and focus (M8.4), dialog stack (TODO(M8.7)) plus
 /// the app-shell bookkeeping of M8.3.
 #[derive(Debug, Default)]
 pub struct UiState {
     /// One current toast at a time (`ui/toast.tsx:66-69`).
     pub toasts: Vec<Toast>,
+    /// `toast.show`'s `setTimeout` deadline (`ui/toast.tsx:70-74`).
+    pub toast_deadline_ms: Option<u64>,
+    pub attention: AttentionSets,
     pub theme: ThemeStore,
     /// `StartupLoading` state machine (`component/startup-loading.tsx`).
     pub startup_loading: StartupLoading,
@@ -566,14 +581,22 @@ pub enum Effect {
         message_id: Option<String>,
         seed_prompt: bool,
     },
-    /// The export-options confirm — the file write + `$EDITOR` open is
-    /// TODO(M8.8) (`session/index.tsx:946-1020`).
+    /// The export-options confirm — the file write + `$EDITOR` open
+    /// (`session/index.tsx:946-1020`).
     SessionExport {
         filename: String,
         thinking: bool,
         tool_details: bool,
         assistant_metadata: bool,
         open_without_saving: bool,
+    },
+    /// `attention.notify(...)` (`feature-plugins/system/notifications.ts`).
+    Attention {
+        title: Option<String>,
+        message: String,
+        /// `notification: false` for subagent sessions — bell only.
+        notification: bool,
+        bell: bool,
     },
 }
 
@@ -583,6 +606,9 @@ pub struct App {
     pub config: crate::config::TuiConfig,
     /// The resolved keymap (`config/index.tsx:95-111`) — M8.4.
     pub keymap: Keymap,
+    /// The attention seam (spec §2.3) — terminal BEL/OSC 9 in
+    /// production, a recorder in tests.
+    pub attention: std::sync::Arc<dyn crate::attention::Attention>,
     /// Bumped on every update — the redraw signal (§2.1).
     pub version: u64,
 }
@@ -604,15 +630,18 @@ impl App {
             ui,
             config,
             keymap,
+            attention: crate::attention::terminal_attention(),
             version: 0,
         }
     }
 
     /// `toast.show` (`ui/toast.tsx:60-74`): one current toast — new shows
-    /// replace.
+    /// replace; the duration is the dismissal `setTimeout`.
     pub fn show_toast(&mut self, toast: Toast) {
+        let deadline = self.ui.tick_ms.saturating_add(toast.duration_ms);
         self.ui.toasts.clear();
         self.ui.toasts.push(toast);
+        self.ui.toast_deadline_ms = Some(deadline);
     }
 
     /// `exit(reason?)` (`app.tsx:248-252`).
@@ -631,7 +660,8 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             for event in events {
                 local::on_bus_event(&mut app.state, &event.event);
                 effects.extend(sync::apply_event(&mut app.state, event.clone()));
-                effects.extend(crate::app::on_bus_event(app, event));
+                effects.extend(crate::app::on_bus_event(app, event.clone()));
+                effects.extend(crate::attention::on_bus_event(app, &event.event));
             }
         }
         Msg::Key(key) => {
@@ -725,6 +755,13 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         Msg::Tick(elapsed) => {
             let now_ms = elapsed.as_millis() as u64;
             app.ui.tick_ms = now_ms;
+            // The toast dismissal `setTimeout` (`ui/toast.tsx:70-74`).
+            if let Some(deadline) = app.ui.toast_deadline_ms {
+                if now_ms >= deadline {
+                    app.ui.toasts.clear();
+                    app.ui.toast_deadline_ms = None;
+                }
+            }
             app.ui.startup_loading.poll(now_ms);
             app.ui.startup_loading.transition(true, now_ms);
             // The timed leader's `setTimeout` (`registerTimedLeader`).

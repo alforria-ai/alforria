@@ -12,11 +12,12 @@ pub mod prompt;
 pub mod question;
 #[cfg(test)]
 mod question_tests;
+pub mod sidebar;
+pub mod subagent_footer;
 pub mod transcript;
 
 use ratatui::layout::Rect;
 use ratatui::style::Style;
-use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 
 use super::theme::{selected_foreground, Rgba, Theme};
@@ -180,44 +181,58 @@ pub fn render(app: &mut App, frame: &mut ratatui::Frame, theme: &Theme, area: Re
         height: column.height.saturating_sub(1),
     };
 
-    // The bottom stack: permission > question > prompt
-    // (`session/index.tsx:1296-1313`); the prompt only renders on
-    // parentless sessions without pending requests.
-    // TODO(M8.8): subagent footer.
+    // The bottom stack: permission > question > prompt + the subagent
+    // footer of child sessions (`session/index.tsx:1296-1313`); the
+    // prompt only renders on parentless sessions without pending
+    // requests.
+    let is_child = app
+        .state
+        .sync
+        .session(&session_id)
+        .map(|session| session.parent_id.is_some())
+        .unwrap_or(false);
     let permission_visible = permission::visible(app).is_some();
     let question_visible = !permission_visible && question::visible(app).is_some();
-    let prompt_visible = !permission_visible
-        && !question_visible
-        && app
-            .state
-            .sync
-            .session(&session_id)
-            .map(|session| session.parent_id.is_none())
-            .unwrap_or(true);
-    let prompt_height = if permission_visible {
-        permission::height(app)
+    let prompt_visible = !permission_visible && !question_visible && !is_child;
+    let mut bottom_height = 0;
+    if permission_visible {
+        bottom_height += permission::height(app);
     } else if question_visible {
-        question::height(app)
+        bottom_height += question::height(app);
     } else if prompt_visible {
-        prompt::height(app, column, area.height)
-    } else {
-        0
-    };
+        bottom_height += prompt::height(app, column, area.height);
+    }
+    if is_child {
+        bottom_height += subagent_footer::HEIGHT;
+    }
     let footer_height = 1;
     let vertical = ratatui::layout::Layout::vertical([
         ratatui::layout::Constraint::Fill(1),
-        ratatui::layout::Constraint::Length(prompt_height),
+        ratatui::layout::Constraint::Length(bottom_height),
         ratatui::layout::Constraint::Length(footer_height),
     ])
     .split(column);
 
     transcript::render(app, frame, theme, vertical[0], &session_id, content_width);
+    let mut row = vertical[1];
+    if is_child {
+        let footer = Rect {
+            height: subagent_footer::HEIGHT,
+            ..row
+        };
+        subagent_footer::render(app, frame, theme, footer, &session_id);
+        row = Rect {
+            y: row.y + subagent_footer::HEIGHT,
+            height: row.height.saturating_sub(subagent_footer::HEIGHT),
+            ..row
+        };
+    }
     if permission_visible {
-        permission::render(app, frame, theme, vertical[1]);
+        permission::render(app, frame, theme, row);
     } else if question_visible {
-        question::render(app, frame, theme, vertical[1]);
+        question::render(app, frame, theme, row);
     } else if prompt_visible {
-        prompt::render(app, frame, theme, vertical[1]);
+        prompt::render(app, frame, theme, row);
     }
     footer::render(app, frame, theme, vertical[2], &session_id);
 
@@ -233,17 +248,8 @@ pub fn render(app: &mut App, frame: &mut ratatui::Frame, theme: &Theme, area: Re
                 .style(Style::new().bg(theme.background.to_color()))
                 .render(dim, frame.buffer_mut());
         }
-        // TODO(M8.8): the sidebar content (`routes/session/sidebar.tsx`).
-        render_sidebar_placeholder(frame, theme, sidebar_area);
+        sidebar::render(app, frame, theme, sidebar_area, &session_id);
     }
-}
-
-fn render_sidebar_placeholder(frame: &mut ratatui::Frame, theme: &Theme, area: Rect) {
-    let lines = vec![Line::from(Span::styled(
-        " Side panel",
-        Style::new().fg(theme.text_muted.to_color()),
-    ))];
-    ratatui::widgets::Paragraph::new(lines).render(area, frame.buffer_mut());
 }
 
 /// Memoize the transcript geometry back into the scroll state so the
@@ -303,4 +309,37 @@ pub fn test_theme() -> Theme {
     crate::ui::theme::ThemeStore::init(&mut kv, None)
         .resolve(&kv)
         .unwrap()
+}
+
+/// Shared fixture helper for the session-view test modules.
+#[cfg(test)]
+pub mod tests {
+    pub fn session_info(id: &str, title: &str) -> opencode_schema::session_v1::V1SessionInfo {
+        opencode_schema::session_v1::V1SessionInfo {
+            id: id.into(),
+            slug: "x".into(),
+            project_id: "prj".into(),
+            workspace_id: None,
+            directory: "/x".into(),
+            path: None,
+            parent_id: None,
+            summary: None,
+            cost: None,
+            tokens: None,
+            share: None,
+            title: title.into(),
+            agent: None,
+            model: None,
+            version: "1".into(),
+            metadata: None,
+            time: opencode_schema::session_v1::V1SessionTime {
+                created: 1,
+                updated: 1,
+                compacting: None,
+                archived: None,
+            },
+            permission: None,
+            revert: None,
+        }
+    }
 }
