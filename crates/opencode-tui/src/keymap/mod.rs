@@ -86,7 +86,6 @@ static APP_KEYBINDS: &[&str] = &[
     "help_show",
     "docs_open",
     "diff_open",
-    "workspace_list",
     "app_debug",
     "app_console",
     "app_heap_snapshot",

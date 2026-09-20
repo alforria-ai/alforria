@@ -1183,6 +1183,11 @@ pub fn submit(app: &mut App) -> Vec<crate::state::Effect> {
     if app.ui.prompt.autocomplete.visible() {
         return Vec::new();
     }
+    // `props.disabled` (`routes/session/index.tsx:241`): the prompt is
+    // disabled while a permission or question prompt is open.
+    if !app.state.sync.permission.is_empty() || !app.state.sync.question.is_empty() {
+        return Vec::new();
+    }
     let input = app.ui.prompt.input().to_string();
     if input.is_empty() {
         return Vec::new();
@@ -1499,8 +1504,9 @@ const DRAFT_RETENTION_MIN_CHARS: usize = 20;
 
 /// `clearPrompt` (`prompt/index.tsx:1272-1286`) — the `prompt.clear`
 /// command: drafts ≥ 20 chars (or with parts) go to history first.
+/// TS `.length` counts UTF-16 code units.
 pub fn clear_prompt(app: &mut App) {
-    if app.ui.prompt.input().trim().chars().count() >= DRAFT_RETENTION_MIN_CHARS
+    if app.ui.prompt.input().trim().encode_utf16().count() >= DRAFT_RETENTION_MIN_CHARS
         || !app.ui.prompt.parts.is_empty()
     {
         app.ui.prompt.history.append(PromptEntry {

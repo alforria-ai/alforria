@@ -110,3 +110,22 @@ Panel: glm-5.3-thinking (agentic, 50% budget) + deepseek-v4.1-flash-thinking (ag
 - **MCP stdio `recv_until` is single-consumer** (responses mutex held across recv; non-matching responses consumed). Latent only — single `call_tool` call site; TS SDK correlates per pending-id. Noted in transport.rs.
 - **MCP/LSP stdin writes** happen with concurrent reader tasks on stdout (deadlock neutralized); adversarial servers that reply before reading stdin are out of scope.
 - The agentic reviewer's ~50%-budget handoff listed `background.rs` cancel/spawn race and EngineStore `Arc::as_ptr` eviction as *candidates* to verify — neither verified against TS, not fixed; re-check in the M8 pre-TUI audit.
+
+## Milestone 8 (TUI) review panel
+
+Panel: glm-5.3-thinking (agentic, complete through focus areas 1-4) + deepseek-v4.1-flash-thinking (failed budget twice mid-exploration; both runs offloaded to the agentic reviewer's verified findings). Focus area 5 (transcript rendering) reviewed only by the agentic reviewer's handoff — see below.
+
+### Accepted & fixed
+- **Prompt `submit()` missing the `props.disabled` gate (MAJOR)**: TS gates on `permissions().length > 0 || questions().length > 0` (`routes/session/index.tsx:241`, `prompt/index.tsx:957`); Rust now rejects submit while permission or question prompts are stored (state/prompt.rs).
+- **`clear_prompt` counted Unicode scalars, not UTF-16 units (MINOR)**: TS `.length` (`prompt/index.tsx:1273`); now `encode_utf16().count()` (state/prompt.rs).
+- **`workspace_list` dead entry in `APP_KEYBINDS` (MINOR)**: not present anywhere in the TS TUI source; removed (keymap/mod.rs).
+
+### Recorded divergences (not fixed)
+- **Hydrate "live-tracking wins" under the lock architecture**: TS hydrate merges events arriving during its awaits via the tracker; the Rust runtime holds the app lock across the hydrate awaits, so concurrent updates are structurally impossible — events queue and apply after the merge (live wins by ordering). Tracker kept for the M6.7-equivalent hydrate semantics and tested directly (sync.rs:2066+).
+- **`fatal` bootstrap contract**: `.context("fatal")` is a stringly type-level nit — the caller branches on the same `fatal` bool, so behavior is correct. Recorded, not fixed.
+- **`input_paste` `preventDefault: false`** (`keybind.ts:162`): a browser-only flag (native paste handler also runs); ratatui handles paste via `Msg::Paste`. Non-goal.
+- **`Moved.timestamp`**: `EpochMillis = i64` (opencode-schema), so the `.max(0)` clamp is a dead guard, not a flooring bug. Recorded.
+
+### Withdrawn/rejected by verification
+- "Suspend rewrite skips user `input_undo` overrides" — TS itself guards `keybinds.input_undo === undefined` (`config/index.tsx:105`); the Rust port is faithful.
+- SSE reconnect semantics F8 and VcsBranchUpdated F9 — verified correct / not a divergence.
