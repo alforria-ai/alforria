@@ -1,0 +1,22 @@
+{
+  "comment": "A9 — the model answers through the StructuredOutput tool call",
+  "turns": [
+    {
+      "frames": [
+        {
+          "tool_call": {
+            "id": "cal_1",
+            "name": "StructuredOutput",
+            "arguments": { "answer": 42 }
+          }
+        },
+        {
+          "finish": {
+            "reason": "tool_calls",
+            "usage": { "input": 50, "output": 5 }
+          }
+        }
+      ]
+    }
+  ]
+}

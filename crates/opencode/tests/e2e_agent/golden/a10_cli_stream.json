@@ -1,0 +1,8 @@
+[
+  "step_start",
+  "step_finish",
+  "tool_use:write",
+  "step_start",
+  "text",
+  "step_finish"
+]

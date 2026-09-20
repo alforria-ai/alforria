@@ -19,6 +19,9 @@ pub const A5_DOOM_LOOP: &str = "a5_doom_loop";
 pub const A6_COMPACTION: &str = "a6_compaction";
 pub const A7_REVERT: &str = "a7_revert";
 pub const A8_CANCEL_MID_STREAM: &str = "a8_cancel_mid_stream";
+pub const A9_STRUCTURED_OUTPUT: &str = "a9_structured_output";
+pub const A9_STRUCTURED_ERROR: &str = "a9_structured_error";
+pub const CLI_AUTO_REPLY: &str = "cli_auto_reply";
 
 /// One driven scenario: the process output plus the parsed `--format
 /// json` event stream. Keeps the `Env` (and its tempdir) alive so the
@@ -32,7 +35,7 @@ pub struct ScenarioRun {
 
 impl ScenarioRun {
     /// The `tool_use` events for the given tool, in stream order.
-    fn tool_parts(&self, tool: &str) -> Vec<&Value> {
+    pub fn tool_parts(&self, tool: &str) -> Vec<&Value> {
         self.events
             .iter()
             .filter(|event| {
@@ -58,6 +61,17 @@ fn run_scenario(
     prompt: &str,
     setup: impl FnOnce(&Path),
 ) -> ScenarioRun {
+    run_scenario_with(backend, scenario, prompt, &[], setup)
+}
+
+/// The extra-flags variant (`--auto`, …) of the CLI `run` driver.
+fn run_scenario_with(
+    backend: &impl LlmBackend,
+    scenario: &str,
+    prompt: &str,
+    extra: &[&str],
+    setup: impl FnOnce(&Path),
+) -> ScenarioRun {
     let env = Env::new(scenario);
     env.write_provider_config(
         &backend.base_url(),
@@ -71,7 +85,10 @@ fn run_scenario(
     std::fs::create_dir_all(&project).expect("create project");
     setup(&project);
     let model = format!("{}/{}", backend.provider_id(), backend.model_id());
-    let output = env.run(&["run", "--format", "json", "--model", &model, prompt]);
+    let mut args: Vec<&str> = vec!["run", "--format", "json"];
+    args.extend_from_slice(extra);
+    args.extend(["--model", &model, prompt]);
+    let output = env.run(&args);
     let events = output
         .stdout
         .lines()
@@ -704,4 +721,97 @@ pub async fn a7_revert(backend: &impl LlmBackend) {
         "v2\n",
         "unrevert must restore the edit"
     );
+}
+
+/// A9 — structured output over the wire: the prompt body carries a
+/// `format` json_schema, the scripted model answers through the
+/// `StructuredOutput` tool call, and the captured payload lands on the
+/// final assistant message in the store (prompt.ts:1282-1289). Returns
+/// the message store for request-capture assertions.
+pub async fn a9_structured_output(backend: &impl LlmBackend) -> Vec<Value> {
+    let sess = start_wire(backend, A9_STRUCTURED_OUTPUT, |_| {}).await;
+    drive(&sess, structured_prompt_body(backend), |_, _| None).await;
+    sess.api.messages(&sess.session_id).await
+}
+
+/// A9 error variant: the model streams plain text without calling the
+/// `StructuredOutput` tool — the assistant message fails with the
+/// StructuredOutput error (prompt.ts:1291-1319).
+pub async fn a9_structured_error(backend: &impl LlmBackend) -> Vec<Value> {
+    let sess = start_wire(backend, A9_STRUCTURED_ERROR, |_| {}).await;
+    drive(&sess, structured_prompt_body(backend), |_, _| None).await;
+    sess.api.messages(&sess.session_id).await
+}
+
+/// The `format` json_schema prompt body (spec E2E §2.4 A9): a plain
+/// prompt body plus the output format the loop turns into the
+/// `StructuredOutput` tool.
+fn structured_prompt_body(backend: &impl LlmBackend) -> Value {
+    let mut body = wire_prompt_body(backend, "answer in json");
+    body["format"] = json!({
+        "type": "json_schema",
+        "schema": {
+            "type": "object",
+            "properties": { "answer": { "type": "number" } }
+        }
+    });
+    body
+}
+
+/// A10 — CLI stream shape golden: the filtered event-type sequence of a
+/// one-tool session (the A1 transcript), asserted against the committed
+/// golden file `golden/a10_cli_stream.json`.
+pub fn a10_cli_stream(backend: &impl LlmBackend) {
+    let run = run_scenario(backend, A1_FILE_MUTATION, "create notes.md for me", |_| {});
+    run.assert_exit_zero();
+    if backend.live() {
+        return;
+    }
+    let golden: Vec<String> =
+        serde_json::from_str(include_str!("golden/a10_cli_stream.json")).expect("golden file");
+    assert_eq!(
+        event_sequence(&run.events),
+        golden,
+        "CLI stream diverged from the committed golden\n{}",
+        run.output.stdout
+    );
+}
+
+/// CLI gap #4 (spec E2E §1.6) — `run` with a permission-gated tool:
+/// with `--auto` the run loop answers every `permission.asked` with
+/// `once` (run.rs:724-747) and the loop continues; without it the CLI
+/// auto-rejects and the loop breaks.
+pub fn cli_permission_auto(backend: &impl LlmBackend, auto: bool) -> ScenarioRun {
+    let run = run_scenario_with(
+        backend,
+        CLI_AUTO_REPLY,
+        "read twice",
+        if auto { &["--auto"] } else { &[] },
+        |project| {
+            std::fs::write(project.join("secret.env"), "TOKEN=1\n").expect("seed secret.env");
+        },
+    );
+    run.assert_exit_zero();
+    if !backend.live() {
+        let reads = run.tool_parts("read");
+        if auto {
+            assert_eq!(reads.len(), 2, "both reads ran\n{}", run.output.stdout);
+            for part in &reads {
+                assert_eq!(
+                    part["part"]["state"]["status"],
+                    json!("completed"),
+                    "{part}"
+                );
+            }
+        } else {
+            assert_eq!(
+                reads.len(),
+                1,
+                "the rejected read must stop the run\n{}",
+                run.output.stdout
+            );
+            assert_eq!(reads[0]["part"]["state"]["status"], json!("error"));
+        }
+    }
+    run
 }

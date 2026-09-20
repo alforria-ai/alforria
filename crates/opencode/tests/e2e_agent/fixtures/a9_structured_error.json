@@ -1,0 +1,16 @@
+{
+  "comment": "A9 error variant — plain text, the StructuredOutput tool is never called",
+  "turns": [
+    {
+      "frames": [
+        { "text": "plain text answer" },
+        {
+          "finish": {
+            "reason": "stop",
+            "usage": { "input": 50, "output": 5 }
+          }
+        }
+      ]
+    }
+  ]
+}

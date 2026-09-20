@@ -221,4 +221,106 @@ mod e2e_agent {
             "the re-prompt must reach the model: {serialized}"
         );
     }
+
+    // -------------------------------------------------------------------
+    // A9 — structured output over the wire
+    // -------------------------------------------------------------------
+
+    /// The last assistant message of the store.
+    fn last_assistant(messages: &[serde_json::Value]) -> &serde_json::Value {
+        messages
+            .iter()
+            .rev()
+            .find(|message| message["info"]["role"] == json!("assistant"))
+            .expect("assistant message")
+    }
+
+    #[tokio::test]
+    async fn a9_structured_output_captures_the_tool_payload() {
+        let backend = MockBackend::new(scenarios::A9_STRUCTURED_OUTPUT);
+        let messages = scenarios::a9_structured_output(&backend).await;
+
+        let assistant = last_assistant(&messages);
+        // The step already set finish to tool-calls; the capture keeps it
+        // (the loop only defaults finish when unset, prompt.ts:1282-1289).
+        assert_eq!(
+            assistant["info"]["structured"],
+            json!({ "answer": 42 }),
+            "{assistant}"
+        );
+        assert_eq!(
+            assistant["info"]["finish"],
+            json!("tool-calls"),
+            "{assistant}"
+        );
+
+        // The StructuredOutput tool rode the request with tool_choice
+        // required (prompt.ts:1276-1281).
+        assert_eq!(backend.requests().len(), 1);
+        let request = backend.request(0);
+        let tools = request["tools"].as_array().cloned().unwrap_or_default();
+        let names = tools
+            .iter()
+            .filter_map(|tool| tool["function"]["name"].as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            names.contains(&"StructuredOutput"),
+            "no StructuredOutput tool\n{request}"
+        );
+        assert_eq!(request["tool_choice"], json!("required"), "{request}");
+    }
+
+    #[tokio::test]
+    async fn a9_structured_output_error_without_a_tool_call() {
+        let backend = MockBackend::new(scenarios::A9_STRUCTURED_ERROR);
+        let messages = scenarios::a9_structured_error(&backend).await;
+
+        let assistant = last_assistant(&messages);
+        assert_eq!(
+            assistant["info"]["error"]["name"],
+            json!("StructuredOutputError"),
+            "{assistant}"
+        );
+        assert!(
+            assistant["info"]["structured"].is_null(),
+            "no structured payload on the error path: {assistant}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // A10 + CLI gap #4 — stream golden, --auto reply path
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn a10_cli_stream_matches_the_committed_golden() {
+        let backend = MockBackend::new(scenarios::A1_FILE_MUTATION);
+        scenarios::a10_cli_stream(&backend);
+    }
+
+    #[test]
+    fn cli_auto_replies_permission_asks() {
+        let backend = MockBackend::new(scenarios::CLI_AUTO_REPLY);
+        scenarios::cli_permission_auto(&backend, true);
+
+        assert_eq!(backend.requests().len(), 3, "one request per step");
+        let second = tool_results(backend.request(1));
+        let third = tool_results(backend.request(2));
+        assert_eq!(second.len(), 1, "step 2 sees one result: {second:?}");
+        assert!(
+            second[0]["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("TOKEN=1"),
+            "{second:?}"
+        );
+        assert_eq!(third.len(), 2, "step 3 sees both results: {third:?}");
+    }
+
+    #[test]
+    fn cli_permission_asks_auto_reject_without_auto() {
+        let backend = MockBackend::new(scenarios::CLI_AUTO_REPLY);
+        scenarios::cli_permission_auto(&backend, false);
+
+        assert_eq!(backend.requests().len(), 1, "the loop must break");
+    }
 }
