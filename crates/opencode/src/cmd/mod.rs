@@ -8,6 +8,8 @@ use crate::error::{CliError, TypedError};
 use crate::network;
 use crate::ui::Ui;
 
+pub mod models;
+pub mod providers;
 pub mod run;
 pub mod run_events;
 pub mod run_files;
@@ -75,7 +77,19 @@ pub fn cli() -> Command {
         .subcommand(
             Command::new("models")
                 .about("list all available models")
-                .arg(Arg::new("provider").help("list models for a specific provider")),
+                .arg(Arg::new("provider").help("list models for a specific provider"))
+                .arg(
+                    Arg::new("verbose")
+                        .long("verbose")
+                        .help("use more verbose model output (includes metadata like costs)")
+                        .action(ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("refresh")
+                        .long("refresh")
+                        .help("refresh the models cache from models.dev")
+                        .action(ArgAction::SetTrue),
+                ),
         )
         .subcommand(Command::new("stats").about("show token usage and cost statistics"))
         .subcommand(
@@ -426,7 +440,19 @@ fn providers() -> Command {
         .subcommand(
             Command::new("login")
                 .about("log in to a provider")
-                .arg(Arg::new("url")),
+                .arg(Arg::new("url").help("opencode auth provider"))
+                .arg(
+                    Arg::new("provider")
+                        .long("provider")
+                        .short('p')
+                        .help("provider id or name to log in to (skips provider selection)"),
+                )
+                .arg(
+                    Arg::new("method")
+                        .long("method")
+                        .short('m')
+                        .help("login method label (skips method selection)"),
+                ),
         )
         .subcommand(
             Command::new("logout")
@@ -554,7 +580,11 @@ pub fn route(matches: &ArgMatches, ui: &mut Ui, raw: &[OsString]) -> Result<(), 
         "serve" => serve::run(matches.subcommand_matches("serve").expect("serve"), ui, raw),
         "web" => web::run(matches.subcommand_matches("web").expect("web"), ui, raw),
         "run" => run::run(matches.subcommand_matches("run").expect("run"), ui),
-        // TODO(C5): models, providers
+        "providers" => providers::run(
+            matches.subcommand_matches("providers").expect("providers"),
+            ui,
+        ),
+        "models" => models::run(matches.subcommand_matches("models").expect("models"), ui),
         // TODO(C6): agent, session, db, debug
         // TODO(C7): mcp
         // TODO(C8): tui ($0), attach, acp, pr
@@ -663,11 +693,9 @@ mod tests {
             ("generate", vec!["generate"]),
             ("debug", vec!["debug", "info"]),
             ("console", vec!["console", "orgs"]),
-            ("providers", vec!["providers", "list"]),
             ("agent", vec!["agent", "list"]),
             ("upgrade", vec!["upgrade"]),
             ("uninstall", vec!["uninstall"]),
-            ("models", vec!["models"]),
             ("stats", vec!["stats"]),
             ("export", vec!["export"]),
             ("import", vec!["import", "file.json"]),
@@ -694,6 +722,42 @@ mod tests {
                 format_error_needed(&err)
             );
         }
+    }
+
+    #[test]
+    fn login_and_models_parse_their_flags() {
+        let matches = cli()
+            .try_get_matches_from([
+                "opencode",
+                "auth",
+                "login",
+                "-p",
+                "anthropic",
+                "--method",
+                "oauth",
+            ])
+            .unwrap();
+        let login = matches.subcommand_matches("providers").unwrap();
+        let login = login.subcommand_matches("login").unwrap();
+        assert_eq!(
+            login.get_one::<String>("provider").map(String::as_str),
+            Some("anthropic")
+        );
+        assert_eq!(
+            login.get_one::<String>("method").map(String::as_str),
+            Some("oauth")
+        );
+
+        let matches = cli()
+            .try_get_matches_from(["opencode", "models", "openai", "--verbose", "--refresh"])
+            .unwrap();
+        let models = matches.subcommand_matches("models").unwrap();
+        assert_eq!(
+            models.get_one::<String>("provider").map(String::as_str),
+            Some("openai")
+        );
+        assert!(models.get_flag("verbose"));
+        assert!(models.get_flag("refresh"));
     }
 
     #[test]

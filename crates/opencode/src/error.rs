@@ -202,6 +202,33 @@ pub fn format_unknown(raw: &str) -> String {
     raw.to_string()
 }
 
+/// Map `opencode_core::CoreError` onto the typed CLI surface: config errors
+/// keep their `FormatError` tags, everything else renders as Display text.
+pub fn core_error(err: opencode_core::CoreError) -> TypedError {
+    match err {
+        opencode_core::CoreError::Jsonc { path, message, .. } => TypedError::ConfigJson {
+            path: Some(path.display().to_string()),
+            message: Some(message),
+        },
+        opencode_core::CoreError::ConfigInvalid {
+            path,
+            message,
+            issues,
+        } => TypedError::ConfigInvalid {
+            path: Some(path.display().to_string()),
+            message,
+            issues: issues
+                .into_iter()
+                .map(|issue| ConfigIssue {
+                    message: issue.message,
+                    path: issue.path,
+                })
+                .collect(),
+        },
+        other => TypedError::Cli(CliError::new(other.to_string())),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // FormatError over a JSON error body (error.ts) — the prompt/command
 // result-tuple error shape (run.ts formatRunError).

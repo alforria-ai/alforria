@@ -1,3 +1,4 @@
+pub mod catalog;
 pub mod client;
 pub mod cmd;
 pub mod error;
