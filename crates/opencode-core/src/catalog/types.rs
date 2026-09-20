@@ -10,6 +10,10 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+fn default_true() -> bool {
+    true
+}
+
 /// `CatalogModelStatus` — models-dev.ts:15.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -161,6 +165,27 @@ pub struct ProviderInfo {
     pub api: Option<String>,
 }
 
+/// The capability fields (`attachment`, `reasoning`, `temperature`,
+/// `tool_call`) tolerate the live models.dev drift where a field can
+/// be an object (e.g. per-mode maps) instead of a plain boolean:
+/// presence of any object form means "supported". The pinned TS schema
+/// reads plain booleans; `true` keeps old data byte-identical.
+fn deserialize_capability<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    match value {
+        Value::Bool(value) => Ok(value),
+        Value::Object(_) => Ok(true),
+        Value::Null => Ok(true),
+        other => Err(serde::de::Error::invalid_type(
+            serde::de::Unexpected::Other(std::borrow::Cow::Borrowed(&other.to_string()).as_ref()),
+            &"a boolean or object",
+        )),
+    }
+}
+
 /// `Model` — models-dev.ts:67-120.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Model {
@@ -169,9 +194,13 @@ pub struct Model {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub family: Option<String>,
     pub release_date: String,
+    #[serde(default = "default_true", deserialize_with = "deserialize_capability")]
     pub attachment: bool,
+    #[serde(default = "default_true", deserialize_with = "deserialize_capability")]
     pub reasoning: bool,
+    #[serde(default = "default_true", deserialize_with = "deserialize_capability")]
     pub temperature: bool,
+    #[serde(default = "default_true", deserialize_with = "deserialize_capability")]
     pub tool_call: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_options: Option<Vec<ReasoningOption>>,
@@ -364,5 +393,34 @@ mod tests {
             model(r#""reasoning_content""#),
             Some(Interleaved::Field("reasoning_content".to_string()))
         );
+    }
+
+    #[test]
+    fn capability_fields_tolerate_object_forms() {
+        // Live models.dev drift: capability fields can be objects.
+        let text = r#"{"p":{"name":"P","id":"p","env":[],"models":{"m":{
+            "id":"m","name":"M","release_date":"d",
+            "attachment":false,
+            "reasoning":true,
+            "temperature":{"classic":false},
+            "tool_call":true,
+            "limit":{"context":1,"output":2}}}}}"#;
+        let model = Catalog::parse(text).unwrap().providers["p"].models["m"].clone();
+        assert!(!model.attachment);
+        assert!(model.reasoning);
+        assert!(model.temperature);
+        assert!(model.tool_call);
+    }
+
+    #[test]
+    fn capability_fields_default_to_true_when_absent() {
+        let text = r#"{"p":{"name":"P","id":"p","env":[],"models":{"m":{
+            "id":"m","name":"M","release_date":"d",
+            "limit":{"context":1,"output":2}}}}}"#;
+        let model = Catalog::parse(text).unwrap().providers["p"].models["m"].clone();
+        assert!(model.attachment);
+        assert!(model.reasoning);
+        assert!(model.temperature);
+        assert!(model.tool_call);
     }
 }

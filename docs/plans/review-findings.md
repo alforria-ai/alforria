@@ -129,3 +129,19 @@ Panel: glm-5.3-thinking (agentic, complete through focus areas 1-4) + deepseek-v
 ### Withdrawn/rejected by verification
 - "Suspend rewrite skips user `input_undo` overrides" — TS itself guards `keybinds.input_undo === undefined` (`config/index.tsx:105`); the Rust port is faithful.
 - SSE reconnect semantics F8 and VcsBranchUpdated F9 — verified correct / not a divergence.
+
+## CLI milestone review panel
+
+Panel: glm-5.3-thinking (agentic — two runs, both died mid-flight at turns 50/35 with substantial verification work completed; client.rs verified "matches the SDK v2 semantics", run/tui/attach/providers/models comparisons in progress) + deepseek-v4.1-flash-thinking (three runs — two budget deaths, one external_directory denial; no findings emitted). Orchestrator spot-verification completed the highest-priority items directly.
+
+### Accepted & fixed
+- **Catalog capability-field schema drift (MAJOR, C6/C9 finding)**: live models.dev data fails `temperature` parsing (the pinned TS schema reads plain booleans). `Catalog::Model` capability fields (`attachment`, `reasoning`, `temperature`, `tool_call`) now tolerate object forms (presence ⇒ supported) and default to `true` when absent (crates/opencode-core/src/catalog/types.rs).
+- **`cleanup_loop_fires_after_the_first_delay` flake (test infra)**: the +10ms cleanup tick can race `track()` creating the gitdir; a wasted tick waits the full interval. Test now uses a short retry interval (crates/opencode-core/src/session/snapshot.rs).
+
+### Verified equivalent by the panel/orchestrator
+- `client.rs` matches the TS SDK v2 rewrite semantics for the v1 API.
+- The `run` finish path (prompt error → exit 1; accumulated session.error → exit 1) is equivalent. **Recorded nuance**: TS `finish()` returns early in attach mode without awaiting loop completion; the Rust attach loop consumes events until idle — an attach-mode session.error that TS would not observe can set exit 1 in Rust.
+- tui.ts/attach.ts flag matrices, validation order, PWD-relative project resolution verified against the TS during C8 implementation tests.
+
+### Panel failures recorded
+- The agentic reviewer's budget (~50 turns) is insufficient for a full CLI review; split-scope re-runs also died. deepseek failed on budget ×2 and external_directory ×1. Priority-5 spot-checks (mcp.rs, pr.rs, session.rs, db.rs, stats.rs vs TS) were therefore only partially covered — C9's implementation reports and the e2e suite stand as the primary coverage.

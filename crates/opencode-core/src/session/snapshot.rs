@@ -2011,7 +2011,9 @@ mod git_tests {
         snap.track().await.unwrap();
         let gitdir = gitdir(data.path(), dir.path());
         let mut packed = false;
-        for _ in 0..200 {
+        // Generous budget — `git gc` under a fully parallel test load can
+        // far exceed the usual milliseconds.
+        for _ in 0..600 {
             if gitdir.join("objects/pack").exists()
                 && std::fs::read_dir(gitdir.join("objects/pack"))
                     .unwrap()
@@ -2022,7 +2024,7 @@ mod git_tests {
                 packed = true;
                 break;
             }
-            std::thread::sleep(Duration::from_millis(50));
+            std::thread::sleep(Duration::from_millis(100));
         }
         assert!(packed, "the cleanup loop ran gc");
     }
