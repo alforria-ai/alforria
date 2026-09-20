@@ -6,3 +6,5 @@
 .DS_Store
 .opencode/
 scratchpad/
+.ts-ref-tui
+.ts-ref-tui-real
