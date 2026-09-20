@@ -16,6 +16,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha1 = { workspace = true }
 hex = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+libc = { workspace = true }
+rand = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }

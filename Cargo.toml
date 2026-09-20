@@ -25,6 +25,8 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip"] }
 http-body = "1"
 eventsource-stream = "0.2"
+ratatui = "0.30"
+crossterm = "0.29"
 tokio-tungstenite = "0.26"
 portable-pty = "0.9"
 futures = "0.3"

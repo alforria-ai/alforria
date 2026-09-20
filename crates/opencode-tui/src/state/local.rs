@@ -152,6 +152,7 @@ impl LocalState {
             .any(|a| agent_name(a) == Some(name))
         {
             return Some(Toast {
+                title: None,
                 variant: ToastVariant::Warning,
                 message: format!("Agent not found: {name}"),
                 duration_ms: 3000,
@@ -356,6 +357,7 @@ impl LocalState {
             .collect();
         if favorites.is_empty() {
             return Some(Toast {
+                title: None,
                 variant: ToastVariant::Info,
                 message: "Add a favorite model to use this shortcut".to_string(),
                 duration_ms: 3000,
@@ -397,6 +399,7 @@ impl LocalState {
     pub fn model_set(&mut self, sync: &SyncState, model: ModelRef, recent: bool) -> Option<Toast> {
         if !self.is_model_valid(sync, &model) {
             return Some(Toast {
+                title: None,
                 variant: ToastVariant::Warning,
                 message: format!(
                     "Model {}/{} is not valid",
@@ -419,6 +422,7 @@ impl LocalState {
     pub fn model_toggle_favorite(&mut self, sync: &SyncState, model: &ModelRef) -> Option<Toast> {
         if !self.is_model_valid(sync, model) {
             return Some(Toast {
+                title: None,
                 variant: ToastVariant::Warning,
                 message: format!(
                     "Model {}/{} is not valid",
