@@ -1,6 +1,8 @@
 //! The backend seam (spec E2E §2.2) + the scripted wire mock.
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::routing::post;
 use axum::Router;
@@ -36,6 +38,8 @@ pub trait LlmBackend {
     fn transcript(&self, scenario: &str) -> Option<Transcript>;
     /// Relaxation policy: which assertions hold for this backend.
     fn live(&self) -> bool;
+    /// Per-turn LLM budget for live backends (spec E2E §3.4).
+    fn turn_timeout(&self) -> Duration;
 }
 
 /// The compaction fork rides the same endpoint tool-less (compaction.rs
@@ -146,4 +150,165 @@ impl LlmBackend for MockBackend {
     fn live(&self) -> bool {
         false
     }
+
+    fn turn_timeout(&self) -> Duration {
+        Duration::from_secs(60)
+    }
+}
+
+/// The live LibertAI model tiers (spec E2E §3.4): the cheap tier drives
+/// the full live scenario set; the thinking-quality tiers only the smoke
+/// scenarios (file mutation, read-answer, structured output).
+#[derive(Clone, Copy)]
+pub enum LiveModel {
+    Cheap,
+    QualityGlm,
+    QualityDeepseek,
+}
+
+impl LiveModel {
+    fn id(self) -> &'static str {
+        match self {
+            LiveModel::Cheap => "qwen3.5-4b",
+            LiveModel::QualityGlm => "glm-5.3",
+            LiveModel::QualityDeepseek => "deepseek-v4.1-flash",
+        }
+    }
+
+    fn context_limit(self) -> f64 {
+        match self {
+            LiveModel::Cheap => 32768.0,
+            _ => 262144.0,
+        }
+    }
+
+    fn turn_timeout(self) -> Duration {
+        match self {
+            LiveModel::Cheap => Duration::from_secs(90),
+            _ => Duration::from_secs(180),
+        }
+    }
+}
+
+/// The live LibertAI endpoint (spec E2E §3.1): no server — `opencode.json`
+/// points `baseURL` straight at the OpenAI-compatible API. The key is
+/// resolved once, never logged, never asserted on.
+pub struct LibertaiBackend {
+    model_id: String,
+    context_limit: f64,
+    turn_timeout: Duration,
+    api_key: String,
+}
+
+impl LibertaiBackend {
+    pub fn new(model: LiveModel) -> LibertaiBackend {
+        LibertaiBackend {
+            api_key: libertai_api_key(),
+            turn_timeout: model.turn_timeout(),
+            context_limit: model.context_limit(),
+            model_id: model.id().to_string(),
+        }
+    }
+}
+
+impl LlmBackend for LibertaiBackend {
+    fn base_url(&self) -> String {
+        std::env::var("LIBERTAI_API_BASE")
+            .ok()
+            .filter(|base| !base.trim().is_empty())
+            .unwrap_or_else(|| "https://api.libertai.io/v1".to_string())
+    }
+
+    fn api_key(&self) -> String {
+        self.api_key.clone()
+    }
+
+    fn provider_id(&self) -> &str {
+        "libertai"
+    }
+
+    fn model_id(&self) -> &str {
+        &self.model_id
+    }
+
+    fn context_limit(&self) -> f64 {
+        self.context_limit
+    }
+
+    fn transcript(&self, _scenario: &str) -> Option<Transcript> {
+        None
+    }
+
+    fn live(&self) -> bool {
+        true
+    }
+
+    fn turn_timeout(&self) -> Duration {
+        self.turn_timeout
+    }
+}
+
+/// Key-resolution order (spec E2E §3.1): env, then `[auth] api_key` from
+/// the libertai config, then a one-shot `libertai run` injection. Missing
+/// key ⇒ fail fast, never a network retry loop.
+fn libertai_api_key() -> String {
+    static KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    KEY.get_or_init(|| {
+        for name in ["LIBERTAI_API_KEY", "OPENAI_API_KEY"] {
+            if let Ok(key) = std::env::var(name) {
+                if !key.trim().is_empty() {
+                    return key;
+                }
+            }
+        }
+        config_api_key()
+            .or_else(cli_api_key)
+            .expect("libertai CLI not authenticated: set LIBERTAI_API_KEY or run `libertai login`")
+    })
+    .clone()
+}
+
+fn config_api_key() -> Option<String> {
+    let path = match std::process::Command::new("libertai")
+        .args(["config", "path"])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            PathBuf::from(String::from_utf8_lossy(&output.stdout).trim())
+        }
+        _ => std::env::var("HOME")
+            .ok()
+            .map(|home| PathBuf::from(home).join(".config/libertai/config.toml"))?,
+    };
+    parse_api_key(&std::fs::read_to_string(path).ok()?)
+}
+
+fn parse_api_key(text: &str) -> Option<String> {
+    let mut in_auth = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_auth = line == "[auth]";
+        } else if in_auth {
+            if let Some((key, value)) = line.split_once('=') {
+                let value = value.trim().trim_matches(['"', '\'']);
+                if key.trim() == "api_key" && !value.is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn cli_api_key() -> Option<String> {
+    let output = std::process::Command::new("libertai")
+        .args(["run", "--", "sh", "-c", "echo $LIBERTAI_API_KEY"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let key = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!key.is_empty()).then_some(key)
 }

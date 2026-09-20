@@ -23,6 +23,12 @@ pub const A9_STRUCTURED_OUTPUT: &str = "a9_structured_output";
 pub const A9_STRUCTURED_ERROR: &str = "a9_structured_error";
 pub const CLI_AUTO_REPLY: &str = "cli_auto_reply";
 
+pub const B3_PERMISSION_ASK: &str = "b3_permission_ask";
+pub const B4_SUBAGENT: &str = "b4_subagent";
+pub const B5_CANCEL_REPROMPT: &str = "b5_cancel_reprompt";
+pub const B6_STRUCTURED_OUTPUT: &str = "b6_structured_output";
+pub const B7_EXPORT_ROUND_TRIP: &str = "b7_export_round_trip";
+
 /// One driven scenario: the process output plus the parsed `--format
 /// json` event stream. Keeps the `Env` (and its tempdir) alive so the
 /// project directory survives for assertions.
@@ -88,7 +94,7 @@ fn run_scenario_with(
     let mut args: Vec<&str> = vec!["run", "--format", "json"];
     args.extend_from_slice(extra);
     args.extend(["--model", &model, prompt]);
-    let output = env.run(&args);
+    let output = env.run_with_timeout(&args, None, backend.turn_timeout() * 4);
     let events = output
         .stdout
         .lines()
@@ -152,6 +158,17 @@ pub fn a1_file_mutation(backend: &impl LlmBackend) -> ScenarioRun {
         assert!(!content.trim().is_empty(), "model-created file is empty");
     }
 
+    if backend.live() {
+        // Structural relaxation (spec E2E §3.3): the model's own tool
+        // call created the file — any completed tool part proves it.
+        let completed = run.events.iter().any(|event| {
+            event["type"] == json!("tool_use")
+                && event["part"]["state"]["status"] == json!("completed")
+        });
+        assert!(completed, "no completed tool part\n{}", run.output.stdout);
+        return run;
+    }
+
     let tools = run.tool_parts("write");
     assert_eq!(tools.len(), 1, "one write tool part\n{}", run.output.stdout);
     assert_eq!(tools[0]["part"]["state"]["status"], json!("completed"));
@@ -198,6 +215,19 @@ pub fn a2_multi_step(backend: &impl LlmBackend) -> ScenarioRun {
     run.assert_exit_zero();
 
     let reads = run.tool_parts("read");
+    if backend.live() {
+        // Structural relaxation (spec E2E §3.3): any completed read
+        // counts live — the model picks its own call count.
+        assert!(!reads.is_empty(), "no read parts\n{}", run.output.stdout);
+        for part in &reads {
+            assert_eq!(
+                part["part"]["state"]["status"],
+                json!("completed"),
+                "{part}"
+            );
+        }
+        return run;
+    }
     assert_eq!(reads.len(), 3, "three read parts across the steps");
     for part in &reads {
         assert_eq!(part["part"]["state"]["status"], json!("completed"));
@@ -244,7 +274,8 @@ pub struct WireSession {
     _serve: Serve,
     api: Api,
     log: EventLog,
-    pub session_id: String,
+    session_id: String,
+    budget: Duration,
 }
 
 impl WireSession {
@@ -311,6 +342,7 @@ async fn start_wire(
         api,
         log,
         session_id,
+        budget: backend.turn_timeout() * 4,
     }
 }
 
@@ -343,7 +375,7 @@ async fn pump(
     let mut asks: Vec<Value> = Vec::new();
     let mut cursor = 0;
     let mut busy = false;
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + sess.budget;
     loop {
         let events = sess.log.events();
         let mut done = false;
@@ -484,7 +516,7 @@ pub async fn a8_cancel_mid_stream(backend: &impl LlmBackend) -> Vec<Value> {
 
     // The tool part is in flight (the transcript stalls behind it).
     let session_id = sess.session_id.clone();
-    let _ = pump_until(&sess.log, |events| {
+    let _ = pump_until(&sess.log, sess.budget, |events| {
         events.iter().any(|event| {
             event["type"] == json!("message.part.updated")
                 && event["properties"]["sessionID"] == json!(session_id)
@@ -667,7 +699,7 @@ pub async fn a7_revert(backend: &impl LlmBackend) {
         .prompt_async(&sess.session_id, wire_prompt_body(backend, "edit the file"))
         .await;
     let session_id = sess.session_id.clone();
-    pump_until(&sess.log, |events| {
+    pump_until(&sess.log, sess.budget, |events| {
         events.iter().any(|event| {
             event["type"] == json!("message.part.updated")
                 && event["properties"]["sessionID"] == json!(session_id)
@@ -814,4 +846,187 @@ pub fn cli_permission_auto(backend: &impl LlmBackend, auto: bool) -> ScenarioRun
         }
     }
     run
+}
+
+// ---------------------------------------------------------------------------
+// Live scenarios (spec E2E §3.3): outcome assertions only — the model's
+// transcript is whatever the live backend produces. Flaky mismatch is
+// absorbed by the whole-scenario retry in `live.rs`, not by loosening
+// these asserts.
+// ---------------------------------------------------------------------------
+
+/// B3 — permission ask observed over the wire: reading `secret.env`
+/// publishes a `permission.asked`; answering `once` through the API lets
+/// the tool run to completion.
+pub async fn b3_permission_ask(backend: &impl LlmBackend) {
+    let sess = start_wire(backend, B3_PERMISSION_ASK, |project| {
+        std::fs::write(project.join("secret.env"), "TOKEN=1\n").expect("seed secret.env");
+    })
+    .await;
+    let asks = drive(
+        &sess,
+        wire_prompt_body(
+            backend,
+            "read the file secret.env and tell me what is inside it",
+        ),
+        |_, _| Some("once"),
+    )
+    .await;
+
+    assert!(!asks.is_empty(), "no permission ask was published");
+    let messages = sess.api.messages(&sess.session_id).await;
+    let tools = sess.tool_parts(&messages);
+    assert!(
+        tools
+            .iter()
+            .any(|part| part["state"]["status"] == json!("completed")),
+        "no completed tool part after the reply\n{messages:?}"
+    );
+}
+
+/// B4 — subagent over the wire: a `task` tool call spawns a child
+/// session; the child appears in the session list with the parent link.
+pub async fn b4_subagent(backend: &impl LlmBackend) {
+    let sess = start_wire(backend, B4_SUBAGENT, |_| {}).await;
+    drive(
+        &sess,
+        wire_prompt_body(
+            backend,
+            "use the task tool to spawn a subagent and tell me what it said",
+        ),
+        |_, _| None,
+    )
+    .await;
+
+    let messages = sess.api.messages(&sess.session_id).await;
+    let task = messages
+        .iter()
+        .flat_map(|message| {
+            message["parts"]
+                .as_array()
+                .map(|parts| parts.to_vec())
+                .unwrap_or_default()
+        })
+        .find(|part| part["type"] == "tool" && part["tool"] == "task")
+        .expect("task tool part");
+    assert_eq!(task["state"]["status"], json!("completed"), "{task}");
+    assert_eq!(
+        task["state"]["metadata"]["parentSessionId"],
+        json!(sess.session_id),
+        "{task}"
+    );
+    let child_id = task["state"]["metadata"]["sessionId"]
+        .as_str()
+        .expect("child session id")
+        .to_string();
+    let list = sess.api.session_list().await;
+    let child = list
+        .iter()
+        .find(|item| item["id"] == json!(child_id))
+        .expect("child session in the session list");
+    assert_eq!(child["parentID"], json!(sess.session_id), "{child}");
+}
+
+/// B5 — cancel + re-prompt over the wire: abort once a part is in
+/// flight (or the turn already finished), then a re-prompt must run a
+/// fresh turn to completion.
+pub async fn b5_cancel_reprompt(backend: &impl LlmBackend) {
+    let sess = start_wire(backend, B5_CANCEL_REPROMPT, |project| {
+        std::fs::write(project.join("a.txt"), "x\n").expect("seed a.txt");
+    })
+    .await;
+    sess.api
+        .prompt_async(
+            &sess.session_id,
+            wire_prompt_body(backend, "read a.txt and summarize it"),
+        )
+        .await;
+
+    let session_id = sess.session_id.clone();
+    pump_until(&sess.log, sess.budget, |events| {
+        events.iter().any(|event| {
+            event["properties"]["sessionID"] == json!(session_id)
+                && (event["type"] == json!("message.part.updated")
+                    || (event["type"] == json!("session.status")
+                        && event["properties"]["status"]["type"] == json!("idle")))
+        })
+    })
+    .await;
+    let _ = sess
+        .api
+        .request(
+            reqwest::Method::POST,
+            &format!("/session/{}/abort", sess.session_id),
+            Some(json!({})),
+        )
+        .await;
+    pump(&sess, |_, _| None).await;
+
+    let resumed = sess
+        .api
+        .prompt(
+            &sess.session_id,
+            wire_prompt_body(backend, "thanks, reply with the word done"),
+        )
+        .await;
+    assert!(
+        !WireSession::text_of(&resumed).trim().is_empty(),
+        "no resumed text\n{resumed}"
+    );
+}
+
+/// B6 — structured output over the wire: the `StructuredOutput` tool
+/// capture lands the schema payload on the final assistant message.
+pub async fn b6_structured_output(backend: &impl LlmBackend) {
+    let sess = start_wire(backend, B6_STRUCTURED_OUTPUT, |_| {}).await;
+    drive(&sess, structured_prompt_body(backend), |_, _| None).await;
+
+    let messages = sess.api.messages(&sess.session_id).await;
+    let assistant = messages
+        .iter()
+        .rev()
+        .find(|message| message["info"]["role"] == json!("assistant"))
+        .expect("assistant message");
+    let structured = &assistant["info"]["structured"];
+    assert!(structured.is_object(), "no structured payload\n{assistant}");
+    assert!(structured["answer"].is_number(), "{assistant}");
+}
+
+/// B7 — session export round-trip over a live session: `export latest`,
+/// `import` and re-export must be byte-equal (a storage property, so it
+/// holds for any transcript the model produced).
+pub fn b7_session_export_round_trip(backend: &impl LlmBackend) {
+    let run = run_scenario(backend, B7_EXPORT_ROUND_TRIP, "say hi", |_| {});
+    run.assert_exit_zero();
+
+    let env = &run._env;
+    let export = env.run(&["export"]);
+    assert_eq!(export.code, Some(0), "stderr={}", export.stderr);
+    assert!(
+        export.stderr.contains("Exporting session: latest"),
+        "stderr={}",
+        export.stderr
+    );
+    assert!(
+        export.stdout.contains("\"info\""),
+        "stdout={}",
+        export.stdout
+    );
+    let file = env.home.join("session.json");
+    std::fs::write(&file, export.stdout.trim_end()).expect("write export");
+    let import = env.run(&["import", file.to_str().expect("export path")]);
+    assert_eq!(import.code, Some(0), "stderr={}", import.stderr);
+    let session_id = import
+        .stdout
+        .trim()
+        .strip_prefix("Imported session: ")
+        .expect("imported marker")
+        .to_string();
+    let reexport = env.run(&["export", &session_id]);
+    assert_eq!(reexport.code, Some(0), "stderr={}", reexport.stderr);
+    assert_eq!(
+        reexport.stdout.trim_end(),
+        export.stdout.trim_end(),
+        "re-export differs"
+    );
 }

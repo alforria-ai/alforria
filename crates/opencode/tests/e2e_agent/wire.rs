@@ -10,8 +10,6 @@ use serde_json::{json, Value};
 
 use crate::harness::Serve;
 
-const TIMEOUT: Duration = Duration::from_secs(60);
-
 fn encode_uri_component(input: &str) -> String {
     const SAFE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.!~*'()";
     let mut out = String::with_capacity(input.len());
@@ -264,10 +262,14 @@ fn sse_block_data(block: &str) -> Option<String> {
     }
 }
 
-/// Poll until `check` passes over a fresh event snapshot, bounded by the
-/// scenario timeout. Returns the passing snapshot.
-pub async fn pump_until(log: &EventLog, mut check: impl FnMut(&[Value]) -> bool) -> Vec<Value> {
-    let deadline = Instant::now() + TIMEOUT;
+/// Poll until `check` passes over a fresh event snapshot, bounded by
+/// `timeout` (the backend budget). Returns the passing snapshot.
+pub async fn pump_until(
+    log: &EventLog,
+    timeout: Duration,
+    mut check: impl FnMut(&[Value]) -> bool,
+) -> Vec<Value> {
+    let deadline = Instant::now() + timeout;
     loop {
         let events = log.events();
         if check(&events) {

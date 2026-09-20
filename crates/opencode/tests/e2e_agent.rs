@@ -23,6 +23,8 @@
 mod backend;
 #[path = "e2e_agent/harness.rs"]
 mod harness;
+#[path = "e2e_agent/live.rs"]
+mod live;
 #[path = "e2e_agent/mock.rs"]
 mod mock;
 #[path = "e2e_agent/scenarios.rs"]

@@ -156,6 +156,17 @@ impl Env {
     }
 
     pub fn run_with(&self, args: &[&str], stdin: Option<&str>) -> ProcOutput {
+        self.run_with_timeout(args, stdin, Duration::from_secs(180))
+    }
+
+    /// The backend-budgeted variant: live models need per-turn headroom
+    /// (spec E2E §3.4) beyond the mock's 180 s.
+    pub fn run_with_timeout(
+        &self,
+        args: &[&str],
+        stdin: Option<&str>,
+        timeout: Duration,
+    ) -> ProcOutput {
         let mut command = self.command(args);
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
         if stdin.is_some() {
@@ -172,7 +183,7 @@ impl Env {
             code,
             stdout,
             stderr,
-        } = wait(&mut child);
+        } = wait(&mut child, timeout);
         ProcOutput {
             code,
             stdout,
@@ -249,10 +260,10 @@ impl Drop for Serve {
 
 /// Wait for the child, draining stdout/stderr in reader threads (a
 /// blocking child would otherwise deadlock on a full pipe).
-pub fn wait(child: &mut Child) -> ProcOutput {
+pub fn wait(child: &mut Child, timeout: Duration) -> ProcOutput {
     let stdout = child.stdout.take().map(pump);
     let stderr = child.stderr.take().map(pump);
-    let deadline = Instant::now() + Duration::from_secs(180);
+    let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait().expect("wait status") {
             Some(status) => {
