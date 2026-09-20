@@ -13,6 +13,9 @@ pub mod agent;
 pub mod attach;
 pub mod db;
 pub mod debug;
+pub mod export;
+pub mod generate;
+pub mod import;
 pub mod mcp;
 pub mod models;
 pub mod pr;
@@ -23,6 +26,7 @@ pub mod run_files;
 pub mod run_output;
 pub mod serve;
 pub mod session;
+pub mod stats;
 pub mod tui;
 pub mod web;
 
@@ -178,11 +182,44 @@ pub fn cli() -> Command {
                             .action(ArgAction::SetTrue),
                     ),
             )
-            .subcommand(Command::new("stats").about("show token usage and cost statistics"))
+            .subcommand(
+                Command::new("stats")
+                    .about("show token usage and cost statistics")
+                    .arg(
+                        Arg::new("days")
+                            .long("days")
+                            .help("show stats for the last N days (default: all time)")
+                            .value_parser(clap::value_parser!(f64)),
+                    )
+                    .arg(
+                        Arg::new("tools")
+                            .long("tools")
+                            .help("number of tools to show (default: all)")
+                            .value_parser(clap::value_parser!(f64)),
+                    )
+                    .arg(
+                        Arg::new("models")
+                            .long("models")
+                            .help("show model statistics (default: hidden). Pass a number to show top N, otherwise shows all")
+                            .num_args(0..=1)
+                            .default_missing_value("true"),
+                    )
+                    .arg(
+                        Arg::new("project")
+                            .long("project")
+                            .help("filter by project (default: all projects, empty string: current project)"),
+                    ),
+            )
             .subcommand(
                 Command::new("export")
                     .about("export session data as JSON")
-                    .arg(Arg::new("sessionID")),
+                    .arg(Arg::new("sessionID"))
+                    .arg(
+                        Arg::new("sanitize")
+                            .long("sanitize")
+                            .help("redact sensitive transcript and file data")
+                            .action(ArgAction::SetTrue),
+                    ),
             )
             .subcommand(
                 Command::new("import")
@@ -866,7 +903,13 @@ pub fn route(matches: &ArgMatches, ui: &mut Ui, raw: &[OsString]) -> Result<(), 
         ),
         "acp" => acp::run(matches.subcommand_matches("acp").expect("acp"), ui, raw),
         "pr" => pr::cli_run(matches.subcommand_matches("pr").expect("pr"), ui, raw),
-        // TODO(C9): stats, export, import, generate
+        "stats" => stats::run(matches.subcommand_matches("stats").expect("stats"), ui),
+        "export" => export::run(matches.subcommand_matches("export").expect("export"), ui),
+        "import" => import::run(matches.subcommand_matches("import").expect("import"), ui),
+        "generate" => generate::run(
+            matches.subcommand_matches("generate").expect("generate"),
+            ui,
+        ),
         _ => Err(stub(name)),
     }
 }
@@ -967,13 +1010,9 @@ mod tests {
     #[test]
     fn routes_registered_commands_to_stubs() {
         let cases: Vec<(&str, Vec<&str>)> = vec![
-            ("generate", vec!["generate"]),
             ("console", vec!["console", "orgs"]),
             ("upgrade", vec!["upgrade"]),
             ("uninstall", vec!["uninstall"]),
-            ("stats", vec!["stats"]),
-            ("export", vec!["export"]),
-            ("import", vec!["import", "file.json"]),
             ("github", vec!["github", "install"]),
             ("plugin", vec!["plugin", "module"]),
             ("plugin", vec!["plug", "module"]),
@@ -1207,6 +1246,54 @@ mod tests {
         let opts =
             network::NetworkOptions::from_matches(matches.subcommand_matches("serve").unwrap());
         assert!(!opts.mdns);
+    }
+
+    #[test]
+    fn c9_flags_parse_their_surface() {
+        let matches = cli()
+            .try_get_matches_from([
+                "opencode",
+                "stats",
+                "--days",
+                "7",
+                "--tools",
+                "3",
+                "--models",
+                "5",
+                "--project",
+                "prj_1",
+            ])
+            .unwrap();
+        let stats = matches.subcommand_matches("stats").unwrap();
+        assert_eq!(stats.get_one::<f64>("days"), Some(&7.0));
+        assert_eq!(stats.get_one::<f64>("tools"), Some(&3.0));
+        assert_eq!(
+            stats.get_one::<String>("models").map(String::as_str),
+            Some("5")
+        );
+        assert_eq!(
+            stats.get_one::<String>("project").map(String::as_str),
+            Some("prj_1")
+        );
+
+        let matches = cli()
+            .try_get_matches_from(["opencode", "stats", "--models"])
+            .unwrap();
+        let stats = matches.subcommand_matches("stats").unwrap();
+        assert_eq!(
+            stats.get_one::<String>("models").map(String::as_str),
+            Some("true")
+        );
+
+        let matches = cli()
+            .try_get_matches_from(["opencode", "export", "ses_1", "--sanitize"])
+            .unwrap();
+        let export = matches.subcommand_matches("export").unwrap();
+        assert!(export.get_flag("sanitize"));
+        assert_eq!(
+            export.get_one::<String>("sessionID").map(String::as_str),
+            Some("ses_1")
+        );
     }
 
     #[test]
