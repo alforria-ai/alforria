@@ -11,7 +11,10 @@
 //! execute against the server seam between messages.
 
 pub mod app;
+pub mod clipboard;
+pub mod command;
 pub mod config;
+pub mod keymap;
 pub mod state;
 pub mod transport;
 pub mod ui;
@@ -23,6 +26,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
+use crate::clipboard::Clipboard as _;
 use crate::state::route::Route;
 use crate::state::{App, Args, Effect, Msg, Toast, ToastVariant};
 use crate::transport::api::{HttpClientConfig, HttpServerApi, Location, ServerApi};
@@ -80,6 +84,14 @@ async fn run_inner(input: TuiInput) -> Result<Exit> {
     let mut terminal =
         ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(io::stdout()))?;
     let exit = event_loop(&mut app, api, msg_rx, &mut terminal).await;
+
+    // §6 N6: `docs.open` prints the URL instead of opening a browser —
+    // after the alternate screen is gone.
+    let opened_urls = std::mem::take(&mut app.ui.opened_urls);
+    drop(_guard);
+    for url in opened_urls {
+        println!("{url}");
+    }
 
     let exit = exit?;
     print_exit(&exit);
@@ -189,6 +201,106 @@ async fn execute_effect(app: &mut App, api: Arc<dyn ServerApi>, effect: Effect) 
         }
         Effect::SuspendTerminal => {
             suspend::terminal_suspend_and_resume().await;
+        }
+        Effect::SessionShare { session_id } => {
+            match api.session_share(&Location::default(), &session_id).await {
+                Ok(session) => {
+                    if let Some(share) = session.share {
+                        let _ = clipboard::system_clipboard().write(&share.url);
+                        app.show_toast(Toast {
+                            title: None,
+                            variant: ToastVariant::Success,
+                            message: "Share URL copied to clipboard!".to_string(),
+                            duration_ms: 5000,
+                        });
+                    }
+                }
+                Err(_) => app.show_toast(Toast {
+                    title: None,
+                    variant: ToastVariant::Error,
+                    message: "Failed to share session".to_string(),
+                    duration_ms: 5000,
+                }),
+            }
+        }
+        Effect::SessionUnshare { session_id } => {
+            match api.session_unshare(&Location::default(), &session_id).await {
+                Ok(_) => app.show_toast(Toast {
+                    title: None,
+                    variant: ToastVariant::Success,
+                    message: "Session unshared successfully".to_string(),
+                    duration_ms: 5000,
+                }),
+                Err(_) => app.show_toast(Toast {
+                    title: None,
+                    variant: ToastVariant::Error,
+                    message: "Failed to unshare session".to_string(),
+                    duration_ms: 5000,
+                }),
+            }
+        }
+        Effect::SessionSummarize {
+            session_id,
+            provider_id,
+            model_id,
+        } => {
+            let _ = api
+                .session_summarize(&Location::default(), &session_id, &provider_id, &model_id)
+                .await;
+        }
+        Effect::SessionAbort { session_id } => {
+            let _ = api.session_abort(&Location::default(), &session_id).await;
+        }
+        Effect::SessionRevert {
+            session_id,
+            message_id,
+        } => {
+            let _ = api
+                .session_revert(&Location::default(), &session_id, &message_id, None)
+                .await;
+        }
+        Effect::SessionUnrevert { session_id } => {
+            let _ = api
+                .session_unrevert(&Location::default(), &session_id)
+                .await;
+        }
+        Effect::SessionRefresh => {
+            let sessions = state::sync::list_sessions(
+                api.as_ref(),
+                &Location::default(),
+                &app.state.kv,
+                &app.state.project,
+            )
+            .await;
+            app.state.sync.session = sessions;
+        }
+        Effect::SessionBackground { session_id } => {
+            let _ = api
+                .experimental_session_background(&Location::default(), &session_id)
+                .await;
+        }
+        Effect::SessionCopyTranscript { .. } => {
+            // TODO(M8.8): formatTranscript + clipboard write.
+        }
+        Effect::ClipboardWrite {
+            text,
+            success,
+            failure,
+        } => match clipboard::system_clipboard().write(&text) {
+            Ok(()) => {
+                if let Some(toast) = success {
+                    app.show_toast(toast);
+                }
+            }
+            Err(_) => {
+                if let Some(toast) = failure {
+                    app.show_toast(toast);
+                }
+            }
+        },
+        Effect::OpenUrl { url } => {
+            // §6 N6: no browser from a TUI — the URL prints on exit.
+            app.ui.opened_urls.push(url);
         }
     }
     Ok(())

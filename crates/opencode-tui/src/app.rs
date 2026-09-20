@@ -137,8 +137,7 @@ pub fn on_bus_event(app: &mut App, bus_event: BusEvent) -> Vec<Effect> {
     let workspace_matches = metadata.workspace == app.state.project.workspace.current;
     match event {
         Event::TuiCommandExecute(evt) if workspace_matches => {
-            // TODO(M8.4): keymap dispatchCommand(evt.command)
-            let _ = evt;
+            return crate::command::run(app, &evt.command);
         }
         Event::TuiToastShow(evt) if workspace_matches => {
             app.show_toast(Toast {

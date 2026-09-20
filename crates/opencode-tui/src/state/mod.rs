@@ -15,9 +15,10 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
+use crate::keymap::Keymap;
 use crate::state::kv::Kv;
 use crate::state::local::LocalState;
-use crate::state::route::RouteStore;
+use crate::state::route::{PromptInfo, Route, RouteStore};
 use crate::state::sync::SyncState;
 use crate::transport::events::{BusEvent, EventMetadata};
 use crate::ui::theme::ThemeStore;
@@ -146,16 +147,45 @@ impl State {
 }
 
 /// A dialog awaiting the dialog stack (TODO(M8.7) renders/interacts).
+/// The variants opened by command dispatch (`dialog.replace(...)`) carry
+/// the target dialog; M8.7 will turn this into the real stack.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PendingDialog {
     /// `dialog.replace(DialogProviderList)` (`app.tsx:542-551`).
     ProviderConnect,
     /// `DialogConfirm.show` on `installation.update-available`
     /// (`app.tsx:1033-1079`).
-    UpdateAvailable { version: String },
+    UpdateAvailable {
+        version: String,
+    },
+    CommandPalette,
+    SessionList,
+    Model,
+    Agent,
+    Mcp,
+    ThemeList,
+    Help,
+    Status,
+    Debug,
+    ConsoleOrg,
+    Variant,
+    SessionRename,
+    Timeline,
+    ForkFromTimeline,
+    Skill,
+    StashList,
+    WorkspaceList,
+    WorkspaceSet,
+    ExportOptions,
+    MoveSession,
+    /// The `Share Session` confirm (`session/index.tsx:489-493`) —
+    /// M8.7 wires the answer.
+    ShareConsent {
+        session_id: String,
+    },
 }
 
-/// Keymap modes and focus (TODO(M8.4)), dialog stack (TODO(M8.7)) plus
+/// Keymap modes and focus (M8.4), dialog stack (TODO(M8.7)) plus
 /// the app-shell bookkeeping of M8.3.
 #[derive(Debug, Default)]
 pub struct UiState {
@@ -179,6 +209,28 @@ pub struct UiState {
     /// Exit was requested; `exit_reason` becomes stderr + exit code 1.
     pub exit: bool,
     pub exit_reason: Option<String>,
+    /// The prompt textarea's focus — the managed-textarea layer is
+    /// enabled while focused (`keymap.tsx:229-232`).
+    pub prompt_focused: bool,
+    /// The prompt editor buffer (TODO(M8.6): the real textarea).
+    pub prompt_input: String,
+    pub prompt_parts: Vec<Value>,
+    /// `conceal` signal (`session/index.tsx:258`) — per-session, not
+    /// persisted.
+    pub conceal: bool,
+    /// `sidebarOpen` (`session/index.tsx:260`).
+    pub sidebar_open: bool,
+    /// Terminal width — the `>120` sidebar boundary. Updated on
+    /// `Msg::Resize`.
+    pub terminal_width: u16,
+    /// `store.interrupt` (`prompt/index.tsx:396-421`).
+    pub interrupt: u32,
+    pub interrupt_reset_at: Option<u64>,
+    /// `prompt/stash.tsx`.
+    pub stash: Vec<PromptInfo>,
+    /// `docs.open` etc. print their URL instead of opening a browser
+    /// (spec §6 N6) — collected by the runtime after the loop.
+    pub opened_urls: Vec<String>,
 }
 
 /// `StartupLoading` timers (`component/startup-loading.tsx:26-63`) as a
@@ -261,7 +313,7 @@ pub enum Msg {
 
 /// Async work fired by [`update`] — the runtime loop executes each
 /// against the server seam.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum Effect {
     /// `bootstrap()` (`sync.tsx:451`) — `server.instance.disposed`.
     Bootstrap { fatal: bool },
@@ -279,27 +331,72 @@ pub enum Effect {
     /// `terminal.suspend` — leave raw mode, `SIGTSTP`, resume on
     /// `SIGCONT` (`app.tsx:870-879`).
     SuspendTerminal,
+    /// `session.share` (`session/index.tsx:488-512`).
+    SessionShare { session_id: String },
+    /// `session.unshare` (`session/index.tsx:559-585`).
+    SessionUnshare { session_id: String },
+    /// `session.summarize` (`session/index.tsx:561-572`).
+    SessionSummarize {
+        session_id: String,
+        provider_id: String,
+        model_id: String,
+    },
+    /// `session.abort` (undo + interrupt paths).
+    SessionAbort { session_id: String },
+    /// `session.revert` (`session/index.tsx:610-644`).
+    SessionRevert {
+        session_id: String,
+        message_id: String,
+    },
+    /// `session.unrevert` (`session/index.tsx:646-671`).
+    SessionUnrevert { session_id: String },
+    /// `sync.session.refresh()` — re-list sessions (`local.tsx`).
+    SessionRefresh,
+    /// `experimental.session.background` (`session/index.tsx:1024-1030`).
+    SessionBackground { session_id: String },
+    /// `session.copy` — clipboard write of `formatTranscript(...)`
+    /// (TODO(M8.8): the transcript formatter).
+    SessionCopyTranscript {
+        thinking: bool,
+        tool_details: bool,
+        assistant_metadata: bool,
+    },
+    /// Clipboard write with optional toasts (`util/clipboard.ts`).
+    ClipboardWrite {
+        text: String,
+        success: Option<Toast>,
+        failure: Option<Toast>,
+    },
+    /// §6 N6: `docs.open` prints the URL instead of opening a browser.
+    OpenUrl { url: String },
 }
 
 pub struct App {
     pub state: State,
     pub ui: UiState,
     pub config: crate::config::TuiConfig,
+    /// The resolved keymap (`config/index.tsx:95-111`) — M8.4.
+    pub keymap: Keymap,
     /// Bumped on every update — the redraw signal (§2.1).
     pub version: u64,
 }
 
 impl App {
     pub fn new(config: crate::config::TuiConfig, args: Args, state_dir: Option<&Path>) -> App {
+        let keymap = Keymap::resolve(&config);
         let mut state = State::new(args, state_dir);
         let ui = UiState {
             theme: ThemeStore::init(&mut state.kv, config.theme.as_deref()),
+            conceal: true,
+            prompt_focused: true,
+            terminal_width: 80,
             ..UiState::default()
         };
         App {
             state,
             ui,
             config,
+            keymap,
             version: 0,
         }
     }
@@ -331,36 +428,41 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             }
         }
         Msg::Key(key) => {
-            // TODO(M8.4): keymap dispatch (leader, modes, bindings).
-            // TODO(M8.6): a focused non-empty prompt clears the input
-            // on ctrl+c instead of exiting (app.tsx:977-985).
-            if key.kind != crossterm::event::KeyEventKind::Release
-                && key
-                    .modifiers
-                    .contains(crossterm::event::KeyModifiers::CONTROL)
-            {
-                match key.code {
-                    crossterm::event::KeyCode::Char('c') | crossterm::event::KeyCode::Char('d') => {
-                        app.exit(None);
-                    }
-                    _ => {}
+            let context = crate::keymap::DispatchContext {
+                route_is_session: matches!(app.state.route.data, Route::Session { .. }),
+                prompt_focused: app.ui.prompt_focused,
+                foreground_tasks: crate::command::foreground_tasks(app) > 0,
+            };
+            let commands = app.keymap.dispatch(&context, &key, app.ui.tick_ms);
+            for name in commands {
+                if crate::command::is_enabled(app, name) {
+                    effects.extend(crate::command::run(app, name));
+                    break;
                 }
             }
         }
         Msg::Mouse(_) => {
             // TODO(M8.5): scroll + click handling (util/scroll.ts).
         }
-        Msg::Resize(_, _) => {
-            // Layout is recomputed on every draw.
+        Msg::Resize(columns, _) => {
+            // Layout is recomputed on every draw; the sidebar boundary
+            // needs the width.
+            app.ui.terminal_width = columns;
         }
         Msg::Tick(elapsed) => {
             let now_ms = elapsed.as_millis() as u64;
             app.ui.tick_ms = now_ms;
             app.ui.startup_loading.poll(now_ms);
-            // The Rust port has no plugin host (spec §6 N2) — `ready` is
-            // always true, so the overlay only ever shows the
-            // "Finishing startup…" hold.
             app.ui.startup_loading.transition(true, now_ms);
+            // The timed leader's `setTimeout` (`registerTimedLeader`).
+            app.keymap.poll(now_ms);
+            // `setTimeout(() => setStore("interrupt", 0), 5000)`.
+            if let Some(reset_at) = app.ui.interrupt_reset_at {
+                if now_ms >= reset_at {
+                    app.ui.interrupt = 0;
+                    app.ui.interrupt_reset_at = None;
+                }
+            }
         }
     }
     app.version += 1;
@@ -409,6 +511,8 @@ mod tests {
 
     #[test]
     fn exit_keys_request_exit() {
+        // The prompt starts focused but empty — the `app.exit` gate
+        // (`app.tsx:977-985`) keeps ctrl+c/ctrl+d exiting.
         let mut app = App::new(crate::config::TuiConfig::default(), Args::default(), None);
         update(
             &mut app,
@@ -428,6 +532,20 @@ mod tests {
             )),
         );
         assert!(app.ui.exit);
+
+        // A focused non-empty prompt: ctrl+c clears the input instead
+        // (§5.2 — the app.exit gate).
+        let mut app = App::new(crate::config::TuiConfig::default(), Args::default(), None);
+        app.ui.prompt_input = "typing".into();
+        update(
+            &mut app,
+            Msg::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('c'),
+                crossterm::event::KeyModifiers::CONTROL,
+            )),
+        );
+        assert!(!app.ui.exit);
+        assert_eq!(app.ui.prompt_input, "");
 
         let mut app = App::new(crate::config::TuiConfig::default(), Args::default(), None);
         update(

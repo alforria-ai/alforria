@@ -1,9 +1,8 @@
 //! TUI config (`config/index.tsx`) — the resolved shape `run()` receives.
 //!
 //! The `tui` schema lives in the user's `opencode.json`; the CLI resolves it
-//! and hands it to the TUI as part of [`crate::TuiInput`]. Only the fields
-//! the M8.3 runtime consumes are here; keybinds land with the keymap
-//! (TODO(M8.4)) and attention with the attention seam (TODO(M8.8)).
+//! and hands it to the TUI as part of [`crate::TuiInput`]. `keybinds` carries
+//! the user overrides resolved by the keymap (TODO(M8.7): dialog config).
 
 /// `prompt.max_width` (`config/index.tsx:54-59`): a fixed column cap or
 /// `"auto"` — `max(75, 70% of terminal width)`.
@@ -22,6 +21,14 @@ pub struct TuiConfig {
     pub theme: Option<String>,
     /// `prompt.max_width` — default 75 (`routes/home.tsx:33-37`).
     pub prompt_max_width: PromptMaxWidth,
+    /// `keybinds` (`config/index.tsx:67`) — user overrides,
+    /// keybind name → binding string (`"none"`, `"false"`, …).
+    pub keybinds: std::collections::BTreeMap<String, String>,
+    /// `leader_timeout` (`config/index.tsx:66`) — default 2000.
+    pub leader_timeout_ms: Option<u64>,
+    /// The `ResolveOptions.terminalSuspend` flag (`config/index.tsx:86-89`)
+    /// — `process.platform !== "win32"`.
+    pub terminal_suspend_supported: bool,
 }
 
 impl Default for TuiConfig {
@@ -30,6 +37,9 @@ impl Default for TuiConfig {
             mouse: true,
             theme: None,
             prompt_max_width: PromptMaxWidth::Fixed(75),
+            keybinds: std::collections::BTreeMap::new(),
+            leader_timeout_ms: None,
+            terminal_suspend_supported: cfg!(not(target_os = "windows")),
         }
     }
 }
