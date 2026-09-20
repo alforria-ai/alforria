@@ -141,7 +141,13 @@ fn event_sequence(events: &[Value]) -> Vec<String> {
 /// file lands on disk, the tool result feeds the follow-up request, and
 /// the final text answer closes the loop.
 pub fn a1_file_mutation(backend: &impl LlmBackend) -> ScenarioRun {
-    let run = run_scenario(backend, A1_FILE_MUTATION, "create notes.md for me", |_| {});
+    // Live models need a directive prompt to guarantee a `write` call.
+    let prompt = if backend.live() {
+        "Use the write tool to create a file named notes.md with a note about opencode, then confirm."
+    } else {
+        "create notes.md for me"
+    };
+    let run = run_scenario(backend, A1_FILE_MUTATION, prompt, |_| {});
     run.assert_exit_zero();
 
     let content = std::fs::read_to_string(run.project_dir.join("notes.md"))
@@ -203,15 +209,16 @@ pub fn a1_file_mutation(backend: &impl LlmBackend) -> ScenarioRun {
 /// A2 — multi-step loop: three model steps, the middle one issuing two
 /// parallel `read` calls in one assistant turn.
 pub fn a2_multi_step(backend: &impl LlmBackend) -> ScenarioRun {
-    let run = run_scenario(
-        backend,
-        A2_MULTI_STEP,
-        "read the two files and answer",
-        |project| {
-            std::fs::write(project.join("a.txt"), "alpha\n").expect("seed a.txt");
-            std::fs::write(project.join("b.txt"), "beta\n").expect("seed b.txt");
-        },
-    );
+    // Live models need a directive prompt to guarantee a `read` call.
+    let prompt = if backend.live() {
+        "Use the read tool to read a.txt and b.txt, then tell me their contents."
+    } else {
+        "read the two files and answer"
+    };
+    let run = run_scenario(backend, A2_MULTI_STEP, prompt, |project| {
+        std::fs::write(project.join("a.txt"), "alpha\n").expect("seed a.txt");
+        std::fs::write(project.join("b.txt"), "beta\n").expect("seed b.txt");
+    });
     run.assert_exit_zero();
 
     let reads = run.tool_parts("read");
