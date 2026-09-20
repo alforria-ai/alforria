@@ -5,4 +5,5 @@
 //! per change. This crate is transport-first: everything above
 //! `transport::api` is testable against a `FakeApi` + fake event source.
 
+pub mod state;
 pub mod transport;

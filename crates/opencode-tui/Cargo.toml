@@ -14,6 +14,9 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha1 = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }
+tempfile = "3"

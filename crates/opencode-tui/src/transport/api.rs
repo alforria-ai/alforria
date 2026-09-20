@@ -199,10 +199,15 @@ pub struct MoveSessionDestination {
 }
 
 /// The server API seam — one async trait method per generated SDK client
-/// call the TUI makes. Tests target `FakeApi` scriptable doubles
-/// (TODO(M8.2); the sync reducer drives these).
+/// call the TUI makes. Tests target `FakeApi` scriptable doubles (the
+/// sync reducer drives these).
 #[async_trait]
 pub trait ServerApi: Send + Sync {
+    async fn path_get(&self, loc: &Location) -> Result<Value>;
+    async fn project_current(&self, loc: &Location) -> Result<Value>;
+    async fn project_directories(&self, loc: &Location, project_id: &str) -> Result<Value>;
+    async fn experimental_workspace_list(&self, loc: &Location) -> Result<Value>;
+    async fn experimental_workspace_status(&self, loc: &Location) -> Result<Value>;
     async fn config_providers(&self, loc: &Location) -> Result<Value>;
     async fn config_get(&self, loc: &Location) -> Result<Value>;
     async fn provider_list(&self, loc: &Location) -> Result<Value>;
@@ -449,6 +454,27 @@ impl HttpServerApi {
 
 #[async_trait]
 impl ServerApi for HttpServerApi {
+    async fn path_get(&self, loc: &Location) -> Result<Value> {
+        self.get("/path", loc).await
+    }
+
+    async fn project_current(&self, loc: &Location) -> Result<Value> {
+        self.get("/project/current", loc).await
+    }
+
+    async fn project_directories(&self, loc: &Location, project_id: &str) -> Result<Value> {
+        self.get(&format!("/project/{project_id}/directories"), loc)
+            .await
+    }
+
+    async fn experimental_workspace_list(&self, loc: &Location) -> Result<Value> {
+        self.get("/experimental/workspace", loc).await
+    }
+
+    async fn experimental_workspace_status(&self, loc: &Location) -> Result<Value> {
+        self.get("/experimental/workspace/status", loc).await
+    }
+
     async fn config_providers(&self, loc: &Location) -> Result<Value> {
         self.get("/config/providers", loc).await
     }
