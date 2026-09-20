@@ -172,13 +172,17 @@ pub fn resolve(
 }
 
 /// network.ts:51-54 — raw argv up to a `--` separator.
+pub fn raw_args(raw: &[OsString]) -> &[OsString] {
+    network_args(raw)
+}
+
 fn network_args(raw: &[OsString]) -> &[OsString] {
     let separator = raw.iter().position(|arg| arg == "--");
     separator.map_or(raw, |index| &raw[..index])
 }
 
 /// network.ts:41-43 — `arg === name || arg.startsWith(name + "=")`.
-fn has_arg(argv: &[OsString], name: &str) -> bool {
+pub fn has_arg(argv: &[OsString], name: &str) -> bool {
     let prefix = format!("{name}=");
     argv.iter().any(|arg| {
         let arg = arg.to_string_lossy();
@@ -195,6 +199,12 @@ fn has_boolean_arg(argv: &[OsString], name: &str) -> bool {
         let arg = arg.to_string_lossy();
         arg == name || arg == true_form || arg == false_form || arg == negated
     })
+}
+
+/// The empty global-config view of `resolveNetworkOptionsNoConfig`
+/// (network.ts:62-79 with no config values).
+pub fn empty_server_config() -> ServerConfig {
+    ServerConfig::default()
 }
 
 /// `resolveNetworkOptions` (network.ts:56-59): the `Config.getGlobal()` view.

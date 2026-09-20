@@ -8,11 +8,14 @@ use crate::error::{CliError, TypedError};
 use crate::network;
 use crate::ui::Ui;
 
+pub mod acp;
 pub mod agent;
+pub mod attach;
 pub mod db;
 pub mod debug;
 pub mod mcp;
 pub mod models;
+pub mod pr;
 pub mod providers;
 pub mod run;
 pub mod run_events;
@@ -20,116 +23,261 @@ pub mod run_files;
 pub mod run_output;
 pub mod serve;
 pub mod session;
+pub mod tui;
 pub mod web;
 
 pub fn cli() -> Command {
-    Command::new("opencode")
-        .version(env!("CARGO_PKG_VERSION"))
-        .disable_version_flag(true)
-        .arg(
-            Arg::new("print-logs")
-                .long("print-logs")
-                .global(true)
-                .help("print logs to stderr")
-                .action(ArgAction::SetTrue),
-        )
-        .arg(
-            Arg::new("log-level")
-                .long("log-level")
-                .global(true)
-                .help("log level")
-                .value_parser(PossibleValuesParser::new([
-                    "DEBUG", "INFO", "WARN", "ERROR",
-                ])),
-        )
-        .arg(
-            Arg::new("pure")
-                .long("pure")
-                .global(true)
-                .help("run without external plugins")
-                .action(ArgAction::SetTrue),
-        )
-        .arg(
-            Arg::new("version")
-                .long("version")
-                .short('v')
-                .help("show version number")
-                .action(ArgAction::Version),
-        )
-        .arg(Arg::new("project").help("path to start opencode in"))
-        .subcommand(Command::new("acp").about("start ACP (Agent Client Protocol) server"))
-        .subcommand(mcp())
-        // $0 default command (TODO(C8): tui)
-        .subcommand(attach())
-        .subcommand(run())
-        .subcommand(Command::new("generate"))
-        .subcommand(debug())
-        .subcommand(console())
-        .subcommand(providers())
-        .subcommand(agent())
-        .subcommand(
-            Command::new("upgrade").about("upgrade opencode to the latest or a specific version"),
-        )
-        .subcommand(
-            Command::new("uninstall").about("uninstall opencode and remove all related files"),
-        )
-        .subcommand(network::with_network_options(
-            Command::new("serve").about("starts a headless opencode server"),
-        ))
-        .subcommand(network::with_network_options(
-            Command::new("web").about("start opencode server and open web interface"),
-        ))
-        .subcommand(
-            Command::new("models")
-                .about("list all available models")
-                .arg(Arg::new("provider").help("list models for a specific provider"))
-                .arg(
-                    Arg::new("verbose")
-                        .long("verbose")
-                        .help("use more verbose model output (includes metadata like costs)")
-                        .action(ArgAction::SetTrue),
-                )
-                .arg(
-                    Arg::new("refresh")
-                        .long("refresh")
-                        .help("refresh the models cache from models.dev")
-                        .action(ArgAction::SetTrue),
-                ),
-        )
-        .subcommand(Command::new("stats").about("show token usage and cost statistics"))
-        .subcommand(
-            Command::new("export")
-                .about("export session data as JSON")
-                .arg(Arg::new("sessionID")),
-        )
-        .subcommand(
-            Command::new("import")
-                .about("import session data from JSON file or URL")
-                .arg(
-                    Arg::new("file")
-                        .required(true)
-                        .help("path to JSON file or share URL"),
-                ),
-        )
-        .subcommand(github())
-        .subcommand(
-            Command::new("pr")
-                .about("fetch and checkout a GitHub PR branch, then run opencode")
-                .arg(
-                    Arg::new("number")
-                        .required(true)
-                        .value_parser(clap::value_parser!(i64)),
-                ),
-        )
-        .subcommand(session())
-        .subcommand(plug())
-        .subcommand(db())
+    network::with_network_options(
+        Command::new("opencode")
+            .version(env!("CARGO_PKG_VERSION"))
+            .disable_version_flag(true)
+            .arg(
+                Arg::new("print-logs")
+                    .long("print-logs")
+                    .global(true)
+                    .help("print logs to stderr")
+                    .action(ArgAction::SetTrue),
+            )
+            .arg(
+                Arg::new("log-level")
+                    .long("log-level")
+                    .global(true)
+                    .help("log level")
+                    .value_parser(PossibleValuesParser::new([
+                        "DEBUG", "INFO", "WARN", "ERROR",
+                    ])),
+            )
+            .arg(
+                Arg::new("pure")
+                    .long("pure")
+                    .global(true)
+                    .help("run without external plugins")
+                    .action(ArgAction::SetTrue),
+            )
+            .arg(
+                Arg::new("version")
+                    .long("version")
+                    .short('v')
+                    .help("show version number")
+                    .action(ArgAction::Version),
+            )
+            .arg(Arg::new("project").help("path to start opencode in"))
+            // `$0` default-command flags (tui.ts:75-128).
+            .arg(
+                Arg::new("model")
+                    .long("model")
+                    .short('m')
+                    .help("model to use in the format of provider/model"),
+            )
+            .arg(
+                Arg::new("continue")
+                    .long("continue")
+                    .short('c')
+                    .action(ArgAction::SetTrue)
+                    .help("continue the last session"),
+            )
+            .arg(
+                Arg::new("session")
+                    .long("session")
+                    .short('s')
+                    .help("session id to continue"),
+            )
+            .arg(
+                Arg::new("fork")
+                    .long("fork")
+                    .action(ArgAction::SetTrue)
+                    .help("fork the session when continuing (use with --continue or --session)"),
+            )
+            .arg(Arg::new("prompt").long("prompt").help("prompt to use"))
+            .arg(Arg::new("agent").long("agent").help("agent to use"))
+            .arg(
+                Arg::new("auto")
+                    .long("auto")
+                    .action(ArgAction::SetTrue)
+                    .help("auto-approve permissions that are not explicitly denied (dangerous!)"),
+            )
+            .arg(
+                Arg::new("yolo")
+                    .long("yolo")
+                    .action(ArgAction::SetTrue)
+                    .hide(true),
+            )
+            .arg(
+                Arg::new("dangerously-skip-permissions")
+                    .long("dangerously-skip-permissions")
+                    .action(ArgAction::SetTrue)
+                    .hide(true),
+            )
+            .arg(
+                Arg::new("mini")
+                    .long("mini")
+                    .action(ArgAction::SetTrue)
+                    .help("start the minimal interactive interface"),
+            )
+            .arg(
+                Arg::new("replay")
+                    .long("replay")
+                    .action(ArgAction::SetTrue)
+                    .hide(true),
+            )
+            .arg(
+                Arg::new("no-replay")
+                    .long("no-replay")
+                    .action(ArgAction::SetTrue)
+                    .help("disable mini session history replay on resume and after resize"),
+            )
+            .arg(
+                Arg::new("replay-limit")
+                    .long("replay-limit")
+                    .value_parser(clap::value_parser!(f64))
+                    .help("cap visible mini replay to the newest N messages"),
+            )
+            .arg(
+                Arg::new("demo")
+                    .long("demo")
+                    .action(ArgAction::SetTrue)
+                    .hide(true),
+            )
+            .subcommand(acp())
+            .subcommand(mcp())
+            // $0 default command (TODO(C8): tui)
+            .subcommand(attach())
+            .subcommand(run())
+            .subcommand(Command::new("generate"))
+            .subcommand(debug())
+            .subcommand(console())
+            .subcommand(providers())
+            .subcommand(agent())
+            .subcommand(
+                Command::new("upgrade")
+                    .about("upgrade opencode to the latest or a specific version"),
+            )
+            .subcommand(
+                Command::new("uninstall").about("uninstall opencode and remove all related files"),
+            )
+            .subcommand(network::with_network_options(
+                Command::new("serve").about("starts a headless opencode server"),
+            ))
+            .subcommand(network::with_network_options(
+                Command::new("web").about("start opencode server and open web interface"),
+            ))
+            .subcommand(
+                Command::new("models")
+                    .about("list all available models")
+                    .arg(Arg::new("provider").help("list models for a specific provider"))
+                    .arg(
+                        Arg::new("verbose")
+                            .long("verbose")
+                            .help("use more verbose model output (includes metadata like costs)")
+                            .action(ArgAction::SetTrue),
+                    )
+                    .arg(
+                        Arg::new("refresh")
+                            .long("refresh")
+                            .help("refresh the models cache from models.dev")
+                            .action(ArgAction::SetTrue),
+                    ),
+            )
+            .subcommand(Command::new("stats").about("show token usage and cost statistics"))
+            .subcommand(
+                Command::new("export")
+                    .about("export session data as JSON")
+                    .arg(Arg::new("sessionID")),
+            )
+            .subcommand(
+                Command::new("import")
+                    .about("import session data from JSON file or URL")
+                    .arg(
+                        Arg::new("file")
+                            .required(true)
+                            .help("path to JSON file or share URL"),
+                    ),
+            )
+            .subcommand(github())
+            .subcommand(
+                Command::new("pr")
+                    .about("fetch and checkout a GitHub PR branch, then run opencode")
+                    .arg(
+                        Arg::new("number")
+                            .required(true)
+                            .value_parser(clap::value_parser!(i64)),
+                    ),
+            )
+            .subcommand(session())
+            .subcommand(plug())
+            .subcommand(db()),
+    )
 }
 
 fn attach() -> Command {
     Command::new("attach")
         .about("attach to a running opencode server")
         .arg(Arg::new("url").required(true).help("http://localhost:4096"))
+        .arg(Arg::new("dir").long("dir").help("directory to run in"))
+        .arg(
+            Arg::new("continue")
+                .long("continue")
+                .short('c')
+                .action(ArgAction::SetTrue)
+                .help("continue the last session"),
+        )
+        .arg(
+            Arg::new("session")
+                .long("session")
+                .short('s')
+                .help("session id to continue"),
+        )
+        .arg(
+            Arg::new("fork")
+                .long("fork")
+                .action(ArgAction::SetTrue)
+                .help("fork the session when continuing (use with --continue or --session)"),
+        )
+        .arg(
+            Arg::new("password")
+                .long("password")
+                .short('p')
+                .help("basic auth password (defaults to OPENCODE_SERVER_PASSWORD)"),
+        )
+        .arg(
+            Arg::new("username")
+                .long("username")
+                .short('u')
+                .help("basic auth username (defaults to OPENCODE_SERVER_USERNAME or 'opencode')"),
+        )
+        .arg(
+            Arg::new("mini")
+                .long("mini")
+                .action(ArgAction::SetTrue)
+                .help("start the minimal interactive interface"),
+        )
+        .arg(
+            Arg::new("replay")
+                .long("replay")
+                .action(ArgAction::SetTrue)
+                .hide(true),
+        )
+        .arg(
+            Arg::new("no-replay")
+                .long("no-replay")
+                .action(ArgAction::SetTrue)
+                .help("disable mini session history replay on resume and after resize"),
+        )
+        .arg(
+            Arg::new("replay-limit")
+                .long("replay-limit")
+                .value_parser(clap::value_parser!(f64))
+                .help("cap visible mini replay to the newest N messages"),
+        )
+}
+
+fn acp() -> Command {
+    // The `process.cwd()` default is applied in the handler (clap
+    // defaults are 'static).
+    network::with_network_options(
+        Command::new("acp").about("start ACP (Agent Client Protocol) server"),
+    )
+    .arg(Arg::new("cwd").long("cwd").help("working directory"))
 }
 
 fn run() -> Command {
@@ -710,7 +858,14 @@ pub fn route(matches: &ArgMatches, ui: &mut Ui, raw: &[OsString]) -> Result<(), 
         "db" => db::run(matches.subcommand_matches("db").expect("db"), ui),
         "debug" => debug::run(matches.subcommand_matches("debug").expect("debug"), ui),
         "mcp" => mcp::run(matches.subcommand_matches("mcp").expect("mcp"), ui),
-        // TODO(C8): tui ($0), attach, acp, pr
+        "tui" => tui::run(matches, ui, raw),
+        "attach" => attach::run(
+            matches.subcommand_matches("attach").expect("attach"),
+            ui,
+            raw,
+        ),
+        "acp" => acp::run(matches.subcommand_matches("acp").expect("acp"), ui, raw),
+        "pr" => pr::cli_run(matches.subcommand_matches("pr").expect("pr"), ui, raw),
         // TODO(C9): stats, export, import, generate
         _ => Err(stub(name)),
     }
@@ -803,15 +958,15 @@ mod tests {
     fn no_args_routes_to_default_tui() {
         let matches = cli().try_get_matches_from(["opencode"]).unwrap();
         let (mut ui, _captured) = Ui::capture(false);
-        let err = route(&matches, &mut ui, &[]).unwrap_err();
-        assert!(format_error_needed(&err).contains("tui is not implemented yet"));
+        tui::with_tui_runner(Box::new(|_, _, _, _| Err(stub("tui"))), || {
+            let err = route(&matches, &mut ui, &[]).unwrap_err();
+            assert!(format_error_needed(&err).contains("tui is not implemented yet"));
+        });
     }
 
     #[test]
     fn routes_registered_commands_to_stubs() {
         let cases: Vec<(&str, Vec<&str>)> = vec![
-            ("acp", vec!["acp"]),
-            ("attach", vec!["attach", "http://localhost:4096"]),
             ("generate", vec!["generate"]),
             ("console", vec!["console", "orgs"]),
             ("upgrade", vec!["upgrade"]),
@@ -820,7 +975,6 @@ mod tests {
             ("export", vec!["export"]),
             ("import", vec!["import", "file.json"]),
             ("github", vec!["github", "install"]),
-            ("pr", vec!["pr", "42"]),
             ("plugin", vec!["plugin", "module"]),
             ("plugin", vec!["plug", "module"]),
         ];
