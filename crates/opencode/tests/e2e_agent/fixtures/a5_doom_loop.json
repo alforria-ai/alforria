@@ -1,0 +1,47 @@
+{
+  "comment": "A5 — three identical read calls trigger the doom_loop ask, then recovery text",
+  "turns": [
+    {
+      "frames": [
+        {
+          "tool_call": {
+            "id": "cal_1",
+            "name": "read",
+            "arguments": { "filePath": "a.txt" }
+          }
+        },
+        {
+          "tool_call": {
+            "id": "cal_2",
+            "name": "read",
+            "arguments": { "filePath": "a.txt" }
+          }
+        },
+        {
+          "tool_call": {
+            "id": "cal_3",
+            "name": "read",
+            "arguments": { "filePath": "a.txt" }
+          }
+        },
+        {
+          "finish": {
+            "reason": "tool_calls",
+            "usage": { "input": 50, "output": 5 }
+          }
+        }
+      ]
+    },
+    {
+      "frames": [
+        { "text": "recovered" },
+        {
+          "finish": {
+            "reason": "stop",
+            "usage": { "input": 60, "output": 3 }
+          }
+        }
+      ]
+    }
+  ]
+}

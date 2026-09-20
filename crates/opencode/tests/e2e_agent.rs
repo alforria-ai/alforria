@@ -12,3 +12,5 @@ mod mock;
 mod scenarios;
 #[path = "e2e_agent/transcript.rs"]
 mod transcript;
+#[path = "e2e_agent/wire.rs"]
+mod wire;

@@ -25,6 +25,14 @@ pub enum Frame {
     Text { text: String },
     ToolCall { tool_call: ToolCall },
     Finish { finish: Finish },
+    Sleep { sleep_ms: u64 },
+}
+
+/// One lowered wire chunk: the SSE bytes to flush and an optional
+/// mid-stream stall before flushing them (spec E2E §2.3 `sleep_ms`).
+pub struct Chunk {
+    pub body: String,
+    pub delay_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -69,17 +77,30 @@ fn split_arguments(arguments: &str) -> Vec<String> {
     vec![arguments[..mid].to_string(), arguments[mid..].to_string()]
 }
 
-/// Lower one turn to OpenAI-compatible SSE wire bytes.
-pub fn turn_to_sse(turn: &Turn) -> String {
-    let mut body = String::new();
+/// Lower one turn to wire chunks: every `sleep_ms` frame stalls the
+/// emission of the chunks after it (the abort-test seam).
+pub fn turn_chunks(turn: &Turn) -> Vec<Chunk> {
+    let mut out: Vec<Chunk> = Vec::new();
+    let mut current = String::new();
+    let mut delay: Option<u64> = None;
     let mut tool_index = 0usize;
     for frame in &turn.frames {
+        if let Frame::Sleep { sleep_ms } = frame {
+            if !current.is_empty() {
+                out.push(Chunk {
+                    body: std::mem::take(&mut current),
+                    delay_ms: None,
+                });
+            }
+            delay = Some(delay.unwrap_or_default() + sleep_ms);
+            continue;
+        }
         match frame {
             Frame::Text { text } => {
-                body.push_str(&data_line(&chunk(json!({"content": text}))));
+                current.push_str(&data_line(&chunk(json!({"content": text}))));
             }
             Frame::ToolCall { tool_call } => {
-                body.push_str(&data_line(&chunk(json!({
+                current.push_str(&data_line(&chunk(json!({
                     "tool_calls": [{
                         "index": tool_index,
                         "id": tool_call.id,
@@ -89,7 +110,7 @@ pub fn turn_to_sse(turn: &Turn) -> String {
                 }))));
                 let arguments = tool_call.arguments.to_string();
                 for piece in split_arguments(&arguments) {
-                    body.push_str(&data_line(&chunk(json!({
+                    current.push_str(&data_line(&chunk(json!({
                         "tool_calls": [{
                             "index": tool_index,
                             "function": {"arguments": piece},
@@ -108,12 +129,17 @@ pub fn turn_to_sse(turn: &Turn) -> String {
                         "completion_tokens": usage.output,
                     });
                 }
-                body.push_str(&data_line(&payload));
+                current.push_str(&data_line(&payload));
             }
+            Frame::Sleep { .. } => unreachable!("handled above"),
         }
     }
-    body.push_str("data: [DONE]\n\n");
-    body
+    current.push_str("data: [DONE]\n\n");
+    out.push(Chunk {
+        body: current,
+        delay_ms: delay,
+    });
+    out
 }
 
 impl Transcript {

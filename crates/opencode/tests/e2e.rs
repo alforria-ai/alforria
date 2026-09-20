@@ -5,7 +5,7 @@
 mod harness;
 
 use std::io::{BufRead, BufReader};
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use axum::routing::{any, post};
@@ -152,42 +152,6 @@ fn run_missing_file_exits_one() {
 // serve: handshake + attach
 // -----------------------------------------------------------------------
 
-/// Spawn `serve --port 0`, read stdout lines until the handshake, and
-/// return the child plus the parsed port.
-fn spawn_serve(env: &Env) -> (Child, u16) {
-    let mut child = env
-        .command(&["serve", "--port", "0"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn serve");
-    let stdout = child.stdout.take().expect("serve stdout");
-    let reader = std::sync::mpsc::channel::<String>();
-    std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines() {
-            let Ok(line) = line else { break };
-            let _ = reader.0.send(line);
-        }
-    });
-    let deadline = Instant::now() + Duration::from_secs(60);
-    let mut port = None;
-    while port.is_none() {
-        let line = reader
-            .1
-            .recv_timeout(Duration::from_secs(1))
-            .expect("serve handshake line");
-        if let Some(rest) = line.strip_prefix("opencode server listening on ") {
-            port = rest
-                .trim_start_matches("http://")
-                .rsplit(':')
-                .next()
-                .map(|port| port.parse::<u16>().expect("port"));
-        }
-        assert!(Instant::now() < deadline, "serve handshake timed out");
-    }
-    (child, port.expect("port"))
-}
-
 #[test]
 fn serve_prints_warning_and_handshake() {
     let env = env_with_llm("serve", "x");
@@ -245,17 +209,16 @@ fn serve_prints_warning_and_handshake() {
 #[test]
 fn run_attach_against_running_serve() {
     let env = env_with_llm("attach", "Hello from the mock");
-    let (mut child, port) = spawn_serve(&env);
+    let serve = harness::Serve::spawn(&env);
     let output = env.run(&[
         "run",
         "--attach",
-        &format!("http://127.0.0.1:{port}"),
+        &format!("http://127.0.0.1:{}", serve.port),
         "--model",
         "mock/mock-model",
         "Say hi",
     ]);
-    let _ = child.kill();
-    let _ = child.wait();
+    drop(serve);
     assert_eq!(
         output.code,
         Some(0),

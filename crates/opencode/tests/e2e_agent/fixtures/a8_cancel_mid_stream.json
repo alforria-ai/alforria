@@ -1,0 +1,34 @@
+{
+  "comment": "A8 — the stream stalls behind the tool call so abort interrupts mid-stream; the re-prompt continues on turn 2",
+  "turns": [
+    {
+      "frames": [
+        {
+          "tool_call": {
+            "id": "cal_1",
+            "name": "read",
+            "arguments": { "filePath": "a.txt" }
+          }
+        },
+        { "sleep_ms": 60000 },
+        {
+          "finish": {
+            "reason": "tool_calls",
+            "usage": { "input": 50, "output": 5 }
+          }
+        }
+      ]
+    },
+    {
+      "frames": [
+        { "text": "resumed" },
+        {
+          "finish": {
+            "reason": "stop",
+            "usage": { "input": 60, "output": 3 }
+          }
+        }
+      ]
+    }
+  ]
+}

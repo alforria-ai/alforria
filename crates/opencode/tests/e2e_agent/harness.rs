@@ -2,7 +2,7 @@
 //! lifted from `tests/e2e.rs` (single source of truth — `e2e.rs` includes
 //! this file via `#[path]`).
 
-use std::io::Read;
+use std::io::{BufRead, Read};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -186,6 +186,65 @@ pub struct ProcOutput {
     pub code: Option<i32>,
     pub stdout: String,
     pub stderr: String,
+}
+
+/// A running `opencode serve` bound to a loopback port, killed on drop.
+pub struct Serve {
+    pub port: u16,
+    child: Child,
+}
+
+impl Serve {
+    /// Spawn `serve --port 0` and wait for the handshake line.
+    // The child is killed and waited on in `Drop`; the lint cannot see
+    // through the struct handle.
+    #[allow(clippy::zombie_processes)]
+    pub fn spawn(env: &Env) -> Serve {
+        let mut child = env
+            .command(&["serve", "--port", "0"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn serve");
+        let stdout = child.stdout.take().expect("serve stdout");
+        let mut stderr = child.stderr.take().expect("serve stderr");
+        // Drain both pipes from reader threads so a full pipe can never
+        // block the child.
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                let _ = tx.send(line);
+            }
+        });
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            let _ = stderr.read_to_string(&mut text);
+        });
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let line = rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("serve handshake line");
+            if let Some(rest) = line.strip_prefix("opencode server listening on ") {
+                let port = rest
+                    .trim_start_matches("http://")
+                    .rsplit(':')
+                    .next()
+                    .map(|port| port.parse::<u16>().expect("port"))
+                    .expect("handshake port");
+                return Serve { port, child };
+            }
+            assert!(Instant::now() < deadline, "serve handshake timed out");
+        }
+    }
+}
+
+impl Drop for Serve {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 /// Wait for the child, draining stdout/stderr in reader threads (a

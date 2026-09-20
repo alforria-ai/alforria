@@ -78,4 +78,82 @@ mod e2e_agent {
             })
             .unwrap_or_default()
     }
+    // -------------------------------------------------------------------
+    // A3 — permission gate over the wire (once / always / reject)
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a3_permission_once_asks_for_every_call() {
+        let backend = MockBackend::new(scenarios::A3_PERMISSION_GATE);
+        let asks = scenarios::a3_permission_gate(&backend, scenarios::Reply::Once).await;
+
+        assert_eq!(asks.len(), 2);
+        assert_eq!(backend.requests().len(), 3, "one request per step");
+        let second = tool_results(backend.request(1));
+        assert_eq!(second.len(), 1, "step 2 sees one result: {second:?}");
+        assert!(
+            second[0]["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("TOKEN=1"),
+            "{second:?}"
+        );
+        let third = tool_results(backend.request(2));
+        assert_eq!(third.len(), 2, "step 3 sees both results: {third:?}");
+    }
+
+    #[tokio::test]
+    async fn a3_permission_always_skips_the_second_ask() {
+        let backend = MockBackend::new(scenarios::A3_PERMISSION_GATE);
+        let asks = scenarios::a3_permission_gate(&backend, scenarios::Reply::Always).await;
+
+        assert_eq!(asks.len(), 1, "always must skip the second ask");
+        assert_eq!(backend.requests().len(), 3, "one request per step");
+        let third = tool_results(backend.request(2));
+        assert_eq!(third.len(), 2, "step 3 sees both results: {third:?}");
+    }
+
+    #[tokio::test]
+    async fn a3_permission_reject_breaks_the_loop() {
+        let backend = MockBackend::new(scenarios::A3_PERMISSION_GATE);
+        let asks = scenarios::a3_permission_gate(&backend, scenarios::Reply::Reject).await;
+
+        // The rejection blocks the loop (processor.ts:200-201): no second
+        // model request.
+        assert!(!asks.is_empty());
+        assert_eq!(backend.requests().len(), 1, "the loop must break");
+    }
+
+    // -------------------------------------------------------------------
+    // A5 — doom-loop over the wire
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a5_doom_loop_asks_once_and_all_parts_run() {
+        let backend = MockBackend::new(scenarios::A5_DOOM_LOOP);
+        let asks = scenarios::a5_doom_loop(&backend).await;
+
+        assert_eq!(asks.len(), 1);
+        assert_eq!(backend.requests().len(), 2, "one request per step");
+        let results = tool_results(backend.request(1));
+        assert_eq!(results.len(), 3, "three read results: {results:?}");
+    }
+
+    // -------------------------------------------------------------------
+    // A8 — cancel mid-stream
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a8_cancel_mid_stream_interrupts_and_reprompt_continues() {
+        let backend = MockBackend::new(scenarios::A8_CANCEL_MID_STREAM);
+        let messages = scenarios::a8_cancel_mid_stream(&backend).await;
+
+        // Two model requests: the aborted stream and the re-prompt.
+        assert_eq!(backend.requests().len(), 2, "{messages:?}");
+        let serialized = serde_json::to_string(&backend.request(1)).expect("request body");
+        assert!(
+            serialized.contains("go again"),
+            "the re-prompt must reach the model: {serialized}"
+        );
+    }
 }

@@ -7,7 +7,21 @@ use axum::Router;
 use serde_json::Value;
 
 use crate::harness::MockServer;
-use crate::transcript::{summarizer_turn, turn_to_sse, Transcript};
+use crate::transcript::{summarizer_turn, turn_chunks, Chunk, Transcript, Turn};
+
+/// One scripted response body: the lowered turn chunks, streamed with
+/// their mid-stream stalls (spec E2E §2.3 `sleep_ms`).
+fn turn_body(turn: Turn) -> axum::body::Body {
+    use futures::StreamExt;
+    let chunks: Vec<Chunk> = turn_chunks(&turn);
+    let stream = futures::stream::iter(chunks).then(|chunk| async move {
+        if let Some(ms) = chunk.delay_ms {
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        }
+        Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(chunk.body))
+    });
+    axum::body::Body::from_stream(stream)
+}
 
 /// Everything a scenario needs to wire and drive one LLM provider.
 pub trait LlmBackend {
@@ -60,7 +74,7 @@ impl MockBackend {
                     match turn {
                         Some(turn) => axum::response::Response::builder()
                             .header("content-type", "text/event-stream")
-                            .body(axum::body::Body::from(turn_to_sse(&turn)))
+                            .body(turn_body(turn))
                             .expect("response"),
                         None => axum::response::Response::builder()
                             .status(500)
