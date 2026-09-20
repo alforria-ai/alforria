@@ -65,7 +65,7 @@ pub fn auth_header(password: Option<&str>, username: Option<&str>) -> Option<Str
         .unwrap_or_else(|| "opencode".to_string());
     Some(format!(
         "Basic {}",
-        b64::encode(&format!("{username}:{password}"))
+        b64::encode(format!("{username}:{password}"))
     ))
 }
 
@@ -73,8 +73,8 @@ pub fn auth_header(password: Option<&str>, username: Option<&str>) -> Option<Str
 mod b64 {
     const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-    pub fn encode(input: &str) -> String {
-        let bytes = input.as_bytes();
+    pub fn encode(input: impl AsRef<[u8]>) -> String {
+        let bytes = input.as_ref();
         let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
         for chunk in bytes.chunks(3) {
             let buf = [
@@ -98,6 +98,11 @@ mod b64 {
         }
         out
     }
+}
+
+/// Public re-export of the base64 codec (used by the run `--file` flow).
+pub fn base64_encode(input: impl AsRef<[u8]>) -> String {
+    b64::encode(input)
 }
 
 /// Parse one SSE block (lines between blank-line separators) into its data
@@ -273,6 +278,49 @@ impl OpencodeClient {
             .post(&format!("/session/{session_id}/message"), body)
             .await?;
         Self::response_value(response).await
+    }
+
+    /// `POST /session/{sessionID}/share` (run.ts:535-548 share flow).
+    pub async fn session_share(&self, session_id: &str) -> Result<Value, ClientError> {
+        let response = self
+            .post(
+                &format!("/session/{session_id}/share"),
+                serde_json::json!({}),
+            )
+            .await?;
+        Self::response_value(response).await
+    }
+
+    /// `POST /session/{sessionID}/command` (run.ts:845-861).
+    pub async fn session_command(
+        &self,
+        session_id: &str,
+        body: Value,
+    ) -> Result<Value, ClientError> {
+        let response = self
+            .post(&format!("/session/{session_id}/command"), body)
+            .await?;
+        Self::response_value(response).await
+    }
+
+    /// `GET /config` — `sdk.config.get()`.
+    pub async fn config_get(&self) -> Result<Value, ClientError> {
+        let response = self.get("/config").await?;
+        Self::response_value(response).await
+    }
+
+    /// `GET /path` — `sdk.path.get()`.
+    pub async fn path_get(&self) -> Result<Value, ClientError> {
+        let response = self.get("/path").await?;
+        Self::response_value(response).await
+    }
+
+    /// `GET /agent` — `sdk.app.agents()`.
+    pub async fn agent_list(&self) -> Result<Vec<Value>, ClientError> {
+        let response = self.get("/agent").await?;
+        let value = Self::response_value(response).await?;
+        serde_json::from_value(value)
+            .map_err(|err| ClientError::transport(format!("invalid JSON response: {err}")))
     }
 
     /// `POST /permission/{requestID}/reply`.

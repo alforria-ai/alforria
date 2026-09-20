@@ -8,9 +8,10 @@ use serde_json::{json, Value};
 
 use crate::client::{ClientError, OpencodeClient};
 use crate::error::{CliError, TypedError};
-use crate::ui::Ui;
+use crate::ui::{self, Ui};
 
-use super::run_events::{apply, map_event, LoopState, Output};
+use super::run_events::{self, apply, map_event, LoopState, Output};
+use super::{run_files, run_output};
 
 /// The parsed `run` flag surface (run.ts builder 135-262).
 #[derive(Debug, Clone, Default)]
@@ -227,11 +228,23 @@ fn resolve_root() -> PathBuf {
     fs_resolve(joined)
 }
 
-/// run.ts:331-345 — root resolution + the `--dir` chdir (local mode only).
-pub fn resolve_directory(root: &Path, dir: Option<&str>) -> Result<PathBuf, CliError> {
+/// run.ts:331-345 — root resolution + the `--dir` chdir (local mode only);
+/// in attach mode `--dir` is a path on the remote, never a local chdir.
+pub fn resolve_directory(
+    root: &Path,
+    dir: Option<&str>,
+    attach: bool,
+) -> Result<Option<PathBuf>, CliError> {
     let Some(dir) = dir else {
-        return Ok(root.to_path_buf());
+        return Ok(if attach {
+            None
+        } else {
+            Some(root.to_path_buf())
+        });
     };
+    if attach {
+        return Ok(Some(PathBuf::from(dir)));
+    }
     let target = if Path::new(dir).is_absolute() {
         PathBuf::from(dir)
     } else {
@@ -242,7 +255,32 @@ pub fn resolve_directory(root: &Path, dir: Option<&str>) -> Result<PathBuf, CliE
             "Failed to change directory to {dir}"
         )));
     }
-    Ok(std::env::current_dir().unwrap_or(target))
+    Ok(Some(std::env::current_dir().unwrap_or(target)))
+}
+
+/// run.ts:40-50 — `resolveRunInput`: piped stdin is appended to the CLI
+/// message with `\n` (message wins positionally).
+pub fn resolve_run_input(value: Option<&str>, piped: Option<&str>) -> Option<String> {
+    let falsy = |input: Option<&str>| input.is_none_or(|input| input.is_empty());
+    if falsy(value) {
+        return piped.map(str::to_string);
+    }
+    if falsy(piped) {
+        return value.map(str::to_string);
+    }
+    Some(format!("{}\n{}", value.unwrap(), piped.unwrap()))
+}
+
+/// run.ts:416 — piped stdin, `undefined` when stdin is a TTY.
+fn read_piped_stdin() -> Option<String> {
+    use std::io::IsTerminal;
+    if std::io::stdin().is_terminal() {
+        return None;
+    }
+    let mut buffer = Vec::new();
+    std::io::Read::read_to_end(&mut std::io::stdin(), &mut buffer)
+        .ok()
+        .map(|_| String::from_utf8_lossy(&buffer).into_owned())
 }
 
 /// One resolved session (run.ts:67-71 `SessionInfo`).
@@ -354,8 +392,184 @@ pub async fn resolve_session(
     })
 }
 
-// TODO(C4): formatRunError parity (wrapClientError + FormatError chain).
+/// run.ts:593-668 — agent validation (`localAgent`/`attachAgent` behind
+/// `pickAgent`): unknown or subagent agents fall back to the default with
+/// a warning line.
+pub fn pick_agent(
+    listing: Result<Vec<Value>, ClientError>,
+    name: Option<&str>,
+    attach: Option<&str>,
+    ui: &mut Ui,
+) -> Option<String> {
+    let agent = name?;
+    let agents = match listing {
+        Ok(agents) => agents,
+        Err(_) => {
+            if let Some(attach) = attach {
+                warn_line(
+                    ui,
+                    &format!("failed to list agents from {attach}. Falling back to default agent"),
+                );
+                return None;
+            }
+            Vec::new()
+        }
+    };
+    let found = agents
+        .iter()
+        .find(|entry| entry.get("name").and_then(|v| v.as_str()) == Some(agent));
+    let Some(found) = found else {
+        warn_line(
+            ui,
+            &format!("agent \"{agent}\" not found. Falling back to default agent"),
+        );
+        return None;
+    };
+    if found.get("mode").and_then(|v| v.as_str()) == Some("subagent") {
+        warn_line(
+            ui,
+            &format!("agent \"{agent}\" is a subagent, not a primary agent. Falling back to default agent"),
+        );
+        return None;
+    }
+    Some(agent.to_string())
+}
+
+/// `UI.println(TEXT_WARNING_BOLD + "!", TEXT_NORMAL, message)` — joined
+/// with a single space (run.ts:608-611).
+fn warn_line(ui: &mut Ui, message: &str) {
+    ui.println(&format!(
+        "{}! {}{}",
+        ui::style::TEXT_WARNING_BOLD,
+        ui::style::TEXT_NORMAL,
+        message
+    ));
+}
+
+/// run.ts:538 — `cfg.share === "auto" || flags.autoShare || args.share`.
+pub fn share_gate(config_share: Option<&str>, auto_share_env: bool, share_flag: bool) -> bool {
+    config_share == Some("auto") || auto_share_env || share_flag
+}
+
+/// run.ts:546 — `~  {url}` info-bold.
+pub fn share_success_line(url: &str) -> String {
+    format!("{}~  {url}", ui::style::TEXT_INFO_BOLD)
+}
+
+/// run.ts:542 — `!  {message}` danger-bold.
+pub fn share_disabled_line(message: &str) -> String {
+    format!("{}!  {message}", ui::style::TEXT_DANGER_BOLD)
+}
+
+/// run.ts:535-548 — after session creation (and in `execute`), if config
+/// `share == "auto"` or the flag/env is set → call `session.share`; share
+/// failures are non-fatal.
+async fn share(client: &OpencodeClient, session_id: &str, share_flag: bool, ui: &mut Ui) {
+    let Ok(config) = client.config_get().await else {
+        return;
+    };
+    let config_share = config.get("share").and_then(|v| v.as_str());
+    if !share_gate(
+        config_share,
+        opencode_server::engine::bool_env("OPENCODE_AUTO_SHARE"),
+        share_flag,
+    ) {
+        return;
+    }
+    match client.session_share(session_id).await {
+        Ok(data) => {
+            if let Some(url) = data
+                .get("share")
+                .and_then(|share| share.get("url"))
+                .and_then(|v| v.as_str())
+            {
+                ui.println(&share_success_line(url));
+            }
+        }
+        Err(err) => {
+            let message = error_message(&err);
+            if message.contains("disabled") {
+                ui.println(&share_disabled_line(&message));
+            }
+        }
+    }
+}
+
+/// `current(sdk)` — attach-mode remote directory resolution (run.ts:583-593).
+async fn resolve_remote_directory(client: &OpencodeClient) -> Result<String, CliError> {
+    match client.path_get().await {
+        Ok(value) => value
+            .get("directory")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| CliError::new("Failed to resolve remote directory")),
+        Err(_) => Err(CliError::new("Failed to resolve remote directory")),
+    }
+}
+
+/// run.ts:845-861 — the `session.command` body. Note the raw `--model`
+/// string, not the `pick()`-ed model (matches the TS reference).
+pub fn command_body(args: &RunArgs, agent: Option<&str>, message: &str) -> Value {
+    let mut body = json!({
+        "command": args.command,
+        "arguments": message,
+    });
+    if let Some(agent) = agent {
+        body["agent"] = json!(agent);
+    }
+    if let Some(model) = &args.model {
+        body["model"] = json!(model);
+    }
+    if let Some(variant) = &args.variant {
+        body["variant"] = json!(variant);
+    }
+    body
+}
+
+/// run.ts:863-877 — the `session.prompt` body: parts = files + text.
+pub fn prompt_body(args: &RunArgs, agent: Option<&str>, files: Vec<Value>, message: &str) -> Value {
+    let mut parts = files;
+    parts.push(json!({"type": "text", "text": message}));
+    let mut body = json!({"parts": parts});
+    if let Some((provider_id, model_id)) = pick_model(args.model.as_deref()) {
+        body["model"] = json!({"providerID": provider_id, "modelID": model_id});
+    }
+    if let Some(agent) = agent {
+        body["agent"] = json!(agent);
+    }
+    if let Some(variant) = &args.variant {
+        body["variant"] = json!(variant);
+    }
+    body
+}
+
+/// run.ts:86 — `formatRunError` = `FormatError(error) ?? FormatUnknownError(error)`
+/// over the parsed result-tuple error body.
 fn format_run_error(error: &ClientError) -> String {
+    if let Some(body) = &error.body {
+        if let Ok(value) = serde_json::from_str::<Value>(body) {
+            if let Some(formatted) = crate::error::format_json_error(&value) {
+                return formatted;
+            }
+            return crate::error::format_json_unknown(&value);
+        }
+    }
+    error.message.clone()
+}
+
+/// The error body as a JSON payload for `emit("error", { error })` —
+/// `wrapClientError` keeps the parsed body for the result-tuple path.
+fn error_payload(error: &ClientError) -> Value {
+    if let Some(body) = &error.body {
+        if let Ok(value) = serde_json::from_str::<Value>(body) {
+            return value;
+        }
+    }
+    Value::String(error.message.clone())
+}
+
+/// `wrapClientError`'s message extraction (`data.message` → `message`).
+fn error_message(error: &ClientError) -> String {
     if let Some(body) = &error.body {
         if let Ok(value) = serde_json::from_str::<Value>(body) {
             if let Some(message) = value
@@ -384,44 +598,104 @@ fn handler(args: &RunArgs, ui: &mut Ui) -> Result<(), TypedError> {
     validate(args, true, ui.is_tty())?;
 
     let root = resolve_root();
-    let directory = resolve_directory(&root, args.dir.as_deref())?;
+    let directory = resolve_directory(&root, args.dir.as_deref(), args.attach.is_some())?;
+
+    // File paths resolve against the local root in attach mode
+    // (run.ts:368 — the remote never sees the local chdir).
+    let file_base = if args.attach.is_some() {
+        root.clone()
+    } else {
+        directory.clone().unwrap_or_else(|| root.clone())
+    };
+    let files = run_files::resolve_files(args.attach.is_some(), &file_base, &args.file)?;
+
+    let piped = read_piped_stdin();
+    let message = resolve_run_input(Some(&message), piped.as_deref()).unwrap_or_default();
     require_message(args, &message)?;
     require_fork(args)?;
 
-    if args.command.is_some() {
-        // TODO(C4): command mode (run.ts:845-861).
-        return Err(TypedError::Cli(CliError::new(
-            "--command is not supported yet",
-        )));
-    }
-
     let runtime = super::runtime()?;
-    runtime.block_on(execute(args, ui, &directory, &message))
+    runtime.block_on(execute(args, ui, &root, directory, files, &message))
 }
 
 async fn execute(
     args: &RunArgs,
     ui: &mut Ui,
-    directory: &Path,
+    root: &Path,
+    directory: Option<PathBuf>,
+    files: Vec<Value>,
     message: &str,
 ) -> Result<(), TypedError> {
-    let listener = opencode_server::listen(&opencode_server::ListenOptions {
-        port: args.port,
-        hostname: "127.0.0.1".to_string(),
-        cors: Vec::new(),
-    })
-    .await
-    .map_err(|err| TypedError::Unknown {
-        raw: err.to_string(),
-    })?;
-    let client = OpencodeClient::new(
-        format!("http://127.0.0.1:{}", listener.port),
-        Some(directory.display().to_string()),
-        args.password.as_deref(),
-        args.username.as_deref(),
-    );
-    let sess = resolve_session(&client, args, message).await?;
+    let attach = args.attach.clone();
+    // `_listener` keeps the loopback server bound for the command's life.
+    let _listener = if attach.is_none() {
+        Some(
+            opencode_server::listen(&opencode_server::ListenOptions {
+                port: args.port,
+                hostname: "127.0.0.1".to_string(),
+                cors: Vec::new(),
+            })
+            .await
+            .map_err(|err| TypedError::Unknown {
+                raw: err.to_string(),
+            })?,
+        )
+    } else {
+        None
+    };
+    let base_client = if let Some(url) = &attach {
+        OpencodeClient::new(
+            url,
+            args.dir.clone(),
+            args.password.as_deref(),
+            args.username.as_deref(),
+        )
+    } else {
+        let url = format!(
+            "http://127.0.0.1:{}",
+            _listener.as_ref().map(|l| l.port).unwrap_or_default()
+        );
+        OpencodeClient::new(
+            url,
+            Some(
+                directory
+                    .clone()
+                    .unwrap_or_else(|| root.to_path_buf())
+                    .display()
+                    .to_string(),
+            ),
+            args.password.as_deref(),
+            args.username.as_deref(),
+        )
+    };
+
+    let sess = resolve_session(&base_client, args, message).await?;
     let session_id = sess.id;
+
+    // run.ts:826-828 — attach rebinds the client onto the session's
+    // directory after the session is resolved.
+    let client = if let Some(url) = &attach {
+        let cwd = match args.dir.clone().or(sess.directory) {
+            Some(cwd) => cwd,
+            None => resolve_remote_directory(&base_client).await?,
+        };
+        OpencodeClient::new(
+            url,
+            Some(cwd),
+            args.password.as_deref(),
+            args.username.as_deref(),
+        )
+    } else {
+        base_client
+    };
+
+    let agent = pick_agent(
+        client.agent_list().await,
+        args.agent.as_deref(),
+        attach.as_deref(),
+        ui,
+    );
+    share(&client, &session_id, args.share, ui).await;
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(256);
     client
@@ -429,20 +703,22 @@ async fn execute(
         .await
         .map_err(|err| TypedError::Cli(CliError::new(format_run_error(&err))))?;
 
-    let mut body = json!({"parts": [{"type": "text", "text": message}]});
-    if let Some((provider_id, model_id)) = pick_model(args.model.as_deref()) {
-        body["model"] = json!({"providerID": provider_id, "modelID": model_id});
-    }
-    if let Some(agent) = &args.agent {
-        body["agent"] = json!(agent);
-    }
-    if let Some(variant) = &args.variant {
-        body["variant"] = json!(variant);
-    }
+    let command = args.command.is_some();
+    let body = if command {
+        command_body(args, agent.as_deref(), message)
+    } else {
+        prompt_body(args, agent.as_deref(), files, message)
+    };
     let mut prompt = {
         let client = client.clone();
-        let url = format!("/session/{session_id}/message");
-        tokio::spawn(async move { client.session_prompt(&url, body).await })
+        let session_id = session_id.clone();
+        tokio::spawn(async move {
+            if command {
+                client.session_command(&session_id, body).await
+            } else {
+                client.session_prompt(&session_id, body).await
+            }
+        })
     };
 
     let auto = args.auto || args.yolo || args.dangerously_skip_permissions;
@@ -493,7 +769,20 @@ async fn execute(
         }
     }
     if let Some(err) = prompt_error {
-        return Err(TypedError::Cli(CliError::new(format_run_error(&err))));
+        // run.ts:855-857, 872-874 — emit the error event in json mode,
+        // format onto stderr otherwise; exit 1 either way.
+        if args.format == "json" {
+            let line = run_output::emit_envelope(
+                run_events::now_ms(),
+                "error",
+                &session_id,
+                &json!({"error": error_payload(&err)}),
+            );
+            ui.write_stdout(&format!("{line}\n"));
+        } else {
+            ui.error(&format_run_error(&err));
+        }
+        return Err(TypedError::Cli(CliError::with_exit_code("", 1)));
     }
     if state.error.is_some() {
         // Errors already rendered per event; exit code 1 without a new line.
@@ -501,9 +790,6 @@ async fn execute(
     }
     Ok(())
 }
-
-// TODO(C4): --attach remote transport; --file parts; stdin merge; share flow;
-// agent validation; --format json emission.
 
 #[cfg(test)]
 mod tests {
@@ -772,17 +1058,28 @@ mod tests {
     #[test]
     fn resolve_directory_without_dir_is_root() {
         let root = PathBuf::from("/tmp");
-        assert_eq!(resolve_directory(&root, None).unwrap(), root);
+        assert_eq!(resolve_directory(&root, None, false).unwrap(), Some(root));
     }
 
     #[test]
     fn resolve_directory_chdir_failure_is_error() {
         let root = PathBuf::from("/tmp");
-        let err = resolve_directory(&root, Some("/definitely/not/here")).unwrap_err();
+        let err = resolve_directory(&root, Some("/definitely/not/here"), false).unwrap_err();
         assert_eq!(
             err.message,
             "Failed to change directory to /definitely/not/here"
         );
+    }
+
+    #[test]
+    fn resolve_directory_attach_never_chdirs() {
+        let root = PathBuf::from("/tmp");
+        // An unchdir-able path is fine in attach mode — it is remote data.
+        assert_eq!(
+            resolve_directory(&root, Some("/remote/path"), true).unwrap(),
+            Some(PathBuf::from("/remote/path"))
+        );
+        assert_eq!(resolve_directory(&root, None, true).unwrap(), None);
     }
 
     struct FakeApi {
@@ -922,5 +1219,194 @@ mod tests {
         };
         let err = resolve_session(&api, &args(), "m").await.unwrap_err();
         assert_eq!(err.message, "Session not found");
+    }
+
+    #[test]
+    fn resolve_run_input_matrix() {
+        assert_eq!(resolve_run_input(None, None), None);
+        assert_eq!(
+            resolve_run_input(Some("msg"), None),
+            Some("msg".to_string())
+        );
+        assert_eq!(
+            resolve_run_input(None, Some("piped")),
+            Some("piped".to_string())
+        );
+        assert_eq!(
+            resolve_run_input(Some("msg"), Some("piped")),
+            Some("msg\npiped".to_string())
+        );
+        // Empty strings are falsy (`resolveRunInput`, run.ts:40-46).
+        assert_eq!(resolve_run_input(Some(""), None), None);
+        assert_eq!(
+            resolve_run_input(Some(""), Some("piped")),
+            Some("piped".to_string())
+        );
+        assert_eq!(
+            resolve_run_input(Some("msg"), Some("")),
+            Some("msg".to_string())
+        );
+    }
+
+    #[test]
+    fn pick_agent_matrix() {
+        let (mut ui, captured) = crate::ui::Ui::capture(false);
+        let agents = vec![
+            json!({"name": "build", "mode": "primary"}),
+            json!({"name": "search", "mode": "subagent"}),
+        ];
+        // No agent requested → no validation.
+        assert_eq!(pick_agent(Ok(agents.clone()), None, None, &mut ui), None);
+        // Unknown agent falls back with a warning.
+        assert_eq!(
+            pick_agent(Ok(agents.clone()), Some("nope"), None, &mut ui),
+            None
+        );
+        // Subagents fall back too.
+        assert_eq!(
+            pick_agent(Ok(agents.clone()), Some("search"), None, &mut ui),
+            None
+        );
+        // Primary agents pass through.
+        assert_eq!(
+            pick_agent(Ok(agents.clone()), Some("build"), None, &mut ui),
+            Some("build".to_string())
+        );
+        let stderr = captured.stderr();
+        assert!(
+            stderr.contains("agent \"nope\" not found. Falling back to default agent"),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains(
+                "agent \"search\" is a subagent, not a primary agent. Falling back to default agent"
+            ),
+            "{stderr}"
+        );
+    }
+
+    #[test]
+    fn pick_agent_attach_listing_failure_warns() {
+        let (mut ui, captured) = crate::ui::Ui::capture(false);
+        let err = ClientError {
+            status: Some(500),
+            body: None,
+            message: "boom".to_string(),
+        };
+        assert_eq!(
+            pick_agent(Err(err), Some("build"), Some("http://remote"), &mut ui),
+            None
+        );
+        let stderr = captured.stderr();
+        assert!(
+            stderr.contains(
+                "failed to list agents from http://remote. Falling back to default agent"
+            ),
+            "{stderr}"
+        );
+    }
+
+    #[test]
+    fn share_gate_matrix() {
+        assert!(share_gate(Some("auto"), false, false));
+        assert!(share_gate(None, true, false));
+        assert!(share_gate(None, false, true));
+        assert!(!share_gate(None, false, false));
+        assert!(!share_gate(Some("manual"), false, false));
+    }
+
+    #[test]
+    fn share_lines_follow_ts_styles() {
+        assert_eq!(
+            share_success_line("https://s.opncd.ai/x"),
+            "\u{1b}[94m\u{1b}[1m~  https://s.opncd.ai/x"
+        );
+        assert_eq!(
+            share_disabled_line("Sharing is disabled in configuration"),
+            "\u{1b}[91m\u{1b}[1m!  Sharing is disabled in configuration"
+        );
+    }
+
+    fn client_error(body: Option<&str>) -> ClientError {
+        ClientError {
+            status: Some(400),
+            body: body.map(str::to_string),
+            message: "400 Bad Request".to_string(),
+        }
+    }
+
+    #[test]
+    fn format_run_error_formats_tagged_bodies() {
+        let err = client_error(Some(
+            "{\"name\":\"MCPFailed\",\"data\":{\"name\":\"remote\"}}",
+        ));
+        assert_eq!(
+            format_run_error(&err),
+            "MCP server \"remote\" failed. Note, opencode does not support MCP authentication yet."
+        );
+    }
+
+    #[test]
+    fn format_run_error_pretty_prints_unknown_bodies() {
+        let err = client_error(Some("{\"name\":\"APIError\"}"));
+        assert_eq!(format_run_error(&err), "{\n  \"name\": \"APIError\"\n}");
+    }
+
+    #[test]
+    fn format_run_error_falls_back_to_message() {
+        let err = client_error(None);
+        assert_eq!(format_run_error(&err), "400 Bad Request");
+    }
+
+    #[test]
+    fn error_payload_parses_body_or_falls_back() {
+        assert_eq!(
+            error_payload(&client_error(Some("{\"a\":1}"))),
+            json!({"a": 1})
+        );
+        assert_eq!(
+            error_payload(&client_error(None)),
+            Value::String("400 Bad Request".to_string())
+        );
+    }
+
+    #[test]
+    fn command_body_matches_ts_shape() {
+        let mut run_args = args();
+        run_args.command = Some("compact".to_string());
+        run_args.agent = Some("build".to_string());
+        run_args.model = Some("anthropic/claude".to_string());
+        run_args.variant = Some("high".to_string());
+        assert_eq!(
+            command_body(&run_args, Some("build"), "extra args"),
+            json!({
+                "command": "compact",
+                "arguments": "extra args",
+                "agent": "build",
+                "model": "anthropic/claude",
+                "variant": "high",
+            })
+        );
+    }
+
+    #[test]
+    fn prompt_body_matches_ts_shape() {
+        let mut run_args = args();
+        run_args.model = Some("anthropic/claude".to_string());
+        let files = vec![
+            json!({"type": "file", "url": "file:///a", "filename": "a", "mime": "text/plain"}),
+        ];
+        let body = prompt_body(&run_args, None, files, "hello");
+        assert_eq!(
+            body["parts"],
+            json!([
+                {"type": "file", "url": "file:///a", "filename": "a", "mime": "text/plain"},
+                {"type": "text", "text": "hello"},
+            ])
+        );
+        assert_eq!(
+            body["model"],
+            json!({"providerID": "anthropic", "modelID": "claude"})
+        );
     }
 }

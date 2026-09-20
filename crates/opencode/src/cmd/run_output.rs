@@ -467,6 +467,37 @@ pub fn tool_inline_info(part: &Value) -> Inline {
     }
 }
 
+/// The `emit()` envelope (run.ts:678-691): `{type, timestamp, sessionID,
+/// ...data}` — built as a string so the key order is `JSON.stringify`
+/// regardless of map ordering; `data` keys spread after `sessionID`.
+pub fn emit_envelope(timestamp: u64, kind: &str, session_id: &str, payload: &Value) -> String {
+    let mut out = String::from("{");
+    let mut field = |key: &str, value: String| {
+        if out.len() > 1 {
+            out.push(',');
+        }
+        out.push_str(key);
+        out.push(':');
+        out.push_str(&value);
+    };
+    field("\"type\"", serde_json::to_string(kind).unwrap_or_default());
+    field("\"timestamp\"", timestamp.to_string());
+    field(
+        "\"sessionID\"",
+        serde_json::to_string(session_id).unwrap_or_default(),
+    );
+    if let Some(entries) = payload.as_object() {
+        for (key, value) in entries {
+            field(
+                &serde_json::to_string(key).unwrap_or_default(),
+                serde_json::to_string(value).unwrap_or_default(),
+            );
+        }
+    }
+    out.push('}');
+    out
+}
+
 /// run.ts:73-76 — `UI.println` over the joined style strings.
 pub fn inline_line(info: &Inline) -> String {
     let mut title_suffix = String::new();
@@ -657,5 +688,26 @@ mod tests {
         };
         let line = inline_line(&inline);
         assert_eq!(line, format!("\x1b[0m→ \x1b[0mRead x\x1b[90m extra\x1b[0m"),);
+    }
+
+    #[test]
+    fn emit_envelope_spreads_payload_after_session_id() {
+        let part = json!({"type": "text"});
+        let line = emit_envelope(1234, "text", "ses_1", &json!({"part": part}));
+        assert_eq!(
+            line,
+            format!(
+                "{{\"type\":\"text\",\"timestamp\":1234,\"sessionID\":\"ses_1\",\"part\":{part}}}"
+            )
+        );
+    }
+
+    #[test]
+    fn emit_envelope_without_payload_keys_keeps_envelope() {
+        let line = emit_envelope(0, "error", "ses_1", &json!({}));
+        assert_eq!(
+            line,
+            "{\"type\":\"error\",\"timestamp\":0,\"sessionID\":\"ses_1\"}"
+        );
     }
 }

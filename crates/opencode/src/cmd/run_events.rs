@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::cmd::run_output;
 use crate::ui;
@@ -19,6 +19,8 @@ pub enum Output {
     Stdout(String),
     /// `UI.error(message)`.
     Error(String),
+    /// One `--format json` event line: stdout + EOL (run.ts:678-691).
+    Emit(String),
     /// `client.permission.reply({requestID, reply})`.
     Reply {
         request_id: String,
@@ -38,6 +40,16 @@ pub struct LoopState {
     pub format_json: bool,
     pub tty: bool,
     pub error: Option<String>,
+    /// `Date.now()` seam for the JSON-stream timestamps.
+    pub clock: fn() -> u64,
+}
+
+/// `Date.now()` in epoch milliseconds.
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_default()
 }
 
 impl LoopState {
@@ -47,6 +59,17 @@ impl LoopState {
         thinking: bool,
         format_json: bool,
         tty: bool,
+    ) -> Self {
+        Self::with_clock(session_id, auto, thinking, format_json, tty, now_ms)
+    }
+
+    pub fn with_clock(
+        session_id: String,
+        auto: bool,
+        thinking: bool,
+        format_json: bool,
+        tty: bool,
+        clock: fn() -> u64,
     ) -> Self {
         let mut sessions = HashSet::new();
         sessions.insert(session_id.clone());
@@ -59,6 +82,7 @@ impl LoopState {
             format_json,
             tty,
             error: None,
+            clock,
         }
     }
 }
@@ -113,11 +137,19 @@ fn properties(event: &Value) -> &Value {
     event.get("properties").unwrap_or(&Value::Null)
 }
 
-/// The `emit(type, data)` gate (run.ts:678-691): in json mode an event is
-/// consumed by the JSON stream; the formatted printer skips it.
-fn emit(_state: &LoopState, _kind: &str, _part: &Value) -> bool {
-    // TODO(C4): JSON event stream emission.
-    false
+/// The `emit(type, data)` gate (run.ts:678-691): in json mode the event is
+/// consumed by the JSON stream (stdout + EOL); the formatted printer skips
+/// it. `data` is spread into the envelope after `sessionID`.
+fn emit(state: &LoopState, kind: &str, payload: Value) -> Option<Output> {
+    if !state.format_json {
+        return None;
+    }
+    Some(Output::Emit(run_output::emit_envelope(
+        (state.clock)(),
+        kind,
+        &state.session_id,
+        &payload,
+    )))
 }
 
 /// One event → zero or more outputs (run.ts:702-821). Pure: unit-testable
@@ -200,8 +232,8 @@ pub fn map_event(state: &mut LoopState, event: &Value) -> Vec<Output> {
                 Some(previous) => format!("{previous}\n{err}"),
                 None => err.clone(),
             });
-            if emit(state, "error", error) {
-                return Vec::new();
+            if let Some(emitted) = emit(state, "error", json!({"error": error})) {
+                return vec![emitted];
             }
             vec![Output::Error(err)]
         }
@@ -265,8 +297,8 @@ fn map_part(state: &mut LoopState, part: &Value) -> Vec<Output> {
     let status = str_field(part.get("state").unwrap_or(&Value::Null), "status");
     let part_id = str_field(part, "id");
     if part_type == "tool" && (status == "completed" || status == "error") {
-        if emit(state, "tool_use", part) {
-            return Vec::new();
+        if let Some(emitted) = emit(state, "tool_use", json!({"part": part})) {
+            return vec![emitted];
         }
         if status == "completed" {
             return tool_outputs(part);
@@ -290,14 +322,14 @@ fn map_part(state: &mut LoopState, part: &Value) -> Vec<Output> {
         return tool_outputs(part);
     }
     if part_type == "step-start" {
-        if emit(state, "step_start", part) {
-            return Vec::new();
+        if let Some(emitted) = emit(state, "step_start", json!({"part": part})) {
+            return vec![emitted];
         }
         return Vec::new();
     }
     if part_type == "step-finish" {
-        if emit(state, "step_finish", part) {
-            return Vec::new();
+        if let Some(emitted) = emit(state, "step_finish", json!({"part": part})) {
+            return vec![emitted];
         }
         return Vec::new();
     }
@@ -306,8 +338,8 @@ fn map_part(state: &mut LoopState, part: &Value) -> Vec<Output> {
         if !finished {
             return Vec::new();
         }
-        if emit(state, "text", part) {
-            return Vec::new();
+        if let Some(emitted) = emit(state, "text", json!({"part": part})) {
+            return vec![emitted];
         }
         let text = str_field(part, "text").trim().to_string();
         if text.is_empty() {
@@ -323,8 +355,8 @@ fn map_part(state: &mut LoopState, part: &Value) -> Vec<Output> {
         if !finished || !state.thinking {
             return Vec::new();
         }
-        if emit(state, "reasoning", part) {
-            return Vec::new();
+        if let Some(emitted) = emit(state, "reasoning", json!({"part": part})) {
+            return vec![emitted];
         }
         let text = str_field(part, "text").trim().to_string();
         if text.is_empty() {
@@ -357,6 +389,7 @@ where
             Output::Println(line) => ui.println(line),
             Output::Empty => ui.empty(),
             Output::Stdout(text) => ui.write_stdout(&format!("{text}\n")),
+            Output::Emit(line) => ui.write_stdout(&format!("{line}\n")),
             Output::Error(message) => ui.error(message),
             Output::Reply { request_id, reply } => permission_reply(request_id, reply),
             Output::Stop => {}
@@ -841,5 +874,158 @@ mod tests {
             // The second `empty()` before the text is deduped away (ui.ts:41-46).
             "\u{1b}[0m\n> build · claude\n\u{1b}[0m\nhello\n\u{1b}[0m\n"
         );
+    }
+
+    fn json_state() -> LoopState {
+        LoopState::with_clock("ses_1".to_string(), false, false, true, false, || 1234)
+    }
+
+    #[test]
+    fn json_mode_emits_text_with_envelope() {
+        let mut state = json_state();
+        let event = event(
+            "message.part.updated",
+            json!({"part": part("text", json!({"text": "hi", "time": {"start": 1, "end": 2}}))}),
+        );
+        assert_eq!(
+            map_event(&mut state, &event),
+            vec![Output::Emit(
+                "{\"type\":\"text\",\"timestamp\":1234,\"sessionID\":\"ses_1\",\"part\":{\"id\":\"prt_1\",\"messageID\":\"msg_1\",\"sessionID\":\"ses_1\",\"text\":\"hi\",\"time\":{\"end\":2,\"start\":1},\"type\":\"text\"}}".to_string()
+            )]
+        );
+    }
+
+    /// run.ts:753-754 — `emit` runs before the trim/empty checks.
+    #[test]
+    fn json_mode_emits_empty_text() {
+        let mut state = json_state();
+        let event = event(
+            "message.part.updated",
+            json!({"part": part("text", json!({"text": "  ", "time": {"start": 1, "end": 2}}))}),
+        );
+        let outputs = map_event(&mut state, &event);
+        assert!(
+            matches!(outputs.first(), Some(Output::Emit(_))),
+            "{outputs:?}"
+        );
+    }
+
+    #[test]
+    fn json_mode_emits_reasoning_only_with_thinking() {
+        let mut state = json_state();
+        let event = event(
+            "message.part.updated",
+            json!({"part": part("reasoning", json!({"text": "hmm", "time": {"start": 1, "end": 2}}))}),
+        );
+        assert_eq!(map_event(&mut state, &event), Vec::<Output>::new());
+        state.thinking = true;
+        assert!(matches!(
+            map_event(&mut state, &event).first(),
+            Some(Output::Emit(line)) if line.contains("\"type\":\"reasoning\"")
+        ));
+    }
+
+    #[test]
+    fn json_mode_emits_tool_use_and_skips_inline() {
+        let mut state = json_state();
+        let event = event(
+            "message.part.updated",
+            json!({"part": part("tool", json!({
+                "tool": "read",
+                "state": {"status": "completed", "input": {"filePath": "/a"}, "metadata": {}, "time": {"start": 1, "end": 2}},
+            }))}),
+        );
+        let outputs = map_event(&mut state, &event);
+        assert_eq!(outputs.len(), 1);
+        match &outputs[0] {
+            Output::Emit(line) => {
+                assert!(line.starts_with("{\"type\":\"tool_use\",\"timestamp\":1234,\"sessionID\":\"ses_1\",\"part\":"), "{line}");
+                assert!(line.contains("\"tool\":\"read\""), "{line}");
+            }
+            other => panic!("expected emit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_mode_emits_step_parts() {
+        let mut state = json_state();
+        let step_start = event(
+            "message.part.updated",
+            json!({"part": part("step-start", json!({"time": {"start": 1}}))}),
+        );
+        let outputs = map_event(&mut state, &step_start);
+        match &outputs[0] {
+            Output::Emit(line) => assert!(line.contains("\"type\":\"step_start\""), "{line}"),
+            other => panic!("expected emit, got {other:?}"),
+        }
+        let step_finish = event(
+            "message.part.updated",
+            json!({"part": part("step-finish", json!({"time": {"start": 1, "end": 2}}))}),
+        );
+        let outputs = map_event(&mut state, &step_finish);
+        match &outputs[0] {
+            Output::Emit(line) => assert!(line.contains("\"type\":\"step_finish\""), "{line}"),
+            other => panic!("expected emit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_mode_emits_session_error_and_accumulates() {
+        let mut state = json_state();
+        let event = event(
+            "session.error",
+            json!({
+                "sessionID": "ses_1",
+                "error": {"name": "APIError", "data": {"message": "provider down"}},
+            }),
+        );
+        assert_eq!(
+            map_event(&mut state, &event),
+            vec![Output::Emit(
+                "{\"type\":\"error\",\"timestamp\":1234,\"sessionID\":\"ses_1\",\"error\":{\"data\":{\"message\":\"provider down\"},\"name\":\"APIError\"}}".to_string()
+            )]
+        );
+        assert_eq!(state.error.as_deref(), Some("provider down"));
+    }
+
+    /// run.ts:714-718 — the `> agent · model` header is format-only; the
+    /// `task` running inline is too (run.ts:735).
+    #[test]
+    fn json_mode_suppresses_header_and_task_running() {
+        let mut state = json_state();
+        let header = event(
+            "message.updated",
+            json!({
+                "sessionID": "ses_1",
+                "info": {"role": "assistant", "agent": "build", "modelID": "claude"},
+            }),
+        );
+        assert_eq!(map_event(&mut state, &header), Vec::<Output>::new());
+        let task = event(
+            "message.part.updated",
+            json!({"part": part("tool", json!({
+                "tool": "task",
+                "state": {"status": "running", "input": {"subagent_type": "general"}, "metadata": {}, "time": {"start": 1}},
+            }))}),
+        );
+        assert_eq!(map_event(&mut state, &task), Vec::<Output>::new());
+    }
+
+    /// run.ts:678-691 — stdout + EOL, one compact JSON object per line.
+    #[test]
+    fn apply_writes_json_events_to_stdout_with_eol() {
+        let mut state = json_state();
+        let event = event(
+            "message.part.updated",
+            json!({"part": part("text", json!({"text": "hi", "time": {"start": 1, "end": 2}}))}),
+        );
+        let (mut ui, captured) = crate::ui::Ui::capture(false);
+        let outputs = map_event(&mut state, &event);
+        apply(&mut ui, &outputs, &mut |_, _| {});
+        assert_eq!(
+            captured.stdout(),
+            "{\"type\":\"text\",\"timestamp\":1234,\"sessionID\":\"ses_1\",\"part\":{\"id\":\"prt_1\",\"messageID\":\"msg_1\",\"sessionID\":\"ses_1\",\"text\":\"hi\",\"time\":{\"end\":2,\"start\":1},\"type\":\"text\"}}\n"
+        );
+        assert_eq!(captured.stderr(), "");
     }
 }

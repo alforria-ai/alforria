@@ -10,6 +10,7 @@ use crate::ui::Ui;
 
 pub mod run;
 pub mod run_events;
+pub mod run_files;
 pub mod run_output;
 pub mod serve;
 pub mod web;
