@@ -62,6 +62,10 @@ pub struct SessionPromptDeps {
     pub instruction: Arc<Instruction>,
     pub systems: Arc<dyn SystemPrompts>,
     pub registry: ToolRegistry,
+    /// The engine's MCP tool seam (`mcp.tools()`, tools.ts:389).
+    pub mcp_tools: Option<Arc<dyn crate::session::tools::McpToolSource>>,
+    /// `truncate.output` for MCP tool output (tools.ts:463).
+    pub truncate: Arc<dyn crate::tool::truncate::Truncate>,
     pub revert: Arc<SessionRevert>,
     /// The production `TaskOps` bound into the registry's `task` tool.
     pub prompt_ops: Arc<dyn TaskOps>,
@@ -561,6 +565,8 @@ fn prompt_deps_snapshot(deps: &SessionPromptDeps) -> PromptDeps<'_> {
 fn loop_deps(deps: &SessionPromptDeps) -> LoopDeps {
     LoopDeps {
         sessions: deps.services.sessions.clone(),
+        mcp_tools: deps.mcp_tools.clone(),
+        truncate: deps.truncate.clone(),
         messages: deps.services.messages.clone(),
         events: deps.services.events.clone(),
         status: deps.services.status.clone(),

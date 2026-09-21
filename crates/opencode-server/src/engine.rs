@@ -74,6 +74,55 @@ pub fn background_subagents_enabled() -> bool {
 #[derive(Clone)]
 struct EngineMcp(Arc<opencode_core::mcp::McpService>);
 
+impl opencode_core::session::tools::McpToolSource for EngineMcp {
+    fn mcp_tools<'a>(
+        &'a self,
+    ) -> opencode_core::tool::def::BoxFuture<'a, Vec<opencode_core::session::tools::McpToolEntry>>
+    {
+        Box::pin(async move {
+            self.0
+                .tools()
+                .await
+                .into_iter()
+                .map(|(key, tool)| {
+                    let client = tool.client.clone();
+                    let name = tool.def.name.clone();
+                    opencode_core::session::tools::McpToolEntry {
+                        key,
+                        description: tool.def.description.clone().unwrap_or_default(),
+                        input_schema: tool.def.input_schema.clone(),
+                        execute: std::sync::Arc::new(move |args: serde_json::Value| {
+                            let client = client.clone();
+                            let name = name.clone();
+                            Box::pin(async move {
+                                let raw = client
+                                    .call_tool(&name, args)
+                                    .await
+                                    .map_err(|err| err.to_string())?;
+                                let content = raw
+                                    .get("content")
+                                    .and_then(|value| value.as_array())
+                                    .cloned()
+                                    .unwrap_or_default();
+                                let structured = raw.get("structuredContent").cloned();
+                                let metadata = match raw.get("metadata") {
+                                    Some(value @ serde_json::Value::Object(_)) => value.clone(),
+                                    _ => serde_json::json!({}),
+                                };
+                                Ok(opencode_core::session::tools::McpRawResult {
+                                    content,
+                                    structured_content: structured,
+                                    metadata,
+                                })
+                            })
+                        }),
+                    }
+                })
+                .collect()
+        })
+    }
+}
+
 impl opencode_core::session::prompt_input::McpResources for EngineMcp {
     fn read_resource<'a>(
         &'a self,
@@ -871,6 +920,8 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
         clock,
         instance,
         mcp: Arc::new(EngineMcp(mcp_service.clone())),
+        mcp_tools: Some(Arc::new(EngineMcp(mcp_service.clone()))),
+        truncate,
         lsp: lsp.clone(),
         images: Arc::new(opencode_core::session::prompt_input::NoResize),
         data_dir: input.paths.data.clone(),

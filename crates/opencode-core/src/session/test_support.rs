@@ -845,6 +845,10 @@ fn engine_build_with(
         clock,
         instance: instance.clone(),
         mcp: Arc::new(EmptyMcp),
+        mcp_tools: None,
+        truncate: std::sync::Arc::new(crate::tool::truncate::TruncateService::default_limits(
+            temp.path().to_path_buf(),
+        )),
         lsp: Arc::new(EmptyLsp),
         images: Arc::new(crate::session::prompt_input::NoResize),
         data_dir: temp.path().to_path_buf(),

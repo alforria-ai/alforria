@@ -240,6 +240,10 @@ impl From<crate::CoreError> for LoopError {
 /// Everything `runLoop` closes over.
 pub struct LoopDeps {
     pub sessions: SessionStore,
+    /// The engine's MCP tool seam (`tools()` at tools.ts:389).
+    pub mcp_tools: Option<Arc<dyn crate::session::tools::McpToolSource>>,
+    /// `truncate.output` for MCP tool output (tools.ts:463).
+    pub truncate: Arc<dyn crate::tool::truncate::Truncate>,
     pub messages: MessageStore,
     pub events: Arc<EventBus>,
     pub status: Arc<SessionStatusService>,
@@ -543,6 +547,8 @@ pub async fn run_loop(
                     worktree: deps.instance.worktree.clone(),
                 },
                 clock: deps.clock.clone(),
+                mcp: deps.mcp_tools.clone(),
+                truncate: deps.truncate.clone(),
             };
             let mut tools = crate::session::tools::resolve(
                 &resolve_deps,
@@ -1724,6 +1730,10 @@ mod tests {
         .expect("valid registry");
         LoopDeps {
             sessions: h.services.sessions.clone(),
+            mcp_tools: None,
+            truncate: Arc::new(crate::tool::truncate::TruncateService::default_limits(
+                std::env::temp_dir().join("opencode-loop-tests"),
+            )),
             messages: h.services.messages.clone(),
             events: h.services.events.clone(),
             status: h.services.status.clone(),

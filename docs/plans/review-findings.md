@@ -398,3 +398,16 @@ reference (88c6c7a): llm, session engine, tools, server, CLI+ACP, TUI+foundation
   edit-permission preview is an exact-match simplification (npm `diff`
   fuzzy placement not ported); PowerShell tree-sitter grammar approximated
   by whitespace-split fallback.
+
+
+### Battle-test round 2 (live server, real config)
+
+- **MCP tools were never exposed to the model** — `McpService` connected
+  (status `connected` on `/mcp`) but the session's tool resolution had no
+  MCP seam, so the LLM only ever saw builtin tools. Fixed: `McpToolSource`
+  seam wired engine → `SessionPromptDeps` → `LoopDeps` → `ResolveDeps`;
+  `session/tools.rs` now appends one LLM tool per `{client}_{tool}` with the
+  TS permission ask (`patterns: ["*"]`, `always: ["*"]`), the
+  `structuredContent` fallback, the text/image/resource content mapping
+  and `truncate.output` metadata merge (tools.ts:389-482). Unit test
+  `mcp_tools_are_resolved_and_executed` + live-verified with blender-mcp.
