@@ -185,6 +185,10 @@ fn default_model_from_config(configured_model: Option<&str>, providers: &Value) 
         }
     }
 
+    // TS takes `Provider.sort(models)[0]` — highest priority index
+    // first (provider.ts:2047-2056), i.e. the minimum of the same
+    // key the model options use (priority desc, `latest` first, id
+    // desc).
     let mut best: Option<(i64, i64, std::cmp::Reverse<String>, Value)> = None;
     let mut opencode_best: Option<(i64, i64, std::cmp::Reverse<String>, Value)> = None;
     for (provider_id, provider) in providers.as_object().into_iter().flatten() {
@@ -194,19 +198,18 @@ fn default_model_from_config(configured_model: Option<&str>, providers: &Value) 
         for (model_id, _model) in models {
             let key = sort_key(model_id);
             let value = json!({ "providerID": provider_id, "modelID": model_id });
-            if best
-                .as_ref()
-                .map(|(p, l, r, _)| (*p, *l, r) > (key.0, key.1, &key.2))
-                .unwrap_or(true)
-            {
+            let better = |best: &Option<(i64, i64, std::cmp::Reverse<String>, Value)>| {
+                best.clone()
+                    .map(|(p, l, r, _)| {
+                        (std::cmp::Reverse(p), l, r)
+                            > (std::cmp::Reverse(key.0), key.1, key.2.clone())
+                    })
+                    .unwrap_or(true)
+            };
+            if better(&best) {
                 best = Some((key.0, key.1, key.2.clone(), value.clone()));
             }
-            if provider_id == "opencode"
-                && opencode_best
-                    .as_ref()
-                    .map(|(p, l, r, _)| (*p, *l, r) > (key.0, key.1, &key.2))
-                    .unwrap_or(true)
-            {
+            if provider_id == "opencode" && better(&opencode_best) {
                 opencode_best = Some((key.0, key.1, key.2.clone(), value.clone()));
             }
         }
@@ -410,6 +413,30 @@ mod tests {
         assert_eq!(
             default_model,
             json!({ "providerID": "anthropic", "modelID": "claude-3" })
+        );
+    }
+
+    #[test]
+    fn default_model_follows_the_priority_list() {
+        // `Provider.sort(models)[0]` — the highest priority index wins
+        // over unmatched ids (provider.ts:2047-2056).
+        let providers: Value = serde_json::from_str(
+            r#"{
+                "anthropic": {
+                    "id": "anthropic",
+                    "name": "Anthropic",
+                    "models": {
+                        "claude-3": { "id": "claude-3", "name": "Claude 3" },
+                        "claude-sonnet-4": { "id": "claude-sonnet-4", "name": "Sonnet" }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let default_model = default_model_from_config(None, &providers).unwrap();
+        assert_eq!(
+            default_model,
+            json!({ "providerID": "anthropic", "modelID": "claude-sonnet-4" })
         );
     }
 

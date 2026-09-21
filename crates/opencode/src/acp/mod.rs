@@ -55,36 +55,49 @@ impl AcpAgent {
 
     /// The agent loop — `cli/cmd/acp.ts:47-73` + the sdk
     /// `Connection.receive`. Returns when stdin ends.
+    ///
+    /// Requests are dispatched without awaiting the handler (the sdk
+    /// invokes `processMessage(message)` fire-and-forget), so the read
+    /// loop keeps routing while a long `session/prompt` runs. That is
+    /// load-bearing: inbound responses to outbound requests
+    /// (`session/request_permission`, `fs/write_text_file`) arrive
+    /// mid-prompt and must be routed through `handle_response`, and
+    /// `session/cancel` must interrupt a running prompt.
     pub async fn run(self: Arc<Self>) {
-        let transport = self.connection.transport();
-        while let Some(line) = read_line(&*transport) {
+        while let Some(line) = read_line(&*self.connection.transport()) {
             let Some(message) = Message::parse(&line) else {
                 continue;
             };
             match message {
                 Message::Request { id, method, params } => {
-                    let result = self.dispatch(&method, &params).await;
-                    let response = match result {
-                        Ok(result) => json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "result": result,
-                        }),
-                        Err(error) => json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "error": {
-                                "code": error.code,
-                                "message": error.message,
-                                "data": error.data,
-                            },
-                        }),
-                    };
-                    transport.write(&response.to_string());
+                    let this = Arc::clone(&self);
+                    tokio::spawn(async move {
+                        let result = this.dispatch(&method, &params).await;
+                        let response = match result {
+                            Ok(result) => json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": result,
+                            }),
+                            Err(error) => json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "error": {
+                                    "code": error.code,
+                                    "message": error.message,
+                                    "data": error.data,
+                                },
+                            }),
+                        };
+                        this.connection.transport().write(&response.to_string());
+                    });
                 }
                 Message::Notification { method, params } => {
                     if method == "session/cancel" {
-                        let _ = self.cancel(&params).await;
+                        let this = Arc::clone(&self);
+                        tokio::spawn(async move {
+                            let _ = this.cancel(&params).await;
+                        });
                     }
                 }
                 Message::Response { .. } => {
@@ -570,12 +583,14 @@ impl AcpAgent {
                     .clone()
                     .unwrap_or_else(|| snapshot.select_default_model());
                 let variants = snapshot.variants(&model);
+                // `hasVariant` (service.ts:930-933): the value is valid
+                // when it IS the persisted sentinel or names an existing
+                // variant key.
                 let valid = variants
                     .and_then(|variants| variants.as_object())
                     .map(|variants| {
-                        variants
-                            .keys()
-                            .any(|variant| variant == value || variant == DEFAULT_VARIANT_VALUE)
+                        value == DEFAULT_VARIANT_VALUE
+                            || variants.keys().any(|variant| variant == value)
                     })
                     .unwrap_or(false);
                 if !valid {

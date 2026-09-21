@@ -222,16 +222,12 @@ impl<P: Protocol> Route<P> {
                     let next = tokio::select! {
                         biased;
                         _ = s.halt.cancelled() => {
-                            std::fs::write("/tmp/opencode/dbg_halt.log", format!("halt pending={} state={}
-                    ", s.pending.len(), s.state.is_some())).unwrap();
                             // Interrupted (Effect stream halt): flush the
                             // buffered parser state, then end.
                             s.done = true;
                             if let Some(state) = s.state.take() {
                                 s.pending = s.protocol.on_halt(state);
                             }
-                            std::fs::write("/tmp/opencode/dbg_flush.log", format!("flushed {}
-                    ", s.pending.len())).unwrap();
                             s.frames = futures::stream::empty().boxed();
                             continue;
                         }

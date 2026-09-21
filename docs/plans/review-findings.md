@@ -189,3 +189,151 @@ Panel: glm-5.3-thinking (agentic — two runs, both died mid-flight at turns 50/
   phrasing). Recorded as inherent quality-tier nondeterminism: the live tier
   is a best-effort smoke, not a CI gate; the deterministic contract lives in
   the mock-LLM e2e + parity suites.
+
+## Final full-port review panel (6 agents, post-12.4 close-out)
+
+Six parallel review agents compared the Rust port against the pinned TS
+reference (88c6c7a): llm, session engine, tools, server, CLI+ACP, TUI+foundation.
+
+### Fixed in this pass
+- **CRITICAL — leftover debug `fs::write().unwrap()` in the halt branch of the
+  LLM stream loop** (llm/src/route/client.rs): panicked production machines
+  without /tmp/opencode; removed.
+- **CRITICAL — ACP agent sequential dispatch deadlock** (opencode/src/acp/mod.rs):
+  `run()` awaited each request's dispatch inline, so inbound responses to
+  outbound requests (`session/request_permission`, `fs/write_text_file`) were
+  never routed during a `session/prompt` — the prompt deadlocked on the first
+  permission ask — and `session/cancel` could not interrupt a running prompt.
+  Requests (and cancel notifications) now dispatch on spawned tasks, matching
+  the SDK's fire-and-forget `processMessage`.
+- **CRITICAL — ACP `default_model_from_config` picked the lowest-priority
+  model** (opencode/src/acp/directory.rs): the priority dimension of
+  `Provider.sort` was inverted; the default was `sort[N]` instead of
+  `sort[0]`. Regression test added.
+- **MAJOR — ACP effort validation accepted any string** (opencode/src/acp/mod.rs):
+  `variant == DEFAULT_VARIANT_VALUE` iterated keys instead of comparing the
+  value; "default"-variant models validated everything. Now follows
+  `hasVariant` (service.ts:930-933).
+
+### Open findings — llm (opencode-llm)
+- **MAJOR**: openai-chat finalizes tool calls eagerly (isParsableJson) which
+  downgrades terminal finish reason `tool-calls` → `stop` and streams
+  tool-call events mid-response (openai_chat.rs:722-737 vs
+  openai-chat.ts:429-470). Test at :1214 codifies the divergence.
+- **MAJOR**: openai-responses route drops the static `store: false` default
+  → reasoning replay emits `item_reference` where TS replays encrypted
+  reasoning (openai_responses.rs:1248-1262, 256-263 vs openai-responses.ts:984-992).
+- MINOR: `onOutputItemDone` accepts empty `call_id`/`name`
+  (openai_responses.rs:1003-1010). MINOR: bedrock stores/echoes empty-string
+  signature (bedrock_converse.rs:923-973). MINOR: providerMessage trailing
+  ": " for empty error bodies (route/executor.rs:688-695). MINOR: anthropic
+  stream frames silently tolerated without `type`
+  (anthropic_messages.rs:371-381). MINOR: providerMetadata passthrough keeps
+  undeclared usage fields (openai_chat.rs:621-647). MINOR: alphabetized JSON
+  key order (no preserve_order). MINOR: gemini accepts `functionCall` without
+  `args` (gemini.rs:271-276). MINOR: openai-chat strict tool-call index
+  validation TS doesn't perform (openai_chat.rs:651-660).
+
+### Open findings — session engine (opencode-core)
+- **MAJOR**: question rejection does not block the agent loop: `rejected()`
+  maps to a generic failed-tool message; TS `Question.RejectedError` +
+  `instanceof` sets `ctx.blocked` (session/question.rs:258,
+  session/tools.rs:181-189, processor.rs:572-582 vs question/index.ts:27,
+  processor.ts:200-201).
+- MINOR: cleanup awaits tool settlements serially (N×250ms) instead of
+  concurrently (processor.rs:1892-1899 vs processor.ts:585-588). MINOR:
+  aborted tool completion drops attachments (session/tools.rs:208-220 vs
+  tools.ts:116-127). MINOR: stream-error path leaves tool tasks detached,
+  can write after cleanup (session/llm.rs:688-702). MINOR: `title_from_text`
+  counts scalars not UTF-16 (session/loop.rs:1129-1142 vs prompt.ts:247-249).
+
+### Open findings — tools (opencode-core)
+- **MAJOR**: task input schema marks `command` required; TS keeps it optional
+  (tool/task.rs:218-225 vs tool/task.ts:47-56).
+- **MAJOR**: background subagents accepted but not implemented at runtime —
+  no `BACKGROUND_STARTED`/`BACKGROUND_UPDATED`, no jobId metadata, no
+  promotion (tool/task.rs:276-390 vs tool/task.ts:92-359).
+- **MAJOR**: task foreground runs are not cancellable; `ops.cancel` never
+  wired to `ctx.abort` (tool/task.rs:276-390 vs tool/task.ts:320-358).
+- **MAJOR**: `experimental.primary_tools` denies dropped from subagent
+  permission (`_primary_tools` unused) (tool/task.rs:281 vs tool/task.ts:143-155).
+- **MAJOR**: webfetch treats non-2xx as success — no `filterStatusOk`
+  equivalent (tool/webfetch.rs:211-217 vs webfetch.ts:84-97).
+- **MAJOR**: webfetch turns `image/svg+xml` into an attachment; TS serves it
+  as text; also excludes bmp/tiff (tool/webfetch.rs:22-29 vs util/media.ts).
+- **MAJOR**: websearch MCP call has no timeout; production client has no
+  default timeout (tool/mcp_websearch.rs:90-113, server engine.rs:1077-1105
+  vs mcp-websearch.ts:74-102 — TS: 25s).
+- **MAJOR**: bash run loop can drop output between process exit and pipe
+  drain (tool/shell/mod.rs:790-834 vs shell.ts:486-595).
+- MINOR: webfetch missing Cloudflare-challenge retry (webfetch.ts:99-112).
+  MINOR: `execute` is a projection-port; code-mode interpreter unported by
+  design (tool/code_mode.rs). MINOR: PowerShell parsing is a
+  whitespace-split fallback vs tree-sitter grammar (tool/shell/parse.rs:156-195).
+  MINOR: apply_patch/lsp relative-path helpers fall back to absolute path
+  instead of `../` (tool/apply_patch.rs:77-83, tool/lsp.rs:185-188).
+  MINOR: locale-vs-byte ordering in read/registry sorts (read.rs:444,
+  registry.rs:150). MINOR: grep searches binary files (ripgrep.rs:84-109).
+  MINOR: edit levenshtein counts scalars not UTF-16 (edit.rs:182-203).
+
+### Open findings — server (opencode-server)
+- MINOR: missing `installation.updated` GlobalBus emission after upgrade
+  (routes/v1/global_control.rs:189-216 vs handlers/global.ts:107-114).
+  MINOR: PTY create drops the `shell.env` plugin trigger (no plugin runtime)
+  (pty/routes.rs:228-245, 321-336 vs handlers/pty.ts:69-82). MINOR (latent):
+  UI catch-all doesn't strip the leading slash and never sets CSP
+  (routes/ui.rs:34-46 vs shared/ui.ts:55-76).
+
+### Open findings — ACP + CLI (opencode)
+- **MAJOR**: event subscription never transitions to "disconnected"; idle
+  waiters never rejected on SSE loss (acp/event.rs:110-161 vs
+  acp/event.ts:144-182).
+- **MAJOR**: `percent_decode` corrupts non-ASCII paths byte-as-char
+  (acp/content.rs:329-346 vs decodeURIComponent semantics).
+- **MAJOR**: `--mini` validated but silently runs the single-prompt path
+  (cmd/run.rs:596-792 vs cli/cmd/run.ts:833-905).
+- MINOR: `authenticate` returns null not {} (acp/mod.rs:159-167). MINOR:
+  error message suffixes dropped (`session not found: X` etc.) (acp/mod.rs).
+  MINOR: no zod-style param validation (-32602 vs -32603 confusion)
+  (acp/mod.rs). MINOR: `location_from` dedups only adjacent repeats
+  (acp/tool.rs:54-76). MINOR: `"data": null` always serialized on errors /
+  metadata null vs dropped undefined (acp/jsonrpc.rs:73-81, acp/tool.rs:166-197).
+  MINOR: attach-mode exit code from session errors diverges (cmd/run.rs:787-790
+  vs run.ts:839-843). MINOR: model-option/command sorting lowercases
+  (acp/config_option.rs:190-217, directory.rs:316-321). MINOR: data-URL
+  regex rejects extra params (acp/tool.rs:251-263). MINOR:
+  `available_commands_update` can overtake the response (acp/mod.rs:856-880).
+  MINOR: no `requestPermission`-capability auto-reject (acp/permission.rs:176-244).
+  MINOR: context-limit cache absent (acp/usage.rs:117-123). MINOR: `time.end:
+  null` treated as finished (cmd/run_events.rs:337,354). MINOR: simplified
+  applyPatch in permission bridging (acp/permission.rs:285-343).
+
+### Open findings — TUI + foundation
+- **MAJOR**: `ConfigV2Compat.lower` not ported: V2 keys silently ignored /
+  array-form skills fatally fails / V2 permissions silently accepted where
+  TS rejects (config/precedence.rs:560-583, config/schema.rs:1254 vs
+  config/v2-compat.ts:83-132, config.ts:187-189).
+- MINOR: `normalizeLoadedConfig` legacy-key strip (theme/keybinds/tui) not
+  ported. MINOR: catalog custom-URL cache file uses FNV-1a not SHA-1
+  (catalog/service.rs:421-437 vs models-dev.ts:161-164). MINOR: git runner
+  drops TS global flags (`--no-optional-locks`, `core.quotepath=false`)
+  (git.rs:159-174 vs git/index.ts:6-13). MINOR: transcript formatter drops
+  tool input for completed/errored tools and ignores TS truthiness gates
+  (tui/src/transcript.rs:163-178 vs transcript.ts:101-104). MINOR:
+  account-config failures fatal (config/precedence.rs:347 vs TS catch+log).
+
+### Panel verdicts
+- **llm**: "highly faithful in lowering logic, usage math, and shared
+  machinery" — eager finalization + store:false are the real gaps.
+- **session engine**: "a meticulous port — one MAJOR user-visible divergence
+  (question rejection) plus four minor edge-path divergences."
+- **tools**: "edit/read/grep/glob and truncation/permission seams are
+  effectively byte-parity; task/webfetch/websearch/bash-drain need fixing
+  before parity."
+- **server**: "a notably faithful, fixture-locked transcription — two missing
+  event/plugin side effects and a latent UI divergence, none critical."
+- **ACP+CLI**: "the ACP wire surface is largely faithful; sequential dispatch
+  and the model-priority inversion needed fixing" (both fixed in this pass).
+- **TUI+foundation**: "exceptionally faithful in TUI state machine, keymap,
+  storage, and skill areas; the real gap is the un-ported config v2-compat
+  lowering layer."
