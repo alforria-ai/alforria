@@ -521,6 +521,11 @@ fn truncate_reason(reason: &str) -> String {
 /// `NamedError.Unknown` defect envelope (`middleware/error.ts:29-41`).
 pub fn defect_response() -> Response {
     let reference = format!("err_{}", &Uuid::new_v4().simple().to_string()[..8]);
+    // TEMPORARY battle-test instrumentation
+    eprintln!(
+        "DEFECT-RESPONSE at:\n{}",
+        std::backtrace::Backtrace::force_capture()
+    );
     tracing::error!(reference = %reference, "failed: unexpected server error");
     let body = named_body(
         "UnknownError",
@@ -665,7 +670,18 @@ where
             let future = std::panic::AssertUnwindSafe(inner.call(req)).catch_unwind();
             match future.await {
                 Ok(result) => result,
-                Err(_payload) => Ok(defect_response()),
+                Err(payload) => {
+                    // The panic message feeds stderr (and carries the defect
+                    // ref), mirroring the TS errorLayer's cause log
+                    // (`middleware/error.ts:7-43`).
+                    let message = payload
+                        .downcast_ref::<&str>()
+                        .map(|s| (*s).to_string())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "non-string panic payload".to_string());
+                    eprintln!("panic caught in request handler: {message}");
+                    Ok(defect_response())
+                }
             }
         })
     }

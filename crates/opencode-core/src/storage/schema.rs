@@ -247,12 +247,15 @@ fn json_from_text(text: &str) -> Result<Value, CoreError> {
     serde_json::from_str(text).map_err(|err| CoreError::Storage(err.to_string()))
 }
 
-fn json_column(row: &Row<'_>, idx: usize) -> Result<Value, CoreError> {
-    json_from_text(&row.get::<_, String>(idx)?)
+/// `json_column` by column name — the TS row mappers (Drizzle) bind by
+/// name, so column order can differ across schema versions of an existing
+/// database (e.g. `icon_url_override` appended late in `opencode.db`).
+fn json_named_column(row: &Row<'_>, name: &str) -> Result<Value, CoreError> {
+    json_from_text(&row.get::<_, String>(name)?)
 }
 
-fn json_opt_column(row: &Row<'_>, idx: usize) -> Result<Option<Value>, CoreError> {
-    row.get::<_, Option<String>>(idx)?
+fn json_opt_named_column(row: &Row<'_>, name: &str) -> Result<Option<Value>, CoreError> {
+    row.get::<_, Option<String>>(name)?
         .as_deref()
         .map(json_from_text)
         .transpose()
@@ -828,143 +831,143 @@ impl Storage {
 
 pub(crate) fn project_from_row(row: &Row<'_>) -> Result<Project, CoreError> {
     Ok(Project {
-        id: row.get(0)?,
-        worktree: row.get(1)?,
-        vcs: row.get(2)?,
-        name: row.get(3)?,
-        icon_url: row.get(4)?,
-        icon_url_override: row.get(5)?,
-        icon_color: row.get(6)?,
-        time_created: row.get(7)?,
-        time_updated: row.get(8)?,
-        time_initialized: row.get(9)?,
-        sandboxes: json_column(row, 10)?,
-        commands: row.get(11)?,
+        id: row.get("id")?,
+        worktree: row.get("worktree")?,
+        vcs: row.get("vcs")?,
+        name: row.get("name")?,
+        icon_url: row.get("icon_url")?,
+        icon_url_override: row.get("icon_url_override")?,
+        icon_color: row.get("icon_color")?,
+        time_created: row.get("time_created")?,
+        time_updated: row.get("time_updated")?,
+        time_initialized: row.get("time_initialized")?,
+        sandboxes: json_named_column(row, "sandboxes")?,
+        commands: row.get("commands")?,
     })
 }
 
 fn workspace_from_row(row: &Row<'_>) -> Result<Workspace, CoreError> {
     Ok(Workspace {
-        id: row.get(0)?,
-        r#type: row.get(1)?,
-        name: row.get(2)?,
-        branch: row.get(3)?,
-        directory: row.get(4)?,
-        extra: row.get(5)?,
-        project_id: row.get(6)?,
-        time_used: row.get(7)?,
+        id: row.get("id")?,
+        r#type: row.get("type")?,
+        name: row.get("name")?,
+        branch: row.get("branch")?,
+        directory: row.get("directory")?,
+        extra: row.get("extra")?,
+        project_id: row.get("project_id")?,
+        time_used: row.get("time_used")?,
     })
 }
 
 pub(crate) fn session_from_row(row: &Row<'_>) -> Result<Session, CoreError> {
     Ok(Session {
-        id: row.get(0)?,
-        project_id: row.get(1)?,
-        workspace_id: row.get(2)?,
-        parent_id: row.get(3)?,
-        slug: row.get(4)?,
-        directory: row.get(5)?,
-        path: row.get(6)?,
-        title: row.get(7)?,
-        version: row.get(8)?,
-        share_url: row.get(9)?,
-        summary_additions: row.get(10)?,
-        summary_deletions: row.get(11)?,
-        summary_files: row.get(12)?,
-        summary_diffs: json_opt_column(row, 13)?,
-        metadata: json_opt_column(row, 14)?,
-        cost: row.get(15)?,
-        tokens_input: row.get(16)?,
-        tokens_output: row.get(17)?,
-        tokens_reasoning: row.get(18)?,
-        tokens_cache_read: row.get(19)?,
-        tokens_cache_write: row.get(20)?,
-        revert: json_opt_column(row, 21)?,
-        permission: json_opt_column(row, 22)?,
-        agent: row.get(23)?,
-        model: row.get(24)?,
-        time_created: row.get(25)?,
-        time_updated: row.get(26)?,
-        time_compacting: row.get(27)?,
-        time_archived: row.get(28)?,
+        id: row.get("id")?,
+        project_id: row.get("project_id")?,
+        workspace_id: row.get("workspace_id")?,
+        parent_id: row.get("parent_id")?,
+        slug: row.get("slug")?,
+        directory: row.get("directory")?,
+        path: row.get("path")?,
+        title: row.get("title")?,
+        version: row.get("version")?,
+        share_url: row.get("share_url")?,
+        summary_additions: row.get("summary_additions")?,
+        summary_deletions: row.get("summary_deletions")?,
+        summary_files: row.get("summary_files")?,
+        summary_diffs: json_opt_named_column(row, "summary_diffs")?,
+        metadata: json_opt_named_column(row, "metadata")?,
+        cost: row.get("cost")?,
+        tokens_input: row.get("tokens_input")?,
+        tokens_output: row.get("tokens_output")?,
+        tokens_reasoning: row.get("tokens_reasoning")?,
+        tokens_cache_read: row.get("tokens_cache_read")?,
+        tokens_cache_write: row.get("tokens_cache_write")?,
+        revert: json_opt_named_column(row, "revert")?,
+        permission: json_opt_named_column(row, "permission")?,
+        agent: row.get("agent")?,
+        model: row.get("model")?,
+        time_created: row.get("time_created")?,
+        time_updated: row.get("time_updated")?,
+        time_compacting: row.get("time_compacting")?,
+        time_archived: row.get("time_archived")?,
     })
 }
 
 pub(crate) fn message_from_row(row: &Row<'_>) -> Result<Message, CoreError> {
     Ok(Message {
-        id: row.get(0)?,
-        session_id: row.get(1)?,
-        time_created: row.get(2)?,
-        time_updated: row.get(3)?,
-        data: json_column(row, 4)?,
+        id: row.get("id")?,
+        session_id: row.get("session_id")?,
+        time_created: row.get("time_created")?,
+        time_updated: row.get("time_updated")?,
+        data: json_named_column(row, "data")?,
     })
 }
 
 pub(crate) fn part_from_row(row: &Row<'_>) -> Result<Part, CoreError> {
     Ok(Part {
-        id: row.get(0)?,
-        message_id: row.get(1)?,
-        session_id: row.get(2)?,
-        time_created: row.get(3)?,
-        time_updated: row.get(4)?,
-        data: json_column(row, 5)?,
+        id: row.get("id")?,
+        message_id: row.get("message_id")?,
+        session_id: row.get("session_id")?,
+        time_created: row.get("time_created")?,
+        time_updated: row.get("time_updated")?,
+        data: json_named_column(row, "data")?,
     })
 }
 
 fn todo_from_row(row: &Row<'_>) -> Result<Todo, CoreError> {
     Ok(Todo {
-        session_id: row.get(0)?,
-        content: row.get(1)?,
-        status: row.get(2)?,
-        priority: row.get(3)?,
-        position: row.get(4)?,
-        time_created: row.get(5)?,
-        time_updated: row.get(6)?,
+        session_id: row.get("session_id")?,
+        content: row.get("content")?,
+        status: row.get("status")?,
+        priority: row.get("priority")?,
+        position: row.get("position")?,
+        time_created: row.get("time_created")?,
+        time_updated: row.get("time_updated")?,
     })
 }
 
 fn session_share_from_row(row: &Row<'_>) -> Result<SessionShare, CoreError> {
     Ok(SessionShare {
-        session_id: row.get(0)?,
-        id: row.get(1)?,
-        secret: row.get(2)?,
-        url: row.get(3)?,
-        time_created: row.get(4)?,
-        time_updated: row.get(5)?,
+        session_id: row.get("session_id")?,
+        id: row.get("id")?,
+        secret: row.get("secret")?,
+        url: row.get("url")?,
+        time_created: row.get("time_created")?,
+        time_updated: row.get("time_updated")?,
     })
 }
 
 fn account_from_row(row: &Row<'_>) -> Result<Account, CoreError> {
     Ok(Account {
-        id: row.get(0)?,
-        email: row.get(1)?,
-        url: row.get(2)?,
-        access_token: row.get(3)?,
-        refresh_token: row.get(4)?,
-        token_expiry: row.get(5)?,
-        time_created: row.get(6)?,
-        time_updated: row.get(7)?,
+        id: row.get("id")?,
+        email: row.get("email")?,
+        url: row.get("url")?,
+        access_token: row.get("access_token")?,
+        refresh_token: row.get("refresh_token")?,
+        token_expiry: row.get("token_expiry")?,
+        time_created: row.get("time_created")?,
+        time_updated: row.get("time_updated")?,
     })
 }
 
 fn account_state_from_row(row: &Row<'_>) -> Result<AccountState, CoreError> {
     Ok(AccountState {
-        id: row.get(0)?,
-        active_account_id: row.get(1)?,
-        active_org_id: row.get(2)?,
+        id: row.get("id")?,
+        active_account_id: row.get("active_account_id")?,
+        active_org_id: row.get("active_org_id")?,
     })
 }
 
 fn control_account_from_row(row: &Row<'_>) -> Result<ControlAccount, CoreError> {
     Ok(ControlAccount {
-        email: row.get(0)?,
-        url: row.get(1)?,
-        access_token: row.get(2)?,
-        refresh_token: row.get(3)?,
-        token_expiry: row.get(4)?,
-        active: row.get(5)?,
-        time_created: row.get(6)?,
-        time_updated: row.get(7)?,
+        email: row.get("email")?,
+        url: row.get("url")?,
+        access_token: row.get("access_token")?,
+        refresh_token: row.get("refresh_token")?,
+        token_expiry: row.get("token_expiry")?,
+        active: row.get("active")?,
+        time_created: row.get("time_created")?,
+        time_updated: row.get("time_updated")?,
     })
 }
 
@@ -993,6 +996,55 @@ mod tests {
         // `sqlite_master` rows appear in creation order, so this also pins
         // the statement order.
         assert_eq!(actual, SCHEMA_SQL.to_vec());
+    }
+
+    /// Regression (battle test): the row mappers bind columns by NAME
+    /// because existing databases created by the TS app can carry a
+    /// different column order than `SCHEMA_SQL` (e.g. `opencode.db`
+    /// appends `icon_url_override` last). A positional mapper reads
+    /// `time_created` (INTEGER) into `icon_color` (TEXT) and fails with
+    /// `Invalid column type Integer`.
+    #[test]
+    fn reads_rows_with_reordered_columns() {
+        let temp = TempDir::new("reordered");
+        let path = temp.path().join("db.sqlite");
+        let storage = Storage::open(path).unwrap();
+        // Swap `project` for a legacy-order copy — `opencode.db` ships
+        // `icon_url_override` last.
+        storage
+            .with_connection(|conn| {
+                conn.execute_batch(
+                    "DROP TABLE project;
+                     CREATE TABLE project (
+                        id TEXT PRIMARY KEY NOT NULL,
+                        worktree TEXT NOT NULL,
+                        vcs TEXT,
+                        name TEXT,
+                        icon_url TEXT,
+                        icon_color TEXT,
+                        time_created INTEGER NOT NULL,
+                        time_updated INTEGER NOT NULL,
+                        time_initialized INTEGER,
+                        sandboxes TEXT NOT NULL,
+                        commands TEXT,
+                        icon_url_override TEXT
+                    );
+                     INSERT INTO project (id, worktree, time_created, time_updated, sandboxes, icon_url_override)
+                     VALUES ('p1', '/wt', 123, 456, '{}', 'over');",
+                )?;
+                Ok::<(), CoreError>(())
+            })
+            .unwrap();
+        let project = storage
+            .get_project("p1")
+            .expect("project row reads under legacy column order");
+        let Some(project) = project else {
+            panic!("project row missing");
+        };
+        assert_eq!(project.time_created, 123);
+        assert_eq!(project.time_updated, 456);
+        assert_eq!(project.icon_url_override.as_deref(), Some("over"));
+        assert_eq!(project.icon_color, None);
     }
 
     #[test]

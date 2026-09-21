@@ -27,7 +27,33 @@ pub fn handshake(hostname: &str, port: u16) -> String {
     format!("opencode server listening on http://{hostname}:{port}")
 }
 
+/// `--print-logs` wires `OPENCODE_PRINT_LOGS` (TS `Logger.pretty` prints to
+/// stderr); `--log-level` caps the filter (`Logger.pretty`'s `level`).
+/// Without `--print-logs` the subscriber stays unset and all
+/// `tracing` output is dropped, matching the TS quiet server.
+pub fn init_logging_from_env() {
+    if std::env::var_os("OPENCODE_PRINT_LOGS").is_none() {
+        return;
+    }
+    let level = match std::env::var("OPENCODE_LOG_LEVEL")
+        .unwrap_or_default()
+        .to_ascii_uppercase()
+        .as_str()
+    {
+        "TRACE" => tracing_subscriber::filter::LevelFilter::TRACE,
+        "DEBUG" => tracing_subscriber::filter::LevelFilter::DEBUG,
+        "WARN" | "WARNING" => tracing_subscriber::filter::LevelFilter::WARN,
+        "ERROR" => tracing_subscriber::filter::LevelFilter::ERROR,
+        _ => tracing_subscriber::filter::LevelFilter::INFO,
+    };
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(level)
+        .with_writer(std::io::stderr)
+        .try_init();
+}
+
 pub fn run(matches: &ArgMatches, ui: &mut Ui, raw: &[OsString]) -> Result<(), TypedError> {
+    init_logging_from_env();
     if !password_set() {
         ui.write_stdout(&format!("{UNSECURED_WARNING}\n"));
     }
