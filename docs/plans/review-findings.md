@@ -411,3 +411,19 @@ reference (88c6c7a): llm, session engine, tools, server, CLI+ACP, TUI+foundation
   `structuredContent` fallback, the text/image/resource content mapping
   and `truncate.output` metadata merge (tools.ts:389-482). Unit test
   `mcp_tools_are_resolved_and_executed` + live-verified with blender-mcp.
+
+
+### Battle-test round 3 (tools, interrupts, permissions, TUI)
+
+- All verified working live: write/bash tools through the model, abort
+  mid-generation (POST /session/:id/abort), slash commands (the config's
+  `goal` command), the permission flow (write outside worktree queues an
+  `external_directory` request; /permission/:id/reply once → write
+  completes), share, summarize, concurrent sessions, PTY lifecycle, and
+  the TUI under a pseudo-tty.
+- **`GET /experimental/console` (and `/console/orgs`, `/console/switch`)
+  were still stubs** — the TUI's embedded server hit the defect-500 stub
+  on every startup. Implemented the no-account shapes
+  (handlers/experimental.ts:43-86): `{consoleManagedProviders: [],
+  switchableOrgCount: 0}`, `{orgs: []}`, and the account-missing
+  BadRequest on switch.

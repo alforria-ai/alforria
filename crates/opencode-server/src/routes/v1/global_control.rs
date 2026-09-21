@@ -1020,6 +1020,39 @@ pub async fn control_plane_move_session(
     }
 }
 
+/// `console` (`handlers/experimental.ts:43-58`): the console state —
+/// managed providers, the optional active org name and the switchable org
+/// count. The port has no account-service runtime, so the org list is
+/// always empty (`orgsByAccount` never fails, it yields no groups).
+pub async fn experimental_console() -> Result<Response, ServerError> {
+    Ok(json_ok(json!({
+        "consoleManagedProviders": [],
+        "switchableOrgCount": 0,
+    })))
+}
+
+/// `consoleOrgs` (`handlers/experimental.ts:60-78`).
+pub async fn experimental_console_orgs() -> Result<Response, ServerError> {
+    Ok(json_ok(json!({ "orgs": [] })))
+}
+
+#[derive(serde::Deserialize)]
+pub struct ConsoleSwitchPayload {
+    #[serde(rename = "accountID")]
+    #[allow(dead_code)]
+    account_id: String,
+    #[serde(rename = "orgID")]
+    #[allow(dead_code)]
+    org_id: String,
+}
+
+/// `consoleSwitch` (`handlers/experimental.ts:80-86`): `account.use`
+/// fails without an account runtime, answering the TS BadRequest.
+pub async fn experimental_console_switch(body: Bytes) -> Result<Response, ServerError> {
+    let _payload: ConsoleSwitchPayload = parse_payload(&body)?;
+    Ok(crate::routes::v1::util::bad_request_empty())
+}
+
 /// `session` (`handlers/experimental.ts:157-176`).
 pub async fn experimental_session(
     axum::Extension(location): axum::Extension<LocationContext>,
@@ -1404,6 +1437,11 @@ pub fn register(
         ("GET", "/file/status") => router.route(path, get(file_status)),
         // ---- experimental ----
         ("GET", "/experimental/capabilities") => router.route(path, get(experimental_capabilities)),
+        ("GET", "/experimental/console") => router.route(path, get(experimental_console)),
+        ("GET", "/experimental/console/orgs") => router.route(path, get(experimental_console_orgs)),
+        ("POST", "/experimental/console/switch") => {
+            router.route(path, post(experimental_console_switch))
+        }
         ("GET", "/experimental/tool") => router.route(path, get(experimental_tool)),
         ("GET", "/experimental/tool/ids") => router.route(path, get(experimental_tool_ids)),
         ("GET", "/experimental/worktree") => router.route(path, get(worktree_list)),

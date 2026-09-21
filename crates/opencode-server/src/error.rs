@@ -521,11 +521,7 @@ fn truncate_reason(reason: &str) -> String {
 /// `NamedError.Unknown` defect envelope (`middleware/error.ts:29-41`).
 pub fn defect_response() -> Response {
     let reference = format!("err_{}", &Uuid::new_v4().simple().to_string()[..8]);
-    // TEMPORARY battle-test instrumentation
-    eprintln!(
-        "DEFECT-RESPONSE at:\n{}",
-        std::backtrace::Backtrace::force_capture()
-    );
+    eprintln!("[{reference}] unexpected server error");
     tracing::error!(reference = %reference, "failed: unexpected server error");
     let body = named_body(
         "UnknownError",
