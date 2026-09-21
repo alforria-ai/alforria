@@ -163,6 +163,20 @@ pub struct StreamInput {
 /// implementation; tests script a `MockLlmStream`.
 pub trait LlmStream: Send + Sync {
     fn stream(&self, input: StreamInput) -> LlmEventStream;
+
+    /// The abort-aware entry (Effect streams halt on interruption):
+    /// production routes carry `cancel` into the route client so the
+    /// buffered parser state flushes (`onHalt`) before the consumer
+    /// drops the stream — the forked tool dispatch then runs within
+    /// cleanup's grace window (route/client.ts:287-291).
+    fn stream_with_cancel(
+        &self,
+        input: StreamInput,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> LlmEventStream {
+        let _ = cancel;
+        self.stream(input)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -445,6 +459,15 @@ pub fn has_tool_calls(messages: &[Message]) -> bool {
 pub trait LlmRequestSender: Send + Sync {
     fn model_ref(&self, model: &LlmModel) -> ModelRef;
     fn send(&self, request: LlmRequest) -> BoxFuture<'static, Result<LlmEventStream, LlmError>>;
+
+    fn send_with_cancel(
+        &self,
+        request: LlmRequest,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> BoxFuture<'static, Result<LlmEventStream, LlmError>> {
+        let _ = cancel;
+        self.send(request)
+    }
 }
 
 /// The production [`LlmStream`]: prepare the request, stream it through
@@ -461,12 +484,35 @@ impl LlmStreamImpl {
     }
 }
 
-impl LlmStream for LlmStreamImpl {
-    fn stream(&self, input: StreamInput) -> LlmEventStream {
+impl LlmStreamImpl {
+    fn stream_with_sender(&self, input: StreamInput) -> LlmEventStream {
         let sender = self.sender.clone();
         let request = build_request(sender.as_ref(), &input);
         futures::stream::once(async move {
             match sender.send(request).await {
+                Ok(stream) => dispatch_tool_calls(stream, input.tools),
+                Err(error) => futures::stream::once(async move { Err(error) }).boxed(),
+            }
+        })
+        .flatten()
+        .boxed()
+    }
+}
+
+impl LlmStream for LlmStreamImpl {
+    fn stream(&self, input: StreamInput) -> LlmEventStream {
+        self.stream_with_sender(input)
+    }
+
+    fn stream_with_cancel(
+        &self,
+        input: StreamInput,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> LlmEventStream {
+        let sender = self.sender.clone();
+        let request = build_request(sender.as_ref(), &input);
+        futures::stream::once(async move {
+            match sender.send_with_cancel(request, cancel).await {
                 Ok(stream) => dispatch_tool_calls(stream, input.tools),
                 Err(error) => futures::stream::once(async move { Err(error) }).boxed(),
             }

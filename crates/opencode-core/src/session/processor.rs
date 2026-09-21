@@ -607,6 +607,45 @@ impl Handle {
         self.lock_ctx().assistant_message.clone()
     }
 
+    /// The tool-time half of the structured-output capture: TS mutates
+    /// `handle.message.structured` only after cleanup, but its lazy SSE
+    /// serialization makes the value retroactively visible on frames
+    /// published before the capture (prompt.ts:1288-1289). Setting the
+    /// live message at tool-execution time reproduces that observable
+    /// wire state without publishing.
+    pub fn mark_structured(&self, structured: Value) {
+        let mut ctx = self.lock_ctx();
+        if let V1Message::Assistant {
+            structured: slot, ..
+        } = &mut ctx.assistant_message
+        {
+            *slot = Some(structured);
+        }
+    }
+
+    /// `handle.message.structured = structured` (prompt.ts:1288-1289):
+    /// sets the captured structured output on the live assistant
+    /// message so later publishes (cleanup) carry it too, and persists
+    /// the update.
+    pub fn set_structured(&self, structured: Value) -> Result<(), SessionError> {
+        let mut ctx = self.lock_ctx();
+        if let V1Message::Assistant {
+            structured: slot,
+            finish,
+            ..
+        } = &mut ctx.assistant_message
+        {
+            *slot = Some(structured);
+            if finish.is_none() {
+                *finish = Some("stop".to_string());
+            }
+        }
+        self.inner
+            .deps
+            .sessions
+            .update_message(&ctx.assistant_message)
+    }
+
     fn now_ms(&self) -> u64 {
         self.inner.deps.clock.now_ms()
     }
@@ -815,24 +854,57 @@ impl Handle {
         {
             return RunOutcome::Failed(storage_failure(error));
         }
-        let mut stream = inner.deps.llm.stream(stream_input);
+        let mut stream = inner
+            .deps
+            .llm
+            .stream_with_cancel(stream_input, cancel.clone());
         loop {
             let item = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => {
-                    // `Effect.onInterrupt` (processor.ts:625-631).
-                    let halt = {
-                        let mut ctx = self.lock_ctx();
-                        ctx.aborted = true;
-                        match &ctx.assistant_message {
-                            V1Message::Assistant { error: None, .. } => Some(SourceError::Abort {
-                                message: "Aborted".to_string(),
-                            }),
-                            _ => None,
+                    // `Effect.onInterrupt` (processor.ts:625-631) — the
+                    // interrupt lands after the stream pipeline halts:
+                    // drain the `onHalt`-flushed events (route/client.ts
+                    // `Stream.mapAccumEffect` halts on interruption) so
+                    // buffered tool-call events dispatch before cleanup.
+                    {
+                        let halt = {
+                            let mut ctx = self.lock_ctx();
+                            ctx.aborted = true;
+                            match &ctx.assistant_message {
+                                V1Message::Assistant { error: None, .. } => Some(SourceError::Abort {
+                                    message: "Aborted".to_string(),
+                                }),
+                                _ => None,
+                            }
+                        };
+                        if let Some(source) = halt {
+                            let _ = inner.halt(&source);
                         }
-                    };
-                    if let Some(source) = halt {
-                        let _ = inner.halt(&source);
+                        // Halt-aware streams flush their buffered parser
+                        // state and end; a stream that never observes
+                        // the token (a hanging mock) is dropped after
+                        // the cleanup grace budget instead of blocking
+                        // the interrupt.
+                        loop {
+                            let Ok(item) = tokio::time::timeout(
+                                Duration::from_millis(250),
+                                stream.next(),
+                            )
+                            .await
+                            else {
+                                break;
+                            };
+                            match item {
+                                None => break,
+                                Some(Ok(event)) => {
+                                    if let Err(error) = self.handle_event(event).await {
+                                        return RunOutcome::Failed(error);
+                                    }
+                                }
+                                Some(Err(_)) => break,
+                            }
+                        }
                     }
                     return RunOutcome::Cancelled;
                 }

@@ -568,6 +568,7 @@ pub async fn run_loop(
                 tools.push(create_structured_output_tool(
                     Value::Object(schema.clone()),
                     structured.clone(),
+                    processor.clone(),
                 ));
             }
 
@@ -629,19 +630,7 @@ pub async fn run_loop(
             // Structured output captured (prompt.ts:1282-1289).
             let captured = structured.lock().unwrap().take();
             if let Some(captured) = captured {
-                let mut message = processor.message();
-                if let V1Message::Assistant {
-                    structured: slot,
-                    finish,
-                    ..
-                } = &mut message
-                {
-                    *slot = Some(captured);
-                    if finish.is_none() {
-                        *finish = Some("stop".to_string());
-                    }
-                }
-                deps.sessions.update_message(&message)?;
+                processor.set_structured(captured)?;
                 // `Effect.ensuring(instruction.clear(handle.message.id))`.
                 deps.instruction.clear(&assistant_id);
                 Outcome::Break
@@ -827,6 +816,15 @@ async fn finalize_interrupted_assistant(
 ) -> Result<(), SessionError> {
     let mut message = processor.message();
     match &mut message {
+        // `if (msg.time.completed) return` (prompt.ts:1207) — cleanup
+        // already finalized (and published) the message.
+        V1Message::Assistant {
+            time:
+                opencode_schema::session_v1::AssistantTime {
+                    completed: Some(_), ..
+                },
+            ..
+        } => return Ok(()),
         V1Message::Assistant { error, time, .. } => {
             if error.is_none() {
                 *error = Some(AssistantError::Aborted {
@@ -924,6 +922,7 @@ fn publish_unknown_error(
 pub fn create_structured_output_tool(
     schema: Value,
     captured: Arc<Mutex<Option<Value>>>,
+    handle: crate::session::processor::Handle,
 ) -> LlmTool {
     // Remove $schema property if present (not needed for tool input).
     let mut schema = schema;
@@ -936,7 +935,9 @@ pub fn create_structured_output_tool(
         input_schema: schema,
         execute: Arc::new(move |args: Value, _call_id: String| {
             let captured = captured.clone();
+            let handle = handle.clone();
             Box::pin(async move {
+                handle.mark_structured(args.clone());
                 let mut slot = captured.lock().unwrap();
                 *slot = Some(args.clone());
                 Ok(LlmToolOutput {

@@ -1637,7 +1637,10 @@ async fn openai_chat_streams_tool_call() {
     );
     let request = weather_tool_call_request(model, 80.0, Some(0.0));
     let events = replay_interaction(&route, &request, &cassette[0]).await;
-    assert_eq!(assert_turn(&events), FinishReason::ToolCalls);
+    // The AI SDK runtime reports the provider's finish_reason verbatim
+    // (the stop → tool-calls upgrade was the experimental native
+    // runtime's behavior; the tool call finalized eagerly above).
+    assert_eq!(assert_turn(&events), FinishReason::Stop);
     assert_tool_call_shape(&events);
 }
 

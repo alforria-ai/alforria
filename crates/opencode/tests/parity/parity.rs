@@ -452,7 +452,9 @@ async fn p7_cancel_mid_stream_parity() {
     .await;
     assert_parity("p7_cancel_mid_stream", true, &ts, &rs);
 
-    // The interrupted tool part is marked and the re-prompt resumes.
+    // The tool call finalized before the abort landed (the AI SDK runtime
+    // forks it as soon as the arguments parse), so the part completes
+    // within cleanup's grace window and the re-prompt resumes.
     for (side, capture) in [("ts", &ts), ("rs", &rs)] {
         let store = named(capture, "store");
         let aborted = store
@@ -468,10 +470,11 @@ async fn p7_cancel_mid_stream_parity() {
             aborted["parts"].as_array().is_some_and(|parts| {
                 parts.iter().any(|part| {
                     part["type"] == json!("tool")
-                        && part["state"]["metadata"]["interrupted"] == json!(true)
+                        && part["state"]["status"] == json!("completed")
+                        && part["state"]["input"] == json!({"filePath": "a.txt"})
                 })
             }),
-            "{side} no interrupted tool part\n{aborted}"
+            "{side} no completed tool part\n{aborted}"
         );
         assert!(
             named(capture, "resumed")["parts"]

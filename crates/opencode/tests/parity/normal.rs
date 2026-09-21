@@ -63,7 +63,7 @@ fn rules() -> &'static Rules {
 pub struct Normalizer {
     ids: std::collections::HashMap<String, String>,
     counters: std::collections::HashMap<String, usize>,
-    shas: usize,
+    shas: std::collections::HashMap<String, String>,
 }
 
 impl Normalizer {
@@ -71,7 +71,7 @@ impl Normalizer {
         Normalizer {
             ids: std::collections::HashMap::new(),
             counters: std::collections::HashMap::new(),
-            shas: 0,
+            shas: std::collections::HashMap::new(),
         }
     }
 
@@ -111,7 +111,9 @@ impl Normalizer {
                                 && is_sha(text)
                         }) {
                             // N8: per-run git SHAs and project-path hashes.
-                            self.sha_marker()
+                            item.as_str()
+                                .map(|text| self.sha_marker(text))
+                                .unwrap_or(Value::Null)
                         } else {
                             self.value(item, root, in_time)
                         };
@@ -195,10 +197,16 @@ impl Normalizer {
         Value::String("<ts>".to_string())
     }
 
-    /// N8: one per-run git SHA marker, counted in first-occurrence order.
-    fn sha_marker(&mut self) -> Value {
-        let marker = format!("<sha:{}>", self.shas);
-        self.shas += 1;
+    /// N8: one marker per distinct per-run git SHA, memoized so the
+    /// same commit/blob id keeps the same marker across captures (the
+    /// legacy/V2 self-consistency diff compares two normalizations of
+    /// the same stream).
+    fn sha_marker(&mut self, raw: &str) -> Value {
+        if let Some(marker) = self.shas.get(raw) {
+            return Value::String(marker.clone());
+        }
+        let marker = format!("<sha:{}>", self.shas.len());
+        self.shas.insert(raw.to_string(), marker.clone());
         Value::String(marker)
     }
 
@@ -352,11 +360,11 @@ pub fn check_v2_envelope(events: &[Value]) -> Vec<String> {
 /// (Effect Schema.Class encode validation — the same failure that 400s
 /// `GET /message` for format sessions), and the `Effect.ignore` wrapper
 /// swallows it. Rust attaches the summary, TS silently never does.
-fn drop_format_summary_updates(events: &[Value]) -> Vec<Value> {
+fn drop_format_summary_updates_with(events: &[Value], payload: &str) -> Vec<Value> {
     events
         .iter()
         .filter(|event| {
-            let info = &event["properties"]["info"];
+            let info = &event[payload]["info"];
             !(event["type"] == "message.updated"
                 && info["role"] == "user"
                 && info["format"] != Value::Null
@@ -366,12 +374,19 @@ fn drop_format_summary_updates(events: &[Value]) -> Vec<Value> {
         .collect()
 }
 
+fn drop_format_summary_updates(events: &[Value]) -> Vec<Value> {
+    drop_format_summary_updates_with(events, "properties")
+}
+
 /// Normalize each event of a captured stream, dropping heartbeats and
 /// ordering canonically (N9) before normalization so N1/N2 markers
 /// align across the two sides.
 pub fn normalize_events(normalizer: &mut Normalizer, root: &str, events: &[Value]) -> Vec<Value> {
     let ordered = canonicalize_events(
-        &drop_format_summary_updates(&drop_heartbeats(events)),
+        &session_update_race_with(
+            drop_format_summary_updates(&drop_heartbeats(events)),
+            "properties",
+        ),
         "properties",
     );
     ordered
@@ -418,6 +433,53 @@ fn completed_race(event: Value) -> Value {
     completed_race_with("properties", event)
 }
 
+/// N12: the title/summary-zero interleaving race. TS forks the title
+/// LLM call (prompt.ts:1133) and `summary.summarize` (prompt.ts:1253)
+/// in the same step-1 suspension window, so whether the wire carries
+/// the title frame before or after the zero-summary frame is scheduler
+/// timing — p1 captures show the summary landing first, p6 captures
+/// show the title first. Rust is deterministic. A `session.updated`
+/// frame whose (title, summary) state is a merge of its neighbors —
+/// exactly one of the two transitions applied — is a race intermediate
+/// and is dropped; both interleavings then normalize identically.
+fn session_update_race_with(events: Vec<Value>, payload: &str) -> Vec<Value> {
+    fn state<'a>(event: &'a Value, payload: &str) -> (&'a Value, &'a Value) {
+        (
+            &event[payload]["info"]["title"],
+            &event[payload]["info"]["summary"],
+        )
+    }
+    let updates: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e["type"] == json!("session.updated"))
+        .map(|(i, _)| i)
+        .collect();
+    if std::env::var("PARITY_DEBUG_N12").is_ok() {
+        for (n, i) in updates.iter().enumerate() {
+            let (t, s2) = state(&events[*i], payload);
+            eprintln!("N12 session.updated[{n}] title={:?} summary={:?}", t, s2);
+        }
+    }
+    let mut drop = vec![false; events.len()];
+    for w in 1..updates.len().saturating_sub(1) {
+        let prev = state(&events[updates[w - 1]], payload);
+        let cur = state(&events[updates[w]], payload);
+        let next = state(&events[updates[w + 1]], payload);
+        if prev.0 != next.0 && prev.1 != next.1 {
+            let title_first = cur.0 == next.0 && cur.1 == prev.1;
+            let summary_first = cur.0 == prev.0 && cur.1 == next.1;
+            drop[updates[w]] = title_first || summary_first;
+        }
+    }
+    events
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| !drop[*i])
+        .map(|(_, e)| e)
+        .collect()
+}
+
 /// Normalize each event of a captured V2 stream (spec PARITY §3.1): the
 /// `durable` block is dropped before normalization (its presence and
 /// monotonicity are checked on the raw capture, then it leaves the
@@ -427,7 +489,13 @@ pub fn normalize_v2_events(
     root: &str,
     events: &[Value],
 ) -> Vec<Value> {
-    let ordered = canonicalize_events(&drop_durable(events), "data");
+    let ordered = canonicalize_events(
+        &session_update_race_with(
+            drop_format_summary_updates_with(&drop_durable(events), "data"),
+            "data",
+        ),
+        "data",
+    );
     ordered
         .into_iter()
         .map(|event| completed_race_with("data", normalizer.normalize(root, &event)))

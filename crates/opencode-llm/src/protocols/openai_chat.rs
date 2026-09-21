@@ -719,6 +719,21 @@ fn step(state: State, event: &serde_json::Value) -> Result<(State, Vec<LlmEvent>
             lifecycle = lifecycle::step_start(lifecycle, &mut events);
         }
         events.extend(outcome.events);
+        // The AI SDK runtime finalizes a tool call as soon as the
+        // accumulated arguments parse as complete JSON
+        // (openai-compatible-chat-language-model.ts: "check if tool call
+        // is complete (some providers send the full tool call in one
+        // chunk)"). Later deltas for a finished call are ignored.
+        let key = tool_key(tool.index)?;
+        let input = tools
+            .get(&key)
+            .map(|tool| tool.input.as_str())
+            .unwrap_or_default();
+        if !input.is_empty() && serde_json::from_str::<serde_json::Value>(input).is_ok() {
+            let finished = tool_stream::finish(ADAPTER, tools, key)?;
+            tools = finished.tools;
+            events.extend(finished.events);
+        }
     }
 
     // Finalize accumulated tool inputs eagerly when finish_reason arrives so
@@ -1145,7 +1160,8 @@ mod tests {
         );
 
         let mut state = state;
-        for arguments in ["{\"", "city", "\":\"", "Paris", "\"}"] {
+        let pieces = ["{\"", "city", "\":\"", "Paris", "\"}"];
+        for (n, arguments) in pieces.iter().enumerate() {
             let (next, events) = protocol
                 .step(
                     state,
@@ -1157,14 +1173,42 @@ mod tests {
                 )
                 .unwrap();
             state = next;
-            assert_eq!(
-                events,
-                vec![LlmEvent::ToolInputDelta {
-                    id: "call_1".to_string(),
-                    name: "get_weather".to_string(),
-                    text: arguments.to_string(),
-                }],
-            );
+            if n + 1 < pieces.len() {
+                // Argument text still incomplete JSON: only the delta.
+                assert_eq!(
+                    events,
+                    vec![LlmEvent::ToolInputDelta {
+                        id: "call_1".to_string(),
+                        name: "get_weather".to_string(),
+                        text: arguments.to_string(),
+                    }],
+                );
+            } else {
+                // The accumulated arguments parse as complete JSON: the
+                // AI SDK runtime finalizes the call eagerly.
+                assert_eq!(
+                    events,
+                    vec![
+                        LlmEvent::ToolInputDelta {
+                            id: "call_1".to_string(),
+                            name: "get_weather".to_string(),
+                            text: arguments.to_string(),
+                        },
+                        LlmEvent::ToolInputEnd {
+                            id: "call_1".to_string(),
+                            name: "get_weather".to_string(),
+                            provider_metadata: None,
+                        },
+                        LlmEvent::ToolCall {
+                            id: "call_1".to_string(),
+                            name: "get_weather".to_string(),
+                            input: json!({"city": "Paris"}),
+                            provider_executed: None,
+                            provider_metadata: None,
+                        },
+                    ],
+                );
+            }
         }
 
         let (state, events) = protocol
@@ -1185,20 +1229,10 @@ mod tests {
             .unwrap();
         assert!(events.is_empty());
 
+        // The eager finalization consumed the tool call, so the halt
+        // flush carries only the step-finish/finish pair.
         let finish = protocol.on_halt(state);
-        assert_eq!(
-            finish[0],
-            LlmEvent::ToolInputEnd {
-                id: "call_1".to_string(),
-                name: "get_weather".to_string(),
-                provider_metadata: None,
-            },
-        );
-        match &finish[1] {
-            LlmEvent::ToolCall { input, .. } => assert_eq!(input, &json!({"city": "Paris"})),
-            event => panic!("expected a tool-call, got {event:?}"),
-        }
-        match &finish[2] {
+        match &finish[0] {
             LlmEvent::StepFinish {
                 index,
                 reason,
@@ -1206,7 +1240,7 @@ mod tests {
                 provider_metadata,
             } => {
                 assert_eq!(*index, 0.0);
-                assert_eq!(*reason, FinishReason::ToolCalls);
+                assert_eq!(*reason, FinishReason::Stop);
                 assert!(provider_metadata.is_none());
                 assert_eq!(usage.input_tokens, Some(67.0));
                 assert_eq!(usage.output_tokens, Some(5.0));
@@ -1215,13 +1249,13 @@ mod tests {
             }
             event => panic!("expected a step-finish with usage, got {event:?}"),
         }
-        match &finish[3] {
+        match &finish[1] {
             LlmEvent::Finish {
                 reason,
                 usage: Some(usage),
                 provider_metadata,
             } => {
-                assert_eq!(*reason, FinishReason::ToolCalls);
+                assert_eq!(*reason, FinishReason::Stop);
                 assert!(provider_metadata.is_none());
                 assert_eq!(usage.input_tokens, Some(67.0));
             }

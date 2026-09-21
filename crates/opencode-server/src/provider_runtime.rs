@@ -786,6 +786,71 @@ impl RouteLlmSender {
     }
 }
 
+impl RouteLlmSender {
+    fn route_send(
+        request: opencode_llm::schema::messages::LlmRequest,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> BoxFuture<
+        'static,
+        Result<opencode_core::session::llm::LlmEventStream, opencode_llm::LlmError>,
+    > {
+        Box::pin(async move {
+            let handle = request.model.route.clone();
+            match handle.protocol_id.as_str() {
+                "anthropic-messages" => {
+                    let route = Route {
+                        handle,
+                        protocol: Arc::new(
+                            opencode_llm::protocols::anthropic_messages::AnthropicMessages,
+                        ),
+                        executor: Default::default(),
+                    };
+                    Ok(route.stream_with_halt(&request, cancel).await?)
+                }
+                "openai-chat" | "openai-compatible-chat" => {
+                    let route = Route {
+                        handle,
+                        protocol: Arc::new(opencode_llm::protocols::openai_chat::OpenAiChat),
+                        executor: Default::default(),
+                    };
+                    Ok(route.stream_with_halt(&request, cancel).await?)
+                }
+                "openai-responses" => {
+                    let route = Route {
+                        handle,
+                        protocol: Arc::new(
+                            opencode_llm::protocols::openai_responses::OpenAiResponses,
+                        ),
+                        executor: Default::default(),
+                    };
+                    Ok(route.stream_with_halt(&request, cancel).await?)
+                }
+                "gemini" => {
+                    let route = Route {
+                        handle,
+                        protocol: Arc::new(opencode_llm::protocols::gemini::Gemini),
+                        executor: Default::default(),
+                    };
+                    Ok(route.stream_with_halt(&request, cancel).await?)
+                }
+                "bedrock-converse" => {
+                    let route = Route {
+                        handle,
+                        protocol: Arc::new(
+                            opencode_llm::protocols::bedrock_converse::BedrockConverse,
+                        ),
+                        executor: Default::default(),
+                    };
+                    Ok(route.stream_with_halt(&request, cancel).await?)
+                }
+                other => Err(opencode_llm::LlmError::invalid(format!(
+                    "Unknown route: {other}"
+                ))),
+            }
+        })
+    }
+}
+
 impl LlmRequestSender for RouteLlmSender {
     fn model_ref(&self, model: &LlmModel) -> ModelRef {
         ModelRef::new(
@@ -802,60 +867,18 @@ impl LlmRequestSender for RouteLlmSender {
         'static,
         Result<opencode_core::session::llm::LlmEventStream, opencode_llm::LlmError>,
     > {
-        Box::pin(async move {
-            let handle = request.model.route.clone();
-            match handle.protocol_id.as_str() {
-                "anthropic-messages" => {
-                    let route = Route {
-                        handle,
-                        protocol: Arc::new(
-                            opencode_llm::protocols::anthropic_messages::AnthropicMessages,
-                        ),
-                        executor: Default::default(),
-                    };
-                    Ok(route.stream(&request).await?)
-                }
-                "openai-chat" | "openai-compatible-chat" => {
-                    let route = Route {
-                        handle,
-                        protocol: Arc::new(opencode_llm::protocols::openai_chat::OpenAiChat),
-                        executor: Default::default(),
-                    };
-                    Ok(route.stream(&request).await?)
-                }
-                "openai-responses" => {
-                    let route = Route {
-                        handle,
-                        protocol: Arc::new(
-                            opencode_llm::protocols::openai_responses::OpenAiResponses,
-                        ),
-                        executor: Default::default(),
-                    };
-                    Ok(route.stream(&request).await?)
-                }
-                "gemini" => {
-                    let route = Route {
-                        handle,
-                        protocol: Arc::new(opencode_llm::protocols::gemini::Gemini),
-                        executor: Default::default(),
-                    };
-                    Ok(route.stream(&request).await?)
-                }
-                "bedrock-converse" => {
-                    let route = Route {
-                        handle,
-                        protocol: Arc::new(
-                            opencode_llm::protocols::bedrock_converse::BedrockConverse,
-                        ),
-                        executor: Default::default(),
-                    };
-                    Ok(route.stream(&request).await?)
-                }
-                other => Err(opencode_llm::LlmError::invalid(format!(
-                    "Unknown route: {other}"
-                ))),
-            }
-        })
+        Self::route_send(request, tokio_util::sync::CancellationToken::new())
+    }
+
+    fn send_with_cancel(
+        &self,
+        request: opencode_llm::schema::messages::LlmRequest,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> BoxFuture<
+        'static,
+        Result<opencode_core::session::llm::LlmEventStream, opencode_llm::LlmError>,
+    > {
+        Self::route_send(request, cancel)
     }
 }
 

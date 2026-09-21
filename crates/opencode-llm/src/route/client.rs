@@ -170,6 +170,24 @@ impl<P: Protocol> Route<P> {
         P: Send + Sync + 'static,
         P::State: Send + 'static,
     {
+        Self::stream_with_halt(self, request, tokio_util::sync::CancellationToken::new()).await
+    }
+
+    /// `Stream.mapAccumEffect`'s `onHalt` (route/client.ts:287-291): the
+    /// parser state flushes when the stream halts — which in Effect
+    /// includes interruption. `halt` carries the abort signal so the
+    /// buffered tool-call events emit before the consumer drops the
+    /// stream (native-runtime's forked tool dispatch then runs within
+    /// cleanup's 250ms grace).
+    pub async fn stream_with_halt(
+        &self,
+        request: &LlmRequest,
+        halt: tokio_util::sync::CancellationToken,
+    ) -> Result<futures::stream::BoxStream<'static, Result<LlmEvent, LlmError>>, LlmError>
+    where
+        P: Send + Sync + 'static,
+        P::State: Send + 'static,
+    {
         use futures::StreamExt;
 
         let prepared = self.compile(request)?;
@@ -190,6 +208,7 @@ impl<P: Protocol> Route<P> {
                 frames,
                 pending: Vec::new(),
                 done: false,
+                halt,
             },
             |mut s| async move {
                 loop {
@@ -200,7 +219,25 @@ impl<P: Protocol> Route<P> {
                     if s.done {
                         return None;
                     }
-                    match s.frames.next().await {
+                    let next = tokio::select! {
+                        biased;
+                        _ = s.halt.cancelled() => {
+                            std::fs::write("/tmp/opencode/dbg_halt.log", format!("halt pending={} state={}
+                    ", s.pending.len(), s.state.is_some())).unwrap();
+                            // Interrupted (Effect stream halt): flush the
+                            // buffered parser state, then end.
+                            s.done = true;
+                            if let Some(state) = s.state.take() {
+                                s.pending = s.protocol.on_halt(state);
+                            }
+                            std::fs::write("/tmp/opencode/dbg_flush.log", format!("flushed {}
+                    ", s.pending.len())).unwrap();
+                            s.frames = futures::stream::empty().boxed();
+                            continue;
+                        }
+                        item = s.frames.next() => item,
+                    };
+                    match next {
                         Some(Ok(frame)) => {
                             let event = match s.protocol.decode_frame(&frame) {
                                 Ok(Some(event)) => event,
@@ -283,6 +320,7 @@ struct StreamState<P: Protocol> {
     frames: futures::stream::BoxStream<'static, Result<serde_json::Value, LlmError>>,
     pending: Vec<LlmEvent>,
     done: bool,
+    halt: tokio_util::sync::CancellationToken,
 }
 
 fn transport_error(e: reqwest::Error) -> LlmError {

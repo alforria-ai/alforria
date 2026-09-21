@@ -534,8 +534,10 @@ pub async fn a8_cancel_mid_stream(backend: &impl LlmBackend) -> Vec<Value> {
     .await;
     sess.api.abort(&sess.session_id).await;
 
-    // The interrupted assistant finalizes: abort error, completed time,
-    // the in-flight tool part marked interrupted (prompt.ts:1206-1212).
+    // The interrupted assistant finalizes: abort error + completed time.
+    // The tool part completed before the abort landed (the AI SDK runtime
+    // forks a tool call as soon as its arguments parse — p7 parity): the
+    // part carries its accumulated input, not the interrupted marker.
     let deadline = Instant::now() + Duration::from_secs(60);
     let aborted = loop {
         let messages = sess.api.messages(&sess.session_id).await;
@@ -561,17 +563,17 @@ pub async fn a8_cancel_mid_stream(backend: &impl LlmBackend) -> Vec<Value> {
         json!("MessageAbortedError"),
         "{aborted}"
     );
-    let interrupted = aborted["parts"]
+    let completed = aborted["parts"]
         .as_array()
         .map(|parts| {
             parts.iter().any(|part| {
                 part["type"] == json!("tool")
-                    && part["state"]["status"] == json!("error")
-                    && part["state"]["metadata"]["interrupted"] == json!(true)
+                    && part["state"]["status"] == json!("completed")
+                    && part["state"]["input"] == json!({ "filePath": "a.txt" })
             })
         })
         .unwrap_or_default();
-    assert!(interrupted, "no interrupted tool part\n{aborted}");
+    assert!(completed, "no completed tool part\n{aborted}");
 
     // A re-prompt continues the session normally.
     let resumed = sess
