@@ -211,7 +211,8 @@ pub fn a1_file_mutation(backend: &impl LlmBackend) -> ScenarioRun {
 pub fn a2_multi_step(backend: &impl LlmBackend) -> ScenarioRun {
     // Live models need a directive prompt to guarantee a `read` call.
     let prompt = if backend.live() {
-        "Use the read tool to read a.txt and b.txt, then tell me their contents."
+        "Use the read tool to read the relative paths a.txt and b.txt \
+         (do not use absolute paths), then tell me their contents."
     } else {
         "read the two files and answer"
     };
@@ -901,7 +902,9 @@ pub async fn b4_subagent(backend: &impl LlmBackend) {
         &sess,
         wire_prompt_body(
             backend,
-            "use the task tool to spawn a subagent and tell me what it said",
+            "Call the task tool to spawn a subagent that answers with the \
+             word hello, then tell me what it said. You must use the task \
+             tool — do not answer yourself.",
         ),
         |_, _| None,
     )

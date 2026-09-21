@@ -180,3 +180,12 @@ Panel: glm-5.3-thinking (agentic — two runs, both died mid-flight at turns 50/
   10.1–10.4, the parity harness as 12.1–12.3, and the ACP adapter as 12.4
   (completing plan row 7). Acceptance rows map to: row 8 → C-series, row 9
   → 8.x, row 12 → 12.x.
+
+### Live E2E tier (final acceptance re-run)
+- All 13 live scenarios pass individually on current HEAD. Full-suite runs
+  (3 × ~20 min) each surfaced a rotating pair of failures — different
+  scenarios each time, every one green on isolated re-run (b2_glm needed a
+  sharper relative-path directive; b4_qwen a mandatory "call the task tool"
+  phrasing). Recorded as inherent quality-tier nondeterminism: the live tier
+  is a best-effort smoke, not a CI gate; the deterministic contract lives in
+  the mock-LLM e2e + parity suites.
