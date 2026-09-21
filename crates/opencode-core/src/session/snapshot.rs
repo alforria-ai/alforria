@@ -1344,13 +1344,24 @@ fn spawn_cleanup_loop(snapshot: Arc<GitSnapshot>, first: Duration, interval: Dur
             let Some(snap) = snapshot.upgrade() else {
                 return;
             };
-            let (lock, cvar) = &*snap.cleanup;
+            // Clone the shared stop signal and drop the strong snapshot
+            // reference before waiting: the async `Snapshot` wrappers
+            // clone the struct into `'static` futures (`track`, `patch`,
+            // ...), and each clone's `Drop` re-arms the stop flag, so the
+            // flag alone cannot distinguish a stale clone drop from the
+            // final drop — the weak reference can.
+            let cleanup = snap.cleanup.clone();
+            drop(snap);
+            let (lock, cvar) = &*cleanup;
             let Ok(mut stopped) = lock.lock() else {
                 return;
             };
             loop {
                 if *stopped {
-                    return;
+                    *stopped = false;
+                    if snapshot.upgrade().is_none() {
+                        return;
+                    }
                 }
                 let (next, timed_out) = match cvar.wait_timeout(stopped, delay) {
                     Ok(result) => (result.0, result.1.timed_out()),
@@ -1995,6 +2006,12 @@ mod git_tests {
         commit_all(dir.path());
         let data = TempDir::new("snap-data");
 
+        // The interval must stay short enough to retry: the first gc can
+        // fire before `track()` has created the snapshot repo, and
+        // `cleanup` then early-returns — a hour-long production
+        // interval would never retry inside the test budget. One
+        // second retries promptly without colliding gc runs into
+        // `git gc` lock/gc.log contention.
         let snap = GitSnapshot::with_cleanup(
             GitSnapshotInput {
                 directory: dir.path().to_path_buf(),
@@ -2005,7 +2022,7 @@ mod git_tests {
                 data: data.path().to_path_buf(),
             },
             Duration::from_millis(10),
-            Duration::from_secs(3600),
+            Duration::from_secs(1),
         );
         std::fs::write(dir.path().join("b.txt"), "two\n").unwrap();
         snap.track().await.unwrap();

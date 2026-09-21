@@ -741,10 +741,9 @@ async fn update_merges_permission_and_archives() {
     )
     .await;
     let updated: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
-    assert_eq!(
-        updated["time"]["archived"],
-        serde_json::Value::from(12345.0)
-    );
+    // JS-number wire parity: whole f64s serialize as integers
+    // (`js_number.rs`), like the TS reference's JSON.stringify.
+    assert_eq!(updated["time"]["archived"], serde_json::Value::from(12345));
 
     // Invalid payload → schema-error 400.
     let response = send(

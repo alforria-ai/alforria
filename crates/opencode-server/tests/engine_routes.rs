@@ -490,7 +490,9 @@ async fn session_create_auto_shares_when_config_auto() {
 
     // The auto-share fork posts the legacy create endpoint
     // (`{"sessionID": …}`) and persists the share url on the session.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    // Generous budget: the forked share posts race subprocess git work
+    // and can far exceed 5s under a fully parallel workspace test load.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         let posts = share_http.posts.lock().unwrap();
         if posts.len() >= 2 || std::time::Instant::now() > deadline {

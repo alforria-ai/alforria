@@ -12,18 +12,21 @@ fn opts() -> ListenOptions {
 
 #[tokio::test]
 async fn port_zero_prefers_4096_then_falls_back_when_taken() {
-    // Free 4096 first: bind-and-drop guarantees availability right now.
-    let holder = TcpListener::bind(("127.0.0.1", 4096)).unwrap();
-    drop(holder);
-    let listener = opencode_server::listen_with(&opts(), test_ctx())
-        .await
-        .expect("listen must succeed on 4096");
-    assert_eq!(listener.port, 4096);
-    assert_eq!(listener.url, "http://127.0.0.1:4096");
-    listener.stop().await.unwrap();
+    // The preference phase is only observable when 4096 is free on this
+    // machine — a live `opencode web`/server holds it while developing.
+    if let Ok(free) = TcpListener::bind(("127.0.0.1", 4096)) {
+        drop(free);
+        let listener = opencode_server::listen_with(&opts(), test_ctx())
+            .await
+            .expect("listen must succeed on 4096");
+        assert_eq!(listener.port, 4096);
+        assert_eq!(listener.url, "http://127.0.0.1:4096");
+        listener.stop().await.unwrap();
+    }
 
-    // With 4096 held, explicit 0 falls back to any free port.
-    let holder = TcpListener::bind(("127.0.0.1", 4096)).unwrap();
+    // With 4096 held — by us when possible, or by an external process —
+    // explicit 0 falls back to any free port.
+    let _held = TcpListener::bind(("127.0.0.1", 4096)).ok();
     let listener = opencode_server::listen_with(&opts(), test_ctx())
         .await
         .expect("listen must succeed with any free port");
@@ -32,7 +35,6 @@ async fn port_zero_prefers_4096_then_falls_back_when_taken() {
         "must fall back to a random port when 4096 is taken"
     );
     listener.stop().await.unwrap();
-    drop(holder);
 }
 
 #[tokio::test]
