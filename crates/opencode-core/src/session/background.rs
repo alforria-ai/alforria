@@ -265,9 +265,20 @@ impl BackgroundJobService {
         };
         let info = job.snapshot();
         jobs.insert(id.clone(), job);
+        drop(jobs);
         let handle = self.spawn_run(id.clone(), token, 0, None, input.run, tail);
-        if let Some(job) = jobs.get_mut(&id) {
-            job.tasks.push(handle);
+        // TS forks the run into the job's Effect scope: a cancel that
+        // closes the scope before/while the fork lands also interrupts
+        // it. Pushing under a second lock acquisition can observe a
+        // cancel that slipped between insert and push — abort then,
+        // like a fork into an already-closed scope.
+        let mut jobs = self.lock_jobs();
+        match jobs.get_mut(&id) {
+            Some(job) if job.info.status == Status::Running => {
+                job.tasks.push(handle);
+            }
+            Some(_) => handle.abort(),
+            None => handle.abort(),
         }
         Ok(info)
     }
@@ -301,8 +312,13 @@ impl BackgroundJobService {
             tail,
         );
         let mut jobs = self.lock_jobs();
-        if let Some(job) = jobs.get_mut(&input.id) {
-            job.tasks.push(handle);
+        // Same race as `start`: a cancel between the reserve and this
+        // push must abort the run, like a fork into a closed scope.
+        match jobs.get_mut(&input.id) {
+            Some(job) if job.info.status == Status::Running => {
+                job.tasks.push(handle);
+            }
+            _ => handle.abort(),
         }
         Ok(true)
     }
@@ -750,6 +766,34 @@ mod tests {
             })
             .await;
         assert_eq!(result.info.unwrap().status, Status::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn cancel_interrupts_the_in_flight_run() {
+        // A cancelled job must not keep its run executing (TS closes the
+        // job's Effect scope); the abort must cut the future short.
+        let strong = Arc::new(());
+        let weak = Arc::downgrade(&strong);
+        let run = strong.clone();
+        let jobs = service();
+        jobs.start(StartInput {
+            id: Some("job_race".to_string()),
+            ..running(Box::pin(async move {
+                let _hold = run;
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                Ok("never".to_string())
+            }))
+        })
+        .unwrap();
+        jobs.cancel("job_race").unwrap();
+        // Give the abort a moment to land, then the run's Arc must be the
+        // last strong reference.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(strong);
+        assert!(
+            weak.upgrade().is_none(),
+            "the cancelled run future must be dropped"
+        );
     }
 
     #[tokio::test]

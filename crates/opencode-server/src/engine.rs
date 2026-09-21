@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use futures::future::BoxFuture;
 use opencode_core::session::agents::AgentRegistry;
@@ -930,26 +930,44 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
 // ---------------------------------------------------------------------------
 
 /// Per-instance engines keyed by the `Arc<SessionServices>` a
-/// [`LocationContext`] carries. The value keeps the services `Arc` alive so
-/// the address key can't be reused while the entry exists.
+/// [`LocationContext`] carries. Entries hold only a weak services
+/// reference: once the instance's services `Arc` dies the entry lapses
+/// and is evicted on the next lookup, so dead instances don't leak
+/// engines (TS gets the same lifetime from per-instance Effect
+/// scopes).
 #[derive(Default)]
 pub struct EngineStore {
     entries: Mutex<HashMap<usize, EngineEntry>>,
 }
 
 struct EngineEntry {
-    /// Keeps the key (the services address) alive and unique — never read.
-    _services: Arc<SessionServices>,
+    /// Lapses when the instance's services `Arc` dies. A live upgrade
+    /// also proves the address key still belongs to this instance —
+    /// lookup must never match a newer `Arc` allocated at a reused
+    /// address.
+    services: Weak<SessionServices>,
     engine: Arc<ProductionEngine>,
 }
 
 impl EngineStore {
     fn engine(&self, services: &Arc<SessionServices>) -> Option<Arc<ProductionEngine>> {
-        self.entries
+        let mut entries = self
+            .entries
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(&(Arc::as_ptr(services) as usize))
-            .map(|entry| entry.engine.clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = Arc::as_ptr(services) as usize;
+        match entries.get(&key) {
+            Some(entry) => match entry.services.upgrade() {
+                Some(_guard) => Some(entry.engine.clone()),
+                // Lapsed instance: evict so a newer `Arc` reusing the
+                // address can boot cleanly.
+                None => {
+                    entries.remove(&key);
+                    None
+                }
+            },
+            None => None,
+        }
     }
 
     fn insert(
@@ -963,7 +981,7 @@ impl EngineStore {
             .insert(
                 Arc::as_ptr(&services) as usize,
                 EngineEntry {
-                    _services: services,
+                    services: Arc::downgrade(&services),
                     engine,
                 },
             );
