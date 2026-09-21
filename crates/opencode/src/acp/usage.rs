@@ -92,6 +92,17 @@ pub fn find_context_limit(providers: &Value, provider_id: &str, model_id: &str) 
 
 /// `sendUpdate` (usage.ts:183-221): best-effort — every failure is
 /// logged and swallowed.
+/// The TS memoizes context-limit lookups per (directory, providerID,
+/// modelID) via `Effect.cached` inside a `SynchronizedRef` (usage.ts:148-169).
+static CONTEXT_LIMIT_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, Option<f64>>>,
+> = std::sync::OnceLock::new();
+
+fn context_limit_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, Option<f64>>>
+{
+    CONTEXT_LIMIT_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
 pub async fn send_update(
     connection: &crate::acp::jsonrpc::Connection,
     server: &ServerClient,
@@ -114,9 +125,27 @@ pub async fn send_update(
     ) else {
         return;
     };
-    let size = match server.config_providers(directory).await {
-        Ok(providers) => find_context_limit(&providers, provider_id, model_id),
-        Err(_) => None,
+    let cache_key = format!("{directory}\x00{provider_id}\x00{model_id}");
+    let size = {
+        let cached = context_limit_cache()
+            .lock()
+            .unwrap()
+            .get(&cache_key)
+            .cloned();
+        match cached {
+            Some(size) => size,
+            None => {
+                let size = match server.config_providers(directory).await {
+                    Ok(providers) => find_context_limit(&providers, provider_id, model_id),
+                    Err(_) => None,
+                };
+                context_limit_cache()
+                    .lock()
+                    .unwrap()
+                    .insert(cache_key, size.clone());
+                size
+            }
+        }
     };
     let Some(size) = size else {
         return;

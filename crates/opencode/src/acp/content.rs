@@ -327,22 +327,25 @@ pub fn path_to_file_url(path: &str) -> String {
 }
 
 fn percent_decode(input: &str) -> String {
-    let mut out = String::new();
+    // `decodeURIComponent` semantics: %XX escapes decode to raw bytes and
+    // the byte string is then read as UTF-8 — a multi-byte sequence may be
+    // built from several consecutive escapes.
     let bytes = input.as_bytes();
+    let mut out: Vec<u8> = Vec::new();
     let mut index = 0;
     while index < bytes.len() {
         if bytes[index] == b'%' && index + 2 < bytes.len() {
             let hex = &input[index + 1..index + 3];
             if let Ok(byte) = u8::from_str_radix(hex, 16) {
-                out.push(byte as char);
+                out.push(byte);
                 index += 3;
                 continue;
             }
         }
-        out.push(bytes[index] as char);
+        out.push(bytes[index]);
         index += 1;
     }
-    out
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn decode_data_url(url: &str) -> Option<(String, String)> {

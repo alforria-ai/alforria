@@ -596,6 +596,11 @@ pub fn run(matches: &ArgMatches, ui: &mut Ui) -> Result<(), TypedError> {
 fn handler(args: &RunArgs, ui: &mut Ui) -> Result<(), TypedError> {
     let message = build_message(&args.message);
     validate(args, true, ui.is_tty())?;
+    // The `--mini` interactive mode (`run/runtime.ts`) is not ported; fail
+    // loudly rather than silently consuming the prompt single-shot.
+    if args.mini {
+        return Err(CliError::new("--mini interactive mode is not supported").into());
+    }
 
     let root = resolve_root();
     let directory = resolve_directory(&root, args.dir.as_deref(), args.attach.is_some())?;
@@ -784,7 +789,9 @@ async fn execute(
         }
         return Err(TypedError::Cli(CliError::with_exit_code("", 1)));
     }
-    if state.error.is_some() {
+    // `finish()` returns early in attach mode (run.ts:839-843) — the
+    // loop's error exit code only applies to the local server.
+    if state.error.is_some() && args.attach.is_none() {
         // Errors already rendered per event; exit code 1 without a new line.
         return Err(TypedError::Cli(CliError::with_exit_code("", 1)));
     }

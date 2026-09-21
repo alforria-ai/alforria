@@ -334,7 +334,11 @@ fn map_part(state: &mut LoopState, part: &Value) -> Vec<Output> {
         return Vec::new();
     }
     if part_type == "text" {
-        let finished = part.get("time").and_then(|time| time.get("end")).is_some();
+        // `part.time?.end` (run.ts:753) — a null end is not finished.
+        let finished = part
+            .get("time")
+            .and_then(|time| time.get("end"))
+            .is_some_and(|end| !end.is_null());
         if !finished {
             return Vec::new();
         }
@@ -351,7 +355,11 @@ fn map_part(state: &mut LoopState, part: &Value) -> Vec<Output> {
         return vec![Output::Empty, Output::Println(text), Output::Empty];
     }
     if part_type == "reasoning" {
-        let finished = part.get("time").and_then(|time| time.get("end")).is_some();
+        // `part.time?.end` (run.ts:766) — a null end is not finished.
+        let finished = part
+            .get("time")
+            .and_then(|time| time.get("end"))
+            .is_some_and(|end| !end.is_null());
         if !finished || !state.thinking {
             return Vec::new();
         }

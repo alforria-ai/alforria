@@ -193,18 +193,14 @@ fn build_model_select_options(providers: &[Value], _include_variants: bool) -> V
         let Some(models) = provider.get("models").and_then(Value::as_object) else {
             continue;
         };
+        // `a.name.localeCompare(b.name)` (config-option.ts:175) —
+        // case-sensitive, no lowercasing.
         let mut sorted: Vec<(&String, &Value)> = models.iter().collect();
         sorted.sort_by(|a, b| {
             a.1.get("name")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
-                .to_lowercase()
-                .cmp(
-                    &b.1.get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_lowercase(),
-                )
+                .cmp(b.1.get("name").and_then(Value::as_str).unwrap_or_default())
         });
         for (model_id, model) in sorted {
             options.push(json!({

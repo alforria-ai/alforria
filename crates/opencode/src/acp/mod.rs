@@ -79,15 +79,23 @@ impl AcpAgent {
                                 "id": id,
                                 "result": result,
                             }),
-                            Err(error) => json!({
-                                "jsonrpc": "2.0",
-                                "id": id,
-                                "error": {
+                            Err(error) => {
+                                // The SDK's RequestError omits `data`
+                                // when undefined — JSON.stringify drops
+                                // the key, it doesn't null it.
+                                let mut payload = json!({
                                     "code": error.code,
                                     "message": error.message,
-                                    "data": error.data,
-                                },
-                            }),
+                                });
+                                if let Some(data) = error.data {
+                                    payload["data"] = data;
+                                }
+                                json!({
+                                    "jsonrpc": "2.0",
+                                    "id": id,
+                                    "error": payload,
+                                })
+                            }
                         };
                         this.connection.transport().write(&response.to_string());
                     });
@@ -173,10 +181,14 @@ impl AcpAgent {
         if params["methodId"].as_str() != Some(AUTH_METHOD_ID) {
             return Err(AcpError::invalid_params(
                 json!({ "methodId": params["methodId"] }),
-                None,
+                Some(&format!(
+                    "unknown auth method: {}",
+                    params["methodId"].as_str().unwrap_or_default()
+                )),
             ));
         }
-        Ok(Value::Null)
+        // `return {}` (service.ts:146) — an empty object, not null.
+        Ok(json!({}))
     }
 
     // ------------------------------------------------------------------
@@ -594,7 +606,10 @@ impl AcpAgent {
                     })
                     .unwrap_or(false);
                 if !valid {
-                    return Err(AcpError::invalid_params(json!({ "effort": value }), None));
+                    return Err(AcpError::invalid_params(
+                        json!({ "effort": value }),
+                        Some(&format!("effort not found: {value}")),
+                    ));
                 }
                 self.sessions
                     .set_variant(session_id, Some(value.to_string()));
@@ -610,7 +625,10 @@ impl AcpAgent {
             }
             "mode" => {
                 if !snapshot.has_mode(value) {
-                    return Err(AcpError::invalid_params(json!({ "mode": value }), None));
+                    return Err(AcpError::invalid_params(
+                        json!({ "mode": value }),
+                        Some(&format!("mode not found: {value}")),
+                    ));
                 }
                 self.sessions.set_mode(session_id, Some(value.to_string()));
                 let state = self.get_session(session_id)?;
@@ -640,7 +658,10 @@ impl AcpAgent {
         let snapshot = self.config_snapshot(&current).await?;
         let mode_id = params["modeId"].as_str().unwrap_or_default();
         if !snapshot.has_mode(mode_id) {
-            return Err(AcpError::invalid_params(json!({ "mode": mode_id }), None));
+            return Err(AcpError::invalid_params(
+                json!({ "mode": mode_id }),
+                Some(&format!("mode not found: {mode_id}")),
+            ));
         }
         self.sessions
             .set_mode(session_id, Some(mode_id.to_string()));
@@ -736,6 +757,7 @@ impl AcpAgent {
                         .await
                 })
                 .await
+                .map_err(internal_error)?
                 .map_err(internal_error)?;
             usage::send_update(&self.connection, &self.server, &current.cwd, session_id).await;
             return prompt_response(response.get("info"), message_id).await;
@@ -767,6 +789,7 @@ impl AcpAgent {
                         .await
                 })
                 .await
+                .map_err(internal_error)?
                 .map_err(internal_error)?;
             usage::send_update(&self.connection, &self.server, &current.cwd, session_id).await;
             return prompt_response(response.get("info"), message_id).await;
@@ -799,9 +822,12 @@ impl AcpAgent {
     // ------------------------------------------------------------------
 
     fn get_session(&self, session_id: &str) -> Result<SessionInfo, AcpError> {
-        self.sessions
-            .get(session_id)
-            .ok_or_else(|| AcpError::invalid_params(json!({ "sessionId": session_id }), None))
+        self.sessions.get(session_id).ok_or_else(|| {
+            AcpError::invalid_params(
+                json!({ "sessionId": session_id }),
+                Some(&format!("session not found: {session_id}")),
+            )
+        })
     }
 
     fn store_session(&self, session: SessionInfo) -> SessionInfo {
@@ -873,6 +899,10 @@ impl AcpAgent {
         let session_id = session_id.to_string();
         let commands = snapshot.available_commands.clone();
         tokio::spawn(async move {
+            // `setTimeout(0)` (service.ts:992) — the notification must not
+            // overtake the response for the dispatch that scheduled it;
+            // yield a tick so the response write wins the race.
+            tokio::time::sleep(std::time::Duration::ZERO).await;
             let _ = connection
                 .send_notification(
                     "session/update",
@@ -1045,7 +1075,10 @@ struct SlashCommand {
 
 /// `invalidParams` shapes from error.ts:63-93.
 fn invalid_config_option(config_id: &str) -> AcpError {
-    AcpError::invalid_params(json!({ "configId": config_id }), None)
+    AcpError::invalid_params(
+        json!({ "configId": config_id }),
+        Some(&format!("unknown config option: {config_id}")),
+    )
 }
 
 fn internal_error(message: String) -> AcpError {
@@ -1367,7 +1400,7 @@ fn parse_selected_model(snapshot: &Snapshot, model_id: &str) -> Result<Value, Ac
     let Some(_model) = model else {
         return Err(AcpError::invalid_params(
             json!({ "providerId": provider_id, "modelId": model_id }),
-            None,
+            Some(&format!("model not found: {model_id}")),
         ));
     };
     if let Some(variant) = selection.get("variant").and_then(Value::as_str) {
@@ -1376,7 +1409,10 @@ fn parse_selected_model(snapshot: &Snapshot, model_id: &str) -> Result<Value, Ac
             .and_then(|variants| variants.get(variant))
             .is_none()
         {
-            return Err(AcpError::invalid_params(json!({ "effort": variant }), None));
+            return Err(AcpError::invalid_params(
+                json!({ "effort": variant }),
+                Some(&format!("effort not found: {variant}")),
+            ));
         }
     }
     Ok(selection)

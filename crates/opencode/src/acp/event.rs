@@ -26,7 +26,7 @@ pub struct Subscription {
     sessions: SessionStore,
     abort: Arc<AtomicBool>,
     connected: Arc<AtomicBool>,
-    idle_waiters: Mutex<HashMap<String, Vec<tokio::sync::oneshot::Sender<()>>>>,
+    idle_waiters: Mutex<HashMap<String, Vec<tokio::sync::oneshot::Sender<Result<(), String>>>>>,
     connection_waiters: Mutex<Vec<tokio::sync::oneshot::Sender<()>>>,
     shell_snapshots: Mutex<HashMap<String, String>>,
     tool_starts: Mutex<std::collections::HashSet<String>>,
@@ -59,19 +59,25 @@ pub fn start(
 }
 
 impl Subscription {
-    /// `runUntilIdle` (event.ts:74-91).
+    /// `runUntilIdle` (event.ts:74-91) — rejects with the disconnect
+    /// error when the SSE stream drops mid-request (event.ts:113-122).
     pub async fn run_until_idle<A>(
         &self,
         session_id: &str,
         request: impl std::future::Future<Output = A>,
-    ) -> A {
+    ) -> Result<A, String> {
         self.wait_until_connected().await;
         let mut rx = self.register_idle_waiter(session_id);
         let response = request.await;
-        if rx.try_recv().is_err() {
-            let _ = rx.await;
+        match rx.try_recv() {
+            Err(_) => match rx.await {
+                Ok(Ok(())) => Ok(response),
+                Ok(Err(error)) => Err(error),
+                Err(_) => Ok(response),
+            },
+            Ok(Ok(())) => Ok(response),
+            Ok(Err(error)) => Err(error),
         }
-        response
     }
 
     /// The connected handshake (`waitUntilConnected`, event.ts:167-172).
@@ -86,7 +92,10 @@ impl Subscription {
         }
     }
 
-    fn register_idle_waiter(&self, session_id: &str) -> tokio::sync::oneshot::Receiver<()> {
+    fn register_idle_waiter(
+        &self,
+        session_id: &str,
+    ) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.idle_waiters
             .lock()
@@ -97,11 +106,26 @@ impl Subscription {
         rx
     }
 
+    /// `disconnected` (event.ts:113-122) — reject every idle waiter when
+    /// the stream drops.
+    fn disconnected(&self) {
+        if !self.connected.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        let mut waiters = self.idle_waiters.lock().unwrap();
+        let mut taken = HashMap::new();
+        std::mem::swap(&mut *waiters, &mut taken);
+        let senders: Vec<_> = taken.values_mut().flat_map(|v| v.drain(..)).collect();
+        for waiter in senders {
+            let _ = waiter.send(Err("ACP event stream disconnected".to_string()));
+        }
+    }
+
     fn idle(&self, session_id: &str) {
         let mut waiters = self.idle_waiters.lock().unwrap();
         if let Some(waiters) = waiters.remove(session_id) {
             for waiter in waiters {
-                let _ = waiter.send(());
+                let _ = waiter.send(Ok(()));
             }
         }
     }
@@ -110,6 +134,7 @@ impl Subscription {
     async fn run(&self) {
         while !self.abort.load(Ordering::SeqCst) {
             self.consume().await;
+            self.disconnected();
             if self.abort.load(Ordering::SeqCst) {
                 break;
             }

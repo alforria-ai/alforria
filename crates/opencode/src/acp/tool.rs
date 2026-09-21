@@ -68,7 +68,10 @@ fn location_from(values: &[Option<&Value>]) -> Vec<Value> {
             _ => {}
         }
     }
-    paths.dedup();
+    // `Array.from(new Set(...))` (tool.ts:310-321) — global dedup, not
+    // just adjacent repeats.
+    let mut seen = std::collections::HashSet::new();
+    paths.retain(|path| seen.insert(path.clone()));
     paths
         .into_iter()
         .map(|path| json!({ "path": path }))
@@ -174,11 +177,20 @@ pub fn error_tool_update(
             "type": "content",
             "content": { "type": "text", "text": error },
         }],
-        "rawOutput": {
-            "error": error,
-            "metadata": state.get("metadata").cloned().unwrap_or(Value::Null),
-        },
+        "rawOutput": error_tool_raw_output(state),
     })
+}
+
+/// The error variant of `rawOutput` (tool.ts:222-227) — metadata is
+/// `undefined`-dropped, not null.
+fn error_tool_raw_output(state: &Value) -> Value {
+    let mut raw_output = json!({
+        "error": state.get("error").cloned().unwrap_or(Value::Null),
+    });
+    if let Some(metadata) = state.get("metadata") {
+        raw_output["metadata"] = metadata.clone();
+    }
+    raw_output
 }
 
 /// `completedToolRawOutput` (tool.ts:230-236).
@@ -249,17 +261,24 @@ struct UrlCaptures {
 }
 
 fn url_regex_captures(url: &str) -> Option<UrlCaptures> {
+    // `/^data:([^;,]+)(?:;[^,]*)*;base64,(.*)$/` (tool.ts:353) — optional
+    // parameter segments sit between the mime and the `;base64,` payload.
     let rest = url.strip_prefix("data:")?;
-    let mime_end = rest.find(';')?;
+    let mime_end = rest.find([';', ','])?;
     let mime = &rest[..mime_end];
-    let after = &rest[mime_end..];
-    if !after.starts_with(";base64,") {
-        return None;
+    let mut after = &rest[mime_end..];
+    loop {
+        if let Some(data) = after.strip_prefix(";base64,") {
+            return Some(UrlCaptures {
+                mime: Some(mime.to_string()),
+                data: Some(data.to_string()),
+            });
+        }
+        let Some(offset) = after[1..].find(';') else {
+            return None;
+        };
+        after = &after[offset + 1..];
     }
-    Some(UrlCaptures {
-        mime: Some(mime.to_string()),
-        data: Some(after[";base64,".len()..].to_string()),
-    })
 }
 
 /// `shellOutputSnapshot` (tool.ts:258-261).
