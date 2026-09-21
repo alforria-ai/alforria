@@ -1001,10 +1001,12 @@ fn on_output_item_done(
     };
 
     if str_field(item, "type") == Some("function_call") {
+        // `!item.id || !item.call_id || !item.name` (openai-responses.ts:816)
+        // — empty strings drop the item like any other missing field.
         let (Some(item_id), Some(call_id), Some(name)) = (
-            item_id(item),
-            str_field(item, "call_id"),
-            str_field(item, "name"),
+            item_id(item).filter(|value| !value.is_empty()),
+            str_field(item, "call_id").filter(|value| !value.is_empty()),
+            str_field(item, "name").filter(|value| !value.is_empty()),
         ) else {
             return Ok(no_events(state));
         };

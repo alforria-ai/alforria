@@ -686,8 +686,9 @@ fn response_body(body: Option<&str>, request: &PreparedRequest) -> ResponseBody 
 }
 
 fn provider_message(status: u16, details: &ResponseBody) -> String {
+    // `body.body &&` (executor.ts:205) — empty strings drop the suffix.
     match &details.body {
-        Some(body) if body.len() <= 500 => {
+        Some(body) if !body.is_empty() && body.len() <= 500 => {
             format!("Provider request failed with HTTP {status}: {body}")
         }
         _ => format!("Provider request failed with HTTP {status}"),

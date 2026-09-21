@@ -920,7 +920,13 @@ fn step(mut state: State, event: &BedrockEvent) -> Result<(State, Vec<LlmEvent>)
                     None,
                 );
             }
-            if let Some(signature) = reasoning.signature.clone() {
+            // `reasoning.signature ? …` (bedrock-converse.ts:520) — the
+            // truthy check drops empty-string signatures.
+            if let Some(signature) = reasoning
+                .signature
+                .clone()
+                .filter(|signature| !signature.is_empty())
+            {
                 state.reasoning_signatures.insert(index, signature);
             }
             return Ok((state, events));

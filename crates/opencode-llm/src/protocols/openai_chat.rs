@@ -633,7 +633,23 @@ fn map_usage(usage: Option<&serde_json::Value>) -> Option<Usage> {
         .and_then(serde_json::Value::as_f64);
     let prompt_tokens = field("prompt_tokens");
     let completion_tokens = field("completion_tokens");
-    let raw = usage.as_object()?.clone();
+    // Effect Schema decodes strip excess keys — `providerMetadata: {openai:
+    // usage}` carries only the declared usage fields (openai-chat.ts:117-126).
+    let raw: serde_json::Map<String, serde_json::Value> = usage
+        .as_object()?
+        .iter()
+        .filter(|(key, _)| {
+            matches!(
+                key.as_str(),
+                "prompt_tokens"
+                    | "completion_tokens"
+                    | "total_tokens"
+                    | "prompt_tokens_details"
+                    | "completion_tokens_details"
+            )
+        })
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
     Some(Usage {
         input_tokens: prompt_tokens,
         output_tokens: completion_tokens,

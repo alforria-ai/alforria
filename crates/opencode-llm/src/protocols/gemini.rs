@@ -271,8 +271,8 @@ struct GeminiPartWire {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 struct GeminiFunctionCallWire {
     name: String,
-    #[serde(default)]
-    args: Option<Value>,
+    // `args: Schema.Unknown` (gemini.ts:47) — the field must be present.
+    args: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -709,7 +709,7 @@ fn step(mut state: State, event: &GeminiEventWire) -> (State, Vec<LlmEvent>) {
             events.push(LlmEvent::ToolCall {
                 id,
                 name: function_call.name.clone(),
-                input: function_call.args.clone().unwrap_or(Value::Null),
+                input: function_call.args.clone(),
                 provider_executed: None,
                 provider_metadata: part_signature.map(signature_metadata),
             });
