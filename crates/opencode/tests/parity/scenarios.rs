@@ -8,15 +8,16 @@
 //! SSE stream alongside them (spec PARITY §2.3).
 
 use std::future::Future;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::backend::{LibertaiBackend, LiveModel, LlmBackend, MockBackend};
 use crate::harness::{Env, ProcOutput, Serve};
-use crate::parity_harness::{TsServe, TsSource};
+use crate::parity_harness::{golden_mode, record_mode, TsServe, TsSource};
 use crate::transcript::Transcript;
 use crate::wire::{pump_until, Api, EventLog};
 
@@ -27,6 +28,7 @@ pub const A3_PERMISSION_GATE: &str = "a3_permission_gate";
 pub const A4_SUBAGENT: &str = "a4_subagent";
 pub const A6_COMPACTION: &str = "a6_compaction";
 pub const A7_REVERT: &str = "a7_revert";
+pub const A8_CANCEL_MID_STREAM: &str = "a8_cancel_mid_stream";
 pub const A9_STRUCTURED_OUTPUT: &str = "a9_structured_output";
 
 /// Named HTTP captures produced by one scenario driver, in driving order.
@@ -76,8 +78,86 @@ pub struct Capture {
     pub requests: Vec<Value>,
     /// The legacy `/event` SSE stream (envelope per event).
     pub events: Vec<Value>,
+    /// The V2 `/api/event` SSE stream. TS `opencode serve` does not mount
+    /// the V2 event group (it lives in the embedded `packages/server`
+    /// web server, `protocol/src/groups/event.ts`), so this stays empty
+    /// on the TS side and the V2 envelope is checked on the Rust capture.
+    pub v2_events: Vec<Value>,
     /// The project directory (the N4 normalization root).
     pub project: String,
+}
+
+/// The serialized form of [`Capture`] stored in the golden files (spec
+/// PARITY §7). Raw captures, not normalized ones: normalization is a
+/// pure function of the capture, so replay-time normalization is
+/// byte-identical to record-time, and the raw artifacts keep the
+/// scenario-specific assertions working in golden mode.
+#[derive(Serialize, Deserialize)]
+struct GoldenCapture {
+    named: Vec<(String, Value)>,
+    requests: Vec<Value>,
+    events: Vec<Value>,
+    v2_events: Vec<Value>,
+    project: String,
+}
+
+impl Capture {
+    fn to_golden(&self) -> GoldenCapture {
+        GoldenCapture {
+            named: self
+                .named
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.clone()))
+                .collect(),
+            requests: self.requests.clone(),
+            events: self.events.clone(),
+            v2_events: self.v2_events.clone(),
+            project: self.project.clone(),
+        }
+    }
+
+    fn from_golden(golden: GoldenCapture) -> Capture {
+        Capture {
+            named: golden
+                .named
+                .into_iter()
+                .map(|(key, value)| {
+                    let key: &'static str = Box::leak(key.into_boxed_str());
+                    (key, value)
+                })
+                .collect(),
+            requests: golden.requests,
+            events: golden.events,
+            v2_events: golden.v2_events,
+            project: golden.project,
+        }
+    }
+}
+
+/// The committed golden file of one scenario's TS capture.
+fn golden_path(check: &str) -> PathBuf {
+    Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/parity/golden/ts"))
+        .join(format!("{check}.json"))
+}
+
+fn store_golden(check: &str, capture: &Capture) {
+    let path = golden_path(check);
+    std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&capture.to_golden()).expect("serialize golden"),
+    )
+    .expect("write golden");
+}
+
+fn load_golden(check: &str) -> Capture {
+    let path = golden_path(check);
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|err| {
+        panic!(
+            "golden capture {path:?} missing ({err}) — record it with \
+             OPENCODE_PARITY_RECORD=1 on a machine with the pinned TS clone"
+        )
+    });
+    Capture::from_golden(serde_json::from_str(&text).expect("golden capture body"))
 }
 
 /// Fresh isolated env wired at the given mock-LLM base URL.
@@ -221,15 +301,34 @@ async fn drain(log: &EventLog) -> Vec<Value> {
     }
 }
 
-/// Assemble the capture once the driver is done: drain the stream so
+/// Assemble the capture once the driver is done: drain the streams so
 /// late control-plane events settle before the capture.
-async fn finish(env: &Env, log: &EventLog, named: Named, requests: Vec<Value>) -> Capture {
+async fn finish(
+    env: &Env,
+    log: &EventLog,
+    v2_log: &EventLog,
+    named: Named,
+    requests: Vec<Value>,
+) -> Capture {
     Capture {
         named,
         requests,
         events: drain(log).await,
+        v2_events: drain(v2_log).await,
         project: env.project_dir().display().to_string(),
     }
+}
+
+/// Wait until a fresh subscription is actually connected — both binaries
+/// emit `server.connected` as the first frame on connect, so awaiting it
+/// closes the subscribe-before-drive race (no published event is lost).
+async fn await_connected(log: &EventLog) {
+    let _ = pump_until(log, Duration::from_secs(30), |events| {
+        events
+            .first()
+            .is_some_and(|event| event["type"] == json!("server.connected"))
+    })
+    .await;
 }
 
 /// The Rust half of one dual run.
@@ -244,12 +343,15 @@ where
     setup(&env.project_dir());
     let serve = Serve::spawn(&env);
     let directory = env.project_dir().display().to_string();
+    let v2_log = EventLog::subscribe_url(&format!("http://127.0.0.1:{}/api/event", serve.port));
+    await_connected(&v2_log).await;
     let log = EventLog::subscribe(&serve, &directory);
+    await_connected(&log).await;
     let cli = Cli {
         run: Box::new(|args| env.run(args)),
     };
     let named = drive(&backend, &env, serve.port, &log, &cli).await;
-    finish(&env, &log, named, backend.requests()).await
+    finish(&env, &log, &v2_log, named, backend.requests()).await
 }
 
 /// The TS half of one dual run.
@@ -264,28 +366,40 @@ where
     let serve = TsServe::spawn(ts, &env);
     let directory = env.project_dir().display().to_string();
     let log = EventLog::subscribe_at(serve.port, &directory);
+    await_connected(&log).await;
+    // `opencode serve` has no `/api/event` route — see `Capture::v2_events`.
+    let v2_log = EventLog::empty();
     let cli = Cli {
         run: Box::new(|args| crate::parity_harness::ts_cli(ts, &env, args)),
     };
     let named = drive(&backend, &env, serve.port, &log, &cli).await;
-    finish(&env, &log, named, backend.requests()).await
+    finish(&env, &log, &v2_log, named, backend.requests()).await
 }
 
-/// Run one scenario against both binaries (Rust first, then the TS
-/// reference) against a fresh project env + mock backend per side.
-pub async fn scenario<S, F>(
-    tag: &str,
-    fixture: &str,
-    ts: &TsSource,
-    setup: S,
-    drive: F,
-) -> (Capture, Capture)
+/// Run one scenario against both binaries against a fresh project env +
+/// mock backend per side. `check` is the scenario's report/golden key.
+/// Golden mode (spec PARITY §7) replaces the live TS run with the
+/// committed golden capture; record mode rewrites the goldens from a
+/// live TS run.
+pub async fn scenario<S, F>(check: &str, fixture: &str, setup: S, drive: F) -> (Capture, Capture)
 where
     S: Fn(&Path),
     F: for<'a> Fn(&'a MockBackend, &'a Env, u16, &'a EventLog, &'a Cli<'a>) -> DriveFuture<'a>,
 {
-    let rs = run_rust(tag, fixture, &setup, &drive).await;
-    let ts = run_ts(tag, fixture, ts, &setup, &drive).await;
+    assert!(
+        !(golden_mode() && record_mode()),
+        "OPENCODE_PARITY_GOLDEN and OPENCODE_PARITY_RECORD are mutually exclusive"
+    );
+    let rs = run_rust(check, fixture, &setup, &drive).await;
+    if golden_mode() {
+        let ts = load_golden(check);
+        return (ts, rs);
+    }
+    let ts_source = TsSource::resolve();
+    let ts = run_ts(check, fixture, &ts_source, &setup, &drive).await;
+    if record_mode() {
+        store_golden(check, &ts);
+    }
     (ts, rs)
 }
 
@@ -472,6 +586,62 @@ pub async fn drive_p6(backend: &MockBackend, env: &Env, port: u16, log: &EventLo
         ("a_txt_reverted", json!(a_txt_reverted)),
         ("unrevert", unrevert),
         ("a_txt_unreverted", json!(a_txt_unreverted)),
+    ]
+}
+
+/// P7 — cancel mid-stream (A8): the transcript streams a tool call, then
+/// stalls behind it; `POST /session/{id}/abort` interrupts the in-flight
+/// turn (the pinned route inventory has no `/cancel` route — abort is
+/// the wired twin of the spec's `POST /cancel`), and a re-prompt
+/// continues on turn 2. The interrupted-part event sequence is the
+/// strict SSE stream diff's subject.
+pub async fn drive_p7(backend: &MockBackend, env: &Env, port: u16, log: &EventLog) -> Named {
+    let api = Api::new(port, env.project_dir().display().to_string());
+    std::fs::write(env.project_dir().join("a.txt"), "x\n").expect("seed a.txt");
+    let session = create_session(&api).await;
+    let id = session_id(&session);
+    api.prompt_async(&id, prompt_body("go")).await;
+
+    // The tool part is in flight (the transcript stalls behind it).
+    pump_until(log, backend.turn_timeout(), |events| {
+        events.iter().any(|event| {
+            event["type"] == json!("message.part.updated")
+                && event["properties"]["sessionID"] == json!(id)
+                && event["properties"]["part"]["type"] == json!("tool")
+                && event["properties"]["part"]["state"]["status"] == json!("pending")
+        })
+    })
+    .await;
+    api.abort(&id).await;
+
+    // The interrupted assistant finalizes: abort error, completed time,
+    // the in-flight tool part marked interrupted.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let messages = api.messages(&id).await;
+        let finalized = messages.iter().rfind(|message| {
+            message["info"]["role"] == json!("assistant")
+                && message["info"]["error"].is_object()
+                && message["info"]["time"]["completed"].is_number()
+        });
+        if finalized.is_some() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "aborted assistant never finalized\n{messages:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let store = api.messages(&id).await;
+
+    // The re-prompt continues the session on turn 2.
+    let resumed = api.prompt(&id, prompt_body("go again")).await;
+    vec![
+        ("session", session),
+        ("store", json!(store)),
+        ("part_sequence", part_sequence(&store)),
+        ("resumed", resumed),
     ]
 }
 

@@ -344,6 +344,21 @@ pub async fn run_loop(
         step += 1;
         if step == 1 {
             fork_title(deps, session.clone(), msgs.clone(), &last_user);
+            // TS forks `summary.summarize` at the same step
+            // (prompt.ts:1253, after the title fork at :1133), and
+            // Effect's cooperative scheduler runs it as soon as the
+            // parent suspends — observably, the zero summary lands
+            // before the title's LLM round trip completes. Await the
+            // zeroing half inline and fork the diff attachment.
+            deps.summary.reset(session_id).await?;
+            let summary = deps.summary.clone();
+            let fork_session_id = session_id.to_string();
+            let fork_message_id = last_user_id.clone();
+            tokio::spawn(async move {
+                summary
+                    .attach_diffs(&fork_session_id, &fork_message_id)
+                    .await;
+            });
         }
 
         let (provider_id, model_id) = match &last_user {
@@ -554,15 +569,6 @@ pub async fn run_loop(
                     Value::Object(schema.clone()),
                     structured.clone(),
                 ));
-            }
-
-            if step == 1 {
-                let summary = deps.summary.clone();
-                let fork_session_id = session_id.to_string();
-                let fork_message_id = last_user_id.clone();
-                tokio::spawn(async move {
-                    summary.summarize(&fork_session_id, &fork_message_id).await;
-                });
             }
 
             // System prompts (prompt.ts:1258-1277).

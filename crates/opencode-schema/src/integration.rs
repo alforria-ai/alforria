@@ -111,7 +111,9 @@ pub enum IntegrationAttemptMode {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IntegrationAttemptTime {
+    #[serde(serialize_with = "crate::js_number::js_f64")]
     pub created: f64,
+    #[serde(serialize_with = "crate::js_number::js_f64")]
     pub expires: f64,
 }
 
@@ -214,7 +216,7 @@ mod tests {
                 "url": "https://example.com/oauth/authorize",
                 "instructions": "Visit the URL",
                 "mode": "auto",
-                "time": {"created": 1.0, "expires": 2.0},
+                "time": {"created": 1, "expires": 2},
             }),
         );
         assert!(roundtrip.get("attemptID").is_some());
@@ -226,7 +228,7 @@ mod tests {
         let value = json!({
             "status": "failed",
             "message": "code expired",
-            "time": {"created": 1.0, "expires": 2.0},
+            "time": {"created": 1, "expires": 2},
         });
         let status: IntegrationAttemptStatus = serde_json::from_value(value.clone()).unwrap();
         assert!(matches!(status, IntegrationAttemptStatus::Failed { .. }));

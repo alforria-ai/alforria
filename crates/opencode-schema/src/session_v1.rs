@@ -97,7 +97,9 @@ pub enum OutputFormat {
 #[serde(rename_all = "camelCase")]
 pub struct V1FilePartSourceText {
     pub value: String,
+    #[serde(serialize_with = "crate::js_number::js_f64")]
     pub start: f64,
+    #[serde(serialize_with = "crate::js_number::js_f64")]
     pub end: f64,
 }
 
@@ -206,7 +208,9 @@ pub struct V1SubtaskModel {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct V1TokenCache {
+    #[serde(serialize_with = "crate::js_number::js_f64")]
     pub read: f64,
+    #[serde(serialize_with = "crate::js_number::js_f64")]
     pub write: f64,
 }
 
@@ -216,9 +220,13 @@ pub struct V1TokenCache {
 #[serde(rename_all = "camelCase")]
 pub struct V1StepTokens {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(serialize_with = "crate::js_number::js_opt_f64")]
     pub total: Option<f64>,
+    #[serde(serialize_with = "crate::js_number::js_f64")]
     pub input: f64,
+    #[serde(serialize_with = "crate::js_number::js_f64")]
     pub output: f64,
+    #[serde(serialize_with = "crate::js_number::js_f64")]
     pub reasoning: f64,
     pub cache: V1TokenCache,
 }
@@ -392,6 +400,7 @@ pub enum V1Part {
         reason: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         snapshot: Option<String>,
+        #[serde(serialize_with = "crate::js_number::js_f64")]
         cost: f64,
         tokens: V1StepTokens,
     },
@@ -459,6 +468,7 @@ pub enum V1Part {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UserTime {
+    #[serde(serialize_with = "crate::js_number::js_f64")]
     pub created: f64,
 }
 
@@ -545,6 +555,7 @@ pub enum V1Message {
         path: V1Path,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         summary: Option<bool>,
+        #[serde(serialize_with = "crate::js_number::js_f64")]
         cost: f64,
         tokens: V1StepTokens,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -560,8 +571,11 @@ pub enum V1Message {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct V1SessionSummary {
+    #[serde(serialize_with = "crate::js_number::js_f64")]
     pub additions: f64,
+    #[serde(serialize_with = "crate::js_number::js_f64")]
     pub deletions: f64,
+    #[serde(serialize_with = "crate::js_number::js_f64")]
     pub files: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diffs: Option<Vec<SnapshotFileDiff>>,
@@ -595,6 +609,7 @@ pub struct V1SessionTime {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compacting: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(serialize_with = "crate::js_number::js_opt_f64")]
     pub archived: Option<f64>,
 }
 
@@ -635,6 +650,7 @@ pub struct V1SessionInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<V1SessionSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(serialize_with = "crate::js_number::js_opt_f64")]
     pub cost: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokens: Option<crate::session::SessionTokens>,
@@ -708,6 +724,7 @@ pub struct MessagePartUpdatedData {
     #[serde(rename = "sessionID")]
     pub session_id: SessionId,
     pub part: V1Part,
+    #[serde(serialize_with = "crate::js_number::js_f64")]
     pub time: f64,
 }
 
@@ -931,7 +948,7 @@ mod tests {
                 "role": "user",
                 "id": "msg_1",
                 "sessionID": "ses_1",
-                "time": {"created": 1778031210000.0},
+                "time": {"created": 1778031210000i64},
                 "agent": "build",
                 "model": {
                     "providerID": "anthropic",
@@ -1159,7 +1176,7 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_value(&file).unwrap(),
-            json!({"type": "file", "text": {"value": "v", "start": 0.0, "end": 1.0}, "path": "/tmp/a"})
+            json!({"type": "file", "text": {"value": "v", "start": 0, "end": 1}, "path": "/tmp/a"})
         );
         assert_eq!(
             serde_json::to_value(&symbol).unwrap()["type"],
@@ -1169,7 +1186,7 @@ mod tests {
             serde_json::to_value(&resource).unwrap(),
             json!({
                 "type": "resource",
-                "text": {"value": "v", "start": 0.0, "end": 1.0},
+                "text": {"value": "v", "start": 0, "end": 1},
                 "clientName": "client",
                 "uri": "file:///tmp/a"
             })

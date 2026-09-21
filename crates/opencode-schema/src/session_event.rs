@@ -156,6 +156,7 @@ pub struct StepEnded {
     #[serde(rename = "assistantMessageID")]
     pub assistant_message_id: MessageId,
     pub finish: String,
+    #[serde(serialize_with = "crate::js_number::js_f64")]
     pub cost: f64,
     pub tokens: SessionTokens,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -390,6 +391,7 @@ pub struct ToolFailed {
 pub struct RetryError {
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(serialize_with = "crate::js_number::js_opt_f64")]
     pub status_code: Option<f64>,
     pub is_retryable: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -407,6 +409,7 @@ pub struct Retried {
     pub timestamp: EpochMillis,
     #[serde(rename = "sessionID")]
     pub session_id: SessionId,
+    #[serde(serialize_with = "crate::js_number::js_f64")]
     pub attempt: f64,
     pub error: RetryError,
 }
@@ -663,10 +666,10 @@ mod tests {
                 "type": "session.next.retried",
                 "timestamp": 1_762_000_000_000i64,
                 "sessionID": "ses_test",
-                "attempt": 2.0,
+                "attempt": 2,
                 "error": {
                     "message": "rate limited",
-                    "statusCode": 429.0,
+                    "statusCode": 429,
                     "isRetryable": true,
                 },
         });

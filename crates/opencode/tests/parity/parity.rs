@@ -1,16 +1,17 @@
 //! Scenario parity tests (gated): the dual-binary drivers compared under
-//! normalization. P1–P6/P8/P9 — the chunk-2 HTTP scenario matrix (spec
-//! PARITY §5); the strict SSE stream diff is chunk 3's first-class
-//! section, so only the event-type multiset is compared here.
+//! normalization. P1–P9 — the scenario matrix (spec PARITY §5), each
+//! diffing named HTTP captures, the recorded mock-LLM requests, and the
+//! SSE event streams in both envelopes (spec PARITY §3.1).
 
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::differ::{diff, Deviation, Kind};
 use crate::normal::{
-    drop_control_plane, event_types, normalize_events, normalize_requests, sort_events, Normalizer,
+    check_v2_envelope, drop_control_plane, drop_envelope_id, event_types, normalize_events,
+    normalize_requests, normalize_v2_events, sort_events, Normalizer,
 };
-use crate::parity_harness::{gated, TsSource};
+use crate::parity_harness::gated;
 use crate::report::Report;
 use crate::scenarios::{self, Capture, Named};
 use crate::transcript::Transcript;
@@ -69,12 +70,13 @@ fn triage(check: &str, deviations: Vec<Deviation>) -> Vec<Deviation> {
 
 /// One side's captures, normalized with a per-side `Normalizer` in a
 /// fixed order (named captures in driving order, then requests, then
-/// events) so id/timestamp counters align across the two sides.
+/// the canonically-ordered event streams, spec PARITY N9) so
+/// id/timestamp counters align across the two sides.
 struct Normalized {
     named: Named,
     requests: Value,
     events: Vec<Value>,
-    types: Vec<String>,
+    v2_events: Vec<Value>,
     control_plane: std::collections::BTreeMap<String, usize>,
 }
 
@@ -87,7 +89,7 @@ fn normalize_side(capture: &Capture) -> Normalized {
         .collect();
     let requests = normalize_requests(&mut normalizer, &capture.project, &capture.requests);
     let events = normalize_events(&mut normalizer, &capture.project, &capture.events);
-    let types = event_types(&sort_events(drop_control_plane(&events)));
+    let v2_events = normalize_v2_events(&mut normalizer, &capture.project, &capture.v2_events);
     let control_plane = events
         .iter()
         .filter_map(|event| {
@@ -104,15 +106,22 @@ fn normalize_side(capture: &Capture) -> Normalized {
         named,
         requests,
         events,
-        types,
+        v2_events,
         control_plane,
     }
 }
 
+/// Project one event onto the payload shape shared by the legacy and V2
+/// envelopes for the consistency diff: `{type, properties}`.
+fn project_envelope(event: &Value, payload: &str) -> Value {
+    json!({"type": event["type"], "properties": event[payload]})
+}
+
 /// Normalize both sides, diff every named capture (plus the recorded
-/// mock-LLM request bodies where the scenario's parity assertion needs
-/// them), triage value deviations, write the report, and assert the
-/// matrix clean. Returns the report for scenario-specific findings.
+/// mock-LLM request bodies and both event envelopes where the scenario's
+/// parity assertion needs them), triage value deviations, write the
+/// report, and assert the matrix clean. Returns the report for
+/// scenario-specific findings.
 fn assert_parity(check: &str, diff_requests: bool, ts: &Capture, rs: &Capture) -> Report {
     let report = Report::open(check);
     for (side, capture) in [("ts", ts), ("rs", rs)] {
@@ -121,12 +130,38 @@ fn assert_parity(check: &str, diff_requests: bool, ts: &Capture, rs: &Capture) -
         }
         report.write_raw(side, "requests", &json!(capture.requests));
         report.write_raw(side, "events", &json!(capture.events));
+        report.write_raw(side, "v2_events", &json!(capture.v2_events));
     }
+
+    // V2 envelope structural checks (spec PARITY §3.1): presence,
+    // monotonicity and durability tag — asserted on the raw capture.
+    // The TS `serve` binary has no `/api/event` stream (the V2 event
+    // group is mounted by the embedded `packages/server` web server
+    // only), so the V2 envelope is verified on the Rust capture; the
+    // cross-binary payload contract is the legacy stream diff below.
+    let findings = check_v2_envelope(&rs.v2_events);
+    if !findings.is_empty() {
+        report.append_findings(&format!(
+            "## V2 envelope findings\n\n{}\n",
+            findings
+                .iter()
+                .map(|finding| format!("- {finding}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+    assert!(
+        findings.is_empty(),
+        "{check}: V2 envelope structural violations:\n{}",
+        findings.join("\n")
+    );
 
     let ts = normalize_side(ts);
     let rs = normalize_side(rs);
     report.write_events("ts", &ts.events);
     report.write_events("rs", &rs.events);
+    report.write_events_v2("ts", &ts.v2_events);
+    report.write_events_v2("rs", &rs.v2_events);
 
     let mut captures: Vec<(&str, Vec<Deviation>)> = Vec::new();
     for ((name, ts_value), (rs_name, rs_value)) in ts.named.iter().zip(rs.named.iter()) {
@@ -140,6 +175,40 @@ fn assert_parity(check: &str, diff_requests: bool, ts: &Capture, rs: &Capture) -
             triage(check, diff("$.requests", &ts.requests, &rs.requests)),
         ));
     }
+
+    // Legacy envelope: the full normalized stream diff (instance
+    // control-plane events are dropped from it and reported below).
+    let ts_stream = drop_envelope_id(sort_events(drop_control_plane(&ts.events)));
+    let rs_stream = drop_envelope_id(sort_events(drop_control_plane(&rs.events)));
+    captures.push((
+        "events",
+        triage(
+            check,
+            diff("$.events", &json!(ts_stream), &json!(rs_stream)),
+        ),
+    ));
+
+    // V2 envelope: both envelopes of one run must carry identical
+    // payloads (TS event-v2-bridge.ts publishes the legacy stream from
+    // the same V2 events); verified on the Rust capture, whose V2
+    // stream is the only one `serve` exposes.
+    let v2: Vec<Value> = sort_events(
+        drop_control_plane(&rs.v2_events)
+            .iter()
+            .map(|event| project_envelope(event, "data"))
+            .collect(),
+    );
+    let legacy: Vec<Value> = sort_events(
+        drop_control_plane(&rs.events)
+            .iter()
+            .map(|event| project_envelope(event, "properties"))
+            .collect(),
+    );
+    captures.push((
+        "v2_events",
+        triage(check, diff("$.v2_events", &json!(legacy), &json!(v2))),
+    ));
+
     let all = report.write_scenario(check, &captures);
     assert!(
         all.is_empty(),
@@ -147,13 +216,17 @@ fn assert_parity(check: &str, diff_requests: bool, ts: &Capture, rs: &Capture) -
         all.len()
     );
 
-    // Event-type multiset (chunk 3 tightens this into a full stream
-    // diff). Instance control-plane startup events that only one side
-    // publishes are chunk-3 triage findings, not assertion failures.
-    assert_eq!(ts.types, rs.types, "event-type streams diverged in {check}");
+    // Event-type multiset (the strict value diff above subsumes it; the
+    // sequence gives the crisper failure message).
+    let ts_types = event_types(&sort_events(drop_control_plane(&ts.events)));
+    let rs_types = event_types(&sort_events(drop_control_plane(&rs.events)));
+    assert_eq!(ts_types, rs_types, "event-type streams diverged in {check}");
     if !ts.control_plane.is_empty() || !rs.control_plane.is_empty() {
         report.append_findings(&format!(
-            "## Instance control-plane events (chunk-3 triage)\n\n- ts: {:?}\n- rs: {:?}\n",
+            "## Instance control-plane events\n\n\
+             (TS instance-lifecycle startup events the Rust binary does not\n\
+             publish; dropped from the stream diff by `drop_control_plane`.)\n\n\
+             - ts: {:?}\n- rs: {:?}\n",
             ts.control_plane, rs.control_plane
         ));
     }
@@ -179,11 +252,9 @@ async fn p1_file_mutation_parity() {
     if !gated() {
         return;
     }
-    let ts_source = TsSource::resolve();
     let (ts, rs) = scenarios::scenario(
-        "p1",
+        "p1_file_mutation",
         scenarios::A1_FILE_MUTATION,
-        &ts_source,
         setup_none(),
         |backend, env, port, log, _| Box::pin(scenarios::drive_p1(backend, env, port, log)),
     )
@@ -216,15 +287,13 @@ async fn p2_multi_step_parity() {
     if !gated() {
         return;
     }
-    let ts_source = TsSource::resolve();
     let setup = |project: &std::path::Path| {
         std::fs::write(project.join("a.txt"), "alpha\n").expect("seed a.txt");
         std::fs::write(project.join("b.txt"), "beta\n").expect("seed b.txt");
     };
     let (ts, rs) = scenarios::scenario(
-        "p2",
+        "p2_multi_step",
         scenarios::A2_MULTI_STEP,
-        &ts_source,
         setup,
         |backend, env, port, log, _| Box::pin(scenarios::drive_p2(backend, env, port, log)),
     )
@@ -236,14 +305,12 @@ async fn p3_parity(check: &str, reply: scenarios::Reply) {
     if !gated() {
         return;
     }
-    let ts_source = TsSource::resolve();
     let setup = |project: &std::path::Path| {
         std::fs::write(project.join("secret.env"), "TOKEN=1\n").expect("seed secret.env");
     };
     let (ts, rs) = scenarios::scenario(
-        "p3",
+        check,
         scenarios::A3_PERMISSION_GATE,
-        &ts_source,
         setup,
         |backend, env, port, log, _| Box::pin(scenarios::drive_p3(backend, env, port, log, reply)),
     )
@@ -277,11 +344,9 @@ async fn p4_subagent_parity() {
     if !gated() {
         return;
     }
-    let ts_source = TsSource::resolve();
     let (ts, rs) = scenarios::scenario(
-        "p4",
+        "p4_subagent",
         scenarios::A4_SUBAGENT,
-        &ts_source,
         setup_none(),
         |backend, env, port, log, _| Box::pin(scenarios::drive_p4(backend, env, port, log)),
     )
@@ -307,14 +372,12 @@ async fn p5_compaction_parity() {
     if !gated() {
         return;
     }
-    let ts_source = TsSource::resolve();
     let setup = |project: &std::path::Path| {
         std::fs::write(project.join("a.txt"), "x\n").expect("seed a.txt");
     };
     let (ts, rs) = scenarios::scenario(
-        "p5",
+        "p5_compaction",
         scenarios::A6_COMPACTION,
-        &ts_source,
         setup,
         |backend, env, port, log, _| Box::pin(scenarios::drive_p5(backend, env, port, log)),
     )
@@ -347,7 +410,6 @@ async fn p6_revert_unrevert_parity() {
     if !gated() {
         return;
     }
-    let ts_source = TsSource::resolve();
     let setup = |project: &std::path::Path| {
         git(project, &["init", "--quiet"]);
         git(project, &["config", "user.email", "e2e@opencode.test"]);
@@ -357,9 +419,8 @@ async fn p6_revert_unrevert_parity() {
         git(project, &["commit", "--quiet", "-m", "init"]);
     };
     let (ts, rs) = scenarios::scenario(
-        "p6",
+        "p6_revert_unrevert",
         scenarios::A7_REVERT,
-        &ts_source,
         setup,
         |backend, env, port, log, _| Box::pin(scenarios::drive_p6(backend, env, port, log)),
     )
@@ -378,15 +439,58 @@ async fn p6_revert_unrevert_parity() {
 }
 
 #[tokio::test]
+async fn p7_cancel_mid_stream_parity() {
+    if !gated() {
+        return;
+    }
+    let (ts, rs) = scenarios::scenario(
+        "p7_cancel_mid_stream",
+        scenarios::A8_CANCEL_MID_STREAM,
+        setup_none(),
+        |backend, env, port, log, _| Box::pin(scenarios::drive_p7(backend, env, port, log)),
+    )
+    .await;
+    assert_parity("p7_cancel_mid_stream", true, &ts, &rs);
+
+    // The interrupted tool part is marked and the re-prompt resumes.
+    for (side, capture) in [("ts", &ts), ("rs", &rs)] {
+        let store = named(capture, "store");
+        let aborted = store
+            .as_array()
+            .expect("store")
+            .iter()
+            .find(|message| {
+                message["info"]["role"] == json!("assistant")
+                    && message["info"]["error"].is_object()
+            })
+            .unwrap_or_else(|| panic!("{side} no aborted assistant"));
+        assert!(
+            aborted["parts"].as_array().is_some_and(|parts| {
+                parts.iter().any(|part| {
+                    part["type"] == json!("tool")
+                        && part["state"]["metadata"]["interrupted"] == json!(true)
+                })
+            }),
+            "{side} no interrupted tool part\n{aborted}"
+        );
+        assert!(
+            named(capture, "resumed")["parts"]
+                .to_string()
+                .contains("resumed"),
+            "{side} re-prompt did not resume"
+        );
+        assert_eq!(capture.requests.len(), 2, "{side} agent requests");
+    }
+}
+
+#[tokio::test]
 async fn p8_structured_output_parity() {
     if !gated() {
         return;
     }
-    let ts_source = TsSource::resolve();
     let (ts, rs) = scenarios::scenario(
-        "p8",
+        "p8_structured_output",
         scenarios::A9_STRUCTURED_OUTPUT,
-        &ts_source,
         setup_none(),
         |backend, env, port, log, _| Box::pin(scenarios::drive_p8(backend, env, port, log)),
     )
@@ -408,11 +512,9 @@ async fn p9_session_lifecycle_parity() {
     if !gated() {
         return;
     }
-    let ts_source = TsSource::resolve();
     let (ts, rs) = scenarios::scenario(
-        "p9",
+        "p9_session_lifecycle",
         scenarios::A1_FILE_MUTATION,
-        &ts_source,
         setup_none(),
         |backend, env, port, log, cli| Box::pin(scenarios::drive_p9(backend, env, port, log, cli)),
     )

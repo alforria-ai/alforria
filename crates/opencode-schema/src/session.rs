@@ -12,8 +12,11 @@ use crate::schema::EpochMillis;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionTokens {
+    #[serde(serialize_with = "crate::js_number::js_f64")]
     pub input: f64,
+    #[serde(serialize_with = "crate::js_number::js_f64")]
     pub output: f64,
+    #[serde(serialize_with = "crate::js_number::js_f64")]
     pub reasoning: f64,
     pub cache: SessionTokensCache,
 }
@@ -22,7 +25,9 @@ pub struct SessionTokens {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionTokensCache {
+    #[serde(serialize_with = "crate::js_number::js_f64")]
     pub read: f64,
+    #[serde(serialize_with = "crate::js_number::js_f64")]
     pub write: f64,
 }
 
@@ -50,6 +55,7 @@ pub struct SessionInfo {
     pub agent: Option<AgentId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<ModelRef>,
+    #[serde(serialize_with = "crate::js_number::js_f64")]
     pub cost: f64,
     pub tokens: SessionTokens,
     pub time: SessionTime,
@@ -75,6 +81,7 @@ pub enum SessionListDirection {
 #[serde(rename_all = "camelCase")]
 pub struct SessionListAnchor {
     pub id: SessionId,
+    #[serde(serialize_with = "crate::js_number::js_f64")]
     pub time: f64, // Schema.Finite in session.ts
     pub direction: SessionListDirection,
 }
@@ -92,10 +99,10 @@ mod tests {
             "projectID": "global",
             "cost": 0.001,
             "tokens": {
-                "input": 10.0,
-                "output": 5.0,
-                "reasoning": 0.0,
-                "cache": { "read": 0.0, "write": 0.0 },
+                "input": 10,
+                "output": 5,
+                "reasoning": 0,
+                "cache": { "read": 0, "write": 0 },
             },
             "time": { "created": 1778031210000i64, "updated": 1778031211000i64 },
             "title": "hello",
@@ -117,12 +124,12 @@ mod tests {
             "projectID": "global",
             "agent": "build",
             "model": { "id": "claude-sonnet-4-5", "providerID": "anthropic" },
-            "cost": 0.0,
+            "cost": 0,
             "tokens": {
-                "input": 10.0,
-                "output": 5.0,
-                "reasoning": 0.0,
-                "cache": { "read": 0.0, "write": 0.0 },
+                "input": 10,
+                "output": 5,
+                "reasoning": 0,
+                "cache": { "read": 0, "write": 0 },
             },
             "time": {
                 "created": 1778031210000i64,
@@ -149,7 +156,7 @@ mod tests {
         // Not present in openapi.json — self-authored vector (spec S5).
         let value = json!({
             "id": "ses_01JDY",
-            "time": 1778031210000.0,
+            "time": 1778031210000i64,
             "direction": "previous",
         });
         let anchor: SessionListAnchor = serde_json::from_value(value.clone()).unwrap();

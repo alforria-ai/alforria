@@ -5,7 +5,7 @@
 use crate::catalog;
 use crate::differ::Deviation;
 use crate::harness::Env;
-use crate::parity_harness::{gated, TsServe, TsSource};
+use crate::parity_harness::{gated, golden_mode, TsServe, TsSource};
 use crate::report::Report;
 
 use crate::harness::Serve;
@@ -35,7 +35,9 @@ async fn surface() -> Surface {
 
 #[tokio::test]
 async fn p0_route_inventory_parity() {
-    if !gated() {
+    // P0 compares live TS docs: no golden replay exists for it, so the
+    // golden mode (no TS clone) skips like the un-gated default run.
+    if !gated() || golden_mode() {
         return;
     }
     let surface = surface().await;
@@ -50,7 +52,9 @@ async fn p0_route_inventory_parity() {
 
 #[tokio::test]
 async fn p0_openapi_schema_shape_parity() {
-    if !gated() {
+    // P0 compares live TS docs: no golden replay exists for it, so the
+    // golden mode (no TS clone) skips like the un-gated default run.
+    if !gated() || golden_mode() {
         return;
     }
     let report = Report::open("p0_openapi_schema_shape");
@@ -69,7 +73,9 @@ async fn p0_openapi_schema_shape_parity() {
 
 #[tokio::test]
 async fn p0_event_type_inventory_parity() {
-    if !gated() {
+    // P0 compares live TS docs: no golden replay exists for it, so the
+    // golden mode (no TS clone) skips like the un-gated default run.
+    if !gated() || golden_mode() {
         return;
     }
     let surface = surface().await;

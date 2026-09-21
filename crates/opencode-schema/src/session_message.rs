@@ -260,6 +260,7 @@ pub enum SessionMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         finish: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(serialize_with = "crate::js_number::js_opt_f64")]
         cost: Option<f64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tokens: Option<SessionTokens>,
@@ -456,10 +457,10 @@ mod tests {
             "finish": "stop",
             "cost": 0.001,
             "tokens": {
-                "input": 10.0,
-                "output": 5.0,
-                "reasoning": 0.0,
-                "cache": { "read": 0.0, "write": 0.0 },
+                "input": 10,
+                "output": 5,
+                "reasoning": 0,
+                "cache": { "read": 0, "write": 0 },
             },
             "error": { "type": "unknown", "message": "boom" },
         });

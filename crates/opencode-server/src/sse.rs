@@ -74,7 +74,10 @@ pub enum GlobalPayload {
     },
 }
 
-/// One `GlobalBus` event (`bus/global.ts:3-9`).
+/// One `GlobalBus` event (`bus/global.ts:3-9`). The optional `v2` payload
+/// carries the raw `EventV2` payload across the bridge so the V2 stream
+/// (`/api/event`) can re-emit it with its envelope intact — the legacy
+/// `{id, type, properties}` frame below loses `durable`/`location`.
 #[derive(Debug, Clone, Serialize)]
 pub struct GlobalEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -84,6 +87,8 @@ pub struct GlobalEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
     pub payload: GlobalPayload,
+    #[serde(skip)]
+    pub v2: Option<Payload>,
 }
 
 impl GlobalEvent {
@@ -105,6 +110,7 @@ impl GlobalEvent {
                 properties,
                 id: new_event_id(),
             },
+            v2: None,
         }
     }
 }
@@ -202,6 +208,7 @@ fn bridge_frames(event: &Payload) -> Vec<GlobalEvent> {
             r#type: event.r#type.clone(),
             properties: event.data.clone(),
         },
+        v2: Some(event.clone()),
     }];
     if let Some(durable) = &event.durable {
         let sync = SyncEvent {
@@ -223,6 +230,7 @@ fn bridge_frames(event: &Payload) -> Vec<GlobalEvent> {
                 sync_event: sync.clone(),
                 id: sync.id,
             },
+            v2: None,
         });
     }
     out
@@ -411,6 +419,7 @@ pub async fn global_event(State(ctx): State<Arc<ServerContext>>) -> Response {
                 r#type: SERVER_CONNECTED_TYPE.to_string(),
                 properties: serde_json::json!({}),
             },
+            v2: None,
         };
         if tx
             .send(sse_frame(&serde_json::to_string(&connected).unwrap()).into())
@@ -443,6 +452,7 @@ pub async fn global_event(State(ctx): State<Arc<ServerContext>>) -> Response {
                             r#type: SERVER_HEARTBEAT_TYPE.to_string(),
                             properties: serde_json::json!({}),
                         },
+                        v2: None,
                     };
                     let frame = sse_frame(&serde_json::to_string(&heartbeat_event).unwrap());
                     if tx.send(frame.into()).await.is_err() {
@@ -464,27 +474,42 @@ pub async fn api_event(State(ctx): State<Arc<ServerContext>>) -> Response {
     // a dropping queue — once it is full the queue fails permanently and the
     // stream ends. Acquiring the bounded stream installs its listener
     // before readiness is observable (handlers/event.ts:32-35).
+    //
+    // The stream subscribes to the global bus, which mirrors every V2
+    // publish — the server bus and each per-instance bus — carrying the
+    // raw `EventV2` payload on the bridge frames (`event-v2-bridge.ts`:
+    // the process-wide `EventV2` service TS subscribes to here).
     let (event_tx, mut events) = mpsc::channel::<Payload>(SUBSCRIBER_CAPACITY);
     let event_tx = Arc::new(std::sync::Mutex::new(Some(event_tx)));
     let listener_tx = Arc::clone(&event_tx);
-    let subscription = ctx.bus.listen(Arc::new(move |event| {
-        let mut sender = listener_tx.lock().unwrap_or_else(|p| p.into_inner());
-        let failed = match sender.as_ref() {
-            Some(sender) => sender.try_send(event.clone()).is_err(),
-            None => false,
-        };
-        if failed {
-            *sender = None;
+    let mut global = ctx.global_bus.subscribe();
+    tokio::spawn(async move {
+        loop {
+            let received = global.recv().await;
+            let payload = match received {
+                Ok(event) => event.v2,
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            };
+            let Some(payload) = payload else {
+                continue;
+            };
+            let mut sender = listener_tx.lock().unwrap_or_else(|p| p.into_inner());
+            let sender = match sender.as_mut() {
+                Some(sender) => sender,
+                None => return,
+            };
+            if sender.try_send(payload).is_err() {
+                return;
+            }
         }
-    }));
+    });
 
     let interval = ctx.heartbeat.v2;
     let (tx, rx) = mpsc::channel(64);
     tokio::spawn(async move {
-        // Hold the subscription (and the listener's sender) for the
-        // lifetime of the stream — dropping them on disconnect
-        // unsubscribes.
-        let _subscription = subscription;
+        // Hold the listener's sender for the lifetime of the stream —
+        // dropping it on disconnect unsubscribes.
         let _listener_sender = event_tx;
 
         let connected = Payload {

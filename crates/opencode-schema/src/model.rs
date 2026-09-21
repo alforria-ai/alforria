@@ -29,7 +29,9 @@ pub struct ModelCapabilities {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelCostCache {
+    #[serde(serialize_with = "crate::js_number::js_f64")]
     pub read: f64,
+    #[serde(serialize_with = "crate::js_number::js_f64")]
     pub write: f64,
 }
 
@@ -55,7 +57,9 @@ pub struct ModelCostTier {
 pub struct ModelCost {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tier: Option<ModelCostTier>,
+    #[serde(serialize_with = "crate::js_number::js_f64")]
     pub input: f64,
+    #[serde(serialize_with = "crate::js_number::js_f64")]
     pub output: f64,
     pub cache: ModelCostCache,
 }
@@ -110,6 +114,7 @@ pub struct ModelVariant {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelTime {
+    #[serde(serialize_with = "crate::js_number::js_f64")]
     pub released: f64,
 }
 

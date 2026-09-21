@@ -19,6 +19,7 @@ use crate::session::message::WithParts;
 use crate::session::processor::SummarySummarize;
 use crate::session::snapshot::Snapshot;
 use crate::session::store::SessionStore;
+use crate::tool::def::BoxFuture;
 
 // ---------------------------------------------------------------------------
 // unquoteGitPath (summary.ts:10-63)
@@ -165,6 +166,16 @@ impl SessionSummary {
     /// publish the empty diff, then attach the turn's diffs to the user
     /// message's `summary.diffs`.
     pub async fn summarize(&self, session_id: &str, message_id: &str) -> Result<(), SessionError> {
+        self.reset(session_id).await?;
+        self.attach_diffs(session_id, message_id).await
+    }
+
+    /// The zeroing half of `summarize`. TS forks `summarize` with
+    /// `Effect.forkIn(scope)`, and Effect's cooperative scheduler runs
+    /// the fork as soon as the parent suspends — observably, the zero
+    /// summary lands mid-turn, before any later event (e.g. the title
+    /// update). The prompt loop therefore awaits this half inline.
+    pub async fn reset(&self, session_id: &str) -> Result<(), SessionError> {
         self.deps.sessions.set_summary(
             session_id,
             Some(V1SessionSummary {
@@ -179,6 +190,16 @@ impl SessionSummary {
             serde_json::json!({ "sessionID": session_id, "diff": [] }),
             PublishOptions::default(),
         )?;
+        Ok(())
+    }
+
+    /// The diff-attaching half of `summarize`: compute the turn's diffs
+    /// and attach them to the user message's `summary.diffs`.
+    pub async fn attach_diffs(
+        &self,
+        session_id: &str,
+        message_id: &str,
+    ) -> Result<(), SessionError> {
         if self.deps.config.snapshot == Some(false) {
             return Ok(());
         }
@@ -307,6 +328,45 @@ impl SummarySummarize for SessionSummary {
                 config,
             });
             if let Err(error) = summary.summarize(&session_id, &message_id).await {
+                tracing::warn!("summarize failed: {error}");
+            }
+        })
+    }
+
+    fn reset<'a>(&'a self, session_id: &'a str) -> BoxFuture<'a, Result<(), SessionError>> {
+        let sessions = self.deps.sessions.clone();
+        let events = self.deps.events.clone();
+        let session_id = session_id.to_string();
+        Box::pin(async move {
+            let summary = SessionSummary::new(SummaryDeps {
+                sessions,
+                snapshot: self.deps.snapshot.clone(),
+                events,
+                config: self.deps.config.clone(),
+            });
+            summary.reset(&session_id).await
+        })
+    }
+
+    fn attach_diffs<'a>(
+        &'a self,
+        session_id: &'a str,
+        message_id: &'a str,
+    ) -> BoxFuture<'static, ()> {
+        let sessions = self.deps.sessions.clone();
+        let snapshot = self.deps.snapshot.clone();
+        let events = self.deps.events.clone();
+        let config = self.deps.config.clone();
+        let session_id = session_id.to_string();
+        let message_id = message_id.to_string();
+        Box::pin(async move {
+            let summary = SessionSummary::new(SummaryDeps {
+                sessions,
+                snapshot,
+                events,
+                config,
+            });
+            if let Err(error) = summary.attach_diffs(&session_id, &message_id).await {
                 tracing::warn!("summarize failed: {error}");
             }
         })

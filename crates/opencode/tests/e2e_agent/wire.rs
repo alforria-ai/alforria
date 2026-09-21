@@ -202,15 +202,29 @@ impl EventLog {
         EventLog::subscribe_at(serve.port, directory)
     }
 
+    /// An empty log that never receives events — used by the parity
+    /// harness on sides whose binary exposes no such stream.
+    #[allow(dead_code)] // not every test target links a caller
+    pub fn empty() -> EventLog {
+        EventLog(Arc::new(Mutex::new(Vec::new())))
+    }
+
     /// The port-parameterized variant (used by the parity harness, which
     /// also drives non-`Serve` servers).
     pub fn subscribe_at(port: u16, directory: &str) -> EventLog {
-        let log = EventLog(Arc::new(Mutex::new(Vec::new())));
         let url = format!(
             "http://127.0.0.1:{}/event?directory={}",
             port,
             encode_uri_component(directory)
         );
+        EventLog::subscribe_url(&url)
+    }
+
+    /// The raw-URL variant (used by the parity harness for streams other
+    /// than the directory-scoped legacy `/event`, e.g. `/api/event`).
+    pub fn subscribe_url(url: &str) -> EventLog {
+        let url = url.to_string();
+        let log = EventLog(Arc::new(Mutex::new(Vec::new())));
         let sink = log.0.clone();
         tokio::spawn(async move {
             let http = reqwest::Client::new();
@@ -223,7 +237,7 @@ impl EventLog {
             let mut stream = response.bytes_stream();
             let mut buffer = String::new();
             while let Some(chunk) = stream.next().await {
-                let chunk = chunk.expect("event chunk");
+                let chunk = chunk.unwrap_or_else(|_| panic!("event chunk for {url}"));
                 buffer.push_str(&String::from_utf8_lossy(&chunk));
                 while let Some(index) = buffer.find("\n\n") {
                     let block = buffer[..index].to_string();

@@ -22,6 +22,10 @@
 //!   protocol-layer knobs, not the opencode wire contract.
 //! - N8 per-run git SHAs: `snapshot`/`hash`/`projectID` keys holding
 //!   40-hex strings (commit/blob ids, path hashes) → `<sha:N>`.
+//! - N9 canonical event order: SSE events are sorted by
+//!   `(type, projected payload)` — volatile tokens replaced — before
+//!   normalization, so marker assignment does not depend on the arrival
+//!   order that differs between the two binaries.
 //!
 //! Explicitly NOT normalized: field names, null-vs-absent keys, union
 //! `type` tags, enum values, token/cost fields, tool-part shapes.
@@ -59,7 +63,6 @@ fn rules() -> &'static Rules {
 pub struct Normalizer {
     ids: std::collections::HashMap<String, String>,
     counters: std::collections::HashMap<String, usize>,
-    timestamps: usize,
     shas: usize,
 }
 
@@ -68,7 +71,6 @@ impl Normalizer {
         Normalizer {
             ids: std::collections::HashMap::new(),
             counters: std::collections::HashMap::new(),
-            timestamps: 0,
             shas: 0,
         }
     }
@@ -84,7 +86,7 @@ impl Normalizer {
             Value::String(text) => Value::String(self.string(text, root)),
             Value::Number(number) if in_time => {
                 let _ = number;
-                self.timestamp_marker()
+                self.timestamp_marker(&number.to_string())
             }
             Value::Array(items) => Value::Array(
                 items
@@ -98,7 +100,7 @@ impl Normalizer {
                         let value = if key == "time" {
                             self.value(item, root, true)
                         } else if is_timestamp_key(key) && item.is_number() {
-                            self.timestamp_marker()
+                            self.timestamp_marker(&item.to_string())
                         } else if is_duration_key(key) {
                             Value::String("<dur>".to_string())
                         } else if key == "slug" {
@@ -132,7 +134,7 @@ impl Normalizer {
         let mut last = 0;
         for m in rules().iso8601.find_iter(&replaced) {
             out.push_str(&replaced[last..m.start()]);
-            out.push_str(&self.next_timestamp_marker());
+            out.push_str(&self.next_timestamp_marker(m.as_str()));
             last = m.end();
         }
         out.push_str(&replaced[last..]);
@@ -182,8 +184,15 @@ impl Normalizer {
         Some(marker)
     }
 
-    fn timestamp_marker(&mut self) -> Value {
-        Value::String(self.next_timestamp_marker())
+    /// N2: one constant marker. The raw instants differ per side, so a
+    /// per-side counter cannot align across binaries: a side that
+    /// completes two steps inside one clock tick collapses two distinct
+    /// instants into one marker, shifting every later number. The
+    /// constant marker keeps the wire-shape comparison (presence,
+    /// ordering, structure) exact and lets the timing artifacts cancel.
+    fn timestamp_marker(&mut self, raw: &str) -> Value {
+        let _ = raw;
+        Value::String("<ts>".to_string())
     }
 
     /// N8: one per-run git SHA marker, counted in first-occurrence order.
@@ -193,10 +202,9 @@ impl Normalizer {
         Value::String(marker)
     }
 
-    fn next_timestamp_marker(&mut self) -> String {
-        let marker = format!("<ts:{}>", self.timestamps);
-        self.timestamps += 1;
-        marker
+    fn next_timestamp_marker(&mut self, raw: &str) -> String {
+        let _ = raw;
+        "<ts>".to_string()
     }
 }
 
@@ -256,12 +264,13 @@ pub fn drop_control_plane(events: &[Value]) -> Vec<Value> {
 /// N6 ordering: stable sort events by `(type, normalized subject)` so
 /// arrival-order noise does not defeat the diff.
 pub fn sort_events(events: Vec<Value>) -> Vec<Value> {
+    let payload = "properties";
     let mut events = events;
     events.sort_by(|a, b| {
         let key = |event: &Value| {
             (
                 event["type"].as_str().unwrap_or_default().to_string(),
-                event["properties"].to_string(),
+                event[payload].to_string(),
             )
         };
         key(a).cmp(&key(b))
@@ -275,6 +284,67 @@ pub fn event_types(events: &[Value]) -> Vec<String> {
         .iter()
         .map(|event| event["type"].as_str().unwrap_or_default().to_string())
         .collect()
+}
+
+/// Drop the V2 envelope `durable` block (`{aggregateID, seq, version}`)
+/// from every event — sequence numbers are schema-checked, not diffed
+/// (spec PARITY §3.1).
+pub fn drop_durable(events: &[Value]) -> Vec<Value> {
+    events
+        .iter()
+        .map(|event| {
+            let mut event = event.clone();
+            if let Some(object) = event.as_object_mut() {
+                object.remove("durable");
+            }
+            event
+        })
+        .collect()
+}
+
+/// Structural checks on the raw V2 envelope (spec PARITY §3.1): envelope
+/// shape (`id`, `type`, `data` present), and for durable events the
+/// presence, type and per-aggregate monotonicity of `durable.seq`.
+/// Returns one finding per violation.
+pub fn check_v2_envelope(events: &[Value]) -> Vec<String> {
+    let mut findings = Vec::new();
+    let mut last_seq: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    for (index, event) in events.iter().enumerate() {
+        let event_type = event["type"].as_str().unwrap_or("<missing>");
+        for key in ["id", "type", "data"] {
+            if event[key].is_null() || event.get(key).is_none() {
+                findings.push(format!("v2_events[{index}] ({event_type}): no {key}"));
+            }
+        }
+        let Some(durable) = event.get("durable").filter(|durable| !durable.is_null()) else {
+            continue;
+        };
+        let aggregate = durable["aggregateID"].as_str().unwrap_or("<missing>");
+        let seq = match durable["seq"].as_i64() {
+            Some(seq) => seq,
+            None => {
+                findings.push(format!(
+                    "v2_events[{index}] ({event_type}): durable.seq is not an integer"
+                ));
+                continue;
+            }
+        };
+        if durable["version"].as_i64().is_none() {
+            findings.push(format!(
+                "v2_events[{index}] ({event_type}): durable.version is not an integer"
+            ));
+        }
+        if let Some(previous) = last_seq.get(aggregate) {
+            if seq <= *previous {
+                findings.push(format!(
+                    "v2_events[{index}] ({event_type}): durable.seq {seq} not monotonic \
+                     after {previous} for aggregate {aggregate}"
+                ));
+            }
+        }
+        last_seq.insert(aggregate.to_string(), seq);
+    }
+    findings
 }
 
 /// Drop TS-side-impossible user-message summary attaches (N8): TS's
@@ -296,11 +366,207 @@ fn drop_format_summary_updates(events: &[Value]) -> Vec<Value> {
         .collect()
 }
 
-/// Normalize each event of a captured stream, dropping heartbeats.
+/// Normalize each event of a captured stream, dropping heartbeats and
+/// ordering canonically (N9) before normalization so N1/N2 markers
+/// align across the two sides.
 pub fn normalize_events(normalizer: &mut Normalizer, root: &str, events: &[Value]) -> Vec<Value> {
-    drop_format_summary_updates(&drop_heartbeats(events))
+    let ordered = canonicalize_events(
+        &drop_format_summary_updates(&drop_heartbeats(events)),
+        "properties",
+    );
+    ordered
         .into_iter()
-        .map(|event| normalizer.normalize(root, &event))
+        .map(|event| completed_race(normalizer.normalize(root, &event)))
+        .collect()
+}
+
+/// N10: the `message.updated` `time.completed` race. TS publishes the
+/// assistant message by reference and serializes lazily, so whether the
+/// step-finish frame shows the cleanup's `completed` mutation depends on
+/// SSE drain timing (p1 shows it, p6 does not). Rust serializes by value
+/// and deterministically emits null on that frame; project both to the
+/// marker so the racy field cannot fail the diff.
+fn completed_race_with(payload: &str, mut event: Value) -> Value {
+    if event["type"] == json!("message.updated") {
+        let path = format!("/{payload}/info/time");
+        if let Some(Value::Object(time)) = event.pointer_mut(&path) {
+            time.insert("completed".to_string(), Value::String("<ts>".to_string()));
+        }
+    }
+    if event["type"] == json!("message.part.updated") {
+        // N11: the running-state title/metadata race: TS spreads
+        // execute's `ctx.metadata` update into the shared part object,
+        // so whether the running frame carries the title/metadata
+        // depends on SSE drain timing (the completed frame and the
+        // store captures verify both strictly).
+        let path = format!("/{payload}/part/state");
+        let is_running = event
+            .pointer(&path)
+            .and_then(Value::as_object)
+            .is_some_and(|state| state.get("status") == Some(&json!("running")));
+        if is_running {
+            if let Some(Value::Object(state)) = event.pointer_mut(&path) {
+                state.remove("title");
+                state.remove("metadata");
+            }
+        }
+    }
+    event
+}
+
+fn completed_race(event: Value) -> Value {
+    completed_race_with("properties", event)
+}
+
+/// Normalize each event of a captured V2 stream (spec PARITY §3.1): the
+/// `durable` block is dropped before normalization (its presence and
+/// monotonicity are checked on the raw capture, then it leaves the
+/// value diff); V2 heartbeats are SSE comments and never reach the log.
+pub fn normalize_v2_events(
+    normalizer: &mut Normalizer,
+    root: &str,
+    events: &[Value],
+) -> Vec<Value> {
+    let ordered = canonicalize_events(&drop_durable(events), "data");
+    ordered
+        .into_iter()
+        .map(|event| completed_race_with("data", normalizer.normalize(root, &event)))
+        .collect()
+}
+
+/// N9 canonical pre-normalization order: arrival order is not stable
+/// across the two binaries (parallel tool parts, SSE interleavings), and
+/// N1/N2 markers are assigned in first-occurrence order — so markers
+/// would be assigned differently per side. Events are therefore sorted
+/// by `(type, projected payload)` before normalization, with every
+/// volatile token (ids, timestamps, durations, SHAs) projected to a fixed
+/// token so the sort key is identical for corresponding events on the
+/// two sides. Events that tie on the projected key (identical except
+/// volatile content) fall back to their raw timestamps as the
+/// tie-breaker, so the two binaries number their markers in the same
+/// order within a tie group.
+pub fn canonicalize_events(events: &[Value], payload: &str) -> Vec<Value> {
+    let mut events = events.to_vec();
+    events.sort_by(|a, b| {
+        canonical_key(a, payload)
+            .cmp(&canonical_key(b, payload))
+            .then_with(|| time_kept_key(a, payload).cmp(&time_kept_key(b, payload)))
+    });
+    events
+}
+
+/// The canonical sort key of one raw event: its `type` plus its payload
+/// with volatile content projected away.
+fn canonical_key(event: &Value, payload: &str) -> (String, String) {
+    (
+        event["type"].as_str().unwrap_or_default().to_string(),
+        project_value(&event[payload]),
+    )
+}
+
+/// The tie-breaker key: the payload with ids/SHAs/durations projected
+/// away but raw timestamps kept, ordering volatile-identical events by
+/// their logical instants.
+fn time_kept_key(event: &Value, payload: &str) -> String {
+    serde_json::to_string(&time_kept(&event[payload])).unwrap_or_default()
+}
+
+fn time_kept(value: &Value) -> Value {
+    match value {
+        Value::String(text) => Value::String(project_string(text)),
+        Value::Array(items) => Value::Array(items.iter().map(time_kept).collect()),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, value)| {
+                    let value = if is_duration_key(key) || key == "slug" {
+                        Value::String("<volatile>".to_string())
+                    } else if (key == "snapshot" || key == "hash" || key == "projectID")
+                        && value.as_str().is_some_and(|text| {
+                            text.len() == 40
+                                && text
+                                    .bytes()
+                                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+                        })
+                    {
+                        Value::String("<sha>".to_string())
+                    } else {
+                        time_kept(value)
+                    };
+                    (key.clone(), value)
+                })
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
+}
+
+fn project_value(value: &Value) -> String {
+    serde_json::to_string(&project(value)).unwrap_or_default()
+}
+
+fn project(value: &Value) -> Value {
+    match value {
+        Value::String(text) => Value::String(project_string(text)),
+        Value::Array(items) => Value::Array(items.iter().map(project).collect()),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, value)| {
+                    let value = if is_duration_key(key)
+                        || (is_timestamp_key(key) && value.is_number())
+                        || key == "time"
+                        || (key == "snapshot" || key == "hash" || key == "projectID")
+                            && value.as_str().is_some_and(|text| {
+                                text.len() == 40
+                                    && text
+                                        .bytes()
+                                        .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+                            }) {
+                        Value::String("<volatile>".to_string())
+                    } else {
+                        project(value)
+                    };
+                    (key.clone(), value)
+                })
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
+}
+
+fn project_string(text: &str) -> String {
+    let projected = rules()
+        .embedded_id
+        .replace_all(text, |found: &regex::Captures| {
+            let token = found.get(0).map(|m| m.as_str()).unwrap_or_default();
+            if token.contains('_') {
+                token.split('_').next().unwrap_or_default().to_string()
+            } else {
+                "ulid".to_string()
+            }
+        });
+    let projected = rules().iso8601.replace_all(&projected, "<ts>");
+    if projected.len() == 40
+        && projected
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return "<sha>".to_string();
+    }
+    projected.to_string()
+}
+
+/// Drop the envelope `id` key from each event before the stream value
+/// diff: event ids are opaque, never cross-referenced, and their N1
+/// markers stay arrival-order-sensitive within canonical-order ties.
+pub fn drop_envelope_id(events: Vec<Value>) -> Vec<Value> {
+    events
+        .into_iter()
+        .map(|mut event| {
+            if let Some(object) = event.as_object_mut() {
+                object.remove("id");
+            }
+            event
+        })
         .collect()
 }
 

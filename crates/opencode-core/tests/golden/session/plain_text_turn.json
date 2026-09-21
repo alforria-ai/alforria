@@ -13,7 +13,7 @@
           "role": "user",
           "sessionID": "ses_0",
           "time": {
-            "created": 1761000000000.0
+            "created": 1761000000000
           }
         },
         "sessionID": "ses_0"
@@ -30,7 +30,7 @@
           "type": "text"
         },
         "sessionID": "ses_0",
-        "time": 1761000000000.0
+        "time": 1761000000000
       },
       "type": "message.part.updated"
     },
@@ -47,7 +47,7 @@
       "data": {
         "info": {
           "agent": "build",
-          "cost": 0.0,
+          "cost": 0,
           "id": "msg_2",
           "mode": "build",
           "modelID": "claude",
@@ -64,12 +64,12 @@
           },
           "tokens": {
             "cache": {
-              "read": 0.0,
-              "write": 0.0
+              "read": 0,
+              "write": 0
             },
-            "input": 0.0,
-            "output": 0.0,
-            "reasoning": 0.0
+            "input": 0,
+            "output": 0,
+            "reasoning": 0
           }
         },
         "sessionID": "ses_0"
@@ -98,7 +98,7 @@
           "type": "text"
         },
         "sessionID": "ses_0",
-        "time": 1761000000000.0
+        "time": 1761000000000
       },
       "type": "message.part.updated"
     },
@@ -126,14 +126,14 @@
           "type": "text"
         },
         "sessionID": "ses_0",
-        "time": 1761000000000.0
+        "time": 1761000000000
       },
       "type": "message.part.updated"
     },
     {
       "data": {
         "part": {
-          "cost": 0.0,
+          "cost": 0,
           "id": "prt_4",
           "messageID": "msg_2",
           "reason": "stop",
@@ -141,17 +141,17 @@
           "snapshot": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855-1",
           "tokens": {
             "cache": {
-              "read": 0.0,
-              "write": 0.0
+              "read": 0,
+              "write": 0
             },
-            "input": 0.0,
-            "output": 0.0,
-            "reasoning": 0.0
+            "input": 0,
+            "output": 0,
+            "reasoning": 0
           },
           "type": "step-finish"
         },
         "sessionID": "ses_0",
-        "time": 1761000000000.0
+        "time": 1761000000000
       },
       "type": "message.part.updated"
     },
@@ -159,7 +159,7 @@
       "data": {
         "info": {
           "agent": "build",
-          "cost": 0.0,
+          "cost": 0,
           "finish": "stop",
           "id": "msg_2",
           "mode": "build",
@@ -177,12 +177,12 @@
           },
           "tokens": {
             "cache": {
-              "read": 0.0,
-              "write": 0.0
+              "read": 0,
+              "write": 0
             },
-            "input": 0.0,
-            "output": 0.0,
-            "reasoning": 0.0
+            "input": 0,
+            "output": 0,
+            "reasoning": 0
           }
         },
         "sessionID": "ses_0"
@@ -193,7 +193,7 @@
       "data": {
         "info": {
           "agent": "build",
-          "cost": 0.0,
+          "cost": 0,
           "finish": "stop",
           "id": "msg_2",
           "mode": "build",
@@ -212,12 +212,12 @@
           },
           "tokens": {
             "cache": {
-              "read": 0.0,
-              "write": 0.0
+              "read": 0,
+              "write": 0
             },
-            "input": 0.0,
-            "output": 0.0,
-            "reasoning": 0.0
+            "input": 0,
+            "output": 0,
+            "reasoning": 0
           }
         },
         "sessionID": "ses_0"

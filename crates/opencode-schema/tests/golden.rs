@@ -173,7 +173,7 @@ fn v5_session_message_user() {
                 "uri": "file:///tmp/a.txt",
                 "mime": "text/plain",
                 "name": "a.txt",
-                "source": { "start": 0.0, "end": 5.0, "text": "hello" },
+                "source": { "start": 0, "end": 5, "text": "hello" },
             },
         ],
         "type": "user",
@@ -245,7 +245,7 @@ fn v7_legacy_envelope_message_part_updated() {
         "type": "message.part.updated",
         "properties": {
             "sessionID": "ses_01JDY",
-            "time": 1778031210000.0,
+            "time": 1778031210000i64,
             "part": {
                 "id": "prt_01J",
                 "sessionID": "ses_01JDY",
@@ -281,10 +281,10 @@ fn v8_v1_assistant_message_api_error() {
         "path": { "cwd": "/repo", "root": "/repo" },
         "cost": 0.001,
         "tokens": {
-            "input": 10.0,
-            "output": 5.0,
-            "reasoning": 0.0,
-            "cache": { "read": 0.0, "write": 0.0 },
+            "input": 10,
+            "output": 5,
+            "reasoning": 0,
+            "cache": { "read": 0, "write": 0 },
         },
     });
     round_trip::<V1Message>(value);
@@ -575,26 +575,26 @@ fn union_integration_method() {
 fn union_integration_attempt_status() {
     let pending = json!({
         "status": "pending",
-        "time": { "created": 1.0, "expires": 2.0 },
+        "time": { "created": 1, "expires": 2 },
     });
     round_trip::<IntegrationAttemptStatus>(pending);
 
     let complete = json!({
         "status": "complete",
-        "time": { "created": 1.0, "expires": 2.0 },
+        "time": { "created": 1, "expires": 2 },
     });
     round_trip::<IntegrationAttemptStatus>(complete);
 
     let failed = json!({
         "status": "failed",
         "message": "code expired",
-        "time": { "created": 1.0, "expires": 2.0 },
+        "time": { "created": 1, "expires": 2 },
     });
     round_trip::<IntegrationAttemptStatus>(failed);
 
     let expired = json!({
         "status": "expired",
-        "time": { "created": 1.0, "expires": 2.0 },
+        "time": { "created": 1, "expires": 2 },
     });
     round_trip::<IntegrationAttemptStatus>(expired);
 }
@@ -835,7 +835,7 @@ fn union_v1_part_all_variants() {
         "url": "file:///tmp/a.txt",
         "source": {
             "type": "file",
-            "text": { "value": "hi", "start": 0.0, "end": 2.0 },
+            "text": { "value": "hi", "start": 0, "end": 2 },
             "path": "/tmp/a.txt",
         },
     });
@@ -859,10 +859,10 @@ fn union_v1_part_all_variants() {
         "snapshot": "snap",
         "cost": 0.001,
         "tokens": {
-            "input": 10.0,
-            "output": 5.0,
-            "reasoning": 0.0,
-            "cache": { "read": 0.0, "write": 0.0 },
+            "input": 10,
+            "output": 5,
+            "reasoning": 0,
+            "cache": { "read": 0, "write": 0 },
         },
     });
     round_trip::<V1Part>(step_finish);
@@ -953,14 +953,14 @@ fn union_v1_tool_state() {
 fn union_v1_file_part_source() {
     let file = json!({
         "type": "file",
-        "text": { "value": "hi", "start": 0.0, "end": 2.0 },
+        "text": { "value": "hi", "start": 0, "end": 2 },
         "path": "/tmp/a.txt",
     });
     round_trip::<V1FilePartSource>(file);
 
     let symbol = json!({
         "type": "symbol",
-        "text": { "value": "hi", "start": 0.0, "end": 2.0 },
+        "text": { "value": "hi", "start": 0, "end": 2 },
         "path": "/tmp/a.txt",
         "range": {
             "start": { "line": 1, "character": 2 },
@@ -973,7 +973,7 @@ fn union_v1_file_part_source() {
 
     let resource = json!({
         "type": "resource",
-        "text": { "value": "hi", "start": 0.0, "end": 2.0 },
+        "text": { "value": "hi", "start": 0, "end": 2 },
         "clientName": "client",
         "uri": "file:///tmp/a.txt",
     });
@@ -990,7 +990,7 @@ fn union_v1_message_user() {
         "id": "msg_01JDY",
         "sessionID": "ses_01JDY",
         "role": "user",
-        "time": { "created": 1778031210000.0 },
+        "time": { "created": 1778031210000i64 },
         "agent": "build",
         "model": { "providerID": "anthropic", "modelID": "claude-sonnet-4-5" },
     });
@@ -1143,10 +1143,10 @@ fn numeric_epoch_millis_accepts_integral_values() {
         "projectID": "global",
         "cost": 0.0,
         "tokens": {
-            "input": 10.0,
-            "output": 5.0,
-            "reasoning": 0.0,
-            "cache": { "read": 0.0, "write": 0.0 },
+            "input": 10,
+            "output": 5,
+            "reasoning": 0,
+            "cache": { "read": 0, "write": 0 },
         },
         "time": { "created": 1778031210000i64, "updated": 1778031211000i64 },
         "title": "hello",

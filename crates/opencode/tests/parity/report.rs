@@ -70,6 +70,15 @@ impl Report {
         );
     }
 
+    /// The V2-envelope twin of [`Report::write_events`].
+    pub fn write_events_v2(&self, side: &str, events: &[Value]) {
+        self.write_raw(
+            "normalized",
+            &format!("{side}_v2_events"),
+            &Value::Array(events.to_vec()),
+        );
+    }
+
     /// Append a findings section to the human report.
     pub fn append_findings(&self, section: &str) {
         use std::io::Write;

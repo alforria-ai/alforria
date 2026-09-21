@@ -14,6 +14,7 @@
 // M1.1 — Foundation modules
 pub mod file_diff;
 pub mod ids;
+pub mod js_number;
 pub mod llm;
 pub mod location;
 pub mod prompt;

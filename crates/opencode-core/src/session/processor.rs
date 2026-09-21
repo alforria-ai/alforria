@@ -126,9 +126,17 @@ pub trait AskPermission: Send + Sync {
 }
 
 /// The M5.6 `SessionSummary.Service` seam — `summarize` is fire-and-forget
-/// (TS forks it in a scope).
+/// (TS forks it in a scope). `reset` is the inline zeroing half the prompt
+/// loop awaits at step 1 (Effect's cooperative scheduler runs the TS fork
+/// at the parent's first suspension point).
 pub trait SummarySummarize: Send + Sync {
     fn summarize(&self, session_id: &str, message_id: &str) -> BoxFuture<'static, ()>;
+    fn reset<'a>(&'a self, session_id: &'a str) -> BoxFuture<'a, Result<(), SessionError>>;
+    fn attach_diffs<'a>(
+        &'a self,
+        session_id: &'a str,
+        message_id: &'a str,
+    ) -> BoxFuture<'static, ()>;
 }
 
 /// No-op default (M5.6 not landed).
@@ -136,6 +144,18 @@ pub struct NoSummary;
 
 impl SummarySummarize for NoSummary {
     fn summarize(&self, _session_id: &str, _message_id: &str) -> BoxFuture<'static, ()> {
+        Box::pin(async {})
+    }
+
+    fn reset<'a>(&'a self, _session_id: &'a str) -> BoxFuture<'a, Result<(), SessionError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn attach_diffs<'a>(
+        &'a self,
+        _session_id: &'a str,
+        _message_id: &'a str,
+    ) -> BoxFuture<'static, ()> {
         Box::pin(async {})
     }
 }
@@ -1863,7 +1883,9 @@ impl Handle {
             let mut ctx = self.lock_ctx();
             let now = inner.deps.clock.now_ms();
             if let V1Message::Assistant { time, .. } = &mut ctx.assistant_message {
-                time.completed = Some(now);
+                if time.completed.is_none() {
+                    time.completed = Some(now);
+                }
             }
             let assistant = ctx.assistant_message.clone();
             inner.deps.sessions.update_message(&assistant)?;

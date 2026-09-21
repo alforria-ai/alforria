@@ -745,9 +745,9 @@ pub async fn a7_revert(backend: &impl LlmBackend) {
         "{reverted}"
     );
     let summary = reverted.get("summary").expect("diff summary recorded");
-    assert_eq!(summary["files"], json!(1.0), "{reverted}");
-    assert_eq!(summary["additions"], json!(1.0), "{reverted}");
-    assert_eq!(summary["deletions"], json!(1.0), "{reverted}");
+    assert_eq!(summary["files"], json!(1), "{reverted}");
+    assert_eq!(summary["additions"], json!(1), "{reverted}");
+    assert_eq!(summary["deletions"], json!(1), "{reverted}");
     assert_eq!(
         std::fs::read_to_string(&a_txt).expect("a.txt"),
         "v1\n",

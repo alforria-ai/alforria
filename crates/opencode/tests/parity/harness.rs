@@ -17,6 +17,18 @@ pub fn gated() -> bool {
     std::env::var("OPENCODE_PARITY").ok().as_deref() == Some("1")
 }
 
+/// `OPENCODE_PARITY_RECORD=1` — live TS runs also rewrite the golden
+/// captures (spec PARITY §7 refresh procedure).
+pub fn record_mode() -> bool {
+    std::env::var("OPENCODE_PARITY_RECORD").ok().as_deref() == Some("1")
+}
+
+/// `OPENCODE_PARITY_GOLDEN=1` — no TS clone needed: the Rust side runs
+/// alone and is diffed against the stored TS goldens.
+pub fn golden_mode() -> bool {
+    std::env::var("OPENCODE_PARITY_GOLDEN").ok().as_deref() == Some("1")
+}
+
 /// A verified TS reference checkout at the pinned commit.
 pub struct TsSource {
     pub root: PathBuf,

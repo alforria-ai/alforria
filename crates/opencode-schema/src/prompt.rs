@@ -6,7 +6,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PromptSource {
+    #[serde(serialize_with = "crate::js_number::js_f64")]
     pub start: f64,
+    #[serde(serialize_with = "crate::js_number::js_f64")]
     pub end: f64,
     pub text: String,
 }
