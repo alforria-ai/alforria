@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+sha2 = { workspace = true }
 opencode-llm = { workspace = true }
 opencode-schema = { workspace = true }
 opencode-core = { workspace = true }

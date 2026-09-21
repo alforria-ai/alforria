@@ -158,7 +158,17 @@ pub struct SubprocessGit;
 impl GitRunner for SubprocessGit {
     fn run(&self, cwd: Option<&Path>, args: &[&str]) -> GitResult {
         let mut command = Command::new("git");
-        command.args(args).stdin(std::process::Stdio::null());
+        // The TS global config (git/index.ts:6-13): no lock contention,
+        // raw paths, and quotepath=false so non-ASCII filenames decode.
+        command
+            .arg("--no-optional-locks")
+            .args(["-c", "core.autocrlf=false"])
+            .args(["-c", "core.fsmonitor=false"])
+            .args(["-c", "core.longpaths=true"])
+            .args(["-c", "core.symlinks=true"])
+            .args(["-c", "core.quotepath=false"])
+            .args(args)
+            .stdin(std::process::Stdio::null());
         if let Some(cwd) = cwd {
             command.current_dir(cwd);
         }

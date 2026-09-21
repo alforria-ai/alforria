@@ -30,19 +30,77 @@ fn not_found() -> Response<Body> {
 }
 
 /// Serve the embedded UI for a request path: map lookup, then the
-/// `index.html` fallback, then the 404 JSON envelope (`shared/ui.ts:69-70`).
+/// `index.html` fallback, then the 404 JSON envelope (`shared/ui.ts:55-79`).
 pub fn serve_ui(ctx: &Arc<ServerContext>, path: &str) -> Response<Body> {
+    // `embeddedWebUI[requestPath.replace(/^\//, "")]` (ui.ts:60) — the
+    // leading slash never keys the map.
+    let path = path.strip_prefix('/').unwrap_or(path);
     if let Some(file) = ctx.ui.get(path).or_else(|| ctx.ui.index()) {
         let mut response = Response::builder()
             .status(200)
-            .body(Body::from(file.bytes))
+            .body(Body::from(file.bytes.clone()))
             .expect("static response parts are valid");
         if let Ok(value) = HeaderValue::from_str(&file.mime) {
             response.headers_mut().insert("content-type", value);
         }
+        if file.mime.starts_with("text/html") {
+            // `cspForHtml` (ui.ts:12-16) — the theme-preload script hash
+            // inlines into the CSP.
+            if let Ok(value) =
+                HeaderValue::from_str(&csp_for_html(&String::from_utf8_lossy(&file.bytes)))
+            {
+                response
+                    .headers_mut()
+                    .insert("content-security-policy", value);
+            }
+        }
         return response;
     }
     not_found()
+}
+
+/// `themePreloadHash` + `csp` (ui.ts:14-19, 26-27).
+fn csp_for_html(body: &str) -> String {
+    let hash = theme_preload_script(body)
+        .map(|script| {
+            use base64::Engine as _;
+            use sha2::{Digest, Sha256};
+            let digest = Sha256::digest(script.as_bytes());
+            base64::engine::general_purpose::STANDARD.encode(digest)
+        })
+        .unwrap_or_default();
+    csp(&hash)
+}
+
+fn csp(hash: &str) -> String {
+    if hash.is_empty() {
+        "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https: blob:; font-src 'self' data:; media-src 'self' data:; connect-src * data: blob:"
+            .to_string()
+    } else {
+        format!("default-src 'self'; script-src 'self' 'wasm-unsafe-eval' 'sha256-{hash}'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https: blob:; font-src 'self' data:; media-src 'self' data:; connect-src * data: blob:")
+    }
+}
+
+/// `<script id="oc-theme-preload-script">…</script>` — the captured script
+/// element's content feeds the CSP hash (ui.ts:18-19).
+fn theme_preload_script(body: &str) -> Option<String> {
+    let start = body
+        .match_indices("<script")
+        .find(|(index, _)| {
+            body[*index..]
+                .split_once('>')
+                .map(|(tag, _)| {
+                    tag.contains("id=")
+                        && tag.contains("oc-theme-preload-script")
+                        && !tag.contains("src=")
+                })
+                .unwrap_or(false)
+        })
+        .map(|(index, _)| index)?;
+    let rest = &body[start..];
+    let open_end = rest.find('>')?;
+    let close = rest[open_end..].find("</script>")?;
+    Some(rest[open_end + 1..open_end + close].to_string())
 }
 
 /// Axum fallback handler: TS `router.add("*", "/*", serveUI)`
@@ -127,5 +185,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&bytes[..], b"{\"error\":\"Not Found\"}");
+    }
+
+    #[test]
+    fn csp_defaults_without_the_theme_preload_script() {
+        let csp = csp_for_html("<html><body></body></html>");
+        assert!(csp.contains("wasm-unsafe-eval"));
+        assert!(!csp.contains("sha256-"));
+    }
+
+    #[test]
+    fn csp_hashes_the_theme_preload_script() {
+        let html =
+            r#"<html><script id="oc-theme-preload-script">window.__theme = "dark"</script></html>"#;
+        let csp = csp_for_html(html);
+        assert!(csp.contains("sha256-"));
     }
 }

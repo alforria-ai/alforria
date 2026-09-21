@@ -337,3 +337,64 @@ reference (88c6c7a): llm, session engine, tools, server, CLI+ACP, TUI+foundation
 - **TUI+foundation**: "exceptionally faithful in TUI state machine, keymap,
   storage, and skill areas; the real gap is the un-ported config v2-compat
   lowering layer."
+
+### Findings triage (post-panel fix pass)
+
+**Fixed:**
+- Session engine: question rejection blocks the loop (ToolError::Rejected
+  wired through); cleanup awaits settlements concurrently; aborted tool
+  completion carries attachments; title_from_text counts UTF-16; stream
+  error aborts forked tool tasks.
+- Tools: webfetch filterStatusOk + Cloudflare retry + svg-as-text; websearch
+  25s timeout; bash drains until channel close after exit; task schema keeps
+  `command` optional; task background mode implemented end-to-end
+  (extend/start/notify/inject through BackgroundJobService, foreground race
+  vs promotion, abort cancel); primary_tools denies dedup'd into the child
+  ruleset; apply_patch/lsp relative paths use `ts_relative`; edit
+  levenshtein counts UTF-16.
+- ACP/CLI: idle waiters reject on SSE disconnect (run_until_idle → Result);
+  percent_decode byte-then-UTF-8 semantics; --mini fails loudly instead of
+  silently consuming a prompt; authenticate returns {}; error message
+  suffixes restored; data omitted from JSON-RPC errors when unset; error
+  rawOutput omits metadata like the SDK; locationFrom global dedup;
+  model-option sort no longer lowercases; data-URL parser accepts
+  parameter segments; available_commands_update yields a tick (setTimeout
+  (0)); usage context-limit cache; run.ts time.end:null is not finished;
+  attach mode skips the loop-error exit code.
+- LLM: providerMessage drops the ": " suffix for empty bodies;
+  onOutputItemDone drops empty identifiers; bedrock signature truthiness;
+  gemini args required; openai-chat usage providerMetadata projects the
+  declared fields only.
+- Foundation: ConfigV2Compat.lower + normalizeLoadedConfig ported
+  (config/v2_compat.rs, 20 tests) and wired into the load pipeline;
+  git runner passes the TS global -c flags; transcript prints tool input
+  for every state with truthiness gates; account-config failures are
+  logged, not fatal.
+- Server: installation.updated emitted on the global bus after upgrade; UI
+  catch-all strips the leading slash and sets CSP (with theme-preload
+  sha256).
+
+**Refuted by ground truth:**
+- openai-responses `store:false` static default — the frozen golden
+  recordings (fixtures/llm-recordings) show the real TS app does NOT send
+  `store` on openai-responses request bodies; wiring the default in broke
+  golden replay and was reverted.
+- openai-chat eager tool-call finalization — the pinned TS protocol code
+  does the same (openai-chat.ts:444-449); the isParsableJson finalization
+  is the AI-SDK default runtime (documented STOP S11) and the finish-reason
+  `stop → tool-calls` upgrade (openai-chat.ts:465) is already ported.
+
+**Accepted deviations (documented):**
+- localeCompare collation is environment-dependent (this machine: fr_FR) —
+  byte ordering used; rg JSON mode does NOT suppress binary-file matches
+  (verified against ripgrep 15.1.0 — the in-process walker is faithful);
+  the `requestPermission` auto-reject check is dead code in TS (the SDK
+  connection always defines the method); openai-chat tool-call index
+  validation (u32 keys) diverges only on malformed provider output; JSON
+  key order (serde_json BTreeMap) is alphabetized; catalog cache filename
+  uses FNV-1a (self-consistent, opaque); PTY `shell.env` plugin trigger
+  needs a plugin runtime (not ported); `--mini` interactive mode
+  (run/runtime.ts) not ported — errors loudly instead; applyPatch in the
+  edit-permission preview is an exact-match simplification (npm `diff`
+  fuzzy placement not ported); PowerShell tree-sitter grammar approximated
+  by whitespace-split fallback.

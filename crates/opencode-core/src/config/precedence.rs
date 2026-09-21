@@ -343,8 +343,13 @@ impl ConfigLoader {
             merge_config_concat_arrays(&mut result, &next);
         }
 
-        // 8. Active-org account config (auth seam).
-        if let Some((source, account)) = params.auth.account_config()? {
+        // 8. Active-org account config (auth seam) — failures are logged,
+        // not fatal (config.ts:520-526 wraps the whole block in
+        // `Effect.catch` + `logDebug`).
+        let account = (|| -> Result<(), CoreError> {
+            let Some((source, account)) = params.auth.account_config()? else {
+                return Ok(());
+            };
             let text = serde_json::to_string(&account)
                 .map_err(|e| CoreError::invalid(Path::new(&source), e.to_string()))?;
             let next = self.load_config(
@@ -356,6 +361,10 @@ impl ConfigLoader {
                 &auth_env,
             )?;
             merge_config_concat_arrays(&mut result, &next);
+            Ok(())
+        })();
+        if let Err(error) = account {
+            eprintln!("failed to fetch remote account config: {error}");
         }
 
         // 9. Managed config dir (MDM). Managed *preferences*
@@ -566,7 +575,16 @@ impl ConfigLoader {
         let expanded = substitute(text, &source, env, Missing::Error)?;
         let source_path = source_name(&source);
         let value = parse_jsonc(&expanded, &source_path)?;
-        decode_config(&value, &source_path)?;
+        // `ConfigV2Compat.lower(normalizeLoadedConfig(input))` before the
+        // V1 schema (config.ts:189) — V2 keys lower onto V1, V2 permissions
+        // are fatal, diagnostics are logged warnings.
+        let lowered = super::v2_compat::lower(&super::v2_compat::normalize_loaded_config(&value))
+            .map_err(|error| CoreError::ConfigInvalid {
+            path: PathBuf::from(&source_path),
+            message: None,
+            issues: error.issues,
+        })?;
+        decode_config(&lowered.value, &source_path)?;
 
         // Path-based configs get `$schema` seeded into the merged result
         // (TS `loadConfig` does this on every load; it also writes the file

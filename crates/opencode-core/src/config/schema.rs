@@ -1016,6 +1016,11 @@ const LSP_BUILTIN_SERVER_IDS: &[&str] = &[
     "julials",
 ];
 
+/// The builtin LSP server ids (`v2-compat.ts` reads `builtinServerIds`).
+pub fn lsp_builtin_server_ids() -> &'static [&'static str] {
+    LSP_BUILTIN_SERVER_IDS
+}
+
 /// `lsp.ts` `Info` — `boolean | Record<string, Entry>` with the
 /// custom-servers-require-`extensions` check.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -9,6 +9,7 @@ pub mod agent;
 pub mod command;
 pub mod precedence;
 pub mod schema;
+pub mod v2_compat;
 pub mod variable;
 
 pub use agent::MarkdownDiscovery;

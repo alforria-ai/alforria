@@ -161,16 +161,29 @@ pub fn format_part(part: &V1Part, options: &TranscriptOptions) -> String {
             }
         }
         V1Part::Tool { tool, state, .. } => {
+            // `part.state.input` gates on truthiness for every status
+            // (transcript.ts:100-107), and completed/error render only
+            // when their payload is non-empty.
             let mut result = format!("**Tool: {tool}**\n");
             if options.tool_details {
-                if let V1ToolState::Running { input, .. } = state {
+                let input = match &state {
+                    V1ToolState::Pending { input, .. }
+                    | V1ToolState::Running { input, .. }
+                    | V1ToolState::Completed { input, .. }
+                    | V1ToolState::Error { input, .. } => input,
+                };
+                if !input.is_empty() {
                     result += &format!("\n**Input:**\n```json\n{}\n```\n", pretty_json(input));
                 }
                 if let V1ToolState::Completed { output, .. } = state {
-                    result += &format!("\n**Output:**\n```\n{output}\n```\n");
+                    if !output.is_empty() {
+                        result += &format!("\n**Output:**\n```\n{output}\n```\n");
+                    }
                 }
                 if let V1ToolState::Error { error, .. } = state {
-                    result += &format!("\n**Error:**\n```\n{error}\n```\n");
+                    if !error.is_empty() {
+                        result += &format!("\n**Error:**\n```\n{error}\n```\n");
+                    }
                 }
             }
             result += "\n";
