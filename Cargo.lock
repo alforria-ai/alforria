@@ -1942,6 +1942,7 @@ dependencies = [
  "opencode-schema",
  "opencode-server",
  "opencode-tui",
+ "regex",
  "reqwest",
  "rusqlite",
  "serde",

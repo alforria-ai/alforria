@@ -199,10 +199,16 @@ pub struct EventLog(Arc<Mutex<Vec<Value>>>);
 
 impl EventLog {
     pub fn subscribe(serve: &Serve, directory: &str) -> EventLog {
+        EventLog::subscribe_at(serve.port, directory)
+    }
+
+    /// The port-parameterized variant (used by the parity harness, which
+    /// also drives non-`Serve` servers).
+    pub fn subscribe_at(port: u16, directory: &str) -> EventLog {
         let log = EventLog(Arc::new(Mutex::new(Vec::new())));
         let url = format!(
             "http://127.0.0.1:{}/event?directory={}",
-            serve.port,
+            port,
             encode_uri_component(directory)
         );
         let sink = log.0.clone();
