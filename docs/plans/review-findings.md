@@ -145,3 +145,38 @@ Panel: glm-5.3-thinking (agentic — two runs, both died mid-flight at turns 50/
 
 ### Panel failures recorded
 - The agentic reviewer's budget (~50 turns) is insufficient for a full CLI review; split-scope re-runs also died. deepseek failed on budget ×2 and external_directory ×1. Priority-5 spot-checks (mcp.rs, pr.rs, session.rs, db.rs, stats.rs vs TS) were therefore only partially covered — C9's implementation reports and the e2e suite stand as the primary coverage.
+
+## Post-12.4 close-out (final acceptance)
+
+### Deferred candidates — verified & fixed
+- **`background.rs` cancel/spawn race (from the M7 panel handoff)**: CONFIRMED.
+  TS forks runs into the job's Effect scope, so a cancel that closes the
+  scope also interrupts a fork landing concurrently with it. The Rust port
+  pushed the `AbortHandle` into `job.tasks` under a second lock acquisition
+  after `tokio::spawn` — a cancel slipping between insert and push left the
+  run executing forever. `start`/`extend` now re-check `status == Running`
+  at push time and abort otherwise (fork-into-closed-scope semantics);
+  regression test `cancel_interrupts_the_in_flight_run` (background.rs).
+- **`EngineStore` `Arc::as_ptr` eviction (from the M7 panel handoff)**:
+  CONFIRMED (leak, not correctness). Entries held a strong services `Arc`
+  keyed by its address and were never removed — every dead instance leaked
+  its engine for the process lifetime. Entries now hold a `Weak`, and
+  lookups lazily evict lapsed entries; a live upgrade also proves the
+  address key still belongs to that instance (address reuse can never
+  produce a stale match). TS gets the same lifetime from per-instance
+  Effect scopes.
+
+### TUI acceptance clarification (M9 row, "headless vt100 snapshot tests")
+- Satisfied by ratatui `TestBackend` buffer assertions rather than a vt100
+  emulator: the TUI e2e renders the whole app through `ui::view` into a
+  100x30 buffer over the real M6 server wire and asserts cell content
+  (`e2e.rs`), and footer/transcript widgets have dedicated render unit
+  tests. vt100-level golden snapshots would primarily test ratatui's escape
+  sequences, not app rendering; recorded as a deliberate deviation.
+
+### Plan-doc numbering errata
+- The milestone table's row numbering diverged from the executed series:
+  the TUI shipped as 8.1–8.8, the CLI as C1–C9, the mock-LLM E2E as
+  10.1–10.4, the parity harness as 12.1–12.3, and the ACP adapter as 12.4
+  (completing plan row 7). Acceptance rows map to: row 8 → C-series, row 9
+  → 8.x, row 12 → 12.x.
