@@ -178,28 +178,30 @@ pub type Replacer = for<'a> fn(&'a str, &'a str) -> ReplacerIter<'a>;
 const SINGLE_CANDIDATE_SIMILARITY_THRESHOLD: f64 = 0.65;
 const MULTIPLE_CANDIDATES_SIMILARITY_THRESHOLD: f64 = 0.65;
 
-/// Levenshtein distance over characters (edit.ts:226-242).
+/// Levenshtein distance over UTF-16 code units (edit.ts:226-242 —
+/// JS `.length` / indexing operate on UTF-16).
 fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<u16> = a.encode_utf16().collect();
+    let b: Vec<u16> = b.encode_utf16().collect();
     if a.is_empty() || b.is_empty() {
-        return a.chars().count().max(b.chars().count());
+        return a.len().max(b.len());
     }
-    let b_chars: Vec<char> = b.chars().collect();
-    let mut matrix: Vec<Vec<usize>> = Vec::with_capacity(a.chars().count() + 1);
-    for i in 0..=a.chars().count() {
-        matrix.push((0..=b_chars.len()).collect());
+    let mut matrix: Vec<Vec<usize>> = Vec::with_capacity(a.len() + 1);
+    for i in 0..=a.len() {
+        matrix.push((0..=b.len()).collect());
         if i > 0 {
             matrix[i][0] = i;
         }
     }
-    for (i, a_char) in a.chars().enumerate() {
-        for (j, b_char) in b_chars.iter().enumerate() {
-            let cost = usize::from(a_char != *b_char);
-            matrix[i + 1][j + 1] = (matrix[i][j + 1] + 1)
-                .min(matrix[i + 1][j] + 1)
-                .min(matrix[i][j] + cost);
+    for i in 1..=a.len() {
+        for j in 1..=b.len() {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            matrix[i][j] = (matrix[i - 1][j] + 1)
+                .min(matrix[i][j - 1] + 1)
+                .min(matrix[i - 1][j - 1] + cost);
         }
     }
-    matrix[a.chars().count()][b_chars.len()]
+    matrix[a.len()][b.len()]
 }
 
 /// `SimpleReplacer` (edit.ts:244-246): yields `find` (exact).

@@ -788,10 +788,12 @@ async fn run(
                 }
             }
             code = &mut exit => {
-                // The exit status wins the race, but the output pipe may still
-                // hold buffered chunks (TS drains via its forked stream fiber
-                // while the exit race settles) — drain before finishing.
-                while let Ok(chunk) = chunks.try_recv() {
+                // Drain until the channel closes — the exit status can win
+                // the race while the reader tasks still hold a final read,
+                // so a one-shot try_recv drain would drop trailing chunks
+                // (TS's forked stream consumer runs until the merged
+                // stream ends).
+                while let Some(chunk) = chunks.recv().await {
                             used += chunk.len();
                             list.push_back(chunk.clone());
                             while used > keep && list.len() > 1 {

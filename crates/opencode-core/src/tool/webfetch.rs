@@ -18,15 +18,11 @@ const MAX_TIMEOUT_MS: u64 = 120 * 1000; // 2 minutes
 
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36";
 
-/// `isImageAttachment` (`util/media.ts`).
-const IMAGE_MIMES: [&str; 6] = [
-    "image/png",
-    "image/jpeg",
-    "image/gif",
-    "image/webp",
-    "image/avif",
-    "image/svg+xml",
-];
+/// `isImageAttachment` (`util/media.ts`): any `image/*` mime except the
+/// two formats the TS deliberately serves as text.
+fn is_image_attachment(mime: &str) -> bool {
+    mime.starts_with("image/") && mime != "image/svg+xml" && mime != "image/vnd.fastbidsheet"
+}
 
 /// Minimal HTTP response used by the [`HttpClient`] seam.
 pub struct HttpResponse {
@@ -208,13 +204,35 @@ async fn run(
             ("Accept", accept_header(format)),
             ("Accept-Language", "en-US,en;q=0.9"),
         ];
-        let response = http
+        let is_ok = |response: &HttpResponse| (200..300).contains(&response.status);
+        let mut response = http
             .get(
                 &params.url,
-                headers,
+                headers.clone(),
                 std::time::Duration::from_millis(timeout_ms),
             )
             .await?;
+        // `HttpClient.filterStatusOk` — a non-2xx fails the tool, except
+        // the Cloudflare-challenge retry below (webfetch.ts:84-97).
+        if !is_ok(&response) {
+            if response.status == 403 && response.header("cf-mitigated") == Some("challenge") {
+                let mut retry = headers;
+                retry[0] = ("User-Agent", "opencode");
+                response = http
+                    .get(
+                        &params.url,
+                        retry,
+                        std::time::Duration::from_millis(timeout_ms),
+                    )
+                    .await?;
+            }
+            if !is_ok(&response) {
+                return Err(ToolError::Failed(format!(
+                    "StatusCode error ({} GET {})",
+                    response.status, params.url
+                )));
+            }
+        }
 
         // Check content length (webfetch.ts:96-104).
         if let Some(content_length) = response.header("content-length") {
@@ -241,7 +259,7 @@ async fn run(
             .to_lowercase();
         let title = format!("{} ({})", params.url, content_type);
 
-        if IMAGE_MIMES.contains(&mime.as_str()) {
+        if is_image_attachment(&mime) {
             use base64::Engine as _;
             let base64_content = base64::engine::general_purpose::STANDARD.encode(&response.body);
             return Ok(ExecuteResult {

@@ -231,7 +231,12 @@ impl BackgroundJobService {
     /// `start` (background-job.ts:202-254) — returns the running job's
     /// info without restarting an already-running job.
     pub fn start(self: &Arc<Self>, input: StartInput) -> Result<Info, CoreError> {
-        let id = JobId::ascending(input.id.as_deref())?;
+        // The TS service accepts arbitrary ids — the task tool keys jobs
+        // by the subagent session id (task.ts:274).
+        let id = match input.id {
+            Some(id) => id,
+            None => JobId::ascending(None)?,
+        };
         let started_at = self.clock.now_ms();
         let mut jobs = self.lock_jobs();
         if let Some(existing) = jobs.get(&id) {

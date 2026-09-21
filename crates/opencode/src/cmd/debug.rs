@@ -481,6 +481,15 @@ fn tool_registry(
         } else {
             opencode_core::tool::task::BackgroundMode::Disabled
         },
+        if background_subagents_enabled() {
+            Some(
+                opencode_core::session::background::BackgroundJobService::new(
+                    instance.services.clock().clone(),
+                ),
+            )
+        } else {
+            None
+        },
     );
     let ripgrep: Arc<dyn opencode_core::tool::ripgrep::Ripgrep> =
         Arc::new(opencode_core::tool::ripgrep::RipgrepService);

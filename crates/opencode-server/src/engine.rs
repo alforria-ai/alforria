@@ -647,6 +647,11 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
         } else {
             BackgroundMode::Disabled
         },
+        if background_enabled {
+            Some(input.background.clone())
+        } else {
+            None
+        },
     );
     let question = opencode_core::tool::question::question_tool(
         truncate.clone(),

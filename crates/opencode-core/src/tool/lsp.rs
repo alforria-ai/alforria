@@ -182,10 +182,8 @@ async fn run(
     let uri = format!("file://{file}");
     let line = params.line.unwrap_or(1);
     let character = params.character.unwrap_or(1);
-    let rel_path = std::path::Path::new(&file)
-        .strip_prefix(&instance.worktree)
-        .map(|path| path.to_string_lossy().to_string())
-        .unwrap_or_else(|_| file.clone());
+    let rel_path =
+        crate::tool::ripgrep::ts_relative(&instance.worktree, std::path::Path::new(&file));
     let detail = match params.operation.as_str() {
         "workspaceSymbol" => String::new(),
         "documentSymbol" => rel_path,

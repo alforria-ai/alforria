@@ -1,5 +1,6 @@
 //! `apply_patch` tool — port of `tool/apply_patch.ts` (spec M4.7).
 
+use std::path::Path;
 use std::sync::Arc;
 
 use serde::Deserialize;
@@ -75,11 +76,9 @@ pub fn apply_patch_tool(
 }
 
 fn relative(instance_worktree: &std::path::Path, target: &str) -> String {
-    let rel = std::path::Path::new(target)
-        .strip_prefix(instance_worktree)
-        .map(|path| path.to_string_lossy().to_string())
-        .unwrap_or_else(|_| target.to_string());
-    rel.replace('\\', "/")
+    // `path.relative(worktree, target)` — `../` sequences for targets
+    // outside the worktree, not the raw absolute path.
+    crate::tool::ripgrep::ts_relative(instance_worktree, Path::new(target))
 }
 
 async fn run(

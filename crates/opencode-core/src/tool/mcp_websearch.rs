@@ -108,7 +108,17 @@ pub async fn call(
         "application/json, text/event-stream".to_string(),
     )];
     all_headers.extend(headers);
-    let response = http.post(url, all_headers, &request.to_string()).await?;
+    // `Effect.timeoutOrElse` — the caller-supplied budget bounds the whole
+    // request so a stalled provider can't hold the agent turn hostage.
+    let response = match tokio::time::timeout(
+        std::time::Duration::from_secs(25),
+        http.post(url, all_headers, &request.to_string()),
+    )
+    .await
+    {
+        Ok(response) => response?,
+        Err(_) => return Err(ToolError::Failed(format!("{tool} request timed out"))),
+    };
     Ok(parse_response(&response.body))
 }
 

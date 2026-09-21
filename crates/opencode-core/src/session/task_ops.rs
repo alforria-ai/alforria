@@ -297,6 +297,44 @@ impl TaskOps for ProductionTaskOps {
             }
         })
     }
+
+    /// `injectBackgroundResult` (task.ts:236-252) — a synthetic text prompt
+    /// into the parent session, fire-and-forget.
+    fn inject_background_result<'a>(
+        &'a self,
+        parent_session_id: &'a str,
+        variant: Option<&'a str>,
+        text: &'a str,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let Ok(facade) = self.facade() else { return };
+            let agent = self
+                .sessions
+                .get(parent_session_id)
+                .ok()
+                .and_then(|session| session.agent.clone());
+            let input = crate::session::prompt_input::PromptInput {
+                session_id: parent_session_id.to_string(),
+                message_id: None,
+                model: None,
+                agent,
+                no_reply: None,
+                tools: None,
+                format: None,
+                system: None,
+                variant: variant.map(|value| value.to_string()),
+                parts: vec![crate::session::prompt_input::PromptPartInput::Text {
+                    id: None,
+                    text: text.to_string(),
+                    synthetic: Some(true),
+                    ignored: None,
+                    time: None,
+                    metadata: None,
+                }],
+            };
+            let _ = facade.prompt(input).await;
+        })
+    }
 }
 
 /// `"message" in error.data.message ? error.data.message : error.name`

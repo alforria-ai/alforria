@@ -741,6 +741,7 @@ fn engine_build_with(
         1,
         Vec::new(),
         crate::tool::task::BackgroundMode::Disabled,
+        None,
     );
     let read = match defs {
         EngineDefs::Real => crate::tool::read::read_tool(truncate.clone(), agents.clone(), None),

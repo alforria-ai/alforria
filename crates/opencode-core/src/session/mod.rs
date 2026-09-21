@@ -125,6 +125,11 @@ pub struct SessionServices {
 }
 
 impl SessionServices {
+    /// The shared wall clock (test doubles override it).
+    pub fn clock(&self) -> Arc<dyn Clock> {
+        self.clock.clone()
+    }
+
     /// Wire the full M5.1 service graph: shared storage + event bus with
     /// the session projectors registered, the stores, the status map, the
     /// run state and the agent registry.

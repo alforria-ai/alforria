@@ -126,14 +126,25 @@ pub trait TaskOps: Send + Sync {
     ) -> BoxFuture<'a, Result<PromptOutcome, ToolError>>;
     /// Cancel a running subagent.
     fn cancel<'a>(&'a self, session_id: &'a str) -> BoxFuture<'a, ()>;
+    /// `injectBackgroundResult` (task.ts:236-252) — a synthetic text prompt
+    /// into the parent session (parent's agent, captured variant),
+    /// fire-and-forget (`Effect.ignore`).
+    fn inject_background_result<'a>(
+        &'a self,
+        parent_session_id: &'a str,
+        variant: Option<&'a str>,
+        text: &'a str,
+    ) -> BoxFuture<'a, ()>;
 }
 
 /// `deriveSubagentSessionPermission` (subagent-permissions.ts:18-31):
 /// parent external_directory + deny rules, then default `todowrite`/`task`
 /// denies when the subagent's own ruleset doesn't already permit them.
+/// `primary_tools` adds one deny rule per experimental tool (task.ts:143-155).
 pub fn derive_subagent_session_permission(
     parent_session_permission: &[Rule],
     subagent_permission: &[Rule],
+    primary_tools: &[String],
 ) -> Vec<Rule> {
     let can_task = subagent_permission
         .iter()
@@ -159,6 +170,24 @@ pub fn derive_subagent_session_permission(
             pattern: "*".to_string(),
             action: "deny",
         });
+    }
+    let primary_tools: Vec<Rule> = primary_tools
+        .iter()
+        .map(|permission| Rule {
+            permission: permission.clone(),
+            pattern: "*".to_string(),
+            action: "deny",
+        })
+        .collect();
+    // The child-tool denies merge into the derived ruleset deduplicated
+    // (task.ts:151-160).
+    for deny in primary_tools {
+        if !result
+            .iter()
+            .any(|rule| rule.permission == deny.permission && rule.pattern == deny.pattern)
+        {
+            result.push(deny);
+        }
     }
     result
 }
@@ -215,14 +244,13 @@ pub fn parameters(background: bool) -> Value {
         "properties": properties,
     });
     if let Some(object) = schema.as_object_mut() {
-        let mut required = vec![
+        // `BaseParameterFields` keeps command/task_id/background optional
+        // in both shapes (task.ts:47-56).
+        let required = [
             "description".to_string(),
             "prompt".to_string(),
             "subagent_type".to_string(),
         ];
-        if !background {
-            required.push("command".to_string());
-        }
         object.insert(
             "required".to_string(),
             Value::Array(required.into_iter().map(Value::String).collect()),
@@ -240,6 +268,7 @@ pub fn task_tool(
     subagent_depth: usize,
     primary_tools: Vec<String>,
     background: BackgroundMode,
+    jobs: Option<Arc<crate::session::background::BackgroundJobService>>,
 ) -> ToolDef {
     let description = match background {
         BackgroundMode::Enabled => {
@@ -260,8 +289,18 @@ pub fn task_tool(
         move |params: TaskParameters, ctx: ToolCtxRef<'_>| {
             let ops = ops.clone();
             let primary_tools = primary_tools.clone();
+            let jobs = jobs.clone();
             Box::pin(async move {
-                run(params, ctx, ops, subagent_depth, primary_tools, &background).await
+                run(
+                    params,
+                    ctx,
+                    ops,
+                    subagent_depth,
+                    primary_tools,
+                    &background,
+                    jobs,
+                )
+                .await
             })
         },
     )
@@ -278,8 +317,9 @@ async fn run(
     ctx: ToolCtxRef<'_>,
     ops: Arc<dyn TaskOps>,
     subagent_depth: usize,
-    _primary_tools: Vec<String>,
+    primary_tools: Vec<String>,
     background: &BackgroundMode,
+    jobs: Option<Arc<crate::session::background::BackgroundJobService>>,
 ) -> Result<ExecuteResult, ToolError> {
     let run_in_background = params.background == Some(true);
     if run_in_background && *background == BackgroundMode::Disabled {
@@ -325,8 +365,11 @@ async fn run(
         Some(session) => session,
         None => {
             let parent_permission = ops.session_permission(ctx.session_id).await;
-            let child_permission =
-                derive_subagent_session_permission(&parent_permission, &next.permission);
+            let child_permission = derive_subagent_session_permission(
+                &parent_permission,
+                &next.permission,
+                &primary_tools,
+            );
             ops.create_session(
                 ctx.session_id,
                 &format!("{} (@{} subagent)", params.description, next.name),
@@ -360,15 +403,303 @@ async fn run(
         })
         .await?;
 
-    let outcome = ops
-        .prompt(
+    // Background subagents (task.ts:205-358). Without the experimental
+    // flag the plain foreground path below runs directly.
+    if let Some(jobs) = jobs {
+        use crate::session::background::{
+            BackgroundJobService, ExtendInput, StartInput, Status, WaitInput,
+        };
+
+        // `runTask` (task.ts:203-233) — the job body.
+        let make_run_task = || {
+            let ops = ops.clone();
+            let session_id = session_id.clone();
+            let agent = next.name.clone();
+            let model = model.clone();
+            let variant = variant.clone();
+            let prompt = params.prompt.clone();
+            Box::pin(async move {
+                let outcome = match ops
+                    .prompt(&session_id, &agent, &model, variant.as_deref(), &prompt)
+                    .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(error) => return Err(error.to_string()),
+                };
+                if let Some(error) = outcome.error {
+                    return Err(format!("Subagent failed (task_id: {session_id}): {error}"));
+                }
+                Ok(outcome.text)
+            }) as crate::session::background::JobFuture
+        };
+
+        // `backgroundResult` (task.ts:280-296).
+        let background_result = |job_id: &str| ExecuteResult {
+            title: params.description.clone(),
+            metadata: json!({
+                "parentSessionId": ctx.session_id,
+                "sessionId": session_id,
+                "model": {
+                    "modelID": model.model_id,
+                    "providerID": model.provider_id,
+                },
+                "background": true,
+                "jobId": job_id,
+            }),
+            output: render_output(RenderOutput {
+                session_id: &session_id,
+                state: "running",
+                summary: Some("Background task started"),
+                text: BACKGROUND_STARTED,
+            }),
+            attachments: None,
+        };
+
+        // `notify` (task.ts:252-261) — forked: wait for the job, inject
+        // the rendered result into the parent session.
+        let notify = {
+            let jobs = jobs.clone();
+            let ops = ops.clone();
+            let parent_session = ctx.session_id.to_string();
+            let variant = variant.clone();
+            let description = params.description.clone();
+            let session_id = session_id.clone();
+            move |job_id: String| {
+                let jobs = jobs.clone();
+                let ops = ops.clone();
+                let parent_session = parent_session.clone();
+                let variant = variant.clone();
+                let description = description.clone();
+                let session_id = session_id.clone();
+                tokio::spawn(async move {
+                    let jobs: Arc<BackgroundJobService> = jobs;
+                    let result = jobs
+                        .wait(WaitInput {
+                            id: job_id,
+                            timeout: None,
+                        })
+                        .await;
+                    let Some(info) = result.info else {
+                        return;
+                    };
+                    let (state, summary, text) = match info.status {
+                        Status::Completed => (
+                            "completed",
+                            format!("Background task completed: {description}"),
+                            info.output.unwrap_or_default(),
+                        ),
+                        Status::Error => (
+                            "error",
+                            format!("Background task failed: {description}"),
+                            info.error.unwrap_or_default(),
+                        ),
+                        _ => return,
+                    };
+                    ops.inject_background_result(
+                        &parent_session,
+                        variant.as_deref(),
+                        &render_output(RenderOutput {
+                            session_id: &session_id,
+                            state,
+                            summary: Some(&summary),
+                            text: &text,
+                        }),
+                    )
+                    .await;
+                });
+            }
+        };
+
+        // `background.extend` (task.ts:261-270) — a follow-up for an
+        // already-running task appends to the job.
+        if jobs
+            .extend(ExtendInput {
+                id: session_id.clone(),
+                run: make_run_task(),
+            })
+            .unwrap_or(false)
+        {
+            return Ok(ExecuteResult {
+                title: params.description.clone(),
+                metadata: json!({
+                    "parentSessionId": ctx.session_id,
+                    "sessionId": session_id,
+                    "model": {
+                        "modelID": model.model_id,
+                        "providerID": model.provider_id,
+                    },
+                    "background": true,
+                    "jobId": session_id,
+                }),
+                output: render_output(RenderOutput {
+                    session_id: &session_id,
+                    state: "running",
+                    summary: Some("Background task updated"),
+                    text: BACKGROUND_UPDATED,
+                }),
+                attachments: None,
+            });
+        }
+
+        // `background.start` (task.ts:272-279) — the onPromote metadata
+        // update needs the call-scoped metadata sink, so only the
+        // notification half runs on promotion.
+        let on_promote = {
+            let notify = notify.clone();
+            let session_id = session_id.clone();
+            Box::pin(async move {
+                let notify = notify;
+                notify(session_id);
+            }) as crate::tool::def::BoxFuture<'static, ()>
+        };
+        let jobs_ref = jobs.clone();
+        let run_task = {
+            let ops = ops.clone();
+            let session_id = session_id.clone();
+            move || {
+                let ops = ops.clone();
+                let session_id = session_id.clone();
+                let run = make_run_task();
+                Box::pin(async move {
+                    // `Effect.onInterrupt(ops.cancel)` (task.ts:277-279) —
+                    // the job runner aborts this task on cancel, so the
+                    // Drop guard fires the session cancel exactly when the
+                    // run is interrupted.
+                    struct OnInterrupt<S> {
+                        ops: Arc<dyn TaskOps>,
+                        session_id: String,
+                        done: bool,
+                        _run: S,
+                    }
+                    impl<S> Drop for OnInterrupt<S> {
+                        fn drop(&mut self) {
+                            if self.done {
+                                return;
+                            }
+                            let ops = self.ops.clone();
+                            let session_id = self.session_id.clone();
+                            tokio::spawn(async move {
+                                ops.cancel(&session_id).await;
+                            });
+                        }
+                    }
+                    let mut guard = OnInterrupt {
+                        ops,
+                        session_id,
+                        done: false,
+                        _run: std::pin::pin!(run),
+                    };
+                    let outcome = (&mut guard._run).await;
+                    guard.done = true;
+                    outcome
+                }) as crate::session::background::JobFuture
+            }
+        };
+        let info = jobs_ref.start(StartInput {
+            id: Some(session_id.clone()),
+            r#type: "task".to_string(),
+            title: Some(params.description.clone()),
+            metadata: metadata.as_object().cloned(),
+            run: run_task(),
+            on_promote: Some(on_promote),
+        });
+
+        // `runInBackground` (task.ts:298-301).
+        if run_in_background {
+            if let Ok(info) = &info {
+                notify(info.id.clone());
+                return Ok(background_result(&info.id));
+            }
+            return Err(ToolError::Failed(
+                "Background subagents require OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true"
+                    .to_string(),
+            ));
+        }
+
+        // Foreground (task.ts:303-358) — race the wait against promotion.
+        if let Ok(started) = info {
+            {
+                let jobs = jobs.clone();
+                let job_id = started.id.clone();
+                let outcome = tokio::select! {
+                    outcome = async {
+                        jobs.wait(WaitInput { id: job_id.clone(), timeout: None }).await
+                    } => outcome,
+                    _ = ctx.abort.cancelled() => {
+                        // `Effect.all([cancel, background.cancel])` on
+                        // interrupt (task.ts:344-353).
+                        let ops = ops.clone();
+                        let session_id = session_id.clone();
+                        let jobs = jobs.clone();
+                        let job_id = started.id.clone();
+                        tokio::spawn(async move {
+                            ops.cancel(&session_id).await;
+                            jobs.cancel(&job_id);
+                        });
+                        return Err(ToolError::Aborted);
+                    }
+                };
+                if let Some(info) = outcome.info {
+                    if info
+                        .metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.get("background"))
+                        == Some(&serde_json::Value::Bool(true))
+                    {
+                        return Ok(background_result(&info.id));
+                    }
+                    match info.status {
+                        Status::Error => {
+                            return Err(ToolError::Failed(
+                                info.error.unwrap_or_else(|| "Task failed".to_string()),
+                            ));
+                        }
+                        Status::Cancelled => {
+                            return Err(ToolError::Failed("Task cancelled".to_string()));
+                        }
+                        _ => {
+                            return Ok(ExecuteResult {
+                                title: params.description.clone(),
+                                metadata,
+                                output: render_output(RenderOutput {
+                                    session_id: &session_id,
+                                    state: "completed",
+                                    summary: None,
+                                    text: &info.output.unwrap_or_default(),
+                                }),
+                                attachments: None,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        return Err(ToolError::Failed(
+            "Background subagents require OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true"
+                .to_string(),
+        ));
+    }
+
+    // `Effect.acquireUseRelease` + the abort listener (task.ts:320-358):
+    // an aborted parent turn cancels the subagent instead of waiting it
+    // out.
+    let outcome = tokio::select! {
+        outcome = ops.prompt(
             &session_id,
             &next.name,
             &model,
             variant.as_deref(),
             &params.prompt,
-        )
-        .await?;
+        ) => outcome?,
+        _ = ctx.abort.cancelled() => {
+            let session_id = session_id.clone();
+            let ops = ops.clone();
+            tokio::spawn(async move {
+                ops.cancel(&session_id).await;
+            });
+            return Err(ToolError::Aborted);
+        }
+    };
 
     if let Some(error) = outcome.error {
         return Err(ToolError::Failed(format!(
@@ -444,6 +775,14 @@ mod tests {
         ) -> BoxFuture<'a, Result<String, ToolError>> {
             Box::pin(async { Ok("ses_child".to_string()) })
         }
+        fn inject_background_result<'a>(
+            &'a self,
+            _parent_session_id: &'a str,
+            _variant: Option<&'a str>,
+            _text: &'a str,
+        ) -> BoxFuture<'a, ()> {
+            Box::pin(async {})
+        }
         fn parent_message<'a>(
             &'a self,
             _session_id: &'a str,
@@ -490,6 +829,7 @@ mod tests {
             depth,
             Vec::new(),
             BackgroundMode::Disabled,
+            None,
         )
     }
 
@@ -508,6 +848,87 @@ mod tests {
         let ctx = ctx(&ask, &inst, &extra);
         let result = (def.execute)(args, ctx).await;
         (result, ask.requests())
+    }
+
+    async fn call_background(
+        ops: Arc<dyn TaskOps>,
+        jobs: Arc<crate::session::background::BackgroundJobService>,
+        args: Value,
+    ) -> Result<ExecuteResult, ToolError> {
+        let def = task_tool(
+            Arc::new(TruncateService::default_limits(std::path::PathBuf::from(
+                "/tmp/opencode",
+            ))),
+            fixed_agents(),
+            ops,
+            1,
+            Vec::new(),
+            BackgroundMode::Enabled,
+            Some(jobs),
+        );
+        let ask = RecordingAsk::new();
+        let inst = instance(std::path::Path::new("/tmp/opencode"));
+        let extra = Extra::default();
+        let ctx = ctx(&ask, &inst, &extra);
+        (def.execute)(args, ctx).await
+    }
+
+    #[tokio::test]
+    async fn background_true_returns_background_started() {
+        let jobs = crate::session::background::BackgroundJobService::new(Arc::new(
+            crate::catalog::SystemClock,
+        ));
+        let result = call_background(
+            Arc::new(FakeOps::new()),
+            jobs.clone(),
+            json!({
+                "description": "bg task",
+                "prompt": "run",
+                "subagent_type": "research",
+                "background": true
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.title, "bg task");
+        assert_eq!(result.metadata["background"], json!(true));
+        assert_eq!(result.metadata["jobId"], json!("ses_child"));
+        assert!(result.output.contains("Background task started"));
+        assert!(result.output.contains(BACKGROUND_STARTED));
+        // The notify waiter shouldn't deadlock the test: let the job run.
+        for _ in 0..50 {
+            if jobs
+                .list()
+                .iter()
+                .all(|job| job.status != crate::session::background::Status::Running)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn foreground_runs_through_the_job_service() {
+        let jobs = crate::session::background::BackgroundJobService::new(Arc::new(
+            crate::catalog::SystemClock,
+        ));
+        let result = call_background(
+            Arc::new(FakeOps::new()),
+            jobs,
+            json!({
+                "description": "fg task",
+                "prompt": "run",
+                "subagent_type": "research"
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(result
+            .output
+            .contains("<task id=\"ses_child\" state=\"completed\">"));
+        assert!(result.output.contains("did the thing"));
+        assert_eq!(result.metadata["background"], serde_json::Value::Null);
     }
 
     #[test]
@@ -536,7 +957,7 @@ mod tests {
     fn deny_rules_derivation() {
         // No explicit permits → both denies appended.
         assert_eq!(
-            derive_subagent_session_permission(&[], &[]),
+            derive_subagent_session_permission(&[], &[], &[]),
             vec![
                 Rule {
                     permission: "todowrite".to_string(),
@@ -558,7 +979,8 @@ mod tests {
                     permission: "task".to_string(),
                     pattern: "*".to_string(),
                     action: "allow",
-                }]
+                }],
+                &[]
             )
             .len()
                 == 1

@@ -1530,6 +1530,14 @@ mod tests {
         fn cancel<'a>(&'a self, _session_id: &'a str) -> BoxFuture<'a, ()> {
             Box::pin(async {})
         }
+        fn inject_background_result<'a>(
+            &'a self,
+            _parent_session_id: &'a str,
+            _variant: Option<&'a str>,
+            _text: &'a str,
+        ) -> BoxFuture<'a, ()> {
+            Box::pin(async {})
+        }
     }
 
     // ------------------------------------------------------------------
