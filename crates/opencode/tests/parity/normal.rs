@@ -14,18 +14,29 @@
 //! - N4 paths: the side's project tempdir → `<root>`.
 //! - N5 volatile scalars: `durationMs`/`*Duration`/`elapsed` → `<dur>`;
 //!   heartbeat frames dropped from event arrays.
+//! - N7 LLM request bodies: the mock-recorded provider requests keep
+//!   only the conversation history (user/assistant/tool messages) — the
+//!   per-implementation system prompt (M5.2 env/skills blocks unlanded on
+//!   Rust), the tool surface (TS `activeTools` vs the Rust registry), and
+//!   the `tool_choice` presence (TS runtime defaults to `"auto"`) are
+//!   protocol-layer knobs, not the opencode wire contract.
+//! - N8 per-run git SHAs: `snapshot`/`hash`/`projectID` keys holding
+//!   40-hex strings (commit/blob ids, path hashes) → `<sha:N>`.
 //!
 //! Explicitly NOT normalized: field names, null-vs-absent keys, union
 //! `type` tags, enum values, token/cost fields, tool-part shapes.
 
 use regex::Regex;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 struct Rules {
     id: Regex,
     ulid: Regex,
     iso8601: Regex,
     host: Regex,
+    /// Unanchored N1 pass: id tokens embedded in larger text blobs
+    /// (tool outputs, task XML, export paths).
+    embedded_id: Regex,
 }
 
 fn rules() -> &'static Rules {
@@ -38,6 +49,10 @@ fn rules() -> &'static Rules {
         iso8601: Regex::new(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})?")
             .expect("iso8601 pattern"),
         host: Regex::new(r"(127\.0\.0\.1|localhost):\d+").expect("host pattern"),
+        embedded_id: Regex::new(
+            r"\b((?:ses|msg|msgpart|evt|prt|per|que|cmd|ws|prj)_[A-Za-z0-9]+|[0-9A-HJKMNP-TV-Z]{26})\b",
+        )
+        .expect("embedded id pattern"),
     })
 }
 
@@ -45,6 +60,7 @@ pub struct Normalizer {
     ids: std::collections::HashMap<String, String>,
     counters: std::collections::HashMap<String, usize>,
     timestamps: usize,
+    shas: usize,
 }
 
 impl Normalizer {
@@ -53,6 +69,7 @@ impl Normalizer {
             ids: std::collections::HashMap::new(),
             counters: std::collections::HashMap::new(),
             timestamps: 0,
+            shas: 0,
         }
     }
 
@@ -87,6 +104,12 @@ impl Normalizer {
                         } else if key == "slug" {
                             // N5: the session slug is random per session.
                             Value::String("<slug>".to_string())
+                        } else if item.as_str().is_some_and(|text| {
+                            (key == "snapshot" || key == "hash" || key == "projectID")
+                                && is_sha(text)
+                        }) {
+                            // N8: per-run git SHAs and project-path hashes.
+                            self.sha_marker()
                         } else {
                             self.value(item, root, in_time)
                         };
@@ -113,6 +136,30 @@ impl Normalizer {
             last = m.end();
         }
         out.push_str(&replaced[last..]);
+        self.embedded_ids(&out)
+    }
+
+    /// N1 continuation: ids embedded in larger text blobs (tool output
+    /// XML, task wrappers). Map through the same per-id marker table so
+    /// embedded and standalone occurrences stay cross-referenced.
+    fn embedded_ids(&mut self, text: &str) -> String {
+        let matches: Vec<(usize, usize)> = rules()
+            .embedded_id
+            .find_iter(text)
+            .map(|m| (m.start(), m.end()))
+            .collect();
+        if matches.is_empty() {
+            return text.to_string();
+        }
+        let mut out = String::with_capacity(text.len());
+        let mut last = 0;
+        for (start, end) in matches {
+            out.push_str(&text[last..start]);
+            let token = &text[start..end];
+            out.push_str(&self.id_marker(token).unwrap_or_else(|| token.to_string()));
+            last = end;
+        }
+        out.push_str(&text[last..]);
         out
     }
 
@@ -139,6 +186,13 @@ impl Normalizer {
         Value::String(self.next_timestamp_marker())
     }
 
+    /// N8: one per-run git SHA marker, counted in first-occurrence order.
+    fn sha_marker(&mut self) -> Value {
+        let marker = format!("<sha:{}>", self.shas);
+        self.shas += 1;
+        Value::String(marker)
+    }
+
     fn next_timestamp_marker(&mut self) -> String {
         let marker = format!("<ts:{}>", self.timestamps);
         self.timestamps += 1;
@@ -154,6 +208,15 @@ fn is_timestamp_key(key: &str) -> bool {
 /// Keys whose values are volatile durations (N5).
 fn is_duration_key(key: &str) -> bool {
     key == "durationMs" || key == "elapsed" || key.ends_with("Duration")
+}
+
+/// A 40-char lowercase hex string (N8): a git commit/blob id or a
+/// project-path hash.
+fn is_sha(text: &str) -> bool {
+    text.len() == 40
+        && text
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// TS instance-lifecycle events published at instance boot (45×
@@ -214,10 +277,73 @@ pub fn event_types(events: &[Value]) -> Vec<String> {
         .collect()
 }
 
+/// Drop TS-side-impossible user-message summary attaches (N8): TS's
+/// `sessions.updateMessage` dies on user messages that carry a `format`
+/// (Effect Schema.Class encode validation — the same failure that 400s
+/// `GET /message` for format sessions), and the `Effect.ignore` wrapper
+/// swallows it. Rust attaches the summary, TS silently never does.
+fn drop_format_summary_updates(events: &[Value]) -> Vec<Value> {
+    events
+        .iter()
+        .filter(|event| {
+            let info = &event["properties"]["info"];
+            !(event["type"] == "message.updated"
+                && info["role"] == "user"
+                && info["format"] != Value::Null
+                && info["summary"] != Value::Null)
+        })
+        .cloned()
+        .collect()
+}
+
 /// Normalize each event of a captured stream, dropping heartbeats.
 pub fn normalize_events(normalizer: &mut Normalizer, root: &str, events: &[Value]) -> Vec<Value> {
-    drop_heartbeats(events)
+    drop_format_summary_updates(&drop_heartbeats(events))
         .into_iter()
         .map(|event| normalizer.normalize(root, &event))
         .collect()
+}
+
+/// N7: the recorded mock-LLM request bodies, reduced to the conversation
+/// history both sides feed back (tool results included). The system
+/// prompt, tool surface, and `tool_choice` are per-implementation
+/// protocol knobs (see the module doc) — they are recorded raw in the
+/// report but not diffed.
+pub fn normalize_requests(normalizer: &mut Normalizer, root: &str, requests: &[Value]) -> Value {
+    let conversation = requests
+        .iter()
+        .map(|request| {
+            let messages = request["messages"]
+                .as_array()
+                .map(|messages| {
+                    messages
+                        .iter()
+                        .filter(|message| {
+                            message["role"] != Value::Null
+                                && message["role"] != json!("system")
+                                && !message["content"]
+                                    .as_str()
+                                    .is_some_and(|text| text.starts_with("<system-update>\n"))
+                        })
+                        .map(|message| {
+                            // The TS runtime emits `""` where the Rust
+                            // protocol emits `null` for a tool-call-only
+                            // assistant message (the frozen cassettes
+                            // encode `null`) — project to the TS shape.
+                            if message["role"] == json!("assistant") && message["content"].is_null()
+                            {
+                                let mut projected = message.clone();
+                                projected["content"] = json!("");
+                                normalizer.normalize(root, &projected)
+                            } else {
+                                normalizer.normalize(root, message)
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            json!({ "messages": messages })
+        })
+        .collect::<Vec<_>>();
+    Value::Array(conversation)
 }

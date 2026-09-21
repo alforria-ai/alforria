@@ -580,6 +580,21 @@ pub fn resolve_prompt_parts(
 // createUserMessage (prompt.ts:635-1050)
 // ---------------------------------------------------------------------------
 
+/// Apply the TS `withDecodingDefault(2)` on the wire `format`: the stored
+/// user message always carries the defaulted `retryCount` (spec STOP S2).
+fn apply_format_default(format: &OutputFormat) -> OutputFormat {
+    match format {
+        OutputFormat::JsonSchema {
+            schema,
+            retry_count,
+        } => OutputFormat::JsonSchema {
+            schema: schema.clone(),
+            retry_count: Some(retry_count.unwrap_or(2)),
+        },
+        OutputFormat::Text {} => OutputFormat::Text {},
+    }
+}
+
 /// The resolved `model` for the message: `input.model ?? ag.model ?? currentModel()`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResolvedModel {
@@ -717,7 +732,7 @@ pub async fn create_user_message(
         time: UserTime {
             created: deps.now_ms as f64,
         },
-        format: input.format.clone(),
+        format: input.format.as_ref().map(apply_format_default),
         summary: None,
         agent: ag.name.clone(),
         model: V1UserModel {

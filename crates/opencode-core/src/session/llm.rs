@@ -388,12 +388,13 @@ pub fn prepare(input: &PrepareInput<'_>) -> Prepared {
         headers.insert(name.clone(), value.clone());
     }
 
-    // messages (request.ts:101-112): system blocks become leading system
-    // messages.
+    // messages (request.ts:101-112): the system blocks travel as the
+    // protocol-level system parameter (`request.system`, set by
+    // `build_request`), not as leading system messages — the protocol
+    // layer lowers `MessageRole::System` chronologically (the
+    // `<system-update>` wrapper), so pushing the system blocks here
+    // would send the system prompt twice.
     let mut messages = Vec::new();
-    for block in &system {
-        messages.push(Message::system(block.clone()));
-    }
     messages.extend(input.messages.iter().cloned());
 
     // tools (request.ts:132-165): resolved, then sorted by name.
@@ -502,9 +503,12 @@ fn build_request(sender: &dyn LlmRequestSender, input: &StreamInput) -> LlmReque
         })
         .collect();
     request.messages = prepared.messages;
+    // `activeTools` (llm.ts:317): the `invalid` router tool is defined but
+    // never model-visible.
     request.tools = prepared
         .tools
         .iter()
+        .filter(|tool| tool.name != "invalid")
         .map(|tool| ToolDefinition {
             name: tool.name.clone(),
             description: tool.description.clone(),

@@ -824,10 +824,12 @@ impl Handle {
                     if let Err(error) = self.handle_event(event).await {
                         return RunOutcome::Failed(error);
                     }
-                    // `Stream.takeUntil(() => ctx.needsCompaction)`.
-                    if self.lock_ctx().needs_compaction {
-                        return RunOutcome::Done;
-                    }
+                    // `Stream.takeUntil(() => ctx.needsCompaction)` — the
+                    // TS chunked stream pipeline keeps pulling its tail
+                    // past the takeUntil boundary, so the in-flight tool
+                    // settlements still flow (the overflow tool part
+                    // completes on TS). Drain to the natural end instead
+                    // of dropping the settlement events mid-flight.
                 }
                 Some(Err(error)) => return RunOutcome::Failed(source_error(&error)),
             }
