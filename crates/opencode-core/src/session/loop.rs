@@ -1132,8 +1132,10 @@ pub fn title_from_text(text: &str) -> Option<String> {
         .split('\n')
         .map(str::trim)
         .find(|line| !line.is_empty())?;
-    let title = if cleaned.chars().count() > 100 {
-        let prefix: String = cleaned.chars().take(97).collect();
+    // JS `.length` / `substring` operate on UTF-16 code units.
+    let title = if cleaned.encode_utf16().count() > 100 {
+        let prefix = crate::tool::ripgrep::truncate_utf16(cleaned, 97)
+            .unwrap_or_else(|| cleaned.to_string());
         format!("{prefix}...")
     } else {
         cleaned.to_string()

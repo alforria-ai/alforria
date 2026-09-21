@@ -23,9 +23,12 @@ use crate::tool::truncate::Truncate;
 /// `Question.RejectedError.message` (question/index.ts:27-31).
 pub const REJECTED_MESSAGE: &str = "The user dismissed this question";
 
-/// The `ToolError` a rejected question surfaces as.
+/// The `ToolError` a rejected question surfaces as. TS dies the tool with
+/// the `Question.RejectedError` instance so the processor's `instanceof`
+/// check blocks the loop (processor.ts:200-201) — the `Rejected` variant
+/// carries exactly that.
 pub fn rejected() -> ToolError {
-    ToolError::Failed(REJECTED_MESSAGE.to_string())
+    ToolError::Rejected(REJECTED_MESSAGE.to_string())
 }
 
 /// `QuestionV1.Answer` — an array of selected labels.

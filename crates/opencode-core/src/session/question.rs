@@ -511,8 +511,8 @@ mod tests {
         recv(&mut asked, "question.asked").await;
         let request = service.list().into_iter().next().unwrap();
         service.reject(&request.id).unwrap();
-        let ToolError::Failed(message) = handle.await.unwrap().unwrap_err() else {
-            panic!("expected a failed tool error");
+        let ToolError::Rejected(message) = handle.await.unwrap().unwrap_err() else {
+            panic!("expected a rejected tool error");
         };
         assert_eq!(message, "The user dismissed this question");
     }

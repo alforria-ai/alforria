@@ -642,6 +642,9 @@ enum Dispatch {
         stream: LlmEventStream,
         tx: tokio::sync::mpsc::UnboundedSender<Result<LlmEvent, LlmError>>,
         rx: tokio::sync::mpsc::UnboundedReceiver<Result<LlmEvent, LlmError>>,
+        /// Forked settlement tasks (the FiberSet) — aborted on a stream
+        /// error like the TS scope interrupt.
+        tasks: Vec<tokio::task::AbortHandle>,
     },
     /// The provider stream ended; drain the settlements queue until every
     /// forked dispatch has completed (and dropped its sender).
@@ -660,13 +663,23 @@ enum Dispatch {
 /// (native-runtime.ts:103-140, tool-runtime.ts).
 fn dispatch_tool_calls(stream: LlmEventStream, tools: Vec<LlmTool>) -> LlmEventStream {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let state = Dispatch::Streaming { stream, tx, rx };
+    let state = Dispatch::Streaming {
+        stream,
+        tx,
+        rx,
+        tasks: Vec::new(),
+    };
     let tools = std::sync::Arc::new(tools);
     futures::stream::unfold(state, move |state| {
         let tools = tools.clone();
         async move {
             match state {
-                Dispatch::Streaming { mut stream, tx, rx } => match stream.next().await {
+                Dispatch::Streaming {
+                    mut stream,
+                    tx,
+                    rx,
+                    mut tasks,
+                } => match stream.next().await {
                     Some(Ok(event)) => {
                         if let LlmEvent::ToolCall {
                             id,
@@ -685,7 +698,7 @@ fn dispatch_tool_calls(stream: LlmEventStream, tools: Vec<LlmTool>) -> LlmEventS
                                 // Fork the dispatch (FiberSet.run): the tool
                                 // executes concurrently with the stream and
                                 // its settlement events join the queue.
-                                tokio::spawn(async move {
+                                let handle = tokio::spawn(async move {
                                     let events = dispatch_one(&tools, &id, &name, input).await;
                                     for event in events {
                                         if tx.send(Ok(event)).is_err() {
@@ -693,13 +706,30 @@ fn dispatch_tool_calls(stream: LlmEventStream, tools: Vec<LlmTool>) -> LlmEventS
                                         }
                                     }
                                 });
+                                tasks.push(handle.abort_handle());
                             }
                         }
-                        Some((Ok(event), Dispatch::Streaming { stream, tx, rx }))
+                        Some((
+                            Ok(event),
+                            Dispatch::Streaming {
+                                stream,
+                                tx,
+                                rx,
+                                tasks,
+                            },
+                        ))
                     }
                     // The provider stream errored: surface it and end (the
                     // TS scope interrupts the settlement fibers).
-                    Some(Err(error)) => Some((Err(error), Dispatch::Done)),
+                    Some(Err(error)) => {
+                        // The TS scope interrupt kills the settlement
+                        // fibers so they stop re-publishing part updates
+                        // after cleanup has marked them interrupted.
+                        for task in &tasks {
+                            task.abort();
+                        }
+                        Some((Err(error), Dispatch::Done))
+                    }
                     // Provider stream complete — drop our sender so the
                     // queue ends once every settlement has finished, then
                     // drain it (Stream.concat(fromQueue(results))).

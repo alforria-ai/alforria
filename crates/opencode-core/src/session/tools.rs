@@ -203,9 +203,20 @@ pub async fn resolve(
                         }),
                     };
                     // TS: aborted mid-execution — the processor will not
-                    // see the tool-result event, complete it here
-                    // (tools.ts:125-127).
+                    // see the tool-result event, complete it here with the
+                    // full output, attachments included (tools.ts:121-127).
                     if cancel.is_cancelled() {
+                        let attachments = output.attachments.clone().map(|parts| {
+                            parts
+                                .iter()
+                                .filter_map(|part| {
+                                    serde_json::from_value::<
+                                        opencode_schema::session_v1::V1FilePart,
+                                    >(part.clone())
+                                    .ok()
+                                })
+                                .collect()
+                        });
                         let _ = processor
                             .complete_tool_call(
                                 &call_id,
@@ -213,7 +224,7 @@ pub async fn resolve(
                                     title: output.title.clone(),
                                     metadata: output.metadata.clone(),
                                     output: output.output.clone(),
-                                    attachments: None,
+                                    attachments,
                                 },
                             )
                             .await;

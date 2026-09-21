@@ -1889,14 +1889,16 @@ impl Handle {
             inner.deps.sessions.update_part(&finish_time(part, end))?;
         }
 
-        // 4. Await tool settlement (250ms each).
+        // 4. Await tool settlement — `{concurrency: "unbounded"}` in TS,
+        // so the 250ms budget covers all calls, not each one.
         let calls: Vec<ToolCall> = {
             let ctx = self.lock_ctx();
             ctx.toolcalls.values().cloned().collect()
         };
-        for call in calls {
+        futures::future::join_all(calls.into_iter().map(|call| async move {
             let _ = tokio::time::timeout(Duration::from_millis(250), call.done.get()).await;
-        }
+        }))
+        .await;
 
         // 5. Mark interrupted tool calls.
         let remaining: Vec<(String, ToolCall)> = {
