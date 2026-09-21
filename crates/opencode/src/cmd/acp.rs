@@ -1,19 +1,18 @@
 //! `acp` — start the ACP (Agent Client Protocol) server
-//! (`cli/cmd/acp.ts:7-73`).
+//! (`cli/cmd/acp.ts:7-73`): boot the HTTP server, then bridge ACP
+//! JSON-RPC over stdio to it.
 
 use std::ffi::OsString;
+use std::sync::Arc;
 
 use clap::ArgMatches;
 
-use crate::error::{CliError, TypedError};
+use crate::error::TypedError;
 use crate::network::{self, NetworkOptions};
 use crate::ui::Ui;
 
-/// The TS ACP agent (`@/acp/agent`, ~3.7k LOC over the
-/// `@agentclientprotocol/sdk` wire protocol) has not been ported; the
-/// command boots the server (matching the TS handler up to the
-/// `AgentSideConnection`) and then reports the gap instead of
-/// approximating the protocol.
+/// The TS handler: resolve network options, listen, wire the ACP agent
+/// over stdin/stdout, run until stdin ends.
 pub fn run(matches: &ArgMatches, _ui: &mut Ui, raw: &[OsString]) -> Result<(), TypedError> {
     let cwd = matches
         .get_one::<String>("cwd")
@@ -28,15 +27,21 @@ pub fn run(matches: &ArgMatches, _ui: &mut Ui, raw: &[OsString]) -> Result<(), T
     let options = NetworkOptions::from_matches(matches);
     let resolved = network::resolve(&options, raw, &network::global_server_config());
     let runtime = super::runtime()?;
-    let _listener = runtime
-        .block_on(opencode_server::listen(&resolved.listen_options()))
-        .map_err(|err| TypedError::Unknown {
-            raw: err.to_string(),
-        })?;
-    let _ = cwd;
+    runtime.block_on(async move {
+        let listener = opencode_server::listen(&resolved.listen_options())
+            .await
+            .map_err(|err| TypedError::Unknown {
+                raw: err.to_string(),
+            })?;
 
-    Err(TypedError::Cli(CliError {
-        message: "ACP agent is not yet ported (acp/agent, ~3.7k LOC) — see docs/plans".to_string(),
-        exit_code: 1,
-    }))
+        let connection = Arc::new(crate::acp::jsonrpc::Connection::new(Arc::new(
+            crate::acp::jsonrpc::StdioTransport::new(),
+        )));
+        let server = crate::acp::server::ServerClient::new(listener.port);
+        let _ = cwd;
+        let agent = crate::acp::AcpAgent::new(server, connection);
+        agent.run().await;
+        Ok::<(), TypedError>(())
+    })?;
+    Ok(())
 }
