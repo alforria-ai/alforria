@@ -18,6 +18,10 @@ use crate::acp::tool;
 /// One parsed SSE frame payload (`{type, properties}`).
 pub type EventPayload = Value;
 
+/// Waiters parked on `connectionChanged`-style idle notifications, keyed by
+/// an opaque wait token.
+type IdleWaiterMap = HashMap<String, Vec<tokio::sync::oneshot::Sender<Result<(), String>>>>;
+
 /// The `Subscription` (event.ts:39-400): state shared by the pump and
 /// the request handlers.
 pub struct Subscription {
@@ -26,7 +30,7 @@ pub struct Subscription {
     sessions: SessionStore,
     abort: Arc<AtomicBool>,
     connected: Arc<AtomicBool>,
-    idle_waiters: Mutex<HashMap<String, Vec<tokio::sync::oneshot::Sender<Result<(), String>>>>>,
+    idle_waiters: Mutex<IdleWaiterMap>,
     connection_waiters: Mutex<Vec<tokio::sync::oneshot::Sender<()>>>,
     shell_snapshots: Mutex<HashMap<String, String>>,
     tool_starts: Mutex<std::collections::HashSet<String>>,

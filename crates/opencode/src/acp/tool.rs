@@ -274,9 +274,7 @@ fn url_regex_captures(url: &str) -> Option<UrlCaptures> {
                 data: Some(data.to_string()),
             });
         }
-        let Some(offset) = after[1..].find(';') else {
-            return None;
-        };
+        let offset = after[1..].find(';')?;
         after = &after[offset + 1..];
     }
 }

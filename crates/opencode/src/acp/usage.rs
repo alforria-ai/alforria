@@ -142,7 +142,7 @@ pub async fn send_update(
                 context_limit_cache()
                     .lock()
                     .unwrap()
-                    .insert(cache_key, size.clone());
+                    .insert(cache_key, size);
                 size
             }
         }

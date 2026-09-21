@@ -436,7 +436,6 @@ fn normalize_agents(
         let Some(parsed) = decode_agent(value, &path, diagnostics) else {
             continue;
         };
-        let parsed = parsed;
         if parsed
             .get("request")
             .and_then(|request| request.get("headers"))
