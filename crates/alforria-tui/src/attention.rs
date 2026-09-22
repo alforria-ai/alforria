@@ -89,11 +89,24 @@ pub fn notify(
 
 // ------------------------------------------------- the notifications plugin
 
-/// The `sessionErrorMessage` map (`notifications.ts:28-36`).
+/// The `sessionErrorMessage` map (`notifications.ts:23-26`).
 fn session_error_message(error: &alforria_schema::session_v1::AssistantError) -> &'static str {
     use alforria_schema::session_v1::AssistantError;
+    if let AssistantError::Aborted { .. } = error {
+        return "Session aborted";
+    }
+    const SSE_READ_TIMED_OUT: &str = "SSE read timed out";
     match error {
-        AssistantError::Aborted { .. } => "Session aborted",
+        AssistantError::Auth { message, .. }
+        | AssistantError::Unknown { message, .. }
+        | AssistantError::StructuredOutput { message, .. }
+        | AssistantError::ContextOverflow { message, .. }
+        | AssistantError::ContentFilter { message }
+        | AssistantError::Api { message, .. }
+            if message == SSE_READ_TIMED_OUT =>
+        {
+            "Model stopped responding"
+        }
         _ => "Session error",
     }
 }
@@ -429,6 +442,28 @@ mod tests {
             attention_effects(&mut app, idle).is_empty(),
             "errored sessions do not fire Session done"
         );
+    }
+
+    #[test]
+    fn sse_read_timeout_maps_to_model_stopped_responding() {
+        let mut app = app();
+        let busy = Event::SessionStatus(SessionStatusData {
+            session_id: "ses_1".into(),
+            status: alforria_schema::session_status::SessionStatusInfo::Busy,
+        });
+        attention_effects(&mut app, busy);
+        let error = Event::SessionError(SessionErrorData {
+            session_id: Some("ses_1".into()),
+            error: AssistantError::Unknown {
+                message: "SSE read timed out".into(),
+                r#ref: None,
+            },
+        });
+        let effects = attention_effects(&mut app, error);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Attention { message, .. }] if message == "Model stopped responding"
+        ));
     }
 
     #[test]
