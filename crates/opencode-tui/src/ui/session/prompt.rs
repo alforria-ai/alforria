@@ -141,7 +141,12 @@ pub fn render(app: &App, frame: &mut ratatui::Frame, theme: &Theme, area: Rect) 
     }
 }
 
-fn render_autocomplete(app: &App, frame: &mut ratatui::Frame, theme: &Theme, area: Rect) {
+pub(crate) fn render_autocomplete(
+    app: &App,
+    frame: &mut ratatui::Frame,
+    theme: &Theme,
+    area: Rect,
+) {
     let autocomplete = &app.ui.prompt.autocomplete;
     let count = autocomplete
         .options

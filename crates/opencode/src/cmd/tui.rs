@@ -30,13 +30,16 @@ fn default_tui_runner(
     headers: Vec<(String, String)>,
     args: opencode_tui::state::Args,
 ) -> Result<(), TypedError> {
+    // `paths.state` (`global.ts:14`): TUI state (pinned sessions, recent
+    // models, favorites, prompt history) persists under the XDG state dir.
+    let state_dir = opencode_core::paths::GlobalPaths::from_env().state;
     let _exit = opencode_tui::run(opencode_tui::TuiInput {
         url: url.to_string(),
         directory,
         headers,
         args,
         config: opencode_tui::config::TuiConfig::default(),
-        state_dir: None,
+        state_dir: Some(state_dir),
     })
     .map_err(|err| TypedError::Unknown {
         raw: err.to_string(),

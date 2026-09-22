@@ -102,7 +102,15 @@ pub fn session_path(worktree: &Path, cwd: &Path) -> String {
         .unwrap_or_else(|_| worktree.to_path_buf());
     let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
     match cwd.strip_prefix(&worktree) {
-        Ok(relative) => relative.to_string_lossy().replace('\\', "/"),
+        Ok(relative) => {
+            let relative = relative.to_string_lossy().replace('\\', "/");
+            // `path.relative` yields "." for equal paths.
+            if relative.is_empty() {
+                ".".to_string()
+            } else {
+                relative
+            }
+        }
         Err(_) => cwd.to_string_lossy().replace('\\', "/"),
     }
 }
@@ -1797,7 +1805,7 @@ mod tests {
                 session_path(Path::new("/repo"), Path::new("/repo/a/b")),
                 "a/b"
             );
-            assert_eq!(session_path(Path::new("/repo"), Path::new("/repo")), "");
+            assert_eq!(session_path(Path::new("/repo"), Path::new("/repo")), ".");
         }
     }
 }

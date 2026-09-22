@@ -169,6 +169,7 @@ fn render_prompt(app: &App, frame: &mut ratatui::Frame, theme: &Theme, area: Rec
             lines.push(Line::from(spans));
         }
     }
+    let prompt_area = center_horizontally(area, max_width);
     Paragraph::new(lines)
         .block(
             Block::new()
@@ -182,7 +183,10 @@ fn render_prompt(app: &App, frame: &mut ratatui::Frame, theme: &Theme, area: Rec
                     bottom: 0,
                 }),
         )
-        .render(center_horizontally(area, max_width), frame.buffer_mut());
+        .render(prompt_area, frame.buffer_mut());
+    if app.ui.prompt.autocomplete.visible.is_some() {
+        crate::ui::session::prompt::render_autocomplete(app, frame, theme, prompt_area);
+    }
 }
 
 #[cfg(test)]

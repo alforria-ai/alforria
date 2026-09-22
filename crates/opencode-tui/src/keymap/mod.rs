@@ -680,6 +680,15 @@ mod tests {
     }
 
     #[test]
+    fn leader_digit_fires_quick_switch() {
+        let mut keymap = keymap();
+        let commands = keymap.dispatch(&ctx(), &ctrl('x'), 0);
+        assert!(commands.is_empty());
+        let commands = keymap.dispatch(&ctx(), &key(KeyCode::Char('1'), KeyModifiers::NONE), 50);
+        assert_eq!(commands, vec!["session.quick_switch.1"]);
+    }
+
+    #[test]
     fn leader_q_fires_app_exit_once() {
         let mut keymap = keymap();
         keymap.dispatch(&ctx(), &ctrl('x'), 0);
