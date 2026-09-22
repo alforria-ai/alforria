@@ -8,7 +8,7 @@ use super::primitives::SelectOption;
 use crate::state::App;
 use crate::ui::dialogs::DialogFrame;
 use crate::ui::theme::Theme;
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 
 /// `DialogMcp.options` (`dialog-mcp.tsx:24-46`) — sorted by name.
@@ -84,7 +84,9 @@ pub fn skill_options(app: &App) -> Vec<SelectOption> {
             let mut title = name.clone();
             let padding = max_width.saturating_sub(name.chars().count());
             title.push_str(&" ".repeat(padding));
-            let option = SelectOption::new(title).with_value(name);
+            let option = SelectOption::new(title)
+                .with_value(name)
+                .with_category("Skills");
             if description.is_empty() {
                 option
             } else {
@@ -95,7 +97,7 @@ pub fn skill_options(app: &App) -> Vec<SelectOption> {
 }
 
 /// `DialogWorkspaceList.options` (`dialog-workspace-list.tsx:34-66`).
-pub fn workspace_options(app: &App, frame: &DialogFrame) -> Vec<SelectOption> {
+pub fn workspace_options(app: &App, frame: &DialogFrame, theme: &Theme) -> Vec<SelectOption> {
     let mut workspaces = app.state.project.workspace.list.clone();
     workspaces.sort_by(|a, b| {
         a.get("name")
@@ -111,15 +113,33 @@ pub fn workspace_options(app: &App, frame: &DialogFrame) -> Vec<SelectOption> {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
+            let name = workspace
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let is_deleting = frame.pending_delete.as_deref() == Some(id.as_str());
             let expanded = frame.expanded.contains(&id);
-            let mut option = SelectOption::new(
-                workspace
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-            )
+            let connected = app
+                .state
+                .project
+                .workspace
+                .status
+                .get(&id)
+                .map(String::as_str)
+                == Some("connected");
+            let mut option = SelectOption::new(if is_deleting {
+                format!("Delete {name}? Press delete again")
+            } else {
+                name
+            })
             .with_value(id)
+            .with_gutter(Some("●".to_string()))
+            .with_gutter_fg(Some(if connected {
+                theme.success
+            } else {
+                theme.error
+            }))
             .with_footer(
                 workspace
                     .get("type")
@@ -157,6 +177,57 @@ pub fn workspace_set_options(app: &App) -> Vec<SelectOption> {
     options
 }
 
+/// `DialogStatus.plugins` (`dialog-status.tsx:17-41`) — the
+/// `config.plugin` entries parsed into (name, version) pairs.
+fn status_plugins(config: &Value) -> Vec<(String, Option<String>)> {
+    let mut result: Vec<(String, Option<String>)> = config
+        .get("plugin")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let value = match item {
+                Value::String(value) => Some(value.as_str()),
+                Value::Array(array) => array.first().and_then(Value::as_str),
+                _ => None,
+            }?;
+            Some(plugin_entry(value))
+        })
+        .collect();
+    result.sort_by(|a, b| a.0.cmp(&b.0));
+    result
+}
+
+/// One `config.plugin` entry — `file://` paths derive the name from
+/// the filename (`dialog-status.tsx:21-38`), package ids split at the
+/// last `@`.
+fn plugin_entry(value: &str) -> (String, Option<String>) {
+    if let Some(path) = value.strip_prefix("file://") {
+        let mut parts: Vec<&str> = path.split('/').collect();
+        let filename = parts.pop().filter(|part| !part.is_empty()).unwrap_or(path);
+        if !filename.contains('.') {
+            return (filename.to_string(), None);
+        }
+        let basename = filename.split('.').next().unwrap_or_default();
+        if basename == "index" {
+            let name = parts
+                .pop()
+                .filter(|part| !part.is_empty())
+                .unwrap_or(basename);
+            return (name.to_string(), None);
+        }
+        return (basename.to_string(), None);
+    }
+    match value.rfind('@') {
+        Some(index) if index > 0 => {
+            let name = value[..index].to_string();
+            let version = value[index + 1..].to_string();
+            (name, Some(version))
+        }
+        _ => (value.to_string(), Some("latest".to_string())),
+    }
+}
+
 /// `DialogStatus` (`dialog-status.tsx`) — MCP/LSP/formatter/plugin list.
 pub fn status_lines(app: &App, theme: &Theme, width: u16) -> Vec<ratatui::text::Line<'static>> {
     let mut lines = vec![super::primitives::header_line(
@@ -164,6 +235,9 @@ pub fn status_lines(app: &App, theme: &Theme, width: u16) -> Vec<ratatui::text::
     )];
     let text = Style::new().fg(theme.text.to_color());
     let muted = Style::new().fg(theme.text_muted.to_color());
+    let bold_text = Style::new()
+        .fg(theme.text.to_color())
+        .add_modifier(Modifier::BOLD);
     if app.state.sync.mcp.is_empty() {
         lines.push(Line::styled("  No MCP Servers".to_string(), text));
     } else {
@@ -172,13 +246,32 @@ pub fn status_lines(app: &App, theme: &Theme, width: u16) -> Vec<ratatui::text::
             text,
         ));
         for (name, status) in app.state.sync.mcp.iter() {
-            lines.push(Line::from(ratatui::text::Span::styled(
-                format!(
-                    "  • {name} {}",
-                    status.get("status").and_then(Value::as_str).unwrap_or("")
-                ),
-                muted,
-            )));
+            let status_value = status.get("status").and_then(Value::as_str);
+            let error = status.get("error").and_then(Value::as_str);
+            // The bullet colour map (`dialog-status.tsx:64-69`).
+            let bullet = match status_value {
+                Some("connected") => theme.success,
+                Some("failed") => theme.error,
+                Some("disabled") => theme.text_muted,
+                Some("needs_auth") => theme.warning,
+                Some("needs_client_registration") => theme.error,
+                _ => theme.text,
+            };
+            let prose = match status_value {
+                Some("connected") => "Connected".to_string(),
+                Some("failed") => error.unwrap_or_default().to_string(),
+                Some("disabled") => "Disabled in configuration".to_string(),
+                Some("needs_auth") => {
+                    format!("Needs authentication (run: opencode mcp auth {name})")
+                }
+                Some("needs_client_registration") => error.unwrap_or_default().to_string(),
+                other => other.unwrap_or_default().to_string(),
+            };
+            lines.push(Line::from(vec![
+                ratatui::text::Span::styled("  • ".to_string(), Style::new().fg(bullet.to_color())),
+                ratatui::text::Span::styled(name.clone(), bold_text),
+                ratatui::text::Span::styled(format!(" {prose}"), muted),
+            ]));
         }
     }
     if !app.state.sync.lsp.is_empty() {
@@ -187,14 +280,28 @@ pub fn status_lines(app: &App, theme: &Theme, width: u16) -> Vec<ratatui::text::
             text,
         ));
         for item in &app.state.sync.lsp {
-            lines.push(Line::from(ratatui::text::Span::styled(
-                format!(
-                    "  • {} {}",
-                    item.get("id").and_then(Value::as_str).unwrap_or(""),
-                    item.get("root").and_then(Value::as_str).unwrap_or(""),
+            let bullet = match item.get("status").and_then(Value::as_str) {
+                Some("connected") => theme.success,
+                Some("error") => theme.error,
+                _ => theme.text,
+            };
+            lines.push(Line::from(vec![
+                ratatui::text::Span::styled("  • ".to_string(), Style::new().fg(bullet.to_color())),
+                ratatui::text::Span::styled(
+                    item.get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    bold_text,
                 ),
-                muted,
-            )));
+                ratatui::text::Span::styled(
+                    format!(
+                        " {}",
+                        item.get("root").and_then(Value::as_str).unwrap_or("")
+                    ),
+                    muted,
+                ),
+            ]));
         }
     }
     let formatters: Vec<&Value> = app
@@ -212,13 +319,39 @@ pub fn status_lines(app: &App, theme: &Theme, width: u16) -> Vec<ratatui::text::
             text,
         ));
         for formatter in formatters {
-            lines.push(Line::from(ratatui::text::Span::styled(
-                format!(
-                    "  • {}",
-                    formatter.get("name").and_then(Value::as_str).unwrap_or(""),
+            lines.push(Line::from(vec![
+                ratatui::text::Span::styled(
+                    "  • ".to_string(),
+                    Style::new().fg(theme.success.to_color()),
                 ),
-                muted,
-            )));
+                ratatui::text::Span::styled(
+                    formatter
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    bold_text,
+                ),
+            ]));
+        }
+    }
+    let plugins = status_plugins(&app.state.sync.config);
+    if plugins.is_empty() {
+        lines.push(Line::styled("  No Plugins".to_string(), text));
+    } else {
+        lines.push(Line::styled(format!("  {} Plugins", plugins.len()), text));
+        for (name, version) in plugins {
+            let mut spans = vec![
+                ratatui::text::Span::styled(
+                    "  • ".to_string(),
+                    Style::new().fg(theme.success.to_color()),
+                ),
+                ratatui::text::Span::styled(name, bold_text),
+            ];
+            if let Some(version) = version {
+                spans.push(ratatui::text::Span::styled(format!(" @{version}"), muted));
+            }
+            lines.push(Line::from(spans));
         }
     }
     lines

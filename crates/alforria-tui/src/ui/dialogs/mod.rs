@@ -70,6 +70,9 @@ pub struct DialogFrame {
     pub active: usize,
     /// The `toDelete()` double-press of the session-list/stash delete.
     pub pending_delete: Option<String>,
+    /// The focused footer action — `focusedAction` of `DialogSelect`
+    /// (`dialog-select.tsx:95-96,358-367`).
+    pub focused_action: Option<usize>,
     /// `DialogThemeList.initial` — the theme to revert to when the
     /// dialog closes unconfirmed (`dialog-theme-list.tsx:16-36`).
     pub initial_theme: Option<String>,
@@ -92,6 +95,7 @@ impl DialogFrame {
             // `DialogRetryAction` on `action`.
             active: 1,
             pending_delete: None,
+            focused_action: None,
             initial_theme: None,
             confirmed: false,
             checks: Vec::new(),
@@ -240,7 +244,13 @@ pub fn options(app: &App, frame: &DialogFrame) -> Vec<primitives::SelectOption> 
         PendingDialog::Model => model::model_options(app),
         PendingDialog::Agent => model::agent_options(app),
         PendingDialog::Variant => model::variant_options(app),
-        PendingDialog::ProviderConnect => model::provider_options(app),
+        PendingDialog::ProviderConnect => model::provider_options(
+            app,
+            &app.ui
+                .theme
+                .resolve(&app.state.kv)
+                .expect("builtin theme resolves"),
+        ),
         PendingDialog::ProviderAuthMethod { provider_id } => {
             model::auth_method_options(app, provider_id)
         }
@@ -253,7 +263,14 @@ pub fn options(app: &App, frame: &DialogFrame) -> Vec<primitives::SelectOption> 
         PendingDialog::ForkFromTimeline => sessions::fork_options(app),
         PendingDialog::Message { .. } => sessions::message_options(),
         PendingDialog::MoveSession => sessions::move_options(app, frame),
-        PendingDialog::WorkspaceList => system::workspace_options(app, frame),
+        PendingDialog::WorkspaceList => system::workspace_options(
+            app,
+            frame,
+            &app.ui
+                .theme
+                .resolve(&app.state.kv)
+                .expect("builtin theme resolves"),
+        ),
         PendingDialog::WorkspaceSet => system::workspace_set_options(app),
         PendingDialog::Subagent { .. } => sessions::subagent_options(),
         PendingDialog::ProviderCustomId => Vec::new(),
@@ -304,6 +321,9 @@ fn actions(app: &App, frame: &DialogFrame) -> Vec<(String, String)> {
             ("delete".to_string(), hint("dialog.move_session.delete")),
             ("refresh".to_string(), hint("dialog.move_session.refresh")),
         ],
+        PendingDialog::WorkspaceList => {
+            vec![("delete".to_string(), hint("session_delete"))]
+        }
         _ => Vec::new(),
     }
 }
@@ -674,6 +694,18 @@ fn select_key(app: &mut App, key: &crossterm::event::KeyEvent) -> Vec<Effect> {
         pop(app);
         return Vec::new();
     }
+    // ---- `tab`/`shift+tab` — the footer action focus
+    // (`dialog-select.tsx:461-476`)
+    if key.code == crossterm::event::KeyCode::Tab || key.code == crossterm::event::KeyCode::BackTab
+    {
+        let direction = if key.code == crossterm::event::KeyCode::Tab {
+            1
+        } else {
+            -1
+        };
+        move_action(app, &kind, direction);
+        return Vec::new();
+    }
     // ---- `dialog.select.*` (`dialog-select.tsx:450-459`)
     let movement = if app.keymap.matches("dialog.select.prev", key) {
         Some(-1i64)
@@ -690,6 +722,7 @@ fn select_key(app: &mut App, key: &crossterm::event::KeyEvent) -> Vec<Effect> {
         let len = filtered_options(app).len();
         let max_visible = max_visible(app);
         if let Some(frame) = app.ui.dialogs.top_mut() {
+            frame.focused_action = None;
             frame.select.move_by(step, len, max_visible);
             on_move(app, &kind);
         }
@@ -698,6 +731,7 @@ fn select_key(app: &mut App, key: &crossterm::event::KeyEvent) -> Vec<Effect> {
     if app.keymap.matches("dialog.select.home", key) {
         let max_visible = max_visible(app);
         if let Some(frame) = app.ui.dialogs.top_mut() {
+            frame.focused_action = None;
             frame.select.move_to(0, max_visible);
         }
         return Vec::new();
@@ -706,6 +740,7 @@ fn select_key(app: &mut App, key: &crossterm::event::KeyEvent) -> Vec<Effect> {
         let len = filtered_options(app).len();
         let max_visible = max_visible(app);
         if let Some(frame) = app.ui.dialogs.top_mut() {
+            frame.focused_action = None;
             frame.select.move_to(len.saturating_sub(1), max_visible);
         }
         return Vec::new();
@@ -718,10 +753,15 @@ fn select_key(app: &mut App, key: &crossterm::event::KeyEvent) -> Vec<Effect> {
     }
     // ---- submit (`dialog.select.submit` = return)
     if app.keymap.matches("dialog.select.submit", key) {
+        let focused = app.ui.dialogs.top().and_then(|frame| frame.focused_action);
+        if let Some(index) = focused {
+            return run_action(app, &kind, index);
+        }
         return submit(app, &kind);
     }
     // ---- the filter input
     if let Some(frame) = app.ui.dialogs.top_mut() {
+        frame.focused_action = None;
         match key.code {
             crossterm::event::KeyCode::Backspace => {
                 frame.select.filter.pop();
@@ -755,6 +795,33 @@ fn select_key(app: &mut App, key: &crossterm::event::KeyEvent) -> Vec<Effect> {
         }
     }
     Vec::new()
+}
+
+/// `moveAction` (`dialog-select.tsx:358-367`) — cycle the footer action
+/// focus; stepping past either end clears it.
+fn move_action(app: &mut App, kind: &PendingDialog, direction: i64) {
+    let total = app
+        .ui
+        .dialogs
+        .top()
+        .map(|frame| actions(app, frame).len().min(action_keybinds(kind).len()))
+        .unwrap_or(0);
+    if total == 0 {
+        return;
+    }
+    if let Some(frame) = app.ui.dialogs.top_mut() {
+        frame.focused_action = match frame.focused_action {
+            None => Some(if direction == 1 { 0 } else { total - 1 }),
+            Some(index) => {
+                let next = index as i64 + direction;
+                if next < 0 || next >= total as i64 {
+                    None
+                } else {
+                    Some(next as usize)
+                }
+            }
+        };
+    }
 }
 
 /// The currently filtered option list of the top dialog.
@@ -820,6 +887,7 @@ fn select_layout(app: &App) -> Option<Vec<(usize, usize)>> {
         filter: true,
         options: view_options,
         actions: actions(app, frame),
+        action_focused: frame.focused_action.is_some(),
     };
     // The select branch renders header + filter before the options
     // (content_lines); their text does not affect the row count.
@@ -907,6 +975,11 @@ fn filtered_options(app: &App) -> Vec<primitives::SelectOption> {
 /// delete-confirm reset (`dialog-theme-list.tsx:29-31`,
 /// `dialog-timeline.tsx:44`).
 fn on_move(app: &mut App, kind: &PendingDialog) {
+    if let Some(frame) = app.ui.dialogs.top_mut() {
+        // `moveTo` clears the footer action focus
+        // (`dialog-select.tsx:299-309`).
+        frame.focused_action = None;
+    }
     let Some(frame) = app.ui.dialogs.top() else {
         return;
     };
@@ -936,7 +1009,10 @@ fn on_move(app: &mut App, kind: &PendingDialog) {
                 }
             }
         }
-        PendingDialog::SessionList | PendingDialog::StashList => {
+        PendingDialog::SessionList
+        | PendingDialog::StashList
+        | PendingDialog::MoveSession
+        | PendingDialog::WorkspaceList => {
             // `onMove={() => setToDelete(undefined)}`
             if let Some(frame) = app.ui.dialogs.top_mut() {
                 frame.pending_delete = None;
@@ -946,51 +1022,67 @@ fn on_move(app: &mut App, kind: &PendingDialog) {
     }
 }
 
-/// The per-dialog action keybinds. Returns the effects plus whether the
-/// key was consumed.
-fn action_key(
-    app: &mut App,
-    kind: &PendingDialog,
-    key: &crossterm::event::KeyEvent,
-) -> (Vec<Effect>, bool) {
-    let selected_value = || {
-        app.ui.dialogs.top().and_then(|frame| {
-            let filter = frame.select.filter.clone();
-            let selected = frame.select.selected;
-            let view_options = options(app, frame);
-            primitives::filter_options(&filter, view_options)
-                .get(selected)
-                .and_then(|option| option.value.clone())
-        })
-    };
+/// The footer action keybinds, in `actions()` order — the `tab`-focusable
+/// subset (`dialog-select.tsx:143-147,461-476`). The trailing
+/// footer hints (the session-list quick switch) are not actions.
+fn action_keybinds(kind: &PendingDialog) -> &'static [&'static str] {
     match kind {
-        PendingDialog::Mcp if app.keymap.matches("dialog.mcp.toggle", key) => {
-            if let Some(name) = selected_value() {
-                return (vec![Effect::McpToggle { name }], true);
-            }
-        }
-        PendingDialog::Model => {
-            if app.keymap.matches("model_provider_list", key) {
+        PendingDialog::Model => &["model_provider_list", "model_favorite_toggle"],
+        PendingDialog::Mcp => &["dialog.mcp.toggle"],
+        PendingDialog::SessionList => &["session_pin_toggle", "session_delete", "session_rename"],
+        PendingDialog::StashList => &["stash_delete"],
+        PendingDialog::MoveSession => &[
+            "dialog.move_session.new",
+            "dialog.move_session.delete",
+            "dialog.move_session.refresh",
+        ],
+        PendingDialog::WorkspaceList => &["session_delete"],
+        _ => &[],
+    }
+}
+
+/// The value of the currently selected option.
+fn selected_value(app: &App) -> Option<String> {
+    app.ui.dialogs.top().and_then(|frame| {
+        let filter = frame.select.filter.clone();
+        let selected = frame.select.selected;
+        let options = options(app, frame);
+        primitives::filter_options(&filter, options)
+            .get(selected)
+            .and_then(|option| option.value.clone())
+    })
+}
+
+/// Trigger the `index`th footer action on the selected option —
+/// `triggerAction` (`dialog-select.tsx:344-356,503-510`).
+fn run_action(app: &mut App, kind: &PendingDialog, index: usize) -> Vec<Effect> {
+    let value = selected_value(app);
+    match kind {
+        PendingDialog::Model => match index {
+            0 => {
                 app.ui.dialogs.stack.pop();
-                let effects = open(app, PendingDialog::ProviderConnect);
-                return (effects, true);
+                return open(app, PendingDialog::ProviderConnect);
             }
-            if app.keymap.matches("model_favorite_toggle", key) {
-                if let Some(value) = selected_value() {
+            1 => {
+                if let Some(value) = value {
                     model::toggle_favorite(app, &value);
                 }
-                return (Vec::new(), true);
+            }
+            _ => {}
+        },
+        PendingDialog::Mcp => {
+            if let (0, Some(name)) = (index, value) {
+                return vec![Effect::McpToggle { name }];
             }
         }
-        PendingDialog::SessionList => {
-            if app.keymap.matches("session_pin_toggle", key) {
-                if let Some(value) = selected_value() {
+        PendingDialog::SessionList => match index {
+            0 => {
+                if let Some(value) = value {
                     app.state.local.session_toggle_pin(&value);
                 }
-                return (Vec::new(), true);
             }
-            if app.keymap.matches("session_delete", key) {
-                if let Some(value) = selected_value() {
+            1 => {
+                if let Some(value) = value {
                     let pending = app
                         .ui
                         .dialogs
@@ -1000,52 +1092,103 @@ fn action_key(
                         if let Some(frame) = app.ui.dialogs.top_mut() {
                             frame.pending_delete = None;
                         }
-                        return (vec![Effect::SessionDelete { session_id: value }], true);
+                        return vec![Effect::SessionDelete { session_id: value }];
                     }
                     if let Some(frame) = app.ui.dialogs.top_mut() {
                         frame.pending_delete = Some(value);
                     }
                 }
-                return (Vec::new(), true);
             }
-            if app.keymap.matches("session_rename", key) {
-                if let Some(value) = selected_value() {
+            2 => {
+                if let Some(value) = value {
                     app.ui.dialogs.stack.pop();
-                    let effects = open(app, PendingDialog::SessionRename { session_id: value });
-                    return (effects, true);
+                    return open(app, PendingDialog::SessionRename { session_id: value });
                 }
-                return (Vec::new(), true);
             }
-        }
-        PendingDialog::StashList if app.keymap.matches("stash_delete", key) => {
-            if let Some(value) = selected_value() {
+            _ => {}
+        },
+        PendingDialog::StashList => {
+            if let (0, Some(value)) = (index, value) {
                 sessions::stash_delete(app, &value);
             }
-            return (Vec::new(), true);
         }
-        PendingDialog::MoveSession if app.keymap.matches("dialog.move_session.refresh", key) => {
-            if let Some(project_id) = app.state.project.project_id.clone() {
-                return (vec![Effect::ProjectDirectories { project_id }], true);
+        PendingDialog::MoveSession => match index {
+            // TODO(M8.7): `dialog.move_session.new` needs the
+            // `projectCopy.create` endpoint — absent from the M8.1
+            // server seam (recorded gap).
+            0 => {}
+            1 => {
+                if let Some(value) = value {
+                    let pending = app
+                        .ui
+                        .dialogs
+                        .top()
+                        .and_then(|frame| frame.pending_delete.clone());
+                    if pending.as_deref() == Some(value.as_str()) {
+                        if let Some(frame) = app.ui.dialogs.top_mut() {
+                            frame.pending_delete = None;
+                        }
+                        // TODO(M8.7): the removal itself needs the
+                        // `projectCopy.remove` endpoint — absent from
+                        // the server seam (recorded gap).
+                        app.show_toast(Toast {
+                            title: None,
+                            variant: ToastVariant::Warning,
+                            message: format!("Failed to delete project copy: {value}"),
+                            duration_ms: 5000,
+                        });
+                    } else if let Some(frame) = app.ui.dialogs.top_mut() {
+                        frame.pending_delete = Some(value);
+                    }
+                }
             }
-            return (Vec::new(), true);
-        }
-        // TODO(M8.7): `dialog.move_session.new`/`delete` need the
-        // `projectCopy.create/remove` endpoints — absent from the
-        // M8.1 server seam (recorded gap).
-        PendingDialog::WorkspaceList if app.keymap.matches("session_delete", key) => {
-            if let Some(value) = selected_value() {
-                // TODO(M8.7): `experimental.workspace.remove` is
-                // absent from the server seam (recorded gap).
-                app.show_toast(Toast {
-                    title: None,
-                    variant: ToastVariant::Warning,
-                    message: format!("Failed to delete workspace: {value}"),
-                    duration_ms: 5000,
-                });
+            2 => {
+                if let Some(project_id) = app.state.project.project_id.clone() {
+                    return vec![Effect::ProjectDirectories { project_id }];
+                }
             }
-            return (Vec::new(), true);
+            _ => {}
+        },
+        PendingDialog::WorkspaceList => {
+            if let (0, Some(value)) = (index, value) {
+                let pending = app
+                    .ui
+                    .dialogs
+                    .top()
+                    .and_then(|frame| frame.pending_delete.clone());
+                if pending.as_deref() == Some(value.as_str()) {
+                    if let Some(frame) = app.ui.dialogs.top_mut() {
+                        frame.pending_delete = None;
+                    }
+                    // TODO(M8.7): `experimental.workspace.remove` is
+                    // absent from the server seam (recorded gap).
+                    app.show_toast(Toast {
+                        title: None,
+                        variant: ToastVariant::Warning,
+                        message: format!("Failed to delete workspace: {value}"),
+                        duration_ms: 5000,
+                    });
+                } else if let Some(frame) = app.ui.dialogs.top_mut() {
+                    frame.pending_delete = Some(value);
+                }
+            }
         }
         _ => {}
+    }
+    Vec::new()
+}
+
+/// The per-dialog action keybinds. Returns the effects plus whether the
+/// key was consumed.
+fn action_key(
+    app: &mut App,
+    kind: &PendingDialog,
+    key: &crossterm::event::KeyEvent,
+) -> (Vec<Effect>, bool) {
+    for (index, keybind) in action_keybinds(kind).iter().enumerate() {
+        if app.keymap.matches(keybind, key) {
+            return (run_action(app, kind, index), true);
+        }
     }
     (Vec::new(), false)
 }
@@ -1396,6 +1539,7 @@ fn content_lines(app: &App, dialog: &DialogFrame, theme: &Theme) -> Vec<Line<'st
                 "  Press ctrl+p to see all available actions and commands in any context.",
                 Style::new().fg(theme.text_muted.to_color()),
             ));
+            lines.push(ok_button(theme, width));
             lines
         }
         PendingDialog::Debug => {
@@ -1427,7 +1571,7 @@ fn content_lines(app: &App, dialog: &DialogFrame, theme: &Theme) -> Vec<Line<'st
                 &mut lines,
                 Style::new().fg(theme.text_muted.to_color()),
             );
-            lines.push(Line::styled("  ok", Style::new().fg(theme.text.to_color())));
+            lines.push(ok_button(theme, width));
             lines
         }
         PendingDialog::SessionRename { .. } | PendingDialog::ProviderCustomId => {
@@ -1457,7 +1601,15 @@ fn content_lines(app: &App, dialog: &DialogFrame, theme: &Theme) -> Vec<Line<'st
                 &mut lines,
                 Style::new().fg(theme.text_muted.to_color()),
             );
-            lines.push(buttons(theme, &["skip", "Confirm"], dialog.active));
+            lines.push(buttons(
+                theme,
+                width,
+                &["Skip", "Confirm"],
+                dialog.active,
+                1,
+                0,
+                false,
+            ));
             lines
         }
         PendingDialog::ShareConsent { .. } => {
@@ -1473,7 +1625,15 @@ fn content_lines(app: &App, dialog: &DialogFrame, theme: &Theme) -> Vec<Line<'st
                 &mut lines,
                 Style::new().fg(theme.text_muted.to_color()),
             );
-            lines.push(buttons(theme, &["Cancel", "Confirm"], dialog.active));
+            lines.push(buttons(
+                theme,
+                width,
+                &["Cancel", "Confirm"],
+                dialog.active,
+                1,
+                0,
+                false,
+            ));
             lines
         }
         PendingDialog::WorkspaceUnavailable => {
@@ -1489,25 +1649,97 @@ fn content_lines(app: &App, dialog: &DialogFrame, theme: &Theme) -> Vec<Line<'st
                 &mut lines,
                 Style::new().fg(theme.text_muted.to_color()),
             );
-            lines.push(buttons(theme, &["cancel", "restore"], dialog.active));
+            lines.push(buttons(
+                theme,
+                width,
+                &["cancel", "restore"],
+                dialog.active,
+                2,
+                1,
+                false,
+            ));
             lines
         }
-        PendingDialog::SessionDeleteFailed { workspace, .. } => {
+        PendingDialog::SessionDeleteFailed {
+            session_id,
+            workspace,
+        } => {
             let mut lines = vec![primitives::header_line(
                 theme,
                 "Failed to Delete Session",
                 "esc",
                 width,
             )];
+            let session = app
+                .state
+                .sync
+                .session(session_id)
+                .map(|session| session.title.clone())
+                .unwrap_or_default();
             primitives::wrap_text(
                 &format!(
-                    "The session could not be deleted because the workspace \"{workspace}\" is not available."
+                    "The session \"{session}\" could not be deleted because the workspace \"{workspace}\" is not available."
                 ),
                 wrap_width,
                 &mut lines,
                 Style::new().fg(theme.text_muted.to_color()),
             );
-            lines.push(buttons(theme, &["delete", "restore"], dialog.active));
+            primitives::wrap_text(
+                "Choose how you want to recover this broken workspace session.",
+                wrap_width,
+                &mut lines,
+                Style::new().fg(theme.text_muted.to_color()),
+            );
+            let options = [
+                (
+                    "Delete workspace",
+                    "Delete the workspace and all sessions attached to it.",
+                ),
+                (
+                    "Restore to new workspace",
+                    "Try to restore this session into a new workspace.",
+                ),
+            ];
+            for (index, (title, description)) in options.iter().enumerate() {
+                if index > 0 {
+                    lines.push(Line::raw(""));
+                }
+                let active = dialog.active == index;
+                let box_width = description.chars().count() + 2;
+                let bg = |style: Style| {
+                    if active {
+                        style.bg(theme.primary.to_color())
+                    } else {
+                        style
+                    }
+                };
+                let (title_fg, description_fg) = if active {
+                    (
+                        theme.selected_list_item_text.to_color(),
+                        theme.selected_list_item_text.to_color(),
+                    )
+                } else {
+                    (theme.text.to_color(), theme.text_muted.to_color())
+                };
+                lines.push(Line::styled(" ".repeat(box_width), bg(Style::new())));
+                lines.push(Line::from(vec![
+                    Span::raw(" "),
+                    Span::styled(
+                        (*title).to_string(),
+                        bg(Style::new().fg(title_fg)).add_modifier(ratatui::style::Modifier::BOLD),
+                    ),
+                    Span::raw(" "),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::raw(" "),
+                    Span::styled(
+                        (*description).to_string(),
+                        bg(Style::new().fg(description_fg)),
+                    ),
+                    Span::raw(" "),
+                ]));
+                lines.push(Line::styled(" ".repeat(box_width), bg(Style::new())));
+            }
             lines
         }
         PendingDialog::RetryAction {
@@ -1523,7 +1755,7 @@ fn content_lines(app: &App, dialog: &DialogFrame, theme: &Theme) -> Vec<Line<'st
                 &mut lines,
                 Style::new().fg(theme.text_muted.to_color()),
             );
-            lines.push(buttons(theme, &["don't show again", label], dialog.active));
+            lines.push(retry_buttons(theme, width, label, dialog.active));
             lines
         }
         PendingDialog::ExportOptions => {
@@ -1572,6 +1804,7 @@ fn content_lines(app: &App, dialog: &DialogFrame, theme: &Theme) -> Vec<Line<'st
                 filter: true,
                 options: options(app, dialog),
                 actions: actions(app, dialog),
+                action_focused: dialog.focused_action.is_some(),
             };
             let mut lines = vec![primitives::header_line(theme, &view.title, "esc", width)];
             if view.filter {
@@ -1594,7 +1827,11 @@ fn content_lines(app: &App, dialog: &DialogFrame, theme: &Theme) -> Vec<Line<'st
                 max_visible(app),
             );
             if !view.actions.is_empty() {
-                lines.push(primitives::render_actions(theme, &view.actions));
+                lines.push(primitives::render_actions(
+                    theme,
+                    &view.actions,
+                    dialog.focused_action,
+                ));
             }
             lines
         }
@@ -1628,27 +1865,84 @@ fn select_title(kind: &PendingDialog) -> &'static str {
     }
 }
 
-/// The confirm button row — the active button gets the primary bg
-/// (`dialog-confirm.tsx:75-95`).
-fn buttons(theme: &Theme, labels: &[&str], active: usize) -> Line<'static> {
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    for (index, label) in labels.iter().enumerate() {
-        spans.push(Span::styled(
-            format!(" {label} "),
+/// The right-aligned primary-bg `ok` button
+/// (`dialog-alert.tsx:42-54`, `dialog-help.tsx:33-37`).
+fn ok_button(theme: &Theme, width: u16) -> Line<'static> {
+    let padding = (width as usize).saturating_sub(8);
+    Line::from(vec![
+        Span::raw(" ".repeat(padding)),
+        Span::styled(
+            "   ok   ".to_string(),
             Style::new()
-                .fg(if index == active {
-                    theme.selected_list_item_text
-                } else {
-                    theme.text_muted
-                }
-                .to_color())
-                .bg(if index == active {
-                    theme.primary.to_color()
-                } else {
-                    theme.background_panel.to_color()
-                }),
+                .fg(theme.selected_list_item_text.to_color())
+                .bg(theme.primary.to_color()),
+        ),
+    ])
+}
+
+/// The confirm button row — right-aligned
+/// (`justifyContent="flex-end"`, `dialog-confirm.tsx:69-88`): the
+/// active button gets the primary bg (`dialog-confirm.tsx:75-95`).
+#[allow(clippy::too_many_arguments)]
+fn buttons(
+    theme: &Theme,
+    width: u16,
+    labels: &[&str],
+    active: usize,
+    pad: usize,
+    gap: usize,
+    bold: bool,
+) -> Line<'static> {
+    let selected_fg = crate::ui::theme::selected_foreground(theme, Some(theme.primary));
+    let used = labels
+        .iter()
+        .map(|label| label.chars().count() + 2 * pad)
+        .sum::<usize>()
+        + gap * labels.len().saturating_sub(1);
+    let mut spans = vec![Span::raw(" ".repeat((width as usize).saturating_sub(used)))];
+    for (index, label) in labels.iter().enumerate() {
+        if index > 0 && gap > 0 {
+            spans.push(Span::raw(" ".repeat(gap)));
+        }
+        let mut style = Style::new().fg(if index == active {
+            selected_fg
+        } else {
+            theme.text_muted
+        }
+        .to_color());
+        if index == active {
+            style = style.bg(theme.primary.to_color());
+            if bold {
+                style = style.add_modifier(ratatui::style::Modifier::BOLD);
+            }
+        }
+        spans.push(Span::styled(
+            format!("{}{label}{}", " ".repeat(pad), " ".repeat(pad)),
+            style,
         ));
-        spans.push(Span::raw(" "));
     }
     Line::from(spans)
+}
+
+/// The retry footer — `don't show again` left, the action label right
+/// (`justifyContent="space-between"`, `dialog-retry-action.tsx:113-144`).
+fn retry_buttons(theme: &Theme, width: u16, label: &str, active: usize) -> Line<'static> {
+    let selected_fg = crate::ui::theme::selected_foreground(theme, Some(theme.primary));
+    let button = |text: &str, active: bool, inactive_fg: crate::ui::theme::Rgba| -> Span<'static> {
+        let mut style = Style::new().fg(if active { selected_fg } else { inactive_fg }.to_color());
+        if active {
+            style = style
+                .bg(theme.primary.to_color())
+                .add_modifier(ratatui::style::Modifier::BOLD);
+        }
+        Span::styled(format!("  {text}  "), style)
+    };
+    let dismiss = button("don't show again", active == 0, theme.text_muted);
+    let action = button(label, active == 1, theme.text);
+    let used = dismiss.content.chars().count() + action.content.chars().count();
+    Line::from(vec![
+        dismiss,
+        Span::raw(" ".repeat((width as usize).saturating_sub(used))),
+        action,
+    ])
 }
