@@ -40,6 +40,12 @@ pub struct Ctx<'a> {
     /// `contentWidth` (`session/index.tsx:278`).
     pub width: u16,
     pub session_id: &'a str,
+    /// Whether the message being rendered is finished (completed or
+    /// errored). The cleanup path closes every running part when a
+    /// message ends; a part still "running" on a finished message is
+    /// a persisted defect (e.g. a failed cleanup write) and must not
+    /// animate forever.
+    pub message_done: bool,
 }
 
 impl<'a> Ctx<'a> {
@@ -49,6 +55,7 @@ impl<'a> Ctx<'a> {
             theme,
             width,
             session_id,
+            message_done: false,
         }
     }
 

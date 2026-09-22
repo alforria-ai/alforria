@@ -479,12 +479,20 @@ fn assistant_message_lines(
     else {
         return;
     };
+    // A completed/errored message is done — its parts must not animate.
+    let ctx = Ctx {
+        app: ctx.app,
+        theme: ctx.theme,
+        width: ctx.width,
+        session_id: ctx.session_id,
+        message_done: time.completed.is_some() || error.is_some(),
+    };
 
     for part in parts {
         // The clickable part ranges (BlockTool/InlineTool/ReasoningPart
         // onClick, session/index.tsx:1822,1900,1609).
         let start = lines.len();
-        lines.extend(parts::render_part(part, ctx));
+        lines.extend(parts::render_part(part, &ctx));
         let id = match part {
             V1Part::Reasoning { id, .. } | V1Part::Tool { id, .. } => Some(id.clone()),
             _ => None,

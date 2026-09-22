@@ -140,7 +140,10 @@ fn render_reasoning(part: &V1Part, ctx: &Ctx) -> Vec<Line<'static>> {
     if content.is_empty() && !opaque {
         return Vec::new();
     }
-    let is_done = time.end.is_some();
+    // A finished message never animates: cleanup closes every running
+    // part when the message ends, so a part still "running" here is a
+    // persisted defect (a failed cleanup write, e.g. a storage error).
+    let is_done = time.end.is_some() || ctx.message_done;
     let in_minimal = ctx.thinking_mode() == "hide";
     let duration_ms = match time.end {
         Some(end) => end.saturating_sub(time.start),
@@ -1613,6 +1616,31 @@ mod tests {
         };
         let text = plain(&render_part(&part, &ctx));
         assert!(text.contains("Thinking"), "{text}");
+    }
+
+    #[test]
+    fn reasoning_on_a_finished_message_never_spins() {
+        // A part left "running" on a completed/errored message is a
+        // persisted defect (a failed cleanup write) — it must not
+        // animate forever.
+        let app = app();
+        let theme = theme();
+        let mut ctx = Ctx::new(&app, &theme, "ses_a", 80);
+        ctx.message_done = true;
+        let part = V1Part::Reasoning {
+            id: "prt_r".into(),
+            session_id: "ses_a".into(),
+            message_id: "msg_1".into(),
+            text: "stuck mid-thought".into(),
+            metadata: None,
+            time: ReasoningTime {
+                start: 0,
+                end: None,
+            },
+        };
+        let text = plain(&render_part(&part, &ctx));
+        assert!(!text.contains("Thinking"), "{text}");
+        assert!(text.contains("Thought"), "{text}");
     }
 
     #[test]

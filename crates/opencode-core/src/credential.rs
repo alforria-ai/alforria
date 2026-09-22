@@ -127,7 +127,7 @@ impl CredentialStore {
         let now = self.clock.now_ms() as i64;
         self.storage.with_connection_mut(|conn| {
             let result: Result<(), CoreError> = (|| {
-                let tx = conn.transaction()?;
+                let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 tx.execute(
                     "DELETE FROM credential WHERE integration_id = ?1",
                     rusqlite::params![credential.integration_id],

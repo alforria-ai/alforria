@@ -378,7 +378,7 @@ impl EventBus {
     /// Remove an aggregate and all its events (`event.ts:514-523`).
     pub fn remove(&self, aggregate_id: &str) -> Result<(), CoreError> {
         self.storage.with_connection_mut(|conn| {
-            let tx = conn.transaction()?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             sql::delete_event_sequence(&tx, aggregate_id)?;
             sql::delete_events(&tx, aggregate_id)?;
             tx.commit()?;
@@ -453,7 +453,7 @@ impl EventBus {
 
         let committed = self.storage.with_connection_mut(
             |conn| -> Result<Option<(String, i64)>, CoreError> {
-            let tx = conn.transaction()?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             let row = sql::get_event_sequence(&tx, aggregate_id)?;
             let latest = row.as_ref().map(|row| row.seq).unwrap_or(-1);
             let stored_type = versioned_type(definition.r#type, durable.version);

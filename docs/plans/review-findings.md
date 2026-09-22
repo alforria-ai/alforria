@@ -684,3 +684,34 @@ Fixed every remaining recorded gap from round 8:
    navigates), option-row layout mapping, window-height scaling,
    wide-char trim/wrap. The dialog test helper now feeds the
    terminal dimensions like the real app.
+
+## Round 10 — "database is locked" + stuck thinking
+
+User report: mid-prompt `StorageError: database is locked` rendered under
+the message, and the Thinking indicator never stopped for that message.
+
+**Root cause.** All six write transactions used deferred `BEGIN`. In
+WAL mode a deferred transaction that reads before writing fails
+*immediately* with SQLITE_BUSY when another process committed in between
+— the 5s `busy_timeout` is not honored for the upgrade (the snapshot
+trap). Two opencode processes writing the same database (the user's
+server plus the probe test server, which shared
+`~/.local/share/opencode/opencode.db`) made the durable-event commit
+(`commit_durable_event`, bus.rs) hit exactly this on every prompt.
+
+**Fixes.**
+
+- Every write transaction now begins `IMMEDIATE`
+  (`transaction_with_behavior(TransactionBehavior::Immediate)`) so the
+  busy handler waits instead of failing: the event bus, the project
+  registry, todos, credentials and the migration. Regression test:
+  `write_transactions_wait_for_a_foreign_writer` holds the write lock
+  from a second connection and asserts our write succeeds.
+- The probe test server (`start9.sh`) now runs with an isolated
+  `XDG_DATA_HOME` so it never contends with (or pollutes) the user's
+  real database.
+- TUI hardening for already-stuck data: a reasoning part left "running"
+  on a completed/errored message no longer animates — cleanup closes
+  every part when a message ends, so that state is a persisted defect
+  (e.g. a cleanup write that failed under the lock) and now renders as
+  a finished `Thought` instead of spinning forever.

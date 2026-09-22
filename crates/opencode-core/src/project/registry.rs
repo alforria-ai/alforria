@@ -214,7 +214,7 @@ impl ProjectRegistry {
         let now = self.now() as i64;
         self.storage
             .with_connection_mut(|conn| {
-                let tx = conn.transaction()?;
+                let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 let old_project = query_project(&tx, old_id)?;
                 let new_project = query_project(&tx, new_id)?;
 

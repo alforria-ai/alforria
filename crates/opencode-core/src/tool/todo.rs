@@ -170,7 +170,7 @@ impl Todo for TodoService {
         Box::pin(async move {
             self.storage
                 .with_connection_mut(|conn| {
-                    let tx = conn.transaction().map_err(core_error)?;
+                    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(core_error)?;
                     tx.execute("DELETE FROM todo WHERE session_id = ?1", [session_id])
                         .map_err(core_error)?;
                     let now = chrono::Utc::now().timestamp_millis();

@@ -166,4 +166,49 @@ mod tests {
         let storage = Storage::open_in_memory().unwrap();
         assert!(storage.list_projects().unwrap().is_empty());
     }
+
+    /// A foreign connection holding the write lock must not fail our
+    /// write transactions: `BEGIN IMMEDIATE` acquires the write lock
+    /// upfront, so the `busy_timeout` window is honored instead of a
+    /// deferred read→write upgrade failing immediately with "database
+    /// is locked" (the WAL snapshot-upgrade trap).
+    #[test]
+    fn write_transactions_wait_for_a_foreign_writer() {
+        let dir = TempDir::new("foreign-writer");
+        let path = dir.path().join("db.sqlite");
+        let storage = Storage::open(&path).unwrap();
+        storage.with_connection(|conn| {
+            conn.execute("CREATE TABLE busy_probe (id INTEGER)", [])
+                .unwrap();
+        });
+
+        let holder = Connection::open(&path).unwrap();
+        holder.execute("BEGIN IMMEDIATE", []).unwrap();
+        holder
+            .execute("INSERT INTO busy_probe (id) VALUES (1)", [])
+            .unwrap();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            holder.execute("COMMIT", []).unwrap();
+        });
+
+        storage
+            .with_connection_mut(|conn| -> Result<(), rusqlite::Error> {
+                let tx = conn
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .unwrap();
+                tx.execute("INSERT INTO busy_probe (id) VALUES (2)", [])
+                    .unwrap();
+                tx.commit()
+            })
+            .unwrap();
+        releaser.join().unwrap();
+
+        storage.with_connection(|conn| {
+            let count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM busy_probe", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(count, 2);
+        });
+    }
 }

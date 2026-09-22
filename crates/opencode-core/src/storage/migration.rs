@@ -117,7 +117,7 @@ pub fn apply(conn: &mut Connection) -> Result<(), CoreError> {
         ));
     }
 
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     for statement in SCHEMA_SQL {
         tx.execute_batch(statement)?;
     }
