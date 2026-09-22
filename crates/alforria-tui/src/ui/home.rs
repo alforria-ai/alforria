@@ -673,7 +673,7 @@ fn render_prompt(app: &App, frame: &mut ratatui::Frame, theme: &Theme, area: Rec
                     vertical_left: "┃",
                     ..Default::default()
                 })
-                .border_style(theme.border.to_color())
+                .border_style(crate::ui::session::prompt::border_highlight(app, theme).to_color())
                 .style(Style::new().bg(theme.background_element.to_color()))
                 .padding(ratatui::widgets::Padding {
                     left: 2,
@@ -684,6 +684,7 @@ fn render_prompt(app: &App, frame: &mut ratatui::Frame, theme: &Theme, area: Rec
         )
         .render(main, frame.buffer_mut());
     render_prompt_cap(
+        app,
         frame,
         theme,
         Rect {
@@ -699,7 +700,7 @@ fn render_prompt(app: &App, frame: &mut ratatui::Frame, theme: &Theme, area: Rec
 
 /// The 1-row bottom cap under the prompt (`prompt/index.tsx:1487-1512`):
 /// a `╹` left border with a `▀` underline in `backgroundElement`.
-fn render_prompt_cap(frame: &mut ratatui::Frame, theme: &Theme, area: Rect) {
+fn render_prompt_cap(app: &App, frame: &mut ratatui::Frame, theme: &Theme, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -708,7 +709,10 @@ fn render_prompt_cap(frame: &mut ratatui::Frame, theme: &Theme, area: Rect) {
     } else {
         (" ", " ")
     };
-    let mut spans = vec![Span::styled(left, theme.border.to_color())];
+    let mut spans = vec![Span::styled(
+        left,
+        crate::ui::session::prompt::border_highlight(app, theme).to_color(),
+    )];
     let width = area.width.saturating_sub(1) as usize;
     if width > 0 {
         spans.push(Span::styled(
@@ -752,6 +756,68 @@ mod tests {
             lines.push(line.trim_end().to_string());
         }
         lines
+    }
+
+    /// The fg colours of every `┃` prompt-border cell on the home screen.
+    fn border_colors(app: &App, width: u16, height: u16) -> Vec<ratatui::style::Color> {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let theme = app
+                    .ui
+                    .theme
+                    .resolve(&app.state.kv)
+                    .expect("builtin theme resolves");
+                super::render(app, frame, &theme, frame.area());
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut colors = Vec::new();
+        for y in 0..height {
+            for x in 0..width {
+                let cell = &buffer[(x, y)];
+                if cell.symbol() == "┃" {
+                    colors.push(cell.fg);
+                }
+            }
+        }
+        colors
+    }
+
+    /// Regression: the home prompt border follows the current agent's
+    /// colour — the shared `borderHighlight()` tint, not plain
+    /// `theme.border` — so Build/Plan cycling is visible on the first
+    /// screen.
+    #[test]
+    fn home_border_follows_the_agent_color() {
+        let mut sync = crate::state::sync::SyncState::new();
+        sync.agent = vec![
+            serde_json::json!({"name": "build", "mode": "primary"}),
+            serde_json::json!({"name": "plan", "mode": "primary", "hidden": false}),
+        ];
+        let mut app = make_app();
+        app.state.sync = sync.clone();
+        let theme = app
+            .ui
+            .theme
+            .resolve(&app.state.kv)
+            .expect("builtin theme resolves");
+        let build = theme.get("secondary").expect("theme secondary").to_color();
+        let plan = theme.get("accent").expect("theme accent").to_color();
+        assert_ne!(build, plan);
+        let colors = border_colors(&app, 80, 24);
+        assert!(!colors.is_empty(), "no border cells rendered");
+        assert!(
+            colors.iter().all(|c| *c == build),
+            "border should be build colour: {colors:?}"
+        );
+        app.state.local.agent_move(1, &sync);
+        let colors = border_colors(&app, 80, 24);
+        assert!(
+            colors.iter().all(|c| *c == plan),
+            "border should be plan colour: {colors:?}"
+        );
     }
 
     #[test]

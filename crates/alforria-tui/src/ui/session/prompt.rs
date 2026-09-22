@@ -29,7 +29,7 @@ fn split_border_set() -> ratatui::symbols::border::Set<'static> {
 /// `theme.primary` in shell mode, the current agent's colour otherwise
 /// (the `tint(theme.border, highlight(), agentMetaAlpha())` blend at
 /// full opacity).
-fn border_highlight(app: &App, theme: &Theme) -> Rgba {
+pub(crate) fn border_highlight(app: &App, theme: &Theme) -> Rgba {
     if app.ui.prompt.mode == PromptMode::Shell {
         return theme.primary;
     }
