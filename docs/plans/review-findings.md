@@ -427,3 +427,25 @@ reference (88c6c7a): llm, session engine, tools, server, CLI+ACP, TUI+foundation
   (handlers/experimental.ts:43-86): `{consoleManagedProviders: [],
   switchableOrgCount: 0}`, `{orgs: []}`, and the account-missing
   BadRequest on switch.
+
+### Battle-test round 4 (interactive TUI)
+
+- Live TUI drive under a pty (pyte VT100 emulation): typed text inserted
+  into the editor model but never appeared on the home screen, and Enter
+  never submitted. Two bugs:
+- **The home prompt box rendered a dead field**: `render_prompt` drew
+  `Route::Home { prompt }`'s seed value — which is `None` everywhere in
+  the codebase — instead of the shared prompt editor. Typing updated
+  `app.ui.prompt.textarea` while the view read nothing. Fixed: the home
+  box renders the shared editor (text + reversed cursor), falling back to
+  the seeded `--prompt` input when the editor is empty (M8.6).
+- **`input.submit` was a silent no-op**: the keymap dispatches Enter to
+  `input.submit` (TS `keymap.tsx:172` `inputCommands`), but
+  `command::run`'s registry gate only listed `prompt.submit`, so the
+  command was dropped before the submit arm. Fixed: hidden
+  `input.submit` alias registered (`command.rs`), asserted in
+  `registry_names_match_the_ts_command_sets`.
+- Live-verified end-to-end after the fix: type "hello" on the home
+  screen, Enter → session created, prompt sent, model reply rendered in
+  the session view (Build · qwen3.8-27b-thinking · 3.7s). Regression
+  test `prompt_renders_typed_text`.
