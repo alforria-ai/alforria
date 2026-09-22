@@ -18,25 +18,28 @@ pub mod style {
     pub const TEXT_INFO_BOLD: &str = "\x1b[94m\x1b[1m";
 }
 
-const WORDMARK: [&str; 4] = [
-    "                                 ▄     ",
-    "█▀▀█ █    █▀▀█ █▀▀█ █▀▀█ █▀▀█ ▀▀▀▀ █▀▀█",
-    "█▄▄█ █    █▀▀▀ █  █ █  ▀ █  ▀  █   █▄▄█",
-    "█  █ █▀▀█ █    ▀▀▀▀ █  █ █  █ ▀▀▀▀ █  █",
+const WORDMARK: [&str; 5] = [
+    " ███  █     █████  ███  ████  ████  █████  ███ ",
+    "█   █ █     █     █   █ █   █ █   █   █   █   █",
+    "█████ █     ████  █   █ ████  ████    █   █████",
+    "█   █ █     █     █   █ █  █  █  █    █   █   █",
+    "█   █ █████ █      ███  █   █ █   █ █████ █   █",
 ];
 
-const LOGO_LEFT: [&str; 4] = [
-    "                   ",
-    "█▀▀█ █___ █▀▀█ █▀▀█",
-    "█▄▄█ █___ █▀▀▀ █__█",
-    "█__█ █▀▀█ █___ ▀~~▀",
+const LOGO_LEFT: [&str; 5] = [
+    " ███  █     █████  ███ ",
+    "█   █ █     █     █   █",
+    "█████ █     ████  █   █",
+    "█   █ █     █     █   █",
+    "█   █ █████ █      ███ ",
 ];
 
-const LOGO_RIGHT: [&str; 4] = [
-    "             ▄     ",
-    "█▀▀█ █▀▀█ ▀▀▀▀ █▀▀█",
-    "█__^ █__^ _█__ █▄▄█",
-    "█__█ █__█ ▀▀▀▀ █__█",
+const LOGO_RIGHT: [&str; 5] = [
+    "████  ████  █████  ███ ",
+    "█   █ █   █   █   █   █",
+    "████  ████    █   █████",
+    "█  █  █  █    █   █   █",
+    "█   █ █   █ █████ █   █",
 ];
 
 fn draw(line: &str, fg: &str, shadow: &str, bg: &str) -> String {
@@ -305,8 +308,8 @@ mod tests {
         assert!(!ui.is_tty());
         let logo = ui.logo(None);
         let lines: Vec<&str> = logo.split('\n').collect();
-        assert_eq!(lines[0], "                                 ▄     ");
-        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[0], " ███  █     █████  ███  ████  ████  █████  ███ ");
+        assert_eq!(lines.len(), 5);
         assert!(!logo.contains("\x1b["));
     }
 

@@ -60,7 +60,7 @@ fn logo_lines(theme: &Theme) -> Vec<Line<'static>> {
 }
 
 /// `Logo` column width: left half + gap + right half.
-const LOGO_WIDTH: u16 = 39;
+const LOGO_WIDTH: u16 = 47;
 
 /// The inner textarea width: the frame pads left+right by 2.
 fn inner_width(area: Rect) -> u16 {
@@ -114,7 +114,7 @@ pub fn render(app: &App, frame: &mut ratatui::Frame, theme: &Theme, area: Rect) 
     let [_, _gap, logo, _, prompt, _bottom] = Layout::vertical([
         Constraint::Fill(1),
         Constraint::Length(4),
-        Constraint::Length(4),
+        Constraint::Length(5),
         Constraint::Length(1),
         Constraint::Length(prompt_height(rows.len())),
         Constraint::Fill(1),
@@ -246,15 +246,15 @@ mod tests {
         let lines = buffer_text(&make_app(), 80, 24);
         let joined = lines.join("\n");
         assert!(
-            joined.contains("█▀▀█ █    █▀▀█ █▀▀█ █▀▀█ █▀▀█ ▀▀▀▀ █▀▀█"),
+            joined.contains(" ███  █     █████  ███  ████  ████  █████  ███"),
             "{joined}"
         );
         assert!(
-            joined.contains("█▄▄█ █    █▀▀▀ █  █ █  ▀ █  ▀  █   █▄▄█"),
+            joined.contains("█████ █     ████  █   █ ████  ████    █   █████"),
             "{joined}"
         );
         assert!(
-            joined.contains("█  █ █▀▀█ █    ▀▀▀▀ █  █ █  █ ▀▀▀▀ █  █"),
+            joined.contains("█   █ █████ █      ███  █   █ █   █ █████ █   █"),
             "{joined}"
         );
     }
@@ -304,7 +304,7 @@ mod tests {
                 "{width}: {lines:?}"
             );
             assert!(
-                lines.iter().any(|l| l.contains("█▀▀█")),
+                lines.iter().any(|l| l.contains("█████")),
                 "{width}: logo missing"
             );
         }
@@ -331,19 +331,26 @@ mod tests {
         let lines = buffer_text(&make_app(), 80, 24);
         let pad = |n| " ".repeat(n);
         assert_eq!(lines.len(), 24);
-        // vertical: fill(7) + gap(4) + logo(4) + spacer(1) + prompt(2) + fill(6)
-        assert_eq!(lines[11], format!("{}▄", pad(53)));
+        // vertical: fill(6) + gap(4) + logo(5) + spacer(1) + prompt(2) + fill(6)
+        assert_eq!(
+            lines[10],
+            format!("{} ███  █     █████  ███  ████  ████  █████  ███", pad(16))
+        );
+        assert_eq!(
+            lines[11],
+            format!("{}█   █ █     █     █   █ █   █ █   █   █   █   █", pad(16))
+        );
         assert_eq!(
             lines[12],
-            format!("{}█▀▀█ █    █▀▀█ █▀▀█ █▀▀█ █▀▀█ ▀▀▀▀ █▀▀█", pad(20))
+            format!("{}█████ █     ████  █   █ ████  ████    █   █████", pad(16))
         );
         assert_eq!(
             lines[13],
-            format!("{}█▄▄█ █    █▀▀▀ █  █ █  ▀ █  ▀  █   █▄▄█", pad(20))
+            format!("{}█   █ █     █     █   █ █  █  █  █    █   █   █", pad(16))
         );
         assert_eq!(
             lines[14],
-            format!("{}█  █ █▀▀█ █    ▀▀▀▀ █  █ █  █ ▀▀▀▀ █  █", pad(20))
+            format!("{}█   █ █████ █      ███  █   █ █   █ █████ █   █", pad(16))
         );
         assert_eq!(lines[16], format!("{}│", pad(2)));
         assert_eq!(
@@ -351,7 +358,7 @@ mod tests {
             format!("{}│  Ask anything… \"Fix a TODO in the codebase\"", pad(2))
         );
         for (row, line) in lines.iter().enumerate() {
-            if ![11, 12, 13, 14, 16, 17].contains(&row) {
+            if ![10, 11, 12, 13, 14, 16, 17].contains(&row) {
                 assert_eq!(line, "", "row {row}: {}", lines[row]);
             }
         }
