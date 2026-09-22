@@ -48,10 +48,10 @@ fn display(ui: &mut Ui, subscription: &auth::Subscription) {
     if let Some(balance) = subscription.prepaid_balance {
         let plural = if balance == 1.0 { "" } else { "s" };
         ui.println(&format!(
-            "  {} {}{} prepaid credit{plural}{}",
+            "  {}{}{} prepaid credit{plural}{}",
             style::TEXT_NORMAL_BOLD,
-            style::TEXT_NORMAL,
             money(balance),
+            style::TEXT_NORMAL,
             style::TEXT_NORMAL
         ));
     }
@@ -117,13 +117,13 @@ fn bar(used: f64, limit: f64) -> String {
 
 fn relative_time(target: chrono::DateTime<chrono::FixedOffset>) -> String {
     let now = chrono::Local::now();
-    let seconds = (target.with_timezone(&chrono::Local) - now)
-        .to_std()
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0);
+    let seconds = (target.with_timezone(&chrono::Local) - now).num_seconds();
+    if seconds <= 60 {
+        return "1m".to_string();
+    }
     let minutes = seconds / 60;
     match minutes {
-        0..=59 => format!("{:2}m", minutes.max(1)),
+        0..=59 => format!("{minutes:2}m"),
         _ => format!("{}h {}m", minutes / 60, minutes % 60),
     }
 }

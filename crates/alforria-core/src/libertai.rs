@@ -320,18 +320,25 @@ fn fetch_pricing() -> Option<LtaiPricing> {
 
 /// Fresh 24h cache → fetch (rewrites the cache) → stale cache → embedded
 /// snapshot → hardcoded fallback pair. Result memoized for the process so
-/// at most one fetch attempt happens per TTL window.
+/// at most one fetch attempt happens per TTL window. The memo lock is held
+/// only for the read/write — never across the fetch — so concurrent
+/// callers race the fetch instead of serializing behind it (both compute
+/// the same answer; the disk cache write is idempotent).
 fn resolve_models() -> BTreeMap<String, Model> {
     static MEMO: std::sync::Mutex<Option<(u64, BTreeMap<String, Model>)>> =
         std::sync::Mutex::new(None);
-    let mut memo = MEMO.lock().unwrap();
-    if let Some((fetched_at, models)) = memo.as_ref() {
-        if now_unix().saturating_sub(*fetched_at) < CACHE_TTL_SECS {
-            return models.clone();
+    let now = now_unix();
+    if let Ok(memo) = MEMO.lock() {
+        if let Some((fetched_at, models)) = memo.as_ref() {
+            if now.saturating_sub(*fetched_at) < CACHE_TTL_SECS {
+                return models.clone();
+            }
         }
     }
     let models = compute_models();
-    *memo = Some((now_unix(), models.clone()));
+    if let Ok(mut memo) = MEMO.lock() {
+        *memo = Some((now, models.clone()));
+    }
     models
 }
 

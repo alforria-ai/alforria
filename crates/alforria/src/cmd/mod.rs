@@ -214,6 +214,7 @@ pub fn cli() -> Command {
             .subcommand(
                 Command::new("libertai")
                     .about("LibertAI account commands")
+                    .subcommand_required(true)
                     .subcommand(
                         Command::new("usage")
                             .about("show plan and usage (allowance windows, prepaid credits)")

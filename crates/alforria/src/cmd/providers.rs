@@ -386,13 +386,24 @@ fn login_api_key_flow(ui: &mut Ui, deps: &mut LoginDeps, provider: &str) -> Resu
 
 /// `libertai` browser-SSO: PKCE + loopback against console.libertai.io,
 /// key minted against the account API, stored like any API key. Falls back
-/// to the manual API-key flow when SSO fails at any step.
+/// to the manual API-key flow when SSO fails — unless the stdin race was
+/// armed (its orphaned reader would eat the fallback prompt's first line,
+/// so the user gets a re-run hint instead).
 fn login_libertai_flow(ui: &mut Ui, deps: &mut LoginDeps) -> Result<(), TypedError> {
     let result = login_libertai_sso(ui, deps);
-    let error = match result {
+    let (error, stdin_armed) = match result {
         Ok(()) => return Ok(()),
-        Err(err) => err,
+        Err((err, stdin_armed)) => (err, stdin_armed),
     };
+    if stdin_armed {
+        log_warn(
+            ui,
+            &format!(
+                "Browser sign-in failed: {error:?}.\nRun `alforria auth login -p libertai` to retry, or log in with an API key.",
+            ),
+        );
+        return Err(TypedError::Cli(CliError::new("browser sign-in failed")));
+    }
     log_warn(
         ui,
         &format!("Browser sign-in failed: {error:?}. Falling back to API key."),
@@ -400,28 +411,34 @@ fn login_libertai_flow(ui: &mut Ui, deps: &mut LoginDeps) -> Result<(), TypedErr
     login_api_key_flow(ui, deps, "libertai")
 }
 
-fn login_libertai_sso(ui: &mut Ui, deps: &mut LoginDeps) -> Result<(), TypedError> {
+fn login_libertai_sso(ui: &mut Ui, deps: &mut LoginDeps) -> Result<(), (TypedError, bool)> {
     use alforria_core::libertai::auth;
 
     let pkce = auth::Pkce::generate();
-    let server = auth::CallbackServer::bind().map_err(|err| cli_error(err.to_string()))?;
+    let server = auth::CallbackServer::bind().map_err(|err| (cli_error(err.to_string()), false))?;
     let redirect_uri = server.redirect_uri();
     let url = auth::authorize_url(&pkce, "Alforria", &redirect_uri);
     log_info(ui, "Opening your browser to sign in…");
     log_info(ui, &format!("If it doesn't open, visit:\n  {url}"));
     auth::open_browser(&url);
 
-    let (code, returned_state) = collect_libertai_code(ui, server).map_err(cli_error)?;
+    let (code, returned_state, stdin_armed) =
+        collect_libertai_code(ui, server).map_err(|err| (cli_error(err), true))?;
+    // The loopback leg always carries `state` and a mismatch aborts; a
+    // bare pasted code carries none, and the PKCE verifier alone guards
+    // the exchange.
     if returned_state
         .as_deref()
         .is_some_and(|state| state != pkce.state)
     {
-        return Err(cli_error(
-            "login state mismatch — aborting (possible interference)",
+        return Err((
+            cli_error("login state mismatch — aborting (possible interference)"),
+            stdin_armed,
         ));
     }
 
-    let pair = auth::exchange_code(&code, &pkce.verifier).map_err(cli_error)?;
+    let pair =
+        auth::exchange_code(&code, &pkce.verifier).map_err(|err| (cli_error(err), stdin_armed))?;
 
     // Per-device key: a stable id keeps this device's key name unique, so
     // logging in elsewhere mints a separate key instead of rotating this one.
@@ -429,16 +446,18 @@ fn login_libertai_sso(ui: &mut Ui, deps: &mut LoginDeps) -> Result<(), TypedErro
         .map(|session| session.device_id)
         .unwrap_or_else(auth::new_device_id);
     let host = format!("{}-{}", auth::device_hostname(), device_id);
-    let created = auth::create_cli_api_key(&pair.access_token, &host).map_err(cli_error)?;
+    let created = auth::create_cli_api_key(&pair.access_token, &host)
+        .map_err(|err| (cli_error(err), stdin_armed))?;
     auth::store_session(&auth::StoredSession {
         refresh_token: pair.refresh_token,
         expires_at: created.expires_at.clone(),
         device_id,
-    });
+    })
+    .map_err(|err| (cli_error(err), stdin_armed))?;
 
     deps.auth
         .set("libertai", json!({"type": "api", "key": created.full_key}))
-        .map_err(server_error)?;
+        .map_err(|err| (server_error(err), stdin_armed))?;
     log_info(
         ui,
         &format!("Logged in. Key: {}", mask_key(&created.full_key)),
@@ -452,10 +471,13 @@ fn login_libertai_sso(ui: &mut Ui, deps: &mut LoginDeps) -> Result<(), TypedErro
 
 /// Race the loopback callback against a code pasted by hand (the
 /// remote-browser fallback). Whichever source produces input first wins.
+/// Returns `(code, state?, stdin_armed)` — the reader thread outlives this
+/// call whenever the callback wins, which is why callers must not prompt
+/// for more stdin after it.
 fn collect_libertai_code(
     ui: &mut Ui,
     server: alforria_core::libertai::auth::CallbackServer,
-) -> Result<(String, Option<String>), String> {
+) -> Result<(String, Option<String>, bool), String> {
     enum Msg {
         Callback(Result<alforria_core::libertai::auth::Callback, String>),
         Manual(String),
@@ -489,9 +511,14 @@ fn collect_libertai_code(
     }
 
     match rx.recv_timeout(alforria_core::libertai::auth::CALLBACK_TIMEOUT) {
-        Ok(Msg::Callback(result)) => result.map(|callback| (callback.code, Some(callback.state))),
-        Ok(Msg::Manual(line)) => alforria_core::libertai::auth::parse_manual_code(&line)
-            .ok_or_else(|| "could not find a login code in the pasted text".to_string()),
+        Ok(Msg::Callback(result)) => {
+            result.map(|callback| (callback.code, Some(callback.state), interactive))
+        }
+        Ok(Msg::Manual(line)) => {
+            alforria_core::libertai::auth::parse_manual_code(&line)
+                .map(|(code, state)| (code, state, interactive))
+        }
+        .ok_or_else(|| "could not find a login code in the pasted text".to_string()),
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
             Err("timed out waiting for sign-in".to_string())
         }
@@ -503,9 +530,20 @@ fn collect_libertai_code(
 
 fn mask_key(key: &str) -> String {
     if key.len() <= 8 {
-        return "*".repeat(key.len());
+        return "*".repeat(key.chars().count());
     }
-    format!("{}****{}", &key[..4], &key[key.len() - 4..])
+    // Guard byte-slices on non-ASCII keys (char boundaries, 4+4 max).
+    let head = key.char_indices().nth(4).map(|(i, _)| i).unwrap_or(0);
+    let tail = key
+        .char_indices()
+        .rev()
+        .nth(3)
+        .map(|(i, _)| i)
+        .unwrap_or(key.len());
+    if tail <= head {
+        return "*".repeat(key.chars().count());
+    }
+    format!("{}****{}", &key[..head], &key[tail..])
 }
 
 fn cli_error(message: impl Into<String>) -> TypedError {

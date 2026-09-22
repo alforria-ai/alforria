@@ -52,6 +52,8 @@ pub fn output_token_max() -> Option<f64> {
 /// `sort` (provider.ts:2050-2058) — the priority index, `latest` first,
 /// id desc.
 fn sort_model_ids(mut models: Vec<String>) -> Vec<String> {
+    // Deviation from provider.ts:2050-2058 — "glm-5.3-thinking" appended so
+    // the built-in libertai provider wins when nothing earlier is connected.
     const PRIORITY: [&str; 5] = [
         "gpt-5",
         "claude-sonnet-4",

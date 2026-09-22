@@ -51,9 +51,10 @@ fn env_override(env_var: &str, default: &str) -> String {
 // PKCE
 // ---------------------------------------------------------------------------
 
-/// The custom PKCE pair the console authorize page expects. The challenge is
-/// base64url(SHA-256(verifier)) — not standard S256, and there is no
-/// `code_challenge_method`; the verifier itself travels in the exchange body.
+/// The custom PKCE pair the console authorize page expects: the challenge is
+/// S256 (base64url of SHA-256(verifier)) but travels as a `challenge` query
+/// param — no standard `code_challenge`/`code_challenge_method` fields; the
+/// verifier itself travels in the exchange body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pkce {
     pub verifier: String,
@@ -137,9 +138,6 @@ impl CallbackServer {
     /// Serve one GET to `/callback`, reply with a "you can close this tab"
     /// page, and return its `code` + `state` query params.
     pub fn wait(&self, timeout: Duration) -> Result<Callback, String> {
-        self.listener
-            .set_nonblocking(false)
-            .map_err(|err| err.to_string())?;
         // Deadline-driven accept: poll the socket instead of blocking past
         // the timeout, so an abandoned login never hangs the caller.
         self.listener
@@ -162,7 +160,7 @@ impl CallbackServer {
             .set_nonblocking(false)
             .map_err(|err| err.to_string())?;
         let (code, state, error) =
-            Self::parse_request(stream.try_clone().map_err(|e| e.to_string())?);
+            Self::parse_request(stream.try_clone().map_err(|e| e.to_string())?, deadline);
         let _ = Self::respond(stream, error.is_none() && code.is_some());
         match error {
             Some(error) => Err(format!("login was rejected: {error}")),
@@ -174,10 +172,23 @@ impl CallbackServer {
     }
 
     /// Read one HTTP request and pull `code`/`state`/`error` from the query.
-    fn parse_request(mut stream: TcpStream) -> (Option<String>, Option<String>, Option<String>) {
-        let mut buffer = [0u8; 4096];
-        let read = stream.read(&mut buffer).unwrap_or(0);
-        let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+    /// Reads until the end of the headers — a single read() may be partial.
+    fn parse_request(
+        mut stream: TcpStream,
+        deadline: std::time::Instant,
+    ) -> (Option<String>, Option<String>, Option<String>) {
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 512];
+        loop {
+            if buffer.ends_with(b"\r\n\r\n") || std::time::Instant::now() >= deadline {
+                break;
+            }
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => buffer.extend_from_slice(&chunk[..read]),
+            }
+        }
+        let request = String::from_utf8_lossy(&buffer).to_string();
         let query = request
             .split_whitespace()
             .nth(1)
@@ -234,10 +245,12 @@ margin:0 0 .5rem}}p{{margin:0;color:#9ca3af;font-size:.95rem;line-height:1.4}}</
 }
 
 /// `+`-tolerant minimal query parser (browsers may send spaces as `+`).
+/// Operates on bytes so a `%` followed by a multi-byte UTF-8 char can never
+/// panic a str slice.
 fn parse_query(query: &str) -> Vec<(String, String)> {
     fn decode(value: &str) -> String {
         let bytes = value.as_bytes();
-        let mut decoded = Vec::with_capacity(bytes.len());
+        let mut decoded: Vec<u8> = Vec::with_capacity(bytes.len());
         let mut index = 0;
         while index < bytes.len() {
             match bytes[index] {
@@ -246,13 +259,18 @@ fn parse_query(query: &str) -> Vec<(String, String)> {
                     index += 1;
                 }
                 b'%' if index + 2 < bytes.len() => {
-                    let hex = &value[index + 1..index + 3];
-                    if let Ok(byte) = u8::from_str_radix(hex, 16) {
-                        decoded.push(byte);
-                        index += 3;
-                    } else {
-                        decoded.push(b'%');
-                        index += 1;
+                    let hex = std::str::from_utf8(&bytes[index + 1..index + 3])
+                        .ok()
+                        .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+                    match hex {
+                        Some(byte) => {
+                            decoded.push(byte);
+                            index += 3;
+                        }
+                        None => {
+                            decoded.push(b'%');
+                            index += 1;
+                        }
                     }
                 }
                 byte => {
@@ -383,14 +401,19 @@ pub fn refresh(access_token_refresh: &str) -> Result<TokenPair, String> {
         .map_err(|err| format!("parsing /auth/refresh response: {err}"))
 }
 
-/// Best-effort revocation of a refresh token (logout).
+/// Best-effort revocation of a refresh token (logout). Surfaced errors
+/// include the HTTP status so a permanent failure isn't mistaken for
+/// success.
 pub fn revoke(refresh_token: &str) -> Result<(), String> {
     let url = format!("{}/auth/logout", account_base());
-    account_client()?
+    let response = account_client()?
         .post(&url)
         .json(&serde_json::json!({"refresh_token": refresh_token}))
         .send()
         .map_err(|err| format!("POST {url}: {err}"))?;
+    if !response.status().is_success() {
+        return Err(format!("POST {url} → {}", response.status()));
+    }
     Ok(())
 }
 
@@ -448,7 +471,12 @@ pub fn with_refreshed_session<T>(
         refresh_token: pair.refresh_token.clone(),
         expires_at: session.expires_at,
         device_id: session.device_id,
-    });
+    })
+    .map_err(|err| {
+        format!(
+            "could not persist the refreshed session ({err}) — run `alforria auth login -p libertai` again"
+        )
+    })?;
     query(&pair.access_token)
 }
 
@@ -473,10 +501,8 @@ pub fn load_session() -> Option<StoredSession> {
     serde_json::from_str(&text).ok()
 }
 
-pub fn store_session(session: &StoredSession) {
-    let Ok(text) = serde_json::to_string(session) else {
-        return;
-    };
+pub fn store_session(session: &StoredSession) -> Result<(), String> {
+    let text = serde_json::to_string(session).map_err(|err| err.to_string())?;
     let path = session_path();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -484,18 +510,20 @@ pub fn store_session(session: &StoredSession) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        let _ = std::fs::OpenOptions::new()
+        std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .mode(0o600)
             .open(&path)
-            .and_then(|mut file| std::io::Write::write_all(&mut file, text.as_bytes()));
+            .and_then(|mut file| std::io::Write::write_all(&mut file, text.as_bytes()))
+            .map_err(|err| format!("writing {}: {err}", path.display()))?;
     }
     #[cfg(not(unix))]
     {
-        let _ = std::fs::write(&path, &text);
+        std::fs::write(&path, &text).map_err(|err| format!("writing {}: {err}", path.display()))?;
     }
+    Ok(())
 }
 
 pub fn clear_session() {
