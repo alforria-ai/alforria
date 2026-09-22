@@ -152,9 +152,20 @@ impl Truncate for TruncateService {
             tokio::fs::create_dir_all(&self.dir)
                 .await
                 .expect("create truncation dir");
-            tokio::fs::write(&file, text)
+            // tokio::fs::write only buffers small writes and relies on the
+            // async close from Drop to submit them — a caller reading the
+            // returned path immediately could observe a short file. Open,
+            // write, flush, sync: complete before the path is returned.
+            use tokio::io::AsyncWriteExt;
+            let mut handle = tokio::fs::File::create(&file)
+                .await
+                .expect("create spill file");
+            handle
+                .write_all(text.as_bytes())
                 .await
                 .expect("write spill file");
+            handle.flush().await.expect("flush spill file");
+            handle.sync_all().await.expect("sync spill file");
             file
         })
     }

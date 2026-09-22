@@ -861,7 +861,16 @@ async fn run(
         }
     };
     // Scoped exit of the chunk sink mirrors closeSink (shell.ts:450-473).
-    drop(sink);
+    // tokio::fs::File buffers small writes in its state machine and only
+    // submits them to the OS on the next write or flush; dropping the
+    // handle merely schedules an async close with no ordering guarantee
+    // against a later reader of the spill file. Flush the pipe before
+    // returning so the spill content is complete when the caller reads it.
+    if let Some(mut sink) = sink.take() {
+        use tokio::io::AsyncWriteExt;
+        let _ = sink.flush().await;
+        let _ = sink.sync_all().await;
+    }
 
     let mut meta: Vec<String> = Vec::new();
     if expired {
