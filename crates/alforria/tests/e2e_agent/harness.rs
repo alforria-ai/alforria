@@ -83,7 +83,15 @@ impl Env {
     }
 
     pub fn project_dir(&self) -> PathBuf {
-        self.home.join("project")
+        let project = self.home.join("project");
+        // macOS resolves TMPDIR through a symlink (/var/folders ->
+        // /private/var/folders): canonicalize so the `?directory=` the
+        // client sends matches the cwd the spawned server reports.
+        if project.exists() {
+            std::fs::canonicalize(&project).expect("canonicalize project dir")
+        } else {
+            project
+        }
     }
 
     pub fn write_project_config(&self, llm_url: &str, tag: &str) {
