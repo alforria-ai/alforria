@@ -3,11 +3,11 @@
 Deferred findings from rotating-model review panels. These are accepted
 deviations or future work items — not blockers.
 
-## M1: opencode-schema
+## M1: alforria-schema
 
 - none outstanding (two wire bugs found by review were fixed in `fixup:` commits).
 
-## M2: opencode-llm
+## M2: alforria-llm
 
 - MINOR (executor): TS threads `Headers.CurrentRedactedNames` through the
   executor; Rust redacts only the fixed SENSITIVE_NAME set. No call sites need
@@ -24,7 +24,7 @@ deviations or future work items — not blockers.
 - CONVENTION: f64-typed wire numbers serialize as x.0 vs integer — golden
   comparisons must be numeric-tolerant (applies to all future milestones).
 
-## M3: opencode-core foundation
+## M3: alforria-core foundation
 
 - MINOR (bus): TS `readAggregate` (paged, manifest-filtered read),
   `beforeAggregateRead` hook, `allBounded`/`SubscriberOverflowError` not
@@ -124,7 +124,7 @@ Panel: glm-5.3-thinking (agentic, complete through focus areas 1-4) + deepseek-v
 - **Hydrate "live-tracking wins" under the lock architecture**: TS hydrate merges events arriving during its awaits via the tracker; the Rust runtime holds the app lock across the hydrate awaits, so concurrent updates are structurally impossible — events queue and apply after the merge (live wins by ordering). Tracker kept for the M6.7-equivalent hydrate semantics and tested directly (sync.rs:2066+).
 - **`fatal` bootstrap contract**: `.context("fatal")` is a stringly type-level nit — the caller branches on the same `fatal` bool, so behavior is correct. Recorded, not fixed.
 - **`input_paste` `preventDefault: false`** (`keybind.ts:162`): a browser-only flag (native paste handler also runs); ratatui handles paste via `Msg::Paste`. Non-goal.
-- **`Moved.timestamp`**: `EpochMillis = i64` (opencode-schema), so the `.max(0)` clamp is a dead guard, not a flooring bug. Recorded.
+- **`Moved.timestamp`**: `EpochMillis = i64` (alforria-schema), so the `.max(0)` clamp is a dead guard, not a flooring bug. Recorded.
 
 ### Withdrawn/rejected by verification
 - "Suspend rewrite skips user `input_undo` overrides" — TS itself guards `keybinds.input_undo === undefined` (`config/index.tsx:105`); the Rust port is faithful.
@@ -135,8 +135,8 @@ Panel: glm-5.3-thinking (agentic, complete through focus areas 1-4) + deepseek-v
 Panel: glm-5.3-thinking (agentic — two runs, both died mid-flight at turns 50/35 with substantial verification work completed; client.rs verified "matches the SDK v2 semantics", run/tui/attach/providers/models comparisons in progress) + deepseek-v4.1-flash-thinking (three runs — two budget deaths, one external_directory denial; no findings emitted). Orchestrator spot-verification completed the highest-priority items directly.
 
 ### Accepted & fixed
-- **Catalog capability-field schema drift (MAJOR, C6/C9 finding)**: live models.dev data fails `temperature` parsing (the pinned TS schema reads plain booleans). `Catalog::Model` capability fields (`attachment`, `reasoning`, `temperature`, `tool_call`) now tolerate object forms (presence ⇒ supported) and default to `true` when absent (crates/opencode-core/src/catalog/types.rs).
-- **`cleanup_loop_fires_after_the_first_delay` flake (test infra)**: the +10ms cleanup tick can race `track()` creating the gitdir; a wasted tick waits the full interval. Test now uses a short retry interval (crates/opencode-core/src/session/snapshot.rs).
+- **Catalog capability-field schema drift (MAJOR, C6/C9 finding)**: live models.dev data fails `temperature` parsing (the pinned TS schema reads plain booleans). `Catalog::Model` capability fields (`attachment`, `reasoning`, `temperature`, `tool_call`) now tolerate object forms (presence ⇒ supported) and default to `true` when absent (crates/alforria-core/src/catalog/types.rs).
+- **`cleanup_loop_fires_after_the_first_delay` flake (test infra)**: the +10ms cleanup tick can race `track()` creating the gitdir; a wasted tick waits the full interval. Test now uses a short retry interval (crates/alforria-core/src/session/snapshot.rs).
 
 ### Verified equivalent by the panel/orchestrator
 - `client.rs` matches the TS SDK v2 rewrite semantics for the v1 API.
@@ -215,7 +215,7 @@ reference (88c6c7a): llm, session engine, tools, server, CLI+ACP, TUI+foundation
   value; "default"-variant models validated everything. Now follows
   `hasVariant` (service.ts:930-933).
 
-### Open findings — llm (opencode-llm)
+### Open findings — llm (alforria-llm)
 - **MAJOR**: openai-chat finalizes tool calls eagerly (isParsableJson) which
   downgrades terminal finish reason `tool-calls` → `stop` and streams
   tool-call events mid-response (openai_chat.rs:722-737 vs
@@ -234,7 +234,7 @@ reference (88c6c7a): llm, session engine, tools, server, CLI+ACP, TUI+foundation
   `args` (gemini.rs:271-276). MINOR: openai-chat strict tool-call index
   validation TS doesn't perform (openai_chat.rs:651-660).
 
-### Open findings — session engine (opencode-core)
+### Open findings — session engine (alforria-core)
 - **MAJOR**: question rejection does not block the agent loop: `rejected()`
   maps to a generic failed-tool message; TS `Question.RejectedError` +
   `instanceof` sets `ctx.blocked` (session/question.rs:258,
@@ -247,7 +247,7 @@ reference (88c6c7a): llm, session engine, tools, server, CLI+ACP, TUI+foundation
   can write after cleanup (session/llm.rs:688-702). MINOR: `title_from_text`
   counts scalars not UTF-16 (session/loop.rs:1129-1142 vs prompt.ts:247-249).
 
-### Open findings — tools (opencode-core)
+### Open findings — tools (alforria-core)
 - **MAJOR**: task input schema marks `command` required; TS keeps it optional
   (tool/task.rs:218-225 vs tool/task.ts:47-56).
 - **MAJOR**: background subagents accepted but not implemented at runtime —
@@ -276,7 +276,7 @@ reference (88c6c7a): llm, session engine, tools, server, CLI+ACP, TUI+foundation
   registry.rs:150). MINOR: grep searches binary files (ripgrep.rs:84-109).
   MINOR: edit levenshtein counts scalars not UTF-16 (edit.rs:182-203).
 
-### Open findings — server (opencode-server)
+### Open findings — server (alforria-server)
 - MINOR: missing `installation.updated` GlobalBus emission after upgrade
   (routes/v1/global_control.rs:189-216 vs handlers/global.ts:107-114).
   MINOR: PTY create drops the `shell.env` plugin trigger (no plugin runtime)

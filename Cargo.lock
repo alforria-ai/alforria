@@ -30,6 +30,163 @@ dependencies = [
 ]
 
 [[package]]
+name = "alforria"
+version = "0.1.0"
+dependencies = [
+ "alforria-core",
+ "alforria-llm",
+ "alforria-schema",
+ "alforria-server",
+ "alforria-tui",
+ "anyhow",
+ "axum",
+ "base64",
+ "chrono",
+ "clap",
+ "futures",
+ "libc",
+ "regex",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "alforria-core"
+version = "0.1.0"
+dependencies = [
+ "alforria-llm",
+ "alforria-schema",
+ "anyhow",
+ "base64",
+ "chrono",
+ "dirs",
+ "fs4",
+ "futures",
+ "globset",
+ "gray_matter",
+ "grep-regex",
+ "grep-searcher",
+ "hex",
+ "ignore",
+ "indexmap",
+ "jsonc-parser",
+ "libc",
+ "notify",
+ "rand 0.8.8",
+ "regex",
+ "reqwest",
+ "rusqlite",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "similar",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tree-sitter",
+ "tree-sitter-bash",
+ "ulid",
+ "walkdir",
+]
+
+[[package]]
+name = "alforria-llm"
+version = "0.1.0"
+dependencies = [
+ "alforria-schema",
+ "eventsource-stream",
+ "futures",
+ "regex",
+ "reqwest",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "alforria-schema"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "alforria-server"
+version = "0.1.0"
+dependencies = [
+ "alforria-core",
+ "alforria-llm",
+ "alforria-schema",
+ "axum",
+ "base64",
+ "flate2",
+ "futures",
+ "http-body",
+ "ignore",
+ "portable-pty",
+ "regex",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-tungstenite 0.26.2",
+ "tokio-util",
+ "tower",
+ "tower-http",
+ "tracing",
+ "ulid",
+ "uuid",
+]
+
+[[package]]
+name = "alforria-tui"
+version = "0.1.0"
+dependencies = [
+ "alforria-core",
+ "alforria-llm",
+ "alforria-schema",
+ "alforria-server",
+ "anyhow",
+ "async-trait",
+ "axum",
+ "crossterm",
+ "eventsource-stream",
+ "futures",
+ "hex",
+ "libc",
+ "rand 0.8.8",
+ "ratatui",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha1",
+ "tempfile",
+ "tokio",
+ "unicode-width",
+]
+
+[[package]]
 name = "allocator-api2"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1926,163 +2083,6 @@ name = "once_cell_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
-
-[[package]]
-name = "opencode"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "base64",
- "chrono",
- "clap",
- "futures",
- "libc",
- "opencode-core",
- "opencode-llm",
- "opencode-schema",
- "opencode-server",
- "opencode-tui",
- "regex",
- "reqwest",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "opencode-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64",
- "chrono",
- "dirs",
- "fs4",
- "futures",
- "globset",
- "gray_matter",
- "grep-regex",
- "grep-searcher",
- "hex",
- "ignore",
- "indexmap",
- "jsonc-parser",
- "libc",
- "notify",
- "opencode-llm",
- "opencode-schema",
- "rand 0.8.8",
- "regex",
- "reqwest",
- "rusqlite",
- "rust_decimal",
- "serde",
- "serde_json",
- "sha1",
- "sha2",
- "similar",
- "tempfile",
- "thiserror 2.0.20",
- "tokio",
- "tokio-util",
- "tracing",
- "tree-sitter",
- "tree-sitter-bash",
- "ulid",
- "walkdir",
-]
-
-[[package]]
-name = "opencode-llm"
-version = "0.1.0"
-dependencies = [
- "eventsource-stream",
- "futures",
- "opencode-schema",
- "regex",
- "reqwest",
- "rust_decimal",
- "serde",
- "serde_json",
- "sha2",
- "thiserror 2.0.20",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
-name = "opencode-schema"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "serde",
- "serde_json",
- "thiserror 2.0.20",
-]
-
-[[package]]
-name = "opencode-server"
-version = "0.1.0"
-dependencies = [
- "axum",
- "base64",
- "flate2",
- "futures",
- "http-body",
- "ignore",
- "opencode-core",
- "opencode-llm",
- "opencode-schema",
- "portable-pty",
- "regex",
- "reqwest",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror 2.0.20",
- "tokio",
- "tokio-tungstenite 0.26.2",
- "tokio-util",
- "tower",
- "tower-http",
- "tracing",
- "ulid",
- "uuid",
-]
-
-[[package]]
-name = "opencode-tui"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum",
- "crossterm",
- "eventsource-stream",
- "futures",
- "hex",
- "libc",
- "opencode-core",
- "opencode-llm",
- "opencode-schema",
- "opencode-server",
- "rand 0.8.8",
- "ratatui",
- "reqwest",
- "serde",
- "serde_json",
- "sha1",
- "tempfile",
- "tokio",
- "unicode-width",
-]
 
 [[package]]
 name = "openssl"

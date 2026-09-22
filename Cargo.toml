@@ -1,12 +1,12 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/opencode-schema",
-    "crates/opencode-llm",
-    "crates/opencode-core",
-    "crates/opencode-server",
-    "crates/opencode-tui",
-    "crates/opencode",
+    "crates/alforria-schema",
+    "crates/alforria-llm",
+    "crates/alforria-core",
+    "crates/alforria-server",
+    "crates/alforria-tui",
+    "crates/alforria",
 ]
 
 [workspace.package]
@@ -80,11 +80,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Internal
-opencode-schema = { path = "crates/opencode-schema" }
-opencode-llm = { path = "crates/opencode-llm" }
-opencode-core = { path = "crates/opencode-core" }
-opencode-server = { path = "crates/opencode-server" }
-opencode-tui = { path = "crates/opencode-tui" }
+alforria-schema = { path = "crates/alforria-schema" }
+alforria-llm = { path = "crates/alforria-llm" }
+alforria-core = { path = "crates/alforria-core" }
+alforria-server = { path = "crates/alforria-server" }
+alforria-tui = { path = "crates/alforria-tui" }
 
 [profile.dev]
 debug = 1

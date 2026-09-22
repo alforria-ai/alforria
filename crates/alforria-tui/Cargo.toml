@@ -1,0 +1,30 @@
+[package]
+name = "alforria-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+alforria-schema = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+eventsource-stream = { workspace = true }
+futures = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha1 = { workspace = true }
+hex = { workspace = true }
+ratatui = { workspace = true }
+unicode-width = { workspace = true }
+crossterm = { workspace = true }
+libc = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }
+alforria-core = { workspace = true }
+alforria-llm = { workspace = true }
+alforria-server = { workspace = true }
+tempfile = "3"

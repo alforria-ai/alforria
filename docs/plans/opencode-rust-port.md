@@ -21,12 +21,12 @@ Porting target (~125k LOC of TypeScript that implements the product):
 
 | TS package | LOC | Rust destination |
 |---|---|---|
-| `packages/opencode` (core agent/CLI/server) | 81k | `opencode-core`, `opencode-server`, `opencode` bin |
-| `packages/core` (LLM abstractions, session runtime) | 33k | `opencode-core` |
-| `packages/llm` (native LLM client, 6 protocols) | 9.5k | `opencode-llm` |
-| `packages/schema` (wire DTOs/events) | 3.4k | `opencode-schema` |
-| `packages/protocol` + `packages/server` (v2 API) | ~3k | `opencode-server` |
-| `packages/tui` | 27k | `opencode-tui` (ratatui) |
+| `packages/opencode` (core agent/CLI/server) | 81k | `alforria-core`, `alforria-server`, `opencode` bin |
+| `packages/core` (LLM abstractions, session runtime) | 33k | `alforria-core` |
+| `packages/llm` (native LLM client, 6 protocols) | 9.5k | `alforria-llm` |
+| `packages/schema` (wire DTOs/events) | 3.4k | `alforria-schema` |
+| `packages/protocol` + `packages/server` (v2 API) | ~3k | `alforria-server` |
+| `packages/tui` | 27k | `alforria-tui` (ratatui) |
 
 **Remain TS clients over the wire** (confirmed hybrid scope): `app`, `desktop`, `session-ui`,
 `ui`, `web`, `sdk` — they work unchanged via the wire contract.
@@ -36,11 +36,11 @@ Porting target (~125k LOC of TypeScript that implements the product):
 ```
 opencode-rs/
 ├── crates/
-│   ├── opencode-schema      # wire DTOs, events, JSON shapes (serde, byte-parity)
-│   ├── opencode-llm         # protocols, LLMEvent stream, usage/cost, cache policy, retries
-│   ├── opencode-core        # session runner, event bus, projector, catalog, tools, permission, config
-│   ├── opencode-server      # v1+v2 HTTP, SSE, PTY WS, auth, OpenAPI export
-│   ├── opencode-tui         # ratatui, pure HTTP+SSE client of the server
+│   ├── alforria-schema      # wire DTOs, events, JSON shapes (serde, byte-parity)
+│   ├── alforria-llm         # protocols, LLMEvent stream, usage/cost, cache policy, retries
+│   ├── alforria-core        # session runner, event bus, projector, catalog, tools, permission, config
+│   ├── alforria-server      # v1+v2 HTTP, SSE, PTY WS, auth, OpenAPI export
+│   ├── alforria-tui         # ratatui, pure HTTP+SSE client of the server
 │   └── opencode/            # binary: clap CLI (run, serve, tui, attach, acp, mcp, ...)
 ├── fixtures/                # frozen golden fixtures extracted from the TS repo
 └── docs/plans/
@@ -67,8 +67,8 @@ opentelemetry, octocrab, tokio-tungstenite.
 | # | Milestone | Key deliverable | Acceptance check |
 |---|---|---|---|
 | 0 | Workspace + fixtures | Cargo workspace, CI, frozen TS fixtures | `cargo test` green; fixture extraction reproducible |
-| 1 | `opencode-schema` | All DTOs/events, golden JSON round-trip | byte-identical serialization vs fixtures |
-| 2 | `opencode-llm` protocols | openai-chat, openai-compatible-chat, openai-responses, anthropic-messages, gemini, bedrock-converse; LLMEvent stream; usage invariants; retries; cache policy | golden SSE-fixture replay tests; usage property tests |
+| 1 | `alforria-schema` | All DTOs/events, golden JSON round-trip | byte-identical serialization vs fixtures |
+| 2 | `alforria-llm` protocols | openai-chat, openai-compatible-chat, openai-responses, anthropic-messages, gemini, bedrock-converse; LLMEvent stream; usage invariants; retries; cache policy | golden SSE-fixture replay tests; usage property tests |
 | 3 | Config + catalog + storage | JSONC config loader (precedence chain), models.dev catalog, SQLite storage (drizzle-compatible), EventV2 bus | config precedence tests; DB schema diff vs TS migrations |
 | 4 | Tools (all 17) | bash, edit (fuzzy-replacer chain), read, write, grep, glob, task, todowrite, skill, question, webfetch, websearch, lsp, apply_patch, plan_exit, execute, invalid + truncation | per-tool unit + integration matrix |
 | 5 | Session engine | Agent loop, processor (stream→parts), compaction, revert/snapshot, permissions, subagents, retry, doom-loop detection, cost accounting | mock-LLM full-loop E2E |
