@@ -17,10 +17,8 @@ pub mod subagent_footer;
 pub mod transcript;
 
 use ratatui::layout::Rect;
-use ratatui::style::Style;
-use ratatui::widgets::Widget;
 
-use super::theme::{selected_foreground, Rgba, Theme};
+use super::theme::{selected_foreground, tint, Rgba, Theme};
 use crate::state::route::Route;
 use crate::state::{App, SessionScroll};
 use crate::ui::theme::Mode as ThemeMode;
@@ -215,13 +213,16 @@ pub fn render(app: &mut App, frame: &mut ratatui::Frame, theme: &Theme, area: Re
     let footer_height = 1;
     let vertical = ratatui::layout::Layout::vertical([
         ratatui::layout::Constraint::Fill(1),
+        // The `gap={1}` between the transcript scrollbox and the
+        // bottom stack (`session/index.tsx:1178`).
+        ratatui::layout::Constraint::Length(1),
         ratatui::layout::Constraint::Length(bottom_height),
         ratatui::layout::Constraint::Length(footer_height),
     ])
     .split(column);
 
     transcript::render(app, frame, theme, vertical[0], &session_id, content_width);
-    let mut row = vertical[1];
+    let mut row = vertical[2];
     if is_child {
         let footer = Rect {
             height: subagent_footer::HEIGHT,
@@ -241,19 +242,28 @@ pub fn render(app: &mut App, frame: &mut ratatui::Frame, theme: &Theme, area: Re
     } else if prompt_visible {
         prompt::render(app, frame, theme, row);
     }
-    footer::render(app, frame, theme, vertical[2], &session_id);
+    footer::render(app, frame, theme, vertical[3], &session_id);
 
     if sidebar_visible && !sidebar_area.is_empty() {
         if !wide {
-            // Dimmed backdrop (`RGBA.fromInts(0, 0, 0, 70)`) — approximated
-            // by drawing the backdrop dark under the sidebar column.
-            let dim = Rect {
-                width: SIDEBAR_WIDTH,
-                ..sidebar_area
-            };
-            ratatui::widgets::Block::new()
-                .style(Style::new().bg(theme.background.to_color()))
-                .render(dim, frame.buffer_mut());
+            // The full-frame translucent backdrop (`session/index.tsx:1343-1355`,
+            // `RGBA.fromInts(0, 0, 0, 70)`) — ratatui has no alpha channel,
+            // so every painted background cell is tinted toward black by
+            // `70/255`. The sidebar then renders on top of the overlay.
+            let black = Rgba::from_values(0.0, 0.0, 0.0, 1.0);
+            let alpha = 70.0 / 255.0;
+            let buffer = frame.buffer_mut();
+            for y in area.top()..area.bottom() {
+                for x in area.left()..area.right() {
+                    let Some(cell) = buffer.cell_mut((x, y)) else {
+                        continue;
+                    };
+                    if let ratatui::style::Color::Rgb(r, g, b) = cell.bg {
+                        let dimmed = tint(Rgba::from_ints(r, g, b), black, alpha);
+                        cell.bg = dimmed.to_color();
+                    }
+                }
+            }
         }
         sidebar::render(app, frame, theme, sidebar_area, &session_id);
     }
@@ -292,7 +302,14 @@ pub fn directory_label(app: &App) -> String {
         .directory
         .clone()
         .unwrap_or_default();
-    let result = super::locale::abbreviate_home(&directory, "");
+    let home = app
+        .state
+        .project
+        .instance_path
+        .home
+        .clone()
+        .unwrap_or_default();
+    let result = super::locale::abbreviate_home(&directory, &home);
     match app
         .state
         .sync
