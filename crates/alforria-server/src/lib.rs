@@ -345,7 +345,7 @@ pub fn write_warning(out: &mut impl std::io::Write) {
 }
 
 pub fn write_listening(out: &mut impl std::io::Write, hostname: &str, port: u16) {
-    let _ = writeln!(out, "opencode server listening on http://{hostname}:{port}");
+    let _ = writeln!(out, "alforria server listening on http://{hostname}:{port}");
 }
 
 /// `URL.canParse(item) && /^(https?:)$/.test(new URL(item).protocol)`
@@ -421,7 +421,7 @@ fn materialize_git_reference(
     Some(path)
 }
 
-/// `opencode serve` — print the banner and run until stopped.
+/// `alforria serve` — print the banner and run until stopped.
 pub async fn serve(opts: &ListenOptions) -> io::Result<Listener> {
     let password_set = std::env::var("OPENCODE_SERVER_PASSWORD")
         .map(|v| !v.is_empty())
@@ -447,7 +447,7 @@ mod tests {
         assert_eq!(
             out,
             "Warning: OPENCODE_SERVER_PASSWORD is not set; server is unsecured.\n\
-             opencode server listening on http://127.0.0.1:4096\n"
+             alforria server listening on http://127.0.0.1:4096\n"
         );
     }
 
@@ -456,7 +456,7 @@ mod tests {
         let mut out = Vec::new();
         write_listening(&mut out, "0.0.0.0", 1234);
         let out = String::from_utf8(out).unwrap();
-        assert_eq!(out, "opencode server listening on http://0.0.0.0:1234\n");
+        assert_eq!(out, "alforria server listening on http://0.0.0.0:1234\n");
     }
 
     #[test]

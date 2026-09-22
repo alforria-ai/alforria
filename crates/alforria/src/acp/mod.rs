@@ -148,7 +148,7 @@ impl AcpAgent {
                 "terminal-auth": {
                     "command": "alforria",
                     "args": ["auth", "login"],
-                    "label": "OpenCode Login",
+                    "label": "Alforria Login",
                 },
             });
         }
@@ -167,7 +167,7 @@ impl AcpAgent {
             },
             "authMethods": [auth_method],
             "agentInfo": {
-                "name": "OpenCode",
+                "name": "Alforria",
                 "version": alforria_core::session::store::INSTALLATION_VERSION,
             },
         }))
@@ -837,7 +837,7 @@ impl AcpAgent {
 
     async fn directory_snapshot(&self, cwd: &str) -> Result<Arc<Snapshot>, AcpError> {
         self.directories.get(cwd).await.map_err(|_| {
-            AcpError::internal_error(json!({ "details": "OpenCode service failure" }), None)
+            AcpError::internal_error(json!({ "details": "Alforria service failure" }), None)
         })
     }
 
@@ -1038,7 +1038,7 @@ fn prompt_error_message(error: &Value) -> String {
     error
         .pointer("/data/message")
         .and_then(Value::as_str)
-        .unwrap_or("OpenCode prompt failed")
+        .unwrap_or("Alforria prompt failed")
         .to_string()
 }
 

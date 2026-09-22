@@ -313,15 +313,18 @@ fn info(app: &App, request: &PermissionV1Request) -> (&'static str, String, Vec<
                 if patterns.is_empty() {
                     Vec::new()
                 } else {
-                    patterns
-                        .into_iter()
-                        .map(|pattern| Line::styled(pattern, text))
-                        .collect()
+                    let mut lines = vec![Line::styled("Patterns", muted), Line::raw("")];
+                    lines.extend(
+                        patterns
+                            .into_iter()
+                            .map(|pattern| Line::styled(format!("- {pattern}"), text)),
+                    );
+                    lines
                 },
             )
         }
         "doom_loop" => (
-            "�",
+            "⟳",
             "Continue after repeated failures".to_string(),
             vec![muted_line(
                 "  This keeps the session running despite repeated failures.".to_string(),
@@ -403,7 +406,7 @@ pub fn handle_key(app: &mut App, key: &crossterm::event::KeyEvent) -> Option<Vec
                 let selected = app.ui.permission.selected;
                 app.ui.permission.stage = PermissionStage::Permission;
                 app.ui.permission.selected = 0;
-                if selected == 1 {
+                if selected == 0 {
                     return Some(vec![reply_effect(
                         &request,
                         PermissionV1Reply::Always,
@@ -457,7 +460,7 @@ fn select(
         "once" => vec![reply_effect(request, PermissionV1Reply::Once, None)],
         "always" => {
             app.ui.permission.stage = PermissionStage::Always;
-            app.ui.permission.selected = 1;
+            app.ui.permission.selected = 0;
             Vec::new()
         }
         _ => {
@@ -544,14 +547,14 @@ pub fn lines(app: &App) -> Vec<Line<'static>> {
             if request.always.len() == 1 && request.always[0] == "*" {
                 rows.push(Line::styled(
                     format!(
-                        "  This will allow {} until OpenCode is restarted.",
+                        "  This will allow {} until Alforria is restarted.",
                         request.permission
                     ),
                     Style::new().fg(theme.text_muted.to_color()),
                 ));
             } else {
                 rows.push(Line::styled(
-                    "  This will allow the following patterns until OpenCode is restarted",
+                    "  This will allow the following patterns until Alforria is restarted",
                     Style::new().fg(theme.text_muted.to_color()),
                 ));
                 for pattern in &request.always {
@@ -561,7 +564,7 @@ pub fn lines(app: &App) -> Vec<Line<'static>> {
                     ));
                 }
             }
-            let labels = ["Cancel", "Confirm"];
+            let labels = ["Confirm", "Cancel"];
             let mut spans: Vec<Span<'static>> = Vec::new();
             for (index, label) in labels.iter().enumerate() {
                 let active = index == state.selected;
@@ -592,7 +595,7 @@ pub fn lines(app: &App) -> Vec<Line<'static>> {
                 ),
             ]));
             rows.push(Line::styled(
-                "  Tell OpenCode what to do differently",
+                "  Tell Alforria what to do differently",
                 Style::new().fg(theme.text_muted.to_color()),
             ));
             rows.push(Line::styled(

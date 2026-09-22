@@ -198,7 +198,7 @@ fn acp_end_to_end_flow() {
         json!({ "protocolVersion": 1, "clientCapabilities": {} }),
     );
     assert_eq!(initialized["protocolVersion"], json!(1));
-    assert_eq!(initialized["agentInfo"]["name"], json!("OpenCode"));
+    assert_eq!(initialized["agentInfo"]["name"], json!("Alforria"));
     assert!(
         initialized["agentCapabilities"]["sessionCapabilities"]["fork"] == json!({}),
         "session capabilities: {initialized}"

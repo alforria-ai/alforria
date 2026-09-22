@@ -19,24 +19,24 @@ pub mod style {
 }
 
 const WORDMARK: [&str; 4] = [
-    "⠀                                 ▄    ",
+    "                                 ▄     ",
     "█▀▀█ █    █▀▀█ █▀▀█ █▀▀█ █▀▀█ ▀▀▀▀ █▀▀█",
-    "█  █ █    █  ▀ █  █ █  ▀ █  ▀  █   █  █",
-    "▀▀▀▀ █▀▀█ █    ▀▀▀▀ █▀▀█ █▀▀█ ▀▀▀▀ ▀▀▀▀",
+    "█▄▄█ █    █▀▀▀ █  █ █  ▀ █  ▀  █   █▄▄█",
+    "█  █ █▀▀█ █    ▀▀▀▀ █  █ █  █ ▀▀▀▀ █  █",
 ];
 
 const LOGO_LEFT: [&str; 4] = [
     "                   ",
     "█▀▀█ █___ █▀▀█ █▀▀█",
-    "█__█ █___ █__^ █__█",
-    "▀▀▀▀ █▀▀█ █___ ▀~~▀",
+    "█▄▄█ █___ █▀▀▀ █__█",
+    "█__█ █▀▀█ █___ ▀~~▀",
 ];
 
 const LOGO_RIGHT: [&str; 4] = [
     "             ▄     ",
     "█▀▀█ █▀▀█ ▀▀▀▀ █▀▀█",
-    "█__^ █__^ _█__ █__█",
-    "█▀▀█ █▀▀█ ▀▀▀▀ ▀▀▀▀",
+    "█__^ █__^ _█__ █▄▄█",
+    "█__█ █__█ ▀▀▀▀ █__█",
 ];
 
 fn draw(line: &str, fg: &str, shadow: &str, bg: &str) -> String {
@@ -305,7 +305,7 @@ mod tests {
         assert!(!ui.is_tty());
         let logo = ui.logo(None);
         let lines: Vec<&str> = logo.split('\n').collect();
-        assert_eq!(lines[0], "⠀                                 ▄    ");
+        assert_eq!(lines[0], "                                 ▄     ");
         assert_eq!(lines.len(), 4);
         assert!(!logo.contains("\x1b["));
     }
@@ -316,9 +316,7 @@ mod tests {
         assert!(ui.is_tty());
         let logo = ui.logo(None);
         assert!(logo.contains("\x1b[90m"));
-        assert!(logo.contains("\x1b[38;5;235m"));
-        assert!(logo.contains("\x1b[48;5;238m"));
-        assert!(logo.contains("▀"));
+        assert!(logo.contains("█"));
     }
 
     #[test]

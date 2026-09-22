@@ -244,18 +244,17 @@ mod tests {
     #[test]
     fn logo_renders_the_wordmark() {
         let lines = buffer_text(&make_app(), 80, 24);
-        // `_` renders as a shadowed space and `~` as a shadowed `▀`.
         let joined = lines.join("\n");
         assert!(
             joined.contains("█▀▀█ █    █▀▀█ █▀▀█ █▀▀█ █▀▀█ ▀▀▀▀ █▀▀█"),
             "{joined}"
         );
         assert!(
-            joined.contains("█  █ █    █  ▀ █  █ █  ▀ █  ▀  █   █  █"),
+            joined.contains("█▄▄█ █    █▀▀▀ █  █ █  ▀ █  ▀  █   █▄▄█"),
             "{joined}"
         );
         assert!(
-            joined.contains("▀▀▀▀ █▀▀█ █    ▀▀▀▀ █▀▀█ █▀▀█ ▀▀▀▀ ▀▀▀▀"),
+            joined.contains("█  █ █▀▀█ █    ▀▀▀▀ █  █ █  █ ▀▀▀▀ █  █"),
             "{joined}"
         );
     }
@@ -340,11 +339,11 @@ mod tests {
         );
         assert_eq!(
             lines[13],
-            format!("{}█  █ █    █  ▀ █  █ █  ▀ █  ▀  █   █  █", pad(20))
+            format!("{}█▄▄█ █    █▀▀▀ █  █ █  ▀ █  ▀  █   █▄▄█", pad(20))
         );
         assert_eq!(
             lines[14],
-            format!("{}▀▀▀▀ █▀▀█ █    ▀▀▀▀ █▀▀█ █▀▀█ ▀▀▀▀ ▀▀▀▀", pad(20))
+            format!("{}█  █ █▀▀█ █    ▀▀▀▀ █  █ █  █ ▀▀▀▀ █  █", pad(20))
         );
         assert_eq!(lines[16], format!("{}│", pad(2)));
         assert_eq!(
@@ -375,7 +374,7 @@ mod tests {
             })
             .unwrap();
         let buffer = terminal.backend().buffer();
-        let cell = |column: u16| buffer[(column, 13)].clone();
+        let cell = |column: u16| buffer[(column, 12)].clone();
         // Left half `█` in textMuted, no modifiers.
         assert_eq!(cell(20).fg, ratatui::style::Color::Rgb(0x80, 0x80, 0x80));
         assert_eq!(cell(20).modifier, ratatui::style::Modifier::empty());

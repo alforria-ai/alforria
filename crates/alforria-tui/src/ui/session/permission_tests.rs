@@ -289,7 +289,7 @@ fn the_always_stage_lists_patterns() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        text.contains("This will allow the following patterns until OpenCode is restarted"),
+        text.contains("This will allow the following patterns until Alforria is restarted"),
         "{text}"
     );
     assert!(text.contains("- src/**"), "{text}");

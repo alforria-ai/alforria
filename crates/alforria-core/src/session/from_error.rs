@@ -191,7 +191,7 @@ fn api_error_message(e: &ApiCallError) -> String {
         let body = e.response_body.as_deref().unwrap_or_default();
         if is_html_page(body) {
             return match e.status_code {
-                Some(401) => "Unauthorized: request was blocked by a gateway or proxy. Your authentication token may be missing or expired — try running `opencode auth login <your provider URL>` to re-authenticate.",
+                Some(401) => "Unauthorized: request was blocked by a gateway or proxy. Your authentication token may be missing or expired — try running `alforria auth login <your provider URL>` to re-authenticate.",
                 Some(403) => "Forbidden: request was blocked by a gateway or proxy. You may not have permission to access this resource — check your account and provider settings.",
                 _ => msg,
             }

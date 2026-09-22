@@ -1,4 +1,4 @@
-# AGENTS.md — opencode-rs
+# AGENTS.md — alforria
 
 **alforria** — a Rust port of [opencode](https://github.com/anomalyco/opencode),
 released by LibertAI. Pinned TS reference commit:

@@ -1,20 +1,25 @@
-//! The alforria ASCII wordmark (left `ALFO` + right `RRIA` halves, in the
-//! style of the TS `logo.ts`) and the spinner frames
-//! (`component/spinner.tsx`).
+//! The alforria ASCII wordmark (left `ALFO` + right `RRIA` halves) and the
+//! spinner frames (`component/spinner.tsx`).
+//!
+//! The half-block letters share opencode's `logo.ts` idiom — left half muted,
+//! right half bold — but `ALFORRIA` needs glyphs the reference never had
+//! (`A`,`L`,`F`,`R`,`I`). Those are drawn below with a custom shadow
+//! treatment: `_` is a shadowed space, `^` a shadowed `▀`, `~` a shadow `▀`
+//! and `,` a shadow `▄` (see `component/logo.tsx`).
 
 /// The wordmark halves: `left` renders muted, `right` renders bold.
 pub const LOGO: Logo = Logo {
     left: [
         "                   ",
         "█▀▀█ █___ █▀▀█ █▀▀█",
-        "█__█ █___ █__^ █__█",
-        "▀▀▀▀ █▀▀█ █___ ▀~~▀",
+        "█▄▄█ █___ █▀▀▀ █__█",
+        "█__█ █▀▀█ █___ ▀~~▀",
     ],
     right: [
         "             ▄     ",
         "█▀▀█ █▀▀█ ▀▀▀▀ █▀▀█",
-        "█__^ █__^ _█__ █__█",
-        "█▀▀█ █▀▀█ ▀▀▀▀ ▀▀▀▀",
+        "█__^ █__^ _█__ █▄▄█",
+        "█__█ █__█ ▀▀▀▀ █__█",
     ],
 };
 
@@ -35,6 +40,7 @@ mod tests {
         assert_eq!(LOGO.left.len(), LOGO.right.len());
         for (left, right) in LOGO.left.iter().zip(LOGO.right.iter()) {
             assert_eq!(left.chars().count(), right.chars().count());
+            assert_eq!(left.chars().count(), 19);
         }
     }
 }

@@ -102,13 +102,20 @@ pub fn lines(app: &App, theme: &Theme, session_id: &str) -> Vec<Line<'static>> {
     rows
 }
 
-/// The footer `• OpenCode <version>` (`sidebar.tsx:81-95`) — green
-/// bullet, bold wordmark, muted version.
+/// The footer `• Alforria <version>` (`sidebar.tsx:81-95`) — green
+/// bullet, two-tone bold wordmark (muted `Alfo` + `rria` in text),
+/// muted version.
 pub fn footer_line(theme: &Theme) -> Line<'static> {
     Line::from(vec![
         Span::styled("• ", Style::new().fg(theme.success.to_color())),
         Span::styled(
-            "OpenCode",
+            "Alfo",
+            Style::new()
+                .fg(theme.text_muted.to_color())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "rria",
             Style::new()
                 .fg(theme.text.to_color())
                 .add_modifier(Modifier::BOLD),
@@ -229,6 +236,6 @@ mod tests {
     #[test]
     fn footer_wordmark() {
         let theme = crate::ui::session::test_theme();
-        assert_eq!(text(&footer_line(&theme)), "• OpenCode dev");
+        assert_eq!(text(&footer_line(&theme)), "• Alforria dev");
     }
 }

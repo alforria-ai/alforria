@@ -378,22 +378,22 @@ fn compare_prerelease(a: &str, b: &str) -> std::cmp::Ordering {
     a_parts.len().cmp(&b_parts.len()).then(a.cmp(b))
 }
 
-/// The terminal title effect (`app.tsx:455-478`): `OpenCode` on home and
-/// default-titled sessions, `OC | <title truncated to 40>` otherwise.
+/// The terminal title effect (`app.tsx:455-478`): `Alforria` on home and
+/// default-titled sessions, `AL | <title truncated to 40>` otherwise.
 /// `None` means "do not set" (disabled or env-suppressed).
 pub fn terminal_title(app: &App, env_disabled: bool) -> Option<String> {
     if env_disabled || !app.state.kv.get_bool(keys::TERMINAL_TITLE_ENABLED, true) {
         return None;
     }
     match &app.state.route.data {
-        Route::Home { .. } => Some("OpenCode".to_string()),
+        Route::Home { .. } => Some("Alforria".to_string()),
         Route::Session { session_id, .. } => {
             let session = app.state.sync.session(session_id);
             let Some(session) = session else {
-                return Some("OpenCode".to_string());
+                return Some("Alforria".to_string());
             };
             if is_default_title(&session.title) {
-                return Some("OpenCode".to_string());
+                return Some("Alforria".to_string());
             }
             let truncated = if session.title.chars().count() > 40 {
                 let prefix: String = session.title.chars().take(37).collect();
@@ -401,9 +401,9 @@ pub fn terminal_title(app: &App, env_disabled: bool) -> Option<String> {
             } else {
                 session.title.clone()
             };
-            Some(format!("OC | {truncated}"))
+            Some(format!("AL | {truncated}"))
         }
-        Route::Plugin { id, .. } => Some(format!("OC | {id}")),
+        Route::Plugin { id, .. } => Some(format!("AL | {id}")),
     }
 }
 
@@ -536,7 +536,7 @@ mod tests {
     #[test]
     fn terminal_title_matrix() {
         let mut app = app_with(Args::default());
-        assert_eq!(terminal_title(&app, false), Some("OpenCode".to_string()));
+        assert_eq!(terminal_title(&app, false), Some("Alforria".to_string()));
 
         app.state.route.navigate(Route::Session {
             session_id: "ses_1".into(),
@@ -548,26 +548,26 @@ mod tests {
             1,
             None,
         )];
-        assert_eq!(terminal_title(&app, false), Some("OpenCode".to_string()));
+        assert_eq!(terminal_title(&app, false), Some("Alforria".to_string()));
 
         app.state.sync.session[0].title = "Fix the build".into();
         assert_eq!(
             terminal_title(&app, false),
-            Some("OC | Fix the build".to_string())
+            Some("AL | Fix the build".to_string())
         );
 
         app.state.sync.session[0].title =
             "A title that is way longer than forty characters in total".into();
         assert_eq!(
             terminal_title(&app, false),
-            Some("OC | A title that is way longer than forty…".to_string())
+            Some("AL | A title that is way longer than forty…".to_string())
         );
 
         app.state.route.navigate(Route::Plugin {
             id: "diff".into(),
             data: None,
         });
-        assert_eq!(terminal_title(&app, false), Some("OC | diff".to_string()));
+        assert_eq!(terminal_title(&app, false), Some("AL | diff".to_string()));
     }
 
     #[test]
