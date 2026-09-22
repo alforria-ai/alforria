@@ -381,6 +381,14 @@ pub fn builtin_provider() -> Provider {
     }
 }
 
+/// Merge the built-in provider into a provider map — only when absent, a
+/// models.dev or opencode.json entry is never clobbered.
+pub fn merge_builtin_provider(providers: &mut crate::catalog::Providers) {
+    providers
+        .entry(LIBERTAI_PROVIDER_ID.to_string())
+        .or_insert_with(builtin_provider);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

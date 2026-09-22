@@ -796,9 +796,7 @@ pub fn load_catalog(
 ) -> Result<alforria_core::catalog::Providers, ServerError> {
     let mut providers = catalog()
         .map_err(|err| ServerError::Core(alforria_core::CoreError::Catalog(err.to_string())))?;
-    providers
-        .entry(alforria_core::libertai::LIBERTAI_PROVIDER_ID.to_string())
-        .or_insert_with(alforria_core::libertai::builtin_provider);
+    alforria_core::libertai::merge_builtin_provider(&mut providers);
     Ok(providers)
 }
 

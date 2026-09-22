@@ -422,7 +422,8 @@ fn login_url(ui: &mut Ui, deps: &mut LoginDeps, raw_url: &str) -> Result<(), Typ
 fn login_provider(ui: &mut Ui, deps: &mut LoginDeps, args: &LoginArgs) -> Result<(), TypedError> {
     // `Effect.ignore(modelsDev.refresh(true))` — refresh errors are swallowed.
     deps.catalog.refresh(true);
-    let catalog = deps.catalog.get().map_err(core_error)?;
+    let mut catalog = deps.catalog.get().map_err(core_error)?;
+    alforria_core::libertai::merge_builtin_provider(&mut catalog);
     let providers = ordered_providers(deps, &catalog);
     let provider = match &args.provider {
         Some(input) => {
@@ -555,7 +556,8 @@ pub fn run(matches: &ArgMatches, ui: &mut Ui) -> Result<(), TypedError> {
     let catalog = crate::catalog::catalog_service();
     match matches.subcommand_name() {
         Some("list") => {
-            let providers = catalog.get().map_err(core_error)?;
+            let mut providers = catalog.get().map_err(core_error)?;
+            alforria_core::libertai::merge_builtin_provider(&mut providers);
             list(
                 ui,
                 &auth,
@@ -707,6 +709,10 @@ mod tests {
     }
 
     fn fixture_catalog(dir: &Path) -> Arc<CatalogService> {
+        // The built-in libertai provider merge must stay deterministic:
+        // empty cache + no fetch → embedded snapshot.
+        std::env::set_var("XDG_CACHE_HOME", dir.join("cache-home"));
+        std::env::set_var("LIBERTAI_MODEL_CATALOG_URL", "");
         let fixture = dir.join("models.json");
         std::fs::write(&fixture, FIXTURE).unwrap();
         let cfg = alforria_core::CatalogConfig {
@@ -1089,6 +1095,10 @@ mod tests {
     fn login_provider_hints() {
         for (provider, hint) in [
             ("alforria", "Create an api key at https://opencode.ai/auth"),
+            (
+                "libertai",
+                "Create an API key at https://console.libertai.io",
+            ),
             (
                 "vercel",
                 "You can create an api key at https://vercel.link/ai-gateway-token",

@@ -36,7 +36,8 @@ pub fn run_with(
             ui::style::TEXT_NORMAL
         ));
     }
-    let providers = catalog.get().map_err(core_error)?;
+    let mut providers = catalog.get().map_err(core_error)?;
+    alforria_core::libertai::merge_builtin_provider(&mut providers);
     if let Some(id) = provider {
         let Some(found) = providers.get(id) else {
             return Err(TypedError::Cli(CliError::new(format!(
@@ -102,6 +103,10 @@ mod tests {
     }
 
     fn fixture_catalog(dir: &Path) -> (Arc<CatalogService>, Arc<FixtureFetcher>) {
+        // The built-in libertai provider merge must stay deterministic:
+        // empty cache + no fetch → embedded snapshot.
+        std::env::set_var("XDG_CACHE_HOME", dir.join("cache-home"));
+        std::env::set_var("LIBERTAI_MODEL_CATALOG_URL", "");
         let fixture = dir.join("models.json");
         std::fs::write(&fixture, FIXTURE).unwrap();
         let fetcher = Arc::new(FixtureFetcher {
@@ -133,7 +138,11 @@ mod tests {
         let stdout = captured.stdout();
         assert_eq!(
             stdout,
-            "opencode/grok-code\nacme/acme-1\nanthropic/claude-3-7\nanthropic/claude-4\nopenai/gpt-5.1\nopenai/o4-mini\n"
+            "opencode/grok-code\nacme/acme-1\nanthropic/claude-3-7\nanthropic/claude-4\n\
+             libertai/deepseek-v4-flash\nlibertai/deepseek-v4.1-flash\nlibertai/glm-5.3\n\
+             libertai/glm-5.3-flash\nlibertai/glm-5.3-thinking\nlibertai/hermes-3-8b-tee\n\
+             libertai/qwen3.5-122b-a10b\nlibertai/qwen3.6-35b-a3b\nlibertai/qwen3.8-27b\n\
+             openai/gpt-5.1\nopenai/o4-mini\n"
         );
     }
 
