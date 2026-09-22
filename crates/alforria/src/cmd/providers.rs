@@ -959,7 +959,7 @@ mod tests {
             &paths.home,
         )
         .unwrap();
-        let stderr = captured.stderr();
+        let stderr = captured.stderr().replace('\\', "/");
         assert_eq!(
             stderr,
             format!(

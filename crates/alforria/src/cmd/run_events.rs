@@ -810,7 +810,9 @@ mod tests {
                 "message.part.updated",
                 json!({"part": part("tool", json!({
                     "tool": "read",
-                    "state": {"status": "completed", "input": {"filePath": "/a"}, "metadata": {}, "time": {"start": 1, "end": 2}},
+                    // Relative: renders identically on every platform (an
+                    // absolute path would gain a drive prefix on Windows).
+                    "state": {"status": "completed", "input": {"filePath": "a"}, "metadata": {}, "time": {"start": 1, "end": 2}},
                 }))}),
             ),
             event(
@@ -839,7 +841,7 @@ mod tests {
         assert_eq!(
             stderr,
             "\u{1b}[0m\n> build · claude\n\u{1b}[0m\n\
-             \u{1b}[0m→ \u{1b}[0mRead /a\n\
+             \u{1b}[0m→ \u{1b}[0mRead a\n\
              \u{1b}[91m\u{1b}[1mError: \u{1b}[0mprovider down\n"
         );
         assert!(replies.is_empty());
