@@ -581,13 +581,13 @@ mod tests {
             "edit",
             json!({
                 "status": "completed",
-                "input": {"filePath": "/x"},
+                "input": {"filePath": "x"},
                 "metadata": {"diff": "+a"},
                 "time": {"start": 1, "end": 2},
             }),
         );
         let inline = tool_inline_info(&part);
-        assert_eq!(inline.title, "Edit /x");
+        assert_eq!(inline.title, "Edit x");
         assert_eq!(inline.body.as_deref(), Some("+a"));
     }
 
@@ -613,7 +613,7 @@ mod tests {
             "glob",
             json!({
                 "status": "completed",
-                "input": {"pattern": "*.rs", "path": "/a"},
+                "input": {"pattern": "*.rs", "path": "a"},
                 "metadata": {"count": 2},
                 "time": {"start": 1, "end": 2},
             }),
@@ -621,7 +621,7 @@ mod tests {
         let inline = tool_inline_info(&part);
         assert_eq!(inline.icon, "✱");
         assert!(inline.title.contains("\"*.rs\""));
-        assert_eq!(inline.description.as_deref(), Some("in /a · 2 matches"));
+        assert_eq!(inline.description.as_deref(), Some("in a · 2 matches"));
     }
 
     #[test]

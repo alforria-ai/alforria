@@ -261,7 +261,10 @@ mod tests {
     #[test]
     fn resolve_prefers_absolute_paths() {
         let (_guard, dir) = temp_dir();
-        assert_eq!(resolve(&dir, "/a"), PathBuf::from("/a"));
+        // A platform-absolute path passes through unchanged; build it from
+        // the temp dir so the test holds on every OS.
+        let abs = dir.join("abs");
+        assert_eq!(resolve(&dir, abs.to_str().unwrap()), abs);
         assert_eq!(resolve(&dir, "a"), dir.join("a"));
     }
 }

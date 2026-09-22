@@ -283,8 +283,10 @@ mod tests {
     fn resolve_thread_directory_is_pwd_relative() {
         assert_eq!(
             resolve_thread_directory(Some("foo"), Some("/root"), "/cwd"),
-            "/root/foo"
+            Path::new("/root").join("foo").to_string_lossy()
         );
+        // "/abs" is only absolute on unix (no drive on Windows).
+        #[cfg(unix)]
         assert_eq!(
             resolve_thread_directory(Some("/abs"), Some("/root"), "/cwd"),
             "/abs"
