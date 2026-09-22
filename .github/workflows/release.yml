@@ -1,0 +1,185 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g. 0.1.0)'
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # 1. Verify the tag version matches the workspace version in Cargo.toml,
+  #    that the tag sits on the default branch, and classify prerelease.
+  check-version:
+    name: Check Version Consistency
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get-version.outputs.version }}
+      is-prerelease: ${{ steps.get-version.outputs.is-prerelease }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Verify the tag is on the default branch
+        if: github.event_name == 'push'
+        env:
+          GIT_REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          TAG="${GIT_REF#refs/tags/}"
+          git fetch --no-tags origin "+refs/heads/$DEFAULT_BRANCH:refs/remotes/origin/$DEFAULT_BRANCH"
+          TAG_SHA=$(git rev-list -n 1 "$TAG")
+          if ! git merge-base --is-ancestor "$TAG_SHA" "origin/$DEFAULT_BRANCH"; then
+            echo "::error::tag $TAG ($TAG_SHA) is not an ancestor of origin/$DEFAULT_BRANCH. Merge the release commit to $DEFAULT_BRANCH and re-tag there."
+            exit 1
+          fi
+          echo "$TAG is on $DEFAULT_BRANCH ($TAG_SHA)"
+
+      - id: get-version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          GIT_REF: ${{ github.ref }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            VERSION="$INPUT_VERSION"
+          else
+            VERSION="${GIT_REF#refs/tags/v}"
+          fi
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::invalid version format: $VERSION"
+            exit 1
+          fi
+
+          IS_PRERELEASE="false"
+          case "$VERSION" in *-*) IS_PRERELEASE="true" ;; esac
+
+          CARGO_VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          echo "Tag version: $VERSION"
+          echo "Cargo.toml workspace version: $CARGO_VERSION"
+
+          if [ "$VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::tag version ($VERSION) does not match Cargo.toml workspace version ($CARGO_VERSION)"
+            exit 1
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "is-prerelease=$IS_PRERELEASE" >> "$GITHUB_OUTPUT"
+
+  # 2. Require a manually-created GitHub Release (with human-authored notes)
+  #    before we start attaching binaries.
+  check-release:
+    name: Verify Release Exists
+    needs: [check-version]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify release exists
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.check-version.outputs.version }}
+          REPO: ${{ github.repository }}
+        run: |
+          TAG="v$VERSION"
+          if ! gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "::error::Release with tag $TAG not found. Draft a GitHub Release with notes before pushing the tag."
+            exit 1
+          fi
+
+  # 3. Run the full test suite on the three OSes before shipping anything.
+  verify:
+    name: Verify Release Build
+    needs: [check-version, check-release]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test --workspace
+
+  # 4. Cross-build and attach binaries + sha256 sidecars.
+  build-binaries:
+    name: Build Release Binaries
+    needs: [verify]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    strategy:
+      matrix:
+        include:
+          # Oldest supported runner (glibc 2.35) so the binary runs on
+          # Ubuntu 22.04+ instead of requiring 24.04's glibc 2.39.
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            artifact: alforria
+            asset: alforria-linux-x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: alforria.exe
+            asset: alforria-windows-x86_64.exe
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact: alforria
+            asset: alforria-macos-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: alforria
+            asset: alforria-macos-aarch64
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release binary
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --release --target "$TARGET" -p alforria --bin alforria
+
+      - name: Stage asset
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          ARTIFACT: ${{ matrix.artifact }}
+          ASSET: ${{ matrix.asset }}
+        run: cp "./target/$TARGET/release/$ARTIFACT" "$ASSET"
+
+      - name: Compute sha256
+        shell: bash
+        env:
+          ASSET: ${{ matrix.asset }}
+        run: |
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$ASSET" > "$ASSET.sha256"
+          else
+            shasum -a 256 "$ASSET" > "$ASSET.sha256"
+          fi
+
+      - name: Upload to release
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.check-version.outputs.version }}
+          REPO: ${{ github.repository }}
+          ASSET: ${{ matrix.asset }}
+        run: |
+          gh release upload "v$VERSION" \
+            "$ASSET" "$ASSET.sha256" \
+            --repo "$REPO" --clobber
