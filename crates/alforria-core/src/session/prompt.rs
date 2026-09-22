@@ -1015,17 +1015,31 @@ where
 
 /// `forceKillAfter: "3 seconds"` — SIGTERM the process group now,
 /// SIGKILL after the grace window (best effort; the spawned timer dies
-/// with the process reaper).
+/// with the process reaper). On Windows there is no graceful signal, so
+/// the whole process tree is force-killed immediately.
 fn kill_process_group(pid: u32, force_after: Duration) {
-    let pgid = pid as libc::pid_t;
-    if pgid == 0 {
-        return;
+    #[cfg(unix)]
+    {
+        let pgid = pid as libc::pid_t;
+        if pgid == 0 {
+            return;
+        }
+        unsafe { libc::kill(-pgid, libc::SIGTERM) };
+        tokio::spawn(async move {
+            tokio::time::sleep(force_after).await;
+            unsafe { libc::kill(-pgid, libc::SIGKILL) };
+        });
     }
-    unsafe { libc::kill(-pgid, libc::SIGTERM) };
-    tokio::spawn(async move {
-        tokio::time::sleep(force_after).await;
-        unsafe { libc::kill(-pgid, libc::SIGKILL) };
-    });
+    #[cfg(not(unix))]
+    {
+        let _ = force_after;
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
 }
 
 fn tool_input(part: &V1Part) -> serde_json::Map<String, Value> {

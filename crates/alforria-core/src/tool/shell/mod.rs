@@ -644,9 +644,25 @@ impl ShellSpawner for TokioSpawner {
                 Arc::new(move |force_after: Duration| {
                     let exited = Arc::clone(&exited);
                     Box::pin(async move {
-                        let pgid = pid as libc::pid_t;
-                        unsafe { libc::kill(-pgid, libc::SIGTERM) };
-                        let deadline = tokio::time::Instant::now() + force_after;
+                        #[cfg(unix)]
+                        let (pgid, grace) = (pid as libc::pid_t, force_after);
+                        #[cfg(unix)]
+                        unsafe {
+                            libc::kill(-pgid, libc::SIGTERM)
+                        };
+                        #[cfg(not(unix))]
+                        {
+                            // No graceful signal on Windows: force-kill the
+                            // whole process tree right away.
+                            let _ = std::process::Command::new("taskkill")
+                                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                                .stdin(std::process::Stdio::null())
+                                .stdout(std::process::Stdio::null())
+                                .stderr(std::process::Stdio::null())
+                                .status();
+                            return;
+                        }
+                        let deadline = tokio::time::Instant::now() + grace;
                         while tokio::time::Instant::now() < deadline {
                             if exited.load(AtomicOrdering::SeqCst) {
                                 return;

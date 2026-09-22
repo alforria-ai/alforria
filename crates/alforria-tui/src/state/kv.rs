@@ -10,7 +10,6 @@
 //! `meta.json`).
 
 use std::fs;
-use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -184,22 +183,35 @@ fn is_stale(lock_dir: &Path) -> bool {
     }
 }
 
+/// Create `path` with owner-only permissions where the platform supports it.
+fn create_dir_700(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new().mode(0o700).create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::DirBuilder::new().create(path)
+    }
+}
+
 fn try_acquire(lock_dir: &Path, token: &str) -> Result<bool> {
-    match fs::DirBuilder::new().mode(0o700).create(lock_dir) {
+    match create_dir_700(lock_dir) {
         Ok(()) => {}
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
             if !is_stale(lock_dir) {
                 return Ok(false);
             }
             let breaker = PathBuf::from(format!("{}.breaker", lock_dir.display()));
-            match fs::DirBuilder::new().mode(0o700).create(&breaker) {
+            match create_dir_700(&breaker) {
                 Ok(()) => {
                     let acquired = (|| -> Result<bool> {
                         if !is_stale(lock_dir) {
                             return Ok(false);
                         }
                         let _ = fs::remove_dir_all(lock_dir);
-                        match fs::DirBuilder::new().mode(0o700).create(lock_dir) {
+                        match create_dir_700(lock_dir) {
                             Ok(()) => Ok(true),
                             Err(err) => {
                                 if err.kind() == std::io::ErrorKind::AlreadyExists {

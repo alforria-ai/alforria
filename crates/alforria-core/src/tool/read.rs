@@ -611,6 +611,7 @@ mod tests {
     use crate::tool::ripgrep::test_support::{ctx, fixed_agents, instance, RecordingAsk};
     use crate::tool::truncate::TruncateService;
     use serde_json::json;
+    #[cfg(unix)]
     use std::os::unix::fs::symlink;
 
     fn tool(dir: &Path) -> ToolDef {
@@ -914,6 +915,7 @@ mod tests {
         std::fs::remove_dir_all(temp.path()).ok();
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn symlinks_to_directories_get_the_slash_suffix() {
         let temp = crate::storage::test_support::TempDir::new("read-dirlink");
