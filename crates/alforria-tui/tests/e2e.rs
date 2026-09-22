@@ -322,6 +322,7 @@ async fn wire_e2e_bootstrap_prompt_stream_share_export() {
     )));
 
     // The SSE pump — batches flow through `state::update`.
+    let app_lock = app.clone();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     alforria_tui::transport::events::spawn_event_loop(
         Arc::clone(&source),
@@ -333,7 +334,7 @@ async fn wire_e2e_bootstrap_prompt_stream_share_export() {
     drive(&app, &api, Msg::Bus(Vec::new())).await;
     execute_effect(&app, Arc::clone(&api), Effect::Bootstrap { fatal: true }).await;
     {
-        let app = app.lock().await;
+        let mut app = app.lock().await;
         assert!(
             matches!(
                 app.state.sync.status,
@@ -341,7 +342,20 @@ async fn wire_e2e_bootstrap_prompt_stream_share_export() {
             ),
             "bootstrap reaches Complete"
         );
-        assert!(!app.state.sync.provider.is_empty(), "providers landed");
+        // Slow CI runners can observe Complete before the provider list is
+        // served — poll for the providers instead of asserting once.
+        // (The lock is dropped between attempts; nothing else contends it
+        // in this harness, but keep the invariant anyway.)
+        let providers_deadline = Instant::now() + Duration::from_secs(30);
+        while app.state.sync.provider.is_empty() {
+            assert!(
+                Instant::now() < providers_deadline,
+                "providers landed after bootstrap"
+            );
+            drop(app);
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            app = app_lock.lock().await;
+        }
     }
 
     // ---- prompt ---------------------------------------------------

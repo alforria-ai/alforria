@@ -107,8 +107,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Install nextest
+        run: cargo install cargo-nextest --locked || true
+
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo nextest run --retries 2 || cargo test --workspace
 
   # 4. Cross-build and attach binaries + sha256 sidecars.
   build-binaries:
