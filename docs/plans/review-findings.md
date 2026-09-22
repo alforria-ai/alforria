@@ -449,3 +449,53 @@ reference (88c6c7a): llm, session engine, tools, server, CLI+ACP, TUI+foundation
   screen, Enter → session created, prompt sent, model reply rendered in
   the session view (Build · qwen3.8-27b-thinking · 3.7s). Regression
   test `prompt_renders_typed_text`.
+
+### Battle-test round 5 (full TUI drive)
+
+Driven under a pty with pyte VT100 emulation (~50 scenarios): home render,
+editor mechanics, dialogs, live model round trips, interrupt, queued
+prompts, pin/quick-switch, paste, scrolling, resize, exit paths.
+
+**Fixed (commit f19f1f7):**
+
+- **Home prompt dropped newlines** — ctrl+j text rendered on one row; home
+  now renders the textarea `Display` rows (one Line per row + cursor) with
+  the box height growing with the row count, mirroring the session prompt.
+
+**Fixed (commit 736ed38):**
+
+- **`session_path(worktree, worktree)` stored `""`** — TS `path.relative`
+  yields `"."` — so the TUI's `path="."` session-list query matched nothing:
+  the session list, quick switch (leader+1) and pin slots were always empty
+  despite the sessions existing server-side.
+- **TUI state never persisted** — `cmd/tui.rs` passed `state_dir=None`, so
+  pinned sessions, recent models, favorites and prompt history were dropped
+  on every restart. Now wired to `GlobalPaths::from_env().state`
+  (`global.ts:14`), matching TS.
+- **Home autocomplete never rendered** — typing "/" showed no menu (the
+  session view did); home's `render_prompt` now draws the same
+  `render_autocomplete` overlay.
+
+**TS parity confirmed (initially suspected bugs):**
+
+- ctrl+c on an empty prompt exits the app (`app_exit` gate: exit disabled
+  only while the prompt is focused and non-empty) — a "frozen" screen after
+  ctrl+c is the dead process's last frame, with the pty echoing subsequent
+  keystrokes in caret notation.
+- ESC on the "/" autocomplete clears the slash text (`autocomplete.tsx`
+  `hide()` deletes the input when visible=="/").
+- ctrl+- (undo) requires the kitty keyboard protocol; legacy 0x1f decodes
+  as ctrl+7 under crossterm, so undo is unreachable in legacy terminals —
+  same physical constraint as TS.
+- The home screen shows tips at the bottom, not a status bar (status bar
+  is session-view only).
+- Quick switch slots contain pinned sessions only.
+
+**Verified working:** multiline editing, cursor/word/line movement, delete
+ops (char/word/line/to-line-end), undo/redo, clear, history recall (up
+arrow), queued prompts (submitting while generating queues and drains
+correctly), interrupt (escape), session rename dialog, agent cycling (tab:
+build→plan), model list, theme list, command palette, session list
+navigate/select, pin (ctrl+f) + quick switch (leader+1), bracketed paste,
+pageup/pagedown scrolling, terminal resize, and the exit paths
+(ctrl+c/ctrl+d on empty prompt, "exit" text + enter).
