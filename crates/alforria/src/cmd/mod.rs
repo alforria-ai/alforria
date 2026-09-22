@@ -16,6 +16,7 @@ pub mod debug;
 pub mod export;
 pub mod generate;
 pub mod import;
+pub mod libertai;
 pub mod mcp;
 pub mod models;
 pub mod pr;
@@ -208,6 +209,20 @@ pub fn cli() -> Command {
                         Arg::new("project")
                             .long("project")
                             .help("filter by project (default: all projects, empty string: current project)"),
+                    ),
+            )
+            .subcommand(
+                Command::new("libertai")
+                    .about("LibertAI account commands")
+                    .subcommand(
+                        Command::new("usage")
+                            .about("show plan and usage (allowance windows, prepaid credits)")
+                            .arg(
+                                Arg::new("json")
+                                    .long("json")
+                                    .help("output raw JSON")
+                                    .action(ArgAction::SetTrue),
+                            ),
                     ),
             )
             .subcommand(
@@ -889,6 +904,15 @@ pub fn route(matches: &ArgMatches, ui: &mut Ui, raw: &[OsString]) -> Result<(), 
             matches.subcommand_matches("providers").expect("providers"),
             ui,
         ),
+        "libertai" => {
+            let matches = matches.subcommand_matches("libertai").expect("libertai");
+            match matches.subcommand_name() {
+                Some("usage") => {
+                    libertai::run(matches.subcommand_matches("usage").expect("usage"), ui)
+                }
+                _ => unreachable!("libertai requires a subcommand"),
+            }
+        }
         "models" => models::run(matches.subcommand_matches("models").expect("models"), ui),
         "agent" => agent::run(matches.subcommand_matches("agent").expect("agent"), ui),
         "session" => session::run(matches.subcommand_matches("session").expect("session"), ui),

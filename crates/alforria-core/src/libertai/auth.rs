@@ -394,6 +394,64 @@ pub fn revoke(refresh_token: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// `GET /payments/subscription` — plan tier, allowance windows, prepaid
+/// balance. Requires a session access token (the `LTAI_` inference key
+/// cannot authenticate account endpoints).
+pub fn subscription(access_token: &str) -> Result<Subscription, String> {
+    let url = format!("{}/payments/subscription", account_base());
+    let response = account_client()?
+        .get(&url)
+        .bearer_auth(access_token)
+        .send()
+        .map_err(|err| format!("GET {url}: {err}"))?;
+    if !response.status().is_success() {
+        return Err(format!("GET {url} → {}", response.status()));
+    }
+    response
+        .json()
+        .map_err(|err| format!("parsing /payments/subscription response: {err}"))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Subscription {
+    pub tier: String,
+    #[serde(default)]
+    pub has_subscription: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_5h_used: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_5h_limit: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_5h_resets_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weekly_used: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weekly_limit: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weekly_resets_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepaid_balance: Option<f64>,
+}
+
+/// Refresh the stored session and run a query with the rotated access token.
+/// The rotated refresh token replaces the stored one BEFORE the query runs
+/// (rotation is one-time-use; the old token is already invalid).
+pub fn with_refreshed_session<T>(
+    query: impl FnOnce(&str) -> Result<T, String>,
+) -> Result<T, String> {
+    let session = load_session()
+        .ok_or_else(|| "not logged in — run `alforria auth login -p libertai`".to_string())?;
+    let pair = refresh(&session.refresh_token)?;
+    store_session(&StoredSession {
+        refresh_token: pair.refresh_token.clone(),
+        expires_at: session.expires_at,
+        device_id: session.device_id,
+    });
+    query(&pair.access_token)
+}
+
 // ---------------------------------------------------------------------------
 // sidecar session store
 // ---------------------------------------------------------------------------
