@@ -1569,15 +1569,18 @@ mod tests {
         let service = SessionShare::new(share, harness.services.sessions.clone(), None, true);
 
         service.auto_share(&session);
-        wait_until(|| !harness.http.posts().is_empty());
-        let share_url_set = harness
-            .services
-            .sessions
-            .get(&session.id)
-            .unwrap()
-            .share
-            .is_some();
-        assert!(share_url_set, "auto-share persisted the share url");
+        // auto_share posts the HTTP request first and persists the share
+        // url second — poll for the persisted url, not the post, or the
+        // assert can run between the two steps.
+        wait_until(|| {
+            harness
+                .services
+                .sessions
+                .get(&session.id)
+                .unwrap()
+                .share
+                .is_some()
+        });
 
         // Parented sessions never auto-share.
         let count = harness.http.posts().len();

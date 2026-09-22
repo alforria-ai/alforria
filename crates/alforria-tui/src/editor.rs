@@ -33,8 +33,11 @@ pub fn open_editor_with(value: &str, editor: &str, cwd: Option<&Path>) -> Option
     }
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let directory = std::env::temp_dir();
+    // nextest runs each test in its own process, so COUNTER restarts at 0:
+    // keep the pid in the name or two editor tests starting within the
+    // same millisecond would clobber each other's file.
     let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let file = directory.join(format!("{}-{unique}.md", millis()));
+    let file = directory.join(format!("{}-{}-{unique}.md", millis(), std::process::id()));
     std::fs::write(&file, value).ok()?;
     let result = run_editor(editor, &file, cwd);
     let content = std::fs::read_to_string(&file).ok();
