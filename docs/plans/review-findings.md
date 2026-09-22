@@ -715,3 +715,26 @@ server plus the probe test server, which shared
   every part when a message ends, so that state is a persisted defect
   (e.g. a cleanup write that failed under the lock) and now renders as
   a finished `Thought` instead of spinning forever.
+
+## Round 11 — markdown tables
+
+User report: tables in assistant messages weren't rendered.
+
+The TS reference renders `<markdown tableOptions={{ style: "grid" }}>`
+backed by `mdast-util-gfm-table` — full GFM tables, where the outer
+pipes are optional. The port's parser required BOTH leading and
+trailing pipes, so the common shapes models emit (`a | b` /
+`---|---`, or a leading pipe without a trailing one) fell through to
+plain text.
+
+- Table detection is now real GFM: a table opens at any pipe row whose
+  next line is a delimiter row (`:?-+:?` cells, outer pipes optional);
+  body rows continue while lines contain a pipe. A lone pipe row
+  without a delimiter stays prose (GFM semantics — the old parser
+  turned it into a one-row table).
+- Over-wide tables stay aligned: OpenTUI fits columns proportionally
+  (`computeColumnWidths` / `fitColumnWidthsProportional`, min one
+  cell) and wraps the content inside each column; the port now does
+  the same instead of letting wide cells break the grid.
+- Live-verified with a model-emitted table (pyte probe checks every
+  rendered row closes at the same pipe column).

@@ -36,7 +36,6 @@ enum Block {
     },
     Quote(String),
     Table(Vec<Vec<String>>),
-    TableRow(Vec<String>),
     Rule,
 }
 
@@ -46,10 +45,12 @@ fn blocks(content: &str) -> Vec<Block> {
     let mut out: Vec<Block> = Vec::new();
     let mut paragraph: Option<String> = None;
     let mut quote: Option<String> = None;
-    let mut table: Vec<Vec<String>> = Vec::new();
     let mut code: Option<(Option<String>, Vec<String>)> = None;
 
-    for raw in content.lines() {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut index = 0usize;
+    while index < lines.len() {
+        let raw = lines[index];
         let trimmed = raw.trim_start();
         if let Some((language, lines)) = code.as_mut() {
             let close = match &raw.trim() {
@@ -66,23 +67,47 @@ fn blocks(content: &str) -> Vec<Block> {
             } else {
                 lines.push(raw.to_string());
             }
+            index += 1;
             continue;
         }
         if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
             flush_paragraph(&mut out, &mut paragraph);
             flush_quote(&mut out, &mut quote);
-            flush_table(&mut out, &mut table);
             let marker = if trimmed.starts_with("```") { '`' } else { '~' };
             let fence_len = trimmed.chars().take_while(|c| *c == marker).count();
             let info = trimmed[fence_len..].trim();
             let language = info.split(',').next().unwrap_or("").trim().to_string();
             code = Some(((!language.is_empty()).then_some(language), Vec::new()));
+            index += 1;
+            continue;
+        }
+        // A GFM table opens with any pipe row whose next line is a
+        // delimiter row — the outer pipes are optional
+        // (`mdast-util-gfm-table`).
+        if trimmed.contains('|')
+            && lines
+                .get(index + 1)
+                .is_some_and(|next| is_delimiter_row(next.trim_start()))
+        {
+            flush_paragraph(&mut out, &mut paragraph);
+            flush_quote(&mut out, &mut quote);
+            let mut rows = vec![row_cells(trimmed), row_cells(lines[index + 1].trim_start())];
+            index += 2;
+            while let Some(next) = lines.get(index) {
+                let next_trimmed = next.trim_start();
+                if next_trimmed.is_empty() || !next_trimmed.contains('|') {
+                    break;
+                }
+                rows.push(row_cells(next_trimmed));
+                index += 1;
+            }
+            out.push(Block::Table(rows));
             continue;
         }
         if trimmed.is_empty() {
             flush_paragraph(&mut out, &mut paragraph);
             flush_quote(&mut out, &mut quote);
-            flush_table(&mut out, &mut table);
+            index += 1;
             continue;
         }
         if let Some(block) = structural_block(trimmed, raw) {
@@ -90,41 +115,38 @@ fn blocks(content: &str) -> Vec<Block> {
             match block {
                 Block::Quote(text) => {
                     flush_quote(&mut out, &mut quote);
-                    flush_table(&mut out, &mut table);
                     let merged = quote.get_or_insert_with(String::new);
                     if !merged.is_empty() {
                         merged.push('\n');
                     }
                     merged.push_str(&text);
                 }
-                Block::TableRow(row) => {
-                    flush_quote(&mut out, &mut quote);
-                    table.push(row);
-                }
                 Block::Code { .. } => unreachable!(),
                 other => {
                     flush_quote(&mut out, &mut quote);
-                    flush_table(&mut out, &mut table);
                     out.push(other);
                 }
             }
+            index += 1;
             continue;
         }
         flush_quote(&mut out, &mut quote);
-        flush_table(&mut out, &mut table);
         let merged = paragraph.get_or_insert_with(String::new);
         if !merged.is_empty() {
             merged.push('\n');
         }
         merged.push_str(raw.trim());
+        index += 1;
     }
 
-    if let Some((language, lines)) = code {
-        out.push(Block::Code { language, lines });
+    if let Some((language, rows)) = code {
+        out.push(Block::Code {
+            language,
+            lines: rows,
+        });
     }
     flush_paragraph(&mut out, &mut paragraph);
     flush_quote(&mut out, &mut quote);
-    flush_table(&mut out, &mut table);
     out
 }
 
@@ -139,13 +161,6 @@ fn structural_block(trimmed: &str, raw: &str) -> Option<Block> {
     }
     if let Some(text) = trimmed.strip_prefix('>') {
         return Some(Block::Quote(text.trim_start().to_string()));
-    }
-    if is_table_row(trimmed) {
-        let cells: Vec<String> = trimmed[1..trimmed.len() - 1]
-            .split('|')
-            .map(|cell| cell.trim().to_string())
-            .collect();
-        return Some(Block::TableRow(cells));
     }
     list_item(trimmed, raw).map(|(depth, ordered, text)| Block::ListItem {
         depth,
@@ -177,8 +192,29 @@ fn is_rule(trimmed: &str) -> bool {
     trimmed.chars().all(|c| c == first) && trimmed.len() >= 3
 }
 
-fn is_table_row(trimmed: &str) -> bool {
-    trimmed.starts_with('|') && trimmed.ends_with('|') && trimmed.len() > 2
+/// A GFM delimiter row (`mdast-util-gfm-table`): optional outer pipes,
+/// every cell `:?-+:?` (or `-` alone).
+fn is_delimiter_row(trimmed: &str) -> bool {
+    let inner = trimmed.trim_start_matches('|').trim_end_matches('|');
+    if !trimmed.contains('|') || inner.is_empty() {
+        return false;
+    }
+    inner.split('|').all(|cell| is_delimiter_cell(cell.trim()))
+}
+
+fn is_delimiter_cell(cell: &str) -> bool {
+    let dashes = cell.trim_matches(':');
+    !dashes.is_empty() && dashes.chars().all(|c| c == '-')
+}
+
+/// The cells of a table row — split on `|`, outer pipes optional.
+fn row_cells(trimmed: &str) -> Vec<String> {
+    trimmed
+        .trim_start_matches('|')
+        .trim_end_matches('|')
+        .split('|')
+        .map(|cell| cell.trim().to_string())
+        .collect()
 }
 
 fn list_item<'a>(trimmed: &'a str, raw: &'a str) -> Option<(usize, Option<u64>, String)> {
@@ -223,17 +259,10 @@ fn flush_quote(out: &mut Vec<Block>, quote: &mut Option<String>) {
     }
 }
 
-fn flush_table(out: &mut Vec<Block>, table: &mut Vec<Vec<String>>) {
-    if !table.is_empty() {
-        out.push(Block::Table(std::mem::take(table)));
-    }
-}
-
 // ------------------------------------------------------------- render
 
 fn render_block(block: Block, theme: &Theme, width: u16) -> Vec<Line<'static>> {
     match block {
-        Block::TableRow(_) => Vec::new(),
         Block::Heading(_, text) => {
             let style = Style::new()
                 .fg(theme.markdown_heading.to_color())
@@ -305,7 +334,9 @@ fn render_table(rows: Vec<Vec<String>>, theme: &Theme, width: u16) -> Vec<Line<'
     let total: usize = widths.iter().sum::<usize>() + columns * 3 + 1;
     if let Some(budget) = (width as usize).checked_sub(1) {
         if total > budget && budget > 0 {
-            widths = widths.iter().map(|w| w * budget / total).collect();
+            // `fitColumnWidthsProportional` — every column keeps a
+            // minimum of one cell.
+            widths = widths.iter().map(|w| (w * budget / total).max(1)).collect();
         }
     }
     let style = Style::new().fg(theme.markdown_text.to_color());
@@ -331,16 +362,72 @@ fn render_table(rows: Vec<Vec<String>>, theme: &Theme, width: u16) -> Vec<Line<'
         } else {
             style
         };
-        let mut line: Vec<Span<'static>> = vec![Span::styled("|", row_style)];
-        for (column, width) in widths.iter().enumerate() {
-            let cell = row.get(column).map(String::as_str).unwrap_or("");
-            line.push(Span::styled(" ", row_style));
-            line.push(Span::styled(pad_to(cell, *width), row_style));
-            line.push(Span::styled(" |", row_style));
+        // Cells wrap within their column (`computeColumnWidths` fits
+        // the columns; the text buffers wrap the content).
+        let cells: Vec<Vec<String>> = (0..columns)
+            .map(|column| {
+                wrap_cell(
+                    row.get(column).map(String::as_str).unwrap_or(""),
+                    widths[column].max(1),
+                )
+            })
+            .collect();
+        let height = cells.iter().map(|cell| cell.len()).max().unwrap_or(1);
+        for line_index in 0..height {
+            let mut line: Vec<Span<'static>> = vec![Span::styled("|", row_style)];
+            for column in 0..columns {
+                let cell = cells[column]
+                    .get(line_index)
+                    .map(String::as_str)
+                    .unwrap_or("");
+                line.push(Span::styled(" ", row_style));
+                line.push(Span::styled(pad_to(cell, widths[column].max(1)), row_style));
+                line.push(Span::styled(" |", row_style));
+            }
+            lines.push(Line::from(line));
         }
-        lines.push(Line::from(line));
     }
     lines
+}
+
+/// Word-wrap a cell within its column, hard-breaking words that do
+/// not fit.
+fn wrap_cell(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for word in text.split(' ') {
+        let pieces = hard_break(word, width);
+        for (index, piece) in pieces.iter().enumerate() {
+            if index == 0 && !current.is_empty() {
+                if current.chars().count() + 1 + piece.chars().count() <= width {
+                    current.push(' ');
+                } else {
+                    lines.push(std::mem::take(&mut current));
+                }
+            } else if index > 0 && !current.is_empty() {
+                lines.push(std::mem::take(&mut current));
+            }
+            current.push_str(piece);
+        }
+    }
+    lines.push(current);
+    lines
+}
+
+fn hard_break(word: &str, width: usize) -> Vec<String> {
+    let mut pieces: Vec<String> = Vec::new();
+    let mut piece = String::new();
+    for char in word.chars() {
+        if piece.chars().count() >= width {
+            pieces.push(std::mem::take(&mut piece));
+        }
+        piece.push(char);
+    }
+    if !piece.is_empty() || pieces.is_empty() {
+        pieces.push(piece);
+    }
+    pieces
 }
 
 fn is_separator_cell(cell: &str) -> bool {
@@ -616,6 +703,53 @@ mod tests {
         assert_eq!(lines[0], "| a | b |");
         assert_eq!(lines[1], "|---|---|");
         assert_eq!(lines[2], "| 1 | 2 |");
+    }
+
+    #[test]
+    fn pipeless_tables_align_columns() {
+        // GFM makes the outer pipes optional
+        // (`mdast-util-gfm-table`) — the shape models emit when not
+        // fenced in full pipes.
+        let markdown = "a | b\n--- | ---\n1 | 2";
+        let lines = lines_of(markdown, 40);
+        assert_eq!(lines[0], "| a | b |");
+        assert_eq!(lines[1], "|---|---|");
+        assert_eq!(lines[2], "| 1 | 2 |");
+    }
+
+    #[test]
+    fn partially_piped_tables_align_columns() {
+        let markdown = "| a | b\n|---|---\n| 1 | 2";
+        let lines = lines_of(markdown, 40);
+        assert_eq!(lines[0], "| a | b |");
+        assert_eq!(lines[1], "|---|---|");
+        assert_eq!(lines[2], "| 1 | 2 |");
+    }
+
+    #[test]
+    fn a_lone_pipe_row_is_prose() {
+        // Without a following delimiter row it is not a table.
+        let lines = lines_of("before\n\na | b\n\nafter", 40);
+        assert_eq!(lines, vec!["before", "a | b", "after"]);
+    }
+
+    #[test]
+    fn over_wide_tables_wrap_cells() {
+        // The table is wider than the budget — columns fit
+        // proportionally and cell content wraps inside its column so
+        // the grid stays aligned (computeColumnWidths).
+        let markdown = "| aaa bbb | ccc ddd |\n|---|---|\n| 123456789 123456789 | x |";
+        let lines = lines_of(markdown, 30);
+        // Every rendered row must be closed at the same column — the
+        // grid stays aligned.
+        for line in &lines {
+            assert!(
+                line.ends_with('|'),
+                "row not closed: {line:?} (lines={lines:?})"
+            );
+        }
+        // The wide cell wrapped inside its column across multiple rows.
+        assert!(lines.len() > 3, "cell did not wrap: {lines:?}");
     }
 
     #[test]
