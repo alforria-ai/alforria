@@ -198,7 +198,7 @@ pub fn open(app: &mut App, kind: PendingDialog) -> Vec<Effect> {
                     .iter()
                     .position(|option| option.value.as_deref() == Some(current))
                 {
-                    frame.select.move_to(index);
+                    frame.select.move_to(index, max_visible(app));
                 }
             }
         }
@@ -291,8 +291,8 @@ fn actions(app: &App, frame: &DialogFrame) -> Vec<(String, String)> {
 }
 
 /// `formatKeyBindings` — the first alternative's first stroke,
-/// human-formatted.
-fn key_hint(app: &App, keybind: &str) -> Option<String> {
+/// human-formatted (`keymap.tsx:210-212`).
+pub(crate) fn key_hint(app: &App, keybind: &str) -> Option<String> {
     let crate::keymap::bindings::BindingValue::Alternatives(alternatives) =
         app.keymap.bindings.get(keybind)?
     else {
@@ -658,22 +658,25 @@ fn select_key(app: &mut App, key: &crossterm::event::KeyEvent) -> Vec<Effect> {
     };
     if let Some(step) = movement {
         let len = filtered_options(app).len();
+        let max_visible = max_visible(app);
         if let Some(frame) = app.ui.dialogs.top_mut() {
-            frame.select.move_by(step, len);
+            frame.select.move_by(step, len, max_visible);
             on_move(app, &kind);
         }
         return Vec::new();
     }
     if app.keymap.matches("dialog.select.home", key) {
+        let max_visible = max_visible(app);
         if let Some(frame) = app.ui.dialogs.top_mut() {
-            frame.select.move_to(0);
+            frame.select.move_to(0, max_visible);
         }
         return Vec::new();
     }
     if app.keymap.matches("dialog.select.end", key) {
         let len = filtered_options(app).len();
+        let max_visible = max_visible(app);
         if let Some(frame) = app.ui.dialogs.top_mut() {
-            frame.select.move_to(len.saturating_sub(1));
+            frame.select.move_to(len.saturating_sub(1), max_visible);
         }
         return Vec::new();
     }
@@ -733,11 +736,132 @@ pub fn wheel_scroll(app: &mut App, direction: i64) {
     if len == 0 {
         return;
     }
+    let max = (len as i64 - max_visible(app) as i64).max(0);
     if let Some(frame) = app.ui.dialogs.top_mut() {
-        let max = len.saturating_sub(1);
         let next = frame.select.scroll as i64 + direction * 3;
-        frame.select.scroll = next.clamp(0, max as i64) as usize;
+        frame.select.scroll = next.clamp(0, max) as usize;
     }
+}
+
+/// The scrollbox window height — `Math.floor(dimensions().height / 2) -
+/// 6` (`dialog-select.tsx:213`).
+pub fn max_visible(app: &App) -> usize {
+    primitives::max_visible_options(app.ui.terminal_height)
+}
+
+/// Whether the dialog renders through the `DialogSelect` branch of
+/// `content_lines` — the kinds with clickable option rows.
+fn is_select_kind(kind: &PendingDialog) -> bool {
+    !matches!(
+        kind,
+        PendingDialog::Status
+            | PendingDialog::Help
+            | PendingDialog::Debug
+            | PendingDialog::Alert { .. }
+            | PendingDialog::SessionRename { .. }
+            | PendingDialog::ProviderCustomId
+            | PendingDialog::UpdateAvailable { .. }
+            | PendingDialog::ShareConsent { .. }
+            | PendingDialog::WorkspaceUnavailable
+            | PendingDialog::SessionDeleteFailed { .. }
+            | PendingDialog::RetryAction { .. }
+            | PendingDialog::ExportOptions
+            | PendingDialog::ConsoleOrg
+    )
+}
+
+/// The option row layout of the top dialog — the
+/// `(line index, filtered option index)` pairs of the rows the
+/// `content_lines` select branch renders. `None` for non-select
+/// dialogs.
+fn select_layout(app: &App) -> Option<Vec<(usize, usize)>> {
+    let frame = app.ui.dialogs.top()?;
+    if !is_select_kind(&frame.kind) {
+        return None;
+    }
+    let theme = app
+        .ui
+        .theme
+        .resolve(&app.state.kv)
+        .expect("builtin theme resolves");
+    let view_options = options(app, frame);
+    let view = primitives::SelectView {
+        title: select_title(&frame.kind).to_string(),
+        filter: true,
+        options: view_options,
+        actions: actions(app, frame),
+    };
+    // The select branch renders header + filter before the options
+    // (content_lines); their text does not affect the row count.
+    let mut lines = vec![
+        primitives::header_line(&theme, &view.title, "esc"),
+        primitives::filter_line(&theme, &frame.select, "Search"),
+    ];
+    let width = app.ui.dialogs.size.width();
+    Some(primitives::render_options(
+        &frame.select,
+        &view,
+        &theme,
+        &mut lines,
+        width,
+        max_visible(app),
+    ))
+}
+
+/// The filtered option index rendered at `column`/`row`, if the
+/// position lands on an option row of the top dialog
+/// (`dialog-select.tsx:640-676`).
+pub fn option_row(app: &App, column: u16, row: u16) -> Option<usize> {
+    let layout = select_layout(app)?;
+    let frame = app.ui.dialogs.top()?;
+    let theme = app
+        .ui
+        .theme
+        .resolve(&app.state.kv)
+        .expect("builtin theme resolves");
+    let lines = content_lines(app, frame, &theme);
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: app.ui.terminal_width.max(1),
+        height: app.ui.terminal_height.max(1),
+    };
+    let rect = frame_rect(app, lines.len(), area);
+    if column < rect.x || column >= rect.x + rect.width {
+        return None;
+    }
+    let clicked = row.checked_sub(rect.y)? as usize;
+    layout
+        .iter()
+        .find(|(line, _)| *line == clicked)
+        .map(|(_, index)| *index)
+}
+
+/// `onMouseDown`/`onMouseOver` (`dialog-select.tsx:664-672`) — hover
+/// or press moves the selection to the row under the pointer.
+pub fn mouse_move_to(app: &mut App, index: usize) {
+    let Some(kind) = app.ui.dialogs.top_kind().cloned() else {
+        return;
+    };
+    let max = max_visible(app);
+    if let Some(frame) = app.ui.dialogs.top_mut() {
+        frame.select.move_to(index, max);
+    }
+    on_move(app, &kind);
+}
+
+/// `onMouseUp` (`dialog-select.tsx:652-657`) — release activates the
+/// row under the pointer.
+pub fn mouse_submit(app: &mut App, index: usize) -> Vec<Effect> {
+    let Some(kind) = app.ui.dialogs.top_kind().cloned() else {
+        return Vec::new();
+    };
+    let max = max_visible(app);
+    if let Some(frame) = app.ui.dialogs.top_mut() {
+        frame.select.move_to(index, max);
+    }
+    on_move(app, &kind);
+    submit(app, &kind)
 }
 
 fn filtered_options(app: &App) -> Vec<primitives::SelectOption> {
@@ -1364,7 +1488,14 @@ fn content_lines(app: &App, dialog: &DialogFrame, theme: &Theme) -> Vec<Line<'st
                     },
                 ));
             }
-            primitives::render_options(&dialog.select, &view, theme, &mut lines, width);
+            primitives::render_options(
+                &dialog.select,
+                &view,
+                theme,
+                &mut lines,
+                width,
+                max_visible(app),
+            );
             if !view.actions.is_empty() {
                 lines.push(primitives::render_actions(theme, &view.actions));
             }

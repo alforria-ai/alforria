@@ -28,6 +28,145 @@ fn press_ctrl(app: &mut App, char: char) {
 // --------------------------------------------------------- stack machine
 
 #[test]
+fn option_rows_are_mouse_clickable() {
+    // Hover moves the selection and release activates the row
+    // (`dialog-select.tsx:640-676`).
+    let mut app = new_app();
+    app.ui.terminal_width = 80;
+    app.ui.terminal_height = 30;
+    open(&mut app, PendingDialog::CommandPalette);
+
+    let titles = palette_titles(&app);
+    let target = titles
+        .iter()
+        .position(|title| title.contains("New session"))
+        .expect("New session is in the palette");
+
+    // Locate a screen cell that renders the target option row.
+    let mut position = None;
+    'outer: for row in 0..30u16 {
+        for column in 0..80u16 {
+            if option_row(&app, column, row) == Some(target) {
+                position = Some((column, row));
+                break 'outer;
+            }
+        }
+    }
+    if position.is_none() {
+        panic!("option {target} not on screen: {titles:?}");
+    }
+    let (column, row) = position.unwrap();
+
+    // `onMouseOver` — hover moves the selection.
+    update(
+        &mut app,
+        crate::state::Msg::Mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Moved,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }),
+    );
+    assert_eq!(
+        app.ui.dialogs.top().expect("still open").select.selected,
+        target
+    );
+
+    // `onMouseUp` — release activates: navigating home closes the
+    // palette.
+    update(
+        &mut app,
+        crate::state::Msg::Mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }),
+    );
+    assert!(app.ui.dialogs.is_empty());
+    assert!(matches!(
+        app.state.route.data,
+        crate::state::route::Route::Home { .. }
+    ));
+}
+
+#[test]
+fn option_row_matches_the_rendered_rows() {
+    // 120x40 with a live session — "Switch session" is suggested and
+    // renders at the top of the Suggested block.
+    let mut app = new_app();
+    app.ui.terminal_width = 120;
+    app.ui.terminal_height = 40;
+    app.state
+        .sync
+        .session
+        .push(opencode_schema::session_v1::V1SessionInfo {
+            id: "s1".into(),
+            slug: "x".into(),
+            project_id: "prj".into(),
+            workspace_id: None,
+            directory: "/repo".into(),
+            path: None,
+            parent_id: None,
+            summary: None,
+            cost: None,
+            tokens: None,
+            share: None,
+            title: "session".into(),
+            agent: None,
+            model: None,
+            version: "1".into(),
+            metadata: None,
+            time: opencode_schema::session_v1::V1SessionTime {
+                created: 0,
+                updated: 0,
+                compacting: None,
+                archived: None,
+            },
+            permission: None,
+            revert: None,
+        });
+    open(&mut app, PendingDialog::CommandPalette);
+    let titles = palette_titles(&app);
+    assert!(
+        titles.iter().any(|t| t.contains("Switch session")),
+        "suggested Switch session in palette: {titles:?}"
+    );
+    // Where does the render put "Switch session"?
+    let lines = render_lines(&mut app, 120, 40);
+    let row = lines
+        .iter()
+        .position(|line| line.contains("Switch session"))
+        .expect("Switch session renders");
+    // The click target maps back to the suggested option.
+    let index = titles
+        .iter()
+        .position(|t| t.contains("Switch session"))
+        .unwrap();
+    assert_eq!(
+        option_row(&app, 40, row as u16),
+        Some(index),
+        "click on the rendered row resolves to the option"
+    );
+
+    // Release activates it — the sessions dialog opens.
+    update(
+        &mut app,
+        crate::state::Msg::Mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            column: 40,
+            row: row as u16,
+            modifiers: KeyModifiers::NONE,
+        }),
+    );
+    assert!(
+        matches!(app.ui.dialogs.top_kind(), Some(PendingDialog::SessionList)),
+        "sessions dialog opened, got {:?}",
+        app.ui.dialogs.top_kind()
+    );
+}
+
+#[test]
 fn open_replaces_and_escape_pops() {
     let mut app = new_app();
     open(&mut app, PendingDialog::CommandPalette);
@@ -146,6 +285,10 @@ fn palette_selection_moves_and_submits() {
 // ---------------------------------------------------- rendering goldens
 
 fn render_lines(app: &mut App, width: u16, height: u16) -> Vec<String> {
+    // The real terminal dimensions arrive via `Msg::Resize` before the
+    // first draw — the dialog window height derives from them.
+    app.ui.terminal_width = width;
+    app.ui.terminal_height = height;
     let backend = ratatui::backend::TestBackend::new(width, height);
     let mut terminal = ratatui::Terminal::new(backend).unwrap();
     terminal

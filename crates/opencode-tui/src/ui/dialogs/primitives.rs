@@ -10,8 +10,10 @@ use ratatui::widgets::{Paragraph, Widget};
 use super::super::theme::Theme;
 
 /// `Math.floor(dimensions().height / 2) - 6` — the scrollbox window
-/// (`dialog-select.tsx:213`); the port keeps a fixed visible window.
-pub const MAX_VISIBLE_OPTIONS: usize = 8;
+/// (`dialog-select.tsx:213`), clamped to at least one row.
+pub fn max_visible_options(terminal_height: u16) -> usize {
+    ((terminal_height / 2).saturating_sub(6)).max(1) as usize
+}
 
 /// One `DialogSelectOption` — the option subset the port renders.
 #[derive(Debug, Clone, Default)]
@@ -132,7 +134,7 @@ pub struct SelectState {
 
 impl SelectState {
     /// `move()` (`dialog-select.tsx:290-297`) — wrap-around.
-    pub fn move_by(&mut self, direction: i64, len: usize) {
+    pub fn move_by(&mut self, direction: i64, len: usize, max_visible: usize) {
         if len == 0 {
             return;
         }
@@ -144,22 +146,23 @@ impl SelectState {
         } else {
             next as usize
         };
-        self.clamp_scroll();
+        self.clamp_scroll(max_visible);
     }
 
     /// `moveTo()` (`dialog-select.tsx:299-309`).
-    pub fn move_to(&mut self, index: usize) {
+    pub fn move_to(&mut self, index: usize, max_visible: usize) {
         self.selected = index;
-        self.clamp_scroll();
+        self.clamp_scroll(max_visible);
     }
 
     /// Keep the selection inside the scrollbox window
     /// (`scrollToSelection`, `dialog-select.tsx:311-342`).
-    fn clamp_scroll(&mut self) {
+    fn clamp_scroll(&mut self, max_visible: usize) {
+        let max_visible = max_visible.max(1);
         if self.selected < self.scroll {
             self.scroll = self.selected;
-        } else if self.selected >= self.scroll + MAX_VISIBLE_OPTIONS {
-            self.scroll = self.selected + 1 - MAX_VISIBLE_OPTIONS;
+        } else if self.selected >= self.scroll + max_visible {
+            self.scroll = self.selected + 1 - max_visible;
         }
     }
 }
@@ -252,32 +255,32 @@ fn option_line(theme: &Theme, option: &SelectOption, active: bool, width: u16) -
 }
 
 /// Render the filtered option window (plus category headers) into `lines`.
+///
+/// Returns the row layout — `(line index, filtered option index)` pairs —
+/// for the mouse hit-testing of `dialog-select.tsx:640-676`.
 pub fn render_options(
     select: &SelectState,
     view: &SelectView,
     theme: &Theme,
     lines: &mut Vec<Line<'static>>,
     width: u16,
-) {
+    max_visible: usize,
+) -> Vec<(usize, usize)> {
+    let mut layout = Vec::new();
     let options = filter_options(&select.filter, view.options.clone());
     if options.is_empty() {
         lines.push(Line::styled(
             "    No results found",
             Style::new().fg(theme.text_muted.to_color()),
         ));
-        return;
+        return layout;
     }
     let mut category = String::new();
     // The scrollbox window (`scrollToSelection`,
     // dialog-select.tsx:311-342): render only the visible slice —
     // the selection can move past the fixed window.
     let start = select.scroll.min(options.len().saturating_sub(1));
-    for (index, option) in options
-        .iter()
-        .enumerate()
-        .skip(start)
-        .take(MAX_VISIBLE_OPTIONS)
-    {
+    for (index, option) in options.iter().enumerate().skip(start).take(max_visible) {
         if let Some(group) = &option.category {
             if group != &category && !group.is_empty() {
                 if !category.is_empty() {
@@ -294,8 +297,10 @@ pub fn render_options(
                 ));
             }
         }
+        layout.push((lines.len(), index));
         lines.push(option_line(theme, option, index == select.selected, width));
     }
+    layout
 }
 
 /// The footer action row (`dialog-select.tsx:717-728`): `title label`
@@ -398,9 +403,9 @@ mod scroll_tests {
             actions: Vec::new(),
         };
         let mut select = SelectState::default();
-        select.move_by(15, 20);
+        select.move_by(15, 20, 8);
         let mut lines = Vec::new();
-        render_options(&select, &view, &theme(), &mut lines, 80);
+        render_options(&select, &view, &theme(), &mut lines, 80, 8);
         let text = lines
             .iter()
             .map(|l| {
@@ -413,5 +418,36 @@ mod scroll_tests {
             .join("\n");
         assert!(text.contains("model-15"), "selection missing: {text}");
         assert!(!text.contains("model-0"), "window did not scroll: {text}");
+    }
+
+    #[test]
+    fn render_options_reports_the_row_layout() {
+        // The layout maps each option row's line index — the mouse
+        // hit-testing of `dialog-select.tsx:640-676`.
+        let view = SelectView {
+            title: "Models".to_string(),
+            filter: false,
+            options: vec![
+                SelectOption::new("a").with_value("a"),
+                SelectOption::new("b").with_value("b").with_category("Cat"),
+                SelectOption::new("c").with_value("c").with_category("Cat"),
+            ],
+            actions: Vec::new(),
+        };
+        let select = SelectState::default();
+        let mut lines = Vec::new();
+        let layout = render_options(&select, &view, &theme(), &mut lines, 80, 8);
+        // First option row directly follows the first category header.
+        assert_eq!(layout, vec![(0, 0), (2, 1), (3, 2)]);
+    }
+
+    #[test]
+    fn max_visible_options_scales_with_the_terminal() {
+        // `Math.floor(dimensions().height / 2) - 6`
+        // (dialog-select.tsx:213).
+        assert_eq!(max_visible_options(40), 14);
+        assert_eq!(max_visible_options(24), 6);
+        assert_eq!(max_visible_options(12), 1);
+        assert_eq!(max_visible_options(2), 1);
     }
 }

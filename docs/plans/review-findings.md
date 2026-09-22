@@ -648,3 +648,39 @@ counting fixed in the textarea but not in diff `trim_to`/`wrap_to`.
 
 Live-verified via pty probes: caret unit tests, modal window/arrow/wheel,
 skills listing, vision + thinking regressions, enter-after-empty-popup.
+
+## Round 9 — recorded-gap cleanup + startup resize
+
+Fixed every remaining recorded gap from round 8:
+
+1. **Dialog option rows are mouse-interactive**
+   (`dialog-select.tsx:640-676`): hover (`Moved`) and press
+   (`Down(Left)`) move the selection to the row under the pointer;
+   release (`Up(Left)`) activates it via the same path as
+   `dialog.select.submit`. `render_options` now returns its row
+   layout (`(line index, filtered option index)` pairs);
+   `option_row()` hit-tests a screen position against it.
+2. **Dynamic dialog window**: the scrollbox window is
+   `floor(terminal_height / 2) - 6` (min 1) instead of a fixed 8 —
+   `max_visible_options()`, plumbed through `move_by`/`move_to`/
+   `render_options`/`wheel_scroll` (which now also clamps the
+   scroll to `len - max_visible`).
+3. **Startup resize (found while live-verifying)**: crossterm only
+   reports SIGWINCH resizes — the app never learned its size at
+   startup and ran on the 80x1 default until the user resized,
+   which quietly broke everything derived from
+   `app.ui.terminal_width/height` (the dialog window height,
+   hit-testing, prompt max width). The event loop now sends an
+   initial `Msg::Resize` from `crossterm::terminal::size()`.
+4. **Palette keybind footers** (`command-palette.tsx:53`): palette
+   options carry their keybind via the existing footer slot
+   (`key_hint`, `formatKeyBindings`).
+5. **Dynamic delete hints**: the session/stash delete-confirm rows
+   derive their hint from the `session_delete`/`stash_delete`
+   keybinds (`useCommandShortcut`) instead of a hardcoded "ctrl+d".
+6. **Diff wrap/trim is display-width aware**: `trim_to`/`wrap_to`
+   count `unicode-width` cells (CJK/emoji) like the textarea.
+7. Tests: option-row click/hover (hover moves selection, release
+   navigates), option-row layout mapping, window-height scaling,
+   wide-char trim/wrap. The dialog test helper now feeds the
+   terminal dimensions like the real app.

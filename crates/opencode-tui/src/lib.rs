@@ -122,7 +122,13 @@ async fn run_inner(input: TuiInput) -> Result<Exit> {
     spawn_sse(source, msg_tx.clone());
     spawn_input_pump(msg_tx.clone());
     spawn_tick(msg_tx.clone());
-    spawn_sighup(msg_tx);
+    spawn_sighup(msg_tx.clone());
+    // crossterm only reports resizes (SIGWINCH) — the terminal size at
+    // startup has to be fed to the app explicitly, or the layout stays
+    // at the 80x1 default until the user resizes.
+    if let Ok((columns, rows)) = crossterm::terminal::size() {
+        let _ = msg_tx.send(Msg::Resize(columns, rows));
+    }
 
     let mut terminal =
         ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(io::stdout()))?;

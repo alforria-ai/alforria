@@ -47,7 +47,12 @@ pub fn session_list_options(app: &App, frame: &DialogFrame) -> Vec<SelectOption>
         }
         let is_deleting = frame.pending_delete.as_deref() == Some(session.id.as_str());
         let title = if is_deleting {
-            "Press ctrl+d again to confirm".to_string()
+            // `Press ${deleteHint()} again to confirm`
+            // (dialog-session-list.tsx:58,246).
+            format!(
+                "Press {} again to confirm",
+                crate::ui::dialogs::key_hint(app, "session_delete").unwrap_or_default()
+            )
         } else {
             session.title.clone()
         };
@@ -311,7 +316,12 @@ pub fn stash_options(app: &App, frame: &DialogFrame) -> Vec<SelectOption> {
         let is_deleting = frame.pending_delete == Some(index.to_string());
         options.push(
             SelectOption::new(if is_deleting {
-                "Press ctrl+d again to confirm".to_string()
+                // `Press ${deleteHint()} again to confirm`
+                // (dialog-stash.tsx:35,45).
+                format!(
+                    "Press {} again to confirm",
+                    crate::ui::dialogs::key_hint(app, "stash_delete").unwrap_or_default()
+                )
             } else {
                 preview
             })

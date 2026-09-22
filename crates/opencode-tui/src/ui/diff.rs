@@ -140,45 +140,81 @@ fn line_number(number: Option<u32>) -> String {
     }
 }
 
+/// Display-width of a string (`unicode_width`) — wide CJK and
+/// emoji glyphs occupy two cells.
+fn display_width(text: &str) -> usize {
+    use unicode_width::UnicodeWidthStr;
+    text.width()
+}
+
 fn trim_to(text: &str, width: usize) -> String {
-    if text.chars().count() <= width {
-        text.to_string()
-    } else {
-        let truncated: String = text.chars().take(width).collect();
-        if truncated.is_empty() {
-            truncated
-        } else {
-            format!("{truncated}…")
-        }
+    if display_width(text) <= width {
+        return text.to_string();
     }
+    let truncated = take_width(text, width);
+    if truncated.is_empty() {
+        truncated
+    } else {
+        format!("{truncated}…")
+    }
+}
+
+/// The longest prefix of `text` that fits `width` display cells.
+fn take_width(text: &str, width: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let mut consumed = 0usize;
+    for (index, char) in text.char_indices() {
+        let char_width = char.width().unwrap_or(0);
+        if consumed + char_width > width {
+            return text[..index].to_string();
+        }
+        consumed += char_width;
+    }
+    text.to_string()
 }
 
 fn wrap_to(text: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return vec![text.to_string()];
     }
+    use unicode_width::UnicodeWidthChar;
     let mut lines = Vec::new();
     let mut remaining = text;
-    while remaining.chars().count() > width {
+    while display_width(remaining) > width {
+        // The last space that fits the width budget is the break
+        // candidate; `break_at` points one past it so the space is
+        // dropped.
         let mut break_at = None;
-        for (position, _) in remaining.char_indices().skip(1) {
-            if position > width {
+        let mut consumed = 0usize;
+        for (index, char) in remaining.char_indices() {
+            if consumed + char.width().unwrap_or(0) > width {
                 break;
             }
-            if remaining.as_bytes()[position - 1] == b' ' {
-                break_at = Some(position);
+            consumed += char.width().unwrap_or(0);
+            if char == ' ' {
+                break_at = Some(index + char.len_utf8());
             }
         }
         match break_at {
-            Some(position) => {
-                let (head, tail) = remaining.split_at(position - 1);
-                lines.push(head.to_string());
-                remaining = tail;
+            Some(position) if position > 0 => {
+                lines.push(remaining[..position - 1].to_string());
+                remaining = &remaining[position..];
             }
-            None => {
-                let head: String = remaining.chars().take(width).collect();
-                lines.push(head.clone());
-                remaining = &remaining[head.len()..];
+            _ => {
+                let head = take_width(remaining, width);
+                let cut = if head.is_empty() {
+                    // A single glyph wider than the budget — consume it
+                    // anyway or the loop never advances.
+                    remaining
+                        .char_indices()
+                        .nth(1)
+                        .map(|(index, _)| index)
+                        .unwrap_or(remaining.len())
+                } else {
+                    head.len()
+                };
+                lines.push(remaining[..cut].to_string());
+                remaining = &remaining[cut..];
             }
         }
     }
@@ -547,5 +583,24 @@ mod tests {
         assert_eq!(files[0].filename, "src/lib.rs");
         assert_eq!(files[0].additions, 2);
         assert_eq!(files[0].deletions, 1);
+    }
+
+    #[test]
+    fn trim_and_wrap_are_display_width_aware() {
+        // A CJK string of 4 chars occupies 8 cells.
+        let wide = "你好世界";
+        assert_eq!(display_width(wide), 8);
+
+        // Truncation is by display cells, not chars.
+        assert_eq!(trim_to(wide, 8), wide);
+        assert_eq!(trim_to(wide, 4), "你好…");
+        assert_eq!(trim_to("abcd", 2), "ab…");
+
+        // Wrapping breaks at spaces by display width...
+        let wrapped = wrap_to("你 好 world", 4);
+        assert_eq!(wrapped, vec!["你", "好", "worl", "d"]);
+        // ...and hard-breaks wide runs without spaces.
+        let wrapped = wrap_to("你好世界!", 4);
+        assert_eq!(wrapped, vec!["你好", "世界", "!"]);
     }
 }

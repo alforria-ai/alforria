@@ -797,6 +797,29 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             crossterm::event::MouseEventKind::ScrollDown => {
                 app.ui.session_scroll.scroll_by(scroll_speed(app) as i64);
             }
+            // Dialog option rows are mouse-interactive
+            // (`dialog-select.tsx:640-676`): hover and press move the
+            // selection to the row under the pointer; release activates.
+            crossterm::event::MouseEventKind::Moved if !app.ui.dialogs.is_empty() => {
+                if let Some(index) = crate::ui::dialogs::option_row(app, mouse.column, mouse.row) {
+                    crate::ui::dialogs::mouse_move_to(app, index);
+                }
+            }
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
+                if !app.ui.dialogs.is_empty() =>
+            {
+                if let Some(index) = crate::ui::dialogs::option_row(app, mouse.column, mouse.row) {
+                    crate::ui::dialogs::mouse_move_to(app, index);
+                }
+            }
+            crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left)
+                if !app.ui.dialogs.is_empty()
+                    && crate::ui::dialogs::option_row(app, mouse.column, mouse.row).is_some() =>
+            {
+                let index = crate::ui::dialogs::option_row(app, mouse.column, mouse.row)
+                    .expect("checked above");
+                effects.extend(crate::ui::dialogs::mouse_submit(app, index));
+            }
             // Backdrop click-through (`dialog.tsx:30-38`): a release
             // outside the frame pops the top dialog. The port has no
             // mouse text selection (recorded divergence §7.8), so a
