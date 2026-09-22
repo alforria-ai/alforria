@@ -490,9 +490,11 @@ mod tests {
         write(temp.path(), ".secret.txt", "x");
         write(temp.path(), "other.md", "x");
 
-        let files = RipgrepService.glob(temp.path(), "*.txt", 100);
+        let mut files = RipgrepService.glob(temp.path(), "*.txt", 100);
         // rg --files -g '*.txt' lists .secret.txt too (overrides beat the
-        // hidden filter), but not other.md.
+        // hidden filter), but not other.md. (Sort first: glob returns
+        // readdir order, which is filesystem-dependent.)
+        files.sort();
         assert_eq!(
             files,
             vec![PathBuf::from(".secret.txt"), PathBuf::from("visible.txt")]

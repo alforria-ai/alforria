@@ -45,11 +45,17 @@ impl GlobalPaths {
     /// Resolve paths against an explicit home directory (XDG env vars are
     /// still consulted; only their fallbacks use `home`).
     pub fn resolve(home: PathBuf) -> GlobalPaths {
+        GlobalPaths::resolve_with(home, |key| env::var_os(key))
+    }
+
+    /// Same as [`GlobalPaths::resolve`], with the env accessor injected
+    /// (tests pass `_|_ None` to be independent of the runner's XDG vars).
+    pub fn resolve_with(home: PathBuf, getenv: impl Fn(&str) -> Option<OsString>) -> GlobalPaths {
         GlobalPaths {
-            config: xdg_or(env::var_os("XDG_CONFIG_HOME"), &home, ".config").join("opencode"),
-            data: xdg_or(env::var_os("XDG_DATA_HOME"), &home, ".local/share").join("opencode"),
-            cache: xdg_or(env::var_os("XDG_CACHE_HOME"), &home, ".cache").join("opencode"),
-            state: xdg_or(env::var_os("XDG_STATE_HOME"), &home, ".local/state").join("opencode"),
+            config: xdg_or(getenv("XDG_CONFIG_HOME"), &home, ".config").join("opencode"),
+            data: xdg_or(getenv("XDG_DATA_HOME"), &home, ".local/share").join("opencode"),
+            cache: xdg_or(getenv("XDG_CACHE_HOME"), &home, ".cache").join("opencode"),
+            state: xdg_or(getenv("XDG_STATE_HOME"), &home, ".local/state").join("opencode"),
             home,
         }
     }
@@ -70,7 +76,7 @@ mod tests {
 
     #[test]
     fn falls_back_to_default_subdirs() {
-        let paths = GlobalPaths::resolve(PathBuf::from("/home/user"));
+        let paths = GlobalPaths::resolve_with(PathBuf::from("/home/user"), |_| None);
         assert_eq!(paths.home, PathBuf::from("/home/user"));
         assert_eq!(paths.config, PathBuf::from("/home/user/.config/opencode"));
         assert_eq!(
