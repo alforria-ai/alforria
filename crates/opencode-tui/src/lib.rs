@@ -380,13 +380,23 @@ pub async fn execute_effect(
             match result {
                 Ok(session) => {
                     if let Some(share) = session.share {
-                        let _ = clipboard::system_clipboard().write(&share.url);
-                        app.show_toast(Toast {
-                            title: None,
-                            variant: ToastVariant::Success,
-                            message: "Share URL copied to clipboard!".to_string(),
-                            duration_ms: 5000,
-                        });
+                        // `copy()` (`session/index.tsx:468-473`): the
+                        // toast reflects the clipboard result.
+                        let toast = match clipboard::system_clipboard().write(&share.url) {
+                            Ok(()) => Toast {
+                                title: None,
+                                variant: ToastVariant::Success,
+                                message: "Share URL copied to clipboard!".to_string(),
+                                duration_ms: 5000,
+                            },
+                            Err(_) => Toast {
+                                title: None,
+                                variant: ToastVariant::Error,
+                                message: "Failed to copy URL to clipboard".to_string(),
+                                duration_ms: 5000,
+                            },
+                        };
+                        app.show_toast(toast);
                     }
                 }
                 Err(_) => {

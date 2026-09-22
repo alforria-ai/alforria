@@ -548,3 +548,40 @@ tests: `reasoning_field_falls_back_to_reasoning_content`,
 `transcript_click_toggles_part_expansion`,
 `busy_session_shows_interrupt_hint`, `retry_status_shows_message_and_attempt`,
 `idle_session_hides_interrupt_row`, `bash_overflow_hint_flips_with_expanded`.
+
+## Round 7 — commands, subagents, vision
+
+Battle-tested the slash-command surface, the `task` tool end-to-end, and
+vision (image attachments). One divergence found and fixed.
+
+**Fixed (commit follows):** `Effect::SessionShare` ignored the clipboard
+result and always showed "Share URL copied to clipboard!", while the
+direct-copy path (`Effect::ClipboardWrite`) surfaced failures — TS's
+`copy()` helper (`session/index.tsx:468-473`) shows the failure toast on
+clipboard errors in both paths. `SessionShare` now uses the same
+result-dependent toasts.
+
+**Verified live (pyte/pty probes):**
+
+- **Vision** — bracketed-paste of an image path creates the `[Image 1]`
+  attachment chip; the submitted message renders "File
+  vision_triangle.png"; a vision-capable model (glm-5.3-flash) described
+  the synthetic test image correctly ("A blue triangle centered on a
+  green background").
+- **Task tool / subagents** — build agent spawned a subagent ("✓ General
+  Task — …" with ↳ duration), the "view subagents" hint row rendered,
+  leader+down navigated to the child session, the subagent footer
+  rendered ("General (1 of 1) 14,765 (3%) · $0.00 Parent up Prev left
+  Next right"), and the `up` arrow returned to the parent transcript.
+- **Slash commands** — dialog sweep (`/sessions`, `/models`, `/agents`,
+  `/status`, `/themes`, `/help`, `/mcps`) all open via autocomplete
+  select; `/share` consent dialog → clipboard toast; `/unshare`, `/copy`
+  toasts; `/export` opens the export-options dialog (filename + toggles)
+  and exports with a success toast; `/undo` reverts with the "N message
+  reverted / or /redo to restore" marker; `/redo` restores; `/new`
+  navigates to a fresh session; `/exit` exits.
+
+**Noted divergence (not fixed, minor):** `/share` on the home route is a
+silent no-op in the port; TS shows the consent dialog and then fails the
+share request (no current session). Session-context share/unshare
+semantics match.
