@@ -671,6 +671,13 @@ pub fn registry(app: &App) -> Vec<CommandInfo> {
         command.hidden = true;
         command
     });
+    // `inputCommands` (`keymap.tsx:134-173`): the keymap layer's
+    // textarea command name for Enter — an alias of `prompt.submit`.
+    commands.push({
+        let mut command = CommandInfo::new("input.submit", "Submit prompt", "Prompt");
+        command.hidden = true;
+        command
+    });
     commands.push({
         let mut command = CommandInfo::new(
             "prompt.editor_context.clear",

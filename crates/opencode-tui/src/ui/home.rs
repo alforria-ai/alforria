@@ -2,7 +2,7 @@
 //! editor itself lands with M8.6; this renders the frame + placeholder.
 
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Widget};
 
@@ -103,13 +103,17 @@ fn render_prompt(app: &App, frame: &mut ratatui::Frame, theme: &Theme, area: Rec
         .config
         .prompt_max_width(area.width.saturating_sub(4))
         .min(area.width);
-    // The seeded --prompt input renders as content.
-    let text = match &app.state.route.data {
+    // The prompt box edits the shared prompt editor (typing inserts
+    // through `prompt::text_input`); the seeded --prompt input renders
+    // as content until the editor holds text of its own.
+    let (text, cursor) = match &app.state.route.data {
         Route::Home {
-            prompt: Some(prompt),
-            ..
-        } => prompt.input.clone(),
-        _ => String::new(),
+            prompt: Some(seed), ..
+        } if app.ui.prompt.is_empty() => (seed.input.clone(), seed.input.chars().count()),
+        _ => (
+            app.ui.prompt.textarea.text().to_string(),
+            app.ui.prompt.textarea.cursor(),
+        ),
     };
     let placeholder = text.is_empty();
     let text = if placeholder {
@@ -117,27 +121,45 @@ fn render_prompt(app: &App, frame: &mut ratatui::Frame, theme: &Theme, area: Rec
     } else {
         text
     };
-    Paragraph::new(Span::styled(
-        text,
-        if placeholder {
-            theme.text_muted.to_color()
-        } else {
-            theme.text.to_color()
-        },
-    ))
-    .block(
-        Block::new()
-            .borders(ratatui::widgets::Borders::LEFT)
-            .border_style(theme.border.to_color())
-            .style(Style::new().bg(theme.background_element.to_color()))
-            .padding(ratatui::widgets::Padding {
-                left: 2,
-                right: 2,
-                top: 1,
-                bottom: 0,
-            }),
-    )
-    .render(center_horizontally(area, max_width), frame.buffer_mut());
+    let style = if placeholder {
+        theme.text_muted.to_color()
+    } else {
+        theme.text.to_color()
+    };
+    // The shared editor renders with a visible cursor (see the session
+    // prompt, `ui/session/prompt.rs`): the char at the cursor position is
+    // reversed, or a reversed block when the cursor sits at the end.
+    let mut spans: Vec<Span> = text
+        .chars()
+        .enumerate()
+        .map(|(index, char)| {
+            let mut style = Style::new().fg(style);
+            if !placeholder && index == cursor {
+                style = style.add_modifier(Modifier::REVERSED);
+            }
+            Span::styled(char.to_string(), style)
+        })
+        .collect();
+    if !placeholder && cursor >= text.chars().count() {
+        spans.push(Span::styled(
+            " ",
+            Style::new().add_modifier(Modifier::REVERSED),
+        ));
+    }
+    Paragraph::new(Line::from(spans))
+        .block(
+            Block::new()
+                .borders(ratatui::widgets::Borders::LEFT)
+                .border_style(theme.border.to_color())
+                .style(Style::new().bg(theme.background_element.to_color()))
+                .padding(ratatui::widgets::Padding {
+                    left: 2,
+                    right: 2,
+                    top: 1,
+                    bottom: 0,
+                }),
+        )
+        .render(center_horizontally(area, max_width), frame.buffer_mut());
 }
 
 #[cfg(test)]
@@ -194,6 +216,16 @@ mod tests {
                 .any(|l| l.contains("Ask anything… \"Fix a TODO in the codebase\"")),
             "{lines:?}"
         );
+    }
+
+    /// Regression (battle-test round 4): the home prompt box renders the
+    /// shared prompt editor — typed text must appear on the home screen.
+    #[test]
+    fn prompt_renders_typed_text() {
+        let mut app = make_app();
+        app.ui.prompt.textarea.insert_text("hello");
+        let lines = buffer_text(&app, 80, 24);
+        assert!(lines.iter().any(|l| l.contains("hello")), "{lines:?}");
     }
 
     #[test]

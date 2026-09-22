@@ -107,6 +107,7 @@ fn registry_names_match_the_ts_command_sets() {
         "tips.toggle",
         "prompt.clear",
         "prompt.submit",
+        "input.submit",
         "prompt.editor_context.clear",
         "prompt.paste",
         "session.interrupt",
