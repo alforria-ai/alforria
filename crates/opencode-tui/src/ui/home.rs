@@ -62,8 +62,46 @@ fn logo_lines(theme: &Theme) -> Vec<Line<'static>> {
 /// `Logo` column width: left half + gap + right half.
 const LOGO_WIDTH: u16 = 39;
 
-/// The rendered prompt row count: `paddingTop={1}` + one textarea row.
-const PROMPT_HEIGHT: u16 = 2;
+/// The inner textarea width: the frame pads left+right by 2.
+fn inner_width(area: Rect) -> u16 {
+    area.width.saturating_sub(4).max(1)
+}
+
+/// The wrapped textarea rows: the live editor, or the seeded --prompt
+/// input while the editor is empty.
+fn rows(app: &App, area: Rect) -> crate::ui::textarea::Display {
+    let seed = match &app.state.route.data {
+        Route::Home {
+            prompt: Some(seed), ..
+        } if app.ui.prompt.is_empty() => Some(&seed.input),
+        _ => None,
+    };
+    let Some(seed) = seed else {
+        return app.ui.prompt.textarea.display(inner_width(area));
+    };
+    let mut rows: Vec<Vec<(char, Option<u64>)>> = vec![Vec::new()];
+    for char in seed.chars() {
+        if char == '\n' {
+            rows.push(Vec::new());
+        } else {
+            rows.last_mut()
+                .expect("rows starts with one row")
+                .push((char, None));
+        }
+    }
+    let cursor_row = rows.len() - 1;
+    let cursor_col = rows.last().map(Vec::len).unwrap_or(0);
+    crate::ui::textarea::Display {
+        rows,
+        cursor_row,
+        cursor_col,
+    }
+}
+
+/// The rendered prompt row count: `paddingTop={1}` + the textarea rows.
+fn prompt_height(rows: usize) -> u16 {
+    1 + rows.min(u16::MAX as usize) as u16
+}
 
 pub fn render(app: &App, frame: &mut ratatui::Frame, theme: &Theme, area: Rect) {
     let padded = Rect {
@@ -72,12 +110,13 @@ pub fn render(app: &App, frame: &mut ratatui::Frame, theme: &Theme, area: Rect) 
         width: area.width.saturating_sub(4),
         height: area.height,
     };
+    let rows = rows(app, padded).rows;
     let [_, _gap, logo, _, prompt, _bottom] = Layout::vertical([
         Constraint::Fill(1),
         Constraint::Length(4),
         Constraint::Length(4),
         Constraint::Length(1),
-        Constraint::Length(PROMPT_HEIGHT),
+        Constraint::Length(prompt_height(rows.len())),
         Constraint::Fill(1),
     ])
     .areas(padded);
@@ -103,50 +142,34 @@ fn render_prompt(app: &App, frame: &mut ratatui::Frame, theme: &Theme, area: Rec
         .config
         .prompt_max_width(area.width.saturating_sub(4))
         .min(area.width);
-    // The prompt box edits the shared prompt editor (typing inserts
-    // through `prompt::text_input`); the seeded --prompt input renders
-    // as content until the editor holds text of its own.
-    let (text, cursor) = match &app.state.route.data {
-        Route::Home {
-            prompt: Some(seed), ..
-        } if app.ui.prompt.is_empty() => (seed.input.clone(), seed.input.chars().count()),
-        _ => (
-            app.ui.prompt.textarea.text().to_string(),
-            app.ui.prompt.textarea.cursor(),
-        ),
-    };
-    let placeholder = text.is_empty();
-    let text = if placeholder {
-        placeholder_text(app)
+    let display = rows(app, area);
+    let placeholder = display.rows.iter().all(|row| row.is_empty());
+    let mut lines: Vec<Line> = Vec::new();
+    if placeholder {
+        lines.push(Line::from(Span::styled(
+            placeholder_text(app),
+            theme.text_muted.to_color(),
+        )));
     } else {
-        text
-    };
-    let style = if placeholder {
-        theme.text_muted.to_color()
-    } else {
-        theme.text.to_color()
-    };
-    // The shared editor renders with a visible cursor (see the session
-    // prompt, `ui/session/prompt.rs`): the char at the cursor position is
-    // reversed, or a reversed block when the cursor sits at the end.
-    let mut spans: Vec<Span> = text
-        .chars()
-        .enumerate()
-        .map(|(index, char)| {
-            let mut style = Style::new().fg(style);
-            if !placeholder && index == cursor {
-                style = style.add_modifier(Modifier::REVERSED);
+        for (row, cells) in display.rows.iter().enumerate() {
+            let mut spans: Vec<Span> = Vec::new();
+            for (column, (char, _mark)) in cells.iter().enumerate() {
+                let mut style = Style::new().fg(theme.text.to_color());
+                if row == display.cursor_row && column == display.cursor_col {
+                    style = style.add_modifier(Modifier::REVERSED);
+                }
+                spans.push(Span::styled(char.to_string(), style));
             }
-            Span::styled(char.to_string(), style)
-        })
-        .collect();
-    if !placeholder && cursor >= text.chars().count() {
-        spans.push(Span::styled(
-            " ",
-            Style::new().add_modifier(Modifier::REVERSED),
-        ));
+            if row == display.cursor_row && spans.is_empty() {
+                spans.push(Span::styled(
+                    " ",
+                    Style::new().add_modifier(Modifier::REVERSED),
+                ));
+            }
+            lines.push(Line::from(spans));
+        }
     }
-    Paragraph::new(Line::from(spans))
+    Paragraph::new(lines)
         .block(
             Block::new()
                 .borders(ratatui::widgets::Borders::LEFT)
