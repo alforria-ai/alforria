@@ -377,6 +377,9 @@ pub fn lines(app: &App) -> Vec<Line<'static>> {
                 }),
         ));
         rows.push(Line::from(spans));
+        // `gap={1}` between the tab row and the question block
+        // (`question.tsx:295`).
+        rows.push(Line::raw(""));
     }
     if !confirm_tab(&request, state) {
         let question = request
@@ -402,10 +405,11 @@ pub fn lines(app: &App) -> Vec<Line<'static>> {
             rows.extend(option_row(app, &request, &theme, index, option));
         }
         if custom {
-            rows.push(other_row(app, &request, &theme));
+            rows.extend(other_row(app, &request, &theme));
         }
     } else {
-        // The confirm review (`question.tsx:459-479`).
+        // The confirm review (`question.tsx:459-479`) — each row is a
+        // separate block of the `gap={1}` column (`question.tsx:295`).
         rows.push(Line::styled(
             "  Review",
             Style::new().fg(theme.text.to_color()),
@@ -421,6 +425,7 @@ pub fn lines(app: &App) -> Vec<Line<'static>> {
             } else {
                 theme.text
             };
+            rows.push(Line::raw(""));
             rows.push(Line::from(vec![
                 Span::styled(
                     format!("  {}: ", question.header),
@@ -503,30 +508,38 @@ fn option_row(
     } else {
         option.label.clone()
     };
+    // The active row highlights over `theme.backgroundElement`
+    // (`question.tsx:378-379`).
+    let mut number = Style::new().fg(theme.text_muted.to_color());
+    let mut text = Style::new();
+    if active {
+        number = number.bg(theme.background_element.to_color());
+        text = text.bg(theme.background_element.to_color());
+    }
     let mut lines = Vec::new();
     if picked && !multi {
         // The single-select picked row keeps its text color and gets a
         // trailing check (`question.tsx:363-399`).
         lines.push(Line::from(vec![
-            Span::styled(
-                format!("  {}. ", index + 1),
-                Style::new().fg(theme.text_muted.to_color()),
-            ),
-            Span::styled(label, Style::new().fg(theme.text.to_color())),
+            Span::styled(format!("  {}. ", index + 1), number),
+            Span::styled(label, text.fg(theme.text.to_color())),
             Span::styled(" ✓", Style::new().fg(theme.success.to_color())),
         ]));
     } else {
-        lines.push(Line::from(Span::styled(
-            format!("  {}. {label}", index + 1),
-            Style::new().fg(if active {
-                theme.secondary
-            } else if picked {
-                theme.success
-            } else {
-                theme.text
-            }
-            .to_color()),
-        )));
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {}. ", index + 1), number),
+            Span::styled(
+                label,
+                text.fg(if active {
+                    theme.secondary
+                } else if picked {
+                    theme.success
+                } else {
+                    theme.text
+                }
+                .to_color()),
+            ),
+        ]));
     }
     // The muted description under the option (question.tsx:393-395).
     if !option.description.is_empty() {
@@ -539,7 +552,7 @@ fn option_row(
 }
 
 /// The "Type your own answer" row (`question.tsx:400-454`).
-fn other_row(app: &App, request: &QuestionV1Request, theme: &Theme) -> Line<'static> {
+fn other_row(app: &App, request: &QuestionV1Request, theme: &Theme) -> Vec<Line<'static>> {
     let state = &app.ui.question;
     let options = options_of(request, state.tab);
     let multi = multiple(request, state.tab);
@@ -556,8 +569,9 @@ fn other_row(app: &App, request: &QuestionV1Request, theme: &Theme) -> Line<'sta
     } else {
         "Type your own answer".to_string()
     };
+    let mut lines = Vec::new();
     if state.editing {
-        return Line::from(vec![
+        lines.push(Line::from(vec![
             Span::styled(
                 format!("  {}. ", options.len() + 1),
                 Style::new().fg(theme.text_muted.to_color()),
@@ -567,19 +581,44 @@ fn other_row(app: &App, request: &QuestionV1Request, theme: &Theme) -> Line<'sta
                 format!(" {}", state.input),
                 Style::new().fg(theme.text.to_color()),
             ),
-        ]);
-    }
-    Line::from(Span::styled(
-        format!("  {}. {label}", options.len() + 1),
-        Style::new().fg(if other {
-            theme.secondary
-        } else if picked {
-            theme.success
-        } else {
-            theme.text
+        ]));
+    } else {
+        let mut number = Style::new().fg(theme.text_muted.to_color());
+        let mut text = Style::new();
+        if other {
+            number = number.bg(theme.background_element.to_color());
+            text = text.bg(theme.background_element.to_color());
         }
-        .to_color()),
-    ))
+        let mut row = vec![
+            Span::styled(format!("  {}. ", options.len() + 1), number),
+            Span::styled(
+                label,
+                text.fg(if other {
+                    theme.secondary
+                } else if picked {
+                    theme.success
+                } else {
+                    theme.text
+                }
+                .to_color()),
+            ),
+        ];
+        if picked && !multi {
+            row.push(Span::styled(
+                " ✓",
+                Style::new().fg(theme.success.to_color()),
+            ));
+        }
+        lines.push(Line::from(row));
+        // The saved custom answer under the row (`question.tsx:448-452`).
+        if !state.custom[state.tab].is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!("     {}", state.custom[state.tab]),
+                Style::new().fg(theme.text_muted.to_color()),
+            )));
+        }
+    }
+    lines
 }
 
 pub fn height(app: &App) -> u16 {
@@ -593,6 +632,10 @@ pub fn render(app: &App, frame: &mut ratatui::Frame, theme: &Theme, area: Rect) 
         .block(
             Block::new()
                 .borders(ratatui::widgets::Borders::LEFT)
+                .border_set(ratatui::symbols::border::Set {
+                    vertical_left: "┃",
+                    ..Default::default()
+                })
                 .border_style(theme.accent.to_color())
                 .style(Style::new().bg(theme.background_panel.to_color()))
                 .padding(Padding {
