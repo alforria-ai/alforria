@@ -556,13 +556,13 @@ mod tests {
             "message.part.updated",
             json!({"part": part("tool", json!({
                 "tool": "read",
-                "state": {"status": "completed", "input": {"filePath": "/a"}, "metadata": {}, "time": {"start": 1, "end": 2}},
+                "state": {"status": "completed", "input": {"filePath": "a"}, "metadata": {}, "time": {"start": 1, "end": 2}},
             }))}),
         );
         let outputs = map_event(&mut state, &event);
         assert_eq!(outputs.len(), 1);
         match &outputs[0] {
-            Output::Println(line) => assert!(line.contains("Read /a"), "{line}"),
+            Output::Println(line) => assert!(line.contains("Read a"), "{line}"),
             other => panic!("expected inline line, got {other:?}"),
         }
     }
@@ -574,12 +574,12 @@ mod tests {
             "message.part.updated",
             json!({"part": part("tool", json!({
                 "tool": "read",
-                "state": {"status": "error", "error": "boom", "input": {"filePath": "/a"}, "metadata": {}, "time": {"start": 1, "end": 2}},
+                "state": {"status": "error", "error": "boom", "input": {"filePath": "a"}, "metadata": {}, "time": {"start": 1, "end": 2}},
             }))}),
         );
         let outputs = map_event(&mut state, &event);
         assert_eq!(outputs.len(), 2);
-        assert!(matches!(&outputs[0], Output::Println(line) if line.contains("Read /a failed")));
+        assert!(matches!(&outputs[0], Output::Println(line) if line.contains("Read a failed")));
         assert_eq!(outputs[1], Output::Error("boom".to_string()));
     }
 
