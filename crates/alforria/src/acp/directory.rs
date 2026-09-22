@@ -8,7 +8,13 @@ use serde_json::{json, Value};
 
 use crate::acp::server::ServerClient;
 
-const PRIORITY: [&str; 4] = ["gpt-5", "claude-sonnet-4", "big-pickle", "gemini-3-pro"];
+const PRIORITY: [&str; 5] = [
+    "gpt-5",
+    "claude-sonnet-4",
+    "big-pickle",
+    "gemini-3-pro",
+    "glm-5.3-thinking",
+];
 
 /// `Provider.sort` (provider.ts:2047-2056): priority index desc,
 /// `latest` first, id desc; stable.

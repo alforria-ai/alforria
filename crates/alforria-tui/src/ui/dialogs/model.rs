@@ -304,10 +304,11 @@ pub fn variant_options(app: &App) -> Vec<SelectOption> {
 const PROVIDER_PRIORITY: &[(&str, i32)] = &[
     ("opencode", 0),
     ("opencode-go", 1),
-    ("openai", 2),
-    ("github-copilot", 3),
-    ("anthropic", 4),
-    ("google", 5),
+    ("libertai", 2),
+    ("openai", 3),
+    ("github-copilot", 4),
+    ("anthropic", 5),
+    ("google", 6),
 ];
 
 const CUSTOM_PROVIDER_OPTION_VALUE: &str = "__opencode_custom_provider__";
@@ -394,6 +395,7 @@ pub fn provider_options(app: &App, theme: &Theme) -> Vec<SelectOption> {
             "anthropic" => Some("(API key)"),
             "openai" => Some("(ChatGPT Plus/Pro or API key)"),
             "opencode-go" => Some("Low cost subscription for everyone"),
+            "libertai" => Some("LibertAI decentralized inference"),
             _ => None,
         };
         let option = SelectOption::new(

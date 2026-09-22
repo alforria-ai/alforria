@@ -53,6 +53,7 @@ impl AcpChild {
             .env("OPENCODE_MODELS_PATH", &env.models_path)
             .env("OPENCODE_DISABLE_MODELS_FETCH", "1")
             .env_remove("OPENCODE_SERVER_PASSWORD")
+            .env_remove("LIBERTAI_API_KEY")
             .current_dir(env.project_dir())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

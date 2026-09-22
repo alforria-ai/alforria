@@ -789,11 +789,17 @@ fn filter_providers(
 }
 
 /// Load the catalog through the source, mapping failures onto the defect
-/// error surface.
+/// error surface. The built-in `libertai` provider is merged in — only
+/// when absent, a user's models.dev or opencode.json is never clobbered.
 pub fn load_catalog(
     catalog: &CatalogSource,
 ) -> Result<alforria_core::catalog::Providers, ServerError> {
-    catalog().map_err(|err| ServerError::Core(alforria_core::CoreError::Catalog(err.to_string())))
+    let mut providers = catalog()
+        .map_err(|err| ServerError::Core(alforria_core::CoreError::Catalog(err.to_string())))?;
+    providers
+        .entry(alforria_core::libertai::LIBERTAI_PROVIDER_ID.to_string())
+        .or_insert_with(alforria_core::libertai::builtin_provider);
+    Ok(providers)
 }
 
 // ---------------------------------------------------------------------------
@@ -861,6 +867,27 @@ mod tests {
         assert_eq!(model["capabilities"]["toolcall"], true);
         // non-reasoning models keep `variants: {}`
         assert_eq!(model["variants"], json!({}));
+    }
+
+    #[test]
+    fn load_catalog_merges_builtin_libertai() {
+        std::env::set_var("LIBERTAI_MODEL_CATALOG_URL", "");
+        let empty: CatalogSource = std::sync::Arc::new(|| Ok(BTreeMap::new()));
+        let catalog = load_catalog(&empty).unwrap();
+        let provider = &catalog["libertai"];
+        assert_eq!(provider.name, "LibertAI");
+        assert_eq!(provider.api.as_deref(), Some("https://api.libertai.io/v1"));
+        assert_eq!(provider.env, vec!["LIBERTAI_API_KEY".to_string()]);
+        assert!(!provider.models.is_empty());
+        std::env::remove_var("LIBERTAI_MODEL_CATALOG_URL");
+
+        let mut custom = catalog_provider();
+        custom.id = "libertai".to_string();
+        let populated: CatalogSource = std::sync::Arc::new(move || {
+            Ok(BTreeMap::from([("libertai".to_string(), custom.clone())]))
+        });
+        let catalog = load_catalog(&populated).unwrap();
+        assert_eq!(catalog["libertai"].name, "Example");
     }
 
     #[test]

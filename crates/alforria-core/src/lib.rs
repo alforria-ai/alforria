@@ -17,6 +17,7 @@ pub mod fuzzysort;
 pub mod git;
 pub mod integration;
 pub mod jsonc;
+pub mod libertai;
 pub mod lsp;
 pub mod mcp;
 pub mod merge;

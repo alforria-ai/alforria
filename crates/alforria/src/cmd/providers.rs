@@ -228,12 +228,13 @@ pub struct LoginDeps<'a> {
 pub fn priority(id: &str) -> usize {
     match id {
         "alforria" => 0,
-        "openai" => 1,
-        "github-copilot" => 2,
-        "google" => 3,
-        "anthropic" => 4,
-        "openrouter" => 5,
-        "vercel" => 6,
+        "libertai" => 1,
+        "openai" => 2,
+        "github-copilot" => 3,
+        "google" => 4,
+        "anthropic" => 5,
+        "openrouter" => 6,
+        "vercel" => 7,
         _ => 99,
     }
 }
@@ -359,6 +360,9 @@ fn login_api_key_flow(ui: &mut Ui, deps: &mut LoginDeps, provider: &str) -> Resu
     }
     if provider == "alforria" {
         log_info(ui, "Create an api key at https://opencode.ai/auth");
+    }
+    if provider == "libertai" {
+        log_info(ui, "Create an API key at https://console.libertai.io");
     }
     if provider == "vercel" {
         log_info(

@@ -52,7 +52,13 @@ pub fn output_token_max() -> Option<f64> {
 /// `sort` (provider.ts:2050-2058) — the priority index, `latest` first,
 /// id desc.
 fn sort_model_ids(mut models: Vec<String>) -> Vec<String> {
-    const PRIORITY: [&str; 4] = ["gpt-5", "claude-sonnet-4", "big-pickle", "gemini-3-pro"];
+    const PRIORITY: [&str; 5] = [
+        "gpt-5",
+        "claude-sonnet-4",
+        "big-pickle",
+        "gemini-3-pro",
+        "glm-5.3-thinking",
+    ];
     let priority = |id: &str| -> i64 {
         PRIORITY
             .iter()
@@ -405,7 +411,7 @@ impl ModelSource for RuntimeModels {
             } else if provider_id == "github-copilot" {
                 vec!["gpt-mini", "gemini-flash", "gpt-nano", "claude-haiku"]
             } else {
-                vec!["gemini-flash", "gpt-nano", "claude-haiku"]
+                vec!["gemini-flash", "gpt-nano", "claude-haiku", "glm-flash"]
             };
             let mut models: Vec<&Value> = provider["models"]
                 .as_object()
