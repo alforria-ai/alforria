@@ -12,8 +12,8 @@ use super::super::theme::Theme;
 use crate::state::route::PromptMode;
 use crate::state::App;
 
-/// The autocomplete popup `maxHeight` (`autocomplete.tsx`).
-pub(crate) const AUTOCOMPLETE_HEIGHT: usize = 8;
+/// The autocomplete popup `maxHeight` (`autocomplete.tsx:712-716`).
+pub(crate) const AUTOCOMPLETE_HEIGHT: usize = 10;
 
 /// The inner textarea width: the frame pads left+right by 2.
 fn inner_width(area: Rect) -> u16 {
@@ -39,7 +39,10 @@ pub fn height(app: &App, area: Rect, terminal_height: u16) -> u16 {
 fn placeholder_text(app: &App) -> String {
     let roll = app.ui.prompt.placeholder as usize % crate::ui::home::PLACEHOLDER_NORMAL.len();
     if app.ui.prompt.mode == PromptMode::Shell {
-        format!("{}…", crate::ui::home::PLACEHOLDER_SHELL[roll])
+        format!(
+            "Run a command… \"{}\"",
+            crate::ui::home::PLACEHOLDER_SHELL[roll]
+        )
     } else {
         format!(
             "Ask anything… \"{}\"",
@@ -48,46 +51,102 @@ fn placeholder_text(app: &App) -> String {
     }
 }
 
-/// The meta row under the textarea: agent · model (`prompt/index.tsx`
-/// `Keybinds` row — the muted hint line).
-fn meta_line<'a>(app: &'a App, theme: &Theme) -> Line<'a> {
+/// The meta row under the textarea (`prompt/index.tsx:1445-1484`):
+/// `space-between` — agent · model · provider · variant on the left,
+/// the `agents`/`commands` shortcut hints (or `esc exit shell mode`) on
+/// the right.
+fn meta_line(app: &App, theme: &Theme, width: u16) -> Line<'static> {
     let muted = theme.text_muted.to_color();
-    let mut spans: Vec<Span<'_>> = Vec::new();
+    let shell = app.ui.prompt.mode == PromptMode::Shell;
+    let mut left: Vec<Span<'static>> = Vec::new();
     if let Some(agent) = app
         .state
         .local
         .agent_current(&app.state.sync)
         .and_then(|a| a.get("name").and_then(|v| v.as_str()))
     {
-        spans.push(Span::styled(agent.to_string(), theme.text.to_color()));
+        left.push(Span::styled(
+            if shell {
+                "Shell".to_string()
+            } else {
+                crate::ui::locale::titlecase(agent)
+            },
+            theme.text.to_color(),
+        ));
+        if !shell && app.state.permission_mode == crate::state::PermissionMode::Auto {
+            left.push(Span::styled("auto".to_string(), muted));
+        }
+        if !shell {
+            let parsed = app
+                .state
+                .local
+                .model_parsed(&app.state.sync, &app.state.args);
+            left.push(Span::styled(" · ".to_string(), muted));
+            left.push(Span::styled(parsed.model.clone(), theme.text.to_color()));
+            left.push(Span::styled(parsed.provider.clone(), muted));
+            if let Some(variant) = app
+                .state
+                .local
+                .variant_current(&app.state.sync, &app.state.args)
+            {
+                if variant != "default" {
+                    left.push(Span::styled(" · ".to_string(), muted));
+                    left.push(Span::styled(
+                        variant,
+                        Style::new()
+                            .fg(theme.warning.to_color())
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                }
+            }
+        }
     }
-    if let Some(model) = app
-        .state
-        .local
-        .model_current(&app.state.sync, &app.state.args)
-    {
-        spans.push(Span::styled("  ·  ", muted));
-        spans.push(Span::styled(model.key(), muted));
+    let mut right: Vec<Span<'static>> = Vec::new();
+    if shell {
+        right.push(Span::styled("esc".to_string(), theme.text.to_color()));
+        right.push(Span::styled(" exit shell mode".to_string(), muted));
+    } else {
+        if let Some(shortcut) = crate::keymap::bindings::keybind_for_command("agent.cycle")
+            .and_then(|k| key_hint(app, k))
+        {
+            right.push(Span::styled(shortcut, theme.text.to_color()));
+            right.push(Span::styled(" agents".to_string(), muted));
+            right.push(Span::raw(" "));
+        }
+        if let Some(shortcut) = crate::keymap::bindings::keybind_for_command("command.palette.show")
+            .and_then(|k| key_hint(app, k))
+        {
+            right.push(Span::styled(shortcut, theme.text.to_color()));
+            right.push(Span::styled(" commands".to_string(), muted));
+        }
     }
+    let left_width: usize = left.iter().map(|s| s.content.chars().count()).sum();
+    let right_width: usize = right.iter().map(|s| s.content.chars().count()).sum();
+    let padding = (width as usize).saturating_sub(left_width + right_width);
+    let mut spans = left;
+    spans.push(Span::raw(" ".repeat(padding.max(1))));
+    spans.extend(right);
     if app.ui.prompt.submitting {
         // `move.progress() === "Submitting prompt"` with animated dots
         // (`move.tsx:174-177`).
-        spans.push(Span::styled("  ·  ", muted));
+        spans.push(Span::styled("  · ".to_string(), muted));
         spans.push(Span::styled(
             format!("{} Submitting prompt", app.session_spinner()),
             theme.text.to_color(),
         ));
     }
-    if app.ui.prompt.mode == PromptMode::Shell {
-        spans.push(Span::styled("  ·  ", muted));
-        spans.push(Span::styled("shell", theme.warning.to_color()));
-    }
     Line::from(spans)
+}
+
+fn key_hint(app: &App, keybind: &str) -> Option<String> {
+    crate::ui::dialogs::key_hint(app, keybind)
 }
 
 /// `formatDuration` (`util/format.ts:1-18`).
 fn format_duration(secs: u64) -> String {
-    if secs < 60 {
+    if secs == 0 {
+        String::new()
+    } else if secs < 60 {
         format!("{secs}s")
     } else if secs < 3600 {
         let mins = secs / 60;
@@ -166,12 +225,13 @@ fn status_row(app: &App, theme: &Theme) -> Option<Line<'static>> {
         ..
     }) = &retry
     {
-        // `message()` (`prompt/index.tsx:1545-1554`).
+        // `message()` / `isTruncated()` (`prompt/index.tsx:1545-1556`).
+        let truncated = message.chars().count() > 120;
         let message =
             if message.contains("exceeded your current quota") && message.contains("gemini") {
                 "gemini is way too hot right now".to_string()
-            } else if message.len() > 80 {
-                format!("{}…", &message[..80])
+            } else if message.chars().count() > 80 {
+                format!("{}…", message.chars().take(80).collect::<String>())
             } else {
                 message.clone()
             };
@@ -181,13 +241,14 @@ fn status_row(app: &App, theme: &Theme) -> Option<Line<'static>> {
             .unwrap_or(0);
         let seconds = next.saturating_sub(now_ms) / 1000;
         let duration = format_duration(seconds);
+        let truncated_hint = if truncated { " (click to expand)" } else { "" };
         let retry_info = if duration.is_empty() {
             format!(" [retrying attempt #{attempt}]")
         } else {
             format!(" [retrying in {duration} attempt #{attempt}]")
         };
         spans.push(Span::styled(
-            format!("{message}{retry_info}"),
+            format!("{message}{truncated_hint}{retry_info}"),
             theme.error.to_color(),
         ));
         spans.push(Span::raw(" "));
@@ -273,7 +334,7 @@ pub fn render(app: &App, frame: &mut ratatui::Frame, theme: &Theme, area: Rect) 
             lines.push(Line::from(spans));
         }
     }
-    lines.push(meta_line(app, theme));
+    lines.push(meta_line(app, theme, area.width.saturating_sub(5)));
     if let Some(row) = status_row(app, theme) {
         lines.push(row);
     }
@@ -341,22 +402,29 @@ pub(crate) fn render_autocomplete(
         .enumerate()
         .map(|(index, option)| {
             let selected = index + scroll == autocomplete.selected;
-            let (fg, bg) = if selected {
-                (theme.text, theme.background_element)
+            let fg = if selected {
+                super::super::theme::selected_foreground(theme, Some(theme.primary))
             } else {
-                (theme.text_muted, theme.background_menu)
+                theme.text
             };
-            Line::from(Span::styled(
+            let bg = if selected {
+                theme.primary
+            } else {
+                theme.background_menu
+            };
+            let mut spans = vec![Span::styled(
                 format!(" {} ", option.display),
-                Style::new()
-                    .fg(fg.to_color())
-                    .bg(bg.to_color())
-                    .add_modifier(if selected {
-                        Modifier::BOLD
-                    } else {
-                        Modifier::empty()
-                    }),
-            ))
+                Style::new().fg(fg.to_color()).bg(bg.to_color()),
+            )];
+            if let Some(description) = &option.description {
+                spans.push(Span::styled(
+                    format!(" {}", description.trim_start()),
+                    Style::new()
+                        .fg(if selected { fg } else { theme.text_muted }.to_color())
+                        .bg(bg.to_color()),
+                ));
+            }
+            Line::from(spans)
         })
         .collect();
     // The zero-match fallback row keeps the popup visible

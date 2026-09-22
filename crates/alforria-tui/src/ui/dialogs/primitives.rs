@@ -25,6 +25,8 @@ pub struct SelectOption {
     pub category: Option<String>,
     pub footer: Option<String>,
     pub gutter: Option<String>,
+    /// The `props.current` `●` marker (`dialog-select.tsx:747`).
+    pub current: bool,
     /// The error background of the delete-confirm rows.
     pub bg_error: bool,
 }
@@ -63,6 +65,14 @@ impl SelectOption {
         let mut option = self;
         option.footer = Some(footer.into());
         option
+    }
+
+    pub fn with_current(self, current: bool) -> SelectOption {
+        SelectOption { current, ..self }
+    }
+
+    pub fn with_bg_error(self, bg_error: bool) -> SelectOption {
+        SelectOption { bg_error, ..self }
     }
 }
 
@@ -179,15 +189,21 @@ pub struct SelectView {
 }
 
 /// The shared header row: bold title left, muted hint right.
-pub fn header_line(theme: &Theme, title: &str, hint: &str) -> Line<'static> {
+pub fn header_line(theme: &Theme, title: &str, hint: &str, width: u16) -> Line<'static> {
+    // `paddingLeft/Right 4`, `justifyContent: space-between`
+    // (`dialog-select.tsx:557-568`).
+    let prefix = "    ";
+    let used = 2 * prefix.chars().count() + title.chars().count() + hint.chars().count();
+    let padding = (width as usize).saturating_sub(used);
     Line::from(vec![
+        Span::raw(prefix),
         Span::styled(
             title.to_string(),
             Style::new()
                 .fg(theme.text.to_color())
                 .add_modifier(ratatui::style::Modifier::BOLD),
         ),
-        Span::raw("  "),
+        Span::raw(" ".repeat(padding)),
         Span::styled(
             hint.to_string(),
             Style::new().fg(theme.text_muted.to_color()),
@@ -196,59 +212,79 @@ pub fn header_line(theme: &Theme, title: &str, hint: &str) -> Line<'static> {
 }
 
 /// One option row (`dialog-select.tsx:732-791`): the `●` current marker,
-/// the gutter, title + description, footer right.
+/// the gutter, title + description, footer right. The title column is
+/// fixed at 6 (`paddingLeft 3` + the leading pad), or `1 +` marker +
+/// gap + `3` when current/gutter.
 fn option_line(theme: &Theme, option: &SelectOption, active: bool, width: u16) -> Line<'static> {
     let selected_fg = super::super::theme::selected_foreground(theme, Some(theme.primary));
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    if active {
-        let bg = if option.bg_error {
+    let bg = if active {
+        Some(if option.bg_error {
             theme.error
         } else {
             theme.primary
-        };
-        spans.push(Span::styled("  ", Style::new().bg(bg.to_color())));
+        })
     } else {
-        spans.push(Span::raw("  "));
+        None
+    };
+    let with_bg = |style: Style| match bg {
+        Some(bg) => style.bg(bg.to_color()),
+        None => style,
+    };
+    let text_fg = if active {
+        selected_fg
+    } else if option.current {
+        theme.primary
+    } else {
+        theme.text
+    };
+    let muted_fg = if active {
+        selected_fg
+    } else {
+        theme.text_muted
+    };
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let current = option.current && option.gutter.is_none();
+    if current {
+        spans.push(Span::styled(" ", with_bg(Style::new())));
+        spans.push(Span::styled(
+            "●".to_string(),
+            with_bg(Style::new().fg(text_fg.to_color())),
+        ));
+        spans.push(Span::styled("    ", with_bg(Style::new())));
+    } else if let Some(gutter) = &option.gutter {
+        spans.push(Span::styled(" ", with_bg(Style::new())));
+        spans.push(Span::styled(
+            gutter.clone(),
+            with_bg(Style::new().fg(text_fg.to_color())),
+        ));
+        spans.push(Span::styled("    ", with_bg(Style::new())));
+    } else {
+        spans.push(Span::styled("      ", with_bg(Style::new())));
     }
-    if let Some(gutter) = &option.gutter {
-        spans.push(Span::raw(format!("{gutter} ")));
-    }
-    let fg = if active { selected_fg } else { theme.text };
-    spans.push(Span::styled(
-        option.title.clone(),
-        Style::new().fg(fg.to_color()).add_modifier(if active {
-            ratatui::style::Modifier::BOLD
-        } else {
-            ratatui::style::Modifier::empty()
-        }),
-    ));
+    let title_style = Style::new().fg(text_fg.to_color()).add_modifier(if active {
+        ratatui::style::Modifier::BOLD
+    } else {
+        ratatui::style::Modifier::empty()
+    });
+    spans.push(Span::styled(option.title.clone(), with_bg(title_style)));
     if let Some(description) = &option.description {
         spans.push(Span::styled(
             format!(" {description}"),
-            Style::new().fg(if active {
-                selected_fg
-            } else {
-                theme.text_muted
-            }
-            .to_color()),
+            with_bg(Style::new().fg(muted_fg.to_color())),
         ));
     }
     if let Some(footer) = &option.footer {
         let used: usize = spans.iter().map(|span| span.content.chars().count()).sum();
         let padding = width.saturating_sub((used + footer.chars().count()) as u16);
         if padding > 0 {
-            if active {
-                spans.push(Span::styled(
-                    " ".repeat(padding as usize),
-                    Style::new().bg(theme.primary.to_color()),
-                ));
-            } else {
-                spans.push(Span::raw(" ".repeat(padding as usize)));
-            }
+            spans.push(Span::styled(
+                " ".repeat(padding as usize),
+                with_bg(Style::new()),
+            ));
         }
         spans.push(Span::styled(
             footer.clone(),
-            Style::new().fg(theme.text_muted.to_color()),
+            with_bg(Style::new().fg(muted_fg.to_color())),
         ));
     }
     Line::from(spans)
@@ -290,7 +326,7 @@ pub fn render_options(
                 }
                 category = group.clone();
                 lines.push(Line::styled(
-                    format!("   {group}"),
+                    format!("    {group}"),
                     Style::new()
                         .fg(theme.accent.to_color())
                         .add_modifier(ratatui::style::Modifier::BOLD),
@@ -307,6 +343,7 @@ pub fn render_options(
 /// pairs with a muted label.
 pub fn render_actions(theme: &Theme, actions: &[(String, String)]) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
+    spans.push(Span::raw("    "));
     for (index, (title, label)) in actions.iter().enumerate() {
         if index > 0 {
             spans.push(Span::raw("  "));
@@ -327,12 +364,12 @@ pub fn render_actions(theme: &Theme, actions: &[(String, String)]) -> Line<'stat
 pub fn filter_line(theme: &Theme, select: &SelectState, placeholder: &str) -> Line<'static> {
     if select.filter.is_empty() {
         Line::from(Span::styled(
-            format!("  {placeholder}"),
+            format!("    {placeholder}"),
             Style::new().fg(theme.text_muted.to_color()),
         ))
     } else {
         Line::from(Span::styled(
-            format!("  {}", select.filter),
+            format!("    {}", select.filter),
             Style::new().fg(theme.text_muted.to_color()),
         ))
     }
@@ -397,6 +434,7 @@ mod scroll_tests {
                     category: None,
                     footer: None,
                     gutter: None,
+                    current: false,
                     bg_error: false,
                 })
                 .collect(),

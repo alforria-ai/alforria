@@ -35,12 +35,22 @@ pub fn mcp_options(app: &App) -> Vec<SelectOption> {
         .collect()
 }
 
-/// `DialogThemeList.options` (`dialog-theme-list.tsx:8-13`).
+/// `DialogThemeList.options` (`dialog-theme-list.tsx:8-13`) — sorted
+/// case-insensitively, `current` marked (`:9,27`).
 pub fn theme_options(app: &App) -> Vec<SelectOption> {
-    let _ = app;
-    crate::ui::theme::all_themes()
+    let current = app.ui.theme.active.clone();
+    let mut names: Vec<&str> = crate::ui::theme::all_themes()
         .into_iter()
-        .map(|(name, _)| SelectOption::new(name.to_string()).with_value(name.to_string()))
+        .map(|(name, _)| name)
+        .collect();
+    names.sort_by_key(|name| name.to_lowercase());
+    names
+        .into_iter()
+        .map(|name| {
+            SelectOption::new(name.to_string())
+                .with_value(name.to_string())
+                .with_current(name == current)
+        })
         .collect()
 }
 
@@ -148,8 +158,10 @@ pub fn workspace_set_options(app: &App) -> Vec<SelectOption> {
 }
 
 /// `DialogStatus` (`dialog-status.tsx`) — MCP/LSP/formatter/plugin list.
-pub fn status_lines(app: &App, theme: &Theme) -> Vec<ratatui::text::Line<'static>> {
-    let mut lines = vec![super::primitives::header_line(theme, "Status", "esc")];
+pub fn status_lines(app: &App, theme: &Theme, width: u16) -> Vec<ratatui::text::Line<'static>> {
+    let mut lines = vec![super::primitives::header_line(
+        theme, "Status", "esc", width,
+    )];
     let text = Style::new().fg(theme.text.to_color());
     let muted = Style::new().fg(theme.text_muted.to_color());
     if app.state.sync.mcp.is_empty() {

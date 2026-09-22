@@ -11,7 +11,9 @@ pub fn options(app: &App, frame: &crate::ui::dialogs::DialogFrame) -> Vec<Select
     // The `footer: formatKeyBindings(entry.bindings, config)` of the
     // palette options (`command-palette.tsx:53`).
     let footer = |command: &crate::command::CommandInfo| {
-        crate::ui::dialogs::key_hint(app, command.name).unwrap_or_default()
+        crate::keymap::bindings::keybind_for_command(command.name)
+            .and_then(|keybind| crate::ui::dialogs::key_hint(app, keybind))
+            .unwrap_or_default()
     };
     let all = || {
         commands

@@ -56,6 +56,24 @@ pub fn session_list_options(app: &App, frame: &DialogFrame) -> Vec<SelectOption>
         } else {
             session.title.clone()
         };
+        // The relative-directory footer (`dialog-session-list.tsx:228-234`).
+        let directory = if let Some(path) = &session.path {
+            session
+                .directory
+                .strip_suffix(path.as_str())
+                .map(|dir| dir.trim_end_matches('/').to_string())
+        } else {
+            Some(session.directory.clone())
+        };
+        let footer = match directory {
+            Some(dir) if !dir.is_empty() && Some(&dir) != app.state.project.main_dir.as_ref() => {
+                std::path::Path::new(&dir)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().chars().take(20).collect::<String>())
+                    .unwrap_or_default()
+            }
+            _ => String::new(),
+        };
 
         // The busy spinner / quick-switch slot gutter
         // (dialog-session-list.tsx:231-240).
@@ -79,11 +97,18 @@ pub fn session_list_options(app: &App, frame: &DialogFrame) -> Vec<SelectOption>
                 gutter = Some((slot + 1).to_string());
             }
         }
+        let current = match &app.state.route.data {
+            Route::Session { session_id, .. } => session_id.as_str(),
+            _ => "",
+        };
         Some(
             SelectOption::new(title)
                 .with_value(session.id.clone())
                 .with_category(category)
-                .with_gutter(gutter),
+                .with_gutter(gutter)
+                .with_current(session.id == current)
+                .with_bg_error(is_deleting)
+                .with_footer(footer),
         )
     };
     for id in &pinned {

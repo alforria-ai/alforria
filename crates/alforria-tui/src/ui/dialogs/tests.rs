@@ -338,7 +338,7 @@ fn dialog_snapshots_at_80_and_140_columns() {
         open(&mut app, PendingDialog::Debug);
         let text = rendered_text(&render_lines(&mut app, width, 30));
         assert!(
-            text.contains("SessionID"),
+            text.contains("Session ID"),
             "debug dialog renders at {width} columns"
         );
         clear(&mut app);

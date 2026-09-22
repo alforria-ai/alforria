@@ -132,7 +132,7 @@ fn render_startup_loading(app: &App, frame: &mut ratatui::Frame, theme: &theme::
         format!("⋯ {text}")
     };
     let width = label.chars().count() as u16 + 2;
-    let [row] = ratatui::layout::Layout::vertical([
+    let [_, _, row] = ratatui::layout::Layout::vertical([
         ratatui::layout::Constraint::Fill(1),
         ratatui::layout::Constraint::Length(1),
         ratatui::layout::Constraint::Length(1),

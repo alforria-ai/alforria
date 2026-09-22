@@ -9,16 +9,28 @@ use crate::state::local::ModelRef;
 use crate::state::route::Route;
 use crate::state::{App, Effect};
 
-/// `sortModelOptions` (`dialog-model.tsx:159-175`).
+/// `sortModelOptions` (`dialog-model.tsx:178-197`) — free models sort
+/// last, then by release date desc, then title.
 fn sort_model_options(options: Vec<SelectOption>, release: Vec<i64>) -> Vec<SelectOption> {
-    let mut keyed: Vec<(i64, String, usize, SelectOption)> = options
+    let mut keyed: Vec<(bool, i64, String, usize, SelectOption)> = options
         .into_iter()
         .enumerate()
         .zip(release)
-        .map(|((index, option), release)| (release, option.title.clone(), index, option))
+        .map(|((index, option), release)| {
+            let free = option.footer.as_deref() == Some("Free");
+            (free, release, option.title.clone(), index, option)
+        })
         .collect();
-    keyed.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-    keyed.into_iter().map(|(_, _, _, option)| option).collect()
+    keyed.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then(b.1.cmp(&a.1))
+            .then(a.2.cmp(&b.2))
+            .then(a.3.cmp(&b.3))
+    });
+    keyed
+        .into_iter()
+        .map(|(_, _, _, _, option)| option)
+        .collect()
 }
 
 fn provider_models(provider: &Value) -> Vec<(String, Value)> {
@@ -39,13 +51,16 @@ fn model_option(
     model_id: &str,
     info: &Value,
     favorites: &[ModelRef],
+    current: Option<&str>,
 ) -> SelectOption {
     let provider_id = provider
         .get("id")
         .and_then(Value::as_str)
         .unwrap_or_default();
+    let value = format!("{provider_id}/{model_id}");
     let option = SelectOption::new(info.get("name").and_then(Value::as_str).unwrap_or(model_id))
-        .with_value(format!("{provider_id}/{model_id}"));
+        .with_value(value.clone())
+        .with_current(current == Some(value.as_str()));
     let option = if favorites
         .iter()
         .any(|favorite| favorite.provider_id == provider_id && favorite.model_id == model_id)
@@ -71,6 +86,11 @@ pub fn model_options(app: &App) -> Vec<SelectOption> {
     let connected = crate::state::connected(app);
     let favorites = app.state.local.model_favorite().to_vec();
     let recents = app.state.local.model_recent().to_vec();
+    let current = app
+        .state
+        .local
+        .model_current(&app.state.sync, &app.state.args)
+        .map(|model| model.key());
 
     let mut options: Vec<SelectOption> = Vec::new();
     // Favorites + Recent sections (`toOptions`).
@@ -97,7 +117,8 @@ pub fn model_options(app: &App) -> Vec<SelectOption> {
                     continue;
                 };
                 options.push(
-                    model_option(provider, &model_id, &info, &favorites).with_category(category),
+                    model_option(provider, &model_id, &info, &favorites, current.as_deref())
+                        .with_category(category),
                 );
             }
         }
@@ -127,15 +148,16 @@ pub fn model_options(app: &App) -> Vec<SelectOption> {
                 }
             }
             provider_options.push(if connected {
-                model_option(provider, &model_id, &info, &favorites).with_category(
-                    provider
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or(provider_id)
-                        .to_string(),
-                )
+                model_option(provider, &model_id, &info, &favorites, current.as_deref())
+                    .with_category(
+                        provider
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or(provider_id)
+                            .to_string(),
+                    )
             } else {
-                model_option(provider, &model_id, &info, &favorites)
+                model_option(provider, &model_id, &info, &favorites, current.as_deref())
             });
             release.push(
                 info.get("release_date")
@@ -202,6 +224,13 @@ pub fn toggle_favorite(app: &mut App, value: &str) {
 
 /// `DialogAgent` (`dialog-agent.tsx`).
 pub fn agent_options(app: &App) -> Vec<SelectOption> {
+    let current = app
+        .state
+        .local
+        .agent_current(&app.state.sync)
+        .and_then(|agent| agent.get("name"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
     crate::state::local::LocalState::agent_values(&app.state.sync)
         .iter()
         .map(|agent| {
@@ -221,7 +250,9 @@ pub fn agent_options(app: &App) -> Vec<SelectOption> {
                         String::new()
                     }
                 });
-            let option = SelectOption::new(name.clone()).with_value(name);
+            let option = SelectOption::new(name.clone())
+                .with_value(name.clone())
+                .with_current(current.as_deref() == Some(name.as_str()));
             if description.is_empty() {
                 option
             } else {
@@ -233,13 +264,23 @@ pub fn agent_options(app: &App) -> Vec<SelectOption> {
 
 /// `DialogVariant` (`dialog-variant.tsx`).
 pub fn variant_options(app: &App) -> Vec<SelectOption> {
-    let mut options = vec![SelectOption::new("Default").with_value("default")];
+    let current = app
+        .state
+        .local
+        .variant_current(&app.state.sync, &app.state.args);
+    let mut options = vec![SelectOption::new("Default")
+        .with_value("default")
+        .with_current(current.as_deref() == Some("default"))];
     let list = app
         .state
         .local
         .variant_list(&app.state.sync, &app.state.args);
     for variant in list {
-        options.push(SelectOption::new(variant.clone()).with_value(variant));
+        options.push(
+            SelectOption::new(variant.clone())
+                .with_value(variant.clone())
+                .with_current(current.as_deref() == Some(variant.as_str())),
+        );
     }
     options
 }

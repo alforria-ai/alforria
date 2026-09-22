@@ -941,6 +941,15 @@ pub static DEFINITIONS: &[Definition] = &[
     }),
 ];
 
+/// The inverse of [`command_of`] — the keybind definition name for a
+/// dotted command name (`SessionList` bindings resolve here).
+pub fn keybind_for_command(command: &str) -> Option<&'static str> {
+    DEFINITIONS
+        .iter()
+        .find(|definition| command_of(definition.name) == Some(command))
+        .map(|definition| definition.name)
+}
+
 /// `CommandMap` (`keybind.ts:256-420`) — keybind name → command name.
 /// `None` = the binding has no dotted command (inline dialog handlers).
 pub fn command_of(keybind: &str) -> Option<&'static str> {

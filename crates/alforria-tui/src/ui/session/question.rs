@@ -437,19 +437,48 @@ pub fn lines(app: &App) -> Vec<Line<'static>> {
             ]));
         }
     }
-    rows.push(Line::from(vec![
-        Span::styled("enter ", Style::new().fg(theme.text.to_color())),
-        Span::styled(
-            if single || confirm_tab(&request, state) {
-                "submit"
-            } else {
-                "confirm"
-            },
-            Style::new().fg(theme.text_muted.to_color()),
-        ),
-        Span::styled("   esc ", Style::new().fg(theme.text.to_color())),
-        Span::styled("dismiss", Style::new().fg(theme.text_muted.to_color())),
-    ]));
+    // The hint row (`question.tsx:490-510`): `⇆ tab`, `↑↓ select`,
+    // `enter …`, `esc dismiss`, joined by two spaces.
+    let text = Style::new().fg(theme.text.to_color());
+    let muted = Style::new().fg(theme.text_muted.to_color());
+    let mut groups: Vec<Vec<Span<'static>>> = Vec::new();
+    if !single {
+        groups.push(vec![
+            Span::styled("⇆", text),
+            Span::styled(" tab".to_string(), muted),
+        ]);
+    }
+    if !confirm_tab(&request, state) {
+        groups.push(vec![
+            Span::styled("↑↓", text),
+            Span::styled(" select".to_string(), muted),
+        ]);
+    }
+    let enter_label = if confirm_tab(&request, state) {
+        "submit"
+    } else if multiple(&request, state.tab) {
+        "toggle"
+    } else if single {
+        "submit"
+    } else {
+        "confirm"
+    };
+    groups.push(vec![
+        Span::styled("enter", text),
+        Span::styled(format!(" {enter_label}"), muted),
+    ]);
+    groups.push(vec![
+        Span::styled("esc", text),
+        Span::styled(" dismiss".to_string(), muted),
+    ]);
+    let mut hint: Vec<Span<'static>> = Vec::new();
+    for (index, group) in groups.into_iter().enumerate() {
+        if index > 0 {
+            hint.push(Span::raw("  "));
+        }
+        hint.extend(group);
+    }
+    rows.push(Line::from(hint));
     rows
 }
 

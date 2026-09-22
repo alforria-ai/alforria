@@ -20,6 +20,7 @@ mod tests;
 use crate::state::kv::keys;
 use crate::state::route::Route;
 use crate::state::{App, Effect, PendingDialog, Toast, ToastVariant};
+use crate::ui::session::sidebar::INSTALLATION_VERSION;
 use crate::ui::theme::{Rgba, Theme};
 
 /// `ui/dialog.tsx:22-26` — the medium/large/xlarge widths.
@@ -177,6 +178,12 @@ pub fn open(app: &mut App, kind: PendingDialog) -> Vec<Effect> {
             }
         }
         PendingDialog::ExportOptions => {
+            // `session-${sessionData.id.slice(0, 8)}.md`
+            // (`routes/session/index.tsx:959`).
+            if let Some(session_id) = route_session_id(app) {
+                let short: String = session_id.chars().take(8).collect();
+                frame.input = format!("session-{short}.md");
+            }
             // The kv-derived defaults: thinking/tool-details/assistant
             // metadata on, open-without-saving off.
             frame.checks = vec![true, true, true, false];
@@ -273,11 +280,22 @@ fn actions(app: &App, frame: &DialogFrame) -> Vec<(String, String)> {
             }
         }
         PendingDialog::Mcp => vec![("toggle".to_string(), hint("dialog.mcp.toggle"))],
-        PendingDialog::SessionList => vec![
-            ("pin/unpin".to_string(), hint("session_pin_toggle")),
-            ("delete".to_string(), hint("session_delete")),
-            ("rename".to_string(), hint("session_rename")),
-        ],
+        PendingDialog::SessionList => {
+            let mut actions = vec![
+                ("pin/unpin".to_string(), hint("session_pin_toggle")),
+                ("delete".to_string(), hint("session_delete")),
+                ("rename".to_string(), hint("session_rename")),
+            ];
+            // `quickSwitchFooterHints` (`dialog-session-list.tsx:197-206`).
+            if !app.state.local.session_slots(&app.state.sync).is_empty() {
+                let first = hint("session_quick_switch_1");
+                let last = hint("session_quick_switch_9");
+                if !first.is_empty() && !last.is_empty() {
+                    actions.push(("switch".to_string(), quick_switch_range(&first, &last)));
+                }
+            }
+            actions
+        }
         PendingDialog::StashList => {
             vec![("delete".to_string(), hint("stash_delete"))]
         }
@@ -308,6 +326,18 @@ pub(crate) fn key_hint(app: &App, keybind: &str) -> Option<String> {
     }
     parts.push(stroke.key.clone());
     Some(parts.join("+"))
+}
+
+/// `quickSwitchRange` (`dialog-session-list.tsx:360-364`).
+fn quick_switch_range(first: &str, last: &str) -> String {
+    let mut chars: Vec<char> = first.chars().collect();
+    chars.pop();
+    let prefix: String = chars.into_iter().collect();
+    if first.ends_with('1') && last == format!("{prefix}9") {
+        format!("{prefix}1-9")
+    } else {
+        format!("{first} through {last}")
+    }
 }
 
 // ----------------------------------------------------------- key input
@@ -793,11 +823,11 @@ fn select_layout(app: &App) -> Option<Vec<(usize, usize)>> {
     };
     // The select branch renders header + filter before the options
     // (content_lines); their text does not affect the row count.
+    let width = app.ui.dialogs.size.width();
     let mut lines = vec![
-        primitives::header_line(&theme, &view.title, "esc"),
+        primitives::header_line(&theme, &view.title, "esc", width),
         primitives::filter_line(&theme, &frame.select, "Search"),
     ];
-    let width = app.ui.dialogs.size.width();
     Some(primitives::render_options(
         &frame.select,
         &view,
@@ -959,7 +989,7 @@ fn action_key(
                 }
                 return (Vec::new(), true);
             }
-            if app.keymap.matches("session.delete", key) {
+            if app.keymap.matches("session_delete", key) {
                 if let Some(value) = selected_value() {
                     let pending = app
                         .ui
@@ -1002,7 +1032,7 @@ fn action_key(
         // TODO(M8.7): `dialog.move_session.new`/`delete` need the
         // `projectCopy.create/remove` endpoints — absent from the
         // M8.1 server seam (recorded gap).
-        PendingDialog::WorkspaceList if app.keymap.matches("session.delete", key) => {
+        PendingDialog::WorkspaceList if app.keymap.matches("session_delete", key) => {
             if let Some(value) = selected_value() {
                 // TODO(M8.7): `experimental.workspace.remove` is
                 // absent from the server seam (recorded gap).
@@ -1214,7 +1244,48 @@ fn submit(app: &mut App, kind: &PendingDialog) -> Vec<Effect> {
 
 // ---------------------------------------------------------------- debug
 
-/// The debug dialog entries (`dialog-debug.tsx:41-51`).
+/// `describeOS` (`util/system.ts:3-13`).
+fn describe_os() -> String {
+    let name = match std::env::consts::OS {
+        "macos" => "macOS",
+        "windows" => "Windows",
+        "linux" => "Linux",
+        other => other,
+    };
+    let release = std::process::Command::new("uname")
+        .arg("-r")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .unwrap_or_default();
+    if release.is_empty() {
+        format!("{name} ({})", std::env::consts::ARCH)
+    } else {
+        format!("{name} {release} ({})", std::env::consts::ARCH)
+    }
+}
+
+/// `describeTerminal` (`util/system.ts:15-21`).
+fn describe_terminal() -> String {
+    let env = |key: &str| std::env::var(key).ok().filter(|value| !value.is_empty());
+    let program = env("TERM_PROGRAM")
+        .or_else(|| env("TERM"))
+        .unwrap_or_else(|| "unknown".to_string());
+    let version = env("TERM_PROGRAM_VERSION")
+        .map(|version| format!(" {version}"))
+        .unwrap_or_default();
+    let multiplexer = if std::env::var_os("TMUX").is_some() {
+        " in tmux"
+    } else if std::env::var_os("STY").is_some() {
+        " in screen"
+    } else {
+        ""
+    };
+    format!("{program}{version}{multiplexer}")
+}
+
+/// The debug dialog entries (`dialog-debug.tsx:26-39`).
 fn debug_entries(app: &App) -> Vec<(String, String)> {
     let session = match &app.state.route.data {
         Route::Session { session_id, .. } => session_id.clone(),
@@ -1226,8 +1297,17 @@ fn debug_entries(app: &App) -> Vec<(String, String)> {
         .model_current(&app.state.sync, &app.state.args)
         .map(|model| model.key());
     vec![
-        ("Version".to_string(), "dev".to_string()),
-        ("SessionID".to_string(), session),
+        (
+            "Version".to_string(),
+            format!("{INSTALLATION_VERSION} (dev)"),
+        ),
+        (
+            "Date".to_string(),
+            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        ),
+        ("OS".to_string(), describe_os()),
+        ("Terminal".to_string(), describe_terminal()),
+        ("Session ID".to_string(), session),
         (
             "Model".to_string(),
             model.unwrap_or_else(|| "n/a".to_string()),
@@ -1309,9 +1389,9 @@ fn content_lines(app: &App, dialog: &DialogFrame, theme: &Theme) -> Vec<Line<'st
     let width = app.ui.dialogs.size.width();
     let wrap_width = width.saturating_sub(4);
     match &dialog.kind {
-        PendingDialog::Status => system::status_lines(app, theme),
+        PendingDialog::Status => system::status_lines(app, theme, width),
         PendingDialog::Help => {
-            let mut lines = vec![primitives::header_line(theme, "Help", "esc/enter")];
+            let mut lines = vec![primitives::header_line(theme, "Help", "esc/enter", width)];
             lines.push(Line::styled(
                 "  Press ctrl+p to see all available actions and commands in any context.",
                 Style::new().fg(theme.text_muted.to_color()),
@@ -1319,11 +1399,11 @@ fn content_lines(app: &App, dialog: &DialogFrame, theme: &Theme) -> Vec<Line<'st
             lines
         }
         PendingDialog::Debug => {
-            let mut lines = vec![primitives::header_line(theme, "Debug", "esc")];
+            let mut lines = vec![primitives::header_line(theme, "Debug", "esc", width)];
             for (label, value) in debug_entries(app) {
                 lines.push(Line::from(vec![
                     Span::styled(
-                        format!("{label:<10}"),
+                        format!("  {label:<10} "),
                         Style::new().fg(theme.text_muted.to_color()),
                     ),
                     Span::styled(value, Style::new().fg(theme.text.to_color())),
@@ -1340,7 +1420,7 @@ fn content_lines(app: &App, dialog: &DialogFrame, theme: &Theme) -> Vec<Line<'st
             message,
             exit_on_confirm: _,
         } => {
-            let mut lines = vec![primitives::header_line(theme, title, "esc")];
+            let mut lines = vec![primitives::header_line(theme, title, "esc", width)];
             primitives::wrap_text(
                 message,
                 wrap_width,
@@ -1357,7 +1437,7 @@ fn content_lines(app: &App, dialog: &DialogFrame, theme: &Theme) -> Vec<Line<'st
                 "Other"
             };
             vec![
-                primitives::header_line(theme, title, "esc"),
+                primitives::header_line(theme, title, "esc", width),
                 Line::styled(
                     format!("  {}", dialog.input),
                     Style::new().fg(theme.text.to_color()),
@@ -1365,7 +1445,12 @@ fn content_lines(app: &App, dialog: &DialogFrame, theme: &Theme) -> Vec<Line<'st
             ]
         }
         PendingDialog::UpdateAvailable { version } => {
-            let mut lines = vec![primitives::header_line(theme, "Update Available", "esc")];
+            let mut lines = vec![primitives::header_line(
+                theme,
+                "Update Available",
+                "esc",
+                width,
+            )];
             primitives::wrap_text(
                 &format!("A new release v{version} is available. Would you like to update now?"),
                 wrap_width,
@@ -1376,7 +1461,12 @@ fn content_lines(app: &App, dialog: &DialogFrame, theme: &Theme) -> Vec<Line<'st
             lines
         }
         PendingDialog::ShareConsent { .. } => {
-            let mut lines = vec![primitives::header_line(theme, "Share Session", "esc")];
+            let mut lines = vec![primitives::header_line(
+                theme,
+                "Share Session",
+                "esc",
+                width,
+            )];
             primitives::wrap_text(
                 "Are you sure you want to share it?",
                 wrap_width,
@@ -1391,6 +1481,7 @@ fn content_lines(app: &App, dialog: &DialogFrame, theme: &Theme) -> Vec<Line<'st
                 theme,
                 "Workspace Unavailable",
                 "esc",
+                width,
             )];
             primitives::wrap_text(
                 "This session is attached to a workspace that is no longer available. Would you like to restore this session into a new workspace?",
@@ -1406,6 +1497,7 @@ fn content_lines(app: &App, dialog: &DialogFrame, theme: &Theme) -> Vec<Line<'st
                 theme,
                 "Failed to Delete Session",
                 "esc",
+                width,
             )];
             primitives::wrap_text(
                 &format!(
@@ -1424,7 +1516,7 @@ fn content_lines(app: &App, dialog: &DialogFrame, theme: &Theme) -> Vec<Line<'st
             label,
             ..
         } => {
-            let mut lines = vec![primitives::header_line(theme, title, "esc")];
+            let mut lines = vec![primitives::header_line(theme, title, "esc", width)];
             primitives::wrap_text(
                 message,
                 wrap_width,
@@ -1441,7 +1533,12 @@ fn content_lines(app: &App, dialog: &DialogFrame, theme: &Theme) -> Vec<Line<'st
                 "Include assistant metadata",
                 "Open without saving",
             ];
-            let mut lines = vec![primitives::header_line(theme, "Export Options", "esc")];
+            let mut lines = vec![primitives::header_line(
+                theme,
+                "Export Options",
+                "esc",
+                width,
+            )];
             lines.push(Line::styled(
                 format!("  Filename: {}", dialog.input),
                 Style::new().fg(theme.text.to_color()),
@@ -1461,7 +1558,7 @@ fn content_lines(app: &App, dialog: &DialogFrame, theme: &Theme) -> Vec<Line<'st
             lines
         }
         PendingDialog::ConsoleOrg => vec![
-            primitives::header_line(theme, "Switch org", "esc"),
+            primitives::header_line(theme, "Switch org", "esc", width),
             Line::styled(
                 "  No orgs found",
                 Style::new().fg(theme.text_muted.to_color()),
@@ -1476,7 +1573,7 @@ fn content_lines(app: &App, dialog: &DialogFrame, theme: &Theme) -> Vec<Line<'st
                 options: options(app, dialog),
                 actions: actions(app, dialog),
             };
-            let mut lines = vec![primitives::header_line(theme, &view.title, "esc")];
+            let mut lines = vec![primitives::header_line(theme, &view.title, "esc", width)];
             if view.filter {
                 lines.push(primitives::filter_line(
                     theme,

@@ -21,6 +21,7 @@ unicode-width = { workspace = true }
 crossterm = { workspace = true }
 libc = { workspace = true }
 rand = { workspace = true }
+chrono = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }

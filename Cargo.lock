@@ -170,6 +170,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "chrono",
  "crossterm",
  "eventsource-stream",
  "futures",
