@@ -921,6 +921,7 @@ fn spawn_tick(messages: tokio::sync::mpsc::UnboundedSender<Msg>) {
 
 /// SIGHUP destroys the renderer (`app.tsx:231-235`) — here it exits the
 /// loop for the scoped teardown.
+#[cfg(unix)]
 fn spawn_sighup(messages: tokio::sync::mpsc::UnboundedSender<Msg>) {
     tokio::spawn(async move {
         let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
@@ -932,6 +933,9 @@ fn spawn_sighup(messages: tokio::sync::mpsc::UnboundedSender<Msg>) {
         )));
     });
 }
+
+#[cfg(not(unix))]
+fn spawn_sighup(_messages: tokio::sync::mpsc::UnboundedSender<Msg>) {}
 
 /// Raw mode + alternate screen + optional mouse capture + the kitty
 /// keyboard protocol (`app.tsx:186-213`).
@@ -994,6 +998,11 @@ mod suspend {
         crossterm::terminal::enable_raw_mode().ok();
         crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen).ok();
     }
+
+    // No terminal suspend on Windows — the keybinding is already disabled
+    // (`terminal_suspend_supported`).
+    #[cfg(not(unix))]
+    pub async fn terminal_suspend_and_resume() {}
 }
 
 #[cfg(test)]
