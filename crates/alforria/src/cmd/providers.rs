@@ -384,6 +384,134 @@ fn login_api_key_flow(ui: &mut Ui, deps: &mut LoginDeps, provider: &str) -> Resu
     Ok(())
 }
 
+/// `libertai` browser-SSO: PKCE + loopback against console.libertai.io,
+/// key minted against the account API, stored like any API key. Falls back
+/// to the manual API-key flow when SSO fails at any step.
+fn login_libertai_flow(ui: &mut Ui, deps: &mut LoginDeps) -> Result<(), TypedError> {
+    let result = login_libertai_sso(ui, deps);
+    let error = match result {
+        Ok(()) => return Ok(()),
+        Err(err) => err,
+    };
+    log_warn(
+        ui,
+        &format!("Browser sign-in failed: {error:?}. Falling back to API key."),
+    );
+    login_api_key_flow(ui, deps, "libertai")
+}
+
+fn login_libertai_sso(ui: &mut Ui, deps: &mut LoginDeps) -> Result<(), TypedError> {
+    use alforria_core::libertai::auth;
+
+    let pkce = auth::Pkce::generate();
+    let server = auth::CallbackServer::bind().map_err(|err| cli_error(err.to_string()))?;
+    let redirect_uri = server.redirect_uri();
+    let url = auth::authorize_url(&pkce, "Alforria", &redirect_uri);
+    log_info(ui, "Opening your browser to sign in…");
+    log_info(ui, &format!("If it doesn't open, visit:\n  {url}"));
+    auth::open_browser(&url);
+
+    let (code, returned_state) = collect_libertai_code(ui, server).map_err(cli_error)?;
+    if returned_state
+        .as_deref()
+        .is_some_and(|state| state != pkce.state)
+    {
+        return Err(cli_error(
+            "login state mismatch — aborting (possible interference)",
+        ));
+    }
+
+    let pair = auth::exchange_code(&code, &pkce.verifier).map_err(cli_error)?;
+
+    // Per-device key: a stable id keeps this device's key name unique, so
+    // logging in elsewhere mints a separate key instead of rotating this one.
+    let device_id = auth::load_session()
+        .map(|session| session.device_id)
+        .unwrap_or_else(auth::new_device_id);
+    let host = format!("{}-{}", auth::device_hostname(), device_id);
+    let created = auth::create_cli_api_key(&pair.access_token, &host).map_err(cli_error)?;
+    auth::store_session(&auth::StoredSession {
+        refresh_token: pair.refresh_token,
+        expires_at: created.expires_at.clone(),
+        device_id,
+    });
+
+    deps.auth
+        .set("libertai", json!({"type": "api", "key": created.full_key}))
+        .map_err(server_error)?;
+    log_info(
+        ui,
+        &format!("Logged in. Key: {}", mask_key(&created.full_key)),
+    );
+    if let Some(expires_at) = &created.expires_at {
+        let date = expires_at.split('T').next().unwrap_or(expires_at);
+        log_info(ui, &format!("Key expires {date}"));
+    }
+    Ok(())
+}
+
+/// Race the loopback callback against a code pasted by hand (the
+/// remote-browser fallback). Whichever source produces input first wins.
+fn collect_libertai_code(
+    ui: &mut Ui,
+    server: alforria_core::libertai::auth::CallbackServer,
+) -> Result<(String, Option<String>), String> {
+    enum Msg {
+        Callback(Result<alforria_core::libertai::auth::Callback, String>),
+        Manual(String),
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    let tx_callback = tx.clone();
+    std::thread::spawn(move || {
+        let _ = tx_callback.send(Msg::Callback(
+            server.wait(alforria_core::libertai::auth::CALLBACK_TIMEOUT),
+        ));
+    });
+
+    let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    if interactive {
+        ui.empty();
+        log_info(
+            ui,
+            "If your browser is on a different machine it can't reach this terminal's\n\
+             local callback. Sign in there, then paste the code from the address bar\n\
+             (the value after `code=`, or the whole redirect URL).",
+        );
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            if std::io::stdin().read_line(&mut line).unwrap_or(0) > 0 {
+                let _ = tx.send(Msg::Manual(line));
+            }
+        });
+    } else {
+        drop(tx);
+    }
+
+    match rx.recv_timeout(alforria_core::libertai::auth::CALLBACK_TIMEOUT) {
+        Ok(Msg::Callback(result)) => result.map(|callback| (callback.code, Some(callback.state))),
+        Ok(Msg::Manual(line)) => alforria_core::libertai::auth::parse_manual_code(&line)
+            .ok_or_else(|| "could not find a login code in the pasted text".to_string()),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            Err("timed out waiting for sign-in".to_string())
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err("sign-in aborted before a code was received".to_string())
+        }
+    }
+}
+
+fn mask_key(key: &str) -> String {
+    if key.len() <= 8 {
+        return "*".repeat(key.len());
+    }
+    format!("{}****{}", &key[..4], &key[key.len() - 4..])
+}
+
+fn cli_error(message: impl Into<String>) -> TypedError {
+    TypedError::Cli(CliError::new(message.into()))
+}
+
 fn login_url(ui: &mut Ui, deps: &mut LoginDeps, raw_url: &str) -> Result<(), TypedError> {
     let url = raw_url.trim_end_matches('/').to_string();
     let wellknown = deps.wellknown.fetch(&url).map_err(|err| {
@@ -457,7 +585,11 @@ fn login_provider(ui: &mut Ui, deps: &mut LoginDeps, args: &LoginArgs) -> Result
             }
         }
     };
-    login_api_key_flow(ui, deps, &provider)
+    if provider == "libertai" {
+        login_libertai_flow(ui, deps)
+    } else {
+        login_api_key_flow(ui, deps, &provider)
+    }
 }
 
 pub fn login(ui: &mut Ui, args: &LoginArgs, deps: &mut LoginDeps) -> Result<(), TypedError> {
@@ -521,6 +653,12 @@ pub fn logout(
             arg.unwrap_or_default()
         ))));
     };
+    if provider == "libertai" {
+        if let Some(session) = alforria_core::libertai::auth::load_session() {
+            let _ = alforria_core::libertai::auth::revoke(&session.refresh_token);
+        }
+        alforria_core::libertai::auth::clear_session();
+    }
     auth.remove(&provider).map_err(server_error)?;
     outro(ui, "Logout successful");
     Ok(())

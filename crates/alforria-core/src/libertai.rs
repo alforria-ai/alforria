@@ -6,6 +6,8 @@
 //! fallback, so the provider is never empty. Every leg degrades — IO errors
 //! and fetch failures fall through to the next source, never fail the call.
 
+pub mod auth;
+
 use std::collections::BTreeMap;
 use std::env;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
