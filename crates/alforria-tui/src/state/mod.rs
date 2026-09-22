@@ -428,6 +428,12 @@ pub struct UiState {
     /// The footer's `welcome` state machine (`routes/session/footer.tsx`).
     pub footer_welcome: bool,
     pub footer_flip_at: Option<u64>,
+    /// `ready` (`app.tsx:409-421`) — the plugin host finished starting;
+    /// the port's analog is the first bootstrap reaching `Complete`.
+    pub startup_ready: bool,
+    /// `tipOffset` (`feature-plugins/home/tips-view.tsx:132`) — the
+    /// `Math.random()` roll picked once at mount.
+    pub home_tip: usize,
 }
 
 /// `StartupLoading` timers (`component/startup-loading.tsx:26-63`) as a
@@ -682,7 +688,7 @@ impl App {
     pub fn new(config: crate::config::TuiConfig, args: Args, state_dir: Option<&Path>) -> App {
         let keymap = Keymap::resolve(&config);
         let mut state = State::new(args, state_dir);
-        let ui = UiState {
+        let mut ui = UiState {
             prompt: crate::state::prompt::PromptState::new(state_dir),
             theme: ThemeStore::init(&mut state.kv, config.theme.as_deref()),
             conceal: true,
@@ -690,6 +696,7 @@ impl App {
             terminal_width: 80,
             ..UiState::default()
         };
+        ui.home_tip = rand::random::<usize>();
         App {
             state,
             ui,
@@ -868,7 +875,12 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                 }
             }
             app.ui.startup_loading.poll(now_ms);
-            app.ui.startup_loading.transition(true, now_ms);
+            if app.state.sync.status == Some(crate::state::sync::SyncStatus::Complete) {
+                app.ui.startup_ready = true;
+            }
+            app.ui
+                .startup_loading
+                .transition(app.ui.startup_ready, now_ms);
             // The timed leader's `setTimeout` (`registerTimedLeader`).
             app.keymap.poll(now_ms);
             // `setTimeout(() => setStore("interrupt", 0), 5000)`.
@@ -909,11 +921,16 @@ pub fn connected(app: &App) -> bool {
             || provider
                 .get("models")
                 .and_then(Value::as_object)
-                .and_then(|models| models.values().next())
-                .and_then(|model| model.get("cost"))
-                .and_then(|cost| cost.get("input"))
-                .and_then(Value::as_f64)
-                .map(|input| input != 0.0)
+                .map(|models| {
+                    models.values().any(|model| {
+                        model
+                            .get("cost")
+                            .and_then(|cost| cost.get("input"))
+                            .and_then(Value::as_f64)
+                            .map(|input| input != 0.0)
+                            .unwrap_or(false)
+                    })
+                })
                 .unwrap_or(false)
     })
 }
@@ -1087,6 +1104,40 @@ mod tests {
         assert!(startup.visible());
         startup.poll(8000);
         assert!(!startup.visible());
+    }
+
+    #[test]
+    fn tick_wires_startup_ready_to_first_bootstrap() {
+        let mut app = App::new(crate::config::TuiConfig::default(), Args::default(), None);
+        update(&mut app, Msg::Tick(std::time::Duration::from_millis(0)));
+        update(&mut app, Msg::Tick(std::time::Duration::from_millis(600)));
+        assert!(!app.ui.startup_ready);
+        assert!(app.ui.startup_loading.visible(), "still loading");
+
+        app.state.sync.status = Some(crate::state::sync::SyncStatus::Complete);
+        update(&mut app, Msg::Tick(std::time::Duration::from_millis(700)));
+        assert!(app.ui.startup_ready);
+    }
+
+    #[test]
+    fn connected_checks_every_model() {
+        let mut app = App::new(crate::config::TuiConfig::default(), Args::default(), None);
+        app.state.sync.provider = vec![serde_json::json!({
+            "id": "opencode",
+            "models": {
+                "a": { "cost": { "input": 0 } },
+                "b": { "cost": { "input": 3 } },
+            },
+        })];
+        assert!(connected(&app), "any nonzero model counts");
+        app.state.sync.provider = vec![serde_json::json!({
+            "id": "opencode",
+            "models": {
+                "a": { "cost": { "input": 0 } },
+                "b": { "cost": { "input": 0 } },
+            },
+        })];
+        assert!(!connected(&app));
     }
 
     fn session_info(id: &str) -> alforria_schema::session_v1::V1SessionInfo {

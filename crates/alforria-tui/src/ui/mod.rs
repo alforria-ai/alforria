@@ -17,7 +17,7 @@ mod logo;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph, Widget, Wrap};
+use ratatui::widgets::{Block, Paragraph, Widget};
 
 use crate::state::route::Route;
 use crate::state::{App, Toast, ToastVariant};
@@ -70,7 +70,9 @@ fn render_plugin_missing(frame: &mut ratatui::Frame, theme: &theme::Theme, area:
 }
 
 /// `ui/toast.tsx` — one current toast, top-right at `top: 2` / `right: 2`.
-/// (TODO(M8.8): duration-based dismissal.)
+/// The frame is a `SplitBorder` (vertical `┃`, no horizontal), with
+/// `paddingTop/paddingBottom=1` and a blank line between title and
+/// message (TODO(M8.8): duration-based dismissal.).
 fn render_toast(frame: &mut ratatui::Frame, theme: &theme::Theme, area: Rect, toast: &Toast) {
     let color = |variant: ToastVariant| match variant {
         ToastVariant::Info => theme.info,
@@ -79,19 +81,6 @@ fn render_toast(frame: &mut ratatui::Frame, theme: &theme::Theme, area: Rect, to
         ToastVariant::Error => theme.error,
     };
     let max_width = std::cmp::min(60, area.width.saturating_sub(6));
-    let rows = toast.title.as_ref().map_or(1, |_| 2);
-    let columns = ratatui::layout::Layout::horizontal([
-        ratatui::layout::Constraint::Fill(1),
-        ratatui::layout::Constraint::Length(max_width),
-        ratatui::layout::Constraint::Length(2),
-    ])
-    .split(area);
-    let target = Rect {
-        x: columns[1].x,
-        y: area.y + 2,
-        width: columns[1].width,
-        height: rows as u16,
-    };
     let mut lines: Vec<Line> = Vec::new();
     if let Some(title) = &toast.title {
         lines.push(Line::styled(
@@ -100,16 +89,41 @@ fn render_toast(frame: &mut ratatui::Frame, theme: &theme::Theme, area: Rect, to
                 .fg(theme.text.to_color())
                 .add_modifier(ratatui::style::Modifier::BOLD),
         ));
+        // `marginBottom={1}` on the title (`ui/toast.tsx:33`).
+        lines.push(Line::raw(""));
     }
-    lines.push(Line::styled(toast.message.clone(), theme.text.to_color()));
+    crate::ui::dialogs::primitives::wrap_text(
+        &toast.message,
+        max_width.saturating_sub(4),
+        &mut lines,
+        theme.text.to_color().into(),
+    );
+    let content_width = lines.iter().map(|line| line.width()).max().unwrap_or(0) as u16;
+    let width = content_width.saturating_add(4).min(max_width);
+    let height = (lines.len() as u16).saturating_add(2);
+    let target = Rect {
+        x: area.right().saturating_sub(2).saturating_sub(width),
+        y: area.y + 2,
+        width,
+        height,
+    };
     Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
         .style(Style::new().bg(theme.background_panel.to_color()))
         .block(
             Block::new()
                 .borders(ratatui::widgets::Borders::LEFT | ratatui::widgets::Borders::RIGHT)
+                .border_set(ratatui::symbols::border::Set {
+                    vertical_left: "┃",
+                    vertical_right: "┃",
+                    ..Default::default()
+                })
                 .border_style(color(toast.variant).to_color())
-                .padding(ratatui::widgets::Padding::horizontal(2)),
+                .padding(ratatui::widgets::Padding {
+                    left: 2,
+                    right: 2,
+                    top: 1,
+                    bottom: 1,
+                }),
         )
         .render(target, frame.buffer_mut());
 }
