@@ -99,8 +99,12 @@ mod tests {
         fs::write(root.path().join("README.md"), "").unwrap();
 
         let state = FindState::build(root.path(), false);
+        // (sort first: files is in readdir order, which is
+        // filesystem-dependent)
+        let mut files = state.files.clone();
+        files.sort_unstable();
         assert_eq!(
-            state.files,
+            files,
             vec!["README.md".to_string(), "src/cmd/main.rs".to_string()]
         );
         // Intermediate directories, `/`-suffixed, first-seen order.

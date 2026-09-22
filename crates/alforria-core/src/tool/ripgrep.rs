@@ -620,9 +620,12 @@ mod tests {
         write(temp.path(), "b.ts", "match\n");
         write(temp.path(), ".hidden.js", "match\n");
 
-        let matches = RipgrepService
+        let mut matches = RipgrepService
             .grep(temp.path(), "match", Some("*.js"), 100)
             .unwrap();
+        // (sort first: matches come in readdir order, which is
+        // filesystem-dependent)
+        matches.sort_by(|a, b| a.path.cmp(&b.path));
         assert_eq!(
             matches,
             vec![
