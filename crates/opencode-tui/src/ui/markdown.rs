@@ -314,19 +314,58 @@ fn render_block(block: Block, theme: &Theme, width: u16) -> Vec<Line<'static>> {
     }
 }
 
+/// Per-column alignment carried by the GFM delimiter row
+/// (`:---`, `---:`, `:---:`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Align {
+    Left,
+    Center,
+    Right,
+}
+
+fn cell_alignment(delimiter_cell: &str) -> Align {
+    match (
+        delimiter_cell.starts_with(':'),
+        delimiter_cell.ends_with(':'),
+    ) {
+        (true, true) => Align::Center,
+        (false, true) => Align::Right,
+        _ => Align::Left,
+    }
+}
+
+fn pad_cell(cell: &str, width: usize, align: Align) -> String {
+    let pad = width.saturating_sub(cell.chars().count());
+    match align {
+        Align::Left => format!("{cell}{}", " ".repeat(pad)),
+        Align::Right => format!("{}{cell}", " ".repeat(pad)),
+        Align::Center => {
+            let left = pad / 2;
+            format!("{}{cell}{}", " ".repeat(left), " ".repeat(pad - left))
+        }
+    }
+}
+
+/// `tableOptions={{ style: "grid" }}` — OpenTUI's single-line
+/// box-drawing borders around the fitted columns.
 fn render_table(rows: Vec<Vec<String>>, theme: &Theme, width: u16) -> Vec<Line<'static>> {
     let columns = rows.iter().map(|row| row.len()).max().unwrap_or(0);
-    if columns == 0 {
+    if columns == 0 || rows.len() < 2 {
         return Vec::new();
     }
+    // rows[0] is the header, rows[1] the delimiter row (construction
+    // guarantees it); its cells carry the column alignments.
+    let alignments: Vec<Align> = (0..columns)
+        .map(|column| cell_alignment(rows[1].get(column).map(String::as_str).unwrap_or("")))
+        .collect();
+    let data: Vec<&Vec<String>> = rows
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != 1)
+        .map(|(_, row)| row)
+        .collect();
     let mut widths = vec![0usize; columns];
-    for row in &rows {
-        if row
-            .iter()
-            .all(|cell| cell.is_empty() || is_separator_cell(cell))
-        {
-            continue;
-        }
+    for row in &data {
         for (index, cell) in row.iter().enumerate() {
             widths[index] = widths[index].max(cell.chars().count());
         }
@@ -339,28 +378,29 @@ fn render_table(rows: Vec<Vec<String>>, theme: &Theme, width: u16) -> Vec<Line<'
             widths = widths.iter().map(|w| (w * budget / total).max(1)).collect();
         }
     }
-    let style = Style::new().fg(theme.markdown_text.to_color());
-    let mut lines = Vec::new();
-    for row in &rows {
-        let is_separator = row
-            .iter()
-            .all(|cell| cell.is_empty() || is_separator_cell(cell));
-        if is_separator {
-            let mut line = String::from("|");
-            for cell_width in &widths {
-                line.push_str(&"-".repeat(cell_width + 2));
-                line.push('|');
+    let border = Style::new().fg(theme.border_subtle.to_color());
+    let text = Style::new().fg(theme.markdown_text.to_color());
+    let rule = |left: char, mid: char, right: char| -> Line<'static> {
+        let mut spans = vec![Span::styled(left.to_string(), border)];
+        for (index, cell_width) in widths.iter().enumerate() {
+            if index > 0 {
+                spans.push(Span::styled(mid.to_string(), border));
             }
-            lines.push(Line::from(Span::styled(
-                line,
-                Style::new().fg(theme.markdown_horizontal_rule.to_color()),
-            )));
-            continue;
+            spans.push(Span::styled("─".repeat(cell_width + 2), border));
         }
-        let row_style = if lines.is_empty() {
-            style.add_modifier(Modifier::BOLD)
+        spans.push(Span::styled(right.to_string(), border));
+        Line::from(spans)
+    };
+
+    let mut lines = vec![rule('┌', '┬', '┐')];
+    for (row_index, row) in data.iter().enumerate() {
+        if row_index > 0 {
+            lines.push(rule('├', '┼', '┤'));
+        }
+        let row_style = if row_index == 0 {
+            text.add_modifier(Modifier::BOLD)
         } else {
-            style
+            text
         };
         // Cells wrap within their column (`computeColumnWidths` fits
         // the columns; the text buffers wrap the content).
@@ -374,19 +414,25 @@ fn render_table(rows: Vec<Vec<String>>, theme: &Theme, width: u16) -> Vec<Line<'
             .collect();
         let height = cells.iter().map(|cell| cell.len()).max().unwrap_or(1);
         for line_index in 0..height {
-            let mut line: Vec<Span<'static>> = vec![Span::styled("|", row_style)];
+            let mut spans: Vec<Span<'static>> = Vec::new();
             for column in 0..columns {
                 let cell = cells[column]
                     .get(line_index)
                     .map(String::as_str)
                     .unwrap_or("");
-                line.push(Span::styled(" ", row_style));
-                line.push(Span::styled(pad_to(cell, widths[column].max(1)), row_style));
-                line.push(Span::styled(" |", row_style));
+                spans.push(Span::styled("│", border));
+                spans.push(Span::styled(" ", row_style));
+                spans.push(Span::styled(
+                    pad_cell(cell, widths[column].max(1), alignments[column]),
+                    row_style,
+                ));
+                spans.push(Span::styled(" ", row_style));
             }
-            lines.push(Line::from(line));
+            spans.push(Span::styled("│", border));
+            lines.push(Line::from(spans));
         }
     }
+    lines.push(rule('└', '┴', '┘'));
     lines
 }
 
@@ -430,18 +476,7 @@ fn hard_break(word: &str, width: usize) -> Vec<String> {
     pieces
 }
 
-fn is_separator_cell(cell: &str) -> bool {
-    !cell.is_empty() && cell.chars().all(|c| matches!(c, '-' | ':' | '='))
-}
 
-fn pad_to(text: &str, width: usize) -> String {
-    let len = text.chars().count();
-    if len >= width {
-        text.to_string()
-    } else {
-        format!("{text}{}", " ".repeat(width - len))
-    }
-}
 
 // ------------------------------------------------------------- inline
 
@@ -700,9 +735,11 @@ mod tests {
     fn grid_tables_align_columns() {
         let markdown = "| a | b |\n|---|---|\n| 1 | 2 |";
         let lines = lines_of(markdown, 40);
-        assert_eq!(lines[0], "| a | b |");
-        assert_eq!(lines[1], "|---|---|");
-        assert_eq!(lines[2], "| 1 | 2 |");
+        assert_eq!(lines[0], "┌───┬───┐");
+        assert_eq!(lines[1], "│ a │ b │");
+        assert_eq!(lines[2], "├───┼───┤");
+        assert_eq!(lines[3], "│ 1 │ 2 │");
+        assert_eq!(lines[4], "└───┴───┘");
     }
 
     #[test]
@@ -712,18 +749,16 @@ mod tests {
         // fenced in full pipes.
         let markdown = "a | b\n--- | ---\n1 | 2";
         let lines = lines_of(markdown, 40);
-        assert_eq!(lines[0], "| a | b |");
-        assert_eq!(lines[1], "|---|---|");
-        assert_eq!(lines[2], "| 1 | 2 |");
+        assert_eq!(lines[1], "│ a │ b │");
+        assert_eq!(lines[3], "│ 1 │ 2 │");
     }
 
     #[test]
     fn partially_piped_tables_align_columns() {
         let markdown = "| a | b\n|---|---\n| 1 | 2";
         let lines = lines_of(markdown, 40);
-        assert_eq!(lines[0], "| a | b |");
-        assert_eq!(lines[1], "|---|---|");
-        assert_eq!(lines[2], "| 1 | 2 |");
+        assert_eq!(lines[1], "│ a │ b │");
+        assert_eq!(lines[3], "│ 1 │ 2 │");
     }
 
     #[test]
@@ -743,8 +778,11 @@ mod tests {
         // Every rendered row must be closed at the same column — the
         // grid stays aligned.
         for line in &lines {
+            if line.contains('┬') || line.contains('┼') || line.contains('┴') {
+                continue; // a border rule
+            }
             assert!(
-                line.ends_with('|'),
+                line.ends_with('│'),
                 "row not closed: {line:?} (lines={lines:?})"
             );
         }

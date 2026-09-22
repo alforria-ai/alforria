@@ -738,3 +738,22 @@ plain text.
   the same instead of letting wide cells break the grid.
 - Live-verified with a model-emitted table (pyte probe checks every
   rendered row closes at the same pipe column).
+
+## Round 12 — grid-style tables
+
+Follow-up: even after GFM detection, the user still "didn't see the
+table" — the ASCII pipe rendering (`| a | b |` / `|---|---|`) is
+indistinguishable from raw markdown. The TS reference renders
+`<markdown tableOptions={{ style: "grid" }}>`: OpenTUI draws
+single-line box-drawing borders around the fitted columns
+(`resolveTableRenderableOptions` — `borderStyle: "single"`, border
+color from the conceal style).
+
+- Tables now render as box grids: `┌─┬─┐` / `│ │` / `├─┼─┤` / `└─┴─┘`
+  with `theme.borderSubtle` borders, a bold header row, and cell
+  wrapping inside the fitted columns.
+- The GFM delimiter row now carries alignment: `:--` left, `--:`
+  right, `:-:` center (`cellAlignment` in markdown-table).
+- Verified against the actual part text from the user's session
+  (fetched from the db by part id) plus a live model-generated table
+  (pyte grid-alignment probe).
