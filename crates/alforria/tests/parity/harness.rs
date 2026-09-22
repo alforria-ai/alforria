@@ -129,6 +129,7 @@ impl TsServe {
             .env("XDG_STATE_HOME", env.home.join(".local/state"))
             .env("OPENCODE_MODELS_PATH", &env.models_path)
             .env("OPENCODE_DISABLE_MODELS_FETCH", "1")
+            .env("LIBERTAI_MODEL_CATALOG_URL", "")
             .env_remove("OPENCODE_SERVER_PASSWORD")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -210,6 +211,7 @@ pub fn ts_cli(ts: &TsSource, env: &Env, args: &[&str]) -> crate::harness::ProcOu
         .env("XDG_STATE_HOME", env.home.join(".local/state"))
         .env("OPENCODE_MODELS_PATH", &env.models_path)
         .env("OPENCODE_DISABLE_MODELS_FETCH", "1")
+        .env("LIBERTAI_MODEL_CATALOG_URL", "")
         .env_remove("OPENCODE_SERVER_PASSWORD")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

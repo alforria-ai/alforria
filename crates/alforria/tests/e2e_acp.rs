@@ -52,6 +52,7 @@ impl AcpChild {
             .env("XDG_STATE_HOME", env.home.join(".local/state"))
             .env("OPENCODE_MODELS_PATH", &env.models_path)
             .env("OPENCODE_DISABLE_MODELS_FETCH", "1")
+            .env("LIBERTAI_MODEL_CATALOG_URL", "")
             .env_remove("OPENCODE_SERVER_PASSWORD")
             .env_remove("LIBERTAI_API_KEY")
             .current_dir(env.project_dir())

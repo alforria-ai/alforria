@@ -146,6 +146,7 @@ impl Env {
             .env("XDG_STATE_HOME", self.home.join(".local/state"))
             .env("OPENCODE_MODELS_PATH", &self.models_path)
             .env("OPENCODE_DISABLE_MODELS_FETCH", "1")
+            .env("LIBERTAI_MODEL_CATALOG_URL", "")
             .env_remove("OPENCODE_SERVER_PASSWORD")
             .current_dir(self.project_dir());
         command
