@@ -1,8 +1,10 @@
 //! `routes/session/footer.tsx` — the session footer bar (M8.5).
 //!
 //! Dead code at the pinned TS commit (imported nowhere — see the M8.5
-//! spec note): the port still renders it at the bottom of the session
-//! column, per the spec.
+//! spec note), kept here deliberately: removing it would strand the
+//! `footer_welcome` timer in `state/mod.rs` (owned by another agent)
+//! and the dedicated render tests below. The bar stays 1:1 with the
+//! reference file so it can be dropped behind a config gate later.
 
 use ratatui::layout::Rect;
 use ratatui::style::Style;

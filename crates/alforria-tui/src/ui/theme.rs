@@ -150,6 +150,241 @@ pub fn tint(base: Rgba, overlay: Rgba, alpha: f32) -> Rgba {
     )
 }
 
+/// `ansiToRgba` (`theme/index.ts:301-344`) — the standard 16, the
+/// 6x6x6 cube and the grayscale ramp.
+pub fn ansi_to_rgba(code: i64) -> Rgba {
+    if (0..16).contains(&code) {
+        let table = [
+            "#000000", "#800000", "#008000", "#808000", "#000080", "#800080", "#008080", "#c0c0c0",
+            "#808080", "#ff0000", "#00ff00", "#ffff00", "#0000ff", "#ff00ff", "#00ffff", "#ffffff",
+        ];
+        return Rgba::from_hex(table[code as usize]).unwrap_or(Rgba::from_ints(0, 0, 0));
+    }
+    if (16..232).contains(&code) {
+        let index = code - 16;
+        let b = index % 6;
+        let g = (index / 6) % 6;
+        let r = index / 36;
+        let value = |x: i64| if x == 0 { 0 } else { x * 40 + 55 };
+        return Rgba::from_ints(value(r) as u8, value(g) as u8, value(b) as u8);
+    }
+    if (232..256).contains(&code) {
+        let gray = ((code - 232) * 10 + 8) as u8;
+        return Rgba::from_ints(gray, gray, gray);
+    }
+    Rgba::from_ints(0, 0, 0)
+}
+
+/// `TerminalColors` from `@opentui/core` — the live terminal palette.
+/// The Rust runtime has no `renderer.getPalette()` seam, so only the
+/// `system` theme generation consumes this and callers pass defaults.
+#[derive(Debug, Clone, Default)]
+pub struct TerminalColors {
+    pub default_background: Option<String>,
+    pub default_foreground: Option<String>,
+    pub palette: Vec<String>,
+}
+
+impl TerminalColors {
+    /// The port's fallback source: no queried palette, so `col(i)`
+    /// resolves through [`ansi_to_rgba`].
+    pub fn defaults() -> TerminalColors {
+        TerminalColors::default()
+    }
+
+    fn color(&self, index: usize) -> Rgba {
+        self.palette
+            .get(index)
+            .and_then(|hex| Rgba::from_hex(hex))
+            .unwrap_or_else(|| ansi_to_rgba(index as i64))
+    }
+}
+
+fn hex(color: Rgba) -> String {
+    format!(
+        "#{:02x}{:02x}{:02x}",
+        (color.r * 255.0).round() as u8,
+        (color.g * 255.0).round() as u8,
+        (color.b * 255.0).round() as u8
+    )
+}
+
+fn hex_alpha(color: Rgba) -> String {
+    format!(
+        "#{:02x}{:02x}{:02x}{:02x}",
+        (color.r * 255.0).round() as u8,
+        (color.g * 255.0).round() as u8,
+        (color.b * 255.0).round() as u8,
+        (color.a * 255.0).round() as u8
+    )
+}
+
+/// `generateGrayScale` (`theme/index.ts:471-523`) — 12 steps above
+/// (dark) / below (light) the terminal background.
+fn generate_gray_scale(bg: Rgba, is_dark: bool) -> Vec<Rgba> {
+    let (bg_r, bg_g, bg_b) = (bg.r * 255.0, bg.g * 255.0, bg.b * 255.0);
+    let luminance = 0.299 * bg_r + 0.587 * bg_g + 0.114 * bg_b;
+    let mut grays = vec![Rgba::from_ints(0, 0, 0); 13];
+    for (i, gray) in grays.iter_mut().enumerate().skip(1).take(12) {
+        let factor = i as f32 / 12.0;
+        let (new_r, new_g, new_b) = if is_dark {
+            if luminance < 10.0 {
+                let gray = (factor * 0.4 * 255.0).floor();
+                (gray, gray, gray)
+            } else {
+                let new_lum = luminance + (255.0 - luminance) * factor * 0.4;
+                let ratio = new_lum / luminance;
+                (
+                    (bg_r * ratio).min(255.0),
+                    (bg_g * ratio).min(255.0),
+                    (bg_b * ratio).min(255.0),
+                )
+            }
+        } else if luminance > 245.0 {
+            let gray = (255.0 - factor * 0.4 * 255.0).floor();
+            (gray, gray, gray)
+        } else {
+            let new_lum = luminance * (1.0 - factor * 0.4);
+            let ratio = new_lum / luminance;
+            (
+                (bg_r * ratio).max(0.0),
+                (bg_g * ratio).max(0.0),
+                (bg_b * ratio).max(0.0),
+            )
+        };
+        *gray = Rgba::from_ints(
+            new_r.floor() as u8,
+            new_g.floor() as u8,
+            new_b.floor() as u8,
+        );
+    }
+    grays
+}
+
+/// `generateMutedTextColor` (`theme/index.ts:525-554`).
+fn generate_muted_text_color(bg: Rgba, is_dark: bool) -> Rgba {
+    let (bg_r, bg_g, bg_b) = (bg.r * 255.0, bg.g * 255.0, bg.b * 255.0);
+    let bg_lum = 0.299 * bg_r + 0.587 * bg_g + 0.114 * bg_b;
+    let gray = if is_dark {
+        if bg_lum < 10.0 {
+            180.0
+        } else {
+            (160.0 + bg_lum * 0.3).floor().min(200.0)
+        }
+    } else if bg_lum > 245.0 {
+        75.0
+    } else {
+        (100.0 - (255.0 - bg_lum) * 0.2).floor().max(60.0)
+    };
+    Rgba::from_ints(gray as u8, gray as u8, gray as u8)
+}
+
+/// `generateSystem` (`theme/index.ts:360-469`) — a palette built from
+/// the terminal colours. The Rust runtime cannot query the live
+/// terminal palette (`renderer.getPalette`), so callers pass
+/// [`TerminalColors::defaults`] and the ANSI-256 fallbacks are used
+/// (recorded divergence from the TS reference).
+pub fn generate_system(colors: &TerminalColors, mode: Mode) -> Value {
+    let bg = colors
+        .default_background
+        .as_deref()
+        .and_then(Rgba::from_hex)
+        .unwrap_or_else(|| colors.color(0));
+    let fg = colors
+        .default_foreground
+        .as_deref()
+        .and_then(Rgba::from_hex)
+        .unwrap_or_else(|| colors.color(7));
+    let transparent = Rgba::from_values(bg.r, bg.g, bg.b, 0.0);
+    let is_dark = mode == Mode::Dark;
+
+    let col = |i: usize| colors.color(i);
+    let red = col(1);
+    let green = col(2);
+    let yellow = col(3);
+    let blue = col(4);
+    let magenta = col(5);
+    let cyan = col(6);
+    let red_bright = col(9);
+    let green_bright = col(10);
+
+    let grays = generate_gray_scale(bg, is_dark);
+    let text_muted = generate_muted_text_color(bg, is_dark);
+
+    let diff_alpha = if is_dark { 0.22 } else { 0.14 };
+    let diff_added_bg = tint(bg, green, diff_alpha);
+    let diff_removed_bg = tint(bg, red, diff_alpha);
+    let diff_context_bg = grays[2];
+    let diff_added_line_number_bg = tint(grays[2], green, diff_alpha);
+    let diff_removed_line_number_bg = tint(grays[2], red, diff_alpha);
+    let diff_line_number = text_muted;
+
+    let entries = [
+        ("primary", cyan),
+        ("secondary", magenta),
+        ("accent", cyan),
+        ("error", red),
+        ("warning", yellow),
+        ("success", green),
+        ("info", cyan),
+        ("text", fg),
+        ("textMuted", text_muted),
+        ("selectedListItemText", bg),
+        ("background", transparent),
+        ("backgroundPanel", grays[2]),
+        ("backgroundElement", grays[3]),
+        ("backgroundMenu", grays[3]),
+        ("borderSubtle", grays[6]),
+        ("border", grays[7]),
+        ("borderActive", grays[8]),
+        ("diffAdded", green),
+        ("diffRemoved", red),
+        ("diffContext", grays[7]),
+        ("diffHunkHeader", grays[7]),
+        ("diffHighlightAdded", green_bright),
+        ("diffHighlightRemoved", red_bright),
+        ("diffAddedBg", diff_added_bg),
+        ("diffRemovedBg", diff_removed_bg),
+        ("diffContextBg", diff_context_bg),
+        ("diffLineNumber", diff_line_number),
+        ("diffAddedLineNumberBg", diff_added_line_number_bg),
+        ("diffRemovedLineNumberBg", diff_removed_line_number_bg),
+        ("markdownText", fg),
+        ("markdownHeading", fg),
+        ("markdownLink", blue),
+        ("markdownLinkText", cyan),
+        ("markdownCode", green),
+        ("markdownBlockQuote", yellow),
+        ("markdownEmph", yellow),
+        ("markdownStrong", fg),
+        ("markdownHorizontalRule", grays[7]),
+        ("markdownListItem", blue),
+        ("markdownListEnumeration", cyan),
+        ("markdownImage", blue),
+        ("markdownImageText", cyan),
+        ("markdownCodeBlock", fg),
+        ("syntaxComment", text_muted),
+        ("syntaxKeyword", magenta),
+        ("syntaxFunction", blue),
+        ("syntaxVariable", fg),
+        ("syntaxString", green),
+        ("syntaxNumber", yellow),
+        ("syntaxType", cyan),
+        ("syntaxOperator", cyan),
+        ("syntaxPunctuation", fg),
+    ];
+    let mut theme = serde_json::Map::new();
+    for (key, color) in entries {
+        let value = if color.a == 0.0 {
+            Value::String(hex_alpha(color))
+        } else {
+            Value::String(hex(color))
+        };
+        theme.insert(key.to_string(), value);
+    }
+    serde_json::json!({ "theme": theme })
+}
+
 /// `"dark" | "light"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -357,6 +592,9 @@ pub fn resolve_theme(raw: &Value, mode: Mode) -> anyhow::Result<Theme> {
             let chain = [chain, &[name]].concat();
             return resolve_color(next, mode, defs, entries, &chain);
         }
+        if let Some(code) = value.as_i64() {
+            return Ok(ansi_to_rgba(code));
+        }
         if let Some(variant) = value.as_object() {
             let side = match mode {
                 Mode::Dark => "dark",
@@ -481,20 +719,29 @@ pub fn selected_foreground(theme: &Theme, bg: Option<Rgba>) -> Rgba {
     theme.background
 }
 
+/// The `system` palette (`theme/index.ts:360-469`) — generated from
+/// the terminal colours, here the ANSI-256 defaults.
+pub fn system_theme(mode: Mode) -> Value {
+    generate_system(&TerminalColors::defaults(), mode)
+}
+
 /// `allThemes()` — the built-in registry (custom/plugin themes are not
-/// part of the Rust runtime).
+/// part of the Rust runtime) plus the generated `system` palette.
 pub fn all_themes() -> Vec<(&'static str, Value)> {
-    DEFAULT_THEMES
+    let mut themes: Vec<(&'static str, Value)> = DEFAULT_THEMES
         .iter()
         .filter_map(|(name, raw)| serde_json::from_str(raw).ok().map(|v| (*name, v)))
-        .collect()
+        .collect();
+    themes.push(("system", system_theme(Mode::Dark)));
+    themes
 }
 
 /// `hasTheme(name)` (`theme/index.ts:215-218`).
 pub fn has_theme(name: &str) -> bool {
-    DEFAULT_THEMES
-        .iter()
-        .any(|(candidate, _)| *candidate == name)
+    name == "system"
+        || DEFAULT_THEMES
+            .iter()
+            .any(|(candidate, _)| *candidate == name)
 }
 
 /// The theme context state (`context/theme.tsx:84-98`): active theme name,
@@ -516,12 +763,33 @@ impl Default for ThemeStore {
     }
 }
 
+/// `terminalMode(colors)` (`theme/index.ts:353-358`), inverted: the
+/// Rust runtime cannot query the terminal palette live, so the
+/// background is detected from the `COLORFGBG` env signal (set by
+/// terminals/multiplexers that know the background). Unknown
+/// backgrounds default to dark.
+fn detected_mode() -> Mode {
+    detected_mode_with(std::env::var("COLORFGBG").ok().as_deref())
+}
+
+fn detected_mode_with(colorfgbg: Option<&str>) -> Mode {
+    colorfgbg
+        .and_then(|value| {
+            let background = value.rsplit(';').next()?.trim().parse::<u8>().ok()?;
+            match background {
+                0..=6 | 8 | 16 => Some(Mode::Dark),
+                _ => Some(Mode::Light),
+            }
+        })
+        .unwrap_or(Mode::Dark)
+}
+
 impl ThemeStore {
     /// `ThemeProvider` init (`context/theme.tsx:114-124`).
     pub fn init(kv: &mut crate::state::kv::Kv, config_theme: Option<&str>) -> ThemeStore {
         let lock = kv.get(keys::THEME_MODE_LOCK, Value::Null);
         let lock = Mode::pick(&lock);
-        let mode = lock.unwrap_or(Mode::Dark);
+        let mode = lock.unwrap_or_else(detected_mode);
         if lock.is_none() {
             let legacy = kv.get(keys::THEME_MODE, Value::Null);
             if Mode::pick(&legacy).is_some() {
@@ -582,7 +850,13 @@ impl ThemeStore {
         {
             return resolve_theme(&serde_json::from_str::<Value>(raw)?, self.mode);
         }
+        if self.active == "system" {
+            return resolve_theme(&system_theme(self.mode), self.mode);
+        }
         if let Some(saved) = kv.get(keys::THEME, Value::Null).as_str() {
+            if saved == "system" {
+                return resolve_theme(&system_theme(self.mode), self.mode);
+            }
             if let Some((_, raw)) = DEFAULT_THEMES.iter().find(|(name, _)| *name == saved) {
                 return resolve_theme(&serde_json::from_str::<Value>(raw)?, self.mode);
             }
@@ -607,7 +881,7 @@ mod tests {
     #[test]
     fn loads_every_builtin_theme() {
         assert_eq!(DEFAULT_THEMES.len(), 33);
-        assert_eq!(all_themes().len(), 33);
+        assert_eq!(all_themes().len(), 34);
         for (name, _) in DEFAULT_THEMES {
             let (name, raw) = DEFAULT_THEMES
                 .iter()
@@ -618,6 +892,10 @@ mod tests {
             resolve_theme(&value, Mode::Dark).expect(name);
             resolve_theme(&value, Mode::Light).expect(name);
         }
+        let system = system_theme(Mode::Dark);
+        assert!(is_theme(&system));
+        resolve_theme(&system, Mode::Dark).expect("system");
+        resolve_theme(&system, Mode::Light).expect("system");
     }
 
     #[test]
@@ -770,8 +1048,71 @@ mod tests {
     fn has_theme_checks_the_registry() {
         assert!(has_theme("opencode"));
         assert!(has_theme("one-dark"));
+        assert!(has_theme("system"));
         assert!(!has_theme(""));
         assert!(!has_theme("nonexistent"));
+    }
+
+    #[test]
+    fn ansi_256_colors_resolve() {
+        assert_eq!(ansi_to_rgba(0), Rgba::from_hex("#000000").expect("black"));
+        assert_eq!(ansi_to_rgba(16), Rgba::from_ints(0, 0, 0));
+        assert_eq!(ansi_to_rgba(17), Rgba::from_ints(0, 0, 95));
+        assert_eq!(ansi_to_rgba(231), Rgba::from_ints(255, 255, 255));
+        assert_eq!(ansi_to_rgba(232), Rgba::from_ints(8, 8, 8));
+        assert_eq!(ansi_to_rgba(255), Rgba::from_ints(238, 238, 238));
+        let mut value: Value = serde_json::from_str(
+            DEFAULT_THEMES
+                .iter()
+                .find(|(name, _)| *name == "opencode")
+                .unwrap()
+                .1,
+        )
+        .unwrap();
+        value["theme"]["syntaxKeyword"] = json_number(196);
+        let theme = resolve_theme(&value, Mode::Dark).unwrap();
+        assert_eq!(theme.syntax_keyword, ansi_to_rgba(196));
+    }
+
+    fn json_number(value: i64) -> Value {
+        serde_json::json!(value)
+    }
+
+    #[test]
+    fn system_theme_generates_from_default_palette() {
+        let raw = system_theme(Mode::Dark);
+        let theme = resolve_theme(&raw, Mode::Dark).unwrap();
+        // bg defaults to ANSI black, fg to bright white-1 (#c0c0c0).
+        assert_eq!(theme.background, Rgba::from_values(0.0, 0.0, 0.0, 0.0));
+        assert_eq!(theme.text, Rgba::from_hex("#c0c0c0").unwrap());
+        // Primary is cyan (ANSI 6, #008080), error red (#800000).
+        assert_eq!(theme.primary, Rgba::from_hex("#008080").unwrap());
+        assert_eq!(theme.error, Rgba::from_hex("#800000").unwrap());
+        assert!(matches!(raw, serde_json::Value::Object { .. }));
+    }
+
+    #[test]
+    fn store_resolves_the_system_theme() {
+        let mut kv = crate::state::kv::Kv::in_memory();
+        let mut store = ThemeStore::init(&mut kv, None);
+        assert!(has_theme("system"));
+        store.set(&mut kv, "system");
+        assert_eq!(store.active, "system");
+        let theme = store.resolve(&kv).unwrap();
+        let system = resolve_theme(&system_theme(Mode::Dark), Mode::Dark).unwrap();
+        assert_eq!(theme.background, system.background);
+        assert_eq!(theme.background, Rgba::from_values(0.0, 0.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn detected_mode_follows_colorfgbg() {
+        assert_eq!(detected_mode_with(None), Mode::Dark);
+        assert_eq!(detected_mode_with(Some("15;0")), Mode::Dark);
+        assert_eq!(detected_mode_with(Some("0;15")), Mode::Light);
+        assert_eq!(detected_mode_with(Some("15;default;0")), Mode::Dark);
+        assert_eq!(detected_mode_with(Some("garbage")), Mode::Dark);
+        assert_eq!(detected_mode_with(Some("15;7")), Mode::Light);
+        assert_eq!(detected_mode_with(Some("15;8")), Mode::Dark);
     }
 
     #[test]
@@ -824,7 +1165,7 @@ mod tests {
 
         kv.set(crate::state::kv::keys::THEME_MODE_LOCK, Value::Null);
         let mut store = ThemeStore::init(&mut kv, None);
-        assert_eq!(store.mode, Mode::Dark);
+        assert_eq!(store.mode, detected_mode());
         store.unlock(&mut kv);
         store.set_mode(&mut kv, Mode::Light);
         assert_eq!(store.mode, Mode::Light);
