@@ -68,6 +68,37 @@ pub fn run(input: TuiInput) -> Result<Exit> {
     runtime.block_on(run_inner(input))
 }
 
+/// Build the forked route prompt from the message parts
+/// (`dialog-message.tsx:38-51`): text input + stripped file parts.
+fn prompt_info_from_parts(
+    parts: &Vec<opencode_schema::session_v1::V1Part>,
+) -> crate::state::route::PromptInfo {
+    let mut input = String::new();
+    let mut file_parts = Vec::new();
+    for part in parts {
+        match part {
+            opencode_schema::session_v1::V1Part::Text {
+                text,
+                synthetic: Some(false),
+                ..
+            } => {
+                input.push_str(text);
+            }
+            opencode_schema::session_v1::V1Part::File { .. } => {
+                if let Ok(value) = serde_json::to_value(part) {
+                    file_parts.push(value);
+                }
+            }
+            _ => {}
+        }
+    }
+    crate::state::route::PromptInfo {
+        input,
+        mode: None,
+        parts: file_parts,
+    }
+}
+
 async fn run_inner(input: TuiInput) -> Result<Exit> {
     let _guard = TerminalGuard::enter(input.config.mouse)?;
 
@@ -457,20 +488,35 @@ pub async fn execute_effect(
             reply,
             message,
         } => {
+            // `workspace: project.workspace.current()` on every reply
+            // (permission.tsx:172, 185; question.tsx:48-62).
+            let workspace = app.lock().await.state.project.workspace.current.clone();
+            let loc = Location {
+                directory: None,
+                workspace,
+            };
             let _ = api
-                .permission_reply(&Location::default(), &request_id, reply, message.as_deref())
+                .permission_reply(&loc, &request_id, reply, message.as_deref())
                 .await;
         }
         Effect::QuestionReply {
             request_id,
             answers,
         } => {
-            let _ = api
-                .question_reply(&Location::default(), &request_id, answers)
-                .await;
+            let workspace = app.lock().await.state.project.workspace.current.clone();
+            let loc = Location {
+                directory: None,
+                workspace,
+            };
+            let _ = api.question_reply(&loc, &request_id, answers).await;
         }
         Effect::QuestionReject { request_id } => {
-            let _ = api.question_reject(&Location::default(), &request_id).await;
+            let workspace = app.lock().await.state.project.workspace.current.clone();
+            let loc = Location {
+                directory: None,
+                workspace,
+            };
+            let _ = api.question_reject(&loc, &request_id).await;
         }
         Effect::SessionRename { session_id, title } => {
             let error = api
@@ -551,6 +597,7 @@ pub async fn execute_effect(
                 app.ui.move_directories = Some(directories);
             }
         }
+
         Effect::SessionForkFromMessage {
             session_id,
             message_id,
@@ -561,15 +608,21 @@ pub async fn execute_effect(
                 .await;
             let mut app = app.lock().await;
             match result {
-                Ok(info) => {
+                Ok(forked) => {
+                    // Seed the prompt from the forked message parts
+                    // (dialog-message.tsx:38-51).
+                    let prompt = if seed_prompt {
+                        message_id
+                            .as_deref()
+                            .and_then(|id| app.state.sync.part.get(id))
+                            .map(prompt_info_from_parts)
+                    } else {
+                        None
+                    };
                     app.state.route.navigate(Route::Session {
-                        session_id: info.id.clone(),
-                        prompt: None,
+                        session_id: forked.id.clone(),
+                        prompt,
                     });
-                    if seed_prompt {
-                        // TODO(M8.8): seed the prompt from the forked
-                        // message parts (`dialog-fork-from-timeline.tsx`).
-                    }
                 }
                 Err(error) => app.show_toast(Toast {
                     title: None,

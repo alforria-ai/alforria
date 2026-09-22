@@ -585,3 +585,66 @@ result-dependent toasts.
 silent no-op in the port; TS shows the consent dialog and then fails the
 share request (no current session). Session-context share/unshare
 semantics match.
+
+## Round 8 — caret, modal scroll, enter-deadlock, tool discovery + systematic sweep
+
+Four user-reported bugs, root-caused via parallel review agents, plus a
+"find them all" sweep of remaining session-view surfaces.
+
+**User-reported, fixed:**
+
+1. **No caret** — the cursor was drawn only via REVERSED on a cell that
+   matches `column == cursor_col`, but the textarea reports
+   `cursor_col == rows.len()` at the usual end-of-row position (matches
+   nothing), and the empty-prompt branch drew no cursor at all. Both
+   renderers now draw an OpenTUI-style block cell
+   (`cursorColor={theme.text}`, prompt/index.tsx:1439) on the placeholder,
+   over the cursor char, and one-past-the-end, blinking at ~530ms
+   (`cursor.blinking`). Unit-tested at the buffer level.
+2. **Modal scroll broken** — two defects: the mouse wheel always scrolled
+   the transcript (dialogs never saw wheel events), and `render_options`
+   ignored `SelectState.scroll` (write-only) so the selection moved past
+   the fixed 8-row window. The wheel now routes to the topmost dialog
+   (`wheel_scroll`, default speed 3 — `util/scroll.ts`), and the renderer
+   windows `options[scroll..scroll+MAX]`. The prompt autocomplete popup
+   got the same scroll-window fix.
+3. **"Enter dead forever"** — not the queue (that was at TS parity): an
+   invisible zero-match autocomplete popup swallowed Enter forever
+   (`select_autocomplete` returned early without hiding; `submit()`
+   blocks while `autocomplete.visible`). The empty popup now renders
+   "No matching items" (`autocomplete.tsx:730-735`) and selecting from
+   it hides the popup. Also scoped the permission/question submit gate
+   to the current session's children (a stale request in another session
+   could silently kill Enter).
+4. **Skills never discovered** — two gaps: the `<available_skills>`
+   block was never injected (`NoSystemPrompts` stub; `system::skills()`
+   was dead code), so the model could never learn skill names like
+   `libertai-search`; and external dirs (`~/.claude/skills/**`,
+   `~/.agents/skills/**`, global + up-tree — `skill/index.ts:184-204`)
+   were not scanned. Wired `EngineSystemPrompts` (environment +
+   skills + `<mcp_instructions>`) into the engine and ported the
+   external-dirs scan. Live-verified: the model now lists all 13
+   skills.
+
+**Sweep findings, fixed:** dialog prev arrow moved 10 items instead of 1
+(`dialog.select.prev` typo); palette listed and dispatched disabled
+commands (`visibility: "reachable"`); ctrl+c typed a literal `c` in the
+question dialog; the `edit` permission dialog always said "No diff
+provided" (now renders the diff via the transcript diff component);
+`permission.reply`/`question_reply` missing the `workspace` query param
+(wire parity); `external_directory` ignored `metadata.parentDir`/
+`filepath`; websearch permission dropped the provider label; question
+options dropped their descriptions; message revert dropped file parts;
+fork-from-message never seeded the prompt; `prompt.max_height` config
+ignored; sessions dialog lacked date categories, busy/slot gutter and
+current-session pre-select; no spacing between dialog categories;
+`tool_input` accepted `Pending` parts.
+
+**Sweep findings, recorded gaps (not fixed):** dialog option rows are not
+mouse-clickable/hoverable; the dialog window is a fixed 8 rows instead of
+dynamic `floor(height/2)-6`; the delete-confirm hint hardcodes "ctrl+d";
+palette rows lack description/keybind footer; wide-char display-width
+counting fixed in the textarea but not in diff `trim_to`/`wrap_to`.
+
+Live-verified via pty probes: caret unit tests, modal window/arrow/wheel,
+skills listing, vision + thinking regressions, enter-after-empty-popup.

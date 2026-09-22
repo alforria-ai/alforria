@@ -158,6 +158,9 @@ fn run(
 /// scan patterns for the two discovery sources M4 supports.
 const OPENCODE_SKILL_PATTERNS: &[&str] = &["{skill,skills}/**/SKILL.md"];
 const SKILL_PATTERNS: &[&str] = &["**/SKILL.md"];
+/// `EXTERNAL_SKILL_PATTERN` (skill/index.ts:23) — the external
+/// (`~/.claude`, `~/.agents`) skills live under `skills/**/SKILL.md`.
+const EXTERNAL_SKILL_PATTERNS: &[&str] = &["skills/**/SKILL.md"];
 
 /// Inputs to [`SkillService::discover`] — the two M4 discovery sources of
 /// `discoverSkills` (skill/index.ts:173-233).
@@ -174,6 +177,9 @@ pub struct SkillDiscovery {
     pub directory: PathBuf,
     /// The user's home directory (`~/` expansion).
     pub home: PathBuf,
+    /// The worktree root — the up-tree walk for `.claude`/`.agents`
+    /// stops here (`fsys.up({ stop: worktree })`).
+    pub worktree: PathBuf,
 }
 
 /// The filesystem-backed `Skill.Service` default: skills discovered eagerly
@@ -187,6 +193,57 @@ pub struct SkillService {
 impl SkillService {
     pub fn discover(input: &SkillDiscovery) -> SkillService {
         let mut skills = HashMap::new();
+        // External skills (skill/index.ts:184-204): `~/.claude` +
+        // `~/.agents` (unless `OPENCODE_DISABLE_EXTERNAL_SKILLS`), plus
+        // the same dirs up-tree from the directory to the worktree.
+        if !std::env::var("OPENCODE_DISABLE_EXTERNAL_SKILLS")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false)
+        {
+            let mut external = vec![".agents".to_string()];
+            let claude_disabled = [
+                "OPENCODE_DISABLE_CLAUDE_CODE",
+                "OPENCODE_DISABLE_CLAUDE_CODE_SKILLS",
+            ]
+            .iter()
+            .any(|key| {
+                std::env::var(key)
+                    .map(|v| !v.is_empty() && v != "0")
+                    .unwrap_or(false)
+            });
+            if !claude_disabled {
+                external.push(".claude".to_string());
+            }
+            for dir in &external {
+                let root = input.home.join(dir);
+                if root.is_dir() {
+                    for path in scan_markdown(&root, EXTERNAL_SKILL_PATTERNS) {
+                        add_skill(&mut skills, &path);
+                    }
+                }
+            }
+            // `fsys.up({ targets, start: directory, stop: worktree })` —
+            // walk directory → worktree (inclusive) looking for the
+            // same dirs.
+            let mut current = input.directory.clone();
+            loop {
+                for dir in &external {
+                    let root = current.join(dir);
+                    if root.is_dir() {
+                        for path in scan_markdown(&root, EXTERNAL_SKILL_PATTERNS) {
+                            add_skill(&mut skills, &path);
+                        }
+                    }
+                }
+                if current == input.worktree {
+                    break;
+                }
+                match current.parent() {
+                    Some(parent) => current = parent.to_path_buf(),
+                    None => break,
+                }
+            }
+        }
         for dir in &input.directories {
             for path in scan_markdown(dir, OPENCODE_SKILL_PATTERNS) {
                 add_skill(&mut skills, &path);
@@ -290,8 +347,76 @@ mod tests {
             directories: vec![dir.join(".opencode")],
             paths: Vec::new(),
             directory: dir.to_path_buf(),
+            worktree: dir.to_path_buf(),
             home: dir.join("home"),
         })
+    }
+
+    #[test]
+    fn external_skill_dirs_are_scanned() {
+        // `~/.claude/skills` + `~/.agents/skills` + up-tree `.claude`
+        // (skill/index.ts:184-204).
+        let dir = TempDir::new("skills");
+        let home = dir.path().join("home");
+        write(
+            &home
+                .join(".claude")
+                .join("skills")
+                .join("libertai-search")
+                .join("SKILL.md"),
+            "---
+name: libertai-search
+description: Search the web
+---
+body",
+        );
+        write(
+            &home
+                .join(".agents")
+                .join("skills")
+                .join("other")
+                .join("SKILL.md"),
+            "---
+name: other-skill
+description: Other
+---
+body",
+        );
+        let service = SkillService::discover(&SkillDiscovery {
+            directories: Vec::new(),
+            paths: Vec::new(),
+            directory: dir.path().to_path_buf(),
+            worktree: dir.path().to_path_buf(),
+            home: home.clone(),
+        });
+        assert!(service.get("libertai-search").is_some(), "claude skills");
+        assert!(service.get("other-skill").is_some(), "agents skills");
+    }
+
+    #[test]
+    fn external_skills_up_tree() {
+        let dir = TempDir::new("skills-up");
+        let home = dir.path().join("home");
+        write(
+            &dir.path()
+                .join(".claude")
+                .join("skills")
+                .join("proj")
+                .join("SKILL.md"),
+            "---
+name: proj-skill
+description: Proj
+---
+body",
+        );
+        let service = SkillService::discover(&SkillDiscovery {
+            directories: Vec::new(),
+            paths: Vec::new(),
+            directory: dir.path().join("sub").join("sub"),
+            worktree: dir.path().to_path_buf(),
+            home,
+        });
+        assert!(service.get("proj-skill").is_some(), "up-tree .claude");
     }
 
     fn write(path: &Path, contents: &str) {
@@ -373,6 +498,7 @@ mod tests {
                 "missing-dir".to_string(),
             ],
             directory: dir.to_path_buf(),
+            worktree: dir.to_path_buf(),
             home: dir.join("home"),
         });
 
@@ -430,6 +556,7 @@ mod tests {
             directories: vec![temp.path().join(".opencode").join("missing")],
             paths: Vec::new(),
             directory: temp.path().to_path_buf(),
+            worktree: temp.path().to_path_buf(),
             home: temp.path().join("home"),
         });
         let err = empty.require("nope").await.unwrap_err();

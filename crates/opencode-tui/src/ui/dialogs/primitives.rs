@@ -53,6 +53,10 @@ impl SelectOption {
         option
     }
 
+    pub fn with_gutter(self, gutter: Option<String>) -> SelectOption {
+        SelectOption { gutter, ..self }
+    }
+
     pub fn with_footer(self, footer: impl Into<String>) -> SelectOption {
         let mut option = self;
         option.footer = Some(footer.into());
@@ -264,12 +268,23 @@ pub fn render_options(
         return;
     }
     let mut category = String::new();
-    for (index, option) in options.iter().enumerate() {
-        if index >= MAX_VISIBLE_OPTIONS {
-            break;
-        }
+    // The scrollbox window (`scrollToSelection`,
+    // dialog-select.tsx:311-342): render only the visible slice —
+    // the selection can move past the fixed window.
+    let start = select.scroll.min(options.len().saturating_sub(1));
+    for (index, option) in options
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(MAX_VISIBLE_OPTIONS)
+    {
         if let Some(group) = &option.category {
             if group != &category && !group.is_empty() {
+                if !category.is_empty() {
+                    // `paddingTop={1}` between category groups
+                    // (dialog-select.tsx:621).
+                    lines.push(Line::raw(""));
+                }
                 category = group.clone();
                 lines.push(Line::styled(
                     format!("   {group}"),
@@ -343,4 +358,60 @@ pub fn paint(lines: &[Line<'static>], theme: &Theme, area: Rect, frame: &mut rat
     Paragraph::new(lines.to_vec())
         .style(Style::new().bg(theme.background_panel.to_color()))
         .render(area, frame.buffer_mut());
+}
+
+#[cfg(test)]
+mod scroll_tests {
+    use super::*;
+
+    fn theme() -> crate::ui::theme::Theme {
+        let app = crate::state::App::new(
+            crate::config::TuiConfig::default(),
+            Default::default(),
+            None,
+        );
+        app.ui
+            .theme
+            .resolve(&app.state.kv)
+            .expect("builtin theme resolves")
+    }
+
+    #[test]
+    fn render_options_follows_the_scroll_window() {
+        // A selection past the visible window must stay on screen —
+        // the window scrolls, it does not strand the highlight
+        // (`scrollToSelection`, dialog-select.tsx:311-342).
+        let view = SelectView {
+            title: "Models".to_string(),
+            filter: false,
+            options: (0..20)
+                .map(|i| SelectOption {
+                    title: format!("model-{i}"),
+                    value: Some(format!("model-{i}")),
+                    description: None,
+                    category: None,
+                    footer: None,
+                    gutter: None,
+                    bg_error: false,
+                })
+                .collect(),
+            actions: Vec::new(),
+        };
+        let mut select = SelectState::default();
+        select.move_by(15, 20);
+        let mut lines = Vec::new();
+        render_options(&select, &view, &theme(), &mut lines, 80);
+        let text = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("model-15"), "selection missing: {text}");
+        assert!(!text.contains("model-0"), "window did not scroll: {text}");
+    }
 }

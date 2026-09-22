@@ -481,6 +481,75 @@ async fn generate_copy_name(
 /// `Agent.Info` records; the tool system needs the reduced slice
 /// (`registry.ts` resolves the same Effect service for both).
 #[derive(Clone)]
+/// `sys.environment` / `sys.skills` / `sys.mcp` (system.ts:69-137) —
+/// the server-side system-prompt inputs: the environment block, the
+/// `<available_skills>` list, and `<mcp_instructions>`.
+struct EngineSystemPrompts {
+    agents: AgentRegistry,
+    skills: Arc<opencode_core::tool::skill::SkillService>,
+    mcp: Arc<opencode_core::mcp::McpService>,
+    directory: PathBuf,
+    worktree: PathBuf,
+}
+
+impl opencode_core::session::r#loop::SystemPrompts for EngineSystemPrompts {
+    fn environment(&self, model: &opencode_core::session::llm::LlmModel) -> Vec<String> {
+        opencode_core::session::system::environment(
+            &opencode_core::session::system::EnvironmentModel {
+                provider_id: model.provider_id.clone(),
+                id: model.id.clone(),
+                api_id: model.api_id.clone(),
+            },
+            &opencode_core::session::system::EnvironmentContext {
+                directory: self.directory.display().to_string(),
+                worktree: self.worktree.display().to_string(),
+                vcs: self.worktree.join(".git").exists(),
+            },
+            Vec::new(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+        )
+    }
+
+    fn skills<'a>(
+        &'a self,
+        agent: &'a str,
+    ) -> opencode_core::tool::def::BoxFuture<'a, Option<String>> {
+        let Some(info) = self.agents.get(agent).cloned() else {
+            return Box::pin(async move { None });
+        };
+        let available: Vec<_> = self.skills.all().into_iter().cloned().collect();
+        Box::pin(async move { opencode_core::session::system::skills(&info, &available) })
+    }
+
+    fn mcp<'a>(
+        &'a self,
+        agent: &'a str,
+        permission: &'a Option<opencode_schema::permission_v1::PermissionV1Ruleset>,
+    ) -> opencode_core::tool::def::BoxFuture<'a, Option<String>> {
+        let Some(info) = self.agents.get(agent).cloned() else {
+            return Box::pin(async move { None });
+        };
+        let mcp = self.mcp.clone();
+        let permission = permission.clone();
+        Box::pin(async move {
+            let items = mcp
+                .instructions()
+                .await
+                .into_iter()
+                .map(|item| opencode_core::session::system::McpInstruction {
+                    name: item.name,
+                    tools: item.tools,
+                    instructions: item.instructions,
+                })
+                .collect::<Vec<_>>();
+            opencode_core::session::system::mcp(&info, permission.as_ref(), &items)
+        })
+    }
+}
+
 struct RegistryAgents(AgentRegistry);
 
 impl opencode_core::tool::def::Agents for RegistryAgents {
@@ -732,6 +801,22 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
             events: Some(services.events.clone()),
         },
     ));
+    // The skills available to the `skill` tool — also injected into the
+    // system prompt via `EngineSystemPrompts` (`sys.skills`).
+    let skill_service = Arc::new(opencode_core::tool::skill::SkillService::discover(
+        &opencode_core::tool::skill::SkillDiscovery {
+            directories: input.config_dirs.clone(),
+            paths: input
+                .config
+                .skills
+                .as_ref()
+                .and_then(|skills| skills.paths.clone())
+                .unwrap_or_default(),
+            directory: input.directory.clone(),
+            worktree: input.worktree.clone(),
+            home: input.paths.home.clone(),
+        },
+    ));
     // Websearch env keys are read once at boot (WebSearchEnv::default).
     let websearch = opencode_core::tool::websearch::websearch_tool(
         truncate.clone(),
@@ -792,19 +877,7 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
         opencode_core::tool::skill::skill_tool(
             truncate.clone(),
             agents.clone(),
-            Arc::new(opencode_core::tool::skill::SkillService::discover(
-                &opencode_core::tool::skill::SkillDiscovery {
-                    directories: input.config_dirs.clone(),
-                    paths: input
-                        .config
-                        .skills
-                        .as_ref()
-                        .and_then(|skills| skills.paths.clone())
-                        .unwrap_or_default(),
-                    directory: input.directory.clone(),
-                    home: input.paths.home.clone(),
-                },
-            )),
+            skill_service.clone(),
             ripgrep.clone(),
         ),
         opencode_core::tool::apply_patch::apply_patch_tool(
@@ -912,7 +985,13 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
         subtasks,
         summary: summary.clone(),
         instruction,
-        systems: Arc::new(opencode_core::session::r#loop::NoSystemPrompts),
+        systems: Arc::new(EngineSystemPrompts {
+            agents: services.agents.clone(),
+            skills: skill_service.clone(),
+            mcp: mcp_service.clone(),
+            directory: input.directory.clone(),
+            worktree: input.worktree.clone(),
+        }),
         registry: (*registry).clone(),
         revert: revert.clone(),
         prompt_ops: ops.clone(),

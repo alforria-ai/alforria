@@ -58,6 +58,8 @@ pub struct TuiConfig {
     pub scroll_acceleration_enabled: bool,
     /// `diff_style` (`config/index.tsx:72`): `"auto" | "stacked"`.
     pub diff_style: String,
+    /// `prompt.max_height` (`config/index.tsx:55`).
+    pub prompt_max_height: Option<u16>,
     /// `attention` (`config/index.tsx:113-122`).
     pub attention: AttentionConfig,
 }
@@ -68,6 +70,7 @@ impl Default for TuiConfig {
             mouse: true,
             theme: None,
             prompt_max_width: PromptMaxWidth::Fixed(75),
+            prompt_max_height: None,
             keybinds: std::collections::BTreeMap::new(),
             leader_timeout_ms: None,
             terminal_suspend_supported: cfg!(not(target_os = "windows")),

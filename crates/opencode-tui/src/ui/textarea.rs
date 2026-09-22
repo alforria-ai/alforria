@@ -487,24 +487,30 @@ impl Textarea {
             .unwrap_or(self.buffer.len())
     }
 
-    /// Soft-wrap the buffer into `width` columns (character wrap) and
-    /// place the cursor.
+    /// Soft-wrap the buffer into `width` columns (display-width aware —
+    /// CJK/emoji count as two columns, `unicode_width`) and place the
+    /// cursor.
     pub fn display(&self, width: u16) -> Display {
         let width = (width.max(1) as usize).max(1);
         let mut rows: Vec<Vec<(char, Option<u64>)>> = vec![Vec::new()];
+        // The display-width budget of the current row.
+        let mut row_widths: Vec<usize> = vec![0];
         let mut cursor_row = 0;
         let mut cursor_col = 0;
         for (offset, char) in self.buffer.chars().enumerate() {
             if offset == self.cursor {
                 cursor_row = rows.len() - 1;
-                cursor_col = rows.last().map(|row| row.len()).unwrap_or(0);
+                cursor_col = *row_widths.last().unwrap_or(&0);
             }
             if char == '\n' {
                 rows.push(Vec::new());
+                row_widths.push(0);
                 continue;
             }
-            if rows.last().is_some_and(|row| row.len() >= width) {
+            let char_width = unicode_width::UnicodeWidthChar::width(char).unwrap_or(0);
+            if row_widths.last().is_some_and(|w| w + char_width > width) {
                 rows.push(Vec::new());
+                row_widths.push(0);
             }
             let mark = self
                 .extmarks
@@ -512,10 +518,11 @@ impl Textarea {
                 .find(|mark| offset >= mark.start && offset < mark.end)
                 .map(|mark| mark.id);
             rows.last_mut().expect("a row").push((char, mark));
+            *row_widths.last_mut().expect("a row") += char_width;
         }
         if self.cursor >= self.char_count() {
             cursor_row = rows.len() - 1;
-            cursor_col = rows.last().map(|row| row.len()).unwrap_or(0);
+            cursor_col = *row_widths.last().unwrap_or(&0);
         }
         Display {
             rows,
@@ -531,6 +538,16 @@ impl Textarea {
             .unwrap_or_else(|| std::cmp::max(6, terminal_height / 3))
             .max(1)
     }
+}
+
+/// The OpenTUI block cursor: one cell painted `theme.text`
+/// (`cursorColor={theme.text}`, prompt/index.tsx:1439-1441). `visible`
+/// is the `cursor.blinking` phase — false hides the cell and restores
+/// the underlying glyph.
+pub fn cursor_cell_style(theme: &crate::ui::theme::Theme) -> ratatui::style::Style {
+    ratatui::style::Style::new()
+        .fg(theme.background_element.to_color())
+        .bg(theme.text.to_color())
 }
 
 #[cfg(test)]

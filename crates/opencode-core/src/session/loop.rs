@@ -189,12 +189,12 @@ pub trait Subtasks: Send + Sync {
 /// machinery).
 pub trait SystemPrompts: Send + Sync {
     fn environment(&self, model: &LlmModel) -> Vec<String>;
-    fn skills(&self, agent: &str) -> Option<String>;
-    fn mcp(
-        &self,
-        agent: &str,
-        permission: &Option<opencode_schema::permission_v1::PermissionV1Ruleset>,
-    ) -> Option<String>;
+    fn skills<'a>(&'a self, agent: &'a str) -> BoxFuture<'a, Option<String>>;
+    fn mcp<'a>(
+        &'a self,
+        agent: &'a str,
+        permission: &'a Option<opencode_schema::permission_v1::PermissionV1Ruleset>,
+    ) -> BoxFuture<'a, Option<String>>;
 }
 
 /// No-op default (M5.2 not landed).
@@ -204,15 +204,15 @@ impl SystemPrompts for NoSystemPrompts {
     fn environment(&self, _model: &LlmModel) -> Vec<String> {
         Vec::new()
     }
-    fn skills(&self, _agent: &str) -> Option<String> {
-        None
+    fn skills<'a>(&'a self, _agent: &'a str) -> BoxFuture<'a, Option<String>> {
+        Box::pin(async move { None })
     }
-    fn mcp(
-        &self,
-        _agent: &str,
-        _permission: &Option<opencode_schema::permission_v1::PermissionV1Ruleset>,
-    ) -> Option<String> {
-        None
+    fn mcp<'a>(
+        &'a self,
+        _agent: &'a str,
+        _permission: &'a Option<opencode_schema::permission_v1::PermissionV1Ruleset>,
+    ) -> BoxFuture<'a, Option<String>> {
+        Box::pin(async move { None })
     }
 }
 
@@ -581,10 +581,10 @@ pub async fn run_loop(
             // System prompts (prompt.ts:1258-1277).
             let mut system = deps.systems.environment(&model.llm);
             system.extend(deps.instruction.system());
-            if let Some(mcp) = deps.systems.mcp(&agent.name, &session.permission) {
+            if let Some(mcp) = deps.systems.mcp(&agent.name, &session.permission).await {
                 system.push(mcp);
             }
-            if let Some(skills) = deps.systems.skills(&agent.name) {
+            if let Some(skills) = deps.systems.skills(&agent.name).await {
                 system.push(skills);
             }
             if json_schema_format {

@@ -641,6 +641,9 @@ pub struct Autocomplete {
     /// Char offset of the trigger character.
     pub index: usize,
     pub selected: usize,
+    /// The scrollbox window top (the popup height cap,
+    /// `autocomplete.tsx` `Intersection` scrollbox).
+    pub scroll: usize,
     pub options: Vec<AutocompleteOption>,
 }
 
@@ -740,6 +743,18 @@ impl Autocomplete {
             selected = 0;
         }
         self.selected = selected as usize;
+        self.clamp_scroll();
+    }
+
+    /// `scrollToSelection` — keep the selection inside the popup
+    /// window (`dialog-select.tsx:311-342`).
+    fn clamp_scroll(&mut self) {
+        let height = crate::ui::session::prompt::AUTOCOMPLETE_HEIGHT;
+        if self.selected < self.scroll {
+            self.scroll = self.selected;
+        } else if self.selected >= self.scroll + height {
+            self.scroll = self.selected + 1 - height;
+        }
     }
 }
 
@@ -1187,9 +1202,41 @@ pub fn submit(app: &mut App) -> Vec<crate::state::Effect> {
         return Vec::new();
     }
     // `props.disabled` (`routes/session/index.tsx:241`): the prompt is
-    // disabled while a permission or question prompt is open.
-    if !app.state.sync.permission.is_empty() || !app.state.sync.question.is_empty() {
-        return Vec::new();
+    // disabled while a permission or question prompt is open — scoped
+    // to the current session's children, like `permission::visible()`.
+    if let Route::Session { session_id, .. } = &app.state.route.data {
+        let visible = app.state.sync.session(session_id).is_some_and(|session| {
+            let parent = session.parent_id.as_deref().unwrap_or(session.id.as_str());
+            app.state
+                .sync
+                .permission
+                .get(parent)
+                .is_some_and(|p| !p.is_empty())
+                || app
+                    .state
+                    .sync
+                    .question
+                    .get(parent)
+                    .is_some_and(|q| !q.is_empty())
+                || app.state.sync.session.iter().any(|s| {
+                    s.parent_id.as_deref() == Some(parent)
+                        && (app
+                            .state
+                            .sync
+                            .permission
+                            .get(&s.id)
+                            .is_some_and(|p| !p.is_empty())
+                            || app
+                                .state
+                                .sync
+                                .question
+                                .get(&s.id)
+                                .is_some_and(|q| !q.is_empty()))
+                })
+        });
+        if visible {
+            return Vec::new();
+        }
     }
     let input = app.ui.prompt.input().to_string();
     if input.is_empty() {
@@ -1709,6 +1756,10 @@ fn select_autocomplete(app: &mut App) -> Vec<crate::state::Effect> {
         .get(app.ui.prompt.autocomplete.selected)
         .cloned()
     else {
+        // A zero-match popup must not eat Enter forever — close it so
+        // the next Enter submits (the port renders a visible
+        // "No matching items" row, `autocomplete.tsx:730-735`).
+        hide_autocomplete(app);
         return Vec::new();
     };
     hide_autocomplete(app);
@@ -1976,6 +2027,34 @@ pub fn text_input(app: &mut App, key: &crossterm::event::KeyEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_select_autocomplete_hides_popup() {
+        // A zero-match popup must not eat Enter forever — selecting
+        // nothing closes it (`autocomplete.tsx:730-735`).
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = crate::state::App::new(
+            crate::config::TuiConfig::default(),
+            crate::state::Args::default(),
+            None,
+        );
+        app.ui.prompt_focused = true;
+        text_input(
+            &mut app,
+            &KeyEvent::new(KeyCode::Char('@'), KeyModifiers::NONE),
+        );
+        assert_eq!(app.ui.prompt.autocomplete.visible, Some('@'));
+        assert!(app.ui.prompt.autocomplete.options.is_empty());
+        let (handled, effects) =
+            autocomplete_key(&mut app, &KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(handled);
+        assert!(effects.is_empty());
+        assert_ne!(
+            app.ui.prompt.autocomplete.visible,
+            Some('@'),
+            "empty popup must close on submit"
+        );
+    }
 
     #[test]
     fn slash_select_dispatches_tui_command() {

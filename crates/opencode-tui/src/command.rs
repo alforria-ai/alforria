@@ -958,7 +958,11 @@ pub fn slash_commands(app: &App) -> Vec<CommandInfo> {
 pub fn palette(app: &App) -> Vec<CommandInfo> {
     registry(app)
         .into_iter()
-        .filter(|command| !command.hidden && command.name != COMMAND_PALETTE_COMMAND)
+        // `visibility: "reachable"` (command-palette.tsx:33-41): only
+        // commands whose `enabled` conditions pass.
+        .filter(|command| {
+            !command.hidden && command.enabled && command.name != COMMAND_PALETTE_COMMAND
+        })
         .collect()
 }
 

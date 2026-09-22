@@ -16,6 +16,7 @@ license = "MIT"
 repository = "https://github.com/moshemalawach/opencode-rs"
 
 [workspace.dependencies]
+unicode-width = "0.2"
 # Async runtime & HTTP
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"

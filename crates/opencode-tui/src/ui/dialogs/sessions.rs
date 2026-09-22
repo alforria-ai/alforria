@@ -31,7 +31,6 @@ pub fn session_list_options(app: &App, frame: &DialogFrame) -> Vec<SelectOption>
         })
         .cloned()
         .collect();
-    let today = "";
     let mut options = Vec::new();
     let build = |id: &str, category: &str| -> Option<SelectOption> {
         let session = app
@@ -52,10 +51,34 @@ pub fn session_list_options(app: &App, frame: &DialogFrame) -> Vec<SelectOption>
         } else {
             session.title.clone()
         };
+
+        // The busy spinner / quick-switch slot gutter
+        // (dialog-session-list.tsx:231-240).
+        let mut gutter = None;
+        let status = app.state.sync.session_status.get(&session.id);
+        let working = matches!(
+            status,
+            Some(opencode_schema::session_status::SessionStatusInfo::Busy)
+                | Some(opencode_schema::session_status::SessionStatusInfo::Retry { .. })
+        );
+        if working {
+            gutter = Some(app.session_spinner().to_string());
+        } else {
+            let slot = app
+                .state
+                .local
+                .session_slots(&app.state.sync)
+                .iter()
+                .position(|slot| slot == &session.id);
+            if let Some(slot) = slot {
+                gutter = Some((slot + 1).to_string());
+            }
+        }
         Some(
             SelectOption::new(title)
                 .with_value(session.id.clone())
-                .with_category(category),
+                .with_category(category)
+                .with_gutter(gutter),
         )
     };
     for id in &pinned {
@@ -75,7 +98,46 @@ pub fn session_list_options(app: &App, frame: &DialogFrame) -> Vec<SelectOption>
         if pinned.contains(&session.id) {
             continue;
         }
-        if let Some(option) = build(&session.id, today) {
+        // "Today" or the date label (dialog-session-list.tsx:257).
+        let category = {
+            let secs = (session.time.updated / 1000) as i64;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let day_of = |secs: i64| secs.div_euclid(86_400);
+            let label = if day_of(secs) == day_of(now) {
+                "Today".to_string()
+            } else {
+                // `new Date(...).toDateString()` — e.g. "Mon Sep 22 2026".
+                let wd = ((day_of(secs) + 4) % 7 + 7) % 7;
+                let weekdays = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+                let months = [
+                    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov",
+                    "Dec",
+                ];
+                // Civil-date conversion (days since epoch -> y/m/d).
+                let z = day_of(secs) + 719_468;
+                let era = z.div_euclid(146_097);
+                let doe = z - era * 146_097;
+                let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+                let year = yoe + era * 400;
+                let yd = doe - (365 * yoe + yoe / 4 - yoe / 100);
+                let mp = (5 * yd + 2) / 153;
+                let day = yd - (153 * mp + 2) / 5 + 1;
+                let month = if mp < 10 { mp + 3 } else { mp - 9 };
+                let year = if month <= 2 { year + 1 } else { year };
+                format!(
+                    "{} {} {} {}",
+                    weekdays[wd as usize],
+                    months[(month as usize - 1) % 12],
+                    day,
+                    year
+                )
+            };
+            label
+        };
+        if let Some(option) = build(&session.id, &category) {
             options.push(option);
         }
     }
@@ -146,19 +208,32 @@ pub fn message_action(
     match option.value.as_deref() {
         Some("session.revert") => {
             crate::ui::dialogs::clear(app);
-            let parts = message_parts(app, message_id);
+            // Revert restores the input AND the file parts
+            // (dialog-message.tsx:38-51).
             let mut input = String::new();
-            for part in &parts {
-                if let opencode_schema::session_v1::V1Part::Text {
-                    text, synthetic, ..
-                } = part
-                {
-                    if !synthetic.unwrap_or(false) {
-                        input.push_str(text);
+            let mut parts = Vec::new();
+            for part in message_parts(app, message_id) {
+                match part {
+                    opencode_schema::session_v1::V1Part::Text {
+                        text,
+                        synthetic: Some(false),
+                        ..
+                    } => {
+                        input.push_str(&text);
                     }
+                    opencode_schema::session_v1::V1Part::File { .. } => {
+                        if let Ok(value) = serde_json::to_value(&part) {
+                            if let Some(part) = crate::state::prompt::PromptPart::from_value(&value)
+                            {
+                                parts.push(part);
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
             app.ui.prompt.textarea.set_text(&input);
+            app.ui.prompt.parts = parts;
             vec![Effect::SessionRevert {
                 session_id: session_id.to_string(),
                 message_id: message_id.to_string(),

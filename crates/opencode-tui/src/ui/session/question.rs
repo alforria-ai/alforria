@@ -149,8 +149,15 @@ pub fn handle_key(app: &mut App, key: &crossterm::event::KeyEvent) -> Option<Vec
             crossterm::event::KeyCode::Backspace => {
                 state.input.pop();
             }
-            crossterm::event::KeyCode::Char(char) if !char.is_control() => {
-                state.input.push(char);
+            // Never insert control-modified chars — ctrl+c clears the
+            // editing input (`prompt.clear`), it must not type a `c`.
+            crossterm::event::KeyCode::Char(char)
+                if !char.is_control()
+                    && !key
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL) =>
+            {
+                state.input.push(char)
             }
             _ => {}
         }
@@ -392,7 +399,7 @@ pub fn lines(app: &App) -> Vec<Line<'static>> {
         let options = options_of(&request, state.tab);
         let custom = custom_allowed(&request, state.tab);
         for (index, option) in options.iter().enumerate() {
-            rows.push(option_row(app, &request, &theme, index, option));
+            rows.extend(option_row(app, &request, &theme, index, option));
         }
         if custom {
             rows.push(other_row(app, &request, &theme));
@@ -453,7 +460,7 @@ fn option_row(
     theme: &Theme,
     index: usize,
     option: &opencode_schema::question_v1::QuestionV1Option,
-) -> Line<'static> {
+) -> Vec<Line<'static>> {
     let state = &app.ui.question;
     let active = index == state.selected;
     let multi = multiple(request, state.tab);
@@ -467,29 +474,39 @@ fn option_row(
     } else {
         option.label.clone()
     };
+    let mut lines = Vec::new();
     if picked && !multi {
         // The single-select picked row keeps its text color and gets a
         // trailing check (`question.tsx:363-399`).
-        return Line::from(vec![
+        lines.push(Line::from(vec![
             Span::styled(
                 format!("  {}. ", index + 1),
                 Style::new().fg(theme.text_muted.to_color()),
             ),
             Span::styled(label, Style::new().fg(theme.text.to_color())),
             Span::styled(" ✓", Style::new().fg(theme.success.to_color())),
-        ]);
+        ]));
+    } else {
+        lines.push(Line::from(Span::styled(
+            format!("  {}. {label}", index + 1),
+            Style::new().fg(if active {
+                theme.secondary
+            } else if picked {
+                theme.success
+            } else {
+                theme.text
+            }
+            .to_color()),
+        )));
     }
-    Line::from(Span::styled(
-        format!("  {}. {label}", index + 1),
-        Style::new().fg(if active {
-            theme.secondary
-        } else if picked {
-            theme.success
-        } else {
-            theme.text
-        }
-        .to_color()),
-    ))
+    // The muted description under the option (question.tsx:393-395).
+    if !option.description.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("      {}", option.description),
+            Style::new().fg(theme.text_muted.to_color()),
+        )));
+    }
+    lines
 }
 
 /// The "Type your own answer" row (`question.tsx:400-454`).

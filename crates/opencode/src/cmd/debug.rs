@@ -309,6 +309,7 @@ pub fn skill(ui: &mut Ui, instance: &Instance) {
                 .and_then(|skills| skills.paths.clone())
                 .unwrap_or_default(),
             directory: instance.directory.clone(),
+            worktree: instance.worktree.clone(),
             home: instance.paths.home.clone(),
         },
     );
@@ -558,6 +559,7 @@ fn tool_registry(
                         .and_then(|skills| skills.paths.clone())
                         .unwrap_or_default(),
                     directory: instance.directory.clone(),
+                    worktree: instance.worktree.clone(),
                     home: instance.paths.home.clone(),
                 },
             )),

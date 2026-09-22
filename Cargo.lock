@@ -2081,6 +2081,7 @@ dependencies = [
  "sha1",
  "tempfile",
  "tokio",
+ "unicode-width",
 ]
 
 [[package]]

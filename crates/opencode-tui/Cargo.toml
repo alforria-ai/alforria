@@ -17,6 +17,7 @@ serde_json = { workspace = true }
 sha1 = { workspace = true }
 hex = { workspace = true }
 ratatui = { workspace = true }
+unicode-width = { workspace = true }
 crossterm = { workspace = true }
 libc = { workspace = true }
 rand = { workspace = true }

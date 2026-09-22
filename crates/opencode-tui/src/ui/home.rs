@@ -2,7 +2,7 @@
 //! editor itself lands with M8.6; this renders the frame + placeholder.
 
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Widget};
 
@@ -144,27 +144,44 @@ fn render_prompt(app: &App, frame: &mut ratatui::Frame, theme: &Theme, area: Rec
         .min(area.width);
     let display = rows(app, area);
     let placeholder = display.rows.iter().all(|row| row.is_empty());
+    // `cursor.blinking` — the same block cursor as the session prompt.
+    let blink = (app.ui.tick_ms / 530).is_multiple_of(2);
+    let cursor = crate::ui::textarea::cursor_cell_style(theme);
     let mut lines: Vec<Line> = Vec::new();
     if placeholder {
-        lines.push(Line::from(Span::styled(
-            placeholder_text(app),
+        let mut spans: Vec<Span> = Vec::new();
+        let text = placeholder_text(app);
+        if blink {
+            spans.push(Span::styled(
+                text.chars().take(1).collect::<String>(),
+                cursor,
+            ));
+        } else {
+            spans.push(Span::styled(
+                text.chars().take(1).collect::<String>(),
+                theme.text_muted.to_color(),
+            ));
+        }
+        spans.push(Span::styled(
+            text.chars().skip(1).collect::<String>(),
             theme.text_muted.to_color(),
-        )));
+        ));
+        lines.push(Line::from(spans));
     } else {
         for (row, cells) in display.rows.iter().enumerate() {
             let mut spans: Vec<Span> = Vec::new();
             for (column, (char, _mark)) in cells.iter().enumerate() {
                 let mut style = Style::new().fg(theme.text.to_color());
-                if row == display.cursor_row && column == display.cursor_col {
-                    style = style.add_modifier(Modifier::REVERSED);
+                if blink && row == display.cursor_row && column == display.cursor_col {
+                    style = cursor;
                 }
                 spans.push(Span::styled(char.to_string(), style));
             }
-            if row == display.cursor_row && spans.is_empty() {
-                spans.push(Span::styled(
-                    " ",
-                    Style::new().add_modifier(Modifier::REVERSED),
-                ));
+            if blink && row == display.cursor_row && display.cursor_col >= cells.len() {
+                spans.push(Span::styled(" ", cursor));
+            }
+            if row == display.cursor_row && spans.is_empty() && blink {
+                spans.push(Span::styled(" ", cursor));
             }
             lines.push(Line::from(spans));
         }

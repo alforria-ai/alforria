@@ -102,12 +102,13 @@ fn tool_input(app: &App, request: &PermissionV1Request) -> Value {
         if let V1Part::Tool { call_id, state, .. } = part {
             if *call_id == tool.call_id {
                 return match state {
-                    opencode_schema::session_v1::V1ToolState::Pending { input, .. }
-                    | opencode_schema::session_v1::V1ToolState::Running { input, .. }
+                    // `Pending` has no input yet (permission.tsx:127).
+                    opencode_schema::session_v1::V1ToolState::Running { input, .. }
                     | opencode_schema::session_v1::V1ToolState::Completed { input, .. }
                     | opencode_schema::session_v1::V1ToolState::Error { input, .. } => {
                         Value::Object(input.clone())
                     }
+                    opencode_schema::session_v1::V1ToolState::Pending { .. } => Value::Null,
                 };
             }
         }
@@ -137,11 +138,33 @@ fn info(app: &App, request: &PermissionV1Request) -> (&'static str, String, Vec<
         "edit" => {
             let meta = Value::Object(request.metadata.clone());
             let filepath = string_of(&meta, "filepath");
-            (
-                "→",
-                format!("Edit {filepath}"),
-                vec![muted_line("  No diff provided".to_string())],
-            )
+            // `EditBody` (permission.tsx:22-88, 199-206) — render the
+            // diff via the same `<diff>` component as the transcript;
+            // the muted fallback only when it is empty.
+            let diff_content = Value::Object(request.metadata.clone())
+                .get("diff")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let lines = if diff_content.is_empty() {
+                vec![muted_line("  No diff provided".to_string())]
+            } else {
+                let style = if app.config.diff_style == "stacked" {
+                    crate::ui::diff::DiffStyle::Stacked
+                } else {
+                    crate::ui::diff::DiffStyle::Auto
+                };
+                let width = app.ui.terminal_width;
+                let view = crate::ui::diff::view_for(style, width);
+                crate::ui::diff::render(
+                    &diff_content,
+                    view,
+                    width.saturating_sub(4),
+                    crate::ui::diff::WrapMode::Word,
+                    &theme,
+                )
+            };
+            ("→", format!("Edit {filepath}"), lines)
         }
         "read" => {
             let path = string_of(&data, "filePath");
@@ -237,9 +260,15 @@ fn info(app: &App, request: &PermissionV1Request) -> (&'static str, String, Vec<
         }
         "websearch" => {
             let query = string_of(&data, "query");
+            // `webSearchProviderLabel` (util/tool-display.ts:1-5).
+            let label = match string_of(&data, "provider").as_str() {
+                "parallel" => "Parallel Web Search",
+                "exa" => "Exa Web Search",
+                _ => "Web Search",
+            };
             (
                 "◈",
-                format!("WebSearch \"{query}\""),
+                format!("{label} \"{query}\""),
                 if query.is_empty() {
                     Vec::new()
                 } else {
@@ -253,20 +282,31 @@ fn info(app: &App, request: &PermissionV1Request) -> (&'static str, String, Vec<
                 .iter()
                 .map(|pattern| format!("  - {pattern}"))
                 .collect();
-            let dir = request
-                .patterns
-                .first()
-                .map(|pattern| {
-                    if pattern.contains('*') {
-                        pattern
-                            .rsplit_once('/')
-                            .map(|(head, _)| head.to_string())
-                            .unwrap_or_default()
-                    } else {
-                        pattern.clone()
-                    }
-                })
+            // `parent ?? filepath ?? derived` (permission.tsx:333-341).
+            let meta = Value::Object(request.metadata.clone());
+            let dir = string_of(&meta, "parentDir")
+                .is_empty()
+                .then(|| string_of(&meta, "filepath"))
+                .filter(|filepath| !filepath.is_empty())
                 .unwrap_or_default();
+            let dir = if dir.is_empty() {
+                request
+                    .patterns
+                    .first()
+                    .map(|pattern| {
+                        if pattern.contains('*') {
+                            pattern
+                                .rsplit_once('/')
+                                .map(|(head, _)| head.to_string())
+                                .unwrap_or_default()
+                        } else {
+                            pattern.clone()
+                        }
+                    })
+                    .unwrap_or_default()
+            } else {
+                dir
+            };
             (
                 "←",
                 format!("Access external directory {dir}"),

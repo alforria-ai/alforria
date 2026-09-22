@@ -13,7 +13,7 @@ use crate::state::route::PromptMode;
 use crate::state::App;
 
 /// The autocomplete popup `maxHeight` (`autocomplete.tsx`).
-const AUTOCOMPLETE_HEIGHT: usize = 8;
+pub(crate) const AUTOCOMPLETE_HEIGHT: usize = 8;
 
 /// The inner textarea width: the frame pads left+right by 2.
 fn inner_width(area: Rect) -> u16 {
@@ -28,7 +28,8 @@ fn display(app: &App, area: Rect) -> crate::ui::textarea::Display {
 /// The rendered prompt row count: `paddingTop={1}` + the visible
 /// textarea rows + the meta row.
 pub fn height(app: &App, area: Rect, terminal_height: u16) -> u16 {
-    let max_height = crate::ui::textarea::Textarea::max_height(None, terminal_height);
+    let max_height =
+        crate::ui::textarea::Textarea::max_height(app.config.prompt_max_height, terminal_height);
     let rows = display(app, area).rows.len() as u16;
     let busy = status_row_visible(app) as u16;
     1 + rows.min(max_height) + 1 + busy
@@ -220,32 +221,54 @@ fn status_row(app: &App, theme: &Theme) -> Option<Line<'static>> {
 /// The prompt frame + textarea + meta row (`prompt/index.tsx:1352-1401`).
 pub fn render(app: &App, frame: &mut ratatui::Frame, theme: &Theme, area: Rect) {
     let display = display(app, area);
-    let max_height = crate::ui::textarea::Textarea::max_height(None, area.height.max(1));
+    let max_height =
+        crate::ui::textarea::Textarea::max_height(app.config.prompt_max_height, area.height.max(1));
     let rows: Vec<&Vec<(char, Option<u64>)>> =
         display.rows.iter().take(max_height as usize).collect();
     let text_empty = app.ui.prompt.is_empty();
+    // `cursor.blinking` (config/index.tsx:33-42) — the OpenTUI cursor
+    // blinks; the blink phase is driven by the render tick.
+    let blink = (app.ui.tick_ms / 530).is_multiple_of(2);
+    let cursor = crate::ui::textarea::cursor_cell_style(theme);
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::raw(""));
     if text_empty {
-        lines.push(Line::from(Span::styled(
-            placeholder_text(app),
+        let mut spans: Vec<Span> = Vec::new();
+        let placeholder = placeholder_text(app);
+        if blink {
+            // The block cursor sits over the first placeholder cell.
+            spans.push(Span::styled(
+                placeholder.chars().take(1).collect::<String>(),
+                cursor,
+            ));
+        } else {
+            spans.push(Span::styled(
+                placeholder.chars().take(1).collect::<String>(),
+                theme.text_muted.to_color(),
+            ));
+        }
+        spans.push(Span::styled(
+            placeholder.chars().skip(1).collect::<String>(),
             theme.text_muted.to_color(),
-        )));
+        ));
+        lines.push(Line::from(spans));
     } else {
         for (row, cells) in rows.iter().enumerate() {
             let mut spans: Vec<Span> = Vec::new();
             for (column, (char, _mark)) in cells.iter().enumerate() {
                 let mut style = Style::new().fg(theme.text.to_color());
-                if row == display.cursor_row && column == display.cursor_col {
-                    style = style.add_modifier(Modifier::REVERSED);
+                if blink && row == display.cursor_row && column == display.cursor_col {
+                    style = cursor;
                 }
                 spans.push(Span::styled(char.to_string(), style));
             }
-            if row == display.cursor_row && spans.is_empty() {
-                spans.push(Span::styled(
-                    " ",
-                    Style::new().add_modifier(Modifier::REVERSED),
-                ));
+            // The cursor one-past-the-last cell (its usual position
+            // while typing) — draw an explicit block cell.
+            if blink && row == display.cursor_row && display.cursor_col >= cells.len() {
+                spans.push(Span::styled(" ", cursor));
+            }
+            if row == display.cursor_row && spans.is_empty() && blink {
+                spans.push(Span::styled(" ", cursor));
             }
             lines.push(Line::from(spans));
         }
@@ -291,27 +314,33 @@ pub(crate) fn render_autocomplete(
     area: Rect,
 ) {
     let autocomplete = &app.ui.prompt.autocomplete;
+    let empty = autocomplete.options.is_empty();
     let count = autocomplete
         .options
         .len()
         .min(AUTOCOMPLETE_HEIGHT)
         .min(area.y as usize);
-    if count == 0 {
+    if count == 0 && !empty {
         return;
     }
+    // `options().length || 1` — the empty popup still occupies one row
+    // (`autocomplete.tsx:713, 730-735`).
+    let count = count.max(1);
     let popup = Rect {
         x: area.x + 1,
         y: area.y - count as u16,
         width: area.width.saturating_sub(1),
         height: count as u16,
     };
+    let scroll = autocomplete.scroll.min(autocomplete.options.len());
     let lines: Vec<Line> = autocomplete
         .options
         .iter()
+        .skip(scroll)
         .take(count)
         .enumerate()
         .map(|(index, option)| {
-            let selected = index == autocomplete.selected;
+            let selected = index + scroll == autocomplete.selected;
             let (fg, bg) = if selected {
                 (theme.text, theme.background_element)
             } else {
@@ -330,7 +359,73 @@ pub(crate) fn render_autocomplete(
             ))
         })
         .collect();
+    // The zero-match fallback row keeps the popup visible
+    // (`autocomplete.tsx:730-735`).
+    let lines = if empty {
+        vec![Line::from(Span::styled(
+            " No matching items",
+            Style::new().fg(theme.text_muted.to_color()),
+        ))]
+    } else {
+        lines
+    };
     Paragraph::new(lines).render(popup, frame.buffer_mut());
+}
+
+#[cfg(test)]
+mod caret_tests {
+    use super::*;
+    use crate::state::App;
+
+    fn app() -> App {
+        App::new(
+            crate::config::TuiConfig::default(),
+            Default::default(),
+            None,
+        )
+    }
+
+    fn theme() -> crate::ui::theme::Theme {
+        let app = app();
+        app.ui
+            .theme
+            .resolve(&app.state.kv)
+            .expect("builtin theme resolves")
+    }
+
+    #[test]
+    fn cursor_renders_at_end_of_row() {
+        // The cursor one-past-the-last cell — its usual position while
+        // typing — must draw an explicit block cell.
+        let mut app = app();
+        app.ui.prompt.textarea.set_text("hi");
+        app.ui.tick_ms = 0; // blink on
+        let t = theme();
+        let area = Rect::new(0, 0, 40, 5);
+        let backend = ratatui::backend::TestBackend::new(40, 5);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render(&app, frame, &t, area);
+            })
+            .unwrap();
+        // The block cursor cell — bg == theme.text.
+        let buffer = terminal.backend().buffer();
+        let ratatui::style::Color::Rgb(r, g, b) = t.text.to_color() else {
+            panic!("expected rgb theme text color");
+        };
+        assert!(
+            (0..5u16).any(|y| {
+                (0..40u16).any(|x| {
+                    matches!(
+                        buffer[(x, y)].bg,
+                        ratatui::style::Color::Rgb(r2, g2, b2) if r2 == r && g2 == g && b2 == b
+                    )
+                })
+            }),
+            "block cursor cell not rendered"
+        );
+    }
 }
 
 #[cfg(test)]

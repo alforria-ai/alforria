@@ -781,8 +781,16 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             }
         }
         Msg::Mouse(mouse) => match mouse.kind {
-            // TODO(M8.5), dialog-scroll and hover handling; the
-            // transcript wheel uses the config `scroll_speed`.
+            // TODO(M8.5), hover handling; the transcript wheel uses the
+            // config `scroll_speed`. Dialogs get the wheel first —
+            // the topmost dialog's scrollbox scrolls instead of the
+            // transcript (`dialog-select.tsx:610-616`).
+            crossterm::event::MouseEventKind::ScrollUp if !app.ui.dialogs.is_empty() => {
+                crate::ui::dialogs::wheel_scroll(app, -1);
+            }
+            crossterm::event::MouseEventKind::ScrollDown if !app.ui.dialogs.is_empty() => {
+                crate::ui::dialogs::wheel_scroll(app, 1);
+            }
             crossterm::event::MouseEventKind::ScrollUp => {
                 app.ui.session_scroll.scroll_by(-(scroll_speed(app) as i64));
             }

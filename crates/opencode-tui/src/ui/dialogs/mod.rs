@@ -190,6 +190,18 @@ pub fn open(app: &mut App, kind: PendingDialog) -> Vec<Effect> {
             // TODO(M8.7): the org list needs `experimental.console.listOrgs`
             // — absent from the M8.1 server seam (recorded gap).
         }
+        PendingDialog::SessionList => {
+            // Pre-select the current session (`ui/dialog-select.tsx:103-110`).
+            if let Some(current) = route_session_id(app) {
+                let options = crate::ui::dialogs::sessions::session_list_options(app, &frame);
+                if let Some(index) = options
+                    .iter()
+                    .position(|option| option.value.as_deref() == Some(current))
+                {
+                    frame.select.move_to(index);
+                }
+            }
+        }
         _ => {}
     }
     app.ui.dialogs.stack.push(frame);
@@ -634,7 +646,7 @@ fn select_key(app: &mut App, key: &crossterm::event::KeyEvent) -> Vec<Effect> {
     }
     // ---- `dialog.select.*` (`dialog-select.tsx:450-459`)
     let movement = if app.keymap.matches("dialog.select.prev", key) {
-        Some(-10i64)
+        Some(-1i64)
     } else if app.keymap.matches("dialog.select.next", key) {
         Some(1)
     } else if app.keymap.matches("dialog.select.page_up", key) {
@@ -713,6 +725,21 @@ fn select_key(app: &mut App, key: &crossterm::event::KeyEvent) -> Vec<Effect> {
 }
 
 /// The currently filtered option list of the top dialog.
+/// Mouse-wheel scroll of the topmost dialog's list (`dialog-select.tsx`
+/// wraps the options in a `<scrollbox>` — the wheel moves the viewport,
+/// not the selection; default speed 3, `util/scroll.ts:24-26`).
+pub fn wheel_scroll(app: &mut App, direction: i64) {
+    let len = filtered_options(app).len();
+    if len == 0 {
+        return;
+    }
+    if let Some(frame) = app.ui.dialogs.top_mut() {
+        let max = len.saturating_sub(1);
+        let next = frame.select.scroll as i64 + direction * 3;
+        frame.select.scroll = next.clamp(0, max as i64) as usize;
+    }
+}
+
 fn filtered_options(app: &App) -> Vec<primitives::SelectOption> {
     let Some(frame) = app.ui.dialogs.top() else {
         return Vec::new();
