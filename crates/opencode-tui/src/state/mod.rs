@@ -251,6 +251,22 @@ pub struct SessionScroll {
     /// `scroll.getChildren()` — (messageID, top row) per message, for
     /// the message-nav commands.
     pub children: Vec<(String, usize)>,
+    /// The last-rendered transcript area origin y (mouse hit-testing).
+    pub area_y: u16,
+    /// The last-rendered clickable part ranges (mouse hit-testing) —
+    /// `BlockTool`/`InlineTool`/`ReasoningPart` `onClick`
+    /// (`session/index.tsx:1822,1900,1609`).
+    pub clicks: Vec<ClickTarget>,
+}
+
+/// One clickable transcript part range (`BlockTool`/`InlineTool`/`ReasoningPart`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClickTarget {
+    pub id: String,
+    /// Inclusive start line (into the full transcript lines).
+    pub start: usize,
+    /// Exclusive end line.
+    pub end: usize,
 }
 
 impl SessionScroll {
@@ -290,6 +306,34 @@ impl SessionScroll {
     /// effect and the post-mount `scrollBy(100_000)`.
     pub fn snap_to_bottom(&mut self) {
         self.sticky = true;
+    }
+}
+
+/// BlockTool/InlineTool/ReasoningPart `onClick`
+/// (`session/index.tsx:1822,1900,1609`): toggle the expansion of the
+/// part whose rendered lines contain the clicked screen row. The
+/// non-applicable set toggle is a rendering no-op.
+fn transcript_click(app: &mut App, row: u16) {
+    let scroll = &app.ui.session_scroll;
+    if (row as usize) < scroll.area_y as usize {
+        return;
+    }
+    let line = (row - scroll.area_y) as usize + scroll.effective_y();
+    let Some(id) = scroll
+        .clicks
+        .iter()
+        .find(|target| target.start <= line && line < target.end)
+        .map(|target| target.id.clone())
+    else {
+        return;
+    };
+    toggle_set(&mut app.ui.expanded, &id);
+    toggle_set(&mut app.ui.expanded_errors, &id);
+}
+
+fn toggle_set(set: &mut HashSet<String>, id: &str) {
+    if !set.remove(id) {
+        set.insert(id.to_string());
     }
 }
 
@@ -614,6 +658,27 @@ pub struct App {
 }
 
 impl App {
+    /// The shared braille spinner (`component/spinner.tsx:10-24`),
+    /// driven by the render tick; `⋯` when animations are off.
+    pub fn session_spinner(&self) -> &'static str {
+        let animations = self
+            .state
+            .kv
+            .get_bool(crate::state::kv::keys::ANIMATIONS_ENABLED, true);
+        if animations {
+            let index = (self.ui.tick_ms / 80) as usize % crate::ui::SPINNER_FRAMES.len();
+            crate::ui::SPINNER_FRAMES[index]
+        } else {
+            "⋯"
+        }
+    }
+
+    /// The `creatingDots()` cycle (`move.tsx:190-196`): 1..3 dots,
+    /// one per second.
+    pub fn submitting_dots(&self) -> String {
+        ".".repeat((self.ui.tick_ms / 1000) as usize % 3 + 1)
+    }
+
     pub fn new(config: crate::config::TuiConfig, args: Args, state_dir: Option<&Path>) -> App {
         let keymap = Keymap::resolve(&config);
         let mut state = State::new(args, state_dir);
@@ -733,6 +798,14 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                     && !crate::ui::dialogs::hit_test(app, mouse.column, mouse.row) =>
             {
                 crate::ui::dialogs::pop(app);
+            }
+            // BlockTool/InlineTool/ReasoningPart onClick
+            // (`session/index.tsx:1822,1900,1609`): toggle the expansion
+            // of the part whose rendered lines contain the click.
+            crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left)
+                if app.ui.dialogs.is_empty() =>
+            {
+                transcript_click(app, mouse.row);
             }
             _ => {}
         },
@@ -908,6 +981,43 @@ mod tests {
             )),
         );
         assert!(!app.ui.exit);
+    }
+
+    #[test]
+    fn transcript_click_toggles_part_expansion() {
+        let mut app = App::new(crate::config::TuiConfig::default(), Args::default(), None);
+        app.ui.session_scroll.area_y = 0;
+        app.ui.session_scroll.y = 0;
+        app.ui.session_scroll.sticky = false;
+        app.ui.session_scroll.clicks = vec![ClickTarget {
+            id: "prt_1".to_string(),
+            start: 2,
+            end: 5,
+        }];
+        let up = || {
+            Msg::Mouse(crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                column: 0,
+                row: 3,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            })
+        };
+        update(&mut app, up());
+        assert!(app.ui.expanded.contains("prt_1"));
+        assert!(app.ui.expanded_errors.contains("prt_1"));
+        update(&mut app, up());
+        assert!(!app.ui.expanded.contains("prt_1"));
+        // A miss (outside every recorded part range) toggles nothing.
+        update(
+            &mut app,
+            Msg::Mouse(crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                column: 0,
+                row: 10,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            }),
+        );
+        assert!(!app.ui.expanded.contains("prt_1"));
     }
 
     #[test]

@@ -206,8 +206,12 @@ struct ToolCallDelta {
 struct Delta {
     #[serde(default)]
     content: Option<String>,
+    /// `reasoning_content ?? reasoning` (@ai-sdk/openai-compatible
+    /// index.mjs:717): OpenAI-compatible providers stream either field.
     #[serde(default)]
     reasoning_content: Option<String>,
+    #[serde(default)]
+    reasoning: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<ToolCallDelta>>,
 }
@@ -692,7 +696,12 @@ fn step(state: State, event: &serde_json::Value) -> Result<(State, Vec<LlmEvent>
     let mut lifecycle = state.lifecycle;
 
     if let Some(reasoning) = delta
-        .and_then(|delta| delta.reasoning_content.as_deref())
+        .and_then(|delta| {
+            delta
+                .reasoning_content
+                .as_deref()
+                .or(delta.reasoning.as_deref())
+        })
         .filter(|reasoning| !reasoning.is_empty())
     {
         lifecycle =
@@ -1414,6 +1423,33 @@ mod tests {
                 LlmEvent::TextDelta {
                     id: "text-0".to_string(),
                     text: "Hello".to_string(),
+                    provider_metadata: None,
+                },
+            ],
+        );
+        let _ = state;
+    }
+
+    /// `reasoning_content ?? reasoning` (@ai-sdk/openai-compatible
+    /// index.mjs:717): some providers stream the bare `reasoning` field.
+    #[test]
+    fn reasoning_field_falls_back_to_reasoning_content() {
+        let protocol = OpenAiChat;
+        let state = protocol.initial(&request());
+        let (state, events) = protocol
+            .step(state, &chunk(json!({"reasoning": "hmm"}), None))
+            .unwrap();
+        assert_eq!(
+            events,
+            vec![
+                LlmEvent::StepStart { index: 0.0 },
+                LlmEvent::ReasoningStart {
+                    id: "reasoning-0".to_string(),
+                    provider_metadata: None,
+                },
+                LlmEvent::ReasoningDelta {
+                    id: "reasoning-0".to_string(),
+                    text: "hmm".to_string(),
                     provider_metadata: None,
                 },
             ],

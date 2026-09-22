@@ -1485,6 +1485,40 @@ mod tests {
     }
 
     #[test]
+    fn bash_overflow_hint_flips_with_expanded() {
+        let mut app = app();
+        app.ui.expanded.insert("prt_1".to_string());
+        let theme = theme();
+        let ctx = Ctx::new(&app, &theme, "ses_a", 80);
+        let output = (1..=60)
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let part = tool_part(
+            "prt_1",
+            "bash",
+            V1ToolState::Completed {
+                input: json!({ "command": "seq 1 60" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                output: String::new(),
+                title: "seq 1 60".into(),
+                metadata: json!({ "output": output }).as_object().unwrap().clone(),
+                time: ToolStateCompletedTime {
+                    start: 0,
+                    end: 1,
+                    compacted: None,
+                },
+                attachments: None,
+            },
+        );
+        let text = plain(&render_part(&part, &ctx));
+        assert!(text.contains("Click to collapse"), "{text}");
+        assert!(text.contains("60"), "{text}");
+    }
+
+    #[test]
     fn bash_completed_renders_block() {
         let app = app();
         let theme = theme();

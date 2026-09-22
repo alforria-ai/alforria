@@ -149,6 +149,7 @@ pub fn render(
             .position(|message| message_id(message) == revert.message_id)
     });
 
+    let mut clicks = Vec::new();
     let (lines, children) = build_lines(
         app,
         theme,
@@ -158,6 +159,7 @@ pub fn render(
         revert.as_ref(),
         revert_index,
         pending,
+        &mut clicks,
     );
 
     super::memo_scroll(
@@ -167,6 +169,8 @@ pub fn render(
         area.height as usize,
         children,
     );
+    app.ui.session_scroll.clicks = clicks;
+    app.ui.session_scroll.area_y = area.y;
 
     let top = app.ui.session_scroll.effective_y();
     let visible: Vec<Line<'static>> = lines
@@ -188,6 +192,7 @@ fn build_lines(
     revert: Option<&opencode_schema::session_v1::V1SessionRevert>,
     revert_index: Option<usize>,
     pending: Option<usize>,
+    clicks: &mut Vec<crate::state::ClickTarget>,
 ) -> (Vec<Line<'static>>, Vec<(String, usize)>) {
     let ctx = Ctx::new(app, theme, session_id, content_width);
     let mut lines: Vec<Line<'static>> = Vec::new();
@@ -233,7 +238,9 @@ fn build_lines(
                 );
             }
             V1Message::Assistant { .. } => {
-                assistant_message_lines(app, &ctx, theme, messages, message, &parts, &mut lines);
+                assistant_message_lines(
+                    app, &ctx, theme, messages, message, &parts, &mut lines, clicks,
+                );
             }
         }
     }
@@ -447,6 +454,7 @@ fn user_message_lines(
 // ------------------------------------------------------------ assistant
 
 /// `AssistantMessage` (`session/index.tsx:1469-1576`).
+#[allow(clippy::too_many_arguments)]
 fn assistant_message_lines(
     app: &App,
     ctx: &Ctx,
@@ -455,6 +463,7 @@ fn assistant_message_lines(
     message: &V1Message,
     parts: &[V1Part],
     lines: &mut Vec<Line<'static>>,
+    clicks: &mut Vec<crate::state::ClickTarget>,
 ) {
     let V1Message::Assistant {
         agent,
@@ -472,7 +481,21 @@ fn assistant_message_lines(
     };
 
     for part in parts {
+        // The clickable part ranges (BlockTool/InlineTool/ReasoningPart
+        // onClick, session/index.tsx:1822,1900,1609).
+        let start = lines.len();
         lines.extend(parts::render_part(part, ctx));
+        let id = match part {
+            V1Part::Reasoning { id, .. } | V1Part::Tool { id, .. } => Some(id.clone()),
+            _ => None,
+        };
+        if let Some(id) = id {
+            clicks.push(crate::state::ClickTarget {
+                id,
+                start,
+                end: lines.len(),
+            });
+        }
     }
 
     // The subagent hint row (`:1509-1532`).

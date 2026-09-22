@@ -499,3 +499,52 @@ build→plan), model list, theme list, command palette, session list
 navigate/select, pin (ctrl+f) + quick switch (leader+1), bracketed paste,
 pageup/pagedown scrolling, terminal resize, and the exit paths
 (ctrl+c/ctrl+d on empty prompt, "exit" text + enter).
+
+## Round 6 — feedback & interactivity (user-reported: "no feedback",
+"Click to expand broken")
+
+Two user-reported bugs, plus a review sweep of the session view
+(spinner, interrupt feedback, retry row, toasts, submitting state,
+copy/undo/redo, subagent footer). Three root causes found and fixed:
+
+1. **No "Thinking" indicator** (reasoning models): the OpenAI-compatible
+   stream reader only read `delta.reasoning_content`, but LibertAI
+   streams `delta.reasoning` — every reasoning delta was dropped, so no
+   reasoning part ever existed. TS reads
+   `reasoning_content ?? reasoning` (`@ai-sdk/openai-compatible`
+   `dist/index.mjs:717`). Fixed in `openai_chat.rs` (`Delta.reasoning`
+   fallback); this also restores reasoning round-tripping into
+   subsequent turns.
+2. **"Click to expand" dead**: `app.ui.expanded` (and `expanded_errors`)
+   were read by every renderer but nothing ever wrote them — TS is
+   mouse-only via OpenTUI hit-testing. The transcript now records a
+   part-id → line-range map (`ClickTarget` in `SessionScroll`) and
+   `Msg::Mouse` `Up(Left)` hit-tests it, toggling both expansion sets
+   (the non-applicable toggle is a rendering no-op). Fixes tool output
+   expand/collapse, failed inline-tool error details, and "+ Thought"
+   reasoning expansion.
+3. **Zero feedback while busy**: TS shows a prompt bottom row
+   (`prompt/index.tsx:1515-1596`) with a spinner, the retry message +
+   countdown ("[retrying in Xs attempt #N]"), and
+   `esc interrupt` / `esc again to interrupt` — the port tracked the
+   double-press counter but never rendered any of it. Ported as a busy
+   row under the meta row (`status_row` in `ui/session/prompt.rs`,
+   prompt height +1 while visible). Also replaced the static
+   "sending…" submitting indicator with the TS
+   "Submitting prompt…" + animated dots (`move.tsx:174-196`).
+
+Review-sweep items confirmed at parity: spinner frames/interval,
+"· interrupted" meta suffix, error boxes, QUEUED tag, session-view
+toasts, timestamps toggle default, messages copy/undo/redo, and the
+subagent footer/hint row. Remaining known gap: the Task tool's
+click-to-child-session navigation (deferred — needs child-route
+navigation, not just expansion).
+
+**Verified live (pyte/pty probes, port 38095):** "Thinking" indicator
+during reasoning-model generation; `esc interrupt` busy row during
+generation; SGR mouse click on "Click to expand" expands overflowing
+tool output and click on "Click to collapse" restores it. Regression
+tests: `reasoning_field_falls_back_to_reasoning_content`,
+`transcript_click_toggles_part_expansion`,
+`busy_session_shows_interrupt_hint`, `retry_status_shows_message_and_attempt`,
+`idle_session_hides_interrupt_row`, `bash_overflow_hint_flips_with_expanded`.
