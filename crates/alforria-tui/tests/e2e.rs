@@ -304,6 +304,13 @@ async fn pump_until(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wire_e2e_bootstrap_prompt_stream_share_export() {
+    // `config.providers` returns only *connected* providers — without
+    // credentials in the environment the list is empty and bootstrap
+    // yields no providers (the dev machine's LIBERTAI_API_KEY must not
+    // be what makes this test pass). Pin a dummy key: this binary has a
+    // single test, so the process-global env mutation is contained.
+    std::env::set_var("LIBERTAI_API_KEY", "e2e-dummy-key");
+
     let server = spawn_server("Hello from the mock").await;
 
     let http_config = HttpClientConfig {
