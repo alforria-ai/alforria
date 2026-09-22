@@ -25,6 +25,10 @@ pub struct SelectOption {
     pub category: Option<String>,
     pub footer: Option<String>,
     pub gutter: Option<String>,
+    /// The foreground of the gutter cell — the status-coloured `●`/
+    /// `✓` markers (`dialog-workspace-list.tsx:49`,
+    /// `dialog-provider.tsx:144`).
+    pub gutter_fg: Option<crate::ui::theme::Rgba>,
     /// The `props.current` `●` marker (`dialog-select.tsx:747`).
     pub current: bool,
     /// The error background of the delete-confirm rows.
@@ -59,6 +63,10 @@ impl SelectOption {
 
     pub fn with_gutter(self, gutter: Option<String>) -> SelectOption {
         SelectOption { gutter, ..self }
+    }
+
+    pub fn with_gutter_fg(self, gutter_fg: Option<crate::ui::theme::Rgba>) -> SelectOption {
+        SelectOption { gutter_fg, ..self }
     }
 
     pub fn with_footer(self, footer: impl Into<String>) -> SelectOption {
@@ -186,6 +194,9 @@ pub struct SelectView {
     pub options: Vec<SelectOption>,
     /// The `actions`/`footerHints` — `(title, label)` pairs.
     pub actions: Vec<(String, String)>,
+    /// `actionFocused()` — a focused footer action mutes the option rows
+    /// (`dialog-select.tsx:637-654`).
+    pub action_focused: bool,
 }
 
 /// The shared header row: bold title left, muted hint right.
@@ -215,7 +226,13 @@ pub fn header_line(theme: &Theme, title: &str, hint: &str, width: u16) -> Line<'
 /// the gutter, title + description, footer right. The title column is
 /// fixed at 6 (`paddingLeft 3` + the leading pad), or `1 +` marker +
 /// gap + `3` when current/gutter.
-fn option_line(theme: &Theme, option: &SelectOption, active: bool, width: u16) -> Line<'static> {
+fn option_line(
+    theme: &Theme,
+    option: &SelectOption,
+    active: bool,
+    muted: bool,
+    width: u16,
+) -> Line<'static> {
     let selected_fg = super::super::theme::selected_foreground(theme, Some(theme.primary));
     let bg = if active {
         Some(if option.bg_error {
@@ -230,14 +247,16 @@ fn option_line(theme: &Theme, option: &SelectOption, active: bool, width: u16) -
         Some(bg) => style.bg(bg.to_color()),
         None => style,
     };
-    let text_fg = if active {
+    let text_fg = if muted && (active || option.current) {
+        theme.text_muted
+    } else if active {
         selected_fg
     } else if option.current {
         theme.primary
     } else {
         theme.text
     };
-    let muted_fg = if active {
+    let muted_fg = if active && !muted {
         selected_fg
     } else {
         theme.text_muted
@@ -255,17 +274,19 @@ fn option_line(theme: &Theme, option: &SelectOption, active: bool, width: u16) -
         spans.push(Span::styled(" ", with_bg(Style::new())));
         spans.push(Span::styled(
             gutter.clone(),
-            with_bg(Style::new().fg(text_fg.to_color())),
+            with_bg(Style::new().fg(option.gutter_fg.unwrap_or(text_fg).to_color())),
         ));
         spans.push(Span::styled("    ", with_bg(Style::new())));
     } else {
         spans.push(Span::styled("      ", with_bg(Style::new())));
     }
-    let title_style = Style::new().fg(text_fg.to_color()).add_modifier(if active {
-        ratatui::style::Modifier::BOLD
-    } else {
-        ratatui::style::Modifier::empty()
-    });
+    let title_style = Style::new()
+        .fg(text_fg.to_color())
+        .add_modifier(if active && !muted {
+            ratatui::style::Modifier::BOLD
+        } else {
+            ratatui::style::Modifier::empty()
+        });
     spans.push(Span::styled(option.title.clone(), with_bg(title_style)));
     if let Some(description) = &option.description {
         spans.push(Span::styled(
@@ -334,27 +355,51 @@ pub fn render_options(
             }
         }
         layout.push((lines.len(), index));
-        lines.push(option_line(theme, option, index == select.selected, width));
+        lines.push(option_line(
+            theme,
+            option,
+            index == select.selected,
+            view.action_focused,
+            width,
+        ));
     }
     layout
 }
 
-/// The footer action row (`dialog-select.tsx:717-728`): `title label`
-/// pairs with a muted label.
-pub fn render_actions(theme: &Theme, actions: &[(String, String)]) -> Line<'static> {
+/// The footer action row (`dialog-select.tsx:717-728`, `526-555`): the
+/// `title label` pairs, with the `focusedAction` highlighted.
+pub fn render_actions(
+    theme: &Theme,
+    actions: &[(String, String)],
+    focused: Option<usize>,
+) -> Line<'static> {
+    let selected_fg = super::super::theme::selected_foreground(theme, Some(theme.primary));
     let mut spans: Vec<Span<'static>> = Vec::new();
     spans.push(Span::raw("    "));
     for (index, (title, label)) in actions.iter().enumerate() {
         if index > 0 {
             spans.push(Span::raw("  "));
         }
-        spans.push(Span::styled(
-            title.clone(),
-            Style::new().fg(theme.text.to_color()),
-        ));
+        let active = focused == Some(index);
+        let (fg, mut style) = if active {
+            (
+                selected_fg,
+                Style::new()
+                    .bg(theme.primary.to_color())
+                    .add_modifier(ratatui::style::Modifier::BOLD),
+            )
+        } else {
+            (theme.text, Style::new())
+        };
+        style = style.fg(fg.to_color());
+        spans.push(Span::styled(title.clone(), style));
         spans.push(Span::styled(
             format!(" {label}"),
-            Style::new().fg(theme.text_muted.to_color()),
+            if active {
+                style
+            } else {
+                Style::new().fg(theme.text_muted.to_color())
+            },
         ));
     }
     Line::from(spans)
@@ -434,11 +479,13 @@ mod scroll_tests {
                     category: None,
                     footer: None,
                     gutter: None,
+                    gutter_fg: None,
                     current: false,
                     bg_error: false,
                 })
                 .collect(),
             actions: Vec::new(),
+            action_focused: false,
         };
         let mut select = SelectState::default();
         select.move_by(15, 20, 8);
@@ -471,6 +518,7 @@ mod scroll_tests {
                 SelectOption::new("c").with_value("c").with_category("Cat"),
             ],
             actions: Vec::new(),
+            action_focused: false,
         };
         let select = SelectState::default();
         let mut lines = Vec::new();

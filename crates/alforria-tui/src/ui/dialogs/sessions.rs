@@ -197,7 +197,11 @@ pub fn timeline_options(app: &App) -> Vec<SelectOption> {
                 continue;
             };
             options.push(
-                SelectOption::new(text.replace('\n', " ")).with_value(message_id.to_string()),
+                SelectOption::new(text.replace('\n', " "))
+                    .with_value(message_id.to_string())
+                    // `footer: Locale.time(message.time.created)`
+                    // (dialog-timeline.tsx:34).
+                    .with_footer(locale_time(message_created(message))),
             );
         }
     }
@@ -331,6 +335,79 @@ fn message_text(app: &App, message_id: &str) -> Option<String> {
     None
 }
 
+/// `getRelativeTime` (`dialog-stash.tsx:9-22`).
+fn relative_time(timestamp: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let diff = now.saturating_sub(timestamp);
+    let seconds = diff / 1000;
+    let minutes = seconds / 60;
+    let hours = minutes / 60;
+    let days = hours / 24;
+    if seconds < 60 {
+        "just now".to_string()
+    } else if minutes < 60 {
+        format!("{minutes}m ago")
+    } else if hours < 24 {
+        format!("{hours}h ago")
+    } else if days < 7 {
+        format!("{days}d ago")
+    } else {
+        locale_datetime(timestamp)
+    }
+}
+
+/// `Locale.time` (`util/locale.ts:7-10`) — `HH:MM`. The TS output is
+/// timezone/locale-dependent; this port renders UTC (same divergence as
+/// `ui::locale::today_time_or_date_time`).
+fn locale_time(ms: i64) -> String {
+    let rest = ms.max(0) as u64 % 86_400_000;
+    format!("{:02}:{:02}", rest / 3_600_000, (rest % 3_600_000) / 60_000)
+}
+
+/// `Locale.datetime` (`util/locale.ts:14-18`).
+fn locale_datetime(ms: u64) -> String {
+    let days = (ms / 86_400_000) as i64;
+    let rest = ms % 86_400_000;
+    let (year, month, day) = civil_from_days(days);
+    format!("{} · {month}/{day}/{year}", locale_time(rest as i64))
+}
+
+/// Days since the unix epoch → `(year, month, day)`.
+fn civil_from_days(days: i64) -> (i64, usize, usize) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as usize;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as usize;
+    let year = if month <= 2 { year + 1 } else { year };
+    (year, month, day)
+}
+
+/// `message.time.created` in unix milliseconds.
+fn message_created(message: &V1Message) -> i64 {
+    match message {
+        V1Message::User { time, .. } => time.created as i64,
+        V1Message::Assistant { time, .. } => time.created as i64,
+    }
+}
+
+/// `Locale.truncateLeft` (`util/locale.ts:66-69`).
+fn truncate_left(input: &str, len: usize) -> String {
+    if input.chars().count() <= len {
+        return input.to_string();
+    }
+    let keep = len.saturating_sub(1);
+    let suffix: String = input.chars().skip(input.chars().count() - keep).collect();
+    format!("…{suffix}")
+}
+
 /// `DialogStash.options` (`dialog-stash.tsx:30-52`) — most recent first.
 pub fn stash_options(app: &App, frame: &DialogFrame) -> Vec<SelectOption> {
     let stash = &app.ui.prompt.stash;
@@ -339,19 +416,25 @@ pub fn stash_options(app: &App, frame: &DialogFrame) -> Vec<SelectOption> {
         let first_line = entry.entry.input.split('\n').next().unwrap_or("").trim();
         let preview: String = first_line.chars().take(50).collect();
         let is_deleting = frame.pending_delete == Some(index.to_string());
-        options.push(
-            SelectOption::new(if is_deleting {
-                // `Press ${deleteHint()} again to confirm`
-                // (dialog-stash.tsx:35,45).
-                format!(
-                    "Press {} again to confirm",
-                    crate::ui::dialogs::key_hint(app, "stash_delete").unwrap_or_default()
-                )
-            } else {
-                preview
-            })
-            .with_value(index.to_string()),
-        );
+        let line_count = entry.entry.input.matches('\n').count() + 1;
+        let option = SelectOption::new(if is_deleting {
+            // `Press ${deleteHint()} again to confirm`
+            // (dialog-stash.tsx:35,45).
+            format!(
+                "Press {} again to confirm",
+                crate::ui::dialogs::key_hint(app, "stash_delete").unwrap_or_default()
+            )
+        } else {
+            preview
+        })
+        .with_value(index.to_string())
+        .with_description(relative_time(entry.timestamp));
+        let option = if line_count > 1 {
+            option.with_footer(format!("~{line_count} lines"))
+        } else {
+            option
+        };
+        options.push(option);
     }
     options
 }
@@ -409,24 +492,124 @@ pub fn stash_pop(app: &mut App, value: &str) {
     crate::ui::dialogs::clear(app);
 }
 
+/// The `directory` field of one `ProjectDirectories` row.
+fn directory_of(root: &Value) -> Option<&str> {
+    root.get("directory").and_then(Value::as_str)
+}
+
 /// `DialogMoveSession.options` (`dialog-move-session.tsx:93-186`) — the
 /// fetched project directories, current first.
-pub fn move_options(app: &App, _frame: &DialogFrame) -> Vec<SelectOption> {
+pub fn move_options(app: &App, frame: &DialogFrame) -> Vec<SelectOption> {
     let Some(directories) = app.ui.move_directories.as_ref() else {
         return vec![SelectOption::new("Loading project directories…")];
     };
     if directories.is_empty() {
         return vec![SelectOption::new("No project directories found")];
     }
-    directories
-        .iter()
-        .filter_map(|directory| {
-            let location = directory.get("directory").and_then(Value::as_str)?;
+    let home = app
+        .state
+        .project
+        .instance_path
+        .home
+        .clone()
+        .unwrap_or_default();
+    // `move.tsx:76-88` — the current session's directory, or the
+    // project instance directory.
+    let current = match &app.state.route.data {
+        Route::Session { session_id, .. } => app
+            .state
+            .sync
+            .session(session_id)
+            .map(|session| session.directory.clone()),
+        _ => None,
+    }
+    .or_else(|| app.state.project.instance_path.directory.clone());
+    // `Math.max(1, Math.min(116, dimensions().width - 2) - 12)`
+    // (`dialog-move-session.tsx:151`).
+    let title_width = (app
+        .ui
+        .terminal_width
+        .saturating_sub(2)
+        .min(116)
+        .saturating_sub(12))
+    .max(1);
+    let strategy = |root: &Value| {
+        root.get("strategy")
+            .is_some_and(|strategy| !strategy.is_null())
+    };
+    let mut roots: Vec<Value> = directories.clone();
+    if let Some(current) = current.clone() {
+        // `roots.unshift({ directory: current })` when missing
+        // (`dialog-move-session.tsx:118`).
+        if !roots
+            .iter()
+            .any(|root| directory_of(root) == Some(current.as_str()))
+        {
+            roots.push(serde_json::json!({ "directory": current }));
+        }
+    }
+    roots.sort_by(|a, b| {
+        if let Some(current) = current.as_deref() {
+            if directory_of(a) == Some(current) {
+                return std::cmp::Ordering::Less;
+            }
+            if directory_of(b) == Some(current) {
+                return std::cmp::Ordering::Greater;
+            }
+        }
+        let (a_strategy, b_strategy) = (strategy(a), strategy(b));
+        if a_strategy != b_strategy {
+            if a_strategy {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Less
+            }
+        } else if !a_strategy {
+            let (a_len, b_len) = (
+                directory_of(a).map(str::len).unwrap_or(0),
+                directory_of(b).map(str::len).unwrap_or(0),
+            );
+            a_len.cmp(&b_len)
+        } else {
+            std::cmp::Ordering::Equal
+        }
+    });
+    roots
+        .into_iter()
+        .filter_map(|root| {
+            let location = root.get("directory").and_then(Value::as_str)?;
             Some(
-                SelectOption::new(crate::ui::locale::abbreviate_home(location, ""))
-                    .with_value(location.to_string())
-                    .with_category("Other"),
+                SelectOption::new(truncate_left(
+                    // The `truncateTitle: "left"` row title
+                    // (`dialog-move-session.tsx:151-157`).
+                    &crate::ui::locale::abbreviate_home(location, &home),
+                    title_width as usize,
+                ))
+                .with_value(location.to_string())
+                .with_category(if Some(location) == current.as_deref() {
+                    "Current"
+                } else {
+                    "Other"
+                })
+                .with_current(Some(location) == current.as_deref())
+                .with_bg_error(frame.pending_delete.as_deref() == Some(location)),
             )
+        })
+        .map(|option| {
+            if option.bg_error {
+                // `Press ${deleteHint()} again to confirm`
+                // (`dialog-move-session.tsx:165-167`).
+                SelectOption {
+                    title: format!(
+                        "Press {} again to confirm",
+                        crate::ui::dialogs::key_hint(app, "dialog.move_session.delete")
+                            .unwrap_or_default()
+                    ),
+                    ..option
+                }
+            } else {
+                option
+            }
         })
         .collect()
 }

@@ -21,6 +21,7 @@ pub fn options(app: &App, frame: &crate::ui::dialogs::DialogFrame) -> Vec<Select
             .map(|command| {
                 SelectOption::new(command.title.clone())
                     .with_value(command.name.to_string())
+                    .with_category(command.category)
                     .with_footer(footer(command))
             })
             .collect::<Vec<_>>()

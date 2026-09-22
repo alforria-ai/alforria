@@ -8,6 +8,7 @@ use super::primitives::SelectOption;
 use crate::state::local::ModelRef;
 use crate::state::route::Route;
 use crate::state::{App, Effect};
+use crate::ui::theme::Theme;
 
 /// `sortModelOptions` (`dialog-model.tsx:178-197`) — free models sort
 /// last, then by release date desc, then title.
@@ -124,7 +125,7 @@ pub fn model_options(app: &App) -> Vec<SelectOption> {
         }
     }
 
-    let mut provider_options: Vec<SelectOption> = Vec::new();
+    let mut model_list: Vec<SelectOption> = Vec::new();
     let mut release: Vec<i64> = Vec::new();
     for provider in &app.state.sync.provider {
         let provider_id = provider
@@ -147,7 +148,7 @@ pub fn model_options(app: &App) -> Vec<SelectOption> {
                     continue;
                 }
             }
-            provider_options.push(if connected {
+            model_list.push(if connected {
                 model_option(provider, &model_id, &info, &favorites, current.as_deref())
                     .with_category(
                         provider
@@ -171,7 +172,22 @@ pub fn model_options(app: &App) -> Vec<SelectOption> {
             );
         }
     }
-    options.extend(sort_model_options(provider_options, release));
+    options.extend(sort_model_options(model_list, release));
+    // The `popularProviders` of the disconnected model dialog
+    // (`dialog-model.tsx:108-117,129`).
+    if !connected {
+        let theme = app
+            .ui
+            .theme
+            .resolve(&app.state.kv)
+            .expect("builtin theme resolves");
+        options.extend(
+            provider_options(app, &theme)
+                .into_iter()
+                .take(6)
+                .map(|option| option.with_category("Popular providers")),
+        );
+    }
     options
 }
 
@@ -239,24 +255,24 @@ pub fn agent_options(app: &App) -> Vec<SelectOption> {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
-            let description = agent
-                .get("description")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .unwrap_or_else(|| {
-                    if agent.get("mode").and_then(Value::as_str) == Some("primary") {
-                        "native".to_string()
-                    } else {
-                        String::new()
-                    }
-                });
+            // `item.native ? "native" : item.description`
+            // (`dialog-agent.tsx:15`).
+            let description = if agent.get("native").and_then(Value::as_bool) == Some(true) {
+                Some("native".to_string())
+            } else {
+                agent
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            };
             let option = SelectOption::new(name.clone())
                 .with_value(name.clone())
                 .with_current(current.as_deref() == Some(name.as_str()));
-            if description.is_empty() {
-                option
-            } else {
-                option.with_description(description)
+            match description {
+                Some(description) if !description.is_empty() => {
+                    option.with_description(description)
+                }
+                _ => option,
             }
         })
         .collect()
@@ -296,8 +312,10 @@ const PROVIDER_PRIORITY: &[(&str, i32)] = &[
 
 const CUSTOM_PROVIDER_OPTION_VALUE: &str = "__opencode_custom_provider__";
 
-/// `providerOptions` (`dialog-provider.tsx:51-118`).
-pub fn provider_options(app: &App) -> Vec<SelectOption> {
+/// `providerOptions` (`dialog-provider.tsx:51-118`) — plus the
+/// connected `✓` gutter and the console-managed org footer
+/// (`dialog-provider.tsx:135-144`).
+pub fn provider_options(app: &App, theme: &Theme) -> Vec<SelectOption> {
     let all = app
         .state
         .sync
@@ -306,6 +324,30 @@ pub fn provider_options(app: &App) -> Vec<SelectOption> {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    let connected_ids = app
+        .state
+        .sync
+        .provider_next
+        .get("connected")
+        .and_then(Value::as_array)
+        .map(|ids| ids.iter().filter_map(Value::as_str).collect::<Vec<&str>>())
+        .unwrap_or_default();
+    let console_managed = app
+        .state
+        .sync
+        .console_state
+        .get("consoleManagedProviders")
+        .and_then(Value::as_array)
+        .map(|ids| ids.iter().filter_map(Value::as_str).collect::<Vec<&str>>())
+        .unwrap_or_default();
+    let active_org = app
+        .state
+        .sync
+        .console_state
+        .get("activeOrgName")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let onboarded = crate::state::connected(app);
     let mut providers: Vec<Value> = all;
     providers.sort_by(|a, b| {
         let priority = |provider: &Value| {
@@ -367,6 +409,20 @@ pub fn provider_options(app: &App) -> Vec<SelectOption> {
         } else {
             "Providers"
         });
+        // `gutter: connected && onboarded() ? ✓ : undefined`
+        // (`dialog-provider.tsx:136,144`).
+        let option = if connected_ids.contains(&id.as_str()) && onboarded {
+            option
+                .with_gutter(Some("✓".to_string()))
+                .with_gutter_fg(Some(theme.success))
+        } else {
+            option
+        };
+        let option = if console_managed.contains(&id.as_str()) {
+            option.with_footer(active_org)
+        } else {
+            option
+        };
         let option = match description {
             Some(description) => option.with_description(description),
             None => option,
