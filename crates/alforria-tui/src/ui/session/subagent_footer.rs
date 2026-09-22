@@ -158,18 +158,28 @@ pub fn line(app: &App, theme: &Theme, session_id: &str) -> Line<'static> {
             theme.text_muted.to_color(),
         ));
     }
-    let right = format!(
-        "Parent {}   Prev {}   Next {}",
-        shortcut(app, "session_parent"),
-        shortcut(app, "session_child_cycle_reverse"),
-        shortcut(app, "session_child_cycle"),
-    );
+    let mut right: Vec<Span> = Vec::new();
+    for (label, keybind) in [
+        ("Parent", "session_parent"),
+        ("Prev", "session_child_cycle_reverse"),
+        ("Next", "session_child_cycle"),
+    ] {
+        if !right.is_empty() {
+            right.push(Span::raw("  "));
+        }
+        right.push(Span::styled(format!("{label} "), theme.text.to_color()));
+        right.push(Span::styled(
+            shortcut(app, keybind),
+            theme.text_muted.to_color(),
+        ));
+    }
     let left_len: usize = left.iter().map(|span| span.content.len()).sum();
+    let right_len: usize = right.iter().map(|span| span.content.len()).sum();
     let mut spans = left;
-    spans.push(Span::raw(" ".repeat(
-        right.len().saturating_sub(1).saturating_sub(left_len) + 1,
-    )));
-    spans.push(Span::styled(right, theme.text.to_color()));
+    spans.push(Span::raw(
+        " ".repeat(right_len.saturating_sub(1).saturating_sub(left_len) + 1),
+    ));
+    spans.extend(right);
     Line::from(spans)
 }
 

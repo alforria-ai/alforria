@@ -512,10 +512,10 @@ fn assistant_message_lines(
         .any(|part| matches!(part, V1Part::Tool { tool, state, .. } if tool == "task"));
     if has_task {
         lines.push(blank());
-        let mut spans = vec![styled(
-            command_shortcut(app, "session.child.first"),
-            theme.text,
-        )];
+        let mut spans = vec![
+            Span::raw("   "),
+            styled(command_shortcut(app, "session.child.first"), theme.text),
+        ];
         spans.push(styled(" view subagents", theme.text_muted));
         let running_foreground = parts.iter().any(|part| {
             matches!(part, V1Part::Tool { tool, state, .. }
@@ -539,6 +539,10 @@ fn assistant_message_lines(
     if let Some(error) = error {
         if !aborted {
             lines.push(blank());
+            lines.push(Line::from(Span::styled(
+                SPLIT_VERTICAL,
+                Style::new().fg(theme.error.to_color()),
+            )));
             let rows = parts::assistant_error_message(error);
             for row in rows.split('\n') {
                 lines.push(Line::from(vec![
@@ -585,14 +589,17 @@ fn assistant_message_lines(
     };
     if last || final_ || aborted {
         lines.push(blank());
-        let mut spans = vec![styled(
-            "▣ ",
-            if aborted {
-                theme.text_muted
-            } else {
-                ctx.agent_color(agent)
-            },
-        )];
+        let mut spans = vec![
+            Span::raw("   "),
+            styled(
+                "▣  ",
+                if aborted {
+                    theme.text_muted
+                } else {
+                    ctx.agent_color(agent)
+                },
+            ),
+        ];
         spans.push(styled(crate::ui::locale::titlecase(mode), theme.text));
         spans.push(styled(
             format!(" · {}", model_name(app, provider_id, model_id)),

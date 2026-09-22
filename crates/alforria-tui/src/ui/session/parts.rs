@@ -205,9 +205,11 @@ fn render_reasoning(part: &V1Part, ctx: &Ctx) -> Vec<Line<'static>> {
     }
 
     if !opaque && open && !body.is_empty() {
-        let body_lines = markdown::render(&body, ctx.width.saturating_sub(5), ctx.theme);
+        let indent: usize = if in_minimal { 5 } else { 3 };
+        let body_lines =
+            markdown::render(&body, ctx.width.saturating_sub(indent as u16), ctx.theme);
         lines.push(blank());
-        lines.extend(pad(body_lines, 5));
+        lines.extend(pad(body_lines, indent));
     }
     pad(lines, 3)
 }
@@ -437,16 +439,17 @@ fn block_tool(
     if let Some(title) = title {
         if spinner {
             lines.push(Line::from(vec![
-                Span::styled("   ", style(ctx.theme.text_muted)),
+                Span::styled("┃", style(ctx.theme.background)),
+                Span::raw("  "),
                 Span::styled(ctx.spin(), style(ctx.theme.text_muted)),
                 Span::raw(" "),
                 span(title.trim_start_matches("# "), ctx.theme.text_muted),
             ]));
         } else {
-            lines.push(Line::from(Span::styled(
-                format!("   {title}"),
-                style(ctx.theme.text_muted),
-            )));
+            lines.push(Line::from(vec![
+                Span::styled("┃", style(ctx.theme.background)),
+                span(format!("  {title}"), ctx.theme.text_muted),
+            ]));
         }
     }
     for mut line in children {
@@ -517,12 +520,16 @@ fn format_input_path(ctx: &Ctx, input: &serde_json::Map<String, Value>, key: &st
     locale::format_path(string_value(input.get(key)), &path_base(ctx), "")
 }
 
-fn workdir_title(input: &serde_json::Map<String, Value>) -> Option<String> {
+fn workdir_title(ctx: &Ctx, input: &serde_json::Map<String, Value>) -> Option<String> {
     let workdir = string_value(input.get("workdir"))?;
     if workdir.is_empty() || workdir == "." {
         return None;
     }
-    Some(format!("# Running in {workdir}"))
+    let formatted = locale::format_path(Some(workdir), &path_base(ctx), "");
+    if formatted == "." {
+        return None;
+    }
+    Some(format!("# Running in {formatted}"))
 }
 
 /// `Shell` (`session/index.tsx:2046-2103`).
@@ -585,7 +592,7 @@ fn shell(tool: &ToolParts, ctx: &Ctx) -> Vec<Line<'static>> {
             ctx.theme.text_muted,
         )));
     }
-    block_tool(ctx, tool, workdir_title(&tool.input), false, children)
+    block_tool(ctx, tool, workdir_title(ctx, &tool.input), false, children)
 }
 
 /// `stripAnsi` — CSI escape sequences are stripped from shell output.
