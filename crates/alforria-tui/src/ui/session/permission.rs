@@ -116,6 +116,17 @@ fn tool_input(app: &App, request: &PermissionV1Request) -> Value {
     Value::Null
 }
 
+/// `usePathFormatter()` (`context/path-format.tsx:26-40`) — paths
+/// render relative to the instance directory, home-abbreviated.
+fn format_path(app: &App, path: &str) -> String {
+    let instance = &app.state.project.instance_path;
+    crate::ui::locale::format_path(
+        Some(path),
+        &instance.directory.clone().unwrap_or_default(),
+        &instance.home.clone().unwrap_or_default(),
+    )
+}
+
 fn string_of(value: &Value, key: &str) -> String {
     value
         .get(key)
@@ -164,10 +175,10 @@ fn info(app: &App, request: &PermissionV1Request) -> (&'static str, String, Vec<
                     &theme,
                 )
             };
-            ("→", format!("Edit {filepath}"), lines)
+            ("→", format!("Edit {}", format_path(app, &filepath)), lines)
         }
         "read" => {
-            let path = string_of(&data, "filePath");
+            let path = format_path(app, &string_of(&data, "filePath"));
             (
                 "→",
                 format!("Read {path}"),
@@ -203,7 +214,7 @@ fn info(app: &App, request: &PermissionV1Request) -> (&'static str, String, Vec<
             )
         }
         "list" => {
-            let dir = string_of(&data, "path");
+            let dir = format_path(app, &string_of(&data, "path"));
             (
                 "→",
                 format!("List {dir}"),
@@ -309,7 +320,7 @@ fn info(app: &App, request: &PermissionV1Request) -> (&'static str, String, Vec<
             };
             (
                 "←",
-                format!("Access external directory {dir}"),
+                format!("Access external directory {}", format_path(app, &dir)),
                 if patterns.is_empty() {
                     Vec::new()
                 } else {
@@ -513,7 +524,10 @@ pub fn lines(app: &App) -> Vec<Line<'static>> {
     match state.stage {
         PermissionStage::Permission => {
             let (icon, title, body) = info(app, &request);
+            // The header wrapper pads the block by 1; the icon row adds
+            // its own `paddingLeft={2}` (`permission.tsx:386-397, 651`).
             rows.push(Line::from(vec![
+                Span::raw(" "),
                 Span::styled("△ ", Style::new().fg(theme.warning.to_color())),
                 Span::styled(
                     "Permission required".to_string(),
@@ -521,6 +535,7 @@ pub fn lines(app: &App) -> Vec<Line<'static>> {
                 ),
             ]));
             rows.push(Line::from(vec![
+                Span::raw("   "),
                 Span::styled(
                     format!("{icon} "),
                     Style::new().fg(theme.text_muted.to_color()),
@@ -529,8 +544,26 @@ pub fn lines(app: &App) -> Vec<Line<'static>> {
             ]));
             rows.extend(body);
             rows.push(option_row(state, &theme));
+            // The `permission.prompt.fullscreen` shortcut hint
+            // (`permission.tsx:698-702`).
+            let fullscreen_hint =
+                crate::keymap::bindings::keybind_for_command("permission.prompt.fullscreen")
+                    .and_then(|keybind| crate::ui::dialogs::key_hint(app, keybind))
+                    .unwrap_or_default();
             rows.push(Line::from(vec![
-                Span::styled("⇆ ", Style::new().fg(theme.text.to_color())),
+                Span::styled(
+                    format!("{fullscreen_hint} "),
+                    Style::new().fg(theme.text.to_color()),
+                ),
+                Span::styled(
+                    if app.ui.permission.expanded {
+                        "minimize"
+                    } else {
+                        "fullscreen"
+                    },
+                    Style::new().fg(theme.text_muted.to_color()),
+                ),
+                Span::styled("   ⇆ ", Style::new().fg(theme.text.to_color())),
                 Span::styled("select", Style::new().fg(theme.text_muted.to_color())),
                 Span::styled("   enter ", Style::new().fg(theme.text.to_color())),
                 Span::styled("confirm", Style::new().fg(theme.text_muted.to_color())),
@@ -557,6 +590,9 @@ pub fn lines(app: &App) -> Vec<Line<'static>> {
                     "  This will allow the following patterns until Alforria is restarted",
                     Style::new().fg(theme.text_muted.to_color()),
                 ));
+                // `gap={1}` between the heading and the pattern list
+                // (`permission.tsx:147`).
+                rows.push(Line::raw(""));
                 for pattern in &request.always {
                     rows.push(Line::styled(
                         format!("  - {pattern}"),
@@ -636,6 +672,10 @@ pub fn render(app: &App, frame: &mut ratatui::Frame, theme: &Theme, area: Rect) 
         .block(
             Block::new()
                 .borders(ratatui::widgets::Borders::LEFT)
+                .border_set(ratatui::symbols::border::Set {
+                    vertical_left: "┃",
+                    ..Default::default()
+                })
                 .border_style(border.to_color())
                 .style(Style::new().bg(theme.background_panel.to_color()))
                 .padding(Padding {

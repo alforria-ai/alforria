@@ -8,12 +8,44 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Padding, Paragraph, Widget};
 
-use super::super::theme::Theme;
+use super::super::theme::{Rgba, Theme};
 use crate::state::route::PromptMode;
 use crate::state::App;
 
 /// The autocomplete popup `maxHeight` (`autocomplete.tsx:712-716`).
 pub(crate) const AUTOCOMPLETE_HEIGHT: usize = 10;
+
+/// `SplitBorder.customBorderChars` (`ui/border.ts:15-21`).
+fn split_border_set() -> ratatui::symbols::border::Set<'static> {
+    ratatui::symbols::border::Set {
+        vertical_left: "┃",
+        vertical_right: "┃",
+        bottom_left: "╹",
+        ..Default::default()
+    }
+}
+
+/// `highlight()` (`prompt/index.tsx:1288-1293`): the border tint —
+/// `theme.primary` in shell mode, the current agent's colour otherwise
+/// (the `tint(theme.border, highlight(), agentMetaAlpha())` blend at
+/// full opacity).
+fn border_highlight(app: &App, theme: &Theme) -> Rgba {
+    if app.ui.prompt.mode == PromptMode::Shell {
+        return theme.primary;
+    }
+    let Some(agent) = app
+        .state
+        .local
+        .agent_current(&app.state.sync)
+        .and_then(|agent| agent.get("name").and_then(serde_json::Value::as_str))
+    else {
+        return theme.border;
+    };
+    match app.state.local.agent_color(agent, &app.state.sync) {
+        crate::state::local::AgentColor::Hex(hex) => Rgba::from_hex(&hex).unwrap_or(theme.border),
+        crate::state::local::AgentColor::Theme(key) => theme.get(&key).unwrap_or(theme.border),
+    }
+}
 
 /// The inner textarea width: the frame pads left+right by 2.
 fn inner_width(area: Rect) -> u16 {
@@ -26,13 +58,14 @@ fn display(app: &App, area: Rect) -> crate::ui::textarea::Display {
 }
 
 /// The rendered prompt row count: `paddingTop={1}` + the visible
-/// textarea rows + the meta row.
+/// textarea rows + the meta row + the 1-row bottom cap
+/// (`prompt/index.tsx:1487-1512`) + the busy row.
 pub fn height(app: &App, area: Rect, terminal_height: u16) -> u16 {
     let max_height =
         crate::ui::textarea::Textarea::max_height(app.config.prompt_max_height, terminal_height);
     let rows = display(app, area).rows.len() as u16;
     let busy = status_row_visible(app) as u16;
-    1 + rows.min(max_height) + 1 + busy
+    1 + rows.min(max_height) + 1 + 1 + busy
 }
 
 /// `placeholderText` (`prompt/index.tsx:1311-1319`).
@@ -335,16 +368,21 @@ pub fn render(app: &App, frame: &mut ratatui::Frame, theme: &Theme, area: Rect) 
         }
     }
     lines.push(meta_line(app, theme, area.width.saturating_sub(5)));
-    if let Some(row) = status_row(app, theme) {
-        lines.push(row);
-    }
 
+    // The bottom cap (`prompt/index.tsx:1487-1512`) and the busy row
+    // render below the frame, outside the left border.
+    let status = status_row(app, theme);
+    let bottom = 1 + u16::from(status.is_some());
+    let frame_height = area.height.saturating_sub(bottom);
+    if frame_height == 0 {
+        return;
+    }
     let mut text = ratatui::text::Text::from(lines);
-    if text.height() as u16 > area.height {
+    if text.height() as u16 > frame_height {
         text = ratatui::text::Text::from(
             text.lines
                 .into_iter()
-                .take(area.height as usize)
+                .take(frame_height as usize)
                 .collect::<Vec<Line>>(),
         );
     }
@@ -352,7 +390,8 @@ pub fn render(app: &App, frame: &mut ratatui::Frame, theme: &Theme, area: Rect) 
         .block(
             Block::new()
                 .borders(ratatui::widgets::Borders::LEFT)
-                .border_style(theme.border.to_color())
+                .border_set(split_border_set())
+                .border_style(border_highlight(app, theme).to_color())
                 .style(Style::new().bg(theme.background_element.to_color()))
                 .padding(Padding {
                     left: 2,
@@ -361,7 +400,42 @@ pub fn render(app: &App, frame: &mut ratatui::Frame, theme: &Theme, area: Rect) 
                     bottom: 0,
                 }),
         )
-        .render(area, frame.buffer_mut());
+        .render(
+            Rect {
+                height: frame_height,
+                ..area
+            },
+            frame.buffer_mut(),
+        );
+    let visible = theme.background_element.a != 0.0;
+    let cap = Line::from(vec![
+        Span::styled(
+            if visible { "╹" } else { " " },
+            Style::new().fg(border_highlight(app, theme).to_color()),
+        ),
+        Span::styled(
+            if visible { "▀" } else { " " }.repeat(area.width.saturating_sub(1) as usize),
+            Style::new().fg(theme.background_element.to_color()),
+        ),
+    ]);
+    Paragraph::new(cap).render(
+        Rect {
+            y: area.y + frame_height,
+            height: 1,
+            ..area
+        },
+        frame.buffer_mut(),
+    );
+    if let Some(row) = status {
+        Paragraph::new(row).render(
+            Rect {
+                y: area.y + frame_height + 1,
+                height: 1,
+                ..area
+            },
+            frame.buffer_mut(),
+        );
+    }
 
     if app.ui.prompt.autocomplete.visible.is_some() {
         render_autocomplete(app, frame, theme, area);
@@ -387,10 +461,13 @@ pub(crate) fn render_autocomplete(
     // `options().length || 1` — the empty popup still occupies one row
     // (`autocomplete.tsx:713, 730-735`).
     let count = count.max(1);
+    // `top={position().y - height()} left={position().x}
+    // width={position().width}` — the anchor spans the prompt area
+    // (`autocomplete.tsx:725-728`).
     let popup = Rect {
-        x: area.x + 1,
-        y: area.y - count as u16,
-        width: area.width.saturating_sub(1),
+        x: area.x,
+        y: area.y.saturating_sub(count as u16),
+        width: area.width,
         height: count as u16,
     };
     let scroll = autocomplete.scroll.min(autocomplete.options.len());
@@ -437,7 +514,15 @@ pub(crate) fn render_autocomplete(
     } else {
         lines
     };
-    Paragraph::new(lines).render(popup, frame.buffer_mut());
+    Paragraph::new(lines)
+        .block(
+            Block::new()
+                .borders(ratatui::widgets::Borders::LEFT | ratatui::widgets::Borders::RIGHT)
+                .border_set(split_border_set())
+                .border_style(theme.border.to_color())
+                .style(Style::new().bg(theme.background_menu.to_color())),
+        )
+        .render(popup, frame.buffer_mut());
 }
 
 #[cfg(test)]
