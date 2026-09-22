@@ -47,7 +47,11 @@ fn read_log(log: &Path) -> Vec<Value> {
 }
 
 fn temp() -> (tempfile::TempDir, PathBuf) {
-    let dir = tempfile::tempdir_in("/tmp/opencode").expect("tempdir");
+    // Mirror the app's scratch parent (`<tmp>/opencode`), creating it so the
+    // test does not depend on it already existing on the machine.
+    let parent = std::env::temp_dir().join("opencode");
+    std::fs::create_dir_all(&parent).expect("create opencode tmp parent");
+    let dir = tempfile::tempdir_in(&parent).expect("tempdir");
     std::fs::write(dir.path().join("a.rs"), "fn main() {}\nlet x = 1;\n").unwrap();
     let file = dir.path().join("a.rs");
     (dir, file)
