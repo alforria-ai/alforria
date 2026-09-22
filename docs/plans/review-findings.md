@@ -757,3 +757,9 @@ color from the conceal style).
 - Verified against the actual part text from the user's session
   (fetched from the db by part id) plus a live model-generated table
   (pyte grid-alignment probe).
+
+Follow-up: table cells rendered raw text — `**bold**` appeared
+literally inside cells. Cells now go through the inline markdown
+renderer (bold/italic/code/links) before wrapping and alignment, and
+column widths are measured on the marker-stripped rendered cells the
+way OpenTUI measures its text buffers.

@@ -334,18 +334,6 @@ fn cell_alignment(delimiter_cell: &str) -> Align {
     }
 }
 
-fn pad_cell(cell: &str, width: usize, align: Align) -> String {
-    let pad = width.saturating_sub(cell.chars().count());
-    match align {
-        Align::Left => format!("{cell}{}", " ".repeat(pad)),
-        Align::Right => format!("{}{cell}", " ".repeat(pad)),
-        Align::Center => {
-            let left = pad / 2;
-            format!("{}{cell}{}", " ".repeat(left), " ".repeat(pad - left))
-        }
-    }
-}
-
 /// `tableOptions={{ style: "grid" }}` — OpenTUI's single-line
 /// box-drawing borders around the fitted columns.
 fn render_table(rows: Vec<Vec<String>>, theme: &Theme, width: u16) -> Vec<Line<'static>> {
@@ -364,10 +352,30 @@ fn render_table(rows: Vec<Vec<String>>, theme: &Theme, width: u16) -> Vec<Line<'
         .filter(|(index, _)| *index != 1)
         .map(|(_, row)| row)
         .collect();
+    // The widths follow the rendered cells (marker-stripped), the
+    // way OpenTUI measures its text buffers.
+    let rendered: Vec<Vec<Vec<Span<'static>>>> = data
+        .iter()
+        .map(|row| {
+            (0..columns)
+                .map(|column| {
+                    inline_spans(
+                        row.get(column).map(String::as_str).unwrap_or(""),
+                        theme,
+                        Style::new(),
+                    )
+                })
+                .collect()
+        })
+        .collect();
     let mut widths = vec![0usize; columns];
-    for row in &data {
+    for row in &rendered {
         for (index, cell) in row.iter().enumerate() {
-            widths[index] = widths[index].max(cell.chars().count());
+            let width = cell
+                .iter()
+                .map(|span| span.content.chars().count())
+                .sum::<usize>();
+            widths[index] = widths[index].max(width);
         }
     }
     let total: usize = widths.iter().sum::<usize>() + columns * 3 + 1;
@@ -404,28 +412,43 @@ fn render_table(rows: Vec<Vec<String>>, theme: &Theme, width: u16) -> Vec<Line<'
         };
         // Cells wrap within their column (`computeColumnWidths` fits
         // the columns; the text buffers wrap the content).
-        let cells: Vec<Vec<String>> = (0..columns)
+        let cells: Vec<Vec<Vec<Span<'static>>>> = (0..columns)
             .map(|column| {
-                wrap_cell(
+                let spans = inline_spans(
                     row.get(column).map(String::as_str).unwrap_or(""),
-                    widths[column].max(1),
-                )
+                    theme,
+                    row_style,
+                );
+                wrap_spans(spans, widths[column].max(1) as u16)
+                    .into_iter()
+                    .map(|line| line.spans)
+                    .collect()
             })
             .collect();
         let height = cells.iter().map(|cell| cell.len()).max().unwrap_or(1);
         for line_index in 0..height {
             let mut spans: Vec<Span<'static>> = Vec::new();
             for column in 0..columns {
-                let cell = cells[column]
+                let cell_spans = cells[column]
                     .get(line_index)
-                    .map(String::as_str)
-                    .unwrap_or("");
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
                 spans.push(Span::styled("│", border));
                 spans.push(Span::styled(" ", row_style));
-                spans.push(Span::styled(
-                    pad_cell(cell, widths[column].max(1), alignments[column]),
-                    row_style,
-                ));
+                let cell_width = widths[column].max(1);
+                let used = cell_spans
+                    .iter()
+                    .map(|span| span.content.chars().count())
+                    .sum::<usize>();
+                let pad = cell_width.saturating_sub(used);
+                let (leading, trailing) = match alignments[column] {
+                    Align::Left => (0, pad),
+                    Align::Right => (pad, 0),
+                    Align::Center => (pad / 2, pad - pad / 2),
+                };
+                spans.push(Span::styled(" ".repeat(leading), row_style));
+                spans.extend(cell_spans.iter().cloned());
+                spans.push(Span::styled(" ".repeat(trailing), row_style));
                 spans.push(Span::styled(" ", row_style));
             }
             spans.push(Span::styled("│", border));
@@ -435,48 +458,6 @@ fn render_table(rows: Vec<Vec<String>>, theme: &Theme, width: u16) -> Vec<Line<'
     lines.push(rule('└', '┴', '┘'));
     lines
 }
-
-/// Word-wrap a cell within its column, hard-breaking words that do
-/// not fit.
-fn wrap_cell(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    let mut lines: Vec<String> = Vec::new();
-    let mut current = String::new();
-    for word in text.split(' ') {
-        let pieces = hard_break(word, width);
-        for (index, piece) in pieces.iter().enumerate() {
-            if index == 0 && !current.is_empty() {
-                if current.chars().count() + 1 + piece.chars().count() <= width {
-                    current.push(' ');
-                } else {
-                    lines.push(std::mem::take(&mut current));
-                }
-            } else if index > 0 && !current.is_empty() {
-                lines.push(std::mem::take(&mut current));
-            }
-            current.push_str(piece);
-        }
-    }
-    lines.push(current);
-    lines
-}
-
-fn hard_break(word: &str, width: usize) -> Vec<String> {
-    let mut pieces: Vec<String> = Vec::new();
-    let mut piece = String::new();
-    for char in word.chars() {
-        if piece.chars().count() >= width {
-            pieces.push(std::mem::take(&mut piece));
-        }
-        piece.push(char);
-    }
-    if !piece.is_empty() || pieces.is_empty() {
-        pieces.push(piece);
-    }
-    pieces
-}
-
-
 
 // ------------------------------------------------------------- inline
 
@@ -766,6 +747,18 @@ mod tests {
         // Without a following delimiter row it is not a table.
         let lines = lines_of("before\n\na | b\n\nafter", 40);
         assert_eq!(lines, vec!["before", "a | b", "after"]);
+    }
+
+    #[test]
+    fn table_cells_render_inline_markdown() {
+        let markdown = "| a | b |\n|---|---|\n| **bold** | `code` |";
+        let lines = lines_of(markdown, 40);
+        assert_eq!(lines[0], "┌──────┬──────┐");
+        assert_eq!(lines[3], "│ bold │ code │");
+        // The widths follow the marker-stripped cells, not the raw
+        // text (`**bold**` is 8 chars rendered as 4).
+        assert!(lines.iter().all(|row| !row.contains("**")));
+        assert!(lines.iter().all(|row| !row.contains("`")));
     }
 
     #[test]
