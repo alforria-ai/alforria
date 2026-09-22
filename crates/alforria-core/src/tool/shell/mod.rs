@@ -640,16 +640,25 @@ impl ShellSpawner for TokioSpawner {
             });
 
             let kill: KillFn = {
-                let exited = Arc::clone(&exited);
                 Arc::new(move |force_after: Duration| {
+                    #[cfg(unix)]
                     let exited = Arc::clone(&exited);
                     Box::pin(async move {
                         #[cfg(unix)]
-                        let (pgid, grace) = (pid as libc::pid_t, force_after);
-                        #[cfg(unix)]
-                        unsafe {
-                            libc::kill(-pgid, libc::SIGTERM)
-                        };
+                        {
+                            let pgid = pid as libc::pid_t;
+                            unsafe { libc::kill(-pgid, libc::SIGTERM) };
+                            let deadline = tokio::time::Instant::now() + force_after;
+                            while tokio::time::Instant::now() < deadline {
+                                if exited.load(AtomicOrdering::SeqCst) {
+                                    return;
+                                }
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                            }
+                            if !exited.load(AtomicOrdering::SeqCst) {
+                                unsafe { libc::kill(-pgid, libc::SIGKILL) };
+                            }
+                        }
                         #[cfg(not(unix))]
                         {
                             // No graceful signal on Windows: force-kill the
@@ -660,17 +669,6 @@ impl ShellSpawner for TokioSpawner {
                                 .stdout(std::process::Stdio::null())
                                 .stderr(std::process::Stdio::null())
                                 .status();
-                            return;
-                        }
-                        let deadline = tokio::time::Instant::now() + grace;
-                        while tokio::time::Instant::now() < deadline {
-                            if exited.load(AtomicOrdering::SeqCst) {
-                                return;
-                            }
-                            tokio::time::sleep(Duration::from_millis(50)).await;
-                        }
-                        if !exited.load(AtomicOrdering::SeqCst) {
-                            unsafe { libc::kill(-pgid, libc::SIGKILL) };
                         }
                     }) as BoxFuture<'static, ()>
                 })
