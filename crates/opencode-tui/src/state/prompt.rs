@@ -628,6 +628,9 @@ pub struct AutocompleteOption {
     pub agent: Option<String>,
     /// A server command name for `/` completions.
     pub command: Option<String>,
+    /// A TUI command name for `/` completions (dispatched on select,
+    /// `useCommandSlashes` → `keymap.dispatchCommand`).
+    pub tui_command: Option<&'static str>,
 }
 
 /// The model half of `prompt/autocomplete.tsx`.
@@ -1547,6 +1550,7 @@ fn rebuild_options(app: &mut App) {
                     description: None,
                     agent: None,
                     command: None,
+                    tui_command: Some(command.name),
                 });
             }
             for command in &app.state.sync.command {
@@ -1569,6 +1573,7 @@ fn rebuild_options(app: &mut App) {
                         .map(str::to_string),
                     agent: None,
                     command: Some(name.to_string()),
+                    tui_command: None,
                 });
             }
         }
@@ -1587,6 +1592,7 @@ fn rebuild_options(app: &mut App) {
                     description: None,
                     agent: Some(name.to_string()),
                     command: None,
+                    tui_command: None,
                 });
             }
         }
@@ -1650,28 +1656,31 @@ fn fuzzy_score(target: &str, search: &str) -> Option<f64> {
 
 /// The visible-keys interception while the autocomplete is open
 /// (`prompt/autocomplete.tsx:581-641`).
-pub fn autocomplete_key(app: &mut App, key: &crossterm::event::KeyEvent) -> bool {
+pub fn autocomplete_key(
+    app: &mut App,
+    key: &crossterm::event::KeyEvent,
+) -> (bool, Vec<crate::state::Effect>) {
     if !app.ui.prompt.autocomplete.visible() || !app.ui.prompt_focused {
-        return false;
+        return (false, Vec::new());
     }
     let matches = |keybind: &str| app.keymap.matches(keybind, key);
     if matches("prompt.autocomplete.prev") {
         app.ui.prompt.autocomplete.move_selection(-1);
-        return true;
+        return (true, Vec::new());
     }
     if matches("prompt.autocomplete.next") {
         app.ui.prompt.autocomplete.move_selection(1);
-        return true;
+        return (true, Vec::new());
     }
     if matches("prompt.autocomplete.hide") {
         hide_autocomplete(app);
-        return true;
+        return (true, Vec::new());
     }
     if matches("prompt.autocomplete.select") || matches("prompt.autocomplete.complete") {
-        select_autocomplete(app);
-        return true;
+        let effects = select_autocomplete(app);
+        return (true, effects);
     }
-    false
+    (false, Vec::new())
 }
 
 /// `hide()` (`autocomplete.tsx:650-661`) — for `/`, clear the slash
@@ -1691,7 +1700,7 @@ pub fn hide_autocomplete(app: &mut App) {
 }
 
 /// `select()` (`autocomplete.tsx:553-558` + `insertPart`).
-fn select_autocomplete(app: &mut App) {
+fn select_autocomplete(app: &mut App) -> Vec<crate::state::Effect> {
     let Some(option) = app
         .ui
         .prompt
@@ -1700,19 +1709,25 @@ fn select_autocomplete(app: &mut App) {
         .get(app.ui.prompt.autocomplete.selected)
         .cloned()
     else {
-        return;
+        return Vec::new();
     };
     hide_autocomplete(app);
+    if let Some(command) = option.tui_command {
+        // `useCommandSlashes` (`keymap.tsx:270-288`): the slash entry's
+        // `onSelect` dispatches the TUI command directly.
+        return crate::command::run(app, command);
+    }
     if let Some(command) = option.command {
         let text = format!("/{command} ");
         app.ui.prompt.textarea.set_text(&text);
         app.ui.prompt.parts.clear();
         app.ui.prompt.extmark_to_part.clear();
-        return;
+        return Vec::new();
     }
     if let Some(agent) = option.agent {
         insert_agent_part(app, &agent);
     }
+    Vec::new()
 }
 
 /// `insertPart` for agents (`autocomplete.tsx:172-240`).
@@ -1961,6 +1976,49 @@ pub fn text_input(app: &mut App, key: &crossterm::event::KeyEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slash_select_dispatches_tui_command() {
+        use crate::state::App;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut app = App::new(
+            crate::config::TuiConfig::default(),
+            crate::state::Args::default(),
+            None,
+        );
+        app.ui.prompt_focused = true;
+        // Type "/" — the autocomplete opens with the slash commands.
+        text_input(
+            &mut app,
+            &KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+        );
+        assert!(app.ui.prompt.autocomplete.visible.is_some());
+        assert!(app
+            .ui
+            .prompt
+            .autocomplete
+            .options
+            .iter()
+            .any(|option| option.tui_command.is_some()));
+        // Move to a known TUI command ("/models" → model.list).
+        while app
+            .ui
+            .prompt
+            .autocomplete
+            .options
+            .get(app.ui.prompt.autocomplete.selected)
+            .and_then(|option| option.tui_command)
+            != Some("model.list")
+        {
+            app.ui.prompt.autocomplete.move_selection(1);
+        }
+        // Enter selects and dispatches the command (`useCommandSlashes`).
+        let effects =
+            super::autocomplete_key(&mut app, &KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!app.ui.dialogs.is_empty(), "model.list dialog opened");
+        let _ = effects;
+    }
 
     #[test]
     fn expand_tracked_pasted_text_replaces_back_to_front() {

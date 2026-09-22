@@ -682,7 +682,8 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                 let commands = app.keymap.dispatch(&context, &key, app.ui.tick_ms);
                 // While the autocomplete is open it takes the keyboard
                 // (§5.2 escape priority).
-                let mut handled = prompt::autocomplete_key(app, &key);
+                let (mut handled, autocomplete_effects) = prompt::autocomplete_key(app, &key);
+                effects.extend(autocomplete_effects);
                 // TS dispatch evaluates every layer's `enabled()` gate before
                 // running handlers, then fires ALL enabled bindings
                 // (`keymap.tsx:229-232` + `app.tsx:975-985`) — snapshot the
