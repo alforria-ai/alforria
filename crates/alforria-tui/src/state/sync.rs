@@ -2012,6 +2012,9 @@ mod tests {
         async fn question_reject(&self, _loc: &Location, _request_id: &str) -> Result<bool> {
             Ok(true)
         }
+        async fn auth_set(&self, _loc: &Location, _provider_id: &str, _key: &str) -> Result<bool> {
+            Ok(true)
+        }
     }
 
     #[tokio::test]

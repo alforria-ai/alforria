@@ -273,7 +273,7 @@ pub fn options(app: &App, frame: &DialogFrame) -> Vec<primitives::SelectOption> 
         ),
         PendingDialog::WorkspaceSet => system::workspace_set_options(app),
         PendingDialog::Subagent { .. } => sessions::subagent_options(),
-        PendingDialog::ProviderCustomId => Vec::new(),
+        PendingDialog::ProviderCustomId | PendingDialog::ProviderApiKey { .. } => Vec::new(),
         PendingDialog::Tag | PendingDialog::ConsoleOrg => Vec::new(),
         _ => Vec::new(),
     }
@@ -368,9 +368,9 @@ pub fn handle_key(app: &mut App, key: &crossterm::event::KeyEvent) -> Vec<Effect
         return Vec::new();
     };
     match &kind {
-        PendingDialog::SessionRename { .. } | PendingDialog::ProviderCustomId => {
-            prompt_key(app, key)
-        }
+        PendingDialog::SessionRename { .. }
+        | PendingDialog::ProviderCustomId
+        | PendingDialog::ProviderApiKey { .. } => prompt_key(app, key),
         PendingDialog::ExportOptions => export_key(app, key),
         PendingDialog::Alert {
             exit_on_confirm, ..
@@ -525,6 +525,24 @@ fn prompt_confirm(app: &mut App, kind: PendingDialog, input: String) -> Vec<Effe
                 duration_ms: 5000,
             });
             open(app, PendingDialog::ProviderCustomId)
+        }
+        PendingDialog::ProviderApiKey { provider_id } => {
+            let key = input.trim();
+            if key.is_empty() {
+                app.show_toast(Toast {
+                    title: None,
+                    variant: ToastVariant::Error,
+                    message: "API key cannot be empty".to_string(),
+                    duration_ms: 5000,
+                });
+                let provider_id = provider_id.clone();
+                open(app, PendingDialog::ProviderApiKey { provider_id });
+                return Vec::new();
+            }
+            vec![Effect::AuthSet {
+                provider_id,
+                key: key.to_string(),
+            }]
         }
         _ => Vec::new(),
     }
@@ -857,6 +875,7 @@ fn is_select_kind(kind: &PendingDialog) -> bool {
             | PendingDialog::Alert { .. }
             | PendingDialog::SessionRename { .. }
             | PendingDialog::ProviderCustomId
+            | PendingDialog::ProviderApiKey { .. }
             | PendingDialog::UpdateAvailable { .. }
             | PendingDialog::ShareConsent { .. }
             | PendingDialog::WorkspaceUnavailable
@@ -1367,10 +1386,12 @@ fn submit(app: &mut App, kind: &PendingDialog) -> Vec<Effect> {
                 PendingDialog::ProviderAuthMethod { provider_id: value },
             );
         }
-        PendingDialog::ProviderAuthMethod { .. } => {
-            // TODO(M8.7): the oauth/api-key submission needs
-            // `provider.oauth.authorize` + credential endpoints — absent
-            // from the M8.1 server seam (recorded gap).
+        PendingDialog::ProviderAuthMethod { provider_id } => {
+            // `method.type === "api"` (`dialog-provider.tsx:209-217`) — the
+            // api-key prompt. OAuth methods need the plugin-hook authorize
+            // flow (`provider.oauth.authorize`), still a recorded seam gap.
+            let provider_id = provider_id.clone();
+            return open(app, PendingDialog::ProviderApiKey { provider_id });
         }
         PendingDialog::Subagent { session_id } => {
             let session_id = session_id.clone();
@@ -1574,11 +1595,13 @@ fn content_lines(app: &App, dialog: &DialogFrame, theme: &Theme) -> Vec<Line<'st
             lines.push(ok_button(theme, width));
             lines
         }
-        PendingDialog::SessionRename { .. } | PendingDialog::ProviderCustomId => {
-            let title = if matches!(dialog.kind, PendingDialog::SessionRename { .. }) {
-                "Rename Session"
-            } else {
-                "Other"
+        PendingDialog::SessionRename { .. }
+        | PendingDialog::ProviderCustomId
+        | PendingDialog::ProviderApiKey { .. } => {
+            let title = match dialog.kind {
+                PendingDialog::SessionRename { .. } => "Rename Session",
+                PendingDialog::ProviderApiKey { .. } => "API key",
+                _ => "Other",
             };
             vec![
                 primitives::header_line(theme, title, "esc", width),

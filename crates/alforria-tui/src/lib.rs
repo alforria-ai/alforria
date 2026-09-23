@@ -539,6 +539,31 @@ pub async fn execute_effect(
                 });
             }
         }
+        Effect::AuthSet { provider_id, key } => {
+            let result = api.auth_set(&Location::default(), &provider_id, &key).await;
+            {
+                let mut app = app.lock().await;
+                app.show_toast(match result {
+                    Ok(_) => Toast {
+                        title: None,
+                        variant: ToastVariant::Success,
+                        message: format!("Saved credential for {provider_id}"),
+                        duration_ms: 5000,
+                    },
+                    Err(error) => Toast {
+                        title: None,
+                        variant: ToastVariant::Error,
+                        message: format!("{error:#}"),
+                        duration_ms: 5000,
+                    },
+                });
+            }
+            // `instance.dispose()` + `sync.bootstrap()`
+            // (`dialog-provider.tsx:406-407`) — the connected-provider
+            // state is credential-derived. Box::pin: the recursive async
+            // call needs indirection.
+            Box::pin(execute_effect(app, api, Effect::Bootstrap { fatal: false })).await;
+        }
         Effect::SessionDelete { session_id } => {
             let error = api
                 .session_delete(&Location::default(), &session_id)
@@ -1288,6 +1313,9 @@ mod tests {
             unreachable!("not under test")
         }
         async fn question_reject(&self, _loc: &Location, _request_id: &str) -> Result<bool> {
+            unreachable!("not under test")
+        }
+        async fn auth_set(&self, _loc: &Location, _provider_id: &str, _key: &str) -> Result<bool> {
             unreachable!("not under test")
         }
     }

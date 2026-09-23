@@ -157,9 +157,15 @@ pub enum PendingDialog {
     /// The `Other` → custom provider id prompt
     /// (`dialog-provider.tsx:129-141`).
     ProviderCustomId,
-    /// `Select auth method` (`dialog-provider.tsx:166-175`) — the
-    /// oauth/credential submission is a recorded seam gap.
+    /// `Select auth method` (`dialog-provider.tsx:166-175`); the "api"
+    /// method continues into [`PendingDialog::ProviderApiKey`].
     ProviderAuthMethod {
+        provider_id: String,
+    },
+    /// The "api" auth-method prompt (`ApiMethod`,
+    /// `dialog-provider.tsx:209-217`) — the entered key is stored through
+    /// `auth.set`.
+    ProviderApiKey {
         provider_id: String,
     },
     /// `DialogConfirm.show` on `installation.update-available`
@@ -609,6 +615,9 @@ pub enum Effect {
     QuestionReject { request_id: String },
     /// `session.update` title (`DialogSessionRename`).
     SessionRename { session_id: String, title: String },
+    /// `auth.set` (`dialog-provider.tsx:405-412`) — store the entered API
+    /// key for the provider, then re-bootstrap.
+    AuthSet { provider_id: String, key: String },
     /// `session.delete` (`dialog-session-list.tsx:248-262`).
     SessionDelete { session_id: String },
     /// `local.mcp.toggle(name)` + `mcp.status` refresh

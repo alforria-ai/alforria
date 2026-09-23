@@ -327,6 +327,7 @@ pub trait ServerApi: Send + Sync {
         answers: Vec<QuestionV1Answer>,
     ) -> Result<bool>;
     async fn question_reject(&self, loc: &Location, request_id: &str) -> Result<bool>;
+    async fn auth_set(&self, loc: &Location, provider_id: &str, key: &str) -> Result<bool>;
 }
 
 /// reqwest production impl of [`ServerApi`].
@@ -832,6 +833,21 @@ impl ServerApi for HttpServerApi {
     async fn question_reject(&self, loc: &Location, request_id: &str) -> Result<bool> {
         self.post(&format!("/question/{request_id}/reject"), loc, None)
             .await
+    }
+
+    async fn auth_set(&self, loc: &Location, provider_id: &str, key: &str) -> Result<bool> {
+        let body = json!({ "type": "api", "key": key });
+        self.request(
+            Method::PUT,
+            &format!("/auth/{provider_id}"),
+            loc,
+            &[],
+            Some(body),
+        )
+        .await?
+        .json()
+        .await
+        .context("auth set response body read failed")
     }
 }
 

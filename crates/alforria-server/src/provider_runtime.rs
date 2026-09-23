@@ -246,9 +246,21 @@ impl RuntimeModels {
                 }
             }
         }
-        if !options.contains_key("apiKey") {
+        // Deviation from provider.ts:1781 (`options["apiKey"] === undefined
+        // && provider.key`): an empty apiKey — e.g. an `{env:VAR}` config
+        // substitution with the variable unset — also falls back to the
+        // auth.json credential. TS would hand the empty string to the SDK
+        // and fail the request with an opaque 401; an empty key can never
+        // authenticate, so the stored credential wins.
+        let api_key_empty = options
+            .get("apiKey")
+            .map(|value| value.as_str().unwrap_or_default().is_empty())
+            .unwrap_or(true);
+        if api_key_empty {
             if let Some(key) = provider["key"].as_str() {
-                options.insert("apiKey".to_string(), json!(key));
+                if !key.is_empty() {
+                    options.insert("apiKey".to_string(), json!(key));
+                }
             }
         }
         let url = options
@@ -961,5 +973,27 @@ mod tests {
             "https://api.example.com/${MISSING_OPencode_VAR}/v1"
         );
         std::env::remove_var("OPencode_RUNTIME_TEST");
+    }
+
+    #[test]
+    fn llm_options_api_key_fallback() {
+        // Empty-string apiKey (an `{env:UNSET}` substitution) falls back to
+        // the stored provider key; a present key always wins.
+        let provider = json!({
+            "key": "stored-key",
+            "options": {"apiKey": "", "baseURL": "https://api.example"},
+            "models": {},
+        });
+        let options = RuntimeModels::llm_options(&provider, &json!({}));
+        assert_eq!(options["apiKey"], json!("stored-key"));
+
+        let provider = json!({"key": "stored-key", "options": {"apiKey": "config-key"}});
+        let options = RuntimeModels::llm_options(&provider, &json!({}));
+        assert_eq!(options["apiKey"], json!("config-key"));
+
+        // No options at all — the stored credential applies (provider.ts:1781).
+        let provider = json!({"key": "stored-key"});
+        let options = RuntimeModels::llm_options(&provider, &json!({}));
+        assert_eq!(options["apiKey"], json!("stored-key"));
     }
 }

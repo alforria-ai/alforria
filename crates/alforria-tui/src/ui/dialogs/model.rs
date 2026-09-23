@@ -440,9 +440,11 @@ pub fn provider_options(app: &App, theme: &Theme) -> Vec<SelectOption> {
     options
 }
 
-/// `Select auth method` (`dialog-provider.tsx:166-175`). The
-/// oauth/credential submission is a recorded seam gap — the list is
-/// informational.
+/// `Select auth method` (`dialog-provider.tsx:166-175`). OAuth methods
+/// need the plugin-hook authorize flow (`provider.oauth.authorize`) —
+/// still a recorded seam gap; the "api" method continues into the
+/// [`PendingDialog::ProviderApiKey`](crate::state::PendingDialog::ProviderApiKey)
+/// prompt.
 pub fn auth_method_options(app: &App, provider_id: &str) -> Vec<SelectOption> {
     let methods = app
         .state
