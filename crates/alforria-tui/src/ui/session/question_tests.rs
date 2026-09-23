@@ -226,3 +226,98 @@ fn visible_requests_surface_on_the_parent() {
         Some("que_1".into())
     );
 }
+
+#[test]
+fn multi_question_custom_answer_advances_to_the_next_tab() {
+    // `pick(text, true)` (`question.tsx:187-188`): a custom answer on a
+    // multi-question request advances like any other pick — it must not
+    // reply early with the other questions unanswered.
+    let mut app = app_with_request(vec![
+        info("first", &["A1", "A2"], false, true),
+        info("second", &["B1", "B2"], false, false),
+    ]);
+    press(&mut app, KeyCode::Down); // The "Other" row.
+    press(&mut app, KeyCode::Down);
+    let effects = question_replies(enter(&mut app));
+    assert!(effects.is_empty(), "{effects:?}");
+    assert!(app.ui.question.editing);
+    for char in "custom one".chars() {
+        press(&mut app, KeyCode::Char(char));
+    }
+    let effects = question_replies(enter(&mut app));
+    assert!(effects.is_empty(), "{effects:?}");
+    assert!(!app.ui.question.editing);
+    assert_eq!(app.ui.question.tab, 1, "custom answer advances the tab");
+    assert_eq!(app.ui.question.custom[0], "custom one");
+    // Answer question 1, land on confirm, submit both.
+    let effects = question_replies(enter(&mut app));
+    assert!(effects.is_empty(), "{effects:?}");
+    let effects = question_replies(enter(&mut app));
+    assert_eq!(
+        effects,
+        vec![Effect::QuestionReply {
+            request_id: "que_1".into(),
+            answers: vec![vec!["custom one".into()], vec!["B1".into()]],
+        }]
+    );
+}
+
+#[test]
+fn ctrl_c_clears_the_editing_input_then_leaves_editing() {
+    // `prompt.clear` on the question textarea (`question.tsx:126-137`).
+    let mut app = app_with_request(vec![info("plan", &["Option A"], false, true)]);
+    press(&mut app, KeyCode::Down); // The "Other" row.
+    enter(&mut app);
+    assert!(app.ui.question.editing);
+    for char in "draft".chars() {
+        press(&mut app, KeyCode::Char(char));
+    }
+    press(&mut app, KeyCode::Char('c'));
+    assert!(app.ui.question.editing, "plain c still types a char");
+    let ctrl_c_first = crate::state::Msg::Key(crossterm::event::KeyEvent::new(
+        KeyCode::Char('c'),
+        KeyModifiers::CONTROL,
+    ));
+    let ctrl_c_second = crate::state::Msg::Key(crossterm::event::KeyEvent::new(
+        KeyCode::Char('c'),
+        KeyModifiers::CONTROL,
+    ));
+    update(&mut app, ctrl_c_first);
+    assert!(
+        app.ui.question.editing,
+        "first ctrl+c only clears the draft"
+    );
+    assert!(app.ui.question.input.is_empty());
+    update(&mut app, ctrl_c_second);
+    assert!(!app.ui.question.editing, "second ctrl+c leaves editing");
+}
+
+#[test]
+fn editing_renders_the_input_line_below_the_row() {
+    // The editing textarea below the wildcard row (`question.tsx:427-448`)
+    // is the only visible cue that editing started.
+    let mut app = app_with_request(vec![info("plan", &["Option A"], false, true)]);
+    press(&mut app, KeyCode::Down); // The "Other" row.
+    enter(&mut app);
+    assert!(app.ui.question.editing);
+    let rows = question::lines(&app);
+    let placeholder = rows
+        .iter()
+        .map(|line| line.to_string())
+        .find(|line| line.starts_with("     Type your own answer"))
+        .unwrap_or_default();
+    assert_eq!(
+        placeholder, "     Type your own answer",
+        "indented placeholder row"
+    );
+    for char in "hello".chars() {
+        press(&mut app, KeyCode::Char(char));
+    }
+    let rows = question::lines(&app);
+    let typed = rows
+        .iter()
+        .map(|line| line.to_string())
+        .find(|line| line.starts_with("     hello"))
+        .unwrap_or_default();
+    assert_eq!(typed, "     hello", "indented input row");
+}

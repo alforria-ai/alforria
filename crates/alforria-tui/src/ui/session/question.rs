@@ -136,18 +136,30 @@ fn reply_effect(request: &QuestionV1Request, answers: Vec<QuestionV1Answer>) -> 
 pub fn handle_key(app: &mut App, key: &crossterm::event::KeyEvent) -> Option<Vec<Effect>> {
     let request = visible(app)?;
     let kind = key.code;
-    let state = &mut app.ui.question;
     let tab_count = tabs(&request);
-    let editing = state.editing;
 
-    if editing && !confirm_tab(&request, state) {
+    if app.ui.question.editing && !confirm_tab(&request, &app.ui.question) {
         if kind == crossterm::event::KeyCode::Esc {
-            state.editing = false;
+            app.ui.question.editing = false;
+            return Some(Vec::new());
+        }
+        // `prompt.clear` on the question textarea: clear the draft, or
+        // leave editing when already empty (`question.tsx:126-137`).
+        if kind == crossterm::event::KeyCode::Char('c')
+            && key
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL)
+        {
+            if app.ui.question.input.is_empty() {
+                app.ui.question.editing = false;
+            } else {
+                app.ui.question.input.clear();
+            }
             return Some(Vec::new());
         }
         match kind {
             crossterm::event::KeyCode::Backspace => {
-                state.input.pop();
+                app.ui.question.input.pop();
             }
             // Never insert control-modified chars — ctrl+c clears the
             // editing input (`prompt.clear`), it must not type a `c`.
@@ -157,47 +169,48 @@ pub fn handle_key(app: &mut App, key: &crossterm::event::KeyEvent) -> Option<Vec
                         .modifiers
                         .contains(crossterm::event::KeyModifiers::CONTROL) =>
             {
-                state.input.push(char)
+                app.ui.question.input.push(char)
             }
             _ => {}
         }
         if kind != crossterm::event::KeyCode::Enter {
             return Some(Vec::new());
         }
-        let tab = state.tab;
+        let tab = app.ui.question.tab;
         let multi = multiple(&request, tab);
-        let text = state.input.trim().to_string();
-        let prev = state.custom[tab].clone();
+        let text = app.ui.question.input.trim().to_string();
+        let prev = app.ui.question.custom[tab].clone();
         if text.is_empty() {
             if !prev.is_empty() {
-                state.custom[tab] = String::new();
-                state.answers[tab].retain(|answer| *answer != prev);
+                app.ui.question.custom[tab] = String::new();
+                app.ui.question.answers[tab].retain(|answer| *answer != prev);
             }
-            state.editing = false;
+            app.ui.question.editing = false;
             return Some(Vec::new());
         }
         if multi {
-            state.custom[tab] = text.clone();
-            state.answers[tab].retain(|answer| *answer != prev);
-            if !state.answers[tab].contains(&text) {
-                state.answers[tab].push(text);
+            app.ui.question.custom[tab] = text.clone();
+            app.ui.question.answers[tab].retain(|answer| *answer != prev);
+            if !app.ui.question.answers[tab].contains(&text) {
+                app.ui.question.answers[tab].push(text);
             }
-            state.editing = false;
+            app.ui.question.editing = false;
             return Some(Vec::new());
         }
-        // Non-multi: pick the custom answer.
-        state.answers[tab] = vec![text.clone()];
-        state.custom[tab] = text.clone();
-        state.editing = false;
-        let mut answers = vec![Vec::new(); question_len(&request)];
-        answers[tab] = vec![text];
-        return Some(vec![reply_effect(&request, answers)]);
+        // Non-multi: pick the custom answer (`pick(text, true)`,
+        // `question.tsx:187-188`): single questions reply immediately,
+        // multi-question requests advance to the next tab.
+        let effects = pick(app, &request, &text, true);
+        app.ui.question.editing = false;
+        return Some(effects);
     }
 
-    let tab = state.tab;
+    let tab = app.ui.question.tab;
     let options = options_of(&request, tab);
     let custom = custom_allowed(&request, tab);
     let total = options.len() + usize::from(custom);
+    let state = &mut app.ui.question;
+    let editing = state.editing;
 
     match kind {
         crossterm::event::KeyCode::Left | crossterm::event::KeyCode::Char('h') => {
@@ -304,10 +317,13 @@ fn select_option(app: &mut App, request: &QuestionV1Request) -> Vec<Effect> {
 }
 
 /// `pick()` (`question.tsx:64-83`).
-fn pick(app: &mut App, request: &QuestionV1Request, answer: &str, _custom: bool) -> Vec<Effect> {
+fn pick(app: &mut App, request: &QuestionV1Request, answer: &str, custom: bool) -> Vec<Effect> {
     let state = &mut app.ui.question;
     let tab = state.tab;
     state.answers[tab] = vec![answer.to_string()];
+    if custom {
+        state.custom[tab] = answer.to_string();
+    }
     if single(request) {
         let mut answers = vec![Vec::new(); question_len(request)];
         answers[tab] = vec![answer.to_string()];
@@ -570,53 +586,57 @@ fn other_row(app: &App, request: &QuestionV1Request, theme: &Theme) -> Vec<Line<
         "Type your own answer".to_string()
     };
     let mut lines = Vec::new();
+    let mut number = Style::new().fg(theme.text_muted.to_color());
+    let mut text = Style::new();
+    if other {
+        number = number.bg(theme.background_element.to_color());
+        text = text.bg(theme.background_element.to_color());
+    }
+    let mut row = vec![
+        Span::styled(format!("  {}. ", options.len() + 1), number),
+        Span::styled(
+            label,
+            text.fg(if other {
+                theme.secondary
+            } else if picked {
+                theme.success
+            } else {
+                theme.text
+            }
+            .to_color()),
+        ),
+    ];
+    if picked && !multi {
+        row.push(Span::styled(
+            " ✓",
+            Style::new().fg(theme.success.to_color()),
+        ));
+    }
+    lines.push(Line::from(row));
     if state.editing {
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("  {}. ", options.len() + 1),
-                Style::new().fg(theme.text_muted.to_color()),
-            ),
-            Span::styled(label, Style::new().fg(theme.secondary.to_color())),
-            Span::styled(
-                format!(" {}", state.input),
-                Style::new().fg(theme.text.to_color()),
-            ),
-        ]));
-    } else {
-        let mut number = Style::new().fg(theme.text_muted.to_color());
-        let mut text = Style::new();
-        if other {
-            number = number.bg(theme.background_element.to_color());
-            text = text.bg(theme.background_element.to_color());
-        }
-        let mut row = vec![
-            Span::styled(format!("  {}. ", options.len() + 1), number),
-            Span::styled(
-                label,
-                text.fg(if other {
-                    theme.secondary
-                } else if picked {
-                    theme.success
+        // The editing textarea below the row (`question.tsx:427-448`):
+        // the typed draft, or the placeholder while empty.
+        lines.push(Line::from(Span::styled(
+            format!(
+                "     {}",
+                if state.input.is_empty() {
+                    "Type your own answer".to_string()
                 } else {
-                    theme.text
+                    state.input.clone()
                 }
-                .to_color()),
             ),
-        ];
-        if picked && !multi {
-            row.push(Span::styled(
-                " ✓",
-                Style::new().fg(theme.success.to_color()),
-            ));
-        }
-        lines.push(Line::from(row));
+            Style::new().fg(if state.input.is_empty() {
+                theme.text_muted.to_color()
+            } else {
+                theme.text.to_color()
+            }),
+        )));
+    } else if !state.custom[state.tab].is_empty() {
         // The saved custom answer under the row (`question.tsx:448-452`).
-        if !state.custom[state.tab].is_empty() {
-            lines.push(Line::from(Span::styled(
-                format!("     {}", state.custom[state.tab]),
-                Style::new().fg(theme.text_muted.to_color()),
-            )));
-        }
+        lines.push(Line::from(Span::styled(
+            format!("     {}", state.custom[state.tab]),
+            Style::new().fg(theme.text_muted.to_color()),
+        )));
     }
     lines
 }
