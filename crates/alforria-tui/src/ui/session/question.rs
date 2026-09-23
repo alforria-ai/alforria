@@ -30,6 +30,29 @@ pub struct QuestionState {
     pub custom: Vec<String>,
     /// The editing textarea content.
     pub input: String,
+    /// The clickable rows of the last render (mouse hit-testing):
+    /// screen row → target.
+    pub clicks: Vec<(u16, Click)>,
+}
+
+/// A mouse-clickable row (`question.tsx:296-408`).
+#[derive(Debug, Clone)]
+pub enum Click {
+    /// The tab row — each tab span as `(x, width, tab index)`; the
+    /// confirm tab is `questions.len()`.
+    Tabs(Vec<(u16, u16, usize)>),
+    /// Option row `index`.
+    Option(usize),
+    /// The "Type your own answer" row.
+    Other,
+}
+
+/// A `(line, target)` pair of the question layout — the line index
+/// into the rows of [`lines`].
+enum ClickLine {
+    Tabs,
+    Option(usize),
+    Other,
 }
 
 /// `questions()` (`session/index.tsx:235-238`) — like permissions, the
@@ -343,12 +366,18 @@ fn app_theme(app: &App) -> Theme {
 
 /// The question box's rendered rows.
 pub fn lines(app: &App) -> Vec<Line<'static>> {
+    layout(app).0
+}
+
+/// The rows plus the clickable line indices (mouse hit-testing).
+fn layout(app: &App) -> (Vec<Line<'static>>, Vec<(usize, ClickLine)>) {
     let theme = app_theme(app);
     let Some(request) = visible(app) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     let state = &app.ui.question;
     let mut rows: Vec<Line<'static>> = Vec::new();
+    let mut clicks: Vec<(usize, ClickLine)> = Vec::new();
     let single = single(&request);
     if !single {
         // The tab row (`question.tsx:296-352`).
@@ -393,6 +422,7 @@ pub fn lines(app: &App) -> Vec<Line<'static>> {
                 }),
         ));
         rows.push(Line::from(spans));
+        clicks.push((rows.len() - 1, ClickLine::Tabs));
         // `gap={1}` between the tab row and the question block
         // (`question.tsx:295`).
         rows.push(Line::raw(""));
@@ -418,9 +448,11 @@ pub fn lines(app: &App) -> Vec<Line<'static>> {
         let options = options_of(&request, state.tab);
         let custom = custom_allowed(&request, state.tab);
         for (index, option) in options.iter().enumerate() {
+            clicks.push((rows.len(), ClickLine::Option(index)));
             rows.extend(option_row(app, &request, &theme, index, option));
         }
         if custom {
+            clicks.push((rows.len(), ClickLine::Other));
             rows.extend(other_row(app, &request, &theme));
         }
     } else {
@@ -500,7 +532,7 @@ pub fn lines(app: &App) -> Vec<Line<'static>> {
         hint.extend(group);
     }
     rows.push(Line::from(hint));
-    rows
+    (rows, clicks)
 }
 
 /// One numbered answer row (`question.tsx:363-399`).
@@ -646,8 +678,28 @@ pub fn height(app: &App) -> u16 {
 }
 
 /// Render into the prompt slot.
-pub fn render(app: &App, frame: &mut ratatui::Frame, theme: &Theme, area: Rect) {
-    let rows = lines(app);
+pub fn render(app: &mut App, frame: &mut ratatui::Frame, theme: &Theme, area: Rect) {
+    let (line_rows, clicks) = layout(app);
+    let rows = line_rows;
+    // The tabs/options are mouse-interactive (`question.tsx:296-408`)
+    // — record their screen geometry for hit-testing. Content starts
+    // at `area.x + 2` (left border + padding) / `area.y + 1` (top
+    // padding).
+    let mut rendered = Vec::new();
+    for (line, target) in clicks {
+        let row = area.y + 1 + line as u16;
+        match target {
+            ClickLine::Tabs => {
+                let Some(spans) = rows.get(line).map(|line| tab_spans(line, area.x + 2)) else {
+                    continue;
+                };
+                rendered.push((row, Click::Tabs(spans)));
+            }
+            ClickLine::Option(index) => rendered.push((row, Click::Option(index))),
+            ClickLine::Other => rendered.push((row, Click::Other)),
+        }
+    }
+    app.ui.question.clicks = rendered;
     Paragraph::new(rows)
         .block(
             Block::new()
@@ -666,4 +718,78 @@ pub fn render(app: &App, frame: &mut ratatui::Frame, theme: &Theme, area: Rect) 
                 }),
         )
         .render(area, frame.buffer_mut());
+}
+
+/// The `(x, width, tab)` of each tab span of the tab row — the tab
+/// spans are the row's only background-carrying spans.
+fn tab_spans(line: &Line<'_>, x_start: u16) -> Vec<(u16, u16, usize)> {
+    let mut spans = Vec::new();
+    let mut x = x_start;
+    for span in &line.spans {
+        let width = span.content.chars().count() as u16;
+        if span.style.bg.is_some() {
+            spans.push((x, width, spans.len()));
+        }
+        x += width;
+    }
+    spans
+}
+
+/// The click target at the position, if the last render placed one.
+/// Tab rows resolve to the tab under the pointer (as a single-span
+/// `Click::Tabs`).
+fn hit(app: &App, column: u16, row: u16) -> Option<Click> {
+    visible(app)?;
+    let (_, click) = app
+        .ui
+        .question
+        .clicks
+        .iter()
+        .find(|(click_row, _)| *click_row == row)?;
+    match click {
+        Click::Tabs(spans) => {
+            let (x, width, tab) = spans
+                .iter()
+                .find(|(x, width, _)| column >= *x && column < *x + *width)?;
+            Some(Click::Tabs(vec![(*x, *width, *tab)]))
+        }
+        _ => Some(click.clone()),
+    }
+}
+
+/// `onMouseOver`/`onMouseDown` (`question.tsx:370-372,402-404`) —
+/// hover/press moves the selection to the row under the pointer.
+pub fn mouse_over(app: &mut App, column: u16, row: u16) {
+    match hit(app, column, row) {
+        Some(Click::Option(index)) => app.ui.question.selected = index,
+        Some(Click::Other) => {
+            let count = visible(app)
+                .map(|request| options_of(&request, app.ui.question.tab).len())
+                .unwrap_or(0);
+            app.ui.question.selected = count;
+        }
+        _ => {}
+    }
+}
+
+/// `onMouseUp` (`question.tsx:317-319,345-351,372-374,404-406`) —
+/// release activates the row under the pointer.
+pub fn mouse_select(app: &mut App, column: u16, row: u16) -> Option<Vec<Effect>> {
+    let request = visible(app)?;
+    match hit(app, column, row)? {
+        Click::Tabs(spans) => {
+            let (_, _, tab) = spans.first()?;
+            app.ui.question.tab = *tab;
+            app.ui.question.selected = 0;
+            Some(Vec::new())
+        }
+        Click::Option(index) => {
+            app.ui.question.selected = index;
+            Some(select_option(app, &request))
+        }
+        Click::Other => {
+            app.ui.question.selected = options_of(&request, app.ui.question.tab).len();
+            Some(select_option(app, &request))
+        }
+    }
 }

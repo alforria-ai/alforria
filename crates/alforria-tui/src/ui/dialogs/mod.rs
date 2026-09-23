@@ -12,7 +12,6 @@ pub mod system;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Widget;
 
 #[cfg(test)]
 mod tests;
@@ -1528,20 +1527,31 @@ pub fn render(app: &App, frame: &mut ratatui::Frame, theme: &Theme, area: Rect) 
     let Some(dialog) = app.ui.dialogs.top() else {
         return;
     };
-    // Backdrop: `RGBA.fromInts(0, 0, 0, 150)`.
-    let overlay = crate::ui::theme::tint(
-        theme.background,
-        Rgba {
-            r: 0.0,
-            g: 0.0,
-            b: 0.0,
-            a: 1.0,
-        },
-        150.0 / 255.0,
-    );
-    ratatui::widgets::Block::new()
-        .style(Style::new().bg(overlay.to_color()))
-        .render(area, frame.buffer_mut());
+    // Backdrop: `RGBA.fromInts(0, 0, 0, 150)` — OpenTUI composites the
+    // translucent black over the underlying cells, dimming their text
+    // too. ratatui has no alpha channel, so both the fg and bg of every
+    // covered cell are tinted toward black by `150/255`.
+    let black = Rgba {
+        r: 0.0,
+        g: 0.0,
+        b: 0.0,
+        a: 1.0,
+    };
+    let alpha = 150.0 / 255.0;
+    let buffer = frame.buffer_mut();
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            let Some(cell) = buffer.cell_mut((x, y)) else {
+                continue;
+            };
+            if let ratatui::style::Color::Rgb(r, g, b) = cell.bg {
+                cell.bg = crate::ui::theme::tint(Rgba::from_ints(r, g, b), black, alpha).to_color();
+            }
+            if let ratatui::style::Color::Rgb(r, g, b) = cell.fg {
+                cell.fg = crate::ui::theme::tint(Rgba::from_ints(r, g, b), black, alpha).to_color();
+            }
+        }
+    }
 
     let lines = content_lines(app, dialog, theme);
     let rect = frame_rect(app, lines.len(), area);

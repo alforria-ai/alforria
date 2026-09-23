@@ -321,3 +321,97 @@ fn editing_renders_the_input_line_below_the_row() {
         .unwrap_or_default();
     assert_eq!(typed, "     hello", "indented input row");
 }
+
+#[test]
+fn options_are_mouse_clickable() {
+    // Hover moves the selection and release submits the option
+    // (`question.tsx:296-408`).
+    let mut app = app_with_request(vec![info("plan", &["Option A", "Option B"], false, false)]);
+    app.ui.terminal_width = 80;
+    app.ui.terminal_height = 24;
+    let backend = ratatui::backend::TestBackend::new(80, 24);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| crate::ui::view(&mut app, frame))
+        .unwrap();
+
+    // The second option row as rendered on screen.
+    let row = app
+        .ui
+        .question
+        .clicks
+        .iter()
+        .find(|(_, click)| matches!(click, question::Click::Option(1)))
+        .map(|(row, _)| *row)
+        .expect("the option row is clickable");
+
+    // `onMouseOver` — hover moves the selection.
+    update(
+        &mut app,
+        crate::state::Msg::Mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Moved,
+            column: 4,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }),
+    );
+    assert_eq!(app.ui.question.selected, 1);
+
+    // `onMouseUp` — release selects the option and submits it.
+    let effects = question_replies(update(
+        &mut app,
+        crate::state::Msg::Mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            column: 4,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }),
+    ));
+    assert_eq!(
+        effects,
+        vec![Effect::QuestionReply {
+            request_id: "que_1".into(),
+            answers: vec![vec!["Option B".into()]],
+        }]
+    );
+}
+
+#[test]
+fn tabs_are_mouse_clickable() {
+    // Release on a tab selects it (`question.tsx:402-406`).
+    let mut app = app_with_request(vec![
+        info("plan", &["Option A", "Option B"], false, false),
+        info("scope", &["Scope A", "Scope B"], false, false),
+    ]);
+    app.ui.terminal_width = 80;
+    app.ui.terminal_height = 24;
+    let backend = ratatui::backend::TestBackend::new(80, 24);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| crate::ui::view(&mut app, frame))
+        .unwrap();
+
+    let (row, click) = app
+        .ui
+        .question
+        .clicks
+        .iter()
+        .find_map(|(row, click)| match click {
+            question::Click::Tabs(spans) => Some((*row, spans.clone())),
+            _ => None,
+        })
+        .expect("a tab row is clickable");
+    let (column, _width, tab) = click[1];
+
+    update(
+        &mut app,
+        crate::state::Msg::Mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            column: column + 1,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }),
+    );
+    assert_eq!(app.ui.question.tab, tab);
+    assert_eq!(app.ui.question.selected, 0);
+}

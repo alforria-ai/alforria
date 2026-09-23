@@ -294,3 +294,59 @@ fn the_always_stage_lists_patterns() {
     );
     assert!(text.contains("- src/**"), "{text}");
 }
+
+#[test]
+fn buttons_are_mouse_clickable() {
+    // Hover moves the selection and release activates the button
+    // (`permission.tsx:676-693`).
+    let mut app = app_with_request("ses_parent", request("per_1", "ses_parent", "bash"));
+    app.ui.terminal_width = 80;
+    app.ui.terminal_height = 24;
+    let backend = ratatui::backend::TestBackend::new(80, 24);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| crate::ui::view(&mut app, frame))
+        .unwrap();
+
+    // The rendered button geometry — the third button is Reject.
+    let row = app
+        .ui
+        .permission
+        .clicks
+        .first()
+        .expect("the option row records its buttons")
+        .row;
+    let (column, width) = app.ui.permission.clicks[0].buttons[2];
+    assert!(width > 0, "the Reject button has a span");
+
+    // `onMouseOver` — hover moves the selection.
+    update(
+        &mut app,
+        crate::state::Msg::Mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Moved,
+            column: column + 1,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }),
+    );
+    assert_eq!(app.ui.permission.selected, 2);
+
+    // `onMouseUp` — release activates: reject replies immediately.
+    let effects = update(
+        &mut app,
+        crate::state::Msg::Mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            column: column + 1,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }),
+    );
+    assert_eq!(
+        effects,
+        vec![crate::state::Effect::PermissionReply {
+            request_id: "per_1".into(),
+            reply: PermissionV1Reply::Reject,
+            message: None,
+        }]
+    );
+}

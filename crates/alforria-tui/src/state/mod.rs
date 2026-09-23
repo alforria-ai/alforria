@@ -821,6 +821,19 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                     crate::ui::dialogs::mouse_move_to(app, index);
                 }
             }
+            // The bottom bars are mouse-interactive too
+            // (`permission.tsx:676-693`, `question.tsx:296-408`):
+            // hover/press moves the selection to the row under the
+            // pointer.
+            crossterm::event::MouseEventKind::Moved if app.ui.dialogs.is_empty() => {
+                crate::ui::session::permission::mouse_over(app, mouse.column, mouse.row);
+                crate::ui::session::question::mouse_over(app, mouse.column, mouse.row);
+            }
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
+                if app.ui.dialogs.is_empty() =>
+            {
+                crate::ui::session::question::mouse_over(app, mouse.column, mouse.row);
+            }
             crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
                 if !app.ui.dialogs.is_empty() =>
             {
@@ -852,7 +865,17 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left)
                 if app.ui.dialogs.is_empty() =>
             {
-                transcript_click(app, mouse.row);
+                if let Some(mut permission) =
+                    crate::ui::session::permission::mouse_select(app, mouse.column, mouse.row)
+                {
+                    effects.append(&mut permission);
+                } else if let Some(mut question) =
+                    crate::ui::session::question::mouse_select(app, mouse.column, mouse.row)
+                {
+                    effects.append(&mut question);
+                } else {
+                    transcript_click(app, mouse.row);
+                }
             }
             _ => {}
         },

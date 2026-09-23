@@ -365,8 +365,18 @@ fn user_message_lines(
         let mut rows: Vec<Line<'static>> = Vec::new();
         // paddingTop={1}
         rows.push(blank());
+        // The `<text>` wraps at the box width (border + 2 padding
+        // columns, like the assistant markdown: `parts.rs`).
+        let wrap_width = content_width.saturating_sub(3);
         for row in text.split('\n') {
-            rows.push(Line::from(styled(row.to_string(), theme.text)));
+            if row.is_empty() {
+                rows.push(blank());
+                continue;
+            }
+            rows.extend(crate::ui::markdown::wrap_spans(
+                vec![styled(row.to_string(), theme.text)],
+                wrap_width,
+            ));
         }
         // QUEUED beyond the pending index, else the timestamp (`:1437-1452`).
         let queued = pending.is_some() && index > pending.unwrap();
@@ -762,6 +772,31 @@ mod tests {
         );
         let text = render_lines(&mut app, 80, 24);
         assert!(text.contains("hello transcript"), "{text}");
+    }
+
+    #[test]
+    fn user_message_wraps_long_text() {
+        // Long lines wrap at the box width instead of clipping
+        // (`session/index.tsx:1364-1467`).
+        let mut app = app_with_messages(vec![user_message("msg_1", 1.0)]);
+        app.state.sync.part.insert(
+            "msg_1".to_string(),
+            vec![V1Part::Text {
+                id: "prt_1".to_string(),
+                session_id: "ses_a".to_string(),
+                message_id: "msg_1".to_string(),
+                text: vec!["wrapword"; 30].join(" "),
+                synthetic: None,
+                ignored: None,
+                time: None,
+                metadata: None,
+            }],
+        );
+        let text = render_lines(&mut app, 80, 40);
+        assert_eq!(text.matches("wrapword").count(), 30, "{text}");
+        // Spread over several wrapped rows, not one clipped row.
+        let rows = text.split('\n').filter(|l| l.contains("wrapword")).count();
+        assert!(rows >= 3, "{text}");
     }
 
     #[test]

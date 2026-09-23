@@ -569,7 +569,7 @@ fn inline_wrap(text: &str, width: u16, base: Option<Style>, theme: &Theme) -> Ve
 }
 
 /// Word-wrap a span list to `width` columns (char-based).
-fn wrap_spans(spans: Vec<Span<'static>>, width: u16) -> Vec<Line<'static>> {
+pub(crate) fn wrap_spans(spans: Vec<Span<'static>>, width: u16) -> Vec<Line<'static>> {
     let width = (width.max(1) as usize).max(1);
     let mut lines = Vec::new();
     let mut current: Vec<Span<'static>> = Vec::new();

@@ -34,6 +34,25 @@ pub struct Display {
     pub cursor_col: usize,
 }
 
+impl Display {
+    /// The visible `maxHeight` window — the OpenTUI textarea scrolls
+    /// to keep the cursor visible (`prompt/index.tsx:1368`); the window
+    /// keeps the cursor row on screen (pinned to the bottom row while
+    /// typing at the end).
+    pub fn window(&self, max_height: u16) -> std::ops::Range<usize> {
+        let max = max_height as usize;
+        if self.rows.len() <= max {
+            return 0..self.rows.len();
+        }
+        let start = self
+            .cursor_row
+            .saturating_add(1)
+            .saturating_sub(max)
+            .min(self.rows.len() - max);
+        start..start + max
+    }
+}
+
 const UNDO_LIMIT: usize = 100;
 
 /// The editing primitive.

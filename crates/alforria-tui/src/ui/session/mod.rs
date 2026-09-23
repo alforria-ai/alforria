@@ -247,9 +247,11 @@ pub fn render(app: &mut App, frame: &mut ratatui::Frame, theme: &Theme, area: Re
     if sidebar_visible && !sidebar_area.is_empty() {
         if !wide {
             // The full-frame translucent backdrop (`session/index.tsx:1343-1355`,
-            // `RGBA.fromInts(0, 0, 0, 70)`) — ratatui has no alpha channel,
-            // so every painted background cell is tinted toward black by
-            // `70/255`. The sidebar then renders on top of the overlay.
+            // `RGBA.fromInts(0, 0, 0, 70)`) — OpenTUI composites it over
+            // both the fg and bg of the covered cells; ratatui has no
+            // alpha channel, so every painted cell is tinted toward
+            // black by `70/255`. The sidebar then renders on top of the
+            // overlay.
             let black = Rgba::from_values(0.0, 0.0, 0.0, 1.0);
             let alpha = 70.0 / 255.0;
             let buffer = frame.buffer_mut();
@@ -259,8 +261,10 @@ pub fn render(app: &mut App, frame: &mut ratatui::Frame, theme: &Theme, area: Re
                         continue;
                     };
                     if let ratatui::style::Color::Rgb(r, g, b) = cell.bg {
-                        let dimmed = tint(Rgba::from_ints(r, g, b), black, alpha);
-                        cell.bg = dimmed.to_color();
+                        cell.bg = tint(Rgba::from_ints(r, g, b), black, alpha).to_color();
+                    }
+                    if let ratatui::style::Color::Rgb(r, g, b) = cell.fg {
+                        cell.fg = tint(Rgba::from_ints(r, g, b), black, alpha).to_color();
                     }
                 }
             }

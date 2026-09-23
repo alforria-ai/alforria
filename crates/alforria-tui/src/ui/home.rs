@@ -114,10 +114,12 @@ fn rows(app: &App, area: Rect) -> crate::ui::textarea::Display {
     }
 }
 
-/// The rendered prompt height: `paddingTop={1}` + the textarea rows +
-/// the 1-row bottom cap (`prompt/index.tsx:1487-1512`).
+/// The rendered prompt height: `paddingTop={1}` + the visible textarea
+/// rows (capped at the textarea `maxHeight`, `prompt/index.tsx:1345`) +
+/// the meta box `paddingTop={1}` + the meta row + the 1-row bottom cap
+/// + the bottom row (`prompt/index.tsx:1356-1512`).
 fn prompt_height(rows: usize) -> u16 {
-    (1 + rows.min(u16::MAX as usize) as u16).saturating_add(1)
+    (1 + rows.min(u16::MAX as usize) as u16).saturating_add(4)
 }
 
 pub fn render(app: &App, frame: &mut ratatui::Frame, theme: &Theme, area: Rect) {
@@ -130,7 +132,9 @@ pub fn render(app: &App, frame: &mut ratatui::Frame, theme: &Theme, area: Rect) 
         width: main.width.saturating_sub(4),
         height: main.height,
     };
-    let rows = rows(app, padded).rows;
+    let rows = rows(app, padded);
+    let max_height =
+        crate::ui::textarea::Textarea::max_height(app.config.prompt_max_height, area.height.max(1));
     let tips_width = padded.width.min(TIPS_MAX_WIDTH);
     let tips_lines = if tips_shown(app) {
         tip_lines(app, theme, tips_width)
@@ -142,19 +146,29 @@ pub fn render(app: &App, frame: &mut ratatui::Frame, theme: &Theme, area: Rect) 
     } else {
         TIPS_PADDING_TOP + tips_lines.len() as u16
     };
+    // The prompt never shrinks (`flexShrink={0}`, `home.tsx:83`): the
+    // gap, the logo spacer and the tips yield first, in that order.
+    let prompt_h = prompt_height(rows.window(max_height).len())
+        .min(padded.height.saturating_sub(5 /* logo */).max(1));
+    let deficit = (4 /* gap */ + 5 /* logo */ + 1 /* spacer */ + prompt_h + tips_height)
+        .saturating_sub(padded.height);
+    let gap = 4usize.saturating_sub(deficit as usize);
+    let shrink = deficit as usize - (4 - gap);
+    let spacer = 1usize.saturating_sub(shrink.min(1));
+    let tips_height = tips_height.saturating_sub((shrink.saturating_sub(1 - spacer)) as u16);
     let [_, _gap, logo, _, prompt, tips_area, _bottom] = Layout::vertical([
         Constraint::Fill(1),
-        Constraint::Length(4),
+        Constraint::Length(gap as u16),
         Constraint::Length(5),
-        Constraint::Length(1),
-        Constraint::Length(prompt_height(rows.len())),
+        Constraint::Length(spacer as u16),
+        Constraint::Length(prompt_h),
         Constraint::Length(tips_height),
         Constraint::Fill(1),
     ])
     .areas(padded);
     Paragraph::new(logo_lines(theme))
         .render(center_horizontally(logo, LOGO_WIDTH), frame.buffer_mut());
-    render_prompt(app, frame, theme, prompt);
+    render_prompt(app, frame, theme, prompt, max_height);
     if !tips_lines.is_empty() {
         render_tips(frame, tips_area, tips_width, &tips_lines);
     }
@@ -611,12 +625,13 @@ fn render_tips(frame: &mut ratatui::Frame, area: Rect, width: u16, lines: &[Line
 /// `backgroundElement` fill + 2-col padding, a `SplitBorder` vertical
 /// (`┃`) and the `╹`/`▀` bottom cap (`prompt/index.tsx:1487-1512`).
 /// The textarea contents render over the seeded --prompt input (M8.6).
-fn render_prompt(app: &App, frame: &mut ratatui::Frame, theme: &Theme, area: Rect) {
+fn render_prompt(app: &App, frame: &mut ratatui::Frame, theme: &Theme, area: Rect, max_rows: u16) {
     let max_width = app
         .config
         .prompt_max_width(area.width.saturating_sub(4))
         .min(area.width);
     let display = rows(app, area);
+    let window = display.window(max_rows);
     let placeholder = display.rows.iter().all(|row| row.is_empty());
     // `cursor.blinking` — the same block cursor as the session prompt.
     let blink = (app.ui.tick_ms / 530).is_multiple_of(2);
@@ -642,27 +657,34 @@ fn render_prompt(app: &App, frame: &mut ratatui::Frame, theme: &Theme, area: Rec
         ));
         lines.push(Line::from(spans));
     } else {
-        for (row, cells) in display.rows.iter().enumerate() {
+        for (row, cells) in display.rows[window.clone()].iter().enumerate() {
             let mut spans: Vec<Span> = Vec::new();
             for (column, (char, _mark)) in cells.iter().enumerate() {
                 let mut style = Style::new().fg(theme.text.to_color());
-                if blink && row == display.cursor_row && column == display.cursor_col {
+                if blink && window.start + row == display.cursor_row && column == display.cursor_col
+                {
                     style = cursor;
                 }
                 spans.push(Span::styled(char.to_string(), style));
             }
-            if blink && row == display.cursor_row && display.cursor_col >= cells.len() {
+            if blink
+                && window.start + row == display.cursor_row
+                && display.cursor_col >= cells.len()
+            {
                 spans.push(Span::styled(" ", cursor));
             }
-            if row == display.cursor_row && spans.is_empty() && blink {
+            if window.start + row == display.cursor_row && spans.is_empty() && blink {
                 spans.push(Span::styled(" ", cursor));
             }
             lines.push(Line::from(spans));
         }
     }
+    // The meta box `paddingTop={1}` — a blank row above the meta row.
+    lines.push(Line::raw(""));
+    lines.push(crate::ui::session::prompt::meta_line(app, theme));
     let prompt_area = center_horizontally(area, max_width);
     let main = Rect {
-        height: prompt_area.height.saturating_sub(1),
+        height: prompt_area.height.saturating_sub(2),
         ..prompt_area
     };
     Paragraph::new(lines)
@@ -688,10 +710,25 @@ fn render_prompt(app: &App, frame: &mut ratatui::Frame, theme: &Theme, area: Rec
         frame,
         theme,
         Rect {
+            y: prompt_area.y + prompt_area.height.saturating_sub(2),
+            height: 1,
+            ..prompt_area
+        },
+    );
+    // The bottom row — always rendered below the cap
+    // (`prompt/index.tsx:1515-1700`).
+    Paragraph::new(crate::ui::session::prompt::bottom_row(
+        app,
+        theme,
+        prompt_area.width,
+    ))
+    .render(
+        Rect {
             y: prompt_area.y + prompt_area.height.saturating_sub(1),
             height: 1,
             ..prompt_area
         },
+        frame.buffer_mut(),
     );
     if app.ui.prompt.autocomplete.visible.is_some() {
         crate::ui::session::prompt::render_autocomplete(app, frame, theme, prompt_area);
@@ -849,6 +886,48 @@ mod tests {
         );
     }
 
+    /// Regression: the prompt box caps at its `maxHeight` and scrolls to
+    /// keep the cursor visible (`prompt/index.tsx:1345,1368`).
+    #[test]
+    fn prompt_caps_and_scrolls_to_the_cursor() {
+        let mut app = make_app();
+        for index in 0..20 {
+            app.ui
+                .prompt
+                .textarea
+                .insert_text(&format!("row {index:02}\n"));
+        }
+        app.ui.prompt.textarea.insert_text("tail row");
+        let lines = buffer_text(&app, 80, 24);
+        // maxHeight = max(6, 24/3) = 8 — the last 8 rows: 7 typed
+        // rows plus the cursor row.
+        let visible = lines.iter().filter(|l| l.contains("row ")).count();
+        assert_eq!(visible, 7, "{lines:?}");
+        assert!(
+            lines.iter().any(|l| l.contains("tail row")),
+            "the cursor row is visible: {lines:?}"
+        );
+        // The window scrolls with the cursor: row 13 renders, row 12
+        // (and the head) scrolled out.
+        assert!(
+            lines.iter().any(|l| l.contains("row 13")),
+            "the window starts at row 13: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("row 12")),
+            "the head scrolled out of the window: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("row 00")),
+            "the head scrolled out: {lines:?}"
+        );
+        // The meta row and the bottom row survive the layout.
+        assert!(
+            lines.iter().any(|l| l.contains("tab agents")),
+            "the bottom row renders: {lines:?}"
+        );
+    }
+
     /// Regression (battle-test round 4): the home prompt box renders the
     /// shared prompt editor — typed text must appear on the home screen.
     #[test]
@@ -910,36 +989,42 @@ mod tests {
         let lines = buffer_text(&make_app(), 80, 24);
         let pad = |n| " ".repeat(n);
         assert_eq!(lines.len(), 24);
-        // vertical: fill(2) + gap(4) + logo(5) + spacer(1) + prompt(3)
+        // vertical: fill(1) + gap(4) + logo(5) + spacer(1) + prompt(6)
         // + tips(4) + fill(2) + footer(3)
         assert_eq!(
-            lines[6],
+            lines[5],
             format!("{} ███  █     █████  ███  ████  ████  █████  ███", pad(16))
         );
         assert_eq!(
-            lines[7],
+            lines[6],
             format!("{}█   █ █     █     █   █ █   █ █   █   █   █   █", pad(16))
         );
         assert_eq!(
-            lines[8],
+            lines[7],
             format!("{}█████ █     ████  █   █ ████  ████    █   █████", pad(16))
         );
         assert_eq!(
-            lines[9],
+            lines[8],
             format!("{}█   █ █     █     █   █ █  █  █  █    █   █   █", pad(16))
         );
         assert_eq!(
-            lines[10],
+            lines[9],
             format!("{}█   █ █████ █      ███  █   █ █   █ █████ █   █", pad(16))
         );
-        assert_eq!(lines[12], format!("{}┃", pad(2)));
+        assert_eq!(lines[11], format!("{}┃", pad(2)));
         assert_eq!(
-            lines[13],
+            lines[12],
             format!("{}┃  Ask anything… \"Fix a TODO in the codebase\"", pad(2))
         );
-        assert_eq!(lines[14], format!("{}╹{}", pad(2), "▀".repeat(74)));
+        // The blank row (meta box paddingTop) + the empty meta row.
+        assert_eq!(lines[13], format!("{}┃", pad(2)));
+        assert_eq!(lines[14], format!("{}┃", pad(2)));
+        assert_eq!(lines[15], format!("{}╹{}", pad(2), "▀".repeat(74)));
+        // The bottom row — `agents`/`commands` shortcuts right-aligned
+        // within the prompt's `maxWidth` (75).
+        assert_eq!(lines[16], format!("{}tab agents  ctrl+p commands", pad(50)));
         assert_eq!(
-            lines[18],
+            lines[20],
             format!(
                 "{}● Tip Run /connect to add an AI provider and start coding",
                 pad(11)
@@ -947,7 +1032,7 @@ mod tests {
         );
         assert_eq!(lines[22], format!("{}dev", pad(75)));
         for (row, line) in lines.iter().enumerate() {
-            if ![6, 7, 8, 9, 10, 12, 13, 14, 18, 22].contains(&row) {
+            if ![5, 6, 7, 8, 9, 11, 12, 13, 14, 15, 16, 20, 22].contains(&row) {
                 assert_eq!(line, "", "row {row}: {}", lines[row]);
             }
         }

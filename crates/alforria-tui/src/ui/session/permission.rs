@@ -38,6 +38,16 @@ pub struct PermissionState {
     pub expanded: bool,
     /// The reject-stage textarea content.
     pub reject_input: String,
+    /// The rendered option-button rows (mouse hit-testing): screen row
+    /// and each button's `(x, width)`.
+    pub clicks: Vec<ClickRow>,
+}
+
+/// One clickable option-button row (`permission.tsx:676-693`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClickRow {
+    pub row: u16,
+    pub buttons: Vec<(u16, u16)>,
 }
 
 const OPTIONS: [(&str, &str); 3] = [
@@ -661,13 +671,47 @@ pub fn height(app: &App) -> u16 {
     }
 }
 
+/// The `(start, width)` of every button span of a row — the only
+/// spans carrying a background colour (`option_row` and the
+/// Confirm/Cancel row).
+fn button_ranges(line: &Line<'_>) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut x = 0usize;
+    for span in &line.spans {
+        let width = span.content.chars().count();
+        if span.style.bg.is_some() {
+            ranges.push((x, width));
+        }
+        x += width;
+    }
+    ranges
+}
+
 /// Render into the prompt slot.
-pub fn render(app: &App, frame: &mut ratatui::Frame, theme: &Theme, area: Rect) {
+pub fn render(app: &mut App, frame: &mut ratatui::Frame, theme: &Theme, area: Rect) {
     let rows = lines(app);
     let border = match app.ui.permission.stage {
         PermissionStage::Reject => theme.error,
         _ => theme.warning,
     };
+    // The option buttons are mouse-interactive (`permission.tsx:676-693`)
+    // — record their screen geometry for hit-testing. Content starts at
+    // `area.x + 2` (left border + padding) / `area.y + 1` (top padding).
+    let mut clicks = Vec::new();
+    for (index, line) in rows.iter().enumerate() {
+        let buttons = button_ranges(line);
+        if buttons.is_empty() {
+            continue;
+        }
+        clicks.push(ClickRow {
+            row: area.y + 1 + index as u16,
+            buttons: buttons
+                .into_iter()
+                .map(|(x, width)| (area.x + 2 + x as u16, width as u16))
+                .collect(),
+        });
+    }
+    app.ui.permission.clicks = clicks;
     Paragraph::new(rows)
         .block(
             Block::new()
@@ -686,4 +730,40 @@ pub fn render(app: &App, frame: &mut ratatui::Frame, theme: &Theme, area: Rect) 
                 }),
         )
         .render(area, frame.buffer_mut());
+}
+
+/// The option index at the position, if the last render placed a
+/// button there.
+fn hit(app: &App, column: u16, row: u16) -> Option<usize> {
+    visible(app)?;
+    let click = app.ui.permission.clicks.first()?;
+    if row != click.row {
+        return None;
+    }
+    click
+        .buttons
+        .iter()
+        .position(|(x, width)| column >= *x && column < *x + *width)
+}
+
+/// `onMouseOver` (`permission.tsx:685`) — hover moves the selection to
+/// the button under the pointer.
+pub fn mouse_over(app: &mut App, column: u16, row: u16) {
+    if let Some(selected) = hit(app, column, row) {
+        app.ui.permission.selected = selected;
+    }
+}
+
+/// `onMouseUp` (`permission.tsx:686-690`) — release selects and
+/// activates the button under the pointer.
+pub fn mouse_select(app: &mut App, column: u16, row: u16) -> Option<Vec<Effect>> {
+    let selected = hit(app, column, row)?;
+    app.ui.permission.selected = selected;
+    let request = visible(app)?;
+    let session_parent = app
+        .state
+        .sync
+        .session(&request.session_id)
+        .and_then(|session| session.parent_id.clone());
+    Some(select(app, &request, session_parent))
 }

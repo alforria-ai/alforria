@@ -376,3 +376,74 @@ fn select_dialogs_render_their_titles() {
         }
     }
 }
+
+#[test]
+fn dialog_backdrop_dims_the_text_behind_it() {
+    // OpenTUI composites the `RGBA.fromInts(0, 0, 0, 150)` backdrop
+    // over the underlying cells — the text behind a dialog fades too,
+    // it does not shine through at full brightness (`dialog.tsx:30-38`).
+    let mut app = new_app();
+    app.state.route.navigate(Route::Session {
+        session_id: "ses_1".into(),
+        prompt: None,
+    });
+    app.state.sync.session = vec![crate::ui::session::tests::session_info("ses_1", "X")];
+    app.state.sync.message.insert(
+        "ses_1".into(),
+        vec![alforria_schema::session_v1::V1Message::User {
+            id: "msg_u".into(),
+            session_id: "ses_1".into(),
+            time: alforria_schema::session_v1::UserTime { created: 1.0 },
+            summary: None,
+            format: None,
+            agent: "build".into(),
+            model: alforria_schema::session_v1::V1UserModel {
+                model_id: "claude".into(),
+                provider_id: "anthropic".into(),
+                variant: None,
+            },
+            system: None,
+            tools: None,
+        }],
+    );
+    app.state.sync.part.insert(
+        "msg_u".into(),
+        vec![alforria_schema::session_v1::V1Part::Text {
+            id: "prt_1".into(),
+            session_id: "ses_1".into(),
+            message_id: "msg_u".into(),
+            text: "BEHIND THE DIALOG TEXT".into(),
+            synthetic: None,
+            ignored: None,
+            time: None,
+            metadata: None,
+        }],
+    );
+    open(&mut app, PendingDialog::Model);
+    app.ui.terminal_width = 80;
+    app.ui.terminal_height = 24;
+    let backend = ratatui::backend::TestBackend::new(80, 24);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            crate::ui::view(&mut app, frame);
+        })
+        .unwrap();
+
+    // Row 2 holds the transcript text, behind the backdrop.
+    let transcript_fg = terminal.backend().buffer()[(7, 2)].fg;
+    let theme = app
+        .ui
+        .theme
+        .resolve(&app.state.kv)
+        .expect("builtin theme resolves");
+    assert!(
+        transcript_fg != theme.text.to_color(),
+        "the backdrop must dim the text behind the dialog"
+    );
+    // The dialog panel itself stays opaque (`theme.backgroundPanel`).
+    assert_eq!(
+        terminal.backend().buffer()[(14, 7)].bg,
+        theme.background_panel.to_color()
+    );
+}
