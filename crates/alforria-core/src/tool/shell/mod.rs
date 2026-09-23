@@ -663,6 +663,7 @@ impl ShellSpawner for TokioSpawner {
                         {
                             // No graceful signal on Windows: force-kill the
                             // whole process tree right away.
+                            let _ = force_after;
                             let _ = std::process::Command::new("taskkill")
                                 .args(["/PID", &pid.to_string(), "/T", "/F"])
                                 .stdin(std::process::Stdio::null())
