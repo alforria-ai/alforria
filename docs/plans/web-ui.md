@@ -1,26 +1,38 @@
 # Web UI: reuse upstream `packages/app`, embed it, improve it
 
-Status: M1 (fork + build + pack), M2 (embed + serve), M3 (branding/theme) and
-M4 (wire parity) **landed**; continuing on UX polish.
+Status: M1 (fork + build + pack), M2 (embed + serve), M3 (branding/theme),
+M4 (wire parity) and M5 (multi-pane grid) **landed**; continuing on UX polish.
 
-- `alforria-ai/web` @ `cef4b1b` holds the fork, `script/pack.ts`, and branding:
+- `alforria-ai/web` @ `953abeb` holds the fork, `script/pack.ts`, and branding:
   alforria wordmark, `<title>`/manifest, an `alforria` theme (cyan accent,
   derived from oc-2) now the web default, home-route wordmark, app-name i18n
   strings, and regenerated favicon/apple-touch/PWA icons + social-share card.
   The upstream bun `patches/` are vendored and registered via
   `patchedDependencies` (notably `@pierre/trees`, `solid-js`) — without them the
   tree/expansion tests and dialog typecheck fail.
+- **Multi-pane grid (M5):** a grid mode tiles session and terminal panes side by
+  side in the main content area, independent of the tab strip. Panes are
+  resizable (drag the divider), addable from open sessions or as a terminal, and
+  closable; layout + sizes persist per server (`grid.<serverKey>`). Each pane is
+  a same-origin iframe onto a chrome-free embed route — sessions use
+  `/server/:serverKey/session/:id?embed=1`, terminal panes use
+  `/server/:serverKey/terminal/:id?embed=1` (a workspace-scoped PTY anchored to a
+  session for directory resolution). Embed mode hides the titlebar/tab strip and
+  suppresses shared tab-store mutations. The grid toggle lives in the titlebar.
 - `crates/alforria-ui/assets/ui.tar.zst` (8.9 MB, `OPENCODE_CHANNEL=prod`) is
   embedded and served via `EmbeddedUiBackend`; `OPENCODE_DISABLE_EMBEDDED_WEB_UI=1`
   reverts to the empty backend.
 - Verified end to end: `alforria serve` + headless Chrome renders the real SPA
   against the Rust server (home + session routes, live history/tool blocks/tabs/
   composer, `/global/event` SSE), every request 200, zero console errors, no DEV
-  badge, `alforria` title/manifest, cyan accent, wordmark on home.
-- `packages/app` unit suite green (724 pass); `crates/alforria-ui` + server lib
+  badge, `alforria` title/manifest, cyan accent, wordmark on home. The grid was
+  verified with two live session panes, a mixed session+terminal grid, drag
+  resize, pane close, and the add-pane menu.
+- `packages/app` unit suite green (728 pass); `crates/alforria-ui` + server lib
   tests green, `cargo fmt`/clippy clean.
 
-Next: M4+ — UX iteration (still wire-compatible presentation-only changes).
+Next: M5+ — UX iteration (grid niceties: vertical splits, drag-to-reorder,
+full-screen pane; all presentation-only and wire-compatible).
 
 Reference: upstream `anomalyco/opencode` @ `88c6c7abc7f320b6aabed2634ac0b2d6e6ecea67`
 (the pinned commit in `fixtures/PINNED.md`). Local clone: `/tmp/opencode-src`.
@@ -124,6 +136,14 @@ streams, session pages, prompts). **Landed:** the app's v1 auto-detection
 (`/global/health`) selects v1, both health endpoints and the whole v1 surface
 answer correctly, `/global/event` SSE connects, and home + session pages render
 live data. Next: UX iteration (presentation-only, wire-compatible).
+
+### M5 — Multi-pane grid
+A grid mode in the main content area tiles session and terminal panes side by
+side, independent of the tab strip; panes are resizable, addable, closable, and
+persisted per server. Panes are same-origin iframes onto chrome-free embed
+routes (`?embed=1`), which suppresses titlebar/tab-store side effects and lets
+each pane carry its own providers/event stream. Terminal panes use a dedicated
+workspace-scoped PTY embed route. **Landed** and verified in headless Chrome.
 
 ## Cross-track contracts
 
