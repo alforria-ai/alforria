@@ -1,12 +1,16 @@
 # Web UI: reuse upstream `packages/app`, embed it, improve it
 
-Status: M1 (fork + build + pack) and M2 (embed + serve) **landed**. M3
-(branding/theme) next.
+Status: M1 (fork + build + pack), M2 (embed + serve) and M3 first pass
+(wordmark/title/manifest) **landed**. Remaining branding: favicon/app
+icons and an alforria theme (accent/splash) — pending brand direction.
 
-- `alforria-ai/web` @ `2026165` holds the fork and `script/pack.ts`.
+- `alforria-ai/web` @ `7751c35` holds the fork, `script/pack.ts`, and branding.
 - `crates/alforria-ui/assets/ui.tar.zst` (8.7 MB, 954 files) is embedded and
   served via `EmbeddedUiBackend`; `OPENCODE_DISABLE_EMBEDDED_WEB_UI=1` reverts
   to the empty backend.
+- Verified end to end: `alforria serve` + headless Chrome renders the real SPA
+  against the Rust server (projects/sessions/settings), title `alforria`,
+  manifest `alforria`.
 
 Reference: upstream `anomalyco/opencode` @ `88c6c7abc7f320b6aabed2634ac0b2d6e6ecea67`
 (the pinned commit in `fixtures/PINNED.md`). Local clone: `/tmp/opencode-src`.
