@@ -10,15 +10,16 @@ M4 (wire parity) and M5 (multi-pane grid) **landed**; continuing on UX polish.
   The upstream bun `patches/` are vendored and registered via
   `patchedDependencies` (notably `@pierre/trees`, `solid-js`) — without them the
   tree/expansion tests and dialog typecheck fail.
-- **Multi-pane grid (M5):** a grid mode tiles session and terminal panes side by
-  side in the main content area, independent of the tab strip. Panes are
-  resizable (drag the divider), addable from open sessions or as a terminal, and
-  closable; layout + sizes persist per server (`grid.<serverKey>`). Each pane is
-  a same-origin iframe onto a chrome-free embed route — sessions use
+- **Multi-pane grid (M5):** a grid mode tiles session and terminal panes in an
+  arbitrary nested split tree, independent of the tab strip. Panes are resizable
+  (drag any divider), splittable right/down, maximisable, closable, and
+  drag-to-reorderable; layout + sizes persist per server (`grid.<serverKey>`).
+  Each pane is a same-origin iframe onto a chrome-free embed route — sessions use
   `/server/:serverKey/session/:id?embed=1`, terminal panes use
   `/server/:serverKey/terminal/:id?embed=1` (a workspace-scoped PTY anchored to a
   session for directory resolution). Embed mode hides the titlebar/tab strip and
-  suppresses shared tab-store mutations. The grid toggle lives in the titlebar.
+  suppresses shared tab-store mutations; grid mode hides the tab strip. The grid
+  toggle lives in the titlebar. The first flat schema migrates to a row split.
 - `crates/alforria-ui/assets/ui.tar.zst` (8.9 MB, `OPENCODE_CHANNEL=prod`) is
   embedded and served via `EmbeddedUiBackend`; `OPENCODE_DISABLE_EMBEDDED_WEB_UI=1`
   reverts to the empty backend.
@@ -143,7 +144,15 @@ side, independent of the tab strip; panes are resizable, addable, closable, and
 persisted per server. Panes are same-origin iframes onto chrome-free embed
 routes (`?embed=1`), which suppresses titlebar/tab-store side effects and lets
 each pane carry its own providers/event stream. Terminal panes use a dedicated
-workspace-scoped PTY embed route. **Landed** and verified in headless Chrome.
+workspace-scoped PTY embed route.
+
+**Landed:** nested horizontal/vertical splits (arbitrary tree), per-pane
+maximise/restore, split-right/split-down controls, drag-to-reorder (swap), and
+the first flat schema migrates into a row split on load. The tab strip is hidden
+while grid mode is active so a tab click can never be masked by the grid.
+**Battle-tested** in headless Chrome (23/23 checks): corrupt-store recovery,
+unknown-session panes, 8-pane layouts, close-all → tabs, maximise-then-close,
+rapid toggling, and deep links.
 
 ## Cross-track contracts
 
