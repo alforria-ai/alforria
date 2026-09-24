@@ -14,11 +14,31 @@ use ratatui::text::{Line, Span};
 use super::theme::{Rgba, Theme};
 
 /// Render `content` into styled lines, word-wrapped to `width`.
+///
+/// Top-level blocks are separated the way `MarkdownRenderable` spaces
+/// them (`shouldAddTopLevelMargin`, md-source.txt:1144): a blank line
+/// before every block that is not a plain paragraph, and between two
+/// paragraphs only when the source had a blank line between them.
 pub fn render(content: &str, width: u16, theme: &Theme) -> Vec<Line<'static>> {
-    blocks(content)
-        .into_iter()
-        .flat_map(|block| render_block(block, theme, width))
-        .collect()
+    let mut out = Vec::new();
+    let mut prev: Option<(bool, bool)> = None; // (separated, list-item)
+    for (block, gap) in blocks(content) {
+        let cur_list = matches!(block, Block::ListItem { .. });
+        let cur_separated = !matches!(block, Block::Paragraph(_));
+        if let Some((prev_separated, prev_list)) = prev {
+            let margin = if prev_list && cur_list {
+                gap
+            } else {
+                prev_separated || cur_separated || gap
+            };
+            if margin {
+                out.push(Line::from(""));
+            }
+        }
+        out.extend(render_block(block, theme, width));
+        prev = Some((cur_separated, cur_list));
+    }
+    out
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -33,36 +53,42 @@ enum Block {
         depth: usize,
         ordered: Option<u64>,
         text: String,
+        marker_width: usize,
     },
     Quote(String),
     Table(Vec<Vec<String>>),
     Rule,
 }
 
-/// Split into blocks. An open fence at EOF flushes as a code block —
-/// the streaming-safe behavior.
-fn blocks(content: &str) -> Vec<Block> {
-    let mut out: Vec<Block> = Vec::new();
-    let mut paragraph: Option<String> = None;
-    let mut quote: Option<String> = None;
-    let mut code: Option<(Option<String>, Vec<String>)> = None;
+/// Split into blocks, each carrying whether a blank line preceded it
+/// (the loose-list / paragraph-gap signal). An open fence at EOF flushes
+/// as a code block — the streaming-safe behavior.
+fn blocks(content: &str) -> Vec<(Block, bool)> {
+    let mut out: Vec<(Block, bool)> = Vec::new();
+    let mut paragraph: Option<(String, bool)> = None;
+    let mut quote: Option<(String, bool)> = None;
+    let mut code: Option<(Option<String>, Vec<String>, bool)> = None;
+    let mut blank = false;
 
     let lines: Vec<&str> = content.lines().collect();
     let mut index = 0usize;
     while index < lines.len() {
         let raw = lines[index];
         let trimmed = raw.trim_start();
-        if let Some((language, lines)) = code.as_mut() {
+        if let Some((language, lines, gap)) = code.as_mut() {
             let close = match &raw.trim() {
                 fence if fence.starts_with("```") && fence.chars().all(|c| c == '`') => Some(3),
                 fence if fence.starts_with("~~~") && fence.chars().all(|c| c == '~') => Some(3),
                 _ => None,
             };
             if close.is_some() {
-                out.push(Block::Code {
-                    language: language.take(),
-                    lines: std::mem::take(lines),
-                });
+                out.push((
+                    Block::Code {
+                        language: language.take(),
+                        lines: std::mem::take(lines),
+                    },
+                    *gap,
+                ));
                 code = None;
             } else {
                 lines.push(raw.to_string());
@@ -77,7 +103,12 @@ fn blocks(content: &str) -> Vec<Block> {
             let fence_len = trimmed.chars().take_while(|c| *c == marker).count();
             let info = trimmed[fence_len..].trim();
             let language = info.split(',').next().unwrap_or("").trim().to_string();
-            code = Some(((!language.is_empty()).then_some(language), Vec::new()));
+            code = Some((
+                (!language.is_empty()).then_some(language),
+                Vec::new(),
+                blank,
+            ));
+            blank = false;
             index += 1;
             continue;
         }
@@ -101,12 +132,14 @@ fn blocks(content: &str) -> Vec<Block> {
                 rows.push(row_cells(next_trimmed));
                 index += 1;
             }
-            out.push(Block::Table(rows));
+            out.push((Block::Table(rows), blank));
+            blank = false;
             continue;
         }
         if trimmed.is_empty() {
             flush_paragraph(&mut out, &mut paragraph);
             flush_quote(&mut out, &mut quote);
+            blank = true;
             index += 1;
             continue;
         }
@@ -115,39 +148,90 @@ fn blocks(content: &str) -> Vec<Block> {
             match block {
                 Block::Quote(text) => {
                     flush_quote(&mut out, &mut quote);
-                    let merged = quote.get_or_insert_with(String::new);
-                    if !merged.is_empty() {
-                        merged.push('\n');
+                    let merged = quote.get_or_insert_with(|| (String::new(), blank));
+                    if !merged.0.is_empty() {
+                        merged.0.push('\n');
                     }
-                    merged.push_str(&text);
+                    merged.0.push_str(&text);
                 }
                 Block::Code { .. } => unreachable!(),
                 other => {
                     flush_quote(&mut out, &mut quote);
-                    out.push(other);
+                    out.push((other, blank));
                 }
             }
+            blank = false;
             index += 1;
             continue;
         }
         flush_quote(&mut out, &mut quote);
-        let merged = paragraph.get_or_insert_with(String::new);
-        if !merged.is_empty() {
-            merged.push('\n');
+        let merged = paragraph.get_or_insert_with(|| (String::new(), blank));
+        if !merged.0.is_empty() {
+            merged.0.push('\n');
         }
-        merged.push_str(raw.trim());
+        merged.0.push_str(raw.trim());
+        blank = false;
         index += 1;
     }
 
-    if let Some((language, rows)) = code {
-        out.push(Block::Code {
-            language,
-            lines: rows,
-        });
+    if let Some((language, rows, gap)) = code {
+        out.push((
+            Block::Code {
+                language,
+                lines: rows,
+            },
+            gap,
+        ));
     }
     flush_paragraph(&mut out, &mut paragraph);
     flush_quote(&mut out, &mut quote);
+    resolve_list_markers(&mut out);
     out
+}
+
+/// `getListItemInputs` (`md-source.txt:705`) — every item of a list pads
+/// its marker to the widest ordered marker in that list. Group the flat
+/// list-item blocks of one list and stamp the width.
+fn resolve_list_markers(out: &mut [(Block, bool)]) {
+    let mut index = 0;
+    while index < out.len() {
+        if !matches!(out[index].0, Block::ListItem { .. }) {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < out.len() && matches!(out[index].0, Block::ListItem { .. }) {
+            index += 1;
+        }
+        let mut widths: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        for (block, _) in &out[start..index] {
+            if let Block::ListItem {
+                depth,
+                ordered: Some(number),
+                ..
+            } = block
+            {
+                let width = format!("{number}.").len();
+                let entry = widths.entry(*depth).or_insert(0);
+                *entry = (*entry).max(width);
+            }
+        }
+        for (block, _) in &mut out[start..index] {
+            if let Block::ListItem {
+                depth,
+                ordered,
+                marker_width,
+                ..
+            } = block
+            {
+                *marker_width = if ordered.is_some() {
+                    widths.get(depth).copied().unwrap_or(1)
+                } else {
+                    1
+                };
+            }
+        }
+    }
 }
 
 /// `#`-headings, rules, quotes, table rows and list items — every
@@ -166,6 +250,7 @@ fn structural_block(trimmed: &str, raw: &str) -> Option<Block> {
         depth,
         ordered,
         text,
+        marker_width: 1,
     })
 }
 
@@ -247,15 +332,15 @@ fn indent(raw: &str) -> usize {
     spaces / 2
 }
 
-fn flush_paragraph(out: &mut Vec<Block>, paragraph: &mut Option<String>) {
-    if let Some(text) = paragraph.take() {
-        out.push(Block::Paragraph(text));
+fn flush_paragraph(out: &mut Vec<(Block, bool)>, paragraph: &mut Option<(String, bool)>) {
+    if let Some((text, gap)) = paragraph.take() {
+        out.push((Block::Paragraph(text), gap));
     }
 }
 
-fn flush_quote(out: &mut Vec<Block>, quote: &mut Option<String>) {
-    if let Some(text) = quote.take() {
-        out.push(Block::Quote(text));
+fn flush_quote(out: &mut Vec<(Block, bool)>, quote: &mut Option<(String, bool)>) {
+    if let Some((text, gap)) = quote.take() {
+        out.push((Block::Quote(text), gap));
     }
 }
 
@@ -274,13 +359,19 @@ fn render_block(block: Block, theme: &Theme, width: u16) -> Vec<Line<'static>> {
             inline_wrap(&text, width, Some(style), theme)
         }
         Block::Quote(text) => {
-            let style = Style::new().fg(theme.markdown_block_quote.to_color());
+            // A left border `│` (`createBlockquoteRenderable`,
+            // md-source.txt:665) colored by the `conceal` scope
+            // (`theme.textMuted`, theme/index.ts:918); the body is
+            // `markup.quote` — markdownBlockQuote, italic.
+            let border = Style::new().fg(theme.text_muted.to_color());
+            let style = Style::new()
+                .fg(theme.markdown_block_quote.to_color())
+                .add_modifier(Modifier::ITALIC);
+            let prefix = vec![Span::styled("│ ", border)];
             let mut lines = Vec::new();
             for row in text.split('\n') {
-                let quote_style = Style::new().fg(theme.markdown_block_quote.to_color());
-                let mut spans = vec![Span::styled("> ", quote_style)];
-                spans.extend(inline_spans(row, theme, style));
-                lines.extend(wrap_spans(spans, width));
+                let spans = inline_spans(row, theme, style);
+                lines.extend(wrap_hanging(spans, width, prefix.clone(), prefix.clone()));
             }
             lines
         }
@@ -295,16 +386,27 @@ fn render_block(block: Block, theme: &Theme, width: u16) -> Vec<Line<'static>> {
             depth,
             ordered,
             text,
+            marker_width,
         } => {
-            let (bullet, color) = match ordered {
-                Some(number) => (format!("{number}. "), theme.markdown_list_enumeration),
-                None => ("• ".to_string(), theme.markdown_list_item),
-            };
+            // `createListItemRenderable` (md-source.txt:752): the marker
+            // sits in a fixed-width column (`- ` / `N.`, both `markup.list`
+            // → markdownListItem) and the content wraps in the box beside
+            // it, so continuation lines stay indented.
             let style = Style::new().fg(theme.markdown_text.to_color());
-            let mut spans: Vec<Span<'static>> = vec![Span::styled("  ".repeat(depth), style)];
-            spans.push(Span::styled(bullet, Style::new().fg(color.to_color())));
-            spans.extend(inline_spans(&text, theme, style));
-            wrap_spans(spans, width)
+            let marker_color = Style::new().fg(theme.markdown_list_item.to_color());
+            let marker = match ordered {
+                Some(number) => format!("{:>width$}", format!("{number}."), width = marker_width),
+                None => format!("{:>width$}", "-", width = marker_width),
+            };
+            let indent = "  ".repeat(depth);
+            let mut first: Vec<Span<'static>> = vec![Span::styled(indent.clone(), style)];
+            first.push(Span::styled(format!("{marker} "), marker_color));
+            let cont: Vec<Span<'static>> = vec![
+                Span::styled(indent, style),
+                Span::styled(" ".repeat(marker_width + 1), style),
+            ];
+            let content = inline_spans(&text, theme, style);
+            wrap_hanging(content, width, first, cont)
         }
         Block::Table(rows) => render_table(rows, theme, width),
         Block::Rule => vec![Line::from(Span::styled(
@@ -568,6 +670,40 @@ fn inline_wrap(text: &str, width: u16, base: Option<Style>, theme: &Theme) -> Ve
     lines
 }
 
+/// Word-wrap `spans` into a hanging-indent column: the first line is
+/// prefixed with `first`, continuation lines with `cont` (both the same
+/// width — the marker column of a list, the border of a quote). The
+/// content itself wraps to `width` minus that prefix.
+fn wrap_hanging(
+    spans: Vec<Span<'static>>,
+    width: u16,
+    first: Vec<Span<'static>>,
+    cont: Vec<Span<'static>>,
+) -> Vec<Line<'static>> {
+    let prefix = first
+        .iter()
+        .map(|span| span.content.chars().count())
+        .sum::<usize>();
+    let content_width = (width as usize).saturating_sub(prefix).max(1) as u16;
+    let wrapped = wrap_spans(spans, content_width);
+    if wrapped.is_empty() {
+        return vec![Line::from(first)];
+    }
+    wrapped
+        .into_iter()
+        .enumerate()
+        .map(|(index, line)| {
+            let mut spans = if index == 0 {
+                first.clone()
+            } else {
+                cont.clone()
+            };
+            spans.extend(line.spans);
+            Line::from(spans)
+        })
+        .collect()
+}
+
 /// Word-wrap a span list to `width` columns (char-based).
 pub(crate) fn wrap_spans(spans: Vec<Span<'static>>, width: u16) -> Vec<Line<'static>> {
     let width = (width.max(1) as usize).max(1);
@@ -668,7 +804,7 @@ mod tests {
     fn headings_are_bold_and_colored() {
         let theme = theme();
         let lines = render("# Title\n\nbody", 80, &theme);
-        let (heading, body) = (lines[0].clone(), lines[1].clone());
+        let heading = lines[0].clone();
         assert_eq!(heading.spans[0].content, "Title");
         assert_eq!(
             heading.spans[0].style.fg,
@@ -678,7 +814,10 @@ mod tests {
             .style
             .add_modifier
             .contains(ratatui::style::Modifier::BOLD));
-        assert_eq!(body.spans[0].content, "body");
+        // A heading is a separated block — the following paragraph is
+        // pushed down by one blank line.
+        assert_eq!(lines[1], Line::from(""));
+        assert_eq!(lines[2].spans[0].content, "body");
     }
 
     #[test]
@@ -687,8 +826,8 @@ mod tests {
         let lines = lines_of(markdown, 80);
         assert_eq!(
             lines,
-            vec!["before", "fn main() {}", "after"],
-            "fence lines drop, language tolerated"
+            vec!["before", "", "fn main() {}", "", "after"],
+            "fence lines drop, language tolerated; code is a separated block"
         );
     }
 
@@ -696,20 +835,50 @@ mod tests {
     fn unterminated_fence_is_streaming_safe() {
         let markdown = "text\n```python\nprint(1)\nprint(2)";
         let lines = lines_of(markdown, 80);
-        assert_eq!(lines, vec!["text", "print(1)", "print(2)"]);
+        assert_eq!(lines, vec!["text", "", "print(1)", "print(2)"]);
     }
 
     #[test]
     fn lists_render_bullets_and_numbers() {
         let markdown = "- one\n- two\n1. three\n  - nested";
         let lines = lines_of(markdown, 80);
-        assert_eq!(lines, vec!["• one", "• two", "1. three", "  • nested"]);
+        assert_eq!(lines, vec!["- one", "- two", "1. three", "  - nested"]);
     }
 
     #[test]
-    fn blockquotes_prefix_rows() {
+    fn list_continuation_lines_hang_under_the_marker() {
+        // `createListItemRenderable` keeps the marker in its own column,
+        // so wrapped content stays indented under it.
+        let lines = lines_of("- aaa bbb ccc ddd eee", 12);
+        assert_eq!(lines, vec!["- aaa bbb", "  ccc ddd", "  eee"]);
+        // Nested items still hang under their own marker.
+        let lines = lines_of("  - aaa bbb ccc ddd", 12);
+        assert_eq!(lines, vec!["  - aaa bbb", "    ccc ddd"]);
+    }
+
+    #[test]
+    fn blockquotes_use_a_left_border() {
         let lines = lines_of("> quoted text", 80);
-        assert_eq!(lines, vec!["> quoted text"]);
+        assert_eq!(lines, vec!["│ quoted text"]);
+        // Continuation rows keep the border prefix.
+        let lines = lines_of("> aaa bbb ccc ddd", 10);
+        assert_eq!(lines, vec!["│ aaa bbb", "│ ccc ddd"]);
+    }
+
+    #[test]
+    fn paragraphs_gain_a_gap_from_a_blank_line() {
+        let lines = lines_of("one\n\ntwo", 80);
+        assert_eq!(lines, vec!["one", "", "two"]);
+        // Without a blank line the lines stay one paragraph (a soft
+        // break is still a line break, but no blank line is inserted).
+        let lines = lines_of("one\ntwo", 80);
+        assert_eq!(lines, vec!["one", "two"]);
+    }
+
+    #[test]
+    fn separated_blocks_gain_a_gap() {
+        let lines = lines_of("intro\n- a\noutro", 80);
+        assert_eq!(lines, vec!["intro", "", "- a", "", "outro"]);
     }
 
     #[test]
@@ -746,7 +915,7 @@ mod tests {
     fn a_lone_pipe_row_is_prose() {
         // Without a following delimiter row it is not a table.
         let lines = lines_of("before\n\na | b\n\nafter", 40);
-        assert_eq!(lines, vec!["before", "a | b", "after"]);
+        assert_eq!(lines, vec!["before", "", "a | b", "", "after"]);
     }
 
     #[test]
@@ -809,6 +978,6 @@ mod tests {
     #[test]
     fn horizontal_rules_fill_the_width() {
         let lines = lines_of("a\n\n---\n\nb", 20);
-        assert_eq!(lines, vec!["a", "────────────────────", "b"]);
+        assert_eq!(lines, vec!["a", "", "────────────────────", "", "b"]);
     }
 }
