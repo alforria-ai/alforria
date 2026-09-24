@@ -1,20 +1,26 @@
 # Web UI: reuse upstream `packages/app`, embed it, improve it
 
-Status: M1 (fork + build + pack), M2 (embed + serve) and M3 (branding/theme)
-**landed**.
+Status: M1 (fork + build + pack), M2 (embed + serve), M3 (branding/theme) and
+M4 (wire parity) **landed**; continuing on UX polish.
 
-- `alforria-ai/web` @ `6960a17` holds the fork, `script/pack.ts`, and branding:
+- `alforria-ai/web` @ `cef4b1b` holds the fork, `script/pack.ts`, and branding:
   alforria wordmark, `<title>`/manifest, an `alforria` theme (cyan accent,
-  derived from oc-2) now the web default, home-route wordmark, and regenerated
-  favicon/apple-touch/PWA icons + social-share card.
-- `crates/alforria-ui/assets/ui.tar.zst` (8.9 MB) is embedded and served via
-  `EmbeddedUiBackend`; `OPENCODE_DISABLE_EMBEDDED_WEB_UI=1` reverts to the empty
-  backend.
+  derived from oc-2) now the web default, home-route wordmark, app-name i18n
+  strings, and regenerated favicon/apple-touch/PWA icons + social-share card.
+  The upstream bun `patches/` are vendored and registered via
+  `patchedDependencies` (notably `@pierre/trees`, `solid-js`) — without them the
+  tree/expansion tests and dialog typecheck fail.
+- `crates/alforria-ui/assets/ui.tar.zst` (8.9 MB, `OPENCODE_CHANNEL=prod`) is
+  embedded and served via `EmbeddedUiBackend`; `OPENCODE_DISABLE_EMBEDDED_WEB_UI=1`
+  reverts to the empty backend.
 - Verified end to end: `alforria serve` + headless Chrome renders the real SPA
-  against the Rust server, title/manifest `alforria`, cyan accent, wordmark on
-  home, icons served.
+  against the Rust server (home + session routes, live history/tool blocks/tabs/
+  composer, `/global/event` SSE), every request 200, zero console errors, no DEV
+  badge, `alforria` title/manifest, cyan accent, wordmark on home.
+- `packages/app` unit suite green (724 pass); `crates/alforria-ui` + server lib
+  tests green, `cargo fmt`/clippy clean.
 
-Next: M4 — wire parity / UX improvements.
+Next: M4+ — UX iteration (still wire-compatible presentation-only changes).
 
 Reference: upstream `anomalyco/opencode` @ `88c6c7abc7f320b6aabed2634ac0b2d6e6ecea67`
 (the pinned commit in `fixtures/PINNED.md`). Local clone: `/tmp/opencode-src`.
@@ -112,9 +118,12 @@ strings in `packages/app/src/i18n/en.ts`. Wire-compat surfaces (`opencode.json`,
 **Accept:** served UI shows the `alforria` wordmark/title; no `OpenCode` in the
 visible chrome; theme parity tests still green.
 
-### M4+ — Wire parity & UX
+### M4 — Wire parity
 Make the unmodified UI fully functional against the alforria server (event
-streams, session pages, prompts), then iterate on UX. Scoped after M1–M3 land.
+streams, session pages, prompts). **Landed:** the app's v1 auto-detection
+(`/global/health`) selects v1, both health endpoints and the whole v1 surface
+answer correctly, `/global/event` SSE connects, and home + session pages render
+live data. Next: UX iteration (presentation-only, wire-compatible).
 
 ## Cross-track contracts
 
