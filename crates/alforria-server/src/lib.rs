@@ -118,6 +118,23 @@ pub async fn listen(opts: &ListenOptions) -> io::Result<Listener> {
     listen_with(opts, ctx).await
 }
 
+/// The UI backend: the binary-embedded web UI unless disabled. TS
+/// `flags.disableEmbeddedWebUi` (`OPENCODE_DISABLE_EMBEDDED_WEB_UI`,
+/// `runtime-flags.ts:20`); when disabled the UI catch-all falls through to the
+/// JSON 404 envelope.
+fn ui_backend() -> Arc<dyn state::UiBackend> {
+    // `truthy()` (`flag.ts:4-6`): "true"/"1", lowercased.
+    let disabled = std::env::var("OPENCODE_DISABLE_EMBEDDED_WEB_UI")
+        .ok()
+        .map(|value| value.to_ascii_lowercase())
+        .is_some_and(|value| value == "true" || value == "1");
+    if disabled {
+        Arc::new(state::EmptyUiBackend)
+    } else {
+        Arc::new(state::EmbeddedUiBackend)
+    }
+}
+
 fn default_context(opts: &ListenOptions) -> io::Result<Arc<ServerContext>> {
     let paths = alforria_core::GlobalPaths::from_env();
     production_context(opts, paths, engine::EngineSeams::default())
@@ -164,7 +181,7 @@ pub fn production_context(
         storage,
         bus,
         opts.cors.clone(),
-        Arc::new(state::EmptyUiBackend),
+        ui_backend(),
     );
     ctx.engine_factory = engines.factory();
     ctx.tools = engines.tools();

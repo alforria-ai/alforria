@@ -1,0 +1,12 @@
+[package]
+name = "alforria-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+zstd = { workspace = true }
+tar = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]

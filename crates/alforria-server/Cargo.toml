@@ -9,6 +9,7 @@ sha2 = { workspace = true }
 alforria-llm = { workspace = true }
 alforria-schema = { workspace = true }
 alforria-core = { workspace = true }
+alforria-ui = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

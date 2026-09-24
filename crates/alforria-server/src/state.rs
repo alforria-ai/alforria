@@ -366,6 +366,29 @@ pub struct EmptyUiBackend;
 
 impl UiBackend for EmptyUiBackend {}
 
+/// The production backend: serves the web UI bundled into the binary from
+/// `alforria-ai/web` (via `crates/alforria-ui/assets/ui.tar.zst`). Requests
+/// are served from an in-memory map decompressed once per process.
+#[derive(Debug, Clone, Default)]
+pub struct EmbeddedUiBackend;
+
+impl UiBackend for EmbeddedUiBackend {
+    fn get(&self, path: &str) -> Option<UiFile> {
+        alforria_ui::bundle().get(path).map(ui_file)
+    }
+
+    fn index(&self) -> Option<UiFile> {
+        alforria_ui::bundle().index().map(ui_file)
+    }
+}
+
+fn ui_file(asset: &alforria_ui::Asset) -> UiFile {
+    UiFile {
+        mime: asset.mime.to_string(),
+        bytes: asset.bytes.clone(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // M6.6 service seams
 // ---------------------------------------------------------------------------
@@ -1298,6 +1321,11 @@ impl ServerContext {
 
     /// `for_tests` with an explicit auth config (M6.2 auth-middleware tests).
     pub fn for_tests_with_auth(auth: AuthConfig) -> ServerContext {
+        Self::for_tests_with_ui(auth, Arc::new(EmptyUiBackend))
+    }
+
+    /// `for_tests` with a specific UI backend (embedded-UI serving tests).
+    pub fn for_tests_with_ui(auth: AuthConfig, ui: Arc<dyn UiBackend>) -> ServerContext {
         let storage = Arc::new(Storage::open_in_memory().expect("in-memory storage"));
         ServerContext::new(
             auth,
@@ -1309,7 +1337,7 @@ impl ServerContext {
             storage.clone(),
             Arc::new(EventBus::new_shared(storage, None)),
             Vec::new(),
-            Arc::new(EmptyUiBackend),
+            ui,
         )
     }
 }

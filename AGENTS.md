@@ -13,6 +13,7 @@ crates/alforria-llm      # LLM protocols, LLMEvent stream, usage/cost, retries
 crates/alforria-core     # session engine, tools, config, storage, bus, catalog
 crates/alforria-server   # v1+v2 HTTP API, SSE, PTY websockets, auth
 crates/alforria-tui      # ratatui terminal UI (HTTP+SSE client of the server)
+crates/alforria-ui       # embedded web UI bundle (built in alforria-ai/web)
 crates/alforria          # CLI binary
 fixtures/                # FROZEN golden fixtures from the TS repo — never edit
 docs/plans/              # approved plans
@@ -27,6 +28,16 @@ cargo fmt --all --check                 # format check (CI enforced)
 cargo clippy --all-targets -- -D warnings   # lint (CI enforced)
 cargo nextest run                       # tests (fallback: cargo test --all)
 cargo test -p <crate>                   # tests for one crate
+```
+
+Web UI regeneration (source lives in `alforria-ai/web`, a fork of opencode's
+`packages/app` — see `docs/plans/web-ui.md`):
+
+```sh
+# in alforria-ai/web
+bun run build && bun run pack            # -> ui.tar.zst
+# in alforria
+cp <web>/ui.tar.zst crates/alforria-ui/assets/ui.tar.zst
 ```
 
 ## Conventions

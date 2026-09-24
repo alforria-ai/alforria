@@ -187,6 +187,74 @@ mod tests {
         assert_eq!(&bytes[..], b"{\"error\":\"Not Found\"}");
     }
 
+    #[tokio::test]
+    async fn embedded_backend_serves_index_with_csp() {
+        let ctx = std::sync::Arc::new(crate::state::ServerContext::for_tests_with_ui(
+            crate::state::AuthConfig::new("alforria", None),
+            std::sync::Arc::new(crate::state::EmbeddedUiBackend),
+        ));
+        // The root maps to `index.html` via the SPA fallback.
+        let response = serve_ui(&ctx, "/");
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers().get("content-type").unwrap(), "text/html");
+        // `index.html` carries the inline theme-preload script, so the CSP
+        // must include its sha256 hash (`cspForHtml`, ui.ts:12-19).
+        let csp = response
+            .headers()
+            .get("content-security-policy")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(csp.contains("sha256-"), "csp: {csp}");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8_lossy(&bytes);
+        assert!(html.contains("id=\"root\""), "index.html not served");
+    }
+
+    #[tokio::test]
+    async fn embedded_backend_falls_back_to_index_for_deep_links() {
+        let ctx = std::sync::Arc::new(crate::state::ServerContext::for_tests_with_ui(
+            crate::state::AuthConfig::new("alforria", None),
+            std::sync::Arc::new(crate::state::EmbeddedUiBackend),
+        ));
+        let response = serve_ui(&ctx, "/session/does-not-exist");
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers().get("content-type").unwrap(), "text/html");
+    }
+
+    #[tokio::test]
+    async fn embedded_backend_serves_known_asset_with_correct_mime() {
+        let ctx = std::sync::Arc::new(crate::state::ServerContext::for_tests_with_ui(
+            crate::state::AuthConfig::new("alforria", None),
+            std::sync::Arc::new(crate::state::EmbeddedUiBackend),
+        ));
+        // `site.webmanifest` ships at the UI root and must carry the manifest
+        // MIME (`mime-types` `lookup` behavior, `fs-util.ts:224-226`).
+        let response = serve_ui(&ctx, "/site.webmanifest");
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "application/manifest+json"
+        );
+    }
+
+    #[tokio::test]
+    async fn embedded_backend_falls_back_to_index_for_missing_assets() {
+        let ctx = std::sync::Arc::new(crate::state::ServerContext::for_tests_with_ui(
+            crate::state::AuthConfig::new("alforria", None),
+            std::sync::Arc::new(crate::state::EmbeddedUiBackend),
+        ));
+        // TS `serveEmbeddedUIEffect` does `embeddedWebUI[path] ?? index.html`
+        // (`shared/ui.ts:60`), so an unknown asset path still yields the SPA
+        // shell rather than a hard 404.
+        let response = serve_ui(&ctx, "/assets/does-not-exist.js");
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers().get("content-type").unwrap(), "text/html");
+    }
+
     #[test]
     fn csp_defaults_without_the_theme_preload_script() {
         let csp = csp_for_html("<html><body></body></html>");

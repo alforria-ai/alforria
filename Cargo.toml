@@ -6,6 +6,7 @@ members = [
     "crates/alforria-core",
     "crates/alforria-server",
     "crates/alforria-tui",
+    "crates/alforria-ui",
     "crates/alforria",
 ]
 
@@ -45,6 +46,8 @@ grep-regex = "0.1"
 grep-searcher = "0.1"
 base64 = "0.22"
 flate2 = "1"
+zstd = "0.13"
+tar = "0.4"
 tokio-util = "0.7"
 rust_decimal = "1"
 
@@ -85,6 +88,7 @@ alforria-llm = { path = "crates/alforria-llm" }
 alforria-core = { path = "crates/alforria-core" }
 alforria-server = { path = "crates/alforria-server" }
 alforria-tui = { path = "crates/alforria-tui" }
+alforria-ui = { path = "crates/alforria-ui" }
 
 [profile.dev]
 debug = 1
