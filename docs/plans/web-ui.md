@@ -1,16 +1,20 @@
 # Web UI: reuse upstream `packages/app`, embed it, improve it
 
-Status: M1 (fork + build + pack), M2 (embed + serve) and M3 first pass
-(wordmark/title/manifest) **landed**. Remaining branding: favicon/app
-icons and an alforria theme (accent/splash) — pending brand direction.
+Status: M1 (fork + build + pack), M2 (embed + serve) and M3 (branding/theme)
+**landed**.
 
-- `alforria-ai/web` @ `7751c35` holds the fork, `script/pack.ts`, and branding.
-- `crates/alforria-ui/assets/ui.tar.zst` (8.7 MB, 954 files) is embedded and
-  served via `EmbeddedUiBackend`; `OPENCODE_DISABLE_EMBEDDED_WEB_UI=1` reverts
-  to the empty backend.
+- `alforria-ai/web` @ `6960a17` holds the fork, `script/pack.ts`, and branding:
+  alforria wordmark, `<title>`/manifest, an `alforria` theme (cyan accent,
+  derived from oc-2) now the web default, home-route wordmark, and regenerated
+  favicon/apple-touch/PWA icons + social-share card.
+- `crates/alforria-ui/assets/ui.tar.zst` (8.9 MB) is embedded and served via
+  `EmbeddedUiBackend`; `OPENCODE_DISABLE_EMBEDDED_WEB_UI=1` reverts to the empty
+  backend.
 - Verified end to end: `alforria serve` + headless Chrome renders the real SPA
-  against the Rust server (projects/sessions/settings), title `alforria`,
-  manifest `alforria`.
+  against the Rust server, title/manifest `alforria`, cyan accent, wordmark on
+  home, icons served.
+
+Next: M4 — wire parity / UX improvements.
 
 Reference: upstream `anomalyco/opencode` @ `88c6c7abc7f320b6aabed2634ac0b2d6e6ecea67`
 (the pinned commit in `fixtures/PINNED.md`). Local clone: `/tmp/opencode-src`.
