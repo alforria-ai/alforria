@@ -200,6 +200,28 @@ also fire for subagent sessions. Verified headless (17/17): empty-state CTA,
 add menus, tab switch/close, sidebar drops (center + edge), tab move, reload
 persistence, iframe pane params, open-session focus/dedupe, and close-all.
 
+### M6 review pass — state retention, focus sync, a11y (landed)
+A four-agent review (UX heuristics, accessibility, visual consistency,
+correctness) drove a hardening pass:
+
+- **State retention:** per-tab persistent iframes (tab switches and
+  maximize/restore no longer reload panes), `collapse()` preserves resize
+  proportions on tab close/move, `resizeNode` rejects stale drag arrays.
+- **Focus sync:** embedded panes relay pane focus to the grid so toolbar and
+  sidebar actions target the pane the user is actually in; focused pane gets a
+  visible outline; active tab chip scrolls into view.
+- **Lifecycle:** deleted sessions prune their grid tabs and title relay; the
+  session cache is server-scoped and invalidated on deletion;
+  `replaceActiveTab` never destroys terminal tabs and closes the origin tab
+  when the target is already open; split with a vanished target no longer
+  persists a dangling focus id.
+- **A11y + consistency:** tab chips are real ARIA tabs (roving arrow keys,
+  Enter/Delete, focus rings, keyboard-revealed close); splitters are focusable
+  with arrow/Home/End resize and `aria-valuenow`; the grid toggle and split
+  buttons use layout glyphs instead of ambiguous icons; the sidebar gained a
+  hidden scrollbar, loading skeletons, and pressed/focus states; postMessage
+  handlers validate origin. Unit suite grew to 31 grid tests; harness 17/17.
+
 ## Cross-track contracts
 
 - **Dist is build output**, never committed; Rust builds must not *require* a
