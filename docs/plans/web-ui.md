@@ -168,6 +168,16 @@ grid, add pane, add/switch/close tab, split, persistence, and zero exceptions.
 Still to come in M6: a left tree of projects + sessions with drag-and-drop into
 panes, and new-session placement (tab in the focused pane, or new space).
 
+### M6 side tree and new-session placement (landed)
+A left sidebar in grid mode lists every project the server knows and, per
+project, its sessions (fetched per directory). Sessions can be **clicked** to
+add a tab to the focused pane or **dragged** onto a pane to add a tab, onto the
+empty grid area to create a new pane. Each project row has a **New session**
+control whose menu creates a session and opens it either as a tab in the focused
+pane or as a new grid space. Verified headless (23/23 overall): tree listing,
+click-to-tab, drag-to-pane, drag-to-new-pane, and both new-session placements,
+with zero exceptions.
+
 ## Cross-track contracts
 
 - **Dist is build output**, never committed; Rust builds must not *require* a
