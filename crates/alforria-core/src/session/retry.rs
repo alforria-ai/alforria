@@ -22,7 +22,11 @@ pub const RETRY_MAX_DELAY_NO_HEADERS: f64 = 30_000.0;
 pub const RETRY_MAX_DELAY: f64 = 2_147_483_647.0;
 pub const RETRY_MAX_RETRIES: u64 = 5;
 
-/// The 7 retryable-message regexes (retry.ts:33-41), verbatim.
+/// The 7 retryable-message regexes (retry.ts:33-41), verbatim, plus a Rust
+/// addition: the native runtime's HTTP client (reqwest) words transport
+/// failures "error sending request for url (…)" where the TS runtime's fetch
+/// says "fetch failed" (already covered by pattern 4). Match it so transport
+/// failures retry like they do on the TS side.
 static RETRYABLE_MESSAGE_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     #[rustfmt::skip]
     let patterns = [
@@ -33,6 +37,8 @@ static RETRYABLE_MESSAGE_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         r"^timeout$|\b(?:request|response|connection|network|stream|read) (?:timeout|timed out|time out)\b",
         r"try your request again|retry your request|resource exhausted|resource_exhausted",
         r"\btry again (?:later|in\b)|\b(?:currently|temporarily) at capacity\b",
+        // Rust addition (reqwest transport failure wording).
+        r"error sending request",
     ];
     patterns
         .iter()
@@ -1172,6 +1178,26 @@ mod tests {
                 "{message}"
             );
         }
+    }
+
+    /// The native runtime's reqwest transport failures surface through the
+    /// generic-error branch as `RequestExecutor.execute: error sending
+    /// request for url (…)` (the TS runtime's fetch wording — "fetch
+    /// failed" — matches pattern 4). They must retry the same way.
+    #[test]
+    fn reqwest_transport_failures_are_retryable() {
+        let message = "RequestExecutor.execute: error sending request for url (https://api.libertai.io/v1/chat/completions)";
+        let error = AssistantError::Unknown {
+            message: message.to_string(),
+            r#ref: None,
+        };
+        assert_eq!(
+            retryable(&error, "libertai"),
+            Some(Retryable {
+                message: message.to_string(),
+                action: None,
+            })
+        );
     }
 
     /// Retry-policy property test: fake clock + fake random, exact attempt
