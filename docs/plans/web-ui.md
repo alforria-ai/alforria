@@ -178,6 +178,28 @@ pane or as a new grid space. Verified headless (23/23 overall): tree listing,
 click-to-tab, drag-to-pane, drag-to-new-pane, and both new-session placements,
 with zero exceptions.
 
+### M6 grid UX redesign + cross-session navigation (landed)
+Chrome overhaul driven by user feedback ("the whole grid and tabs system is
+broken"): ButtonV2/IconButtonV2/MenuV2/TooltipV2 chrome, one add-menu per pane
+header plus a toolbar add button, an empty-grid state with a New session CTA
+and drop hint, drop-region indicators while dragging, and a drag cover so
+iframes cannot swallow drag events. Pane titles are relayed from embedded
+sessions via postMessage (never raw `ses_…` ids).
+
+Cross-session links route through a new **open-session channel**:
+- already open somewhere → focus that pane and activate its tab,
+- a subagent session → open in the pane showing its parent,
+- pane-local navigation (parent breadcrumb, archive fallthrough) → replaces the
+  origin pane's active tab in place,
+- anything else → opens in the focused pane.
+
+Same-window callers (notifications) dispatch a cancelable window event and fall
+back to route navigation when no grid handles it; embedded panes postMessage
+up (iframes carry a `pane` id so requests know their origin). Notifications now
+also fire for subagent sessions. Verified headless (17/17): empty-state CTA,
+add menus, tab switch/close, sidebar drops (center + edge), tab move, reload
+persistence, iframe pane params, open-session focus/dedupe, and close-all.
+
 ## Cross-track contracts
 
 - **Dist is build output**, never committed; Rust builds must not *require* a
