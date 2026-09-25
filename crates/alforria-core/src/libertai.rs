@@ -37,7 +37,13 @@ const CACHE_FILE: &str = "ltai-pricing.json";
 const CACHE_TTL_SECS: u64 = 24 * 60 * 60;
 
 /// Field required by the catalog `Model` type; no upstream data carries it.
-const RELEASE_DATE: &str = "2026-09-22";
+/// Must stay empty: a fabricated date flows into `/config/providers`, where
+/// the web model picker applies its "hide models with a valid release date
+/// that are not the newest of their family" heuristic — with one uniform
+/// date every non-first model of a family gets hidden. An empty string is
+/// not a parsable date, so the picker defaults to visible (matching TS,
+/// where config-only providers carry no release date at all).
+const RELEASE_DATE: &str = "";
 
 // ---------------------------------------------------------------------------
 // LTAI_PRICING wire types
@@ -449,5 +455,20 @@ mod tests {
         assert_eq!(thinking.cost, models["glm-5.3"].cost);
         assert_eq!(thinking.limit, models["glm-5.3"].limit);
         assert!(!models.contains_key("glm-5.3-flash-thinking"));
+    }
+
+    /// No model may carry a parsable release date: the web model picker
+    /// hides valid-dated models that are not the newest of their family, so
+    /// a fabricated uniform date hides everything but one model per family.
+    #[test]
+    fn release_dates_stay_empty() {
+        let models = models_from_pricing(&snapshot_pricing());
+        assert!(!models.is_empty());
+        for model in models.values() {
+            assert_eq!(model.release_date, "", "{}", model.id);
+        }
+        for model in fallback_models().values() {
+            assert_eq!(model.release_date, "", "{}", model.id);
+        }
     }
 }
