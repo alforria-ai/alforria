@@ -154,6 +154,20 @@ while grid mode is active so a tab click can never be masked by the grid.
 unknown-session panes, 8-pane layouts, close-all → tabs, maximise-then-close,
 rapid toggling, and deep links.
 
+### M6 — Desktop-first grid and tabbed panes
+Grid is the **default on desktop** (≥768px) and always disabled on mobile,
+where the normal tab strip renders. Mode is stored as `"auto"` and resolved
+against the viewport, so an explicit user choice still wins on desktop.
+
+Each grid **pane is now a tab container**: it holds several session/terminal
+tabs with its own tab strip, per-tab close, and an add-tab menu; splitting
+creates a new pane. The previous single-view pane shape migrates into a
+one-tab container on load. Verified in headless Chrome (15/15): desktop default
+grid, add pane, add/switch/close tab, split, persistence, and zero exceptions.
+
+Still to come in M6: a left tree of projects + sessions with drag-and-drop into
+panes, and new-session placement (tab in the focused pane, or new space).
+
 ## Cross-track contracts
 
 - **Dist is build output**, never committed; Rust builds must not *require* a
