@@ -307,6 +307,31 @@ fn render_lines(app: &mut App, width: u16, height: u16) -> Vec<String> {
         .collect()
 }
 
+/// The panel's own rows, read cell by cell from the buffer inside the
+/// placed frame — never the backdrop beside it, whatever its glyph widths.
+fn render_panel(app: &mut App, width: u16, height: u16) -> Vec<String> {
+    app.ui.terminal_width = width;
+    app.ui.terminal_height = height;
+    let backend = ratatui::backend::TestBackend::new(width, height);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            crate::ui::view(app, frame);
+        })
+        .unwrap();
+    let rect = placed(app).expect("dialog placed").rect;
+    let buffer = terminal.backend().buffer();
+    (rect.top()..rect.bottom())
+        .map(|y| {
+            (rect.left()..rect.right())
+                .map(|x| buffer[(x, y)].symbol().to_string())
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
+        .collect()
+}
+
 fn rendered_text(lines: &[String]) -> String {
     lines.join("\n")
 }
@@ -599,20 +624,9 @@ fn oauth_dialog_renders_the_link_instructions_and_state() {
     for width in [40u16, 80, 140] {
         let mut app = new_app();
         open(&mut app, oauth_dialog(true, true));
-        let rows = render_lines(&mut app, width, 40);
-        // Only the dialog's own columns — the backdrop shows the session
+        // Only the dialog's own cells — the backdrop shows the session
         // prompt beside it.
-        let rect = placed(&app).expect("dialog placed").rect;
-        let cropped: Vec<String> = rows
-            .iter()
-            .map(|row| {
-                row.chars()
-                    .skip(rect.x as usize)
-                    .take(rect.width as usize)
-                    .collect()
-            })
-            .collect();
-        let text = rendered_text(&cropped);
+        let text = rendered_text(&render_panel(&mut app, width, 40));
         // Wrap-tolerant views: prose with whitespace collapsed, the URL
         // with it removed.
         let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");

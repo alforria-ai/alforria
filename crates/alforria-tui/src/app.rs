@@ -132,8 +132,9 @@ pub fn post_update(app: &mut App) -> Vec<Effect> {
     }
 
     // The prompt loses focus while a dialog is open and reclaims it
-    // after (`prompt/index.tsx:635-645`).
-    app.ui.prompt_focused = app.ui.dialogs.is_empty();
+    // after (`prompt/index.tsx:635-645`); a pending permission/question
+    // unmounts it (`session/index.tsx:240-241`).
+    app.ui.prompt_focused = app.ui.dialogs.is_empty() && !crate::ui::session::prompt_replaced(app);
 
     // While a dialog is open the keymap's modal mode is pushed
     // (`ui/dialog.tsx:79-90`); while a question is pending the question

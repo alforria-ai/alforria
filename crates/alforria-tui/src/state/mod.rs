@@ -553,6 +553,11 @@ pub enum Msg {
 pub enum Effect {
     /// `bootstrap()` (`sync.tsx:451`) — `server.instance.disposed`.
     Bootstrap { fatal: bool },
+    /// List the pending permissions and questions (`GET /permission`,
+    /// `GET /question`) — at startup and on every stream (re)connect — and
+    /// reconcile them with the live events
+    /// ([`sync::prompts_fetched`](crate::state::sync::prompts_fetched)).
+    PromptsRefresh,
     /// Auto-reply to a permission under `"auto"` mode
     /// (`sync.tsx:196-207`).
     PermissionAutoReply {
@@ -812,10 +817,13 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             } else if let Some(handled) = crate::ui::session::question::handle_key(app, &key) {
                 effects.extend(handled);
             } else {
+                // Keys a pending permission/question does not own reach
+                // the keymap like any other (`ctrl+p`, leader sequences).
                 let context = crate::keymap::DispatchContext {
                     route_is_session: matches!(app.state.route.data, Route::Session { .. }),
                     prompt_focused: app.ui.prompt_focused,
                     foreground_tasks: crate::command::foreground_tasks(app) > 0,
+                    prompt_mounted: !crate::ui::session::prompt_replaced(app),
                 };
                 let commands = app.keymap.dispatch(&context, &key, app.ui.tick_ms);
                 // While the autocomplete is open it takes the keyboard
@@ -840,6 +848,18 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                 for (name, enabled) in commands.iter().zip(enabled) {
                     if !enabled {
                         continue;
+                    }
+                    // A pending permission/question overrides `app.exit`
+                    // (`permission.tsx:451-460`, `question.tsx:225-233`):
+                    // `<leader>q` rejects instead of quitting.
+                    if *name == "app.exit" {
+                        if let Some(reply) = crate::ui::session::permission::app_exit(app)
+                            .or_else(|| crate::ui::session::question::app_exit(app))
+                        {
+                            effects.extend(reply);
+                            handled = true;
+                            continue;
+                        }
                     }
                     if prompt::handle_command(app, name) {
                         handled = true;

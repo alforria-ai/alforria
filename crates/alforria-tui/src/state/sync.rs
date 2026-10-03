@@ -76,6 +76,34 @@ pub struct SyncState {
     pub full_synced: HashSet<String>,
     /// `hydratingSessions` (`sync.tsx:152`).
     pub hydrating_sessions: HashMap<String, HydrateTracker>,
+    /// The live prompt events seen while a pending-prompt listing is in
+    /// flight — see [`prompts_fetched`].
+    pub prompts_fetch: PromptsFetch,
+}
+
+/// The `permission.*`/`question.*` request ids seen live while a `GET
+/// /permission` + `GET /question` listing is in flight, so its (older)
+/// snapshot neither resurrects a request answered meanwhile nor drops one
+/// asked meanwhile.
+#[derive(Debug, Clone, Default)]
+pub struct PromptsFetch {
+    in_flight: u32,
+    asked: HashSet<String>,
+    resolved: HashSet<String>,
+}
+
+impl PromptsFetch {
+    fn asked(&mut self, id: &str) {
+        if self.in_flight > 0 {
+            self.asked.insert(id.to_string());
+        }
+    }
+
+    fn resolved(&mut self, id: &str) {
+        if self.in_flight > 0 {
+            self.resolved.insert(id.to_string());
+        }
+    }
 }
 
 fn empty_console_state() -> Value {
@@ -297,9 +325,13 @@ pub fn apply_event(state: &mut State, bus_event: BusEvent) -> Vec<Effect> {
     let sync = &mut state.sync;
     match event {
         Event::ServerInstanceDisposed(_) => {
-            vec![Effect::Bootstrap { fatal: true }]
+            vec![Effect::Bootstrap { fatal: true }, Effect::PromptsRefresh]
         }
+        // Every (re)connect: the requests asked or answered while the
+        // stream was down never arrive as events — list them.
+        Event::ServerConnected(_) => vec![Effect::PromptsRefresh],
         Event::PermissionReplied(data) => {
+            sync.prompts_fetch.resolved(&data.request_id);
             let Some(requests) = sync.permission.get_mut(&data.session_id) else {
                 return Vec::new();
             };
@@ -312,6 +344,7 @@ pub fn apply_event(state: &mut State, bus_event: BusEvent) -> Vec<Effect> {
             Vec::new()
         }
         Event::PermissionAsked(request) => {
+            sync.prompts_fetch.asked(&request.id);
             if state.permission_mode == crate::state::PermissionMode::Auto {
                 return vec![Effect::PermissionAutoReply {
                     request_id: request.id,
@@ -333,14 +366,17 @@ pub fn apply_event(state: &mut State, bus_event: BusEvent) -> Vec<Effect> {
             Vec::new()
         }
         Event::QuestionReplied(data) => {
+            sync.prompts_fetch.resolved(&data.request_id);
             remove_question(sync, &data.session_id, &data.request_id);
             Vec::new()
         }
         Event::QuestionRejected(data) => {
+            sync.prompts_fetch.resolved(&data.request_id);
             remove_question(sync, &data.session_id, &data.request_id);
             Vec::new()
         }
         Event::QuestionAsked(data) => {
+            sync.prompts_fetch.asked(&data.id);
             let request = question_request(data);
             let requests = sync.question.entry(request.session_id.clone()).or_default();
             let m = search(requests, &request.id, |r| r.id.clone());
@@ -528,6 +564,109 @@ fn remove_question(sync: &mut SyncState, session_id: &str, request_id: &str) {
     if m.found {
         requests.remove(m.index);
     }
+}
+
+// ------------------------------------------------------ pending prompts
+
+/// A `GET /permission` + `GET /question` listing starts: track the live
+/// prompt events from here until it lands.
+pub fn prompts_fetch_begin(sync: &mut SyncState) {
+    sync.prompts_fetch.in_flight += 1;
+}
+
+/// A pending-prompt listing landed (`None`: that half failed and changes
+/// nothing). The TS TUI only learns of requests from live events, so a
+/// session already waiting when the TUI attaches — or that asked while the
+/// stream was down — would stay stuck unseen; the listing closes that gap.
+///
+/// Reconciled with the live events since [`prompts_fetch_begin`]: a
+/// request answered meanwhile is not resurrected, one asked meanwhile is
+/// kept, a listed one already present is replaced, not duplicated. A local
+/// request the listing lacks is dropped as answered while unseen — when
+/// its session belongs to this listing (a session of this directory);
+/// other directories' requests are left alone. Under `--auto` the listed
+/// permissions are answered like `permission.asked` ones
+/// (`sync.tsx:198-205`) instead of stored.
+pub fn prompts_fetched(
+    state: &mut State,
+    permissions: Option<Vec<PermissionV1Request>>,
+    questions: Option<Vec<QuestionV1Request>>,
+) -> Vec<Effect> {
+    let mut effects = Vec::new();
+    let sync = &mut state.sync;
+    let known: HashSet<String> = sync.session.iter().map(|s| s.id.clone()).collect();
+    let fetch = std::mem::take(&mut sync.prompts_fetch);
+    if let Some(mut listed) = permissions {
+        listed.retain(|request| !fetch.resolved.contains(&request.id));
+        if state.permission_mode == crate::state::PermissionMode::Auto {
+            let metadata = crate::transport::events::EventMetadata {
+                directory: None,
+                workspace: state.project.workspace.current.clone(),
+            };
+            effects.extend(listed.drain(..).map(|request| Effect::PermissionAutoReply {
+                request_id: request.id,
+                reply: PermissionV1Reply::Once,
+                metadata: metadata.clone(),
+            }));
+        }
+        reconcile_requests(
+            &mut sync.permission,
+            listed,
+            &fetch.asked,
+            &known,
+            |r: &PermissionV1Request| (r.id.clone(), r.session_id.clone()),
+        );
+    }
+    if let Some(mut listed) = questions {
+        listed.retain(|request| !fetch.resolved.contains(&request.id));
+        reconcile_requests(
+            &mut sync.question,
+            listed,
+            &fetch.asked,
+            &known,
+            |r: &QuestionV1Request| (r.id.clone(), r.session_id.clone()),
+        );
+    }
+    // Overlapping listings share one tracker until the last one lands.
+    sync.prompts_fetch = fetch;
+    sync.prompts_fetch.in_flight = sync.prompts_fetch.in_flight.saturating_sub(1);
+    if sync.prompts_fetch.in_flight == 0 {
+        sync.prompts_fetch = PromptsFetch::default();
+    }
+    effects
+}
+
+/// One request map reconciled with a listing — sorted by id per session,
+/// as the event handlers keep it.
+fn reconcile_requests<T>(
+    map: &mut BTreeMap<String, Vec<T>>,
+    listed: Vec<T>,
+    asked: &HashSet<String>,
+    known: &HashSet<String>,
+    ids: impl Fn(&T) -> (String, String),
+) {
+    let listed_ids: HashSet<String> = listed.iter().map(|request| ids(request).0).collect();
+    let listed_sessions: HashSet<String> = listed.iter().map(|request| ids(request).1).collect();
+    for (session_id, requests) in map.iter_mut() {
+        if !known.contains(session_id) && !listed_sessions.contains(session_id) {
+            continue;
+        }
+        requests.retain(|request| {
+            let id = ids(request).0;
+            listed_ids.contains(&id) || asked.contains(&id)
+        });
+    }
+    for request in listed {
+        let (id, session_id) = ids(&request);
+        let requests = map.entry(session_id).or_default();
+        let m = search(requests, &id, |r| ids(r).0);
+        if m.found {
+            requests[m.index] = request;
+        } else {
+            requests.insert(m.index, request);
+        }
+    }
+    map.retain(|_, requests| !requests.is_empty());
 }
 
 // ----------------------------------------------------------- bootstrap
@@ -1285,6 +1424,201 @@ mod tests {
         assert_eq!(ids, vec!["per_b"]);
     }
 
+    // -------------------------------------------------- pending prompts
+
+    fn listed_permission(id: &str, session: &str) -> PermissionV1Request {
+        PermissionV1Request {
+            id: id.to_string(),
+            session_id: session.to_string(),
+            permission: "bash".to_string(),
+            patterns: vec!["echo".to_string()],
+            metadata: serde_json::Map::new(),
+            always: vec![],
+            tool: None,
+        }
+    }
+
+    fn listed_question(id: &str, session: &str) -> QuestionV1Request {
+        QuestionV1Request {
+            id: id.to_string(),
+            session_id: session.to_string(),
+            questions: vec![],
+            tool: None,
+        }
+    }
+
+    fn permission_ids(state: &State) -> Vec<(String, String)> {
+        state
+            .sync
+            .permission
+            .iter()
+            .flat_map(|(session, requests)| {
+                requests
+                    .iter()
+                    .map(move |request| (session.clone(), request.id.clone()))
+            })
+            .collect()
+    }
+
+    fn known_session(state: &mut State, id: &str) {
+        state
+            .sync
+            .session
+            .push(crate::ui::session::tests::session_info(id, "x"));
+    }
+
+    #[test]
+    fn every_connect_lists_the_pending_prompts() {
+        let mut state = state_for_test();
+        let effects = apply_event(
+            &mut state,
+            bus(Event::ServerConnected(
+                alforria_schema::server_event::ServerConnectedData {},
+            )),
+        );
+        assert!(matches!(effects.as_slice(), [Effect::PromptsRefresh]));
+    }
+
+    #[test]
+    fn a_listing_shows_requests_that_were_already_waiting() {
+        let mut state = state_for_test();
+        prompts_fetch_begin(&mut state.sync);
+        let effects = prompts_fetched(
+            &mut state,
+            Some(vec![
+                listed_permission("per_b", "ses_a"),
+                listed_permission("per_a", "ses_a"),
+            ]),
+            Some(vec![listed_question("que_1", "ses_b")]),
+        );
+        assert!(effects.is_empty());
+        assert_eq!(
+            permission_ids(&state),
+            [("ses_a", "per_a"), ("ses_a", "per_b")].map(|(s, i)| (s.into(), i.into()))
+        );
+        assert_eq!(state.sync.question["ses_b"][0].id, "que_1");
+    }
+
+    #[test]
+    fn a_listing_and_the_live_events_never_duplicate() {
+        let mut state = state_for_test();
+        known_session(&mut state, "ses_a");
+        apply_event(&mut state, bus(permission_asked("per_a", "ses_a")));
+        prompts_fetch_begin(&mut state.sync);
+        // Asked while the listing is in flight, and listed too.
+        apply_event(&mut state, bus(permission_asked("per_b", "ses_a")));
+        prompts_fetched(
+            &mut state,
+            Some(vec![
+                listed_permission("per_a", "ses_a"),
+                listed_permission("per_b", "ses_a"),
+            ]),
+            None,
+        );
+        assert_eq!(
+            permission_ids(&state),
+            [("ses_a", "per_a"), ("ses_a", "per_b")].map(|(s, i)| (s.into(), i.into()))
+        );
+        // A later live event for a listed request replaces it in place.
+        apply_event(&mut state, bus(permission_asked("per_a", "ses_a")));
+        assert_eq!(permission_ids(&state).len(), 2);
+    }
+
+    #[test]
+    fn a_listing_respects_what_happened_while_it_was_in_flight() {
+        let mut state = state_for_test();
+        known_session(&mut state, "ses_a");
+        prompts_fetch_begin(&mut state.sync);
+        // Answered after the server built the snapshot: not resurrected.
+        apply_event(&mut state, bus(permission_asked("per_old", "ses_a")));
+        apply_event(
+            &mut state,
+            bus(Event::PermissionReplied(
+                alforria_schema::permission_v1::PermissionRepliedData {
+                    session_id: "ses_a".into(),
+                    request_id: "per_old".into(),
+                    reply: PermissionV1Reply::Once,
+                },
+            )),
+        );
+        // Asked after the snapshot: kept although unlisted.
+        apply_event(&mut state, bus(permission_asked("per_new", "ses_a")));
+        prompts_fetched(
+            &mut state,
+            Some(vec![listed_permission("per_old", "ses_a")]),
+            None,
+        );
+        assert_eq!(
+            permission_ids(&state),
+            [("ses_a", "per_new")].map(|(s, i)| (s.into(), i.into()))
+        );
+    }
+
+    #[test]
+    fn a_reconnect_drops_requests_answered_while_disconnected() {
+        let mut state = state_for_test();
+        known_session(&mut state, "ses_a");
+        apply_event(&mut state, bus(permission_asked("per_gone", "ses_a")));
+        apply_event(&mut state, bus(question_asked("que_gone", "ses_a")));
+        // Another directory's request (a session this TUI doesn't list) is
+        // not this listing's to judge.
+        apply_event(
+            &mut state,
+            bus(permission_asked("per_other", "ses_elsewhere")),
+        );
+        prompts_fetch_begin(&mut state.sync);
+        prompts_fetched(&mut state, Some(Vec::new()), Some(Vec::new()));
+        assert_eq!(
+            permission_ids(&state),
+            [("ses_elsewhere", "per_other")].map(|(s, i)| (s.into(), i.into()))
+        );
+        assert!(state.sync.question.is_empty());
+        // A failed half changes nothing.
+        apply_event(&mut state, bus(question_asked("que_kept", "ses_a")));
+        prompts_fetch_begin(&mut state.sync);
+        prompts_fetched(&mut state, None, None);
+        assert_eq!(state.sync.question["ses_a"][0].id, "que_kept");
+    }
+
+    #[test]
+    fn auto_mode_answers_listed_permissions() {
+        let mut state = state_for_test();
+        state.permission_mode = PermissionMode::Auto;
+        prompts_fetch_begin(&mut state.sync);
+        let effects = prompts_fetched(
+            &mut state,
+            Some(vec![listed_permission("per_1", "ses_a")]),
+            None,
+        );
+        assert!(state.sync.permission.is_empty());
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::PermissionAutoReply { request_id, reply: PermissionV1Reply::Once, .. }]
+                if request_id == "per_1"
+        ));
+    }
+
+    #[test]
+    fn overlapping_listings_share_the_event_tracking() {
+        let mut state = state_for_test();
+        known_session(&mut state, "ses_a");
+        prompts_fetch_begin(&mut state.sync);
+        prompts_fetch_begin(&mut state.sync);
+        apply_event(&mut state, bus(permission_asked("per_new", "ses_a")));
+        prompts_fetched(&mut state, Some(Vec::new()), None);
+        // The second, older-snapshot listing still keeps the live request.
+        prompts_fetched(&mut state, Some(Vec::new()), None);
+        assert_eq!(
+            permission_ids(&state),
+            [("ses_a", "per_new")].map(|(s, i)| (s.into(), i.into()))
+        );
+        // Tracking stops once both landed.
+        apply_event(&mut state, bus(permission_asked("per_later", "ses_a")));
+        prompts_fetch_begin(&mut state.sync);
+        prompts_fetched(&mut state, Some(Vec::new()), None);
+        assert!(state.sync.permission.is_empty());
+    }
+
     // -------------------------------------------------------- questions
 
     fn question_asked(id: &str, session: &str) -> Event {
@@ -1645,8 +1979,9 @@ mod tests {
                 },
             )),
         );
+        // The restarted instance's pending prompts are re-listed too.
         match effects.as_slice() {
-            [Effect::Bootstrap { fatal }] => assert!(*fatal),
+            [Effect::Bootstrap { fatal }, Effect::PromptsRefresh] => assert!(*fatal),
             _ => panic!("expected a bootstrap effect, got {effects:?}"),
         }
     }
@@ -1991,6 +2326,12 @@ mod tests {
             _loc: &Location,
         ) -> Result<std::collections::BTreeMap<String, SessionStatusInfo>> {
             Ok(std::collections::BTreeMap::new())
+        }
+        async fn permission_list(&self, _loc: &Location) -> Result<Vec<PermissionV1Request>> {
+            Ok(Vec::new())
+        }
+        async fn question_list(&self, _loc: &Location) -> Result<Vec<QuestionV1Request>> {
+            Ok(Vec::new())
         }
         async fn permission_reply(
             &self,

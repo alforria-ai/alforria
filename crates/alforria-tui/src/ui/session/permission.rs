@@ -378,10 +378,19 @@ fn reply_effect(
     }
 }
 
-/// Handle a key while a permission request is pending. `None` = no
-/// request pending (fall through to the normal keymap).
+/// Handle a key while a permission request is pending. The prompt owns
+/// only its own bindings (`permission.tsx:449-470,545-620`): left/`h`,
+/// right/`l`, return, escape, `app.exit` and the fullscreen toggle — plus
+/// the reject textarea's typing. `None` = not the prompt's key (or no
+/// request pending): it falls through to the keymap, so the base-mode
+/// app and session bindings (`ctrl+p`, leader sequences, scrolling) stay
+/// live as in TS, where the prompt replaces the unmounted `<Prompt>`.
 pub fn handle_key(app: &mut App, key: &crossterm::event::KeyEvent) -> Option<Vec<Effect>> {
     let request = visible(app)?;
+    // A pending leader sequence completes in the keymap first.
+    if !app.keymap.pending_sequence().is_empty() {
+        return None;
+    }
     let session_parent = app
         .state
         .sync
@@ -390,17 +399,19 @@ pub fn handle_key(app: &mut App, key: &crossterm::event::KeyEvent) -> Option<Vec
         .unwrap_or(None);
     let stage = app.ui.permission.stage;
     let kind = key.code;
-    let left_right = matches!(
-        kind,
-        crossterm::event::KeyCode::Left | crossterm::event::KeyCode::Char('h')
+    let plain = !key.modifiers.intersects(
+        crossterm::event::KeyModifiers::CONTROL
+            | crossterm::event::KeyModifiers::ALT
+            | crossterm::event::KeyModifiers::SUPER,
     );
-    let right = matches!(
-        kind,
-        crossterm::event::KeyCode::Right | crossterm::event::KeyCode::Char('l')
-    );
+    let left_right = kind == crossterm::event::KeyCode::Left
+        || (plain && kind == crossterm::event::KeyCode::Char('h'));
+    let right = kind == crossterm::event::KeyCode::Right
+        || (plain && kind == crossterm::event::KeyCode::Char('l'));
     let escape = kind == crossterm::event::KeyCode::Esc;
     let enter = kind == crossterm::event::KeyCode::Enter;
     let state = app.keymap.matches("app_exit", key);
+    let fullscreen = app.keymap.matches("permission.prompt.fullscreen", key);
 
     match stage {
         PermissionStage::Permission => {
@@ -416,8 +427,10 @@ pub fn handle_key(app: &mut App, key: &crossterm::event::KeyEvent) -> Option<Vec
                 // `escapeKey: "reject"` (`permission.tsx:405-407`).
                 app.ui.permission.selected = 2;
                 return Some(select(app, &request, session_parent));
-            } else if app.keymap.matches("permission.prompt.fullscreen", key) {
+            } else if fullscreen {
                 app.ui.permission.expanded = !app.ui.permission.expanded;
+            } else {
+                return None;
             }
         }
         PermissionStage::Always => {
@@ -438,9 +451,13 @@ pub fn handle_key(app: &mut App, key: &crossterm::event::KeyEvent) -> Option<Vec
                 // `escapeKey: "cancel"`.
                 app.ui.permission.stage = PermissionStage::Permission;
                 app.ui.permission.selected = 0;
+            } else if !fullscreen {
+                return None;
             }
         }
         PermissionStage::Reject => {
+            // The focused textarea takes its editing keys
+            // (`permission.tsx:501-510`); chords fall through.
             if escape || state {
                 app.ui.permission.stage = PermissionStage::Permission;
             } else if enter {
@@ -456,17 +473,45 @@ pub fn handle_key(app: &mut App, key: &crossterm::event::KeyEvent) -> Option<Vec
                 )]);
             } else if let crossterm::event::KeyCode::Backspace = kind {
                 app.ui.permission.reject_input.pop();
-            } else if !key
-                .modifiers
-                .contains(crossterm::event::KeyModifiers::CONTROL)
-            {
-                if let crossterm::event::KeyCode::Char(char) = kind {
-                    app.ui.permission.reject_input.push(char);
-                }
+            } else if let (true, crossterm::event::KeyCode::Char(char)) = (plain, kind) {
+                app.ui.permission.reject_input.push(char);
+            } else if !is_textarea_key(kind) {
+                return None;
             }
         }
     }
     Some(Vec::new())
+}
+
+/// The editing keys a focused textarea consumes even where this port's
+/// single-line input has no use for them (cursor movement).
+pub(crate) fn is_textarea_key(code: crossterm::event::KeyCode) -> bool {
+    matches!(
+        code,
+        crossterm::event::KeyCode::Left
+            | crossterm::event::KeyCode::Right
+            | crossterm::event::KeyCode::Up
+            | crossterm::event::KeyCode::Down
+            | crossterm::event::KeyCode::Home
+            | crossterm::event::KeyCode::End
+            | crossterm::event::KeyCode::Delete
+            | crossterm::event::KeyCode::Tab
+            | crossterm::event::KeyCode::BackTab
+    )
+}
+
+/// The prompt's `app.exit` command (`permission.tsx:451-460,547-555`):
+/// while a request shows, the exit chords — `<leader>q` included — reject
+/// (or step back), they never quit. `None` when no request is pending.
+pub fn app_exit(app: &mut App) -> Option<Vec<Effect>> {
+    visible(app)?;
+    handle_key(
+        app,
+        &crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        ),
+    )
 }
 
 /// `onSelect` (`permission.tsx:408-432`).

@@ -40,8 +40,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 use alforria_schema::file_diff::SnapshotFileDiff;
-use alforria_schema::permission_v1::PermissionV1Reply;
-use alforria_schema::question_v1::QuestionV1Answer;
+use alforria_schema::permission_v1::{PermissionV1Reply, PermissionV1Request};
+use alforria_schema::question_v1::{QuestionV1Answer, QuestionV1Request};
 use alforria_schema::session_status::SessionStatusInfo;
 use alforria_schema::session_todo::TodoInfo;
 use alforria_schema::session_v1::{V1Message, V1Part, V1SessionInfo};
@@ -313,6 +313,8 @@ pub trait ServerApi: Send + Sync {
     async fn session_delete(&self, loc: &Location, session_id: &str) -> Result<bool>;
     async fn session_status(&self, loc: &Location) -> Result<BTreeMap<String, SessionStatusInfo>>;
 
+    /// `permission.list` — the requests still waiting for a reply.
+    async fn permission_list(&self, loc: &Location) -> Result<Vec<PermissionV1Request>>;
     async fn permission_reply(
         &self,
         loc: &Location,
@@ -320,6 +322,8 @@ pub trait ServerApi: Send + Sync {
         reply: PermissionV1Reply,
         message: Option<&str>,
     ) -> Result<bool>;
+    /// `question.list` — the questions still waiting for an answer.
+    async fn question_list(&self, loc: &Location) -> Result<Vec<QuestionV1Request>>;
     async fn question_reply(
         &self,
         loc: &Location,
@@ -816,6 +820,14 @@ impl ServerApi for HttpServerApi {
 
     async fn session_status(&self, loc: &Location) -> Result<BTreeMap<String, SessionStatusInfo>> {
         self.get("/session/status", loc).await
+    }
+
+    async fn permission_list(&self, loc: &Location) -> Result<Vec<PermissionV1Request>> {
+        self.get("/permission", loc).await
+    }
+
+    async fn question_list(&self, loc: &Location) -> Result<Vec<QuestionV1Request>> {
+        self.get("/question", loc).await
     }
 
     async fn permission_reply(

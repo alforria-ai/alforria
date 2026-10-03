@@ -270,7 +270,12 @@ fn no_key_reaches_the_screen_behind_any_dialog() {
         assert!(leaked(&effects).is_empty(), "{kind:?} leaked {effects:?}");
         assert_eq!(behind(&app), before, "{kind:?}: escape leaked");
         assert_eq!(app.ui.theme.active, theme, "{kind:?}: preview reverted");
-        assert!(app.ui.prompt_focused, "{kind:?}: focus back on the prompt");
+        // Focus is back on the permission prompt, which stands in for
+        // the prompt while the request is pending.
+        assert!(
+            crate::ui::session::permission::visible(&app).is_some() && !app.ui.prompt_focused,
+            "{kind:?}: focus back on the permission prompt"
+        );
     }
 }
 

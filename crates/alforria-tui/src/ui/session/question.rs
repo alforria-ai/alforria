@@ -154,12 +154,24 @@ fn reply_effect(request: &QuestionV1Request, answers: Vec<QuestionV1Answer>) -> 
     }
 }
 
-/// Handle a key while a question is pending. `None` = no request
-/// pending.
+/// Handle a key while a question is pending. The prompt owns only its own
+/// bindings (`question.tsx:133-283`) and, while editing, its textarea's
+/// keys. `None` = not the prompt's key (or no request pending): it falls
+/// through to the keymap, where the pushed question mode leaves the
+/// global bindings (`session.list`, `session.new`, scrolling) live.
 pub fn handle_key(app: &mut App, key: &crossterm::event::KeyEvent) -> Option<Vec<Effect>> {
     let request = visible(app)?;
+    // A pending leader sequence completes in the keymap first.
+    if !app.keymap.pending_sequence().is_empty() {
+        return None;
+    }
     let kind = key.code;
     let tab_count = tabs(&request);
+    let plain = !key.modifiers.intersects(
+        crossterm::event::KeyModifiers::CONTROL
+            | crossterm::event::KeyModifiers::ALT
+            | crossterm::event::KeyModifiers::SUPER,
+    );
 
     if app.ui.question.editing && !confirm_tab(&request, &app.ui.question) {
         if kind == crossterm::event::KeyCode::Esc {
@@ -184,17 +196,15 @@ pub fn handle_key(app: &mut App, key: &crossterm::event::KeyEvent) -> Option<Vec
             crossterm::event::KeyCode::Backspace => {
                 app.ui.question.input.pop();
             }
-            // Never insert control-modified chars — ctrl+c clears the
-            // editing input (`prompt.clear`), it must not type a `c`.
-            crossterm::event::KeyCode::Char(char)
-                if !char.is_control()
-                    && !key
-                        .modifiers
-                        .contains(crossterm::event::KeyModifiers::CONTROL) =>
-            {
+            // Never insert chord chars — ctrl+c clears the editing input
+            // (`prompt.clear`), it must not type a `c`.
+            crossterm::event::KeyCode::Char(char) if !char.is_control() && plain => {
                 app.ui.question.input.push(char)
             }
-            _ => {}
+            crossterm::event::KeyCode::Enter => {}
+            code if super::permission::is_textarea_key(code) => {}
+            // Other chords are not the textarea's.
+            _ => return None,
         }
         if kind != crossterm::event::KeyCode::Enter {
             return Some(Vec::new());
@@ -235,7 +245,20 @@ pub fn handle_key(app: &mut App, key: &crossterm::event::KeyEvent) -> Option<Vec
     let state = &mut app.ui.question;
     let editing = state.editing;
 
+    let on_confirm = confirm_tab(&request, state);
     match kind {
+        crossterm::event::KeyCode::Char('h' | 'l' | 'k' | 'j' | '1'..='9') if !plain => {
+            return None;
+        }
+        // The answer keys are bound off the confirm tab only
+        // (`question.tsx:251-281`).
+        crossterm::event::KeyCode::Up
+        | crossterm::event::KeyCode::Down
+        | crossterm::event::KeyCode::Char('k' | 'j' | '1'..='9')
+            if on_confirm =>
+        {
+            return None;
+        }
         crossterm::event::KeyCode::Left | crossterm::event::KeyCode::Char('h') => {
             state.tab = (state.tab + tab_count - 1) % tab_count;
             state.selected = 0;
@@ -274,10 +297,11 @@ pub fn handle_key(app: &mut App, key: &crossterm::event::KeyEvent) -> Option<Vec
         }
         crossterm::event::KeyCode::Char(digit @ '1'..='9') => {
             let index = (digit as u8 - b'1') as usize;
-            if index < total.min(9) {
-                state.selected = index;
-                return Some(select_option(app, &request));
+            if index >= total.min(9) {
+                return None;
             }
+            state.selected = index;
+            return Some(select_option(app, &request));
         }
         _ => {
             if app.keymap.matches("app_exit", key) {
@@ -285,10 +309,24 @@ pub fn handle_key(app: &mut App, key: &crossterm::event::KeyEvent) -> Option<Vec
                     request_id: request.id.clone(),
                 }]);
             }
-            return Some(Vec::new());
+            return None;
         }
     }
     Some(Vec::new())
+}
+
+/// The prompt's `app.exit` command (`question.tsx:225-233`): off the
+/// textarea, the exit chords — `<leader>q` included — reject the
+/// question. `None` when no question shows or its textarea has the focus
+/// (`app.exit` is not bound there).
+pub fn app_exit(app: &mut App) -> Option<Vec<Effect>> {
+    let request = visible(app)?;
+    if app.ui.question.editing && !confirm_tab(&request, &app.ui.question) {
+        return None;
+    }
+    Some(vec![Effect::QuestionReject {
+        request_id: request.id.clone(),
+    }])
 }
 
 /// `selectOption()` (`question.tsx:105-126`).

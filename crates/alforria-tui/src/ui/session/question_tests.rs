@@ -415,3 +415,79 @@ fn tabs_are_mouse_clickable() {
     assert_eq!(app.ui.question.tab, tab);
     assert_eq!(app.ui.question.selected, 0);
 }
+
+// ------------------------------------------- keys beyond the prompt's own
+
+fn key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Vec<Effect> {
+    update(
+        app,
+        crate::state::Msg::Key(crossterm::event::KeyEvent::new(code, modifiers)),
+    )
+}
+
+#[test]
+fn global_bindings_work_over_a_question_but_not_base_ones() {
+    // The question mode (`question.tsx:128-131`) leaves the `app.global`
+    // and `session.global` bindings live, not the base-mode `app` ones.
+    let mut app = app_with_request(vec![info("plan", &["Option A", "Option B"], false, false)]);
+    key(&mut app, KeyCode::Char('p'), KeyModifiers::CONTROL);
+    assert!(app.ui.dialogs.is_empty(), "the palette is base-mode only");
+
+    key(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
+    let effects = key(&mut app, KeyCode::Char('l'), KeyModifiers::NONE);
+    assert!(question_replies(effects).is_empty());
+    assert_eq!(
+        app.ui.dialogs.top_kind(),
+        Some(&crate::state::PendingDialog::SessionList)
+    );
+    assert_eq!(app.ui.question.tab, 0, "the sequence's `l` is not next-tab");
+}
+
+#[test]
+fn the_question_keeps_its_own_keys_and_dialog_keys_stay_out() {
+    let mut app = app_with_request(vec![info("plan", &["Option A", "Option B"], false, false)]);
+    // ctrl+d is `app.exit`, the question's reject — not the session
+    // delete a list dialog binds it to.
+    let effects = key(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+    assert_eq!(
+        question_replies(effects),
+        vec![Effect::QuestionReject {
+            request_id: "que_1".into()
+        }],
+        "ctrl+d is `app.exit`: the question rejects"
+    );
+
+    let mut app = app_with_request(vec![info("plan", &["Option A", "Option B"], false, false)]);
+    press(&mut app, KeyCode::Char('j'));
+    assert_eq!(app.ui.question.selected, 1);
+    // Behind a dialog none of them reach the question.
+    let _ = crate::ui::dialogs::open(&mut app, crate::state::PendingDialog::SessionList);
+    crate::app::post_update(&mut app);
+    let mut effects = Vec::new();
+    for code in [KeyCode::Char('k'), KeyCode::Char('1'), KeyCode::Esc] {
+        effects.extend(key(&mut app, code, KeyModifiers::NONE));
+    }
+    assert!(question_replies(effects).is_empty());
+    assert_eq!(app.ui.question.selected, 1);
+    assert!(question::visible(&app).is_some());
+}
+
+#[test]
+fn the_custom_answer_types_and_chords_fall_through() {
+    let mut app = app_with_request(vec![info("plan", &["Option A"], false, true)]);
+    // Select "Type your own answer" → editing.
+    press(&mut app, KeyCode::Down);
+    enter(&mut app);
+    assert!(app.ui.question.editing);
+    for char in "hjkl".chars() {
+        press(&mut app, KeyCode::Char(char));
+    }
+    assert_eq!(app.ui.question.input, "hjkl");
+    key(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
+    key(&mut app, KeyCode::Char('l'), KeyModifiers::NONE);
+    assert_eq!(
+        app.ui.dialogs.top_kind(),
+        Some(&crate::state::PendingDialog::SessionList)
+    );
+    assert_eq!(app.ui.question.input, "hjkl");
+}

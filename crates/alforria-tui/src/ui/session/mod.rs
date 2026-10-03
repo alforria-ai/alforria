@@ -149,6 +149,12 @@ pub fn route_session_id(app: &App) -> Option<&str> {
     }
 }
 
+/// A pending permission or question shows in place of the prompt
+/// (`session/index.tsx:240-241,1297-1330`).
+pub fn prompt_replaced(app: &App) -> bool {
+    permission::visible(app).is_some() || question::visible(app).is_some()
+}
+
 /// `render(app, frame, theme, area)` — the session layout
 /// (`session/index.tsx:1157-1361`): a row of [transcript column,
 /// sidebar]; the column is a vertical stack of [transcript scrollbox,

@@ -320,6 +320,8 @@ async fn request_shapes_match_frozen_routes() {
     responses.insert("POST /session/ses_1/fork".to_string(), session_json());
     responses.insert("PATCH /session/ses_1".to_string(), session_json());
     responses.insert("DELETE /session/ses_1".to_string(), json!(true));
+    responses.insert("GET /permission".to_string(), json!([]));
+    responses.insert("GET /question".to_string(), json!([]));
     responses.insert("POST /permission/per_1/reply".to_string(), json!(true));
     responses.insert("POST /question/que_1/reply".to_string(), json!(true));
     responses.insert("POST /question/que_1/reject".to_string(), json!(true));
@@ -448,6 +450,8 @@ async fn request_shapes_match_frozen_routes() {
     api.session_status(EMPTY_LOC).await.expect("ok");
 
     // --- permission & question ---
+    api.permission_list(EMPTY_LOC).await.expect("ok");
+    api.question_list(EMPTY_LOC).await.expect("ok");
     api.permission_reply(EMPTY_LOC, "per_1", PermissionV1Reply::Once, None)
         .await
         .expect("ok");

@@ -163,7 +163,7 @@ async fn event_loop(
 ) -> Result<Exit> {
     let title_disabled = app::terminal_title_disabled_from_env();
     let mut last_title: Option<String> = None;
-    let mut pending = vec![Effect::Bootstrap { fatal: true }];
+    let mut pending = vec![Effect::Bootstrap { fatal: true }, Effect::PromptsRefresh];
 
     loop {
         for effect in pending.drain(..) {
@@ -403,6 +403,28 @@ pub async fn execute_effect(
                 if fatal {
                     app.exit(Some(format!("{error:#}")));
                 }
+            }
+        }
+        Effect::PromptsRefresh => {
+            // The lock is released across the requests: the live events
+            // keep flowing, and the reconcile accounts for them.
+            let loc = {
+                let mut app = app.lock().await;
+                state::sync::prompts_fetch_begin(&mut app.state.sync);
+                Location {
+                    directory: None,
+                    workspace: app.state.project.workspace.current.clone(),
+                }
+            };
+            let (permissions, questions) =
+                tokio::join!(api.permission_list(&loc), api.question_list(&loc));
+            let effects = state::sync::prompts_fetched(
+                &mut app.lock().await.state,
+                permissions.ok(),
+                questions.ok(),
+            );
+            for effect in effects {
+                Box::pin(execute_effect(app, Arc::clone(&api), effect)).await;
             }
         }
         Effect::PermissionAutoReply {
@@ -1195,6 +1217,11 @@ mod tests {
         bootstraps: std::sync::atomic::AtomicUsize,
         /// `auth.remove` calls.
         removed: std::sync::Mutex<Vec<String>>,
+        /// What `permission.list` / `question.list` return.
+        permissions: Vec<alforria_schema::permission_v1::PermissionV1Request>,
+        questions: Vec<alforria_schema::question_v1::QuestionV1Request>,
+        /// `permission.reply` calls — `(request id, reply)`.
+        replied: std::sync::Mutex<Vec<(String, alforria_schema::permission_v1::PermissionV1Reply)>>,
     }
 
     impl Default for FakeApi {
@@ -1209,6 +1236,9 @@ mod tests {
                 oauth_calls: std::sync::Mutex::new(Vec::new()),
                 bootstraps: std::sync::atomic::AtomicUsize::new(0),
                 removed: std::sync::Mutex::new(Vec::new()),
+                permissions: Vec::new(),
+                questions: Vec::new(),
+                replied: std::sync::Mutex::new(Vec::new()),
             }
         }
     }
@@ -1442,14 +1472,30 @@ mod tests {
         > {
             unreachable!("not under test")
         }
+        async fn permission_list(
+            &self,
+            _loc: &Location,
+        ) -> Result<Vec<alforria_schema::permission_v1::PermissionV1Request>> {
+            Ok(self.permissions.clone())
+        }
+        async fn question_list(
+            &self,
+            _loc: &Location,
+        ) -> Result<Vec<alforria_schema::question_v1::QuestionV1Request>> {
+            Ok(self.questions.clone())
+        }
         async fn permission_reply(
             &self,
             _loc: &Location,
-            _request_id: &str,
-            _reply: alforria_schema::permission_v1::PermissionV1Reply,
+            request_id: &str,
+            reply: alforria_schema::permission_v1::PermissionV1Reply,
             _message: Option<&str>,
         ) -> Result<bool> {
-            unreachable!("not under test")
+            self.replied
+                .lock()
+                .unwrap()
+                .push((request_id.to_string(), reply));
+            Ok(true)
         }
         async fn question_reply(
             &self,
@@ -1596,6 +1642,60 @@ mod tests {
         assert_eq!(app.ui.toasts.len(), 1);
         assert_eq!(app.ui.toasts[0].variant, ToastVariant::Error);
         assert_eq!(app.ui.toasts[0].message, "Failed to fork session");
+    }
+
+    fn waiting_permission(id: &str) -> alforria_schema::permission_v1::PermissionV1Request {
+        alforria_schema::permission_v1::PermissionV1Request {
+            id: id.into(),
+            session_id: "ses_a".into(),
+            permission: "bash".into(),
+            patterns: vec!["bun run db:migrate".into()],
+            metadata: Default::default(),
+            always: vec!["*".into()],
+            tool: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn attaching_shows_prompts_that_were_already_waiting() {
+        // A session stuck on a permission/question before the TUI attached
+        // shows it: the listing lands in the store the prompts read.
+        let app = Arc::new(tokio::sync::Mutex::new(fake_app()));
+        let api: Arc<dyn ServerApi> = Arc::new(FakeApi {
+            permissions: vec![waiting_permission("per_1")],
+            questions: vec![alforria_schema::question_v1::QuestionV1Request {
+                id: "que_1".into(),
+                session_id: "ses_b".into(),
+                questions: vec![],
+                tool: None,
+            }],
+            ..FakeApi::default()
+        });
+        execute_effect(&app, Arc::clone(&api), Effect::PromptsRefresh).await;
+        let app = app.lock().await;
+        assert_eq!(app.state.sync.permission["ses_a"][0].id, "per_1");
+        assert_eq!(app.state.sync.question["ses_b"][0].id, "que_1");
+    }
+
+    #[tokio::test]
+    async fn auto_mode_answers_the_waiting_permissions() {
+        let mut fake = fake_app();
+        fake.state.permission_mode = crate::state::PermissionMode::Auto;
+        let app = Arc::new(tokio::sync::Mutex::new(fake));
+        let fake_api = Arc::new(FakeApi {
+            permissions: vec![waiting_permission("per_1")],
+            ..FakeApi::default()
+        });
+        let api: Arc<dyn ServerApi> = fake_api.clone();
+        execute_effect(&app, api, Effect::PromptsRefresh).await;
+        assert!(app.lock().await.state.sync.permission.is_empty());
+        assert_eq!(
+            *fake_api.replied.lock().unwrap(),
+            vec![(
+                "per_1".to_string(),
+                alforria_schema::permission_v1::PermissionV1Reply::Once
+            )]
+        );
     }
 
     #[tokio::test]

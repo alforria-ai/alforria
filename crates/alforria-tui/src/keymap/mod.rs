@@ -299,6 +299,10 @@ pub struct DispatchContext {
     pub route_is_session: bool,
     pub prompt_focused: bool,
     pub foreground_tasks: bool,
+    /// The `<Prompt>` is mounted — a pending permission or question
+    /// replaces it (`session/index.tsx:1297-1330`), taking its
+    /// `prompt.palette` bindings along.
+    pub prompt_mounted: bool,
 }
 
 /// The resolved keymap: definitions + overrides after
@@ -420,12 +424,13 @@ impl Keymap {
     fn scope_active(&self, ctx: &DispatchContext, scope: Scope) -> bool {
         let mode = self.modes.current();
         match scope {
-            Scope::Modal => mode != BASE_MODE,
+            // The question prompt's mode is not a dialog's.
+            Scope::Modal => mode != BASE_MODE && mode != QUESTION_MODE,
             Scope::Input => ctx.prompt_focused,
             Scope::SessionUnfocused => ctx.route_is_session && !ctx.prompt_focused,
             Scope::SessionGlobal => ctx.route_is_session,
             Scope::Session => mode == BASE_MODE && ctx.route_is_session,
-            Scope::Prompt => mode == BASE_MODE,
+            Scope::Prompt => mode == BASE_MODE && ctx.prompt_mounted,
             Scope::AppGlobal => true,
             Scope::App => mode == BASE_MODE,
         }
@@ -560,6 +565,7 @@ mod tests {
             route_is_session: true,
             prompt_focused: false,
             foreground_tasks: false,
+            prompt_mounted: true,
         }
     }
 
@@ -664,6 +670,37 @@ mod tests {
         keymap.modes.pop(token);
         let commands = keymap.dispatch(&ctx(), &ctrl('p'), 0);
         assert_eq!(commands, vec!["command.palette.show"]);
+    }
+
+    #[test]
+    fn the_question_mode_is_not_a_dialog() {
+        // Dialog-only bindings (the session list's ctrl+f pin) stay off
+        // while a question pushes its mode; the global ones stay on.
+        let mut keymap = keymap();
+        let token = keymap.modes.push(QUESTION_MODE);
+        assert!(keymap.dispatch(&ctx(), &ctrl('f'), 0).is_empty());
+        assert!(keymap.dispatch(&ctx(), &ctrl('p'), 0).is_empty());
+        keymap.dispatch(&ctx(), &ctrl('x'), 0);
+        let commands = keymap.dispatch(&ctx(), &key(KeyCode::Char('l'), KeyModifiers::NONE), 0);
+        assert_eq!(commands, vec!["session.list"]);
+        keymap.modes.pop(token);
+    }
+
+    #[test]
+    fn the_prompt_bindings_leave_with_the_prompt() {
+        // A pending permission unmounts `<Prompt>` and its
+        // `prompt.palette` bindings (`prompt/index.tsx:566-579`).
+        let mut keymap = keymap();
+        let unmounted = DispatchContext {
+            prompt_mounted: false,
+            ..ctx()
+        };
+        keymap.dispatch(&unmounted, &ctrl('x'), 0);
+        let commands = keymap.dispatch(&unmounted, &key(KeyCode::Char('e'), KeyModifiers::NONE), 0);
+        assert!(!commands.contains(&"prompt.editor"), "{commands:?}");
+        keymap.dispatch(&ctx(), &ctrl('x'), 0);
+        let commands = keymap.dispatch(&ctx(), &key(KeyCode::Char('e'), KeyModifiers::NONE), 0);
+        assert!(commands.contains(&"prompt.editor"), "{commands:?}");
     }
 
     #[test]

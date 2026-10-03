@@ -350,3 +350,152 @@ fn buttons_are_mouse_clickable() {
         }]
     );
 }
+
+// ------------------------------------------- keys beyond the prompt's own
+
+fn key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Vec<crate::state::Effect> {
+    update(
+        app,
+        crate::state::Msg::Key(crossterm::event::KeyEvent::new(code, modifiers)),
+    )
+}
+
+fn replies(effects: &[crate::state::Effect]) -> Vec<&crate::state::Effect> {
+    effects
+        .iter()
+        .filter(|effect| matches!(effect, crate::state::Effect::PermissionReply { .. }))
+        .collect()
+}
+
+#[test]
+fn global_openers_work_over_a_pending_permission() {
+    // `permission.tsx` binds only its own keys; the app/session bindings
+    // stay live in base mode (`app.tsx:968-971`).
+    let mut app = app_with_request("ses_parent", request("per_1", "ses_parent", "bash"));
+    let effects = key(&mut app, KeyCode::Char('p'), KeyModifiers::CONTROL);
+    assert!(replies(&effects).is_empty());
+    assert_eq!(
+        app.ui.dialogs.top_kind(),
+        Some(&crate::state::PendingDialog::CommandPalette)
+    );
+    crate::ui::dialogs::clear(&mut app);
+    crate::app::post_update(&mut app);
+
+    // A leader sequence completes in the keymap — its `l` is not the
+    // prompt's "next option".
+    key(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
+    let effects = key(&mut app, KeyCode::Char('l'), KeyModifiers::NONE);
+    assert!(replies(&effects).is_empty());
+    assert_eq!(app.ui.permission.selected, 0);
+    assert_eq!(
+        app.ui.dialogs.top_kind(),
+        Some(&crate::state::PendingDialog::SessionList)
+    );
+    assert!(visible(&app).is_some(), "still pending");
+}
+
+#[test]
+fn the_prompt_keeps_its_own_keys() {
+    let mut app = app_with_request("ses_parent", request("per_1", "ses_parent", "bash"));
+    app.state.sync.session_status.insert(
+        "ses_parent".into(),
+        alforria_schema::session_status::SessionStatusInfo::Busy,
+    );
+    press(&mut app, KeyCode::Char('l'));
+    assert_eq!(app.ui.permission.selected, 1);
+    press(&mut app, KeyCode::Char('h'));
+    assert_eq!(app.ui.permission.selected, 0);
+    // Escape rejects — it does not interrupt the busy session.
+    let effects = key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+    assert_eq!(
+        effects,
+        vec![crate::state::Effect::PermissionReply {
+            request_id: "per_1".into(),
+            reply: PermissionV1Reply::Reject,
+            message: None,
+        }]
+    );
+    assert_eq!(app.ui.interrupt, 0);
+}
+
+#[test]
+fn leader_q_rejects_instead_of_quitting() {
+    // The prompt overrides `app.exit` (`permission.tsx:451-460`).
+    let mut app = app_with_request("ses_parent", request("per_1", "ses_parent", "bash"));
+    key(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
+    let effects = key(&mut app, KeyCode::Char('q'), KeyModifiers::NONE);
+    assert!(!app.ui.exit);
+    assert_eq!(
+        effects,
+        vec![crate::state::Effect::PermissionReply {
+            request_id: "per_1".into(),
+            reply: PermissionV1Reply::Reject,
+            message: None,
+        }]
+    );
+}
+
+#[test]
+fn the_hidden_prompt_takes_no_input() {
+    // The prompt is unmounted while the request shows
+    // (`session/index.tsx:240-241`): no typing, no prompt bindings.
+    let mut app = app_with_request("ses_parent", request("per_1", "ses_parent", "bash"));
+    app.ui.prompt.textarea.set_text("draft");
+    crate::app::post_update(&mut app);
+    assert!(!app.ui.prompt_focused);
+    for char in "xyz".chars() {
+        key(&mut app, KeyCode::Char(char), KeyModifiers::NONE);
+    }
+    // `<leader>e` is the prompt's `prompt.editor`.
+    key(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
+    let effects = key(&mut app, KeyCode::Char('e'), KeyModifiers::NONE);
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, crate::state::Effect::OpenPromptEditor { .. })),
+        "{effects:?}"
+    );
+    assert_eq!(app.ui.prompt.input(), "draft");
+}
+
+#[test]
+fn the_reject_message_types_and_chords_fall_through() {
+    let mut app = app_with_request("ses_parent", request("per_1", "ses_parent", "bash"));
+    app.ui.permission.stage = PermissionStage::Reject;
+    for char in "no thanks".chars() {
+        press(&mut app, KeyCode::Char(char));
+    }
+    assert_eq!(app.ui.permission.reject_input, "no thanks");
+    // A chord is not the textarea's: ctrl+p opens the palette.
+    press_ctrl(&mut app, 'p');
+    assert_eq!(
+        app.ui.dialogs.top_kind(),
+        Some(&crate::state::PendingDialog::CommandPalette)
+    );
+    assert_eq!(app.ui.permission.reject_input, "no thanks");
+}
+
+#[test]
+fn the_prompt_keys_never_fire_from_behind_a_dialog() {
+    let mut app = app_with_request("ses_parent", request("per_1", "ses_parent", "bash"));
+    key(&mut app, KeyCode::Char('p'), KeyModifiers::CONTROL);
+    let mut effects = Vec::new();
+    for code in [
+        KeyCode::Char('l'),
+        KeyCode::Char('h'),
+        KeyCode::Left,
+        KeyCode::Right,
+        KeyCode::Esc,
+    ] {
+        effects.extend(key(&mut app, code, KeyModifiers::NONE));
+    }
+    assert!(replies(&effects).is_empty(), "{effects:?}");
+    assert!(app.ui.dialogs.is_empty(), "escape closed the palette only");
+    assert_eq!(app.ui.permission.selected, 0);
+    // Enter in a dialog is the dialog's: help closes, nothing replied.
+    let _ = crate::ui::dialogs::open(&mut app, crate::state::PendingDialog::Help);
+    let effects = key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    assert!(replies(&effects).is_empty(), "{effects:?}");
+    assert!(app.ui.dialogs.is_empty());
+    assert!(visible(&app).is_some(), "still pending");
+}
