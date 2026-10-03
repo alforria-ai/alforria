@@ -155,23 +155,29 @@ pub async fn connect_v2(
     upgrade(ctx, service, pty_id, cursor, request, Surface::V2).await
 }
 
-/// The ticket consumption shared by both handlers (`:196-201`,
+/// The origin + ticket check shared by both handlers (`:196-201`,
 /// `packages/.../handlers/pty.ts:152-157`).
+///
+/// Deliberate divergence: TS only checks the origin when a ticket is
+/// present, so without a password a cross-site page could open a ticketless
+/// terminal socket (browsers apply no CORS to WebSockets). Here a foreign
+/// `Origin` is refused either way; clients that send no `Origin` (CLI, TUI,
+/// SDKs) still connect without a ticket.
 fn ticket_check(
     ctx: &Arc<ServerContext>,
     request: &Request,
     pty_id: &str,
     location: &LocationContext,
 ) -> bool {
+    if !request_origin_allowed(request.headers(), &ctx.cors) {
+        return false;
+    }
     let Some(ticket) = query_param(request.uri().query(), "ticket").filter(|t| !t.is_empty())
     else {
         return true;
     };
-    let valid = request_origin_allowed(request.headers(), &ctx.cors)
-        && ctx
-            .pty_tickets
-            .consume(&ticket, &ticket_scope(pty_id, location));
-    valid
+    ctx.pty_tickets
+        .consume(&ticket, &ticket_scope(pty_id, location))
 }
 
 async fn upgrade(

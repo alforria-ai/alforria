@@ -710,6 +710,39 @@ mod tests {
         }
     }
 
+    /// bun-pty (the TS default backend) reports a signal-killed child as
+    /// `exitCode: 1`, both on the session and in `pty.exited`.
+    #[test]
+    fn signal_killed_sessions_exit_with_code_one() {
+        let service = PtyService::new(spawn_backend(), "/tmp");
+        let mut exited = service.events.subscribe("pty.exited");
+        let created = service
+            .create(&PtyCreateInput {
+                command: Some("/bin/sh".to_string()),
+                args: Some(vec!["-c".to_string(), "kill -9 $$".to_string()]),
+                cwd: None,
+                title: None,
+                env: None,
+            })
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let event = loop {
+            match exited.try_recv() {
+                Ok(event) => break event,
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                    assert!(std::time::Instant::now() < deadline, "session must exit");
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(err) => panic!("pty.exited stream failed: {err}"),
+            }
+        };
+        assert_eq!(
+            event.data,
+            serde_json::json!({ "id": created.id, "exitCode": 1 })
+        );
+        assert_eq!(service.get(&created.id).unwrap().exit_code, Some(1));
+    }
+
     #[test]
     fn attach_replays_buffer_from_cursor() {
         let service = PtyService::new(spawn_backend(), "/tmp");

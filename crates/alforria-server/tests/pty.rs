@@ -262,6 +262,22 @@ async fn v2_family_keeps_exited_sessions() {
             .count(),
         0
     );
+    // v1 get/remove go through the running-only `get` too
+    // (`httpapi/handlers/pty.ts:38-41,84-102,129-131`).
+    let v1_get = fx.get(&format!("/pty/{pty_id}")).await;
+    assert_eq!(v1_get.status(), 404);
+    assert_eq!(
+        v1_get.json::<Value>().await.unwrap()["_tag"],
+        "PtyNotFoundError"
+    );
+    let v1_removed = fx
+        .client
+        .delete(format!("{}/pty/{pty_id}", fx.base()))
+        .query(&[("directory", fx.directory.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(v1_removed.status(), 404);
 
     let removed = fx
         .client
@@ -396,6 +412,90 @@ async fn ws_connect(
     let request = url.into_client_request().unwrap();
     let (stream, _) = connect_async(request).await.unwrap();
     stream
+}
+
+/// The websocket handshake status for `path` with optional `Origin` and
+/// `Host` overrides: 101 on upgrade, the refusal status otherwise.
+async fn ws_handshake(fx: &Fixture, path: &str, origin: Option<&str>, host: Option<&str>) -> u16 {
+    let url = format!("ws://127.0.0.1:{}{path}", fx.listener.port);
+    let mut request = url.into_client_request().unwrap();
+    if let Some(origin) = origin {
+        request
+            .headers_mut()
+            .insert("origin", origin.parse().unwrap());
+    }
+    if let Some(host) = host {
+        request.headers_mut().insert("host", host.parse().unwrap());
+    }
+    match connect_async(request).await {
+        Ok((mut stream, response)) => {
+            let _ = stream.close(None).await;
+            response.status().as_u16()
+        }
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => response.status().as_u16(),
+        Err(err) => panic!("handshake failed: {err}"),
+    }
+}
+
+/// A foreign `Origin` never gets a terminal socket, ticket or no ticket;
+/// origin-less clients, localhost and same-host pages do.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_connect_refuses_foreign_origins() {
+    let fx = fixture().await;
+    let created = create(&fx, "/bin/sh", &["-c", "sleep 30"]).await;
+    let pty_id = created["id"].as_str().unwrap().to_string();
+    let v1 = format!("/pty/{pty_id}/connect?directory={}", fx.directory);
+    let v2 = format!(
+        "/api/pty/{pty_id}/connect?location[directory]={}",
+        fx.directory
+    );
+
+    // Ticketless.
+    for path in [&v1, &v2] {
+        assert_eq!(
+            ws_handshake(&fx, path, Some("https://evil.example"), None).await,
+            403
+        );
+        assert_eq!(ws_handshake(&fx, path, Some("null"), None).await, 403);
+        assert_eq!(ws_handshake(&fx, path, None, None).await, 101);
+        assert_eq!(
+            ws_handshake(&fx, path, Some("http://localhost:4610"), None).await,
+            101
+        );
+        assert_eq!(
+            ws_handshake(
+                &fx,
+                path,
+                Some("http://alforria.lan:4096"),
+                Some("alforria.lan:4096")
+            )
+            .await,
+            101
+        );
+    }
+
+    // A foreign origin does not burn the ticket; the right page still can.
+    let token = connect_ticket(
+        &fx,
+        &format!("/pty/{pty_id}/connect-token"),
+        &[("x-opencode-ticket", "1")],
+    )
+    .await;
+    let ticket = token.json::<Value>().await.unwrap()["ticket"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let ticketed = format!("{v1}&ticket={ticket}");
+    assert_eq!(
+        ws_handshake(&fx, &ticketed, Some("https://evil.example"), None).await,
+        403
+    );
+    assert_eq!(
+        ws_handshake(&fx, &ticketed, Some("http://127.0.0.1:4610"), None).await,
+        101
+    );
+
+    fx.listener.stop().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
