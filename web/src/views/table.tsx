@@ -2,7 +2,15 @@
 // subagents nested under their parent.
 import { For, Show } from "solid-js"
 import type { Session } from "../api/types"
-import { activity, contextUse, fleetState, groups, projectName, sessionCost, todoProgress } from "../fleet/fleet"
+import {
+  activity,
+  contextUse,
+  filteredGroups,
+  fleetState,
+  projectName,
+  sessionCost,
+  todoProgress,
+} from "../fleet/fleet"
 import type { FleetState } from "../fleet/derive"
 import { state } from "../store/store"
 import { age, money, now, tildify } from "../ui/format"
@@ -179,7 +187,7 @@ export function SessionTable(props: {
         </tr>
       </thead>
       <tbody>
-        <For each={groups()}>
+        <For each={filteredGroups()}>
           {(g) => (
             <>
               <tr class="proj-row">

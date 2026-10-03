@@ -1,6 +1,6 @@
 // Reactive fleet selectors over the store: which sessions to show, in which
 // order, grouped by project. Views read these instead of walking the store.
-import { createMemo, createRoot } from "solid-js"
+import { createMemo, createRoot, createSignal } from "solid-js"
 import type { Project, Session } from "../api/types"
 import { state } from "../store/store"
 import { basename } from "../ui/format"
@@ -101,9 +101,26 @@ const memos = createRoot(() => {
     return { cost, tokens }
   })
 
-  return { interrupts, groups, counts, totals }
+  // The overview's filter: rows by state, empty projects dropped.
+  const [filter, setFilter] = createSignal<TableFilter>("all")
+  const matches = (st: FleetState) => {
+    const f = filter()
+    if (f === "all") return true
+    if (f === "working") return st === "working" || st === "retry"
+    if (f === "idle") return st === "idle" || st === "fault"
+    return st === f
+  }
+  const filteredGroups = createMemo<ProjectGroup[]>(() =>
+    groups()
+      .map((g) => ({ ...g, rows: g.rows.filter((r) => matches(fleetState(state, r.session.id))) }))
+      .filter((g) => g.rows.length),
+  )
+
+  return { interrupts, groups, counts, totals, filter, setFilter, filteredGroups }
 })
 
-export const { interrupts, groups, counts, totals } = memos
+export type TableFilter = "all" | "waiting" | "working" | "idle"
+
+export const { interrupts, groups, counts, totals, filter, setFilter, filteredGroups } = memos
 
 export { activity, contextUse, fleetState, sessionCost, todoProgress }

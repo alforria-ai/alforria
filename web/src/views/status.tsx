@@ -4,7 +4,7 @@ import { counts, totals } from "../fleet/fleet"
 import { state } from "../store/store"
 import { ktok, money, now } from "../ui/format"
 
-export function StatusLine() {
+export function StatusLine(props: { onKeys: () => void }) {
   const since = () => ((now() - state.conn.lastFrame) / 1000).toFixed(0)
   return (
     <footer class="status" id="status">
@@ -25,6 +25,9 @@ export function StatusLine() {
       <span>{ktok(totals().tokens)} tokens</span>
       <span>{money(totals().cost)}</span>
       <span class="spacer" />
+      <button onClick={props.onKeys} aria-label="Keyboard shortcuts">
+        ? Keys
+      </button>
     </footer>
   )
 }

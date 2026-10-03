@@ -3,7 +3,7 @@
 // phone tab bar. All navigation state lives in nav/route.ts.
 import { createMemo, createSignal, Match, onCleanup, onMount, Show, Switch } from "solid-js"
 import { api } from "./api/client"
-import { fleetState, groups, interrupts, counts } from "./fleet/fleet"
+import { counts, filter, filteredGroups, fleetState, groups, interrupts, setFilter } from "./fleet/fleet"
 import { bindKeys } from "./nav/keys"
 import {
   closeColumn,
@@ -46,7 +46,8 @@ export function App() {
   let workspaceEl!: HTMLElement
 
   const maxColumns = () => (phone() ? 1 : Math.max(1, Math.min(3, Math.floor(workspaceWidth() / 400))))
-  const rows = createMemo(() => groups().flatMap((g) => g.rows.map((r) => r.session.id)))
+  // Keyboard row navigation follows what the table shows.
+  const rows = createMemo(() => filteredGroups().flatMap((g) => g.rows.map((r) => r.session.id)))
 
   const open = (id: string, beside = false) => {
     setCursor(id)
@@ -179,6 +180,21 @@ export function App() {
                 <span class="count">
                   {counts().all} · {state.projectOrder.length} projects
                 </span>
+                <div class="seg" role="group" aria-label="Filter sessions">
+                  {(
+                    [
+                      ["all", "All", counts().all],
+                      ["waiting", "Waiting", counts().waiting],
+                      ["working", "Working", counts().working + counts().retry],
+                      ["idle", "Idle", counts().idle + counts().fault],
+                    ] as const
+                  ).map(([id, label, n]) => (
+                    <button aria-pressed={filter() === id} onClick={() => setFilter(id)}>
+                      <span class="lbl-long">{label}</span>
+                      <span class="c">{n}</span>
+                    </button>
+                  ))}
+                </div>
               </div>
               <div class="ws-body">
                 <Show
@@ -197,7 +213,7 @@ export function App() {
           </Switch>
         </section>
       </main>
-      <StatusLine />
+      <StatusLine onKeys={() => setKeysOpen(true)} />
       <MobileTabs
         pane={phonePane()}
         waiting={interrupts().length}
