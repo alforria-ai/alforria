@@ -5,7 +5,8 @@
 import type {
   Agent,
   Command,
-  FileDiff,
+  SnapshotFileDiff,
+  VcsFileDiff,
   MessageWithParts,
   PermissionReply,
   Project,
@@ -131,7 +132,11 @@ export const api = {
   messages: (id: string, opts: { limit?: number; before?: string } = {}) =>
     request<MessageWithParts[]>("GET", `/session/${id}/message`, { query: opts }),
   todos: (id: string) => request<Todo[]>("GET", `/session/${id}/todo`),
-  diff: (id: string, messageID?: string) => request<FileDiff[]>("GET", `/session/${id}/diff`, { query: { messageID } }),
+  /** TS answers [] without a messageID; a turn's diff is its user message's `summary.diffs`. */
+  diff: (id: string, messageID?: string) =>
+    request<SnapshotFileDiff[]>("GET", `/session/${id}/diff`, { query: { messageID } }),
+  /** Uncommitted changes in the working tree (git projects). */
+  vcsDiff: (directory: string) => request<VcsFileDiff[]>("GET", "/vcs/diff", { directory, query: { mode: "git" } }),
   promptAsync: (id: string, body: PromptInput) => request<void>("POST", `/session/${id}/prompt_async`, { body }),
   command: (id: string, body: { command: string; arguments: string; agent?: string; model?: string }) =>
     request<MessageWithParts>("POST", `/session/${id}/command`, { body }),

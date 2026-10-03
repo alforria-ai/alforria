@@ -34,6 +34,10 @@ export type QuestionRequest = Open<Schemas["QuestionRequest"]>
 export type QuestionInfo = Open<Schemas["QuestionInfo"]>
 export type Todo = Open<Schemas["Todo"]>
 export type FileDiff = Open<Schemas["FileDiff"]>
+/** A turn's file change (user message `summary.diffs`, `session.diff`, GET /session/:id/diff). */
+export type SnapshotFileDiff = Open<Schemas["SnapshotFileDiff"]>
+/** A working-tree change (GET /vcs/diff). */
+export type VcsFileDiff = Open<Schemas["VcsFileDiff"]>
 export type Agent = Open<Schemas["Agent"]>
 export type Command = Open<Schemas["Command"]>
 

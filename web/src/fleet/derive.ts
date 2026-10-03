@@ -1,7 +1,15 @@
 // Per-session aggregates for the fleet views (band counter, queue, table,
 // session list). Everything is derived from the store; nothing is cached here,
 // so callers wrap these in Solid memos where they need stability.
-import type { AssistantMessage, Part, PermissionRequest, QuestionRequest, ToolPart } from "../api/types"
+import type {
+  AssistantMessage,
+  Part,
+  PermissionRequest,
+  QuestionRequest,
+  SnapshotFileDiff,
+  ToolPart,
+  UserMessage,
+} from "../api/types"
 import type { State } from "../store/state"
 
 export type FleetState = "waiting" | "working" | "retry" | "fault" | "idle"
@@ -53,6 +61,23 @@ function askedAt(s: State, sessionID: string, messageID?: string) {
   const msg = messageID ? s.message[messageID] : undefined
   if (msg) return msg.time.created
   return s.sessions[sessionID]?.time.updated ?? Date.now()
+}
+
+/**
+ * The session's turns that changed files, newest first: each user message
+ * carries its turn's diff in `summary.diffs` (first step-start snapshot to
+ * last step-finish snapshot), as in TS.
+ */
+export function turnDiffs(s: State, sessionID: string) {
+  const out: { message: UserMessage; diffs: SnapshotFileDiff[] }[] = []
+  const ids = s.messages[sessionID] ?? []
+  for (let i = ids.length - 1; i >= 0; i--) {
+    const m = s.message[ids[i]!]
+    if (m?.role !== "user") continue
+    const diffs = (m as UserMessage).summary?.diffs ?? []
+    if (diffs.length) out.push({ message: m as UserMessage, diffs })
+  }
+  return out
 }
 
 export function lastAssistant(s: State, sessionID: string): AssistantMessage | undefined {
@@ -112,8 +137,8 @@ export function activity(s: State, sessionID: string): Activity {
     return { kind: "working", text: "", prose: true }
   }
   if (part?.type === "text") return { kind: "done", text: firstLine(part.text), prose: true }
-  const summary = s.sessions[sessionID]?.summary
-  if (summary?.files) return { kind: "done", text: `${summary.files} files changed`, prose: true }
+  const changed = turnDiffs(s, sessionID)[0]?.diffs.length
+  if (changed) return { kind: "done", text: `${changed} ${changed === 1 ? "file" : "files"} changed`, prose: true }
   return { kind: "done", text: "", prose: true }
 }
 

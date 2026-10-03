@@ -2,7 +2,7 @@
 // permission or question exists once however many views render it, and a
 // streamed delta touches exactly one part.
 import type {
-  FileDiff,
+  SnapshotFileDiff,
   Message,
   Part,
   PermissionRequest,
@@ -40,7 +40,8 @@ export interface State {
   permissions: Record<string, PermissionRequest>
   questions: Record<string, QuestionRequest>
   todos: Record<string, Todo[]>
-  diffs: Record<string, FileDiff[]>
+  /** The latest `session.diff` per session (non-empty only after a revert, as in TS). */
+  diffs: Record<string, SnapshotFileDiff[]>
   errors: Record<string, SessionError>
   /** Sessions whose transcript has been fetched and is kept live. */
   loaded: Record<string, boolean>

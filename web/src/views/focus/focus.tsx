@@ -3,7 +3,7 @@
 // reloads when you switch, split or close.
 import { createEffect, For, lazy, Match, onCleanup, Show, Suspense, Switch } from "solid-js"
 import { api, ApiError } from "../../api/client"
-import { fleetState, interruptsFor, lastAssistant, sessionCost } from "../../fleet/derive"
+import { fleetState, interruptsFor, lastAssistant, sessionCost, turnDiffs } from "../../fleet/derive"
 import { displayTitle, projectName } from "../../fleet/fleet"
 import { closeOtherColumns, nav, setActiveColumn, setColumnFile, setColumnTab, type Column } from "../../nav/route"
 import { setState, state } from "../../store/store"
@@ -128,7 +128,8 @@ function SessionColumn(props: {
     const t = s()?.tokens
     return t ? t.input + t.output + t.reasoning + t.cache.read + t.cache.write : 0
   }
-  const changeCount = () => s()?.summary?.files ?? state.diffs[id()]?.length ?? 0
+  // The latest turn's changed files (TS keeps a turn's diff on its user message).
+  const changeCount = () => turnDiffs(state, id())[0]?.diffs.length ?? 0
   let el!: HTMLElement
 
   const fork = async () => {

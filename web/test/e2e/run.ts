@@ -197,6 +197,19 @@ try {
     await p.waitForTimeout(300)
     check((await p.locator("table.reg").count()) === 1, "Esc returns to the overview")
 
+    // A turn that edited a file shows its diff under Changes: the user
+    // message's summary.diffs, as in TS.
+    await p.locator("tr.s-row", { hasText: "Add cursor pagination" }).click()
+    await p.locator(".col.is-active .tabs button", { hasText: "Changes" }).click()
+    await p.locator(".col.is-active .change-list button").first().waitFor({ timeout: 10_000 })
+    check(
+      (await p.locator(".col.is-active .change-source").inputValue()).startsWith("turn:") &&
+        (await p.locator(".col.is-active .change-list button").first().textContent())?.includes("src/routes/users.ts"),
+      "Changes shows the turn's edited file",
+    )
+    await p.keyboard.press("Escape")
+    await p.waitForTimeout(300)
+
     // Dialogs own the keyboard: the app behind them is inert, the queue's
     // keys don't leak through, Tab stays inside, Esc closes, focus returns.
     await p.keyboard.press("q")
