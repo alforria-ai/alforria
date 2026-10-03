@@ -1,0 +1,6 @@
+dist
+node_modules
+src/api/schema.d.ts
+prototype
+.dev
+test/fixtures

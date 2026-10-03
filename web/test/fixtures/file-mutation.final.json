@@ -1,0 +1,260 @@
+{
+  "project": [
+    {
+      "id": "e0988e146466bed0e5819b3627a40cf39835232f",
+      "worktree": "/fixture/file-mutation/project",
+      "vcs": "git",
+      "time": {
+        "created": 1791057881169,
+        "updated": 1791057881169
+      },
+      "sandboxes": []
+    }
+  ],
+  "session": [
+    {
+      "id": "ses_7FS8CQGVZY1KJBM7RYXSMBAPSZ",
+      "slug": "quick-engine",
+      "projectID": "e0988e146466bed0e5819b3627a40cf39835232f",
+      "directory": "/fixture/file-mutation/project",
+      "path": ".",
+      "summary": {
+        "additions": 0,
+        "deletions": 0,
+        "files": 0
+      },
+      "cost": 0,
+      "tokens": {
+        "input": 110,
+        "output": 8,
+        "reasoning": 0,
+        "cache": {
+          "read": 0,
+          "write": 0
+        }
+      },
+      "title": "Create notes.md",
+      "agent": "build",
+      "model": {
+        "id": "mock-model",
+        "providerID": "mock",
+        "variant": "default"
+      },
+      "version": "local",
+      "time": {
+        "created": 1791057881209,
+        "updated": 1791057881674
+      }
+    }
+  ],
+  "sessionStatus": {},
+  "permission": [],
+  "question": [],
+  "messages": {
+    "ses_7FS8CQGVZY1KJBM7RYXSMBAPSZ": [
+      {
+        "info": {
+          "agent": "build",
+          "id": "msg_0G6QK9F401131KD3DWX2JA2V59",
+          "model": {
+            "modelID": "mock-model",
+            "providerID": "mock"
+          },
+          "role": "user",
+          "sessionID": "ses_7FS8CQGVZY1KJBM7RYXSMBAPSZ",
+          "summary": {
+            "diffs": [
+              {
+                "additions": 1,
+                "deletions": 0,
+                "file": "notes.md",
+                "patch": "Index: notes.md\n===================================================================\n--- notes.md\t\n+++ notes.md\t\n@@ -0,0 +1,1 @@\n+generated notes\n",
+                "status": "added"
+              }
+            ]
+          },
+          "time": {
+            "created": 1791057881465
+          }
+        },
+        "parts": [
+          {
+            "id": "prt_0G6QK9F801JY8H0Q84WMFKP7SM",
+            "messageID": "msg_0G6QK9F401131KD3DWX2JA2V59",
+            "sessionID": "ses_7FS8CQGVZY1KJBM7RYXSMBAPSZ",
+            "text": "create notes.md for me",
+            "type": "text"
+          }
+        ]
+      },
+      {
+        "info": {
+          "agent": "build",
+          "cost": 0,
+          "finish": "tool-calls",
+          "id": "msg_0G6QK9FG011CK2XMG4ECJM1B1N",
+          "mode": "build",
+          "modelID": "mock-model",
+          "parentID": "msg_0G6QK9F401131KD3DWX2JA2V59",
+          "path": {
+            "cwd": "/fixture/file-mutation/project",
+            "root": "/fixture/file-mutation/project"
+          },
+          "providerID": "mock",
+          "role": "assistant",
+          "sessionID": "ses_7FS8CQGVZY1KJBM7RYXSMBAPSZ",
+          "time": {
+            "completed": 1791057881577,
+            "created": 1791057881468
+          },
+          "tokens": {
+            "cache": {
+              "read": 0,
+              "write": 0
+            },
+            "input": 50,
+            "output": 5,
+            "reasoning": 0,
+            "total": 55
+          }
+        },
+        "parts": [
+          {
+            "id": "prt_0G6QK9VG013T6X4XYWA13X6YDX",
+            "messageID": "msg_0G6QK9FG011CK2XMG4ECJM1B1N",
+            "sessionID": "ses_7FS8CQGVZY1KJBM7RYXSMBAPSZ",
+            "snapshot": "dcccdc38392e12a7994204066ee444d587878de3",
+            "type": "step-start"
+          },
+          {
+            "callID": "cal_1",
+            "id": "prt_0G6QK9VM01HCAQRNBTS2SGWY6Z",
+            "messageID": "msg_0G6QK9FG011CK2XMG4ECJM1B1N",
+            "sessionID": "ses_7FS8CQGVZY1KJBM7RYXSMBAPSZ",
+            "state": {
+              "input": {
+                "content": "generated notes\n",
+                "filePath": "notes.md"
+              },
+              "metadata": {
+                "diagnostics": {},
+                "exists": false,
+                "filepath": "/fixture/file-mutation/project/notes.md",
+                "truncated": false
+              },
+              "output": "Wrote file successfully.",
+              "status": "completed",
+              "time": {
+                "end": 1791057881577,
+                "start": 1791057881565
+              },
+              "title": "notes.md"
+            },
+            "tool": "write",
+            "type": "tool"
+          },
+          {
+            "cost": 0,
+            "id": "prt_0G6QK9W801A8A142R1G7W2X38M",
+            "messageID": "msg_0G6QK9FG011CK2XMG4ECJM1B1N",
+            "reason": "tool-calls",
+            "sessionID": "ses_7FS8CQGVZY1KJBM7RYXSMBAPSZ",
+            "snapshot": "dcccdc38392e12a7994204066ee444d587878de3",
+            "tokens": {
+              "cache": {
+                "read": 0,
+                "write": 0
+              },
+              "input": 50,
+              "output": 5,
+              "reasoning": 0,
+              "total": 55
+            },
+            "type": "step-finish"
+          },
+          {
+            "files": [
+              "/fixture/file-mutation/project/notes.md"
+            ],
+            "hash": "dcccdc38392e12a7994204066ee444d587878de3",
+            "id": "prt_0G6QK9X001S29PY8CG292TCPBQ",
+            "messageID": "msg_0G6QK9FG011CK2XMG4ECJM1B1N",
+            "sessionID": "ses_7FS8CQGVZY1KJBM7RYXSMBAPSZ",
+            "type": "patch"
+          }
+        ]
+      },
+      {
+        "info": {
+          "agent": "build",
+          "cost": 0,
+          "finish": "stop",
+          "id": "msg_0G6QK9X801H9W6AE1GS66Y5T2Q",
+          "mode": "build",
+          "modelID": "mock-model",
+          "parentID": "msg_0G6QK9F401131KD3DWX2JA2V59",
+          "path": {
+            "cwd": "/fixture/file-mutation/project",
+            "root": "/fixture/file-mutation/project"
+          },
+          "providerID": "mock",
+          "role": "assistant",
+          "sessionID": "ses_7FS8CQGVZY1KJBM7RYXSMBAPSZ",
+          "time": {
+            "completed": 1791057881674,
+            "created": 1791057881578
+          },
+          "tokens": {
+            "cache": {
+              "read": 0,
+              "write": 0
+            },
+            "input": 60,
+            "output": 3,
+            "reasoning": 0,
+            "total": 63
+          }
+        },
+        "parts": [
+          {
+            "id": "prt_0G6QKA7W01V5PPPG3QCEPW68WW",
+            "messageID": "msg_0G6QK9X801H9W6AE1GS66Y5T2Q",
+            "sessionID": "ses_7FS8CQGVZY1KJBM7RYXSMBAPSZ",
+            "snapshot": "46ba0ce3ba99745e2087694ecdc8d0e1342ecf72",
+            "type": "step-start"
+          },
+          {
+            "id": "prt_0G6QKA8001VPYMYE84D6R3CS9Z",
+            "messageID": "msg_0G6QK9X801H9W6AE1GS66Y5T2Q",
+            "sessionID": "ses_7FS8CQGVZY1KJBM7RYXSMBAPSZ",
+            "text": "wrote your notes",
+            "time": {
+              "end": 1791057881665,
+              "start": 1791057881664
+            },
+            "type": "text"
+          },
+          {
+            "cost": 0,
+            "id": "prt_0G6QKA8R0137TPJE4HW0SZXY6K",
+            "messageID": "msg_0G6QK9X801H9W6AE1GS66Y5T2Q",
+            "reason": "stop",
+            "sessionID": "ses_7FS8CQGVZY1KJBM7RYXSMBAPSZ",
+            "snapshot": "46ba0ce3ba99745e2087694ecdc8d0e1342ecf72",
+            "tokens": {
+              "cache": {
+                "read": 0,
+                "write": 0
+              },
+              "input": 60,
+              "output": 3,
+              "reasoning": 0,
+              "total": 63
+            },
+            "type": "step-finish"
+          }
+        ]
+      }
+    ]
+  }
+}

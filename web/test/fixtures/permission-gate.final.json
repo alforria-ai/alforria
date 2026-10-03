@@ -1,0 +1,343 @@
+{
+  "project": [
+    {
+      "id": "4da22615e8527aaf2595c2c6a0ce2fc35d9215dc",
+      "worktree": "/fixture/permission-gate/project",
+      "vcs": "git",
+      "time": {
+        "created": 1791057884669,
+        "updated": 1791057884669
+      },
+      "sandboxes": []
+    }
+  ],
+  "session": [
+    {
+      "id": "ses_7FS8C9V3ZYMZWHNW4DE11R967Q",
+      "slug": "misty-otter",
+      "projectID": "4da22615e8527aaf2595c2c6a0ce2fc35d9215dc",
+      "directory": "/fixture/permission-gate/project",
+      "path": ".",
+      "summary": {
+        "additions": 0,
+        "deletions": 0,
+        "files": 0
+      },
+      "cost": 0,
+      "tokens": {
+        "input": 160,
+        "output": 13,
+        "reasoning": 0,
+        "cache": {
+          "read": 0,
+          "write": 0
+        }
+      },
+      "title": "Read secret.env twice",
+      "agent": "build",
+      "model": {
+        "id": "mock-model",
+        "providerID": "mock",
+        "variant": "default"
+      },
+      "version": "local",
+      "time": {
+        "created": 1791057884711,
+        "updated": 1791057885262
+      }
+    }
+  ],
+  "sessionStatus": {},
+  "permission": [],
+  "question": [],
+  "messages": {
+    "ses_7FS8C9V3ZYMZWHNW4DE11R967Q": [
+      {
+        "info": {
+          "agent": "build",
+          "id": "msg_0G6QKQ4M01DYWT140J2PAJWWPT",
+          "model": {
+            "modelID": "mock-model",
+            "providerID": "mock"
+          },
+          "role": "user",
+          "sessionID": "ses_7FS8C9V3ZYMZWHNW4DE11R967Q",
+          "summary": {
+            "diffs": []
+          },
+          "time": {
+            "created": 1791057884965
+          }
+        },
+        "parts": [
+          {
+            "id": "prt_0G6QKQ4M02S5NPWGF28E7GRCZV",
+            "messageID": "msg_0G6QKQ4M01DYWT140J2PAJWWPT",
+            "sessionID": "ses_7FS8C9V3ZYMZWHNW4DE11R967Q",
+            "text": "read twice",
+            "type": "text"
+          }
+        ]
+      },
+      {
+        "info": {
+          "agent": "build",
+          "cost": 0,
+          "finish": "tool-calls",
+          "id": "msg_0G6QKQ4W01NQTVAXRCBFTM91C3",
+          "mode": "build",
+          "modelID": "mock-model",
+          "parentID": "msg_0G6QKQ4M01DYWT140J2PAJWWPT",
+          "path": {
+            "cwd": "/fixture/permission-gate/project",
+            "root": "/fixture/permission-gate/project"
+          },
+          "providerID": "mock",
+          "role": "assistant",
+          "sessionID": "ses_7FS8C9V3ZYMZWHNW4DE11R967Q",
+          "time": {
+            "completed": 1791057885073,
+            "created": 1791057884967
+          },
+          "tokens": {
+            "cache": {
+              "read": 0,
+              "write": 0
+            },
+            "input": 50,
+            "output": 5,
+            "reasoning": 0,
+            "total": 55
+          }
+        },
+        "parts": [
+          {
+            "id": "prt_0G6QKQGW01EXWS83VK1THX4W9M",
+            "messageID": "msg_0G6QKQ4W01NQTVAXRCBFTM91C3",
+            "sessionID": "ses_7FS8C9V3ZYMZWHNW4DE11R967Q",
+            "snapshot": "2e209f930c7f35578600673d2ab18978e23c6771",
+            "type": "step-start"
+          },
+          {
+            "callID": "cal_1",
+            "id": "prt_0G6QKQH0011J5ANMZ2JFRMQCFG",
+            "messageID": "msg_0G6QKQ4W01NQTVAXRCBFTM91C3",
+            "sessionID": "ses_7FS8C9V3ZYMZWHNW4DE11R967Q",
+            "state": {
+              "input": {
+                "filePath": "secret.env"
+              },
+              "metadata": {
+                "display": {
+                  "lineEnd": 1,
+                  "lineStart": 1,
+                  "path": "/fixture/permission-gate/project/secret.env",
+                  "text": "TOKEN=1",
+                  "totalLines": 1,
+                  "truncated": false,
+                  "type": "file"
+                },
+                "loaded": [],
+                "preview": "TOKEN=1",
+                "truncated": false
+              },
+              "output": "<path>/fixture/permission-gate/project/secret.env</path>\n<type>file</type>\n<content>\n1: TOKEN=1\n\n(End of file - total 1 lines)\n</content>",
+              "status": "completed",
+              "time": {
+                "end": 1791057885072,
+                "start": 1791057885064
+              },
+              "title": "secret.env"
+            },
+            "tool": "read",
+            "type": "tool"
+          },
+          {
+            "cost": 0,
+            "id": "prt_0G6QKQHG01547VK4QJ9P81DZAN",
+            "messageID": "msg_0G6QKQ4W01NQTVAXRCBFTM91C3",
+            "reason": "tool-calls",
+            "sessionID": "ses_7FS8C9V3ZYMZWHNW4DE11R967Q",
+            "snapshot": "2e209f930c7f35578600673d2ab18978e23c6771",
+            "tokens": {
+              "cache": {
+                "read": 0,
+                "write": 0
+              },
+              "input": 50,
+              "output": 5,
+              "reasoning": 0,
+              "total": 55
+            },
+            "type": "step-finish"
+          }
+        ]
+      },
+      {
+        "info": {
+          "agent": "build",
+          "cost": 0,
+          "finish": "tool-calls",
+          "id": "msg_0G6QKQJ801026A34820Q5V6PXA",
+          "mode": "build",
+          "modelID": "mock-model",
+          "parentID": "msg_0G6QKQ4M01DYWT140J2PAJWWPT",
+          "path": {
+            "cwd": "/fixture/permission-gate/project",
+            "root": "/fixture/permission-gate/project"
+          },
+          "providerID": "mock",
+          "role": "assistant",
+          "sessionID": "ses_7FS8C9V3ZYMZWHNW4DE11R967Q",
+          "time": {
+            "completed": 1791057885168,
+            "created": 1791057885074
+          },
+          "tokens": {
+            "cache": {
+              "read": 0,
+              "write": 0
+            },
+            "input": 50,
+            "output": 5,
+            "reasoning": 0,
+            "total": 55
+          }
+        },
+        "parts": [
+          {
+            "id": "prt_0G6QKQWR01BV15KQV047P9Z3NP",
+            "messageID": "msg_0G6QKQJ801026A34820Q5V6PXA",
+            "sessionID": "ses_7FS8C9V3ZYMZWHNW4DE11R967Q",
+            "snapshot": "2e209f930c7f35578600673d2ab18978e23c6771",
+            "type": "step-start"
+          },
+          {
+            "callID": "cal_2",
+            "id": "prt_0G6QKQWW011C8239G8AAQR753C",
+            "messageID": "msg_0G6QKQJ801026A34820Q5V6PXA",
+            "sessionID": "ses_7FS8C9V3ZYMZWHNW4DE11R967Q",
+            "state": {
+              "input": {
+                "filePath": "secret.env"
+              },
+              "metadata": {
+                "display": {
+                  "lineEnd": 1,
+                  "lineStart": 1,
+                  "path": "/fixture/permission-gate/project/secret.env",
+                  "text": "TOKEN=1",
+                  "totalLines": 1,
+                  "truncated": false,
+                  "type": "file"
+                },
+                "loaded": [],
+                "preview": "TOKEN=1",
+                "truncated": false
+              },
+              "output": "<path>/fixture/permission-gate/project/secret.env</path>\n<type>file</type>\n<content>\n1: TOKEN=1\n\n(End of file - total 1 lines)\n</content>",
+              "status": "completed",
+              "time": {
+                "end": 1791057885167,
+                "start": 1791057885159
+              },
+              "title": "secret.env"
+            },
+            "tool": "read",
+            "type": "tool"
+          },
+          {
+            "cost": 0,
+            "id": "prt_0G6QKQXC01239TNV5HSCJKZNV8",
+            "messageID": "msg_0G6QKQJ801026A34820Q5V6PXA",
+            "reason": "tool-calls",
+            "sessionID": "ses_7FS8C9V3ZYMZWHNW4DE11R967Q",
+            "snapshot": "2e209f930c7f35578600673d2ab18978e23c6771",
+            "tokens": {
+              "cache": {
+                "read": 0,
+                "write": 0
+              },
+              "input": 50,
+              "output": 5,
+              "reasoning": 0,
+              "total": 55
+            },
+            "type": "step-finish"
+          }
+        ]
+      },
+      {
+        "info": {
+          "agent": "build",
+          "cost": 0,
+          "finish": "stop",
+          "id": "msg_0G6QKQY4013DK9NRE1P4E9TD2B",
+          "mode": "build",
+          "modelID": "mock-model",
+          "parentID": "msg_0G6QKQ4M01DYWT140J2PAJWWPT",
+          "path": {
+            "cwd": "/fixture/permission-gate/project",
+            "root": "/fixture/permission-gate/project"
+          },
+          "providerID": "mock",
+          "role": "assistant",
+          "sessionID": "ses_7FS8C9V3ZYMZWHNW4DE11R967Q",
+          "time": {
+            "completed": 1791057885262,
+            "created": 1791057885169
+          },
+          "tokens": {
+            "cache": {
+              "read": 0,
+              "write": 0
+            },
+            "input": 60,
+            "output": 3,
+            "reasoning": 0,
+            "total": 63
+          }
+        },
+        "parts": [
+          {
+            "id": "prt_0G6QKR8M0134F1R58XDPND8JJP",
+            "messageID": "msg_0G6QKQY4013DK9NRE1P4E9TD2B",
+            "sessionID": "ses_7FS8C9V3ZYMZWHNW4DE11R967Q",
+            "snapshot": "2e209f930c7f35578600673d2ab18978e23c6771",
+            "type": "step-start"
+          },
+          {
+            "id": "prt_0G6QKR8R01JR9R462ZV7A7YB3Q",
+            "messageID": "msg_0G6QKQY4013DK9NRE1P4E9TD2B",
+            "sessionID": "ses_7FS8C9V3ZYMZWHNW4DE11R967Q",
+            "text": "done reading",
+            "time": {
+              "end": 1791057885254,
+              "start": 1791057885254
+            },
+            "type": "text"
+          },
+          {
+            "cost": 0,
+            "id": "prt_0G6QKR980101NMKB7WX7DK6GE8",
+            "messageID": "msg_0G6QKQY4013DK9NRE1P4E9TD2B",
+            "reason": "stop",
+            "sessionID": "ses_7FS8C9V3ZYMZWHNW4DE11R967Q",
+            "snapshot": "2e209f930c7f35578600673d2ab18978e23c6771",
+            "tokens": {
+              "cache": {
+                "read": 0,
+                "write": 0
+              },
+              "input": 60,
+              "output": 3,
+              "reasoning": 0,
+              "total": 63
+            },
+            "type": "step-finish"
+          }
+        ]
+      }
+    ]
+  }
+}

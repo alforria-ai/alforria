@@ -1,0 +1,56 @@
+{
+  "meta": {
+    "scenario": "permission-gate",
+    "fixture": "crates/alforria/tests/e2e_agent/fixtures/a3_permission_gate.json",
+    "prompt": "read twice",
+    "sessionID": "ses_7FS8C9V3ZYMZWHNW4DE11R967Q",
+    "directory": "/fixture/permission-gate/project",
+    "baseTime": 1791057884600,
+    "eventIndex": 4,
+    "recordedAt": "2026-10-03T20:04:44.600Z",
+    "alforria": {
+      "commit": "58153da29129e2de62853711c22ae9ecce6c3a4e",
+      "built": "2026-09-26T08:17:37.400Z"
+    }
+  },
+  "project": [
+    {
+      "id": "4da22615e8527aaf2595c2c6a0ce2fc35d9215dc",
+      "worktree": "/fixture/permission-gate/project",
+      "vcs": "git",
+      "time": {
+        "created": 1791057884669,
+        "updated": 1791057884669
+      },
+      "sandboxes": []
+    }
+  ],
+  "session": [
+    {
+      "id": "ses_7FS8C9V3ZYMZWHNW4DE11R967Q",
+      "slug": "misty-otter",
+      "projectID": "4da22615e8527aaf2595c2c6a0ce2fc35d9215dc",
+      "directory": "/fixture/permission-gate/project",
+      "path": ".",
+      "cost": 0,
+      "tokens": {
+        "input": 0,
+        "output": 0,
+        "reasoning": 0,
+        "cache": {
+          "read": 0,
+          "write": 0
+        }
+      },
+      "title": "New session - 2026-10-03T20:04:44.711Z",
+      "version": "local",
+      "time": {
+        "created": 1791057884711,
+        "updated": 1791057884711
+      }
+    }
+  ],
+  "sessionStatus": {},
+  "permission": [],
+  "question": []
+}

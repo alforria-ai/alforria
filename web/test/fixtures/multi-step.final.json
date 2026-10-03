@@ -1,0 +1,377 @@
+{
+  "project": [
+    {
+      "id": "ad67e1c99a02042292a19a2d851ff79d5565fbf5",
+      "worktree": "/fixture/multi-step/project",
+      "vcs": "git",
+      "time": {
+        "created": 1791057882869,
+        "updated": 1791057882869
+      },
+      "sandboxes": []
+    }
+  ],
+  "session": [
+    {
+      "id": "ses_7FS8CGVZZYJW161V687NNH73AE",
+      "slug": "cosmic-mountain",
+      "projectID": "ad67e1c99a02042292a19a2d851ff79d5565fbf5",
+      "directory": "/fixture/multi-step/project",
+      "path": ".",
+      "summary": {
+        "additions": 0,
+        "deletions": 0,
+        "files": 0
+      },
+      "cost": 0,
+      "tokens": {
+        "input": 210,
+        "output": 13,
+        "reasoning": 0,
+        "cache": {
+          "read": 0,
+          "write": 0
+        }
+      },
+      "title": "Read a.txt and b.txt",
+      "agent": "build",
+      "model": {
+        "id": "mock-model",
+        "providerID": "mock",
+        "variant": "default"
+      },
+      "version": "local",
+      "time": {
+        "created": 1791057882912,
+        "updated": 1791057883466
+      }
+    }
+  ],
+  "sessionStatus": {},
+  "permission": [],
+  "question": [],
+  "messages": {
+    "ses_7FS8CGVZZYJW161V687NNH73AE": [
+      {
+        "info": {
+          "agent": "build",
+          "id": "msg_0G6QKG3R01VRFVF0HVJFRRY6M5",
+          "model": {
+            "modelID": "mock-model",
+            "providerID": "mock"
+          },
+          "role": "user",
+          "sessionID": "ses_7FS8CGVZZYJW161V687NNH73AE",
+          "summary": {
+            "diffs": []
+          },
+          "time": {
+            "created": 1791057883166
+          }
+        },
+        "parts": [
+          {
+            "id": "prt_0G6QKG3W010879GZTH62E5D1FF",
+            "messageID": "msg_0G6QKG3R01VRFVF0HVJFRRY6M5",
+            "sessionID": "ses_7FS8CGVZZYJW161V687NNH73AE",
+            "text": "read the two files and answer",
+            "type": "text"
+          }
+        ]
+      },
+      {
+        "info": {
+          "agent": "build",
+          "cost": 0,
+          "finish": "tool-calls",
+          "id": "msg_0G6QKG48019QMP8GNYM0R53X3T",
+          "mode": "build",
+          "modelID": "mock-model",
+          "parentID": "msg_0G6QKG3R01VRFVF0HVJFRRY6M5",
+          "path": {
+            "cwd": "/fixture/multi-step/project",
+            "root": "/fixture/multi-step/project"
+          },
+          "providerID": "mock",
+          "role": "assistant",
+          "sessionID": "ses_7FS8CGVZZYJW161V687NNH73AE",
+          "time": {
+            "completed": 1791057883272,
+            "created": 1791057883170
+          },
+          "tokens": {
+            "cache": {
+              "read": 0,
+              "write": 0
+            },
+            "input": 50,
+            "output": 5,
+            "reasoning": 0,
+            "total": 55
+          }
+        },
+        "parts": [
+          {
+            "id": "prt_0G6QKGFR016HH44JTTFD95NDWZ",
+            "messageID": "msg_0G6QKG48019QMP8GNYM0R53X3T",
+            "sessionID": "ses_7FS8CGVZZYJW161V687NNH73AE",
+            "snapshot": "b45252d16e480ec998cda52414dcad53dd0e6847",
+            "type": "step-start"
+          },
+          {
+            "callID": "cal_1",
+            "id": "prt_0G6QKGFR024MHM89VBTF8JMD2V",
+            "messageID": "msg_0G6QKG48019QMP8GNYM0R53X3T",
+            "sessionID": "ses_7FS8CGVZZYJW161V687NNH73AE",
+            "state": {
+              "input": {
+                "filePath": "a.txt"
+              },
+              "metadata": {
+                "display": {
+                  "lineEnd": 1,
+                  "lineStart": 1,
+                  "path": "/fixture/multi-step/project/a.txt",
+                  "text": "alpha",
+                  "totalLines": 1,
+                  "truncated": false,
+                  "type": "file"
+                },
+                "loaded": [],
+                "preview": "alpha",
+                "truncated": false
+              },
+              "output": "<path>/fixture/multi-step/project/a.txt</path>\n<type>file</type>\n<content>\n1: alpha\n\n(End of file - total 1 lines)\n</content>",
+              "status": "completed",
+              "time": {
+                "end": 1791057883271,
+                "start": 1791057883263
+              },
+              "title": "a.txt"
+            },
+            "tool": "read",
+            "type": "tool"
+          },
+          {
+            "cost": 0,
+            "id": "prt_0G6QKGGC0174T93BJ9WGG0HN6W",
+            "messageID": "msg_0G6QKG48019QMP8GNYM0R53X3T",
+            "reason": "tool-calls",
+            "sessionID": "ses_7FS8CGVZZYJW161V687NNH73AE",
+            "snapshot": "b45252d16e480ec998cda52414dcad53dd0e6847",
+            "tokens": {
+              "cache": {
+                "read": 0,
+                "write": 0
+              },
+              "input": 50,
+              "output": 5,
+              "reasoning": 0,
+              "total": 55
+            },
+            "type": "step-finish"
+          }
+        ]
+      },
+      {
+        "info": {
+          "agent": "build",
+          "cost": 0,
+          "finish": "tool-calls",
+          "id": "msg_0G6QKGH001R2HR35B98MCH6T6M",
+          "mode": "build",
+          "modelID": "mock-model",
+          "parentID": "msg_0G6QKG3R01VRFVF0HVJFRRY6M5",
+          "path": {
+            "cwd": "/fixture/multi-step/project",
+            "root": "/fixture/multi-step/project"
+          },
+          "providerID": "mock",
+          "role": "assistant",
+          "sessionID": "ses_7FS8CGVZZYJW161V687NNH73AE",
+          "time": {
+            "completed": 1791057883372,
+            "created": 1791057883272
+          },
+          "tokens": {
+            "cache": {
+              "read": 0,
+              "write": 0
+            },
+            "input": 70,
+            "output": 5,
+            "reasoning": 0,
+            "total": 75
+          }
+        },
+        "parts": [
+          {
+            "id": "prt_0G6QKGVR01PZ99XM8Z08KRP2Y3",
+            "messageID": "msg_0G6QKGH001R2HR35B98MCH6T6M",
+            "sessionID": "ses_7FS8CGVZZYJW161V687NNH73AE",
+            "snapshot": "b45252d16e480ec998cda52414dcad53dd0e6847",
+            "type": "step-start"
+          },
+          {
+            "callID": "cal_2",
+            "id": "prt_0G6QKGVR029KYSN6RVQV8886W2",
+            "messageID": "msg_0G6QKGH001R2HR35B98MCH6T6M",
+            "sessionID": "ses_7FS8CGVZZYJW161V687NNH73AE",
+            "state": {
+              "input": {
+                "filePath": "a.txt"
+              },
+              "metadata": {
+                "display": {
+                  "lineEnd": 1,
+                  "lineStart": 1,
+                  "path": "/fixture/multi-step/project/a.txt",
+                  "text": "alpha",
+                  "totalLines": 1,
+                  "truncated": false,
+                  "type": "file"
+                },
+                "loaded": [],
+                "preview": "alpha",
+                "truncated": false
+              },
+              "output": "<path>/fixture/multi-step/project/a.txt</path>\n<type>file</type>\n<content>\n1: alpha\n\n(End of file - total 1 lines)\n</content>",
+              "status": "completed",
+              "time": {
+                "end": 1791057883367,
+                "start": 1791057883359
+              },
+              "title": "a.txt"
+            },
+            "tool": "read",
+            "type": "tool"
+          },
+          {
+            "callID": "cal_3",
+            "id": "prt_0G6QKGVW01078450J99A96YT73",
+            "messageID": "msg_0G6QKGH001R2HR35B98MCH6T6M",
+            "sessionID": "ses_7FS8CGVZZYJW161V687NNH73AE",
+            "state": {
+              "input": {
+                "filePath": "b.txt"
+              },
+              "metadata": {
+                "display": {
+                  "lineEnd": 1,
+                  "lineStart": 1,
+                  "path": "/fixture/multi-step/project/b.txt",
+                  "text": "beta",
+                  "totalLines": 1,
+                  "truncated": false,
+                  "type": "file"
+                },
+                "loaded": [],
+                "preview": "beta",
+                "truncated": false
+              },
+              "output": "<path>/fixture/multi-step/project/b.txt</path>\n<type>file</type>\n<content>\n1: beta\n\n(End of file - total 1 lines)\n</content>",
+              "status": "completed",
+              "time": {
+                "end": 1791057883372,
+                "start": 1791057883360
+              },
+              "title": "b.txt"
+            },
+            "tool": "read",
+            "type": "tool"
+          },
+          {
+            "cost": 0,
+            "id": "prt_0G6QKGWC01FREAMJW394QTVFPT",
+            "messageID": "msg_0G6QKGH001R2HR35B98MCH6T6M",
+            "reason": "tool-calls",
+            "sessionID": "ses_7FS8CGVZZYJW161V687NNH73AE",
+            "snapshot": "b45252d16e480ec998cda52414dcad53dd0e6847",
+            "tokens": {
+              "cache": {
+                "read": 0,
+                "write": 0
+              },
+              "input": 70,
+              "output": 5,
+              "reasoning": 0,
+              "total": 75
+            },
+            "type": "step-finish"
+          }
+        ]
+      },
+      {
+        "info": {
+          "agent": "build",
+          "cost": 0,
+          "finish": "stop",
+          "id": "msg_0G6QKGXR01KTVGMN1ATEV0VV3D",
+          "mode": "build",
+          "modelID": "mock-model",
+          "parentID": "msg_0G6QKG3R01VRFVF0HVJFRRY6M5",
+          "path": {
+            "cwd": "/fixture/multi-step/project",
+            "root": "/fixture/multi-step/project"
+          },
+          "providerID": "mock",
+          "role": "assistant",
+          "sessionID": "ses_7FS8CGVZZYJW161V687NNH73AE",
+          "time": {
+            "completed": 1791057883465,
+            "created": 1791057883374
+          },
+          "tokens": {
+            "cache": {
+              "read": 0,
+              "write": 0
+            },
+            "input": 90,
+            "output": 3,
+            "reasoning": 0,
+            "total": 93
+          }
+        },
+        "parts": [
+          {
+            "id": "prt_0G6QKH8401VX60PX1KK4191NZB",
+            "messageID": "msg_0G6QKGXR01KTVGMN1ATEV0VV3D",
+            "sessionID": "ses_7FS8CGVZZYJW161V687NNH73AE",
+            "snapshot": "b45252d16e480ec998cda52414dcad53dd0e6847",
+            "type": "step-start"
+          },
+          {
+            "id": "prt_0G6QKH8402C3CM2KME5F59F92T",
+            "messageID": "msg_0G6QKGXR01KTVGMN1ATEV0VV3D",
+            "sessionID": "ses_7FS8CGVZZYJW161V687NNH73AE",
+            "text": "read both files",
+            "time": {
+              "end": 1791057883458,
+              "start": 1791057883457
+            },
+            "type": "text"
+          },
+          {
+            "cost": 0,
+            "id": "prt_0G6QKH8R01F6Y4QKF450RHP5KH",
+            "messageID": "msg_0G6QKGXR01KTVGMN1ATEV0VV3D",
+            "reason": "stop",
+            "sessionID": "ses_7FS8CGVZZYJW161V687NNH73AE",
+            "snapshot": "b45252d16e480ec998cda52414dcad53dd0e6847",
+            "tokens": {
+              "cache": {
+                "read": 0,
+                "write": 0
+              },
+              "input": 90,
+              "output": 3,
+              "reasoning": 0,
+              "total": 93
+            },
+            "type": "step-finish"
+          }
+        ]
+      }
+    ]
+  }
+}

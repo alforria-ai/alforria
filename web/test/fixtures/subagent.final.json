@@ -1,0 +1,388 @@
+{
+  "project": [
+    {
+      "id": "26ce08432c0ee046305d0e4a052d20bd805a7aa0",
+      "worktree": "/fixture/subagent/project",
+      "vcs": "git",
+      "time": {
+        "created": 1791057886368,
+        "updated": 1791057886368
+      },
+      "sandboxes": []
+    }
+  ],
+  "session": [
+    {
+      "id": "ses_7FS8C36VZYZ91CZ92H56XTW5W7",
+      "slug": "glowing-pixel",
+      "projectID": "26ce08432c0ee046305d0e4a052d20bd805a7aa0",
+      "directory": "/fixture/subagent/project",
+      "path": ".",
+      "summary": {
+        "additions": 0,
+        "deletions": 0,
+        "files": 0
+      },
+      "cost": 0,
+      "tokens": {
+        "input": 110,
+        "output": 8,
+        "reasoning": 0,
+        "cache": {
+          "read": 0,
+          "write": 0
+        }
+      },
+      "title": "Delegate research",
+      "agent": "build",
+      "model": {
+        "id": "mock-model",
+        "providerID": "mock",
+        "variant": "default"
+      },
+      "version": "local",
+      "time": {
+        "created": 1791057886409,
+        "updated": 1791057886947
+      }
+    },
+    {
+      "id": "ses_7FS8C1SVZY2Y7G0F5GKD7MWSHK",
+      "slug": "calm-engine",
+      "projectID": "26ce08432c0ee046305d0e4a052d20bd805a7aa0",
+      "directory": "/fixture/subagent/project",
+      "path": ".",
+      "parentID": "ses_7FS8C36VZYZ91CZ92H56XTW5W7",
+      "summary": {
+        "additions": 0,
+        "deletions": 0,
+        "files": 0
+      },
+      "cost": 0,
+      "tokens": {
+        "input": 60,
+        "output": 3,
+        "reasoning": 0,
+        "cache": {
+          "read": 0,
+          "write": 0
+        }
+      },
+      "title": "Research (@general subagent)",
+      "agent": "general",
+      "model": {
+        "id": "mock-model",
+        "providerID": "mock",
+        "variant": "default"
+      },
+      "version": "local",
+      "time": {
+        "created": 1791057886769,
+        "updated": 1791057886853
+      },
+      "permission": [
+        {
+          "permission": "task",
+          "pattern": "*",
+          "action": "deny"
+        }
+      ]
+    }
+  ],
+  "sessionStatus": {},
+  "permission": [],
+  "question": [],
+  "messages": {
+    "ses_7FS8C36VZYZ91CZ92H56XTW5W7": [
+      {
+        "info": {
+          "agent": "build",
+          "id": "msg_0G6QKXS0013WNJYE93AC9BVFDY",
+          "model": {
+            "modelID": "mock-model",
+            "providerID": "mock"
+          },
+          "role": "user",
+          "sessionID": "ses_7FS8C36VZYZ91CZ92H56XTW5W7",
+          "summary": {
+            "diffs": []
+          },
+          "time": {
+            "created": 1791057886664
+          }
+        },
+        "parts": [
+          {
+            "id": "prt_0G6QKXS401DRVHY1QZCE3CZEG5",
+            "messageID": "msg_0G6QKXS0013WNJYE93AC9BVFDY",
+            "sessionID": "ses_7FS8C36VZYZ91CZ92H56XTW5W7",
+            "text": "spawn a subagent",
+            "type": "text"
+          }
+        ]
+      },
+      {
+        "info": {
+          "agent": "build",
+          "cost": 0,
+          "finish": "tool-calls",
+          "id": "msg_0G6QKXSC01EWS0XH9PK1F8YHS8",
+          "mode": "build",
+          "modelID": "mock-model",
+          "parentID": "msg_0G6QKXS0013WNJYE93AC9BVFDY",
+          "path": {
+            "cwd": "/fixture/subagent/project",
+            "root": "/fixture/subagent/project"
+          },
+          "providerID": "mock",
+          "role": "assistant",
+          "sessionID": "ses_7FS8C36VZYZ91CZ92H56XTW5W7",
+          "time": {
+            "completed": 1791057886855,
+            "created": 1791057886667
+          },
+          "tokens": {
+            "cache": {
+              "read": 0,
+              "write": 0
+            },
+            "input": 50,
+            "output": 5,
+            "reasoning": 0,
+            "total": 55
+          }
+        },
+        "parts": [
+          {
+            "id": "prt_0G6QKY54012V21MKJH4M8DFS25",
+            "messageID": "msg_0G6QKXSC01EWS0XH9PK1F8YHS8",
+            "sessionID": "ses_7FS8C36VZYZ91CZ92H56XTW5W7",
+            "snapshot": "1dd186c1a4f5f8a931221027a35ec5df7ee15dc8",
+            "type": "step-start"
+          },
+          {
+            "callID": "cal_1",
+            "id": "prt_0G6QKY58019FZ4F4YJREXWWVW1",
+            "messageID": "msg_0G6QKXSC01EWS0XH9PK1F8YHS8",
+            "sessionID": "ses_7FS8C36VZYZ91CZ92H56XTW5W7",
+            "state": {
+              "input": {
+                "description": "Research",
+                "prompt": "do the research",
+                "subagent_type": "general"
+              },
+              "metadata": {
+                "model": {
+                  "modelID": "mock-model",
+                  "providerID": "mock"
+                },
+                "parentSessionId": "ses_7FS8C36VZYZ91CZ92H56XTW5W7",
+                "sessionId": "ses_7FS8C1SVZY2Y7G0F5GKD7MWSHK",
+                "truncated": false
+              },
+              "output": "<task id=\"ses_7FS8C1SVZY2Y7G0F5GKD7MWSHK\" state=\"completed\">\n<task_result>\nsubagent answer\n</task_result>\n</task>",
+              "status": "completed",
+              "time": {
+                "end": 1791057886855,
+                "start": 1791057886762
+              },
+              "title": "Research"
+            },
+            "tool": "task",
+            "type": "tool"
+          },
+          {
+            "cost": 0,
+            "id": "prt_0G6QKY5W01TF41EJXTABYBGMM7",
+            "messageID": "msg_0G6QKXSC01EWS0XH9PK1F8YHS8",
+            "reason": "tool-calls",
+            "sessionID": "ses_7FS8C36VZYZ91CZ92H56XTW5W7",
+            "snapshot": "1dd186c1a4f5f8a931221027a35ec5df7ee15dc8",
+            "tokens": {
+              "cache": {
+                "read": 0,
+                "write": 0
+              },
+              "input": 50,
+              "output": 5,
+              "reasoning": 0,
+              "total": 55
+            },
+            "type": "step-finish"
+          }
+        ]
+      },
+      {
+        "info": {
+          "agent": "build",
+          "cost": 0,
+          "finish": "stop",
+          "id": "msg_0G6QKYH0010X3ZFDH054C8C9P0",
+          "mode": "build",
+          "modelID": "mock-model",
+          "parentID": "msg_0G6QKXS0013WNJYE93AC9BVFDY",
+          "path": {
+            "cwd": "/fixture/subagent/project",
+            "root": "/fixture/subagent/project"
+          },
+          "providerID": "mock",
+          "role": "assistant",
+          "sessionID": "ses_7FS8C36VZYZ91CZ92H56XTW5W7",
+          "time": {
+            "completed": 1791057886947,
+            "created": 1791057886856
+          },
+          "tokens": {
+            "cache": {
+              "read": 0,
+              "write": 0
+            },
+            "input": 60,
+            "output": 3,
+            "reasoning": 0,
+            "total": 63
+          }
+        },
+        "parts": [
+          {
+            "id": "prt_0G6QKYV8010N1FV0WPQXKKM234",
+            "messageID": "msg_0G6QKYH0010X3ZFDH054C8C9P0",
+            "sessionID": "ses_7FS8C36VZYZ91CZ92H56XTW5W7",
+            "snapshot": "1dd186c1a4f5f8a931221027a35ec5df7ee15dc8",
+            "type": "step-start"
+          },
+          {
+            "id": "prt_0G6QKYVC012TNMRPS8GDJBPERG",
+            "messageID": "msg_0G6QKYH0010X3ZFDH054C8C9P0",
+            "sessionID": "ses_7FS8C36VZYZ91CZ92H56XTW5W7",
+            "text": "parent continues",
+            "time": {
+              "end": 1791057886939,
+              "start": 1791057886939
+            },
+            "type": "text"
+          },
+          {
+            "cost": 0,
+            "id": "prt_0G6QKYVW01398XB5FKKF5QX00Z",
+            "messageID": "msg_0G6QKYH0010X3ZFDH054C8C9P0",
+            "reason": "stop",
+            "sessionID": "ses_7FS8C36VZYZ91CZ92H56XTW5W7",
+            "snapshot": "1dd186c1a4f5f8a931221027a35ec5df7ee15dc8",
+            "tokens": {
+              "cache": {
+                "read": 0,
+                "write": 0
+              },
+              "input": 60,
+              "output": 3,
+              "reasoning": 0,
+              "total": 63
+            },
+            "type": "step-finish"
+          }
+        ]
+      }
+    ],
+    "ses_7FS8C1SVZY2Y7G0F5GKD7MWSHK": [
+      {
+        "info": {
+          "agent": "general",
+          "id": "msg_0G6QKY6801J8CMNBKX2WECPV7J",
+          "model": {
+            "modelID": "mock-model",
+            "providerID": "mock"
+          },
+          "role": "user",
+          "sessionID": "ses_7FS8C1SVZY2Y7G0F5GKD7MWSHK",
+          "summary": {
+            "diffs": []
+          },
+          "time": {
+            "created": 1791057886770
+          }
+        },
+        "parts": [
+          {
+            "id": "prt_0G6QKY6C01569CY5CFQTG6BZTK",
+            "messageID": "msg_0G6QKY6801J8CMNBKX2WECPV7J",
+            "sessionID": "ses_7FS8C1SVZY2Y7G0F5GKD7MWSHK",
+            "text": "do the research",
+            "type": "text"
+          }
+        ]
+      },
+      {
+        "info": {
+          "agent": "general",
+          "cost": 0,
+          "finish": "stop",
+          "id": "msg_0G6QKY6G01H43EDTH4GQZTMH49",
+          "mode": "general",
+          "modelID": "mock-model",
+          "parentID": "msg_0G6QKY6801J8CMNBKX2WECPV7J",
+          "path": {
+            "cwd": "/fixture/subagent/project",
+            "root": "/fixture/subagent/project"
+          },
+          "providerID": "mock",
+          "role": "assistant",
+          "sessionID": "ses_7FS8C1SVZY2Y7G0F5GKD7MWSHK",
+          "time": {
+            "completed": 1791057886853,
+            "created": 1791057886772
+          },
+          "tokens": {
+            "cache": {
+              "read": 0,
+              "write": 0
+            },
+            "input": 60,
+            "output": 3,
+            "reasoning": 0,
+            "total": 63
+          }
+        },
+        "parts": [
+          {
+            "id": "prt_0G6QKYFG01043WT111P2P4X491",
+            "messageID": "msg_0G6QKY6G01H43EDTH4GQZTMH49",
+            "sessionID": "ses_7FS8C1SVZY2Y7G0F5GKD7MWSHK",
+            "snapshot": "1dd186c1a4f5f8a931221027a35ec5df7ee15dc8",
+            "type": "step-start"
+          },
+          {
+            "id": "prt_0G6QKYFM01KQCEBMKN0Q9NB29A",
+            "messageID": "msg_0G6QKY6G01H43EDTH4GQZTMH49",
+            "sessionID": "ses_7FS8C1SVZY2Y7G0F5GKD7MWSHK",
+            "text": "subagent answer",
+            "time": {
+              "end": 1791057886845,
+              "start": 1791057886845
+            },
+            "type": "text"
+          },
+          {
+            "cost": 0,
+            "id": "prt_0G6QKYG401YZADQQEQ6G3K9D08",
+            "messageID": "msg_0G6QKY6G01H43EDTH4GQZTMH49",
+            "reason": "stop",
+            "sessionID": "ses_7FS8C1SVZY2Y7G0F5GKD7MWSHK",
+            "snapshot": "1dd186c1a4f5f8a931221027a35ec5df7ee15dc8",
+            "tokens": {
+              "cache": {
+                "read": 0,
+                "write": 0
+              },
+              "input": 60,
+              "output": 3,
+              "reasoning": 0,
+              "total": 63
+            },
+            "type": "step-finish"
+          }
+        ]
+      }
+    ]
+  }
+}
