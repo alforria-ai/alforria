@@ -13,7 +13,8 @@
     "server": "bun script/dev-server.ts",
     "record": "bun script/record.ts",
     "format": "prettier --write .",
-    "check": "prettier --check . && tsc --noEmit && vitest run"
+    "check": "prettier --check . && tsc --noEmit && vitest run",
+    "e2e": "bun test/e2e/run.ts"
   },
   "dependencies": {
     "@xterm/addon-fit": "^0.11.0",
@@ -25,6 +26,7 @@
   "devDependencies": {
     "@types/bun": "^1.4.2",
     "openapi-typescript": "^7",
+    "playwright": "1.59.1",
     "prettier": "^3",
     "typescript": "^5.9",
     "vite": "^7",

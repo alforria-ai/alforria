@@ -11,7 +11,8 @@ import { dirname, join, resolve } from "node:path"
 
 export const WEB = resolve(import.meta.dir, "../..")
 export const REPO = resolve(WEB, "..")
-export const DEV = join(WEB, ".dev")
+// ALFORRIA_DEV_DIR lets a second harness (the e2e suite) run beside `bun run server`.
+export const DEV = process.env.ALFORRIA_DEV_DIR ?? join(WEB, ".dev")
 export const BIN = join(REPO, "target/debug/alforria")
 
 export const PROVIDER = "mock"

@@ -31,6 +31,11 @@ export default defineConfig({
     port: 4610,
     proxy: Object.fromEntries(api.map((p) => [p, { target, changeOrigin: true, ws: p === "/pty" }])),
   },
+  // `vite preview` serves the production build the same way (the e2e suite uses it).
+  preview: {
+    host: "127.0.0.1",
+    proxy: Object.fromEntries(api.map((p) => [p, { target, changeOrigin: true, ws: p === "/pty" }])),
+  },
   build: {
     target: "es2022",
     outDir: "dist",
