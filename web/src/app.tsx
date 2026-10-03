@@ -203,6 +203,12 @@ export function App() {
                     <div class="q-empty">
                       <h3>{state.conn.state === "live" ? "No sessions yet" : "Connecting…"}</h3>
                       <p>Sessions from every project on this server appear here as they start.</p>
+                      <Show when={state.conn.state === "live" && !Object.keys(state.models).length}>
+                        <p>No model is connected yet. Sign in with LibertAI or add an API key first.</p>
+                        <button class="link-btn primary" onClick={() => openSettings("providers")}>
+                          Connect a provider
+                        </button>
+                      </Show>
                     </div>
                   }
                 >

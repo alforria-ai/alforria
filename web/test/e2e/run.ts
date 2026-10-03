@@ -227,7 +227,7 @@ try {
     check((await p.locator(".palette").count()) === 0, "a press outside closes the palette")
 
     // The model picker works from the keyboard.
-    await p.locator("tr.s-row", { hasText: "Scripted session" }).click()
+    await p.locator("tr.s-row", { hasText: "Apply pending migrations" }).click()
     await p.locator(".col.is-active .model-btn").click()
     await p.locator(".popover.models").waitFor()
     await p.keyboard.type("mock")
