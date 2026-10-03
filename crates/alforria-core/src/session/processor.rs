@@ -20,6 +20,8 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use alforria_llm::route::client::BODY_READ_ERROR;
+use alforria_llm::route::executor::ENCODE_ERROR;
 use alforria_llm::schema::errors::{LlmError, LlmErrorReason, ProviderFailureClassification};
 use alforria_llm::schema::events::{LlmEvent, Usage};
 use alforria_llm::schema::ids::FinishReason;
@@ -454,59 +456,74 @@ fn read_tool_call(
 // -------------------------------------------------------------------------
 
 /// Map the native runtime's [`LlmError`] onto the ai-sdk error classes
-/// `fromError` discriminates over. The native union is richer than the
-/// ai-sdk one, so retryable and overflow signals are preserved
-/// (documented divergence, spec §2.6).
+/// `fromError` discriminates over. TS's default runtime is the ai-sdk
+/// (llm.ts:271-280), whose providers throw an `APICallError` for every
+/// non-2xx response and for a failed connection — so every reason carrying
+/// an HTTP status, and a request that never got a response, becomes one (wire
+/// `APIError`, or `ContextOverflowError`). Other reasons without a
+/// response fall back to `LoadAPIKeyError` (missing credentials) or
+/// `UnknownError`.
 fn source_error(error: &LlmError) -> SourceError {
-    match &error.reason {
-        LlmErrorReason::RateLimit { message, http, .. } => {
-            let (status, headers, body, url) = http_context_parts(http.as_ref());
-            SourceError::ApiCall(Box::new(ApiCallError {
-                message: message.clone(),
-                status_code: status.map(|s| s as u64).or(Some(429)),
-                is_retryable: true,
-                response_headers: headers,
-                response_body: body,
-                url,
-            }))
-        }
-        LlmErrorReason::ProviderInternal {
-            message,
-            status,
-            http,
-            ..
-        } => {
-            let (_, headers, body, url) = http_context_parts(http.as_ref());
-            SourceError::ApiCall(Box::new(ApiCallError {
-                message: message.clone(),
-                status_code: Some(*status as u64),
-                is_retryable: true,
-                response_headers: headers,
-                response_body: body,
-                url,
-            }))
-        }
-        LlmErrorReason::InvalidRequest {
-            message,
-            classification: Some(ProviderFailureClassification::ContextOverflow),
-            http,
-            ..
-        } => {
-            let (_, headers, body, url) = http_context_parts(http.as_ref());
-            SourceError::ApiCall(Box::new(ApiCallError {
-                message: message.clone(),
-                // 413 surfaces as ContextOverflow via `parse_api_call_error`.
-                status_code: Some(413),
-                is_retryable: false,
-                response_headers: headers,
-                response_body: body,
-                url,
-            }))
-        }
-        LlmErrorReason::Authentication { message, .. } => SourceError::LoadApiKey {
+    let reason = &error.reason;
+    let http = reason_http(reason);
+    let status = http
+        .and_then(|http| http.response.as_ref())
+        .map(|response| response.status as u64)
+        .or(match reason {
+            LlmErrorReason::RateLimit { .. } => Some(429),
+            LlmErrorReason::ProviderInternal { status, .. } => Some(*status as u64),
+            LlmErrorReason::UnknownProvider { status, .. } => status.map(|status| status as u64),
+            _ => None,
+        });
+    if let LlmErrorReason::InvalidRequest {
+        classification: Some(ProviderFailureClassification::ContextOverflow),
+        ..
+    } = reason
+    {
+        let mut call = api_call_error(status, reason, http);
+        // 413 surfaces as ContextOverflow via `parse_api_call_error`.
+        call.status_code = Some(413);
+        return SourceError::ApiCall(Box::new(call));
+    }
+    match (status, reason) {
+        (Some(_), _) => SourceError::ApiCall(Box::new(api_call_error(status, reason, http))),
+        (None, LlmErrorReason::Authentication { message, .. }) => SourceError::LoadApiKey {
             message: message.clone(),
         },
-        reason => SourceError::Error {
+        // A body read failing after the 2xx: Bun's fetch rejects the read
+        // with `code: "ECONNRESET"`, which `fromError` matches before any
+        // ai-sdk wrapping (message-v2.ts:629-640).
+        (None, LlmErrorReason::Transport { message, kind, .. })
+            if kind.as_deref() == Some(BODY_READ_ERROR) =>
+        {
+            SourceError::Econnreset {
+                code: "ECONNRESET".to_string(),
+                syscall: String::new(),
+                message: message.clone(),
+            }
+        }
+        // The request never got a response: ai-sdk's `handleFetchError`
+        // (provider-utils handle-fetch-error.ts) wraps the fetch failure
+        // as a retryable, status-less `APICallError`. A request that could
+        // not even be built is rethrown as-is (`UnknownError`).
+        (
+            None,
+            LlmErrorReason::Transport {
+                message, kind, url, ..
+            },
+        ) if kind.as_deref() != Some(ENCODE_ERROR) => {
+            SourceError::ApiCall(Box::new(ApiCallError {
+                message: format!("Cannot connect to API: {message}"),
+                status_code: None,
+                is_retryable: true,
+                response_headers: None,
+                response_body: None,
+                url: url
+                    .clone()
+                    .or_else(|| http.map(|http| http.request.url.clone())),
+            }))
+        }
+        (None, reason) => SourceError::Error {
             message: format!(
                 "{}.{}: {}",
                 error.module,
@@ -517,27 +534,62 @@ fn source_error(error: &LlmError) -> SourceError {
     }
 }
 
-#[allow(clippy::type_complexity)]
-fn http_context_parts(
+/// The `APICallError` ai-sdk's `createJsonErrorResponseHandler` builds for
+/// a failed response: the provider's `error.message` when the body parses
+/// (the openai, openai-compatible, anthropic and google error schemas),
+/// else the status text; retryable on 408/409/429/5xx (the `APICallError`
+/// default). Without response context the native message is kept.
+fn api_call_error(
+    status: Option<u64>,
+    reason: &LlmErrorReason,
     http: Option<&alforria_llm::schema::errors::HttpContext>,
-) -> (
-    Option<f64>,
-    Option<BTreeMap<String, String>>,
-    Option<String>,
-    Option<String>,
-) {
-    let (status, headers, body, url) = match http {
-        None => (None, None, None, None),
-        Some(http) => (
-            http.response.as_ref().map(|response| response.status),
-            http.response
-                .as_ref()
-                .map(|response| response.headers.clone()),
-            http.body.clone(),
-            Some(http.request.url.clone()),
-        ),
+) -> ApiCallError {
+    let message = match http {
+        None => reason_message(reason),
+        Some(http) => http
+            .body
+            .as_deref()
+            .filter(|body| !body.trim().is_empty())
+            .and_then(|body| serde_json::from_str::<Value>(body).ok())
+            .and_then(|body| {
+                body.get("error")?
+                    .get("message")?
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| {
+                status
+                    .and_then(crate::session::from_error::status_text)
+                    .unwrap_or_default()
+                    .to_string()
+            }),
     };
-    (status, headers, body, url)
+    ApiCallError {
+        message,
+        status_code: status,
+        is_retryable: status
+            .map(|status| matches!(status, 408 | 409 | 429) || status >= 500)
+            .unwrap_or(false),
+        response_headers: http
+            .and_then(|http| http.response.as_ref())
+            .map(|response| response.headers.clone()),
+        response_body: http.and_then(|http| http.body.clone()),
+        url: http.map(|http| http.request.url.clone()),
+    }
+}
+
+fn reason_http(reason: &LlmErrorReason) -> Option<&alforria_llm::schema::errors::HttpContext> {
+    match reason {
+        LlmErrorReason::InvalidRequest { http, .. }
+        | LlmErrorReason::Authentication { http, .. }
+        | LlmErrorReason::RateLimit { http, .. }
+        | LlmErrorReason::QuotaExceeded { http, .. }
+        | LlmErrorReason::ContentPolicy { http, .. }
+        | LlmErrorReason::ProviderInternal { http, .. }
+        | LlmErrorReason::Transport { http, .. }
+        | LlmErrorReason::UnknownProvider { http, .. } => http.as_ref(),
+        LlmErrorReason::InvalidProviderOutput { .. } | LlmErrorReason::NoRoute { .. } => None,
+    }
 }
 
 fn reason_message(reason: &LlmErrorReason) -> String {

@@ -39,7 +39,7 @@ const STATUS_CODES: &[(u16, &str)] = &[
     (509, "Bandwidth Limit Exceeded"), (510, "Not Extended"), (511, "Network Authentication Required"),
 ];
 
-fn status_text(code: u64) -> Option<&'static str> {
+pub(crate) fn status_text(code: u64) -> Option<&'static str> {
     STATUS_CODES
         .iter()
         .find(|(candidate, _)| u64::from(*candidate) == code)

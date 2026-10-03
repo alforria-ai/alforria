@@ -240,7 +240,7 @@ impl<S: Sleeper, J: Jitter> RequestExecutor<S, J> {
         let method = match reqwest::Method::from_str(&prepared.method) {
             Ok(method) => method,
             Err(error) => {
-                return Err(self.transport_error(prepared, "RequestError", &error.to_string()))
+                return Err(self.transport_error(prepared, ENCODE_ERROR, &error.to_string()))
             }
         };
         let mut builder = self.client.request(method, &prepared.url);
@@ -250,7 +250,7 @@ impl<S: Sleeper, J: Jitter> RequestExecutor<S, J> {
         let request = match builder.body(prepared.body.clone()).build() {
             Ok(request) => request,
             Err(error) => {
-                return Err(self.transport_error(prepared, "RequestError", &error.to_string()))
+                return Err(self.transport_error(prepared, ENCODE_ERROR, &error.to_string()))
             }
         };
         match self.client.execute(request).await {
@@ -271,7 +271,7 @@ impl<S: Sleeper, J: Jitter> RequestExecutor<S, J> {
                 } else {
                     "TransportError"
                 };
-                Err(self.transport_error(prepared, kind, &error.to_string()))
+                Err(self.transport_error(prepared, kind, &error_chain(&error)))
             }
         }
     }
@@ -468,6 +468,28 @@ pub fn status_reason(input: StatusReasonInput) -> LlmErrorReason {
         status: Some(status as f64),
         provider_metadata: None,
         http: Some(input.http),
+    }
+}
+
+/// Transport `kind` of a request that could not be built (bad method, URL
+/// or header) — it never reached the network, unlike every other kind.
+pub const ENCODE_ERROR: &str = "EncodeError";
+
+/// The causes behind a reqwest error, outermost first. reqwest's own
+/// `Display` is only "error sending request for url (…)", which repeats
+/// the URL and hides why the request failed ("tcp connect error:
+/// Connection refused (os error 111)").
+pub(crate) fn error_chain(error: &reqwest::Error) -> String {
+    let mut causes = Vec::new();
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        causes.push(cause.to_string());
+        source = cause.source();
+    }
+    if causes.is_empty() {
+        error.to_string()
+    } else {
+        causes.join(": ")
     }
 }
 
@@ -1042,6 +1064,50 @@ mod tests {
         assert_eq!(response.status(), 200);
         assert_eq!(server.attempts(), 2);
         assert_eq!(sleeper.delays(), vec![0]);
+    }
+
+    #[tokio::test]
+    async fn connection_refused_is_a_transport_error_carrying_the_cause() {
+        // Bind then drop: nothing listens on the port any more.
+        let addr = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let sleeper = std::sync::Arc::new(FakeSleeper::default());
+        let error = executor(sleeper.clone())
+            .execute(&prepared(&format!("http://{addr}/v1/chat")))
+            .await
+            .unwrap_err();
+        let LlmErrorReason::Transport {
+            message, kind, url, ..
+        } = &error.reason
+        else {
+            panic!("expected a transport error, got {:?}", error.reason);
+        };
+        assert_eq!(kind.as_deref(), Some("ConnectError"));
+        assert!(message.contains("Connection refused"), "{message}");
+        assert_eq!(
+            url.as_deref(),
+            Some(format!("http://{addr}/v1/chat").as_str())
+        );
+        assert!(!error.retryable());
+        assert_eq!(sleeper.delays(), Vec::<u64>::new());
+    }
+
+    #[tokio::test]
+    async fn unbuildable_request_is_an_encode_error() {
+        let mut request = prepared("http://127.0.0.1:9/v1/chat");
+        request
+            .headers
+            .push(("bad header".to_string(), "x".to_string()));
+        let error = executor(std::sync::Arc::new(FakeSleeper::default()))
+            .execute(&request)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            &error.reason,
+            LlmErrorReason::Transport { kind, .. } if kind.as_deref() == Some(ENCODE_ERROR)
+        ));
     }
 
     #[tokio::test]

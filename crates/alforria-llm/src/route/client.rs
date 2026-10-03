@@ -11,7 +11,7 @@ use crate::route::endpoint::{render, Endpoint, EndpointInput};
 use crate::route::executor::{PreparedRequest, RequestExecutor};
 use crate::route::framing::Framing;
 use crate::route::protocol::Protocol;
-use crate::schema::errors::LlmError;
+use crate::schema::errors::{LlmError, LlmErrorReason};
 use crate::schema::events::{LlmEvent, LlmResponse};
 use crate::schema::messages::LlmRequest;
 use crate::schema::options::{
@@ -319,8 +319,21 @@ struct StreamState<P: Protocol> {
     halt: tokio_util::sync::CancellationToken,
 }
 
+/// Transport `kind` of a response body that failed mid-stream, after a
+/// 2xx status (connection reset, truncated chunked body).
+pub const BODY_READ_ERROR: &str = "BodyReadError";
+
 fn transport_error(e: reqwest::Error) -> LlmError {
-    LlmError::invalid(format!("Route.stream: {e}"))
+    LlmError {
+        module: "Route".to_string(),
+        method: "stream".to_string(),
+        reason: LlmErrorReason::Transport {
+            message: crate::route::executor::error_chain(&e),
+            kind: Some(BODY_READ_ERROR.to_string()),
+            url: None,
+            http: None,
+        },
+    }
 }
 
 fn upsert_header(headers: &mut Headers, name: String, value: String) {
@@ -360,6 +373,67 @@ mod tests {
         ) -> Result<((), Vec<LlmEvent>), LlmError> {
             Ok((state, Vec::new()))
         }
+    }
+
+    /// A route to `base_url` speaking [`EchoProtocol`] over SSE.
+    fn echo_route(base_url: String) -> Route<EchoProtocol> {
+        let handle = RouteHandle {
+            id: "echo-route".to_string(),
+            protocol_id: "echo".to_string(),
+            endpoint: {
+                let mut e = Endpoint::path("/v1/chat");
+                e.base_url = Some(base_url);
+                e
+            },
+            auth: Auth::bearer(crate::route::auth::value("test-token")),
+            framing: Framing::Sse,
+            defaults: RouteDefaults::default(),
+        };
+        Route::new(handle, EchoProtocol)
+    }
+
+    #[tokio::test]
+    async fn body_dropped_after_a_2xx_is_a_body_read_error() {
+        use futures::StreamExt;
+        use std::io::{Read, Write};
+
+        // A 200 SSE response whose chunked body is cut off mid-stream.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0u8; 4096];
+            let _ = stream.read(&mut buffer);
+            let chunk = "data: {\"a\":1}\n\n";
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                     transfer-encoding: chunked\r\n\r\n{:x}\r\n{chunk}\r\n",
+                    chunk.len()
+                )
+                .as_bytes(),
+            );
+        });
+
+        let route = echo_route(format!("http://{addr}"));
+        let request = LlmRequest::new(crate::schema::messages::ModelRef::new(
+            "echo-model",
+            "echo",
+            route.handle.clone(),
+        ));
+        let mut stream = route.stream(&request).await.unwrap();
+        let error = loop {
+            match stream.next().await {
+                Some(Ok(_)) => continue,
+                Some(Err(error)) => break error,
+                None => panic!("the truncated body must fail the stream"),
+            }
+        };
+        let LlmErrorReason::Transport { message, kind, .. } = &error.reason else {
+            panic!("expected a transport error, got {:?}", error.reason);
+        };
+        assert_eq!(kind.as_deref(), Some(BODY_READ_ERROR));
+        assert!(message.contains("error reading a body"), "{message}");
     }
 
     #[test]

@@ -952,4 +952,399 @@ mod tests {
             "expected the resumed answer text"
         );
     }
+
+    // ------------------------------------------------------------------
+    // 11. Provider HTTP errors — TS's default ai-sdk runtime throws an
+    // `APICallError` for every non-2xx response, which `fromError` turns
+    // into `APIError` (message-v2.ts:687-714, provider/error.ts:166-190)
+    // ------------------------------------------------------------------
+
+    const API_URL: &str = "https://api.example.com/v1/messages";
+
+    /// A failed response classified by the real executor
+    /// (`status_reason`), as `RequestExecutor.execute` raises it.
+    fn http_failure(status: u16, body: &str) -> LlmError {
+        use alforria_llm::route::executor::{status_reason, StatusReasonInput};
+        let http = HttpContext {
+            request: HttpRequestDetails {
+                method: "POST".to_string(),
+                url: API_URL.to_string(),
+                headers: Default::default(),
+            },
+            response: Some(HttpResponseDetails {
+                status: f64::from(status),
+                headers: BTreeMap::from([(
+                    "content-type".to_string(),
+                    "application/json".to_string(),
+                )]),
+            }),
+            body: Some(body.to_string()),
+            body_truncated: None,
+            request_id: None,
+            rate_limit: None,
+        };
+        LlmError {
+            module: "RequestExecutor".to_string(),
+            method: "execute".to_string(),
+            reason: status_reason(StatusReasonInput {
+                status,
+                message: format!("Provider request failed with HTTP {status}: {body}"),
+                retry_after_ms: None,
+                rate_limit: None,
+                http,
+            }),
+        }
+    }
+
+    /// [`http_failure`] with `retry-after: 0`, so the retry schedule
+    /// (retry.ts:50-66) does not outlast the test timeout.
+    fn immediate_retry(mut error: LlmError) -> LlmError {
+        let http = match &mut error.reason {
+            LlmErrorReason::RateLimit { http, .. }
+            | LlmErrorReason::ProviderInternal { http, .. } => http.as_mut(),
+            _ => None,
+        };
+        let response = http
+            .and_then(|http| http.response.as_mut())
+            .expect("a retryable HTTP failure");
+        response
+            .headers
+            .insert("retry-after".to_string(), "0".to_string());
+        error
+    }
+
+    /// Drive one prompt whose every attempt fails with `error`; returns
+    /// the assistant's wire error, the `session.error` payload errors and
+    /// the `retry` status messages.
+    async fn failing_turn(
+        name: &str,
+        error: LlmError,
+        attempts: usize,
+    ) -> (Value, Vec<Value>, Vec<Value>) {
+        let script = (0..attempts).map(|_| vec![Err(error.clone())]).collect();
+        let e = engine(name, script);
+        let session = create_engine_session(&e);
+        let errors = e.services.events.subscribe("session.error");
+        let statuses = e.services.events.subscribe("session.status");
+
+        // Paused clock: the header-less backoff (retry.ts:77-78, up to 30s
+        // per attempt) elapses virtually, past `run_prompt`'s timeout.
+        let assistant = tokio::time::timeout(
+            std::time::Duration::from_secs(600),
+            e.prompt.prompt(prompt_input(&session.id, "hi")),
+        )
+        .await
+        .expect("prompt runs within the virtual timeout")
+        .expect("prompt succeeds");
+        assert_eq!(e.llm.calls(), attempts);
+        let V1Message::Assistant { error, .. } = &assistant.info else {
+            panic!("expected an assistant message");
+        };
+        let wire = serde_json::to_value(error.as_ref().expect("errored")).unwrap();
+        let published = drain(errors)
+            .into_iter()
+            .map(|(_, data)| data["error"].clone())
+            .collect();
+        let retries = drain(statuses)
+            .into_iter()
+            .filter(|(_, data)| data["status"]["type"] == json!("retry"))
+            .map(|(_, data)| data["status"]["message"].clone())
+            .collect();
+        (wire, published, retries)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn http_400_is_a_non_retryable_api_error() {
+        let body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"model: claude-nope"}}"#;
+        let (wire, published, retries) =
+            failing_turn("e2e-http-400", http_failure(400, body), 1).await;
+        let expected = json!({
+            "name": "APIError",
+            "data": {
+                "message": "model: claude-nope",
+                "statusCode": 400,
+                "isRetryable": false,
+                "responseHeaders": { "content-type": "application/json" },
+                "responseBody": body,
+                "metadata": { "url": API_URL },
+            },
+        });
+        assert_eq!(wire, expected);
+        assert_eq!(published, vec![expected]);
+        assert!(retries.is_empty(), "a 400 is not retried: {retries:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn http_401_is_an_api_error_not_a_provider_auth_error() {
+        // ai-sdk raises `APICallError` for a rejected key; only a missing
+        // key (`LoadAPIKeyError`) becomes `ProviderAuthError`.
+        let body = r#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#;
+        let (wire, _, retries) = failing_turn("e2e-http-401", http_failure(401, body), 1).await;
+        assert_eq!(wire["name"], json!("APIError"));
+        assert_eq!(wire["data"]["message"], json!("invalid x-api-key"));
+        assert_eq!(wire["data"]["statusCode"], json!(401));
+        assert_eq!(wire["data"]["isRetryable"], json!(false));
+        assert!(retries.is_empty(), "a 401 is not retried: {retries:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn missing_key_is_a_provider_auth_error() {
+        let error = LlmError {
+            module: "Auth".to_string(),
+            method: "apply".to_string(),
+            reason: LlmErrorReason::Authentication {
+                message: "Missing API key".to_string(),
+                kind: alforria_llm::schema::errors::AuthKind::Missing,
+                provider_metadata: None,
+                http: None,
+            },
+        };
+        let (wire, _, _) = failing_turn("e2e-missing-key", error, 1).await;
+        assert_eq!(
+            wire,
+            json!({
+                "name": "ProviderAuthError",
+                "data": { "providerID": "anthropic", "message": "Missing API key" },
+            })
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn http_429_and_5xx_are_retryable_api_errors() {
+        // RETRY_MAX_RETRIES (retry.ts:31) retries, then the final error.
+        let body = r#"{"error":{"message":"Rate limited, slow down","type":"rate_limit_error"}}"#;
+        let (wire, _, retries) =
+            failing_turn("e2e-http-429", immediate_retry(http_failure(429, body)), 6).await;
+        assert_eq!(wire["name"], json!("APIError"));
+        assert_eq!(wire["data"]["statusCode"], json!(429));
+        assert_eq!(wire["data"]["isRetryable"], json!(true));
+        assert_eq!(retries, vec![json!("Rate limited, slow down"); 5]);
+
+        let body = r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#;
+        let (wire, _, retries) =
+            failing_turn("e2e-http-529", immediate_retry(http_failure(529, body)), 6).await;
+        assert_eq!(wire["name"], json!("APIError"));
+        assert_eq!(wire["data"]["statusCode"], json!(529));
+        assert_eq!(wire["data"]["isRetryable"], json!(true));
+        // retry.ts:137 — "Overloaded" messages are normalized.
+        assert_eq!(retries, vec![json!("Provider is overloaded"); 5]);
+
+        // A non-JSON gateway page: ai-sdk falls back to the status text.
+        let (wire, _, _) = failing_turn(
+            "e2e-http-502",
+            immediate_retry(http_failure(502, "<html>upstream</html>")),
+            6,
+        )
+        .await;
+        assert_eq!(wire["data"]["message"], json!("Bad Gateway"));
+        assert_eq!(wire["data"]["statusCode"], json!(502));
+        assert_eq!(wire["data"]["isRetryable"], json!(true));
+    }
+
+    /// A request that never got a response, as `RequestExecutor.send`
+    /// raises it (kind from reqwest, message from the cause chain).
+    fn connection_refused() -> LlmError {
+        LlmError {
+            module: "RequestExecutor".to_string(),
+            method: "execute".to_string(),
+            reason: LlmErrorReason::Transport {
+                message:
+                    "client error (Connect): tcp connect error: Connection refused (os error 111)"
+                        .to_string(),
+                kind: Some("ConnectError".to_string()),
+                url: Some(API_URL.to_string()),
+                http: Some(HttpContext {
+                    request: HttpRequestDetails {
+                        method: "POST".to_string(),
+                        url: API_URL.to_string(),
+                        headers: Default::default(),
+                    },
+                    response: None,
+                    body: None,
+                    body_truncated: None,
+                    request_id: None,
+                    rate_limit: None,
+                }),
+            },
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connection_refused_retries_then_is_a_retryable_api_error() {
+        // provider-utils `handleFetchError`: a failed fetch becomes a
+        // status-less, retryable `APICallError("Cannot connect to API: …")`.
+        let (wire, published, retries) = failing_turn("e2e-refused", connection_refused(), 6).await;
+        let message = "Cannot connect to API: client error (Connect): tcp connect error: \
+                       Connection refused (os error 111)";
+        let expected = json!({
+            "name": "APIError",
+            "data": {
+                "message": message,
+                "isRetryable": true,
+                "metadata": { "url": API_URL },
+            },
+        });
+        assert_eq!(wire, expected);
+        assert_eq!(published, vec![expected]);
+        assert_eq!(retries, vec![json!(message); 5]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unbuildable_request_is_an_unknown_error() {
+        // `handleFetchError` rethrows non-network failures untouched.
+        let mut error = connection_refused();
+        if let LlmErrorReason::Transport { message, kind, .. } = &mut error.reason {
+            *message = "builder error".to_string();
+            *kind = Some(alforria_llm::route::executor::ENCODE_ERROR.to_string());
+        }
+        let (wire, _, retries) = failing_turn("e2e-unbuildable", error, 1).await;
+        assert_eq!(
+            wire,
+            json!({
+                "name": "UnknownError",
+                "data": { "message": "RequestExecutor.execute: builder error" },
+            })
+        );
+        assert!(retries.is_empty(), "{retries:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn body_dropped_mid_stream_is_a_connection_reset() {
+        // Bun rejects the body read with `code: "ECONNRESET"`, which
+        // `fromError` maps before any ai-sdk wrapping (message-v2.ts:629).
+        let cause = "error reading a body from connection: unexpected EOF during chunk size line";
+        let error = LlmError {
+            module: "Route".to_string(),
+            method: "stream".to_string(),
+            reason: LlmErrorReason::Transport {
+                message: cause.to_string(),
+                kind: Some(alforria_llm::route::client::BODY_READ_ERROR.to_string()),
+                url: None,
+                http: None,
+            },
+        };
+        let (wire, _, retries) = failing_turn("e2e-mid-stream-reset", error, 6).await;
+        assert_eq!(
+            wire,
+            json!({
+                "name": "APIError",
+                "data": {
+                    "message": "Connection reset by server",
+                    "isRetryable": true,
+                    "metadata": { "code": "ECONNRESET", "syscall": "", "message": cause },
+                },
+            })
+        );
+        assert_eq!(retries, vec![json!("Connection reset by server"); 5]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn context_overflow_body_is_a_context_overflow_error() {
+        let body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 250000 tokens > 200000 maximum"}}"#;
+        let config = json!({ "compaction": { "auto": false } });
+        let e = crate::session::test_support::engine_with_config(
+            "e2e-http-overflow",
+            vec![vec![Err(http_failure(400, body))]],
+            config,
+        );
+        let session = create_engine_session(&e);
+        let assistant = run_prompt(&e, prompt_input(&session.id, "hi")).await;
+        let V1Message::Assistant { error, .. } = &assistant.info else {
+            panic!("expected an assistant message");
+        };
+        assert_eq!(
+            serde_json::to_value(error.as_ref().expect("errored")).unwrap(),
+            json!({
+                "name": "ContextOverflowError",
+                "data": {
+                    "message": "prompt is too long: 250000 tokens > 200000 maximum",
+                    "responseBody": body,
+                },
+            })
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // 12. Final event order of a turn (processor.ts:571-648, run-state.ts:
+    // 60-63): the completed `message.updated` precedes the runner's idle;
+    // on a stream failure `halt` publishes error + idle *before* cleanup
+    // completes the message, and the runner goes idle again after.
+    // ------------------------------------------------------------------
+
+    /// The tail-relevant events: assistant `message.updated` (tagged with
+    /// whether it is completed), `session.error`, `session.status`
+    /// (tagged with its type) and `session.idle`.
+    fn turn_markers(events: &[(String, Value)]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|(type_, data)| match type_.as_str() {
+                "message.updated" if data["info"]["role"] == json!("assistant") => {
+                    Some(if data["info"]["time"]["completed"].is_null() {
+                        "message.updated".to_string()
+                    } else {
+                        "message.updated:completed".to_string()
+                    })
+                }
+                "session.status" => Some(format!(
+                    "session.status:{}",
+                    data["status"]["type"].as_str().unwrap_or_default()
+                )),
+                "session.error" | "session.idle" => Some(type_.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn completed_message_precedes_idle() {
+        let e = engine("e2e-order-ok", vec![text_stream("hello")]);
+        let session = create_engine_session(&e);
+        let rx = e.services.events.all();
+        run_prompt(&e, prompt_input(&session.id, "hi")).await;
+
+        let markers = turn_markers(&drain(rx));
+        assert_eq!(
+            markers[markers.len() - 4..],
+            [
+                "message.updated:completed",
+                "session.status:busy",
+                "session.status:idle",
+                "session.idle",
+            ],
+            "{markers:?}"
+        );
+        assert_eq!(
+            markers
+                .iter()
+                .filter(|marker| *marker == "session.idle")
+                .count(),
+            1,
+            "{markers:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_turn_halts_idle_before_cleanup_completes_the_message() {
+        let body = r#"{"error":{"message":"bad request"}}"#;
+        let e = engine("e2e-order-error", vec![vec![Err(http_failure(400, body))]]);
+        let session = create_engine_session(&e);
+        let rx = e.services.events.all();
+        run_prompt(&e, prompt_input(&session.id, "hi")).await;
+
+        let markers = turn_markers(&drain(rx));
+        assert_eq!(
+            markers,
+            [
+                "session.status:busy",
+                "message.updated",
+                "session.status:busy",
+                "session.error",
+                "session.status:idle",
+                "session.idle",
+                "message.updated:completed",
+                "session.status:idle",
+                "session.idle",
+            ],
+        );
+    }
 }
