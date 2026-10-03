@@ -313,6 +313,12 @@ impl SessionEngine for ProductionEngine {
 }
 
 impl ProductionEngine {
+    /// The model-resolution seam the session loop runs on.
+    #[cfg(test)]
+    pub(crate) fn models(&self) -> Arc<dyn alforria_core::session::r#loop::ModelSource> {
+        self.models.clone()
+    }
+
     /// `sessionBackground` (`handlers/experimental.ts:178-193`): promote the
     /// session's running, non-background task jobs; `true` if any promoted.
     async fn session_background_impl(&self, session_id: &str) -> bool {
@@ -677,10 +683,13 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
 
     // Provider-runtime seams — the M7.7 production runtime (models +
     // route sender) unless the e2e tests script a mock LLM here.
+    // The runtime keeps the auth store and rebuilds its provider state
+    // when credentials change, so a sign-in reaches this instance without
+    // a dispose (see `RuntimeModels`).
     let runtime_models = crate::provider_runtime::RuntimeModels::new(
-        &crate::provider::load_catalog(&input.runtime.catalog)?,
+        crate::provider::load_catalog(&input.runtime.catalog)?,
         &input.config,
-        input.runtime.auth.as_ref(),
+        input.runtime.auth.clone(),
         &input.paths,
     )?;
     let models: Arc<dyn ModelSource> = input

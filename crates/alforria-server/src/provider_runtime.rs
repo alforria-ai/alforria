@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
 
 use crate::provider::{build_state, ProviderState};
 use alforria_core::session::llm::{LlmModel, LlmRequestSender};
@@ -165,7 +165,13 @@ fn provider_suggestions(state: &ProviderState, provider_id: &str) -> Vec<String>
 // ---------------------------------------------------------------------------
 
 struct Inner {
-    state: ProviderState,
+    /// The inputs the provider state is rebuilt from when credentials
+    /// change.
+    catalog: alforria_core::catalog::Providers,
+    config: alforria_core::config::schema::Config,
+    auth: Arc<dyn AuthStore>,
+    /// The provider state and the auth generation it was built against.
+    state: RwLock<(u64, Arc<ProviderState>)>,
     /// `cfg.model` (the `defaultModel` first leg).
     config_model: Option<String>,
     /// `cfg.small_model` (the `getSmallModel` first leg).
@@ -180,18 +186,34 @@ struct Inner {
 /// The production `Provider.Service` runtime (provider.ts:1501-2043): the
 /// per-instance provider state with the env/api credentials merged, plus
 /// the model-resolution surface the session engine consumes.
+///
+/// Deliberate improvement over TS: there the state is built once per
+/// instance, so a new credential only reaches open projects after an
+/// instance dispose (which interrupts running sessions). Here the state is
+/// rebuilt at the next model lookup whenever the auth store's generation
+/// moves — a sign-in, `PUT`/`DELETE /auth`, or a CLI login noticed through
+/// auth.json's mtime. Lookups take an `Arc` snapshot of the state and copy
+/// the credentials into the resolved model, so a rebuild never touches a
+/// request already in flight.
 #[derive(Clone)]
 pub struct RuntimeModels(Arc<Inner>);
 
 impl RuntimeModels {
     pub fn new(
-        catalog: &BTreeMap<String, alforria_core::catalog::Provider>,
+        catalog: alforria_core::catalog::Providers,
         config: &alforria_core::config::schema::Config,
-        auth: &dyn AuthStore,
+        auth: Arc<dyn AuthStore>,
         paths: &alforria_core::GlobalPaths,
     ) -> Result<RuntimeModels, ServerError> {
+        // Read the generation first: a change racing the build moves it
+        // past the recorded one, and the next lookup rebuilds.
+        let generation = auth.generation();
+        let state = build_state(&catalog, config, auth.as_ref())?;
         Ok(RuntimeModels(Arc::new(Inner {
-            state: build_state(catalog, config, auth)?,
+            catalog,
+            config: config.clone(),
+            auth,
+            state: RwLock::new((generation, Arc::new(state))),
             config_model: config.model.clone(),
             config_small_model: config.small_model.clone(),
             config_provider_ids: config
@@ -204,16 +226,51 @@ impl RuntimeModels {
         })))
     }
 
+    /// The provider state for the current credentials, rebuilt first when
+    /// the auth generation moved since the last build.
+    fn state(&self) -> Arc<ProviderState> {
+        let generation = self.0.auth.generation();
+        {
+            let current = self.0.state.read().unwrap_or_else(PoisonError::into_inner);
+            if current.0 >= generation {
+                return current.1.clone();
+            }
+        }
+        let mut current = self.0.state.write().unwrap_or_else(PoisonError::into_inner);
+        // Another lookup may have rebuilt while this one waited.
+        if current.0 >= generation {
+            return current.1.clone();
+        }
+        match build_state(&self.0.catalog, &self.0.config, self.0.auth.as_ref()) {
+            Ok(state) => *current = (generation, Arc::new(state)),
+            Err(err) => {
+                // Keep serving the previous state; retry on the next change.
+                tracing::warn!(?err, "provider state rebuild failed");
+                current.0 = generation;
+            }
+        }
+        current.1.clone()
+    }
+
     /// `getModel` (provider.ts:1872-1895) — the model JSON value.
     fn model_value(&self, provider_id: &str, model_id: &str) -> Result<Value, String> {
-        let Some(entry) = self.0.state.providers.get(provider_id) else {
-            let suggestions = provider_suggestions(&self.0.state, provider_id);
+        self.model_value_in(&self.state(), provider_id, model_id)
+    }
+
+    fn model_value_in(
+        &self,
+        state: &ProviderState,
+        provider_id: &str,
+        model_id: &str,
+    ) -> Result<Value, String> {
+        let Some(entry) = state.providers.get(provider_id) else {
+            let suggestions = provider_suggestions(state, provider_id);
             return Err(self.model_not_found(provider_id, model_id, suggestions));
         };
         let Some(model) = entry["models"].get(model_id) else {
             let mut suggestions = model_suggestions(Some(entry), model_id);
             if suggestions.is_empty() {
-                suggestions = model_suggestions(self.0.state.database.get(provider_id), model_id);
+                suggestions = model_suggestions(state.database.get(provider_id), model_id);
             }
             return Err(self.model_not_found(provider_id, model_id, suggestions));
         };
@@ -287,10 +344,9 @@ impl RuntimeModels {
     }
 
     fn resolve(&self, provider_id: &str, model_id: &str) -> Result<ResolvedModel, String> {
-        let model = self.model_value(provider_id, model_id)?;
-        let provider = self
-            .0
-            .state
+        let state = self.state();
+        let model = self.model_value_in(&state, provider_id, model_id)?;
+        let provider = state
             .providers
             .get(provider_id)
             .ok_or_else(|| self.model_not_found(provider_id, model_id, Vec::new()))?;
@@ -331,13 +387,15 @@ impl RuntimeModels {
 
     /// `defaultModel` (provider.ts:2026-2041) — the `(providerID, modelID)`
     /// pair; `Err` carries the TS error message.
-    fn default_model_ids(inner: &Inner) -> Result<(String, String), String> {
+    fn default_model_ids(&self) -> Result<(String, String), String> {
+        let inner = &self.0;
+        let state = self.state();
         if let Some(model) = &inner.config_model {
             let (provider_id, model_id) = parse_model(model);
             return Ok((provider_id, model_id));
         }
         for entry in recent_models(&inner.state_dir) {
-            let Some(provider) = inner.state.providers.get(&entry.0) else {
+            let Some(provider) = state.providers.get(&entry.0) else {
                 continue;
             };
             if provider["models"].get(&entry.1).is_none() {
@@ -345,8 +403,7 @@ impl RuntimeModels {
             }
             return Ok(entry);
         }
-        let provider = inner
-            .state
+        let provider = state
             .providers
             .values()
             .find(|provider| {
@@ -419,7 +476,8 @@ impl ModelSource for RuntimeModels {
             if provider_id == "azure" || provider_id == "azure-cognitive-services" {
                 return None;
             }
-            let provider = self.0.state.providers.get(provider_id)?;
+            let state = self.state();
+            let provider = state.providers.get(provider_id)?;
             let priority: Vec<&str> = if provider_id.starts_with("opencode") {
                 vec!["gpt-nano"]
             } else if provider_id == "github-copilot" {
@@ -507,8 +565,9 @@ impl Models for RuntimeModels {
     fn default_model(&self) -> BoxFuture<'static, Result<ModelInfo, alforria_core::CoreError>> {
         let this = self.clone();
         Box::pin(async move {
-            let (provider_id, model_id) =
-                Self::default_model_ids(&this.0).map_err(alforria_core::CoreError::Storage)?;
+            let (provider_id, model_id) = this
+                .default_model_ids()
+                .map_err(alforria_core::CoreError::Storage)?;
             this.model_info(&provider_id, &model_id)
                 .map_err(alforria_core::CoreError::Storage)
         })
@@ -995,5 +1054,106 @@ mod tests {
         let provider = json!({"key": "stored-key"});
         let options = RuntimeModels::llm_options(&provider, &json!({}));
         assert_eq!(options["apiKey"], json!("stored-key"));
+    }
+
+    /// A built engine resolves models with credentials set after it was
+    /// built — in-process (`PUT /auth`, a web sign-in) and out-of-process
+    /// (a CLI login rewriting auth.json) — while a model resolved earlier
+    /// keeps the key it was resolved with.
+    #[tokio::test]
+    async fn engine_models_pick_up_credentials_set_after_the_build() {
+        use crate::engine::{build_engine, EngineInput, EngineRuntime, EngineSeams};
+        use crate::state::FileAuthStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = dir.path().join("repo");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let paths = alforria_core::GlobalPaths {
+            home: dir.path().join("home"),
+            config: dir.path().join("config"),
+            data: dir.path().join("data"),
+            cache: dir.path().join("cache"),
+            state: dir.path().join("state"),
+        };
+        let catalog: alforria_core::catalog::Providers = serde_json::from_value(json!({
+            "acme": {
+                "id": "acme",
+                "name": "Acme",
+                "env": ["ALFORRIA_TEST_ACME_API_KEY_UNSET"],
+                "npm": "@ai-sdk/openai-compatible",
+                "api": "https://acme.invalid/v1",
+                "models": {
+                    "acme-1": {
+                        "id": "acme-1",
+                        "name": "Acme 1",
+                        "release_date": "2026-01-01",
+                        "limit": {"context": 1000, "output": 100},
+                    },
+                },
+            },
+        }))
+        .unwrap();
+        let auth_file = paths.data.join("auth.json");
+        let auth = Arc::new(FileAuthStore::new(auth_file.clone()));
+        let config: alforria_core::config::schema::Config =
+            serde_json::from_value(json!({})).unwrap();
+        let storage = Arc::new(alforria_core::Storage::open(dir.path().join("db.sqlite")).unwrap());
+        let clock = Arc::new(alforria_core::catalog::SystemClock);
+        let background = alforria_core::BackgroundJobService::new(clock.clone());
+        let services = Arc::new(alforria_core::SessionServices::new(
+            storage,
+            background.clone(),
+            clock,
+            &alforria_core::AgentRegistryInput {
+                config: config.clone(),
+                skill_dirs: Vec::new(),
+                reference_dirs: Vec::new(),
+                worktree: worktree.clone(),
+                data_dir: paths.data.clone(),
+                tmp_dir: dir.path().to_path_buf(),
+                home: paths.home.clone(),
+            },
+        ));
+        let engine = build_engine(&EngineInput {
+            services,
+            background,
+            config: Arc::new(config),
+            config_dirs: Vec::new(),
+            directory: worktree.clone(),
+            worktree,
+            paths,
+            runtime: EngineRuntime {
+                catalog: Arc::new(move || Ok(catalog.clone())),
+                auth: auth.clone(),
+            },
+            seams: EngineSeams::default(),
+        })
+        .unwrap();
+        let models = engine.models();
+        let api_key = |resolved: &ResolvedModel| resolved.llm.options.get("apiKey").cloned();
+
+        // No credential yet: the provider isn't connected.
+        assert!(models.get_model("acme", "acme-1", "ses").await.is_err());
+
+        // In-process set (`PUT /auth`, the web sign-in sink).
+        auth.set("acme", json!({"type": "api", "key": "sk-first"}))
+            .unwrap();
+        let first = models.get_model("acme", "acme-1", "ses").await.unwrap();
+        assert_eq!(api_key(&first), Some(json!("sk-first")));
+
+        // Out-of-process write (a CLI login), noticed through auth.json.
+        std::fs::write(
+            &auth_file,
+            json!({"acme": {"type": "api", "key": "sk-second-key"}}).to_string(),
+        )
+        .unwrap();
+        let second = models.get_model("acme", "acme-1", "ses").await.unwrap();
+        assert_eq!(api_key(&second), Some(json!("sk-second-key")));
+        // The model resolved before the change is untouched.
+        assert_eq!(api_key(&first), Some(json!("sk-first")));
+
+        // Removal disconnects the provider again.
+        auth.remove("acme").unwrap();
+        assert!(models.get_model("acme", "acme-1", "ses").await.is_err());
     }
 }
