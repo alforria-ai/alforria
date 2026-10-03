@@ -1,0 +1,485 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-10-03T00:00:00Z",
+  "title": "Design System: alforria web",
+  "extensions": {
+    "colorMeta": {
+      "accent": {
+        "role": "primary",
+        "displayName": "Hazard Orange",
+        "canonical": "#e25303",
+        "tonalRamp": [
+          "#3a1500",
+          "#6b2700",
+          "#9c3902",
+          "#e25303",
+          "#ff7a33",
+          "#ffa070",
+          "#ffc8a8",
+          "#ffe8da"
+        ]
+      },
+      "accent-ink": {
+        "role": "primary",
+        "displayName": "Ink on Orange",
+        "canonical": "#0b0e10 (dark) / #14191c (light)"
+      },
+      "accent-text": {
+        "role": "primary",
+        "displayName": "Orange Text",
+        "canonical": "#ff7a33 (dark) / #b84300 (light)"
+      },
+      "accent-veil": {
+        "role": "primary",
+        "displayName": "Waiting Veil"
+      },
+      "accent-veil-2": {
+        "role": "primary",
+        "displayName": "Waiting Veil (hover)"
+      },
+      "ground": {
+        "role": "neutral",
+        "displayName": "Fleet Ground",
+        "tonalRamp": [
+          "#0b0e10",
+          "#121619",
+          "#181d21",
+          "#1f262b",
+          "#35414a",
+          "#7d8a91",
+          "#a3aeb4",
+          "#e3e8ea"
+        ]
+      },
+      "plate": {
+        "role": "neutral",
+        "displayName": "Plate",
+        "tonalRamp": [
+          "#0b0e10",
+          "#121619",
+          "#181d21",
+          "#1f262b",
+          "#35414a",
+          "#7d8a91",
+          "#a3aeb4",
+          "#e3e8ea"
+        ]
+      },
+      "plate-2": {
+        "role": "neutral",
+        "displayName": "Plate, lifted"
+      },
+      "plate-3": {
+        "role": "neutral",
+        "displayName": "Plate, top step"
+      },
+      "rule": {
+        "role": "neutral",
+        "displayName": "Hairline"
+      },
+      "rule-soft": {
+        "role": "neutral",
+        "displayName": "Row Hairline"
+      },
+      "rule-2": {
+        "role": "neutral",
+        "displayName": "Control Rule"
+      },
+      "ink": {
+        "role": "neutral",
+        "displayName": "Pale Ink",
+        "tonalRamp": [
+          "#0b0e10",
+          "#121619",
+          "#181d21",
+          "#1f262b",
+          "#35414a",
+          "#7d8a91",
+          "#a3aeb4",
+          "#e3e8ea"
+        ]
+      },
+      "ink-2": {
+        "role": "neutral",
+        "displayName": "Secondary Ink"
+      },
+      "ink-3": {
+        "role": "neutral",
+        "displayName": "Tertiary Ink"
+      },
+      "add-bg": {
+        "role": "functional",
+        "displayName": "Diff Add Tint"
+      },
+      "add-mark": {
+        "role": "functional",
+        "displayName": "Diff Add Mark"
+      },
+      "del-bg": {
+        "role": "functional",
+        "displayName": "Diff Delete Tint"
+      },
+      "del-mark": {
+        "role": "functional",
+        "displayName": "Diff Delete Mark"
+      },
+      "scrim": {
+        "role": "neutral",
+        "displayName": "Overlay Scrim"
+      },
+      "ground-light": {
+        "role": "neutral",
+        "displayName": "Paper (light ground)",
+        "tonalRamp": [
+          "#14191c",
+          "#4b555c",
+          "#5e6a72",
+          "#b7c0c5",
+          "#cfd7db",
+          "#d2dade",
+          "#e8edef",
+          "#f5f7f8"
+        ]
+      },
+      "ink-light": {
+        "role": "neutral",
+        "displayName": "Ink (light theme)"
+      }
+    },
+    "typographyMeta": {
+      "wordmark": {
+        "displayName": "Wordmark",
+        "purpose": "Lowercase alforria in the band; the only lowercase Barlow."
+      },
+      "display": {
+        "displayName": "Display",
+        "purpose": "ALL CLEAR reward state when the queue empties."
+      },
+      "verdict": {
+        "displayName": "Verdict",
+        "purpose": "The verdict word on the stamp."
+      },
+      "counter": {
+        "displayName": "Counter",
+        "purpose": "Band waiting count; 22px on the collapsed rail."
+      },
+      "headline": {
+        "displayName": "Headline",
+        "purpose": "Settings section titles, keys sheet title, empty-queue headings."
+      },
+      "title": {
+        "displayName": "Title",
+        "purpose": "Focus column session titles."
+      },
+      "pane-title": {
+        "displayName": "Pane Title",
+        "purpose": "Pane heads and project group names."
+      },
+      "control": {
+        "displayName": "Control",
+        "purpose": "Stamps, Send, New session, settings navigation."
+      },
+      "label": {
+        "displayName": "Label",
+        "purpose": "Slip heads, tool names, tabs, segmented buttons, message labels, column band."
+      },
+      "column-head": {
+        "displayName": "Column Head",
+        "purpose": "Table headers, palette group heads."
+      },
+      "body": {
+        "displayName": "Body",
+        "purpose": "Default UI text; tabular numerals."
+      },
+      "prose": {
+        "displayName": "Prose",
+        "purpose": "Assistant transcript text, max 74ch."
+      },
+      "data": {
+        "displayName": "Data",
+        "purpose": "Code, diffs, terminal, command plates, tool targets."
+      },
+      "data-small": {
+        "displayName": "Data Small",
+        "purpose": "Paths, branches, ages, costs, counts, kbd, status line."
+      },
+      "state": {
+        "displayName": "State",
+        "purpose": "Lamp state codes and state pills."
+      }
+    },
+    "themes": {
+      "default": "dark (:root)",
+      "light": ":root[data-theme=\"light\"]; frontmatter keys suffixed -light map to the same custom property under this selector; accent is shared."
+    },
+    "shadows": [
+      {
+        "name": "cursor-frame",
+        "value": "inset 0 1px 0 var(--rule-2), inset 0 -1px 0 var(--rule-2)",
+        "purpose": "Keyboard cursor row frame (add inset ±1px 0 side edges on first/last cells). A rule, not lift."
+      },
+      {
+        "name": "active-column",
+        "value": "inset 0 2px 0 var(--ink)",
+        "purpose": "Active focus column and current mobile tab."
+      },
+      {
+        "name": "palette-selection",
+        "value": "inset 0 0 0 1px var(--rule-2)",
+        "purpose": "Selected command palette result."
+      }
+    ],
+    "motion": [
+      {
+        "name": "ease-out",
+        "value": "cubic-bezier(0.16, 1, 0.3, 1)",
+        "purpose": "The single easing curve (--ease-out)."
+      },
+      {
+        "name": "t-feedback",
+        "value": "150ms",
+        "purpose": "Press feedback, chevrons, and the stamp register/stamp-in (--t-feedback)."
+      },
+      {
+        "name": "stamp-hold",
+        "value": "480ms",
+        "purpose": "Verdict visible before the slip folds."
+      },
+      {
+        "name": "slip-fold",
+        "value": "200ms",
+        "purpose": "grid-template-rows 1fr to 0fr collapse of a stamped slip."
+      },
+      {
+        "name": "slip-arrive",
+        "value": "260ms",
+        "purpose": "New slip slides 12px down and fades in."
+      },
+      {
+        "name": "counter-tick",
+        "value": "220ms",
+        "purpose": "Waiting numeral changes, entering from above."
+      },
+      {
+        "name": "counter-flash",
+        "value": "520ms steps(2, jump-none)",
+        "purpose": "Counter inverts to ink once on new arrival."
+      },
+      {
+        "name": "row-fresh",
+        "value": "700ms",
+        "purpose": "Table now-cell text fades ink to ink-2 on change."
+      },
+      {
+        "name": "working-ring",
+        "value": "1.8s infinite",
+        "purpose": "Working lamp ring pulse."
+      },
+      {
+        "name": "blink",
+        "value": "1s steps(2, jump-none) infinite",
+        "purpose": "Running tool mark, streaming caret, terminal cursor."
+      },
+      {
+        "name": "hover",
+        "value": "0ms",
+        "purpose": "Hover and selection fills are immediate."
+      },
+      {
+        "name": "reduced-motion",
+        "value": "0.001ms",
+        "purpose": "All animation/transition durations collapse; stamp resolves immediately."
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "wide",
+        "value": "1280px",
+        "purpose": "max-width: queue-w 360px, server address hidden."
+      },
+      {
+        "name": "medium",
+        "value": "1080px",
+        "purpose": "max-width: context column hidden, New session icon-only, focus columns min 380px."
+      },
+      {
+        "name": "mobile",
+        "value": "760px",
+        "purpose": "max-width: single pane, 48px band, 56px bottom tabs, card rows, 50px stamps."
+      },
+      {
+        "name": "column-narrow",
+        "value": "560px",
+        "purpose": "@container on a focus column: composer key hint hidden."
+      }
+    ],
+    "fonts": [
+      {
+        "family": "Barlow Condensed",
+        "weights": [
+          700,
+          800
+        ],
+        "files": [
+          "web/prototype/fonts/barlow-condensed-latin-700.woff2",
+          "web/prototype/fonts/barlow-condensed-latin-800.woff2"
+        ],
+        "license": "OFL (web/prototype/fonts/OFL-Barlow-Condensed.txt)"
+      }
+    ],
+    "icons": {
+      "style": "16px viewBox, 1.5 stroke, square caps, miter joins, no fill except solid blocks",
+      "source": "web/prototype/index.html sprite; build library undecided"
+    }
+  },
+  "components": [
+    {
+      "name": "Waiting Counter (lit)",
+      "kind": "custom",
+      "refersTo": "wait-count-lit",
+      "description": "Band cell lit orange only while agents wait on the human; ink on orange.",
+      "html": "<button class=\"ds-wait\"><span class=\"ds-n\">4</span><span class=\"ds-w\"><b>Waiting</b><small>oldest 9m 00s</small></span></button>",
+      "css": ":host{--ground:#0b0e10;--plate:#121619;--plate-2:#181d21;--rule:#232b30;--rule-2:#35414a;--ink:#e3e8ea;--ink-2:#a3aeb4;--ink-3:#7d8a91;--accent:#e25303;--accent-ink:#0b0e10;--accent-text:#ff7a33;--accent-veil:rgba(226,83,3,.09);--add-bg:rgba(84,170,110,.13);--add-mark:#8fd19e;--del-bg:rgba(226,92,80,.13);--del-mark:#f0a39b;--f-label:'Barlow Condensed','Arial Narrow',sans-serif;--f-body:system-ui,-apple-system,'Segoe UI',sans-serif;--f-mono:ui-monospace,'SF Mono',Menlo,Consolas,monospace;--ease-out:cubic-bezier(0.16,1,0.3,1);--t-feedback:150ms}.ds-wait{position:relative;display:flex;align-items:center;gap:12px;min-width:176px;height:44px;padding:0 16px;border:0;background:var(--accent);color:var(--accent-ink);cursor:pointer;text-align:left}.ds-n{font:800 26px/1 var(--f-label)}.ds-w{display:flex;flex-direction:column;gap:3px}.ds-w b{font:700 14px/1 var(--f-label);text-transform:uppercase;letter-spacing:.03em}.ds-w small{font:400 10.5px/1 var(--f-mono)}.ds-wait:hover::after,.ds-wait:focus-visible::after{content:'';position:absolute;inset:0;outline:1px solid var(--accent-ink);outline-offset:-4px}.ds-wait:focus-visible{outline:none}"
+    },
+    {
+      "name": "Queue Slip with Stamps",
+      "kind": "card",
+      "refersTo": "slip-head-active",
+      "description": "Active permission slip: orange head, command plate, ink primary stamp with keys.",
+      "html": "<div class=\"ds-slip\"><div class=\"ds-head\"><span class=\"ds-lamp\"></span>Permission · bash<span class=\"ds-age\">6m 00s</span></div><div class=\"ds-body\"><div class=\"ds-plate\">$ git push origin fix/sse-heartbeat</div></div><div class=\"ds-acts\"><button class=\"ds-stamp ds-primary\"><kbd class=\"ds-kbd\">A</kbd>Allow once</button><button class=\"ds-stamp\"><kbd class=\"ds-kbd\">S</kbd>Always</button><button class=\"ds-stamp\"><kbd class=\"ds-kbd\">D</kbd>Deny</button></div></div>",
+      "css": ":host{--ground:#0b0e10;--plate:#121619;--plate-2:#181d21;--rule:#232b30;--rule-2:#35414a;--ink:#e3e8ea;--ink-2:#a3aeb4;--ink-3:#7d8a91;--accent:#e25303;--accent-ink:#0b0e10;--accent-text:#ff7a33;--accent-veil:rgba(226,83,3,.09);--add-bg:rgba(84,170,110,.13);--add-mark:#8fd19e;--del-bg:rgba(226,92,80,.13);--del-mark:#f0a39b;--f-label:'Barlow Condensed','Arial Narrow',sans-serif;--f-body:system-ui,-apple-system,'Segoe UI',sans-serif;--f-mono:ui-monospace,'SF Mono',Menlo,Consolas,monospace;--ease-out:cubic-bezier(0.16,1,0.3,1);--t-feedback:150ms}.ds-kbd{font:500 10.5px/1 var(--f-mono);color:var(--ink-3);border:1px solid var(--rule-2);padding:2px 4px;min-width:16px;display:inline-block;text-align:center}.ds-slip{width:400px;background:var(--ground);color:var(--ink);border-bottom:1px solid var(--rule);font:400 13.5px/1.5 var(--f-body)}.ds-head{display:flex;align-items:center;gap:10px;height:30px;padding:0 12px 0 16px;background:var(--accent);color:var(--accent-ink);font:700 13px/1 var(--f-label);text-transform:uppercase;letter-spacing:.03em}.ds-lamp{width:9px;height:9px;border-radius:50%;background:var(--accent-ink)}.ds-age{margin-left:auto;font:400 11px/1 var(--f-mono);text-transform:none}.ds-body{padding:10px 16px 14px}.ds-plate{background:var(--plate);border:1px solid var(--rule);font:400 12.5px/1.55 var(--f-mono);padding:8px 10px;white-space:pre}.ds-acts{display:grid;grid-template-columns:1.15fr 1fr .8fr;border-top:1px solid var(--rule)}.ds-stamp{position:relative;display:flex;align-items:center;justify-content:center;gap:8px;min-height:40px;border:0;border-left:1px solid var(--rule);background:none;color:var(--ink);font:700 14px/1 var(--f-label);text-transform:uppercase;letter-spacing:.03em;cursor:pointer;transition:transform var(--t-feedback) var(--ease-out)}.ds-stamp:first-child{border-left:0}.ds-stamp:hover{background:var(--plate-2)}.ds-primary{background:var(--ink);color:var(--ground)}.ds-primary .ds-kbd{color:var(--ground);border-color:var(--ground)}.ds-primary:hover{background:var(--ink-2)}.ds-stamp:active{transform:translate(1px,1px) scale(.985)}.ds-stamp:active::after{content:'';position:absolute;inset:-1px auto auto -1px;width:8px;height:8px;border-top:1px solid var(--ink);border-left:1px solid var(--ink)}:focus-visible{outline:2px solid var(--ink);outline-offset:-2px}"
+    },
+    {
+      "name": "Verdict Stamp",
+      "kind": "custom",
+      "refersTo": "verdict-stamp",
+      "description": "The stamp moment: registration-offset ink frame and verdict, 150ms.",
+      "html": "<div class=\"ds-stamped\"><div class=\"ds-vs\"><b>Continued</b><span>17:41:44 · by you</span></div></div>",
+      "css": ":host{--ground:#0b0e10;--plate:#121619;--plate-2:#181d21;--rule:#232b30;--rule-2:#35414a;--ink:#e3e8ea;--ink-2:#a3aeb4;--ink-3:#7d8a91;--accent:#e25303;--accent-ink:#0b0e10;--accent-text:#ff7a33;--accent-veil:rgba(226,83,3,.09);--add-bg:rgba(84,170,110,.13);--add-mark:#8fd19e;--del-bg:rgba(226,92,80,.13);--del-mark:#f0a39b;--f-label:'Barlow Condensed','Arial Narrow',sans-serif;--f-body:system-ui,-apple-system,'Segoe UI',sans-serif;--f-mono:ui-monospace,'SF Mono',Menlo,Consolas,monospace;--ease-out:cubic-bezier(0.16,1,0.3,1);--t-feedback:150ms}.ds-stamped{position:relative;width:360px;height:140px;background:var(--ground)}.ds-stamped::before{content:'';position:absolute;inset:0;border:1px solid var(--ink);transform:translate(1px,1px);animation:ds-reg 150ms var(--ease-out)}.ds-vs{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);display:flex;flex-direction:column;align-items:center;gap:5px;padding:9px 18px 10px;border:2px solid var(--ink);background:var(--ground);color:var(--ink);animation:ds-in 150ms var(--ease-out)}.ds-vs b{font:800 30px/.9 var(--f-label);text-transform:uppercase;letter-spacing:.01em}.ds-vs span{font:400 11px/1 var(--f-mono);color:var(--ink-2)}@keyframes ds-reg{from{transform:translate(4px,4px)}}@keyframes ds-in{from{transform:translate(calc(-50% + 3px),calc(-50% + 3px)) scale(1.04);opacity:0}}@media (prefers-reduced-motion:reduce){*,*::before{animation-duration:.001ms!important}}"
+    },
+    {
+      "name": "Send Button",
+      "kind": "button",
+      "refersTo": "send",
+      "description": "Primary action: ink fill, ground text, stamp press. Never orange.",
+      "html": "<button class=\"ds-send\">Send <kbd class=\"ds-kbd\">⏎</kbd></button>",
+      "css": ":host{--ground:#0b0e10;--plate:#121619;--plate-2:#181d21;--rule:#232b30;--rule-2:#35414a;--ink:#e3e8ea;--ink-2:#a3aeb4;--ink-3:#7d8a91;--accent:#e25303;--accent-ink:#0b0e10;--accent-text:#ff7a33;--accent-veil:rgba(226,83,3,.09);--add-bg:rgba(84,170,110,.13);--add-mark:#8fd19e;--del-bg:rgba(226,92,80,.13);--del-mark:#f0a39b;--f-label:'Barlow Condensed','Arial Narrow',sans-serif;--f-body:system-ui,-apple-system,'Segoe UI',sans-serif;--f-mono:ui-monospace,'SF Mono',Menlo,Consolas,monospace;--ease-out:cubic-bezier(0.16,1,0.3,1);--t-feedback:150ms}.ds-kbd{font:500 10.5px/1 var(--f-mono);color:var(--ink-3);border:1px solid var(--rule-2);padding:2px 4px;min-width:16px;display:inline-block;text-align:center}.ds-send{display:inline-flex;align-items:center;gap:8px;height:30px;padding:0 12px;border:0;background:var(--ink);color:var(--ground);font:700 14px/1 var(--f-label);text-transform:uppercase;letter-spacing:.04em;cursor:pointer;transition:transform var(--t-feedback) var(--ease-out)}.ds-send .ds-kbd{color:var(--ground);border-color:var(--ground)}.ds-send:hover{background:var(--ink-2)}.ds-send:active{transform:translate(1px,1px) scale(.985)}:focus-visible{outline:2px solid var(--ink);outline-offset:-2px}"
+    },
+    {
+      "name": "Link Button",
+      "kind": "button",
+      "refersTo": "link-btn",
+      "description": "Outlined caps action that inverts to ink on hover.",
+      "html": "<button class=\"ds-link\">Open session</button>",
+      "css": ":host{--ground:#0b0e10;--plate:#121619;--plate-2:#181d21;--rule:#232b30;--rule-2:#35414a;--ink:#e3e8ea;--ink-2:#a3aeb4;--ink-3:#7d8a91;--accent:#e25303;--accent-ink:#0b0e10;--accent-text:#ff7a33;--accent-veil:rgba(226,83,3,.09);--add-bg:rgba(84,170,110,.13);--add-mark:#8fd19e;--del-bg:rgba(226,92,80,.13);--del-mark:#f0a39b;--f-label:'Barlow Condensed','Arial Narrow',sans-serif;--f-body:system-ui,-apple-system,'Segoe UI',sans-serif;--f-mono:ui-monospace,'SF Mono',Menlo,Consolas,monospace;--ease-out:cubic-bezier(0.16,1,0.3,1);--t-feedback:150ms}.ds-link{display:inline-flex;align-items:center;gap:6px;padding:4px 6px;border:1px solid var(--rule-2);background:none;color:var(--ink-2);font:700 12px/1 var(--f-label);text-transform:uppercase;letter-spacing:.04em;cursor:pointer}.ds-link:hover{background:var(--ink);color:var(--ground);border-color:var(--ink)}:focus-visible{outline:2px solid var(--ink);outline-offset:-2px}"
+    },
+    {
+      "name": "Segmented Filter",
+      "kind": "nav",
+      "refersTo": "seg-button",
+      "description": "Shared-edge caps buttons with mono counts; pressed is ink-filled.",
+      "html": "<div class=\"ds-seg\"><button aria-pressed=\"true\">All <span>17</span></button><button>Waiting <span>4</span></button><button>Working <span>7</span></button><button>Idle <span>6</span></button></div>",
+      "css": ":host{--ground:#0b0e10;--plate:#121619;--plate-2:#181d21;--rule:#232b30;--rule-2:#35414a;--ink:#e3e8ea;--ink-2:#a3aeb4;--ink-3:#7d8a91;--accent:#e25303;--accent-ink:#0b0e10;--accent-text:#ff7a33;--accent-veil:rgba(226,83,3,.09);--add-bg:rgba(84,170,110,.13);--add-mark:#8fd19e;--del-bg:rgba(226,92,80,.13);--del-mark:#f0a39b;--f-label:'Barlow Condensed','Arial Narrow',sans-serif;--f-body:system-ui,-apple-system,'Segoe UI',sans-serif;--f-mono:ui-monospace,'SF Mono',Menlo,Consolas,monospace;--ease-out:cubic-bezier(0.16,1,0.3,1);--t-feedback:150ms}.ds-seg{display:inline-flex;background:var(--ground);padding:8px}.ds-seg button{height:24px;padding:0 9px;display:inline-flex;align-items:center;gap:6px;border:1px solid var(--rule-2);margin-left:-1px;background:none;color:var(--ink-2);font:700 12.5px/1 var(--f-label);text-transform:uppercase;letter-spacing:.03em;cursor:pointer}.ds-seg button:first-child{margin-left:0}.ds-seg button span{font:400 10.5px/1 var(--f-mono);letter-spacing:0}.ds-seg button:hover{color:var(--ink);background:var(--plate)}.ds-seg button[aria-pressed=true]{background:var(--ink);color:var(--ground);border-color:var(--ink)}:focus-visible{outline:2px solid var(--ink);outline-offset:-2px}"
+    },
+    {
+      "name": "Session Row",
+      "kind": "custom",
+      "refersTo": "session-row-waiting",
+      "description": "32px table rows: lamp + mono state code, title, caps tool + mono target; waiting rows veiled orange.",
+      "html": "<table class=\"ds-reg\"><tr><td><span class=\"ds-st\"><span class=\"ds-l ds-wk\"></span>Working</span></td><td>Port v2 prompt runner</td><td><b>Bash</b> <code>cargo nextest run</code></td><td class=\"ds-r\">$1.84</td></tr><tr class=\"ds-wait\"><td><span class=\"ds-st ds-sw\"><span class=\"ds-l ds-wt\"></span>Waiting</span></td><td>SSO token refresh</td><td class=\"ds-sw\"><b>Approve</b> <code>edit src/auth/token.rs</code></td><td class=\"ds-r\">$0.44</td></tr><tr><td><span class=\"ds-st ds-si\"><span class=\"ds-l ds-id\"></span>Idle</span></td><td>Release notes 0.9</td><td>finished 41m ago</td><td class=\"ds-r\">$0.12</td></tr></table>",
+      "css": ":host{--ground:#0b0e10;--plate:#121619;--plate-2:#181d21;--rule:#232b30;--rule-2:#35414a;--ink:#e3e8ea;--ink-2:#a3aeb4;--ink-3:#7d8a91;--accent:#e25303;--accent-ink:#0b0e10;--accent-text:#ff7a33;--accent-veil:rgba(226,83,3,.09);--add-bg:rgba(84,170,110,.13);--add-mark:#8fd19e;--del-bg:rgba(226,92,80,.13);--del-mark:#f0a39b;--f-label:'Barlow Condensed','Arial Narrow',sans-serif;--f-body:system-ui,-apple-system,'Segoe UI',sans-serif;--f-mono:ui-monospace,'SF Mono',Menlo,Consolas,monospace;--ease-out:cubic-bezier(0.16,1,0.3,1);--t-feedback:150ms}.ds-reg{border-collapse:collapse;width:640px;background:var(--ground);color:var(--ink);font:400 13.5px/1.5 var(--f-body);font-variant-numeric:tabular-nums}.ds-reg td{height:32px;padding:0 8px;border-bottom:1px solid #1a2125;white-space:nowrap}.ds-reg td:first-child{padding-left:16px}.ds-reg tr:hover td{background:var(--plate)}.ds-reg tr.ds-wait td{background:var(--accent-veil)}.ds-reg b{font:700 12.5px/1 var(--f-label);text-transform:uppercase;letter-spacing:.04em;color:var(--ink-2);margin-right:8px}.ds-reg code{font:400 12px/1 var(--f-mono);color:var(--ink-2)}.ds-r{text-align:right;font:400 11.5px/1 var(--f-mono)}.ds-st{display:inline-flex;align-items:center;gap:8px;font:500 10.5px/1 var(--f-mono);letter-spacing:.06em;text-transform:uppercase}.ds-sw,.ds-sw b,.ds-sw code{color:var(--accent-text)}.ds-si{color:var(--ink-3)}.ds-l{width:9px;height:9px;border-radius:50%;display:inline-block}.ds-wk{background:var(--ink)}.ds-wt{background:var(--accent)}.ds-id{border:1.5px solid var(--ink-3)}"
+    },
+    {
+      "name": "Composer Input",
+      "kind": "input",
+      "refersTo": "composer-input",
+      "description": "Square plate textarea; focus steps the fill and rule, no glow.",
+      "html": "<textarea class=\"ds-comp\" placeholder=\"Message this session…\"></textarea>",
+      "css": ":host{--ground:#0b0e10;--plate:#121619;--plate-2:#181d21;--rule:#232b30;--rule-2:#35414a;--ink:#e3e8ea;--ink-2:#a3aeb4;--ink-3:#7d8a91;--accent:#e25303;--accent-ink:#0b0e10;--accent-text:#ff7a33;--accent-veil:rgba(226,83,3,.09);--add-bg:rgba(84,170,110,.13);--add-mark:#8fd19e;--del-bg:rgba(226,92,80,.13);--del-mark:#f0a39b;--f-label:'Barlow Condensed','Arial Narrow',sans-serif;--f-body:system-ui,-apple-system,'Segoe UI',sans-serif;--f-mono:ui-monospace,'SF Mono',Menlo,Consolas,monospace;--ease-out:cubic-bezier(0.16,1,0.3,1);--t-feedback:150ms}.ds-comp{display:block;width:420px;min-height:62px;resize:none;background:var(--plate);border:1px solid var(--rule);border-radius:0;padding:9px 11px;color:var(--ink);font:400 14px/1.5 var(--f-body)}.ds-comp::placeholder{color:var(--ink-3)}.ds-comp:focus{outline:none;border-color:var(--rule-2);background:var(--plate-2)}"
+    },
+    {
+      "name": "Diff Plate",
+      "kind": "custom",
+      "refersTo": "plate",
+      "description": "Mono diff on a plate; green/red tints exist only here.",
+      "html": "<div class=\"ds-diff\"><div class=\"ds-ln ds-h\">@@ -12,4 +12,5 @@</div><div class=\"ds-ln\"><span>12</span><span></span><span>let token = cache.get(&amp;key);</span></div><div class=\"ds-ln ds-del\"><span>13</span><span>-</span><span>if token.expired() { refresh() }</span></div><div class=\"ds-ln ds-add\"><span>13</span><span>+</span><span>if token.expires_within(SKEW) { refresh().await? }</span></div></div>",
+      "css": ":host{--ground:#0b0e10;--plate:#121619;--plate-2:#181d21;--rule:#232b30;--rule-2:#35414a;--ink:#e3e8ea;--ink-2:#a3aeb4;--ink-3:#7d8a91;--accent:#e25303;--accent-ink:#0b0e10;--accent-text:#ff7a33;--accent-veil:rgba(226,83,3,.09);--add-bg:rgba(84,170,110,.13);--add-mark:#8fd19e;--del-bg:rgba(226,92,80,.13);--del-mark:#f0a39b;--f-label:'Barlow Condensed','Arial Narrow',sans-serif;--f-body:system-ui,-apple-system,'Segoe UI',sans-serif;--f-mono:ui-monospace,'SF Mono',Menlo,Consolas,monospace;--ease-out:cubic-bezier(0.16,1,0.3,1);--t-feedback:150ms}.ds-diff{width:480px;background:var(--plate);color:var(--ink);font:400 12px/1.6 var(--f-mono)}.ds-ln{display:grid;grid-template-columns:44px 16px 1fr;white-space:pre}.ds-ln>span:first-child{text-align:right;padding-right:8px;color:var(--ink-3)}.ds-ln>span:nth-child(2){text-align:center}.ds-add{background:var(--add-bg)}.ds-add>span:nth-child(2){color:var(--add-mark)}.ds-del{background:var(--del-bg)}.ds-del>span:nth-child(2){color:var(--del-mark)}.ds-h{grid-template-columns:1fr;padding:2px 10px;color:var(--ink-3);background:var(--plate-2)}"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Operating Datasheet",
+    "overview": "**Creative North Star: \"The Operating Datasheet\"**\n\nThe alforria website is a component datasheet: an orange identifier band, condensed caps, numbered specifications and square stamped controls on cool paper. The web client is that same datasheet put into service. It is dense and dark-first, read for hours, and its job is to clear a queue of waiting agents and scan a table of live ones. It keeps the website's materials and inverts their emphasis. On the website orange announces the product. Here orange is silent until an agent needs the human, and then it is the only orange on screen.\n\nThe surface is flat and ruled. A cool near-black ground carries slightly lifted plates, and 1px cool-gray rules divide every region, row and cell. Pale ink carries the text. Barlow Condensed caps name things (panes, columns, tools, verdicts, controls). System sans carries sentences. Mono carries only what is data or code: paths, commands, costs, ages, token counts and state codes. Density is set by a 32px row and a 16px gutter. Motion is a grammar of immediate fills plus one signature: the 150ms registration-offset stamp that marks a cleared slip.\n\nThis record was taken from the shipped prototype: `web/prototype/proto.css` (tokens on `:root`, light theme on `:root[data-theme=\"light\"]`), `app.js`, the icon sprite in `index.html`, and the self-hosted fonts in `web/prototype/fonts/`. Brand lineage: `~/repos/alforria-website/DESIGN.md`. Every color key in the frontmatter maps to a CSS custom property of the same name prefixed with `--`. Keys ending in `-light` are the same property's value under `[data-theme=\"light\"]`, and `accent` is identical in both themes. The SolidJS build should keep these property names unchanged.",
+    "keyCharacteristics": [
+      "Dark-first, with a light theme that returns to the website's paper and ink.",
+      "Orange means \"waiting on you\" and nothing else, always with ink on top.",
+      "Square corners, 1px rules, and flat tonal plates. No drop shadows and no gradients.",
+      "Condensed caps for names, system sans for prose, and mono only for data and code.",
+      "Ink-filled controls: the primary action is an ink stamp, never an orange button.",
+      "One signature motion: the registration-offset stamp."
+    ],
+    "rules": [
+      {
+        "name": "The One Signal Rule",
+        "body": "Orange means \"an agent is waiting on the human\" and nothing else. If the waiting state goes away, the orange goes with it: after the last slip clears, the band counter returns to ink-3 on the ground. Primary actions, selection, focus, progress and errors never use orange.",
+        "section": "colors"
+      },
+      {
+        "name": "The Ink-on-Orange Rule",
+        "body": "Every orange fill carries `accent-ink`. Orange text on the ground uses `accent-text`, never `accent`.",
+        "section": "colors"
+      },
+      {
+        "name": "The Diff-Tint Rule",
+        "body": "Green and red exist only to describe added and deleted lines. They never mark status, success, failure or cost.",
+        "section": "colors"
+      },
+      {
+        "name": "The Never-Colour-Alone Rule",
+        "body": "Every state pairs its colour with a shape and a word. Lamps differ by form: filled for waiting, filled with a pulsing ring for working, half-filled for retry, hollow for idle, and slashed for fault. They always sit next to a mono state code (WAITING, WORKING, RETRY, IDLE, FAULT).",
+        "section": "colors"
+      },
+      {
+        "name": "The Three Voices Rule",
+        "body": "Barlow names, sans explains, mono measures. A sentence is never set in mono. Question text and permission explanations use sans even inside slips. A path, command, cost or count is never set in sans.",
+        "section": "typography"
+      },
+      {
+        "name": "The Caps-Only-Condensed Rule",
+        "body": "Barlow Condensed is always uppercase, with the single exception of the wordmark. Inline mono inside a caps label keeps its own case and drops the tracking.",
+        "section": "typography"
+      },
+      {
+        "name": "The Mid-Token Wrap Rule",
+        "body": "Code never breaks inside an identifier. When a diff line wraps inside a narrow slip, break opportunities are inserted only at token boundaries (after `::`, `.`, `(` and `,`, and around spaced operators). Continuation lines hang 2ch past the line's own indent. Wide views scroll horizontally and do not wrap.",
+        "section": "typography"
+      },
+      {
+        "name": "The Flat Plate Rule",
+        "body": "If something needs to stand forward, give it a tonal step or an ink rule, never a shadow. The only offset in the system is the stamp's registration line, and it is a 1px rule, not a shadow.",
+        "section": "elevation"
+      }
+    ],
+    "dos": [
+      "Do reserve `accent` for things waiting on the human: the lit counter, the active and inline slip heads, the column band, the waiting lamp, the pending tool mark, waiting-row veils, and the mobile queue badge.",
+      "Do put `accent-ink` on every orange fill, and use `accent-text` for orange words on the ground.",
+      "Do make primary actions ink-filled with ground text. Selection and the current item are also ink fills.",
+      "Do draw focus as a 2px ink outline inset by 2px (`outline-offset: -2px`).",
+      "Do set every name and control in uppercase Barlow Condensed (700, or 800 for the wordmark, counter, verdict and display). Set sentences in system sans, and data and code in mono.",
+      "Do separate everything with 1px rules (`rule`, `rule-soft` between rows, `rule-2` for control outlines). Head spec lists with a 1px ink rule.",
+      "Do pair every state colour with a lamp shape and a mono state code.",
+      "Do keep hover fills immediate, and spend motion only on the stamp grammar (150ms feedback, 200ms fold, 260ms arrival).",
+      "Do break code only at token boundaries, with a 2ch hanging indent in narrow views.",
+      "Do keep the 16px left gutter and 32px rows when adding panes or tables."
+    ],
+    "donts": [
+      "Don't use orange for primary buttons, links, selection, focus, progress, errors, brand decoration or input carets.",
+      "Don't use green or red outside diff lines and diff counts. Success and failure are told with ink, shape and words.",
+      "Don't round corners. The only round form is the 9px status lamp.",
+      "Don't add drop shadows, blurs or gradients. Inset 1 to 2px box-shadow lines are rules, and are the only permitted `box-shadow`.",
+      "Don't set prose in mono or data in sans.",
+      "Don't set Barlow Condensed in lowercase or sentence case, except the `alforria` wordmark.",
+      "Don't wrap code mid-identifier, and don't let wide code views wrap. They scroll.",
+      "Don't put kickers or eyebrow labels above titles. Pane heads and slip heads are functional labels that carry state, counts or keys."
+    ]
+  }
+}

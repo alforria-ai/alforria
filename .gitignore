@@ -8,3 +8,7 @@
 scratchpad/
 .ts-ref-tui
 .ts-ref-tui-real
+
+# impeccable working files (review captures, decision-page logs)
+.impeccable/review/
+.impeccable/questions/
