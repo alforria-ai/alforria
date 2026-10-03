@@ -4,9 +4,12 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use alforria_core::libertai::login::PendingLogin;
+use alforria_core::libertai::LIBERTAI_PROVIDER_ID;
 use alforria_core::session::prompt::{CommandInput, ShellInput};
 use alforria_core::session::prompt_input::{PromptError, PromptInput};
 use alforria_core::session::revert::RevertInput;
@@ -403,12 +406,19 @@ pub trait AuthStore: Send + Sync {
     fn ids(&self) -> Vec<String>;
     /// `Auth.all()` (auth/index.ts:58-67) — the decoded `Info` entries.
     fn all(&self) -> Result<std::collections::BTreeMap<String, serde_json::Value>, ServerError>;
+    /// Moves whenever the stored credentials may have changed, so state
+    /// derived from them (the per-instance provider runtime) knows to
+    /// rebuild. No TS counterpart. A store that never changes keeps `0`.
+    fn generation(&self) -> u64 {
+        0
+    }
 }
 
 /// In-memory default [`AuthStore`].
 #[derive(Default)]
 pub struct MemoryAuthStore {
     entries: Mutex<std::collections::BTreeMap<String, serde_json::Value>>,
+    generation: AtomicU64,
 }
 
 impl AuthStore for MemoryAuthStore {
@@ -417,6 +427,7 @@ impl AuthStore for MemoryAuthStore {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .insert(provider_id.to_string(), info);
+        self.generation.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
@@ -425,6 +436,7 @@ impl AuthStore for MemoryAuthStore {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(provider_id);
+        self.generation.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
@@ -450,6 +462,10 @@ impl AuthStore for MemoryAuthStore {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone())
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
     }
 }
 
@@ -479,14 +495,35 @@ fn decode_auth_info(value: &serde_json::Value) -> bool {
 pub struct FileAuthStore {
     file: PathBuf,
     lock: Mutex<()>,
+    /// Bumped by every write here and whenever auth.json is seen to change
+    /// underneath (a CLI login in another process).
+    generation: AtomicU64,
+    /// The last observed auth.json `(mtime, len)`; `None` when absent.
+    seen: Mutex<Option<(Option<std::time::SystemTime>, u64)>>,
 }
 
 impl FileAuthStore {
     pub fn new(file: PathBuf) -> FileAuthStore {
+        let seen = Mutex::new(Self::stamp(&file));
         FileAuthStore {
             file,
             lock: Mutex::new(()),
+            generation: AtomicU64::new(0),
+            seen,
         }
+    }
+
+    fn stamp(file: &Path) -> Option<(Option<std::time::SystemTime>, u64)> {
+        std::fs::metadata(file)
+            .ok()
+            .map(|meta| (meta.modified().ok(), meta.len()))
+    }
+
+    /// Record our own write: adopt the new stamp (so it isn't mistaken for
+    /// an outside change) and move the generation.
+    fn bump(&self) {
+        *self.seen.lock().unwrap_or_else(|p| p.into_inner()) = Self::stamp(&self.file);
+        self.generation.fetch_add(1, Ordering::SeqCst);
     }
 
     fn all_unlocked(
@@ -564,7 +601,9 @@ impl AuthStore for FileAuthStore {
         let slash_key = format!("{norm}/");
         object.remove(&slash_key);
         object.insert(norm.to_string(), info);
-        self.write(&data)
+        self.write(&data)?;
+        self.bump();
+        Ok(())
     }
 
     fn remove(&self, provider_id: &str) -> Result<(), ServerError> {
@@ -580,7 +619,9 @@ impl AuthStore for FileAuthStore {
             .expect("auth entries are always an object");
         object.remove(provider_id);
         object.remove(norm);
-        self.write(&data)
+        self.write(&data)?;
+        self.bump();
+        Ok(())
     }
 
     fn has(&self, provider_id: &str) -> bool {
@@ -598,6 +639,18 @@ impl AuthStore for FileAuthStore {
     fn all(&self) -> Result<std::collections::BTreeMap<String, serde_json::Value>, ServerError> {
         let _guard = self.lock.lock().unwrap_or_else(|p| p.into_inner());
         self.all_unlocked()
+    }
+
+    /// One `stat` of auth.json per call — cheap enough for every model
+    /// lookup, and it catches logins written by another process.
+    fn generation(&self) -> u64 {
+        let stamp = Self::stamp(&self.file);
+        let mut seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
+        if *seen != stamp {
+            *seen = stamp;
+            self.generation.fetch_add(1, Ordering::SeqCst);
+        }
+        self.generation.load(Ordering::SeqCst)
     }
 }
 
@@ -960,28 +1013,56 @@ pub enum ProviderAuthError {
     Defect,
 }
 
+/// `ProviderAuthMethod` (auth.ts:43-47). Typed so the wire keeps the TS
+/// field order whatever the `serde_json` map flavour.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ProviderAuthMethod {
+    /// `"oauth" | "api"`.
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompts: Option<Vec<serde_json::Value>>,
+}
+
+/// `ProviderAuth.Methods` — `Record<providerID, Method[]>`.
+pub type ProviderAuthMethods = std::collections::BTreeMap<String, Vec<ProviderAuthMethod>>;
+
+/// `ProviderAuthAuthorization` (auth.ts:49-53).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ProviderAuthAuthorization {
+    pub url: String,
+    /// `"auto" | "code"`.
+    pub method: String,
+    pub instructions: String,
+}
+
 /// `ProviderAuth.Service` seam (`provider/auth.ts`) — the OAuth machinery is
-/// plugin-driven in TS; without a plugin runtime the hook registry ships
-/// empty (M7 §7.4), so `methods()` is `{}`, `authorize` defects and
-/// `callback` reports the missing pending flow.
+/// plugin-driven in TS. Without a plugin runtime the only hook is the
+/// built-in LibertAI one ([`ProviderAuthService`]); the trait defaults are
+/// the empty registry.
 pub trait ProviderAuth: Send + Sync {
     /// `methods()` (auth.ts:131-158) — `Record<providerID, Method[]>`.
-    fn methods(&self) -> Result<serde_json::Value, ServerError> {
-        Ok(serde_json::json!({}))
+    fn methods(&self) -> Result<ProviderAuthMethods, ServerError> {
+        Ok(ProviderAuthMethods::new())
     }
 
     /// `authorize` (auth.ts:160-186) — `Ok(None)` resolves without a result.
+    /// A flow that completes stores its credential into `auth_store`. Never
+    /// waits on the user.
     fn authorize(
         &self,
+        auth_store: Arc<dyn AuthStore>,
         provider_id: &str,
         method: i64,
         inputs: Option<std::collections::BTreeMap<String, String>>,
-    ) -> Result<Option<serde_json::Value>, ProviderAuthError> {
-        let _ = (provider_id, method, inputs);
+    ) -> Result<Option<ProviderAuthAuthorization>, ProviderAuthError> {
+        let _ = (auth_store, provider_id, method, inputs);
         Err(ProviderAuthError::BadRequest)
     }
 
-    /// `callback` (auth.ts:188-221).
+    /// `callback` (auth.ts:188-221). Blocks until the pending flow settles —
+    /// call it off the async workers.
     fn callback(
         &self,
         provider_id: &str,
@@ -990,6 +1071,12 @@ pub trait ProviderAuth: Send + Sync {
     ) -> Result<(), ProviderAuthError> {
         let _ = (provider_id, method, code);
         Err(ProviderAuthError::BadRequest)
+    }
+
+    /// Provider-side logout run before `DELETE /auth/{providerID}` drops the
+    /// stored credential. Best-effort; may block on the network.
+    fn logout(&self, provider_id: &str) {
+        let _ = provider_id;
     }
 }
 
@@ -1000,55 +1087,153 @@ pub struct UnwiredProviderAuth;
 
 impl ProviderAuth for UnwiredProviderAuth {}
 
-/// The production `ProviderAuth.Service` (provider/auth.ts:109-223) with an
-/// empty plugin-hook registry: the pending-oauth map and the authorize/
-/// callback error mapping.
-#[derive(Default)]
+/// `ProviderAuthAuthorization.instructions` of the LibertAI sign-in.
+const LIBERTAI_INSTRUCTIONS: &str = "Finish signing in in the browser tab that opened. If your browser runs on another machine, paste the address it lands on.";
+
+/// The production `ProviderAuth.Service` (provider/auth.ts:109-223). The
+/// hook registry holds the built-in LibertAI hook only: browser sign-in
+/// (PKCE + loopback, or the pasted redirect when the browser runs on
+/// another machine) or a plain API key. Other providers have no hook —
+/// authorize defects (auth.ts:166-167), callback finds no pending flow.
 pub struct ProviderAuthService {
-    pending: Mutex<HashMap<String, serde_json::Value>>,
+    libertai: alforria_core::libertai::auth::Endpoints,
+    /// `pending` (auth.ts:105) — the in-flight LibertAI sign-in.
+    pending: Mutex<Option<Arc<PendingLogin>>>,
+}
+
+impl Default for ProviderAuthService {
+    fn default() -> Self {
+        ProviderAuthService::new()
+    }
 }
 
 impl ProviderAuthService {
     pub fn new() -> ProviderAuthService {
-        ProviderAuthService::default()
+        ProviderAuthService::with_libertai(alforria_core::libertai::auth::Endpoints::from_env())
+    }
+
+    /// A service whose LibertAI sign-in talks to `endpoints`.
+    pub fn with_libertai(
+        endpoints: alforria_core::libertai::auth::Endpoints,
+    ) -> ProviderAuthService {
+        ProviderAuthService {
+            libertai: endpoints,
+            pending: Mutex::new(None),
+        }
+    }
+
+    fn pending(&self) -> std::sync::MutexGuard<'_, Option<Arc<PendingLogin>>> {
+        self.pending.lock().unwrap_or_else(|p| p.into_inner())
     }
 }
 
 impl ProviderAuth for ProviderAuthService {
-    fn methods(&self) -> Result<serde_json::Value, ServerError> {
-        Ok(serde_json::json!({}))
+    fn methods(&self) -> Result<ProviderAuthMethods, ServerError> {
+        let method = |kind: &str, label: &str| ProviderAuthMethod {
+            kind: kind.to_string(),
+            label: label.to_string(),
+            prompts: None,
+        };
+        Ok(ProviderAuthMethods::from([(
+            LIBERTAI_PROVIDER_ID.to_string(),
+            vec![
+                method("oauth", "Sign in with LibertAI"),
+                method("api", "API key"),
+            ],
+        )]))
     }
 
     fn authorize(
         &self,
+        auth_store: Arc<dyn AuthStore>,
         provider_id: &str,
-        _method: i64,
+        method: i64,
         _inputs: Option<std::collections::BTreeMap<String, String>>,
-    ) -> Result<Option<serde_json::Value>, ProviderAuthError> {
-        // `hooks[input.providerID].methods[input.method]` — the no-plugin
-        // registry dereferences undefined and throws (auth.ts:166-167).
-        let _ = provider_id;
-        Err(ProviderAuthError::Defect)
+    ) -> Result<Option<ProviderAuthAuthorization>, ProviderAuthError> {
+        // `hooks[input.providerID].methods[input.method]` — a missing hook or
+        // method dereferences undefined and throws (auth.ts:166-167).
+        if provider_id != LIBERTAI_PROVIDER_ID {
+            return Err(ProviderAuthError::Defect);
+        }
+        match method {
+            0 => {}
+            // `method.type !== "oauth"` resolves without a result.
+            1 => return Ok(None),
+            _ => return Err(ProviderAuthError::Defect),
+        }
+        let sink: alforria_core::libertai::login::KeySink =
+            Box::new(move |key: &alforria_core::libertai::auth::FullApiKey| {
+                auth_store
+                    .set(
+                        LIBERTAI_PROVIDER_ID,
+                        serde_json::json!({"type": "api", "key": key.full_key}),
+                    )
+                    .map_err(|err| format!("storing the key: {err:?}"))
+            });
+        let login = PendingLogin::start(
+            self.libertai.clone(),
+            "Alforria",
+            alforria_core::libertai::auth::CALLBACK_TIMEOUT,
+            sink,
+        )
+        .map_err(|err| {
+            tracing::warn!(error = %err, "libertai sign-in: loopback bind failed");
+            ProviderAuthError::Defect
+        })?;
+        let login = Arc::new(login);
+        // `pending.set` replaces the previous flow, which stops listening
+        // and fails its waiters.
+        if let Some(previous) = self.pending().replace(login.clone()) {
+            previous.cancel();
+        }
+        Ok(Some(ProviderAuthAuthorization {
+            url: login.url().to_string(),
+            method: "auto".to_string(),
+            instructions: LIBERTAI_INSTRUCTIONS.to_string(),
+        }))
     }
 
     fn callback(
         &self,
         provider_id: &str,
         _method: i64,
-        _code: Option<String>,
+        code: Option<String>,
     ) -> Result<(), ProviderAuthError> {
-        let pending = self
-            .pending
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !pending.contains_key(provider_id) {
-            return Err(ProviderAuthError::OauthMissing {
-                provider_id: provider_id.to_string(),
-            });
+        // `pending.get(providerID)` — the method index plays no part.
+        let login = match provider_id {
+            LIBERTAI_PROVIDER_ID => self.pending().clone(),
+            _ => None,
         }
-        // A registered pending flow requires a plugin hook to complete
-        // (match.callback); hooks are empty, so the exchange fails.
-        Err(ProviderAuthError::OauthCallbackFailed)
+        .ok_or_else(|| ProviderAuthError::OauthMissing {
+            provider_id: provider_id.to_string(),
+        })?;
+        // `match.callback()` waits on the loopback; a pasted code (the
+        // remote-browser path) completes the same flow and wakes the waiter.
+        let result = match code.as_deref() {
+            Some(pasted) => login.submit(pasted),
+            None => login.wait(),
+        };
+        // Single-use: a settled flow leaves the registry, unless a newer
+        // authorize already replaced it.
+        if login.is_resolved() {
+            let mut pending = self.pending();
+            if pending
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &login))
+            {
+                *pending = None;
+            }
+        }
+        result.map_err(|err| {
+            tracing::warn!(error = %err, "libertai sign-in failed");
+            ProviderAuthError::OauthCallbackFailed
+        })
+    }
+
+    fn logout(&self, provider_id: &str) {
+        if provider_id == LIBERTAI_PROVIDER_ID {
+            self.libertai.logout();
+        }
     }
 }
 

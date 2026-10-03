@@ -257,11 +257,15 @@ pub async fn auth_set(
     Ok(json_ok(true))
 }
 
-/// `authRemove` (`handlers/control.ts:15-20`).
+/// `authRemove` (`handlers/control.ts:15-20`), after the provider-side
+/// logout (LibertAI revokes its session, like `alforria auth logout`).
 pub async fn auth_remove(
     State(ctx): State<Arc<ServerContext>>,
     PathParam(provider_id): PathParam<String>,
 ) -> Result<Response, ServerError> {
+    let service = ctx.provider_auth.clone();
+    let id = provider_id.clone();
+    let _ = tokio::task::spawn_blocking(move || service.logout(&id)).await;
     ctx.auth_store.remove(&provider_id)?;
     Ok(json_ok(true))
 }

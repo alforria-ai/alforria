@@ -7,6 +7,7 @@
 //! and fetch failures fall through to the next source, never fail the call.
 
 pub mod auth;
+pub mod login;
 
 use std::collections::BTreeMap;
 use std::env;

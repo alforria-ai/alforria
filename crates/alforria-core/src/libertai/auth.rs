@@ -10,7 +10,9 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::time::Duration;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use rand::RngCore;
@@ -31,6 +33,10 @@ const SESSION_FILE: &str = "libertai-auth.json";
 /// How long the loopback callback waits before giving up.
 pub const CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Per-connection read budget on the loopback, so a connection that never
+/// sends its request (a speculative pre-connect) can't stall the wait.
+const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
 pub fn account_base() -> String {
     env_override("LIBERTAI_ACCOUNT_BASE", LIBERTAI_ACCOUNT_BASE)
 }
@@ -45,6 +51,28 @@ fn env_override(env_var: &str, default: &str) -> String {
         .map(|value| value.trim().trim_end_matches('/').to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| default.to_string())
+}
+
+/// The account API, console and session sidecar a login talks to — the
+/// env-resolved defaults in production, fakes in tests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Endpoints {
+    /// Account API base (`/auth/*`, `/api-keys/*`).
+    pub account: String,
+    /// Console base serving the `/cli` authorize page.
+    pub console: String,
+    /// The refresh-token sidecar.
+    pub session_file: PathBuf,
+}
+
+impl Endpoints {
+    pub fn from_env() -> Endpoints {
+        Endpoints {
+            account: account_base(),
+            console: console_base(),
+            session_file: session_path(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -79,14 +107,21 @@ impl Pkce {
 
 /// `{"redirect_uri", "state", "challenge", "client"}` against `{console}/cli`.
 pub fn authorize_url(pkce: &Pkce, client: &str, redirect_uri: &str) -> String {
-    format!(
-        "{}/cli?redirect_uri={}&state={}&challenge={}&client={}",
-        console_base(),
-        urlencode(redirect_uri),
-        urlencode(&pkce.state),
-        urlencode(&pkce.challenge),
-        urlencode(client),
-    )
+    Endpoints::from_env().authorize_url(pkce, client, redirect_uri)
+}
+
+impl Endpoints {
+    /// [`authorize_url`] against this console.
+    pub fn authorize_url(&self, pkce: &Pkce, client: &str, redirect_uri: &str) -> String {
+        format!(
+            "{}/cli?redirect_uri={}&state={}&challenge={}&client={}",
+            self.console,
+            urlencode(redirect_uri),
+            urlencode(&pkce.state),
+            urlencode(&pkce.challenge),
+            urlencode(client),
+        )
+    }
 }
 
 fn urlencode(value: &str) -> String {
@@ -117,6 +152,15 @@ pub struct Callback {
     pub state: String,
 }
 
+/// One request read off the loopback: its path and the redirect params.
+#[derive(Debug, Default)]
+struct LoopbackRequest {
+    path: String,
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+}
+
 impl CallbackServer {
     pub fn bind() -> std::io::Result<CallbackServer> {
         Ok(CallbackServer {
@@ -138,49 +182,67 @@ impl CallbackServer {
     /// Serve one GET to `/callback`, reply with a "you can close this tab"
     /// page, and return its `code` + `state` query params.
     pub fn wait(&self, timeout: Duration) -> Result<Callback, String> {
+        self.wait_cancellable(timeout, &AtomicBool::new(false))
+    }
+
+    /// [`wait`](Self::wait) that also gives up once `cancel` is set, so a
+    /// login held by the server releases its port when the flow is replaced
+    /// or finished elsewhere. Requests for any other path (a favicon probe,
+    /// an empty pre-connect) get a 404 and the wait goes on.
+    pub fn wait_cancellable(
+        &self,
+        timeout: Duration,
+        cancel: &AtomicBool,
+    ) -> Result<Callback, String> {
         // Deadline-driven accept: poll the socket instead of blocking past
         // the timeout, so an abandoned login never hangs the caller.
         self.listener
             .set_nonblocking(true)
             .map_err(|err| err.to_string())?;
-        let deadline = std::time::Instant::now() + timeout;
-        let stream = loop {
-            match self.listener.accept() {
-                Ok((stream, _)) => break stream,
+        let deadline = Instant::now() + timeout;
+        loop {
+            if cancel.load(Ordering::SeqCst) {
+                return Err("sign-in cancelled".to_string());
+            }
+            let stream = match self.listener.accept() {
+                Ok((stream, _)) => stream,
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    if std::time::Instant::now() >= deadline {
+                    if Instant::now() >= deadline {
                         return Err("timed out waiting for browser sign-in".to_string());
                     }
                     std::thread::sleep(Duration::from_millis(100));
+                    continue;
                 }
                 Err(err) => return Err(err.to_string()),
+            };
+            stream
+                .set_nonblocking(false)
+                .map_err(|err| err.to_string())?;
+            let _ = stream.set_read_timeout(Some(REQUEST_READ_TIMEOUT));
+            let request =
+                Self::parse_request(stream.try_clone().map_err(|e| e.to_string())?, deadline);
+            if request.path != "/callback" {
+                let _ = Self::respond_not_found(stream);
+                continue;
             }
-        };
-        stream
-            .set_nonblocking(false)
-            .map_err(|err| err.to_string())?;
-        let (code, state, error) =
-            Self::parse_request(stream.try_clone().map_err(|e| e.to_string())?, deadline);
-        let _ = Self::respond(stream, error.is_none() && code.is_some());
-        match error {
-            Some(error) => Err(format!("login was rejected: {error}")),
-            None => match (code, state) {
-                (Some(code), Some(state)) => Ok(Callback { code, state }),
-                _ => Err("login callback missing code/state".to_string()),
-            },
+            let _ = Self::respond(stream, request.error.is_none() && request.code.is_some());
+            return match request.error {
+                Some(error) => Err(format!("login was rejected: {error}")),
+                None => match (request.code, request.state) {
+                    (Some(code), Some(state)) => Ok(Callback { code, state }),
+                    _ => Err("login callback missing code/state".to_string()),
+                },
+            };
         }
     }
 
     /// Read one HTTP request and pull `code`/`state`/`error` from the query.
     /// Reads until the end of the headers — a single read() may be partial.
-    fn parse_request(
-        mut stream: TcpStream,
-        deadline: std::time::Instant,
-    ) -> (Option<String>, Option<String>, Option<String>) {
+    fn parse_request(mut stream: TcpStream, deadline: Instant) -> LoopbackRequest {
         let mut buffer = Vec::new();
         let mut chunk = [0u8; 512];
         loop {
-            if buffer.ends_with(b"\r\n\r\n") || std::time::Instant::now() >= deadline {
+            if buffer.ends_with(b"\r\n\r\n") || Instant::now() >= deadline {
                 break;
             }
             match stream.read(&mut chunk) {
@@ -189,24 +251,26 @@ impl CallbackServer {
             }
         }
         let request = String::from_utf8_lossy(&buffer).to_string();
-        let query = request
-            .split_whitespace()
-            .nth(1)
-            .and_then(|path| path.split_once('?'))
-            .map(|(_, query)| query.to_string())
-            .unwrap_or_default();
-        let mut code = None;
-        let mut state = None;
-        let mut error = None;
-        for (key, value) in parse_query(&query) {
+        let target = request.split_whitespace().nth(1).unwrap_or_default();
+        let (path, query) = target.split_once('?').unwrap_or((target, ""));
+        let mut parsed = LoopbackRequest {
+            path: path.to_string(),
+            ..LoopbackRequest::default()
+        };
+        for (key, value) in parse_query(query) {
             match key.as_str() {
-                "code" => code = Some(value),
-                "state" => state = Some(value),
-                "error" => error = Some(value),
+                "code" => parsed.code = Some(value),
+                "state" => parsed.state = Some(value),
+                "error" => parsed.error = Some(value),
                 _ => {}
             }
         }
-        (code, state, error)
+        parsed
+    }
+
+    fn respond_not_found(mut stream: TcpStream) -> std::io::Result<()> {
+        stream
+            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
     }
 
     fn respond(mut stream: TcpStream, ok: bool) -> std::io::Result<()> {
@@ -215,14 +279,14 @@ impl CallbackServer {
                 "#10b981",
                 "\u{2713}",
                 "Signed in to LibertAI",
-                "You can now close this page and return to your terminal.",
+                "You can close this tab and return to alforria.",
             )
         } else {
             (
                 "#ef4444",
                 "\u{00d7}",
                 "Sign-in failed",
-                "Something went wrong. Return to your terminal and log in again.",
+                "Something went wrong. Return to alforria and sign in again.",
             )
         };
         let body = format!(
@@ -350,38 +414,87 @@ fn account_client() -> Result<reqwest::blocking::Client, String> {
         .map_err(|err| err.to_string())
 }
 
-/// Exchange a one-time code (+ PKCE verifier) for the session token pair.
-pub fn exchange_code(code: &str, verifier: &str) -> Result<TokenPair, String> {
-    let url = format!("{}/auth/exchange", account_base());
-    let response = account_client()?
-        .post(&url)
-        .json(&serde_json::json!({"code": code, "verifier": verifier}))
-        .send()
-        .map_err(|err| format!("POST {url}: {err}"))?;
-    if !response.status().is_success() {
-        return Err(format!("POST {url} → {}", response.status()));
+impl Endpoints {
+    /// Exchange a one-time code (+ PKCE verifier) for the session token pair.
+    pub fn exchange_code(&self, code: &str, verifier: &str) -> Result<TokenPair, String> {
+        let url = format!("{}/auth/exchange", self.account);
+        let response = account_client()?
+            .post(&url)
+            .json(&serde_json::json!({"code": code, "verifier": verifier}))
+            .send()
+            .map_err(|err| format!("POST {url}: {err}"))?;
+        if !response.status().is_success() {
+            return Err(format!("POST {url} → {}", response.status()));
+        }
+        response
+            .json()
+            .map_err(|err| format!("parsing /auth/exchange response: {err}"))
     }
-    response
-        .json()
-        .map_err(|err| format!("parsing /auth/exchange response: {err}"))
-}
 
-/// Mint (or rotate) this device's CLI API key, authenticating with the
-/// session access token.
-pub fn create_cli_api_key(access_token: &str, host: &str) -> Result<FullApiKey, String> {
-    let url = format!("{}/api-keys/cli", account_base());
-    let response = account_client()?
-        .post(&url)
-        .bearer_auth(access_token)
-        .json(&serde_json::json!({"host": host}))
-        .send()
-        .map_err(|err| format!("POST {url}: {err}"))?;
-    if !response.status().is_success() {
-        return Err(format!("POST {url} → {}", response.status()));
+    /// Mint (or rotate) this device's CLI API key, authenticating with the
+    /// session access token.
+    pub fn create_cli_api_key(&self, access_token: &str, host: &str) -> Result<FullApiKey, String> {
+        let url = format!("{}/api-keys/cli", self.account);
+        let response = account_client()?
+            .post(&url)
+            .bearer_auth(access_token)
+            .json(&serde_json::json!({"host": host}))
+            .send()
+            .map_err(|err| format!("POST {url}: {err}"))?;
+        if !response.status().is_success() {
+            return Err(format!("POST {url} → {}", response.status()));
+        }
+        response
+            .json()
+            .map_err(|err| format!("parsing /api-keys/cli response: {err}"))
     }
-    response
-        .json()
-        .map_err(|err| format!("parsing /api-keys/cli response: {err}"))
+
+    /// Best-effort revocation of a refresh token (logout). Surfaced errors
+    /// include the HTTP status so a permanent failure isn't mistaken for
+    /// success.
+    pub fn revoke(&self, refresh_token: &str) -> Result<(), String> {
+        let url = format!("{}/auth/logout", self.account);
+        let response = account_client()?
+            .post(&url)
+            .json(&serde_json::json!({"refresh_token": refresh_token}))
+            .send()
+            .map_err(|err| format!("POST {url}: {err}"))?;
+        if !response.status().is_success() {
+            return Err(format!("POST {url} → {}", response.status()));
+        }
+        Ok(())
+    }
+
+    /// The leg after the browser redirect, shared by every login surface:
+    /// exchange the code, mint this device's key, persist the session
+    /// sidecar. The caller stores the returned key in auth.json.
+    pub fn complete_login(&self, code: &str, verifier: &str) -> Result<FullApiKey, String> {
+        let pair = self.exchange_code(code, verifier)?;
+        // Per-device key: a stable id keeps this device's key name unique,
+        // so logging in elsewhere mints a separate key instead of rotating
+        // this one.
+        let device_id = self
+            .load_session()
+            .map(|session| session.device_id)
+            .unwrap_or_else(new_device_id);
+        let host = format!("{}-{}", device_hostname(), device_id);
+        let created = self.create_cli_api_key(&pair.access_token, &host)?;
+        self.store_session(&StoredSession {
+            refresh_token: pair.refresh_token,
+            expires_at: created.expires_at.clone(),
+            device_id,
+        })?;
+        Ok(created)
+    }
+
+    /// Logout's account side: revoke the stored refresh token (best-effort)
+    /// and drop the sidecar. The auth.json key is the caller's to remove.
+    pub fn logout(&self) {
+        if let Some(session) = self.load_session() {
+            let _ = self.revoke(&session.refresh_token);
+        }
+        self.clear_session();
+    }
 }
 
 /// One-time-use rotation: the returned pair's refresh token REPLACES the one
@@ -399,22 +512,6 @@ pub fn refresh(access_token_refresh: &str) -> Result<TokenPair, String> {
     response
         .json()
         .map_err(|err| format!("parsing /auth/refresh response: {err}"))
-}
-
-/// Best-effort revocation of a refresh token (logout). Surfaced errors
-/// include the HTTP status so a permanent failure isn't mistaken for
-/// success.
-pub fn revoke(refresh_token: &str) -> Result<(), String> {
-    let url = format!("{}/auth/logout", account_base());
-    let response = account_client()?
-        .post(&url)
-        .json(&serde_json::json!({"refresh_token": refresh_token}))
-        .send()
-        .map_err(|err| format!("POST {url}: {err}"))?;
-    if !response.status().is_success() {
-        return Err(format!("POST {url} → {}", response.status()));
-    }
-    Ok(())
 }
 
 /// `GET /payments/subscription` — plan tier, allowance windows, prepaid
@@ -492,42 +589,53 @@ pub struct StoredSession {
     pub device_id: String,
 }
 
-fn session_path() -> std::path::PathBuf {
+fn session_path() -> PathBuf {
     GlobalPaths::from_env().data.join(SESSION_FILE)
 }
 
 pub fn load_session() -> Option<StoredSession> {
-    let text = std::fs::read_to_string(session_path()).ok()?;
-    serde_json::from_str(&text).ok()
+    Endpoints::from_env().load_session()
 }
 
 pub fn store_session(session: &StoredSession) -> Result<(), String> {
-    let text = serde_json::to_string(session).map_err(|err| err.to_string())?;
-    let path = session_path();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&path)
-            .and_then(|mut file| std::io::Write::write_all(&mut file, text.as_bytes()))
-            .map_err(|err| format!("writing {}: {err}", path.display()))?;
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(&path, &text).map_err(|err| format!("writing {}: {err}", path.display()))?;
-    }
-    Ok(())
+    Endpoints::from_env().store_session(session)
 }
 
-pub fn clear_session() {
-    let _ = std::fs::remove_file(session_path());
+impl Endpoints {
+    pub fn load_session(&self) -> Option<StoredSession> {
+        let text = std::fs::read_to_string(&self.session_file).ok()?;
+        serde_json::from_str(&text).ok()
+    }
+
+    pub fn store_session(&self, session: &StoredSession) -> Result<(), String> {
+        let text = serde_json::to_string(session).map_err(|err| err.to_string())?;
+        let path = &self.session_file;
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(path)
+                .and_then(|mut file| std::io::Write::write_all(&mut file, text.as_bytes()))
+                .map_err(|err| format!("writing {}: {err}", path.display()))?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(path, &text)
+                .map_err(|err| format!("writing {}: {err}", path.display()))?;
+        }
+        Ok(())
+    }
+
+    pub fn clear_session(&self) {
+        let _ = std::fs::remove_file(&self.session_file);
+    }
 }
 
 /// Random 8-hex-char id identifying this install (not security-sensitive);
@@ -647,9 +755,57 @@ mod tests {
         let mut response = String::new();
         stream.read_to_string(&mut response).unwrap();
         assert!(response.contains("Signed in to LibertAI"));
+        assert!(response.contains("You can close this tab and return to alforria."));
         let callback = handle.join().unwrap();
         assert_eq!(callback.code, "abc123");
         assert_eq!(callback.state, "xyz");
+    }
+
+    #[test]
+    fn callback_server_skips_other_paths_and_empty_connections() {
+        let server = CallbackServer::bind().unwrap();
+        let port = server.port();
+        let handle = std::thread::spawn(move || server.wait(Duration::from_secs(10)).unwrap());
+
+        // A pre-connect that closes without sending anything.
+        drop(TcpStream::connect(("127.0.0.1", port)).unwrap());
+
+        let mut favicon = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        favicon
+            .write_all(b"GET /favicon.ico HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .unwrap();
+        let mut response = String::new();
+        favicon.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 404"));
+
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .write_all(b"GET /callback?code=abc&state=xyz HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .unwrap();
+        let callback = handle.join().unwrap();
+        assert_eq!(callback.code, "abc");
+    }
+
+    #[test]
+    fn callback_server_stops_when_cancelled() {
+        let server = CallbackServer::bind().unwrap();
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        let handle =
+            std::thread::spawn(move || server.wait_cancellable(Duration::from_secs(30), &flag));
+        cancel.store(true, Ordering::SeqCst);
+        assert_eq!(handle.join().unwrap().unwrap_err(), "sign-in cancelled");
+    }
+
+    #[test]
+    fn endpoints_authorize_url_uses_their_console() {
+        let endpoints = Endpoints {
+            account: "http://127.0.0.1:1".to_string(),
+            console: "http://127.0.0.1:2".to_string(),
+            session_file: PathBuf::from("/nonexistent/libertai-auth.json"),
+        };
+        let url = endpoints.authorize_url(&Pkce::generate(), "Alforria", "http://x/callback");
+        assert!(url.starts_with("http://127.0.0.1:2/cli?"));
     }
 
     #[test]

@@ -201,21 +201,34 @@ pub async fn authorize(
         serde_json::from_value(payload).map_err(|_| provider_auth_bad_request())?;
     let result = ctx
         .provider_auth
-        .authorize(&provider_id, parsed.method, parsed.inputs)
+        .authorize(
+            ctx.auth_store.clone(),
+            &provider_id,
+            parsed.method,
+            parsed.inputs,
+        )
         .map_err(provider_auth_error)?;
-    Ok(json_ok(serde_json::to_value(result).unwrap_or(Value::Null)))
+    Ok(json_ok(result))
 }
 
-/// `callback` (`handlers/provider.ts:130-139`).
+/// `callback` (`handlers/provider.ts:130-139`). The callback blocks until
+/// the flow settles (a browser sign-in waits up to its loopback timeout),
+/// so it runs on the blocking pool; an aborted request leaves the flow to
+/// that timeout or to the next authorize.
 pub async fn callback(
     State(ctx): State<Arc<ServerContext>>,
     Path(provider_id): Path<String>,
     body: Bytes,
 ) -> Result<Response, ServerError> {
     let payload: CallbackPayload = parse_payload(&body)?;
-    ctx.provider_auth
-        .callback(&provider_id, payload.method, payload.code)
-        .map_err(provider_auth_error)?;
+    let service = ctx.provider_auth.clone();
+    tokio::task::spawn_blocking(move || {
+        service.callback(&provider_id, payload.method, payload.code)
+    })
+    .await
+    .map_err(|_| crate::state::ProviderAuthError::Defect)
+    .and_then(|result| result)
+    .map_err(provider_auth_error)?;
     Ok(json_ok(true))
 }
 

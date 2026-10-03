@@ -294,7 +294,11 @@ async fn provider_list_and_auth_methods() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(body_string(response).await, "{}");
+    // The built-in LibertAI hook is the only provider-auth hook.
+    assert_eq!(
+        body_string(response).await,
+        r#"{"libertai":[{"type":"oauth","label":"Sign in with LibertAI"},{"type":"api","label":"API key"}]}"#
+    );
 }
 
 #[tokio::test]

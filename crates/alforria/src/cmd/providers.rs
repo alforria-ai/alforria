@@ -437,23 +437,9 @@ fn login_libertai_sso(ui: &mut Ui, deps: &mut LoginDeps) -> Result<(), (TypedErr
         ));
     }
 
-    let pair =
-        auth::exchange_code(&code, &pkce.verifier).map_err(|err| (cli_error(err), stdin_armed))?;
-
-    // Per-device key: a stable id keeps this device's key name unique, so
-    // logging in elsewhere mints a separate key instead of rotating this one.
-    let device_id = auth::load_session()
-        .map(|session| session.device_id)
-        .unwrap_or_else(auth::new_device_id);
-    let host = format!("{}-{}", auth::device_hostname(), device_id);
-    let created = auth::create_cli_api_key(&pair.access_token, &host)
+    let created = auth::Endpoints::from_env()
+        .complete_login(&code, &pkce.verifier)
         .map_err(|err| (cli_error(err), stdin_armed))?;
-    auth::store_session(&auth::StoredSession {
-        refresh_token: pair.refresh_token,
-        expires_at: created.expires_at.clone(),
-        device_id,
-    })
-    .map_err(|err| (cli_error(err), stdin_armed))?;
 
     deps.auth
         .set("libertai", json!({"type": "api", "key": created.full_key}))
@@ -692,10 +678,7 @@ pub fn logout(
         ))));
     };
     if provider == "libertai" {
-        if let Some(session) = alforria_core::libertai::auth::load_session() {
-            let _ = alforria_core::libertai::auth::revoke(&session.refresh_token);
-        }
-        alforria_core::libertai::auth::clear_session();
+        alforria_core::libertai::auth::Endpoints::from_env().logout();
     }
     auth.remove(&provider).map_err(server_error)?;
     outro(ui, "Logout successful");
