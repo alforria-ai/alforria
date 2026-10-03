@@ -37,6 +37,9 @@ pub const CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
 /// sends its request (a speculative pre-connect) can't stall the wait.
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// A redirect request is one short GET; anything longer is not one.
+const MAX_REQUEST_BYTES: usize = 8 * 1024;
+
 pub fn account_base() -> String {
     env_override("LIBERTAI_ACCOUNT_BASE", LIBERTAI_ACCOUNT_BASE)
 }
@@ -179,19 +182,25 @@ impl CallbackServer {
             .unwrap_or(0)
     }
 
-    /// Serve one GET to `/callback`, reply with a "you can close this tab"
-    /// page, and return its `code` + `state` query params.
-    pub fn wait(&self, timeout: Duration) -> Result<Callback, String> {
-        self.wait_cancellable(timeout, &AtomicBool::new(false))
+    /// Serve the GET to `/callback` that carries `expected_state`, reply
+    /// with a "you can close this tab" page, and return its `code` +
+    /// `state` query params.
+    pub fn wait(&self, timeout: Duration, expected_state: &str) -> Result<Callback, String> {
+        self.wait_cancellable(timeout, expected_state, &AtomicBool::new(false))
     }
 
     /// [`wait`](Self::wait) that also gives up once `cancel` is set, so a
     /// login held by the server releases its port when the flow is replaced
     /// or finished elsewhere. Requests for any other path (a favicon probe,
-    /// an empty pre-connect) get a 404 and the wait goes on.
+    /// an empty pre-connect) get a 404 and the wait goes on, and so does a
+    /// `/callback` without this flow's `state`: any local process (or a page
+    /// probing loopback ports) can reach the listener, and a forged hit must
+    /// not end a real sign-in. Each request gets [`REQUEST_READ_TIMEOUT`] in
+    /// total, so a slow sender can't hold the listener either.
     pub fn wait_cancellable(
         &self,
         timeout: Duration,
+        expected_state: &str,
         cancel: &AtomicBool,
     ) -> Result<Callback, String> {
         // Deadline-driven accept: poll the socket instead of blocking past
@@ -218,31 +227,42 @@ impl CallbackServer {
             stream
                 .set_nonblocking(false)
                 .map_err(|err| err.to_string())?;
-            let _ = stream.set_read_timeout(Some(REQUEST_READ_TIMEOUT));
-            let request =
-                Self::parse_request(stream.try_clone().map_err(|e| e.to_string())?, deadline);
+            let request_deadline = deadline.min(Instant::now() + REQUEST_READ_TIMEOUT);
+            let request = Self::parse_request(
+                stream.try_clone().map_err(|e| e.to_string())?,
+                request_deadline,
+            );
             if request.path != "/callback" {
                 let _ = Self::respond_not_found(stream);
                 continue;
             }
+            if request.state.as_deref() != Some(expected_state) {
+                // Not this flow's redirect: refuse it and keep waiting.
+                let _ = Self::respond(stream, false);
+                continue;
+            }
             let _ = Self::respond(stream, request.error.is_none() && request.code.is_some());
-            return match request.error {
-                Some(error) => Err(format!("login was rejected: {error}")),
-                None => match (request.code, request.state) {
-                    (Some(code), Some(state)) => Ok(Callback { code, state }),
-                    _ => Err("login callback missing code/state".to_string()),
-                },
+            return match (request.error, request.code, request.state) {
+                (Some(error), _, _) => Err(format!("login was rejected: {error}")),
+                (None, Some(code), Some(state)) => Ok(Callback { code, state }),
+                _ => Err("login callback missing code/state".to_string()),
             };
         }
     }
 
     /// Read one HTTP request and pull `code`/`state`/`error` from the query.
-    /// Reads until the end of the headers — a single read() may be partial.
+    /// Reads until the end of the headers — a single read() may be partial —
+    /// but never past `deadline` (for the whole request, not per read) or
+    /// [`MAX_REQUEST_BYTES`].
     fn parse_request(mut stream: TcpStream, deadline: Instant) -> LoopbackRequest {
         let mut buffer = Vec::new();
         let mut chunk = [0u8; 512];
         loop {
-            if buffer.ends_with(b"\r\n\r\n") || Instant::now() >= deadline {
+            if buffer.ends_with(b"\r\n\r\n") || buffer.len() >= MAX_REQUEST_BYTES {
+                break;
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() || stream.set_read_timeout(Some(left)).is_err() {
                 break;
             }
             match stream.read(&mut chunk) {
@@ -747,7 +767,8 @@ mod tests {
             format!("http://127.0.0.1:{port}/callback")
         );
 
-        let handle = std::thread::spawn(move || server.wait(Duration::from_secs(5)).unwrap());
+        let handle =
+            std::thread::spawn(move || server.wait(Duration::from_secs(5), "xyz").unwrap());
         let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
         stream
             .write_all(b"GET /callback?code=abc123&state=xyz HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
@@ -765,7 +786,8 @@ mod tests {
     fn callback_server_skips_other_paths_and_empty_connections() {
         let server = CallbackServer::bind().unwrap();
         let port = server.port();
-        let handle = std::thread::spawn(move || server.wait(Duration::from_secs(10)).unwrap());
+        let handle =
+            std::thread::spawn(move || server.wait(Duration::from_secs(10), "xyz").unwrap());
 
         // A pre-connect that closes without sending anything.
         drop(TcpStream::connect(("127.0.0.1", port)).unwrap());
@@ -791,10 +813,65 @@ mod tests {
         let server = CallbackServer::bind().unwrap();
         let cancel = std::sync::Arc::new(AtomicBool::new(false));
         let flag = cancel.clone();
-        let handle =
-            std::thread::spawn(move || server.wait_cancellable(Duration::from_secs(30), &flag));
+        let handle = std::thread::spawn(move || {
+            server.wait_cancellable(Duration::from_secs(30), "s", &flag)
+        });
         cancel.store(true, Ordering::SeqCst);
         assert_eq!(handle.join().unwrap().unwrap_err(), "sign-in cancelled");
+    }
+
+    #[test]
+    fn callback_server_ignores_forged_redirects() {
+        let server = CallbackServer::bind().unwrap();
+        let port = server.port();
+        let handle =
+            std::thread::spawn(move || server.wait(Duration::from_secs(10), "real").unwrap());
+        for forged in [
+            "GET /callback?code=evil&state=forged HTTP/1.1\r\n\r\n",
+            "GET /callback?error=access_denied HTTP/1.1\r\n\r\n",
+            "GET /callback HTTP/1.1\r\n\r\n",
+        ] {
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            stream.write_all(forged.as_bytes()).unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            assert!(response.contains("Sign-in failed"), "{forged}");
+        }
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .write_all(b"GET /callback?code=good&state=real HTTP/1.1\r\n\r\n")
+            .unwrap();
+        let callback = handle.join().unwrap();
+        assert_eq!(callback.code, "good");
+    }
+
+    #[test]
+    fn callback_server_bounds_a_slow_sender() {
+        let server = CallbackServer::bind().unwrap();
+        let port = server.port();
+        let handle =
+            std::thread::spawn(move || server.wait(Duration::from_secs(30), "real").unwrap());
+        // A sender that trickles a byte every second never finishes its
+        // headers; it gets cut off after REQUEST_READ_TIMEOUT in total.
+        let mut slow = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let started = Instant::now();
+        let trickle = std::thread::spawn(move || {
+            for _ in 0..20 {
+                if slow.write_all(b"G").is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .write_all(b"GET /callback?code=good&state=real HTTP/1.1\r\n\r\n")
+            .unwrap();
+        let callback = handle.join().unwrap();
+        assert_eq!(callback.code, "good");
+        assert!(started.elapsed() < REQUEST_READ_TIMEOUT + Duration::from_secs(3));
+        let _ = trickle.join();
     }
 
     #[test]

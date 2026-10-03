@@ -422,8 +422,8 @@ fn login_libertai_sso(ui: &mut Ui, deps: &mut LoginDeps) -> Result<(), (TypedErr
     log_info(ui, &format!("If it doesn't open, visit:\n  {url}"));
     auth::open_browser(&url);
 
-    let (code, returned_state, stdin_armed) =
-        collect_libertai_code(ui, server).map_err(|err| (cli_error(err), true))?;
+    let (code, returned_state, stdin_armed) = collect_libertai_code(ui, server, pkce.state.clone())
+        .map_err(|err| (cli_error(err), true))?;
     // The loopback leg always carries `state` and a mismatch aborts; a
     // bare pasted code carries none, and the PKCE verifier alone guards
     // the exchange.
@@ -463,6 +463,7 @@ fn login_libertai_sso(ui: &mut Ui, deps: &mut LoginDeps) -> Result<(), (TypedErr
 fn collect_libertai_code(
     ui: &mut Ui,
     server: alforria_core::libertai::auth::CallbackServer,
+    state: String,
 ) -> Result<(String, Option<String>, bool), String> {
     enum Msg {
         Callback(Result<alforria_core::libertai::auth::Callback, String>),
@@ -473,7 +474,7 @@ fn collect_libertai_code(
     let tx_callback = tx.clone();
     std::thread::spawn(move || {
         let _ = tx_callback.send(Msg::Callback(
-            server.wait(alforria_core::libertai::auth::CALLBACK_TIMEOUT),
+            server.wait(alforria_core::libertai::auth::CALLBACK_TIMEOUT, &state),
         ));
     });
 

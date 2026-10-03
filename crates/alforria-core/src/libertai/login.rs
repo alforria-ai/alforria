@@ -150,7 +150,7 @@ impl Drop for PendingLogin {
 
 impl Inner {
     fn listen(&self, server: CallbackServer, timeout: Duration) {
-        let callback = server.wait_cancellable(timeout, &self.cancel);
+        let callback = server.wait_cancellable(timeout, &self.pkce.state, &self.cancel);
         // Release the port before the (slow) exchange.
         drop(server);
         let callback = match callback {
@@ -161,9 +161,8 @@ impl Inner {
         if lock(&self.outcome).is_some() {
             return;
         }
-        if callback.state != self.pkce.state {
-            return self.resolve(Err("login state mismatch".to_string()));
-        }
+        // The listener only returns this flow's own redirect.
+        debug_assert_eq!(callback.state, self.pkce.state);
         let result = self.complete(&callback.code);
         self.resolve(result);
     }
@@ -268,7 +267,7 @@ mod tests {
     }
 
     #[test]
-    fn loopback_state_mismatch_fails_the_flow() {
+    fn forged_loopback_hits_leave_the_flow_pending() {
         let dir = tempfile::tempdir().unwrap();
         let login = start(dir.path());
         let mut stream = TcpStream::connect(("127.0.0.1", port_of(&login))).unwrap();
@@ -277,10 +276,11 @@ mod tests {
             .unwrap();
         let mut response = String::new();
         stream.read_to_string(&mut response).unwrap();
-        assert_eq!(login.wait().unwrap_err(), "login state mismatch");
-        // A later paste reports the settled failure.
-        assert!(login
-            .submit(&format!("code=abc&state={}", state_of(&login)))
-            .is_err());
+        assert!(response.contains("Sign-in failed"));
+        std::thread::sleep(Duration::from_millis(300));
+        // Still pending: the real redirect or a paste can finish it.
+        assert!(!login.is_resolved());
+        login.cancel();
+        assert_eq!(login.wait().unwrap_err(), "sign-in cancelled");
     }
 }
