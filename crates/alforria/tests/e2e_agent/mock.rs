@@ -205,6 +205,18 @@ mod e2e_agent {
     }
 
     // -------------------------------------------------------------------
+    // A11 — session diff + file events over the wire
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a11_edit_populates_turn_diff_and_file_events() {
+        let backend = MockBackend::new(scenarios::A11_SESSION_DIFF);
+        scenarios::a11_session_diff(&backend).await;
+
+        assert_eq!(backend.requests().len(), 2, "one model request per step");
+    }
+
+    // -------------------------------------------------------------------
     // A8 — cancel mid-stream
     // -------------------------------------------------------------------
 

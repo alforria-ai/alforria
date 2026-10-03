@@ -1,0 +1,33 @@
+{
+  "comment": "A11 — an edit tool call in a git project; the test asserts the turn diff, the session.diff/file.edited events and GET /session/{id}/diff",
+  "turns": [
+    {
+      "frames": [
+        {
+          "tool_call": {
+            "id": "cal_1",
+            "name": "edit",
+            "arguments": { "filePath": "a.txt", "oldString": "v1", "newString": "v2" }
+          }
+        },
+        {
+          "finish": {
+            "reason": "tool_calls",
+            "usage": { "input": 50, "output": 5 }
+          }
+        }
+      ]
+    },
+    {
+      "frames": [
+        { "text": "edited" },
+        {
+          "finish": {
+            "reason": "stop",
+            "usage": { "input": 60, "output": 3 }
+          }
+        }
+      ]
+    }
+  ]
+}

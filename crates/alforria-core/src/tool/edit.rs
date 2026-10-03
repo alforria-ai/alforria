@@ -13,6 +13,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::event::bus::{EventBus, PublishOptions};
+use crate::event::Definition;
 use crate::format::Formatter;
 use crate::tool::bom;
 use crate::tool::def::{
@@ -135,6 +137,48 @@ impl FileEvents for NoopFileEvents {
 
     fn updated<'a>(&'a self, _file: &'a str, _event: &'a str) -> BoxFuture<'a, ()> {
         Box::pin(async {})
+    }
+}
+
+/// `FileSystem.Event.Edited` (`schema/src/filesystem.ts:8-11`) — no
+/// durable options, so bus-only.
+pub const FILE_EDITED: Definition = Definition::ephemeral("file.edited");
+
+/// `FileSystemWatcher.Event.Updated` (`schema/src/filesystem-watcher.ts:6-12`).
+pub const FILE_WATCHER_UPDATED: Definition = Definition::ephemeral("file.watcher.updated");
+
+/// Production [`FileEvents`]: `events.publish(...)` on the instance bus,
+/// as edit.ts/write.ts/apply_patch.ts do. Publish failures are dropped —
+/// the TS publish of an ephemeral event cannot fail the tool.
+pub struct BusFileEvents {
+    events: Arc<EventBus>,
+}
+
+impl BusFileEvents {
+    pub fn new(events: Arc<EventBus>) -> BusFileEvents {
+        BusFileEvents { events }
+    }
+}
+
+impl FileEvents for BusFileEvents {
+    fn edited<'a>(&'a self, file: &'a str) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let _ = self.events.publish(
+                &FILE_EDITED,
+                json!({ "file": file }),
+                PublishOptions::default(),
+            );
+        })
+    }
+
+    fn updated<'a>(&'a self, file: &'a str, event: &'a str) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let _ = self.events.publish(
+                &FILE_WATCHER_UPDATED,
+                json!({ "file": file, "event": event }),
+                PublishOptions::default(),
+            );
+        })
     }
 }
 
@@ -1351,6 +1395,40 @@ mod tests {
                 format!("updated:{}:change", file.display()),
             ]
         );
+        std::fs::remove_dir_all(temp.path()).ok();
+    }
+
+    #[tokio::test]
+    async fn bus_file_events_publish_ts_payloads() {
+        let temp = crate::storage::test_support::TempDir::new("edit-bus-events");
+        let file = write(temp.path(), "main.txt", "hello\n");
+        let bus = Arc::new(EventBus::new(
+            crate::storage::Storage::open_in_memory().unwrap(),
+            None,
+        ));
+        let mut all = bus.all();
+        let (result, _, _) = call(
+            temp.path(),
+            None,
+            Arc::new(BusFileEvents::new(bus.clone())),
+            json!({
+                "filePath": file.to_string_lossy(),
+                "oldString": "hello",
+                "newString": "goodbye",
+            }),
+        )
+        .await;
+        result.unwrap();
+
+        let file = file.to_string_lossy().to_string();
+        let edited = all.try_recv().unwrap();
+        assert_eq!(edited.r#type, "file.edited");
+        assert!(edited.durable.is_none());
+        assert_eq!(edited.data, json!({ "file": file }));
+        let updated = all.try_recv().unwrap();
+        assert_eq!(updated.r#type, "file.watcher.updated");
+        assert_eq!(updated.data, json!({ "file": file, "event": "change" }));
+        assert!(all.try_recv().is_err());
         std::fs::remove_dir_all(temp.path()).ok();
     }
 

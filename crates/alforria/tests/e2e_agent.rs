@@ -17,6 +17,7 @@
 //! | A8 cancel | `a8_cancel_mid_stream.json` | abort mid-stream, interrupted part, re-prompt |
 //! | A9 structured output | `a9_structured_output(_error).json` | json_schema prompt → `structured` on the message; error variant |
 //! | A10 CLI stream golden | `a1_file_mutation.json` | `--format json` event-type golden (`golden/a10_cli_stream.json`) |
+//! | A11 session diff | `a11_session_diff.json` | `edit` in a git project → turn diff on the user message, `session.diff` + `file.edited` events |
 //! | CLI `--auto` reply | `cli_auto_reply.json` | `run --auto` answers asks; without it auto-rejects |
 
 #[path = "e2e_agent/backend.rs"]

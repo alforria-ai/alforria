@@ -739,6 +739,12 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
         flags: alforria_core::lsp::server::Flags::from_env(),
     });
     let edit_lsp: Arc<dyn alforria_core::tool::edit::Lsp> = lsp.clone();
+    // `FileSystem.Event.Edited` / `Watcher.Event.Updated` from the
+    // edit/write/apply_patch tools (edit.ts:115,159, write.ts:68,
+    // apply_patch.ts:256).
+    let file_events: Arc<dyn alforria_core::tool::edit::FileEvents> = Arc::new(
+        alforria_core::tool::edit::BusFileEvents::new(services.events.clone()),
+    );
     let read_lsp: Arc<dyn alforria_core::tool::read::ReadLsp> = lsp.clone();
     let ops = ProductionTaskOps::new(
         services.sessions.clone(),
@@ -866,14 +872,14 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
             agents.clone(),
             Some(edit_lsp.clone()),
             None,
-            None,
+            Some(file_events.clone()),
         ),
         alforria_core::tool::write::write_tool(
             truncate.clone(),
             agents.clone(),
             Some(edit_lsp.clone()),
             None,
-            None,
+            Some(file_events.clone()),
         ),
         task,
         alforria_core::tool::webfetch::webfetch_tool(
@@ -894,7 +900,7 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
             agents.clone(),
             Some(edit_lsp.clone()),
             None,
-            None,
+            Some(file_events.clone()),
         ),
     ];
     // `(questionEnabled ? [tool.question] : [])` — question's slot is

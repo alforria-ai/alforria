@@ -644,7 +644,7 @@ enum Dispatch {
         rx: tokio::sync::mpsc::UnboundedReceiver<Result<LlmEvent, LlmError>>,
         /// Forked settlement tasks (the FiberSet) — aborted on a stream
         /// error like the TS scope interrupt.
-        tasks: Vec<tokio::task::AbortHandle>,
+        tasks: Vec<tokio::task::JoinHandle<()>>,
     },
     /// The provider stream ended; drain the settlements queue until every
     /// forked dispatch has completed (and dropped its sender).
@@ -661,6 +661,13 @@ enum Dispatch {
 /// run concurrently with the ongoing provider stream and each other; the
 /// settlements queue is concatenated after the provider stream
 /// (native-runtime.ts:103-140, tool-runtime.ts).
+///
+/// The provider's `step-finish` is held until every forked execution has
+/// returned (its settlement events still drain after the stream): the
+/// processor tracks the step-finish snapshot on that event
+/// (processor.ts:436), and the default ai-sdk runtime likewise delays
+/// `finish-step` until the step's tool results are in — so the step's
+/// `patch` part and the turn diff see the tools' file edits.
 fn dispatch_tool_calls(stream: LlmEventStream, tools: Vec<LlmTool>) -> LlmEventStream {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let state = Dispatch::Streaming {
@@ -681,6 +688,11 @@ fn dispatch_tool_calls(stream: LlmEventStream, tools: Vec<LlmTool>) -> LlmEventS
                     mut tasks,
                 } => match stream.next().await {
                     Some(Ok(event)) => {
+                        if matches!(event, LlmEvent::StepFinish { .. }) {
+                            for task in tasks.drain(..) {
+                                let _ = task.await;
+                            }
+                        }
                         if let LlmEvent::ToolCall {
                             id,
                             name,
@@ -706,7 +718,7 @@ fn dispatch_tool_calls(stream: LlmEventStream, tools: Vec<LlmTool>) -> LlmEventS
                                         }
                                     }
                                 });
-                                tasks.push(handle.abort_handle());
+                                tasks.push(handle);
                             }
                         }
                         Some((
@@ -828,4 +840,66 @@ pub fn provider_metadata_to_map(
     let metadata = metadata.as_ref()?;
     let value = serde_json::to_value(metadata).ok()?;
     value.as_object().cloned()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use alforria_llm::schema::ids::FinishReason;
+
+    use super::*;
+
+    /// The provider's `step-finish` waits for the forked tool execution —
+    /// the processor's step-finish snapshot must see the tool's writes —
+    /// while the settlement events still drain after the provider stream.
+    #[tokio::test]
+    async fn step_finish_waits_for_forked_tool_executions() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = ran.clone();
+        let tool = LlmTool {
+            name: "slow".to_string(),
+            description: String::new(),
+            input_schema: serde_json::json!({}),
+            execute: Arc::new(move |_args, _id| {
+                let flag = flag.clone();
+                Box::pin(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    flag.store(true, Ordering::SeqCst);
+                    Ok(LlmToolOutput::default())
+                })
+            }),
+        };
+        let provider: LlmEventStream = futures::stream::iter(vec![
+            Ok(LlmEvent::ToolCall {
+                id: "call_1".to_string(),
+                name: "slow".to_string(),
+                input: serde_json::json!({}),
+                provider_executed: None,
+                provider_metadata: None,
+            }),
+            Ok(LlmEvent::StepFinish {
+                index: 0.0,
+                reason: FinishReason::ToolCalls,
+                usage: None,
+                provider_metadata: None,
+            }),
+        ])
+        .boxed();
+
+        let mut stream = dispatch_tool_calls(provider, vec![tool]);
+        let mut order = Vec::new();
+        while let Some(event) = stream.next().await {
+            match event.expect("event") {
+                LlmEvent::ToolCall { .. } => order.push("tool-call"),
+                LlmEvent::StepFinish { .. } => {
+                    assert!(ran.load(Ordering::SeqCst), "tool ran before step-finish");
+                    order.push("step-finish");
+                }
+                LlmEvent::ToolResult { .. } => order.push("tool-result"),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert_eq!(order, ["tool-call", "step-finish", "tool-result"]);
+    }
 }

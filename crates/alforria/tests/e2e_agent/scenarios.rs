@@ -21,6 +21,7 @@ pub const A7_REVERT: &str = "a7_revert";
 pub const A8_CANCEL_MID_STREAM: &str = "a8_cancel_mid_stream";
 pub const A9_STRUCTURED_OUTPUT: &str = "a9_structured_output";
 pub const A9_STRUCTURED_ERROR: &str = "a9_structured_error";
+pub const A11_SESSION_DIFF: &str = "a11_session_diff";
 pub const CLI_AUTO_REPLY: &str = "cli_auto_reply";
 
 pub const B3_PERMISSION_ASK: &str = "b3_permission_ask";
@@ -762,6 +763,130 @@ pub async fn a7_revert(backend: &impl LlmBackend) {
         std::fs::read_to_string(&a_txt).expect("a.txt"),
         "v2\n",
         "unrevert must restore the edit"
+    );
+}
+
+/// A11 — the turn diff of an `edit` tool call in a git project, TS-shaped:
+/// the tool publishes `file.edited` + `file.watcher.updated` (edit.ts:159),
+/// `summarize` zeroes the session summary and publishes an empty
+/// `session.diff` (summary.ts:106-114), then lands the snapshot diff on the
+/// user message's `summary.diffs` — which `GET /session/{id}/diff` serves
+/// for that `messageID` only (summary.ts:129-142).
+pub async fn a11_session_diff(backend: &impl LlmBackend) {
+    let sess = start_wire(backend, A11_SESSION_DIFF, |project| {
+        git(project, &["init", "--quiet"]);
+        git(project, &["config", "user.email", "e2e@opencode.test"]);
+        git(project, &["config", "user.name", "E2E"]);
+        std::fs::write(project.join("a.txt"), "v1\n").expect("seed a.txt");
+        git(project, &["add", "-A"]);
+        git(project, &["commit", "--quiet", "-m", "init"]);
+    })
+    .await;
+    drive(&sess, wire_prompt_body(backend, "edit the file"), |_, _| {
+        None
+    })
+    .await;
+    let a_txt = sess.project_dir().join("a.txt");
+    assert_eq!(std::fs::read_to_string(&a_txt).expect("a.txt"), "v2\n");
+
+    // `summarize` is forked on every step-finish: wait for the user
+    // message update that carries the turn's diffs.
+    let session_id = sess.session_id.clone();
+    let events = pump_until(&sess.log, sess.budget, |events| {
+        events.iter().any(|event| {
+            event["type"] == json!("message.updated")
+                && event["properties"]["sessionID"] == json!(session_id)
+                && event["properties"]["info"]["role"] == json!("user")
+                && event["properties"]["info"]["summary"]["diffs"]
+                    .as_array()
+                    .is_some_and(|diffs| !diffs.is_empty())
+        })
+    })
+    .await;
+    let dump = || serde_json::to_string_pretty(&events).expect("events");
+
+    let file = a_txt.display().to_string();
+    let edited: Vec<&Value> = events
+        .iter()
+        .filter(|event| event["type"] == json!("file.edited"))
+        .collect();
+    assert_eq!(edited.len(), 1, "{}", dump());
+    assert_eq!(edited[0]["properties"], json!({ "file": file }));
+    let updated: Vec<&Value> = events
+        .iter()
+        .filter(|event| event["type"] == json!("file.watcher.updated"))
+        .collect();
+    assert_eq!(updated.len(), 1, "{}", dump());
+    assert_eq!(
+        updated[0]["properties"],
+        json!({ "file": file, "event": "change" })
+    );
+
+    let diffs: Vec<&Value> = events
+        .iter()
+        .filter(|event| {
+            event["type"] == json!("session.diff")
+                && event["properties"]["sessionID"] == json!(sess.session_id)
+        })
+        .collect();
+    assert!(!diffs.is_empty(), "session.diff published\n{}", dump());
+    for event in &diffs {
+        assert_eq!(
+            event["properties"],
+            json!({ "sessionID": sess.session_id, "diff": [] })
+        );
+    }
+
+    let expected = json!([{
+        "file": "a.txt",
+        // jsdiff `formatPatch(structuredPatch(...))` (snapshot/index.ts:737).
+        "patch": "Index: a.txt\n===================================================================\n--- a.txt\t\n+++ a.txt\t\n@@ -1,1 +1,1 @@\n-v1\n+v2\n",
+        "additions": 1,
+        "deletions": 1,
+        "status": "modified",
+    }]);
+    let messages = sess.api.messages(&sess.session_id).await;
+    let user = messages
+        .iter()
+        .find(|message| message["info"]["role"] == json!("user"))
+        .expect("user message");
+    let user_id = user["info"]["id"].as_str().expect("user message id");
+    assert_eq!(user["info"]["summary"]["diffs"], expected, "{user}");
+    // The step that ran the edit records the snapshot patch part.
+    let patches: Vec<Value> = messages
+        .iter()
+        .filter(|message| message["info"]["role"] == json!("assistant"))
+        .flat_map(|message| message["parts"].as_array().cloned().unwrap_or_default())
+        .filter(|part| part["type"] == json!("patch"))
+        .collect();
+    assert_eq!(patches.len(), 1, "{messages:?}");
+    assert_eq!(patches[0]["files"], json!([file]));
+
+    let diff = |query: String| {
+        let api = &sess.api;
+        let path = format!("/session/{}/diff{query}", sess.session_id);
+        async move {
+            let response = api.request(reqwest::Method::GET, &path, None).await;
+            assert!(response.status().is_success(), "{path}");
+            response.json::<Value>().await.expect("diff body")
+        }
+    };
+    assert_eq!(diff(format!("?messageID={user_id}")).await, expected);
+    assert_eq!(diff(String::new()).await, json!([]));
+
+    // `setSummary` zeroes the session summary (summary.ts:106-113); only
+    // revert records non-zero counts (revert.ts:79-87).
+    let session = sess
+        .api
+        .session_list()
+        .await
+        .into_iter()
+        .find(|session| session["id"] == json!(sess.session_id))
+        .expect("session listed");
+    assert_eq!(
+        session["summary"],
+        json!({ "additions": 0, "deletions": 0, "files": 0 }),
+        "{session}"
     );
 }
 
