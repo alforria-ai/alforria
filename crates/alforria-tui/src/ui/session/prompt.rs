@@ -460,7 +460,9 @@ pub fn render(app: &App, frame: &mut ratatui::Frame, theme: &Theme, area: Rect) 
     let text_empty = app.ui.prompt.is_empty();
     // `cursor.blinking` (config/index.tsx:33-42) — the OpenTUI cursor
     // blinks; the blink phase is driven by the render tick.
-    let blink = (app.ui.tick_ms / 530).is_multiple_of(2);
+    // An open dialog holds the focus — the prompt behind it shows no
+    // cursor (`focus?.blur()`, `ui/dialog.tsx:150-156`).
+    let blink = app.ui.prompt_focused && (app.ui.tick_ms / 530).is_multiple_of(2);
     let cursor = crate::ui::textarea::cursor_cell_style(theme);
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::raw(""));

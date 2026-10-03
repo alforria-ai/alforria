@@ -583,26 +583,48 @@ fn paste_lands_in_prompt_dialogs_not_behind_them() {
     update(&mut app, crate::state::Msg::Paste("LTAI_secret".into()));
     assert_eq!(app.ui.dialogs.top().unwrap().input, "LTAI_secret");
 
-    // A select dialog doesn't take text: the paste goes to the prompt.
+    // A list dialog takes it into its filter; the prompt behind never
+    // sees it.
     open(&mut app, PendingDialog::Model);
+    update(&mut app, crate::state::Msg::Paste("gpt\n".into()));
+    assert_eq!(app.ui.dialogs.top().unwrap().select.filter, "gpt");
+    assert_eq!(app.ui.prompt.input(), "");
+    // Without a dialog the paste is the prompt's.
+    clear(&mut app);
     assert!(!paste(&mut app, "text"));
 }
 
 #[test]
 fn oauth_dialog_renders_the_link_instructions_and_state() {
-    for width in [80u16, 140] {
+    for width in [40u16, 80, 140] {
         let mut app = new_app();
         open(&mut app, oauth_dialog(true, true));
-        let text = rendered_text(&render_lines(&mut app, width, 40));
-        assert!(text.contains("Sign in with LibertAI"), "{text}");
-        assert!(text.contains("it lands on."), "{text}");
-        assert!(text.contains("Waiting for authorization…"), "{text}");
-        assert!(text.contains("Paste the address or code here"), "{text}");
-        assert!(text.contains("Invalid code"), "{text}");
-        assert!(text.contains("ctrl+y"), "{text}");
-        // The URL wraps rather than clipping: its head and tail both show.
-        assert!(text.contains("https://console.libertai.io/cli?"), "{text}");
-        assert!(text.contains("client=Alforria"), "{text}");
+        let rows = render_lines(&mut app, width, 40);
+        // Only the dialog's own columns — the backdrop shows the session
+        // prompt beside it.
+        let rect = placed(&app).expect("dialog placed").rect;
+        let cropped: Vec<String> = rows
+            .iter()
+            .map(|row| {
+                row.chars()
+                    .skip(rect.x as usize)
+                    .take(rect.width as usize)
+                    .collect()
+            })
+            .collect();
+        let text = rendered_text(&cropped);
+        // Wrap-tolerant views: prose with whitespace collapsed, the URL
+        // with it removed.
+        let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let joined: String = text.split_whitespace().collect();
+        assert!(flat.contains("Sign in with LibertAI"), "{text}");
+        assert!(flat.contains("paste the address it lands on."), "{text}");
+        assert!(flat.contains("Waiting for authorization…"), "{text}");
+        assert!(flat.contains("Paste the address or code here"), "{text}");
+        assert!(flat.contains("Invalid code"), "{text}");
+        assert!(flat.contains("ctrl+y copy link"), "{text}");
+        // Every URL character survives the frame: wrapped, never cut.
+        assert!(joined.contains(LONG_URL), "{text}");
 
         // The code method has no waiting line.
         open(&mut app, oauth_dialog(false, false));

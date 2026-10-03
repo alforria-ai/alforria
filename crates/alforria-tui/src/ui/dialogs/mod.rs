@@ -14,6 +14,8 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 #[cfg(test)]
+mod modal_tests;
+#[cfg(test)]
 mod tests;
 
 use crate::state::kv::keys;
@@ -135,23 +137,31 @@ impl DialogStack {
     }
 }
 
-/// Close every dialog, running each `onClose` (the theme list reverts an
-/// unconfirmed preview) — `dialog.tsx:140-149`.
+/// Close every dialog, running each `onClose` — `dialog.tsx:140-149`.
 pub fn clear(app: &mut App) {
     let frames = std::mem::take(&mut app.ui.dialogs.stack);
     for frame in frames {
-        revert_theme(app, &frame);
+        on_close(app, &frame);
     }
     app.ui.dialogs.size = DialogSize::Medium;
 }
 
-fn revert_theme(app: &mut App, frame: &DialogFrame) {
-    if let PendingDialog::ThemeList = frame.kind {
-        if !frame.confirmed {
+/// A dismissed dialog's `onClose`: the theme list reverts an unconfirmed
+/// preview (`dialog-theme-list.tsx:16-36`); the update-complete alert
+/// exits however it is closed — `DialogAlert.show` resolves on close too
+/// (`dialog-alert.tsx:57-64`, `app.tsx:1072-1078`).
+fn on_close(app: &mut App, frame: &DialogFrame) {
+    match &frame.kind {
+        PendingDialog::ThemeList if !frame.confirmed => {
             if let Some(initial) = &frame.initial_theme {
                 app.ui.theme.set(&mut app.state.kv, initial);
             }
         }
+        PendingDialog::Alert {
+            exit_on_confirm: true,
+            ..
+        } => app.exit(None),
+        _ => {}
     }
 }
 
@@ -200,21 +210,10 @@ pub fn open(app: &mut App, kind: PendingDialog) -> Vec<Effect> {
             // TODO(M8.7): the org list needs `experimental.console.listOrgs`
             // — absent from the M8.1 server seam (recorded gap).
         }
-        PendingDialog::SessionList => {
-            // Pre-select the current session (`ui/dialog-select.tsx:103-110`).
-            if let Some(current) = route_session_id(app) {
-                let options = crate::ui::dialogs::sessions::session_list_options(app, &frame);
-                if let Some(index) = options
-                    .iter()
-                    .position(|option| option.value.as_deref() == Some(current))
-                {
-                    frame.select.move_to(index, max_visible(app));
-                }
-            }
-        }
         _ => {}
     }
     app.ui.dialogs.stack.push(frame);
+    select_current(app);
     effects
 }
 
@@ -222,7 +221,30 @@ pub fn open(app: &mut App, kind: PendingDialog) -> Vec<Effect> {
 /// `ui/dialog.tsx:105-137`.
 pub fn pop(app: &mut App) {
     if let Some(frame) = app.ui.dialogs.stack.pop() {
-        revert_theme(app, &frame);
+        on_close(app, &frame);
+    }
+}
+
+/// The `current` effect of `DialogSelect` (`dialog-select.tsx:103-110,
+/// 260-272`): the selection lands on the current option (model, agent,
+/// variant, theme, session, …), centered, else on the first.
+fn select_current(app: &mut App) {
+    let Some(frame) = app.ui.dialogs.top() else {
+        return;
+    };
+    if !is_select_kind(&frame.kind) {
+        return;
+    }
+    let options = arranged(app, frame);
+    let index = options
+        .iter()
+        .position(|option| option.current)
+        .unwrap_or(0);
+    let rows = primitives::rows(&options);
+    let max_visible = max_visible(app);
+    if let Some(frame) = app.ui.dialogs.top_mut() {
+        frame.select.selected = index;
+        frame.select.center(&rows, max_visible);
     }
 }
 
@@ -240,7 +262,7 @@ pub fn options(app: &App, frame: &DialogFrame) -> Vec<primitives::SelectOption> 
     use PendingDialog;
     match &frame.kind {
         PendingDialog::CommandPalette => palette::options(app, frame),
-        PendingDialog::Model => model::model_options(app),
+        PendingDialog::Model => model::model_options(app, &frame.select.filter),
         PendingDialog::Agent => model::agent_options(app),
         PendingDialog::Variant => model::variant_options(app),
         PendingDialog::ProviderConnect => model::provider_options(
@@ -254,7 +276,7 @@ pub fn options(app: &App, frame: &DialogFrame) -> Vec<primitives::SelectOption> 
             model::auth_method_options(app, provider_id)
         }
         PendingDialog::Mcp => system::mcp_options(app),
-        PendingDialog::ThemeList => system::theme_options(app),
+        PendingDialog::ThemeList => system::theme_options(app, frame.initial_theme.as_deref()),
         PendingDialog::SessionList => sessions::session_list_options(app, frame),
         PendingDialog::Skill => system::skill_options(app),
         PendingDialog::StashList => sessions::stash_options(app, frame),
@@ -327,24 +349,44 @@ fn actions(app: &App, frame: &DialogFrame) -> Vec<(String, String)> {
     }
 }
 
-/// `formatKeyBindings` — the first alternative's first stroke,
-/// human-formatted (`keymap.tsx:210-212`).
+/// `formatKeyBindings` — the first alternative, human-formatted: the
+/// whole sequence, so a leader binding reads `ctrl+x l`, not just the
+/// leader (`keymap.tsx:190-212`, the `pgup`/`pgdn`/`del` aliases).
 pub(crate) fn key_hint(app: &App, keybind: &str) -> Option<String> {
     let crate::keymap::bindings::BindingValue::Alternatives(alternatives) =
         app.keymap.bindings.get(keybind)?
     else {
         return None;
     };
-    let stroke = alternatives.first()?.first()?;
-    let mut parts: Vec<String> = Vec::new();
-    if stroke.ctrl {
-        parts.push("ctrl".to_string());
-    }
-    if stroke.meta {
-        parts.push("alt".to_string());
-    }
-    parts.push(stroke.key.clone());
-    Some(parts.join("+"))
+    let sequence = alternatives
+        .first()
+        .filter(|sequence| !sequence.is_empty())?;
+    let strokes: Vec<String> = sequence
+        .iter()
+        .map(|stroke| {
+            let mut parts: Vec<&str> = Vec::new();
+            if stroke.ctrl {
+                parts.push("ctrl");
+            }
+            if stroke.meta {
+                parts.push("alt");
+            }
+            if stroke.shift {
+                parts.push("shift");
+            }
+            if stroke.super_key {
+                parts.push("super");
+            }
+            parts.push(match stroke.key.as_str() {
+                "pageup" => "pgup",
+                "pagedown" => "pgdn",
+                "delete" => "del",
+                key => key,
+            });
+            parts.join("+")
+        })
+        .collect();
+    Some(strokes.join(" "))
 }
 
 /// `quickSwitchRange` (`dialog-session-list.tsx:360-364`).
@@ -361,35 +403,34 @@ fn quick_switch_range(first: &str, last: &str) -> String {
 
 // ----------------------------------------------------------- key input
 
-/// Handle a key while the dialog stack is open.
+/// Handle a key while the dialog stack is open. The dialog owns the
+/// keyboard: the caller routes nothing else while the stack is non-empty
+/// (the pushed `modal` mode, `ui/dialog.tsx:79-90`), and the close keys
+/// are the dialog layer's own, for every dialog alike — `escape` and
+/// `ctrl+c` pop the top dialog only, running its `onClose`
+/// (`dialog.tsx:105-137`).
 pub fn handle_key(app: &mut App, key: &crossterm::event::KeyEvent) -> Vec<Effect> {
     let Some(kind) = app.ui.dialogs.top_kind().cloned() else {
         return Vec::new();
     };
+    if key.kind == crossterm::event::KeyEventKind::Release {
+        return Vec::new();
+    }
+    if key.code == crossterm::event::KeyCode::Esc || is_ctrl_c(key) {
+        pop(app);
+        return Vec::new();
+    }
     match &kind {
         PendingDialog::SessionRename { .. }
         | PendingDialog::ProviderCustomId
         | PendingDialog::ProviderApiKey { .. } => prompt_key(app, key),
         PendingDialog::ProviderOauth { .. } => oauth_key(app, key),
         PendingDialog::ExportOptions => export_key(app, key),
-        PendingDialog::Alert {
-            exit_on_confirm, ..
-        } => {
-            if key.code == crossterm::event::KeyCode::Enter
-                || key.code == crossterm::event::KeyCode::Esc
-            {
-                app.ui.dialogs.stack.pop();
-                if *exit_on_confirm {
-                    app.exit(None);
-                }
-            }
-            Vec::new()
-        }
-        PendingDialog::Help => {
-            if key.code == crossterm::event::KeyCode::Enter
-                || key.code == crossterm::event::KeyCode::Esc
-            {
-                app.ui.dialogs.stack.pop();
+        PendingDialog::Alert { .. } | PendingDialog::Help => {
+            // `return` confirms (`dialog-alert.tsx:16-28`,
+            // `dialog-help.tsx:12-16`).
+            if key.code == crossterm::event::KeyCode::Enter {
+                pop(app);
             }
             Vec::new()
         }
@@ -417,12 +458,14 @@ fn is_ctrl_c(key: &crossterm::event::KeyEvent) -> bool {
             .contains(crossterm::event::KeyModifiers::CONTROL)
 }
 
-/// A printable char (filter/textarea input).
+/// A printable char (filter/textarea input) — never a ctrl/alt/super
+/// chord, which are bindings, not text.
 fn typed_char(key: &crossterm::event::KeyEvent) -> Option<char> {
-    if key
-        .modifiers
-        .intersects(crossterm::event::KeyModifiers::CONTROL)
-    {
+    if key.modifiers.intersects(
+        crossterm::event::KeyModifiers::CONTROL
+            | crossterm::event::KeyModifiers::ALT
+            | crossterm::event::KeyModifiers::SUPER,
+    ) {
         return None;
     }
     match key.code {
@@ -499,8 +542,8 @@ fn prompt_key(app: &mut App, key: &crossterm::event::KeyEvent) -> Vec<Effect> {
 /// and the prompt submit sends it (the dialog stays up until the flow
 /// settles); `ctrl+y` copies the URL — `c` in `AutoMethod`
 /// (`dialog-provider.tsx:243-256`), moved off a printable key because
-/// this dialog types; escape closes without cancelling the server-side
-/// wait.
+/// this dialog types. Escape (handled for every dialog in `handle_key`)
+/// closes without cancelling the server-side wait.
 fn oauth_key(app: &mut App, key: &crossterm::event::KeyEvent) -> Vec<Effect> {
     let Some(PendingDialog::ProviderOauth {
         provider_id,
@@ -530,10 +573,6 @@ fn oauth_key(app: &mut App, key: &crossterm::event::KeyEvent) -> Vec<Effect> {
             flow,
             code,
         }];
-    }
-    if key.code == crossterm::event::KeyCode::Esc || is_ctrl_c(key) {
-        app.ui.dialogs.stack.pop();
-        return Vec::new();
     }
     if key.code == crossterm::event::KeyCode::Char('y')
         && key
@@ -571,26 +610,41 @@ fn oauth_key(app: &mut App, key: &crossterm::event::KeyEvent) -> Vec<Effect> {
     Vec::new()
 }
 
-/// A bracketed paste while a text-input dialog is on top lands in its
-/// input (single line) instead of the session prompt behind it. `false`
-/// when no such dialog is open.
+/// A bracketed paste while a dialog is open never reaches the session
+/// prompt behind it: a text-input dialog takes it into its input (single
+/// line), a list dialog into its filter (the focused `<input>`,
+/// `dialog-select.tsx:570-597`); any other dialog drops it. `false` when
+/// no dialog is open.
 pub fn paste(app: &mut App, text: &str) -> bool {
-    let takes_text = matches!(
-        app.ui.dialogs.top_kind(),
-        Some(
-            PendingDialog::SessionRename { .. }
-                | PendingDialog::ProviderCustomId
-                | PendingDialog::ProviderApiKey { .. }
-                | PendingDialog::ProviderOauth { .. }
-        )
-    );
-    if !takes_text {
+    let Some(kind) = app.ui.dialogs.top_kind().cloned() else {
         return false;
-    }
-    if let Some(frame) = app.ui.dialogs.top_mut() {
-        frame
-            .input
-            .extend(text.chars().filter(|char| *char != '\n'));
+    };
+    let line = text.chars().filter(|char| *char != '\n');
+    match kind {
+        PendingDialog::SessionRename { .. }
+        | PendingDialog::ProviderCustomId
+        | PendingDialog::ProviderApiKey { .. }
+        | PendingDialog::ProviderOauth { .. } => {
+            if let Some(frame) = app.ui.dialogs.top_mut() {
+                frame.input.extend(line);
+            }
+        }
+        PendingDialog::ExportOptions => {
+            if let Some(frame) = app.ui.dialogs.top_mut().filter(|frame| frame.active == 0) {
+                frame.input.extend(line);
+            }
+        }
+        kind if is_select_kind(&kind) => {
+            let mut filter = app
+                .ui
+                .dialogs
+                .top()
+                .map(|frame| frame.select.filter.clone())
+                .unwrap_or_default();
+            filter.extend(line);
+            set_filter(app, &kind, filter);
+        }
+        _ => {}
     }
     true
 }
@@ -807,11 +861,6 @@ fn select_key(app: &mut App, key: &crossterm::event::KeyEvent) -> Vec<Effect> {
     let Some(kind) = app.ui.dialogs.top_kind().cloned() else {
         return Vec::new();
     };
-    // Close keys (`dialog.tsx:105-137`): escape/ctrl+c.
-    if key.code == crossterm::event::KeyCode::Esc || is_ctrl_c(key) {
-        pop(app);
-        return Vec::new();
-    }
     // ---- `tab`/`shift+tab` — the footer action focus
     // (`dialog-select.tsx:461-476`)
     if key.code == crossterm::event::KeyCode::Tab || key.code == crossterm::event::KeyCode::BackTab
@@ -837,29 +886,30 @@ fn select_key(app: &mut App, key: &crossterm::event::KeyEvent) -> Vec<Effect> {
         None
     };
     if let Some(step) = movement {
-        let len = filtered_options(app).len();
+        let rows = select_rows(app);
         let max_visible = max_visible(app);
         if let Some(frame) = app.ui.dialogs.top_mut() {
             frame.focused_action = None;
-            frame.select.move_by(step, len, max_visible);
+            frame.select.move_by(step, &rows, max_visible);
             on_move(app, &kind);
         }
         return Vec::new();
     }
-    if app.keymap.matches("dialog.select.home", key) {
+    let home = app.keymap.matches("dialog.select.home", key);
+    if home || app.keymap.matches("dialog.select.end", key) {
+        let rows = select_rows(app);
         let max_visible = max_visible(app);
+        let last = rows
+            .iter()
+            .filter(|row| matches!(row, primitives::Row::Option(_)))
+            .count()
+            .saturating_sub(1);
         if let Some(frame) = app.ui.dialogs.top_mut() {
             frame.focused_action = None;
-            frame.select.move_to(0, max_visible);
-        }
-        return Vec::new();
-    }
-    if app.keymap.matches("dialog.select.end", key) {
-        let len = filtered_options(app).len();
-        let max_visible = max_visible(app);
-        if let Some(frame) = app.ui.dialogs.top_mut() {
-            frame.focused_action = None;
-            frame.select.move_to(len.saturating_sub(1), max_visible);
+            frame
+                .select
+                .move_to(if home { 0 } else { last }, &rows, max_visible);
+            on_move(app, &kind);
         }
         return Vec::new();
     }
@@ -877,42 +927,64 @@ fn select_key(app: &mut App, key: &crossterm::event::KeyEvent) -> Vec<Effect> {
         }
         return submit(app, &kind);
     }
-    // ---- the filter input
-    if let Some(frame) = app.ui.dialogs.top_mut() {
-        frame.focused_action = None;
-        match key.code {
-            crossterm::event::KeyCode::Backspace => {
-                frame.select.filter.pop();
-            }
-            _ => {
-                if let Some(char) = typed_char(key) {
-                    frame.select.filter.push(char);
-                }
-            }
+    // ---- the filter input — every other printable key types, global
+    // shortcut letters included.
+    let mut filter = app
+        .ui
+        .dialogs
+        .top()
+        .map(|frame| frame.select.filter.clone())
+        .unwrap_or_default();
+    match key.code {
+        crossterm::event::KeyCode::Backspace => {
+            filter.pop();
         }
-        if let PendingDialog::ThemeList = kind {
-            // The theme list previews through the filter
-            // (`dialog-theme-list.tsx:34-43`).
-            let (filter, initial) = {
-                let frame = app.ui.dialogs.top().expect("checked above");
-                (frame.select.filter.clone(), frame.initial_theme.clone())
-            };
-            let filtered = {
-                let options = options(app, app.ui.dialogs.top().expect("checked above"));
-                primitives::filter_options(&filter, options)
-            };
-            if filter.is_empty() {
-                if let Some(initial) = initial {
-                    app.ui.theme.set(&mut app.state.kv, &initial);
-                }
-            } else if let Some(first) = filtered.first() {
-                if let Some(value) = &first.value {
-                    app.ui.theme.set(&mut app.state.kv, value);
-                }
+        _ => {
+            if let Some(char) = typed_char(key) {
+                filter.push(char);
             }
         }
     }
+    set_filter(app, &kind, filter);
     Vec::new()
+}
+
+/// A filter edit (typed or pasted): the selection resets — to the first
+/// match while filtering, back to the current option once the filter is
+/// cleared (`dialog-select.tsx:274-288`), so it always lands on a row
+/// that exists.
+fn set_filter(app: &mut App, kind: &PendingDialog, filter: String) {
+    let Some(frame) = app.ui.dialogs.top_mut() else {
+        return;
+    };
+    if frame.select.filter == filter {
+        return;
+    }
+    frame.select.filter = filter;
+    frame.focused_action = None;
+    if frame.select.filter.is_empty() {
+        select_current(app);
+    } else {
+        frame.select.selected = 0;
+        frame.select.scroll = 0;
+    }
+    on_move(app, kind);
+    if let PendingDialog::ThemeList = kind {
+        // The theme list previews through the filter
+        // (`dialog-theme-list.tsx:34-43`).
+        let Some(frame) = app.ui.dialogs.top() else {
+            return;
+        };
+        let initial = frame.initial_theme.clone();
+        let first = arranged(app, frame).into_iter().next();
+        if frame.select.filter.is_empty() {
+            if let Some(initial) = initial {
+                app.ui.theme.set(&mut app.state.kv, &initial);
+            }
+        } else if let Some(value) = first.and_then(|first| first.value) {
+            app.ui.theme.set(&mut app.state.kv, &value);
+        }
+    }
 }
 
 /// `moveAction` (`dialog-select.tsx:358-367`) — cycle the footer action
@@ -942,19 +1014,28 @@ fn move_action(app: &mut App, kind: &PendingDialog, direction: i64) {
     }
 }
 
-/// The currently filtered option list of the top dialog.
 /// Mouse-wheel scroll of the topmost dialog's list (`dialog-select.tsx`
 /// wraps the options in a `<scrollbox>` — the wheel moves the viewport,
 /// not the selection; default speed 3, `util/scroll.ts:24-26`).
 pub fn wheel_scroll(app: &mut App, direction: i64) {
-    let len = filtered_options(app).len();
-    if len == 0 {
+    let rows = select_rows(app).len();
+    if rows == 0 {
         return;
     }
-    let max = (len as i64 - max_visible(app) as i64).max(0);
+    let max = (rows as i64 - max_visible(app) as i64).max(0);
     if let Some(frame) = app.ui.dialogs.top_mut() {
         let next = frame.select.scroll as i64 + direction * 3;
         frame.select.scroll = next.clamp(0, max) as usize;
+    }
+}
+
+/// A terminal resize re-fits the open list: the window height follows the
+/// terminal (`dialog-select.tsx:213`), and the selection stays in view.
+pub fn on_resize(app: &mut App) {
+    let rows = select_rows(app);
+    let max_visible = max_visible(app);
+    if let Some(frame) = app.ui.dialogs.top_mut() {
+        frame.select.reveal(&rows, max_visible);
     }
 }
 
@@ -987,72 +1068,41 @@ fn is_select_kind(kind: &PendingDialog) -> bool {
     )
 }
 
-/// The option row layout of the top dialog — the
-/// `(line index, filtered option index)` pairs of the rows the
-/// `content_lines` select branch renders. `None` for non-select
-/// dialogs.
-fn select_layout(app: &App) -> Option<Vec<(usize, usize)>> {
-    let frame = app.ui.dialogs.top()?;
-    if !is_select_kind(&frame.kind) {
+/// The option index rendered at `column`/`row`, if the position lands on
+/// an option row of the top dialog (`dialog-select.tsx:640-676`).
+pub fn option_row(app: &App, column: u16, row: u16) -> Option<usize> {
+    let placed = placed(app)?;
+    if column < placed.rect.x || column >= placed.rect.right() {
         return None;
     }
-    let theme = app
-        .ui
-        .theme
-        .resolve(&app.state.kv)
-        .expect("builtin theme resolves");
-    let view_options = options(app, frame);
-    let view = primitives::SelectView {
-        title: select_title(&frame.kind).to_string(),
-        filter: true,
-        options: view_options,
-        actions: actions(app, frame),
-        action_focused: frame.focused_action.is_some(),
-    };
-    // The select branch renders header + filter before the options
-    // (content_lines); their text does not affect the row count.
-    let width = app.ui.dialogs.size.width();
-    let mut lines = vec![
-        primitives::header_line(&theme, &view.title, "esc", width),
-        primitives::filter_line(&theme, &frame.select, "Search"),
-    ];
-    Some(primitives::render_options(
-        &frame.select,
-        &view,
-        &theme,
-        &mut lines,
-        width,
-        max_visible(app),
-    ))
+    let line = row.checked_sub(placed.rect.y + primitives::PADDING_TOP)? as usize;
+    placed
+        .options
+        .iter()
+        .find(|(at, _)| *at == line)
+        .map(|(_, index)| *index)
 }
 
-/// The filtered option index rendered at `column`/`row`, if the
-/// position lands on an option row of the top dialog
-/// (`dialog-select.tsx:640-676`).
-pub fn option_row(app: &App, column: u16, row: u16) -> Option<usize> {
-    let layout = select_layout(app)?;
-    let frame = app.ui.dialogs.top()?;
-    let theme = app
-        .ui
-        .theme
-        .resolve(&app.state.kv)
-        .expect("builtin theme resolves");
-    let lines = content_lines(app, frame, &theme);
-    let area = Rect {
-        x: 0,
-        y: 0,
-        width: app.ui.terminal_width.max(1),
-        height: app.ui.terminal_height.max(1),
+/// Whether `column`/`row` is on the header's `esc` hint — clicking it
+/// closes the dialog (`onMouseUp={() => dialog.clear()}`,
+/// `dialog-select.tsx:562-564`, `dialog-alert.tsx:35-37`).
+pub fn close_hint(app: &App, column: u16, row: u16) -> bool {
+    use unicode_width::UnicodeWidthStr;
+    let Some(placed) = placed(app) else {
+        return false;
     };
-    let rect = frame_rect(app, lines.len(), area);
-    if column < rect.x || column >= rect.x + rect.width {
-        return None;
+    let Some(header) = placed.lines.first() else {
+        return false;
+    };
+    let Some(hint) = header.spans.last() else {
+        return false;
+    };
+    if !hint.content.starts_with("esc") {
+        return false;
     }
-    let clicked = row.checked_sub(rect.y)? as usize;
-    layout
-        .iter()
-        .find(|(line, _)| *line == clicked)
-        .map(|(_, index)| *index)
+    let end = placed.rect.x + header.width().min(placed.rect.width as usize) as u16;
+    let start = end.saturating_sub(hint.content.width() as u16);
+    row == placed.rect.y + primitives::PADDING_TOP && column >= start && column < end
 }
 
 /// `onMouseDown`/`onMouseOver` (`dialog-select.tsx:664-672`) — hover
@@ -1061,9 +1111,10 @@ pub fn mouse_move_to(app: &mut App, index: usize) {
     let Some(kind) = app.ui.dialogs.top_kind().cloned() else {
         return;
     };
+    let rows = select_rows(app);
     let max = max_visible(app);
     if let Some(frame) = app.ui.dialogs.top_mut() {
-        frame.select.move_to(index, max);
+        frame.select.move_to(index, &rows, max);
     }
     on_move(app, &kind);
 }
@@ -1074,21 +1125,50 @@ pub fn mouse_submit(app: &mut App, index: usize) -> Vec<Effect> {
     let Some(kind) = app.ui.dialogs.top_kind().cloned() else {
         return Vec::new();
     };
-    let max = max_visible(app);
-    if let Some(frame) = app.ui.dialogs.top_mut() {
-        frame.select.move_to(index, max);
-    }
-    on_move(app, &kind);
+    mouse_move_to(app, index);
     submit(app, &kind)
 }
 
+/// `flat` dialogs list their matches ungrouped while filtering
+/// (`dialog-model.tsx:178`, `dialog-variant.tsx:36`).
+fn is_flat(kind: &PendingDialog) -> bool {
+    matches!(kind, PendingDialog::Model | PendingDialog::Variant)
+}
+
+/// The option list of `frame` in display order — filtered and grouped
+/// ([`primitives::arrange`]); `selected` indexes into it.
+fn arranged(app: &App, frame: &DialogFrame) -> Vec<primitives::SelectOption> {
+    primitives::arrange(
+        &frame.select.filter,
+        options(app, frame),
+        is_flat(&frame.kind),
+    )
+}
+
+/// The top dialog's [`arranged`] options.
 fn filtered_options(app: &App) -> Vec<primitives::SelectOption> {
-    let Some(frame) = app.ui.dialogs.top() else {
-        return Vec::new();
-    };
-    let filter = frame.select.filter.clone();
-    let options = options(app, frame);
-    primitives::filter_options(&filter, options)
+    app.ui
+        .dialogs
+        .top()
+        .map(|frame| arranged(app, frame))
+        .unwrap_or_default()
+}
+
+/// The scrollbox rows of the top dialog's list.
+fn select_rows(app: &App) -> Vec<primitives::Row> {
+    primitives::rows(&filtered_options(app))
+}
+
+/// The selected option of the top dialog — clamped, the list can shrink
+/// under the selection.
+fn selected_option(app: &App) -> Option<primitives::SelectOption> {
+    let frame = app.ui.dialogs.top()?;
+    let mut options = arranged(app, frame);
+    if options.is_empty() {
+        return None;
+    }
+    let index = frame.select.selected.min(options.len() - 1);
+    Some(options.swap_remove(index))
 }
 
 /// `onMove` — the theme list live preview, the timeline jump and the
@@ -1100,15 +1180,7 @@ fn on_move(app: &mut App, kind: &PendingDialog) {
         // (`dialog-select.tsx:299-309`).
         frame.focused_action = None;
     }
-    let Some(frame) = app.ui.dialogs.top() else {
-        return;
-    };
-    let selected = frame.select.selected;
-    let filter = frame.select.filter.clone();
-    let view_options = options(app, frame);
-    let option = primitives::filter_options(&filter, view_options)
-        .get(selected)
-        .cloned();
+    let option = selected_option(app);
     match kind {
         PendingDialog::ThemeList => {
             if let Some(value) = option.and_then(|option| option.value) {
@@ -1163,14 +1235,7 @@ fn action_keybinds(kind: &PendingDialog) -> &'static [&'static str] {
 
 /// The value of the currently selected option.
 fn selected_value(app: &App) -> Option<String> {
-    app.ui.dialogs.top().and_then(|frame| {
-        let filter = frame.select.filter.clone();
-        let selected = frame.select.selected;
-        let options = options(app, frame);
-        primitives::filter_options(&filter, options)
-            .get(selected)
-            .and_then(|option| option.value.clone())
-    })
+    selected_option(app).and_then(|option| option.value)
 }
 
 /// Trigger the `index`th footer action on the selected option —
@@ -1315,16 +1380,7 @@ fn action_key(
 
 /// `dialog.select.submit` — the `onSelect` of the selected option.
 fn submit(app: &mut App, kind: &PendingDialog) -> Vec<Effect> {
-    let Some(option) = filtered_options(app)
-        .get(
-            app.ui
-                .dialogs
-                .top()
-                .map(|frame| frame.select.selected)
-                .unwrap_or(0),
-        )
-        .cloned()
-    else {
+    let Some(option) = selected_option(app) else {
         return Vec::new();
     };
     match kind {
@@ -1598,53 +1654,104 @@ fn debug_entries(app: &App) -> Vec<(String, String)> {
 
 // -------------------------------------------------------------- render
 
-/// The dialog frame rectangle (`ui/dialog.tsx:39-64`): centered,
-/// `paddingTop = height / 4`, width capped to the terminal.
-fn frame_rect(app: &App, lines: usize, area: Rect) -> Rect {
-    let width = app
-        .ui
+/// The panel width: the dialog size, capped to the terminal
+/// (`maxWidth={dimensions().width - 2}`, `dialog.tsx:55-57`). Every row
+/// of a dialog is laid out at this width.
+fn dialog_width(app: &App) -> u16 {
+    app.ui
         .dialogs
         .size
         .width()
-        .min(area.width.saturating_sub(2));
+        .min(app.ui.terminal_width.saturating_sub(2))
+        .max(1)
+}
+
+/// The dialog frame rectangle (`ui/dialog.tsx:39-64`): centered,
+/// `paddingTop = height / 4`, the 1-row top/bottom padding around the
+/// content. A panel that would run off the bottom moves up instead (TS
+/// lets it overflow and clip — its footer and buttons with it).
+fn frame_rect(app: &App, lines: usize, area: Rect) -> Rect {
+    let width = dialog_width(app).min(area.width);
+    let height = (lines as u16).saturating_add(2).min(area.height).max(1);
     let x = area.x + (area.width.saturating_sub(width)) / 2;
-    let y = area.y + area.height / 4;
-    let height = (lines as u16 + 2).max(1);
+    let y = (area.y + area.height / 4).min(area.bottom().saturating_sub(height));
     Rect {
         x,
         y,
         width,
-        height: height.min(area.bottom().saturating_sub(y).max(1)),
+        height,
     }
 }
 
-/// Backdrop hit test — a click outside the frame closes the dialog
-/// (`dialog.tsx:30-38`).
-pub fn hit_test(app: &App, column: u16, row: u16) -> bool {
-    let Some(frame) = app.ui.dialogs.top() else {
-        return false;
+/// The top dialog laid out on screen.
+struct Placed {
+    rect: Rect,
+    /// The rows inside the padding, cut to fit the frame.
+    lines: Vec<Line<'static>>,
+    /// `(line index, option index)` of each visible option row.
+    options: Vec<(usize, usize)>,
+}
+
+/// Lay out the top dialog over `area`. A dialog taller than the terminal
+/// keeps its header and the end of its body — the option window and the
+/// footer, the buttons, the input and its submit hint — and gives up the
+/// rows right below the header.
+fn place(app: &App, theme: &Theme, area: Rect) -> Option<Placed> {
+    let dialog = app.ui.dialogs.top()?;
+    let (mut lines, mut options) = if is_select_kind(&dialog.kind) {
+        select_content(app, dialog, theme)
+    } else {
+        (content_lines(app, dialog, theme), Vec::new())
     };
+    let rect = frame_rect(app, lines.len(), area);
+    let room = rect.height.saturating_sub(2).max(1) as usize;
+    if lines.len() > room {
+        let cut = lines.len() - room;
+        lines.drain(1..1 + cut);
+        options = options
+            .into_iter()
+            .filter(|(line, _)| *line > cut)
+            .map(|(line, index)| (line - cut, index))
+            .collect();
+    }
+    Some(Placed {
+        rect,
+        lines,
+        options,
+    })
+}
+
+/// [`place`] over the whole terminal — the mouse hit tests.
+fn placed(app: &App) -> Option<Placed> {
     let theme = app
         .ui
         .theme
         .resolve(&app.state.kv)
         .expect("builtin theme resolves");
-    let lines = content_lines(app, frame, &theme).len();
     let area = Rect {
         x: 0,
         y: 0,
         width: app.ui.terminal_width.max(1),
         height: app.ui.terminal_height.max(1),
     };
-    let rect = frame_rect(app, lines, area);
-    column >= rect.x && column < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
+    place(app, &theme, area)
+}
+
+/// Backdrop hit test — a click outside the frame closes the dialog
+/// (`dialog.tsx:30-38`).
+pub fn hit_test(app: &App, column: u16, row: u16) -> bool {
+    let Some(placed) = placed(app) else {
+        return false;
+    };
+    let rect = placed.rect;
+    column >= rect.x && column < rect.right() && row >= rect.y && row < rect.bottom()
 }
 
 /// Render the top dialog over a dimmed backdrop (`dialog.tsx:28-66`).
 pub fn render(app: &App, frame: &mut ratatui::Frame, theme: &Theme, area: Rect) {
-    let Some(dialog) = app.ui.dialogs.top() else {
+    if app.ui.dialogs.is_empty() {
         return;
-    };
+    }
     // Backdrop: `RGBA.fromInts(0, 0, 0, 150)` — OpenTUI composites the
     // translucent black over the underlying cells, dimming their text
     // too. ratatui has no alpha channel, so both the fg and bg of every
@@ -1671,41 +1778,68 @@ pub fn render(app: &App, frame: &mut ratatui::Frame, theme: &Theme, area: Rect) 
         }
     }
 
-    let lines = content_lines(app, dialog, theme);
-    let rect = frame_rect(app, lines.len(), area);
-    primitives::paint(&lines, theme, rect, frame);
+    if let Some(placed) = place(app, theme, area) {
+        primitives::paint(&placed.lines, theme, placed.rect, frame);
+    }
 }
 
 /// The line rows of one dialog.
 fn content_lines(app: &App, dialog: &DialogFrame, theme: &Theme) -> Vec<Line<'static>> {
-    let width = app.ui.dialogs.size.width();
+    let width = dialog_width(app);
     let wrap_width = width.saturating_sub(4);
     match &dialog.kind {
         PendingDialog::Status => system::status_lines(app, theme, width),
         PendingDialog::Help => {
-            let mut lines = vec![primitives::header_line(theme, "Help", "esc/enter", width)];
-            lines.push(Line::styled(
-                "  Press ctrl+p to see all available actions and commands in any context.",
-                Style::new().fg(theme.text_muted.to_color()),
-            ));
+            let shortcut = key_hint(app, "command_list").unwrap_or_else(|| "ctrl+p".to_string());
+            let mut lines = message_lines(
+                theme,
+                "Help",
+                "esc/enter",
+                &format!(
+                    "Press {shortcut} to see all available actions and commands in any context."
+                ),
+                width,
+            );
             lines.push(ok_button(theme, width));
             lines
         }
         PendingDialog::Debug => {
-            let mut lines = vec![primitives::header_line(theme, "Debug", "esc", width)];
+            // `dialog-debug.tsx:58-96`: label column, wrapped values,
+            // then the hint row with `copy enter` on the right.
+            let muted = Style::new().fg(theme.text_muted.to_color());
+            let mut lines = vec![
+                primitives::header_line_padded(theme, "Debug", "esc", width, 2),
+                Line::raw(""),
+            ];
             for (label, value) in debug_entries(app) {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("  {label:<10} "),
-                        Style::new().fg(theme.text_muted.to_color()),
-                    ),
-                    Span::styled(value, Style::new().fg(theme.text.to_color())),
-                ]));
+                let mut rows = Vec::new();
+                primitives::wrap_text(
+                    &value,
+                    width.saturating_sub(4 + 11),
+                    &mut rows,
+                    Style::new().fg(theme.text.to_color()),
+                );
+                for (index, row) in rows.into_iter().enumerate() {
+                    let label = if index == 0 { label.as_str() } else { "" };
+                    let mut spans = vec![Span::styled(format!("  {label:<10} "), muted)];
+                    spans.extend(row.spans);
+                    lines.push(Line::from(spans));
+                }
             }
-            lines.push(Line::styled(
-                "  Share this when reporting an issue.",
-                Style::new().fg(theme.text_muted.to_color()),
-            ));
+            lines.push(Line::raw(""));
+            let hint = "Share this when reporting an issue.";
+            let copy = "copy enter";
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {hint}"), muted),
+                Span::raw(" ".repeat((width as usize).saturating_sub(4 + hint.len() + copy.len()))),
+                Span::styled(
+                    "copy ",
+                    Style::new()
+                        .fg(theme.text.to_color())
+                        .add_modifier(ratatui::style::Modifier::BOLD),
+                ),
+                Span::styled("enter", muted),
+            ]));
             lines
         }
         PendingDialog::Alert {
@@ -1713,31 +1847,57 @@ fn content_lines(app: &App, dialog: &DialogFrame, theme: &Theme) -> Vec<Line<'st
             message,
             exit_on_confirm: _,
         } => {
-            let mut lines = vec![primitives::header_line(theme, title, "esc", width)];
-            primitives::wrap_text(
-                message,
-                wrap_width,
-                &mut lines,
-                Style::new().fg(theme.text_muted.to_color()),
-            );
+            let mut lines = message_lines(theme, title, "esc", message, width);
             lines.push(ok_button(theme, width));
             lines
         }
         PendingDialog::SessionRename { .. }
         | PendingDialog::ProviderCustomId
         | PendingDialog::ProviderApiKey { .. } => {
-            let title = match dialog.kind {
-                PendingDialog::SessionRename { .. } => "Rename Session",
-                PendingDialog::ProviderApiKey { .. } => "API key",
-                _ => "Other",
-            };
-            vec![
-                primitives::header_line(theme, title, "esc", width),
-                Line::styled(
-                    format!("  {}", dialog.input),
-                    Style::new().fg(theme.text.to_color()),
+            // `DialogPrompt` (`dialog-prompt.tsx:96-140`): the header, the
+            // description, the 3-row textarea, the submit hint.
+            let (title, placeholder, description) = match dialog.kind {
+                PendingDialog::SessionRename { .. } => ("Rename Session", "Enter text", None),
+                PendingDialog::ProviderApiKey { .. } => ("API key", "API key", None),
+                _ => (
+                    "Other",
+                    "Provider id",
+                    Some("This only stores a credential. Configure the provider in opencode.json to use it."),
                 ),
-            ]
+            };
+            let muted = Style::new().fg(theme.text_muted.to_color());
+            let text = Style::new().fg(theme.text.to_color());
+            let mut lines = vec![
+                primitives::header_line_padded(theme, title, "esc", width, 2),
+                Line::raw(""),
+            ];
+            if let Some(description) = description {
+                primitives::wrap_indented(description, wrap_width, 2, &mut lines, muted);
+                lines.push(Line::raw(""));
+            }
+            lines.extend(textarea_lines(
+                &dialog.input,
+                placeholder,
+                text,
+                muted,
+                primitives::cursor_style(theme, theme.text),
+                width,
+            ));
+            lines.push(Line::raw(""));
+            let submit = key_hint(app, "dialog.prompt.submit")
+                .map(|key| {
+                    if key == "return" {
+                        "enter".to_string()
+                    } else {
+                        key
+                    }
+                })
+                .unwrap_or_else(|| "enter".to_string());
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {submit} "), text),
+                Span::styled("submit", muted),
+            ]));
+            lines
         }
         PendingDialog::ProviderOauth {
             title,
@@ -1810,17 +1970,12 @@ fn content_lines(app: &App, dialog: &DialogFrame, theme: &Theme) -> Vec<Line<'st
             lines
         }
         PendingDialog::UpdateAvailable { version } => {
-            let mut lines = vec![primitives::header_line(
+            let mut lines = message_lines(
                 theme,
                 "Update Available",
                 "esc",
-                width,
-            )];
-            primitives::wrap_text(
                 &format!("A new release v{version} is available. Would you like to update now?"),
-                wrap_width,
-                &mut lines,
-                Style::new().fg(theme.text_muted.to_color()),
+                width,
             );
             lines.push(buttons(
                 theme,
@@ -1834,17 +1989,12 @@ fn content_lines(app: &App, dialog: &DialogFrame, theme: &Theme) -> Vec<Line<'st
             lines
         }
         PendingDialog::ShareConsent { .. } => {
-            let mut lines = vec![primitives::header_line(
+            let mut lines = message_lines(
                 theme,
                 "Share Session",
                 "esc",
-                width,
-            )];
-            primitives::wrap_text(
                 "Are you sure you want to share it?",
-                wrap_width,
-                &mut lines,
-                Style::new().fg(theme.text_muted.to_color()),
+                width,
             );
             lines.push(buttons(
                 theme,
@@ -1858,17 +2008,12 @@ fn content_lines(app: &App, dialog: &DialogFrame, theme: &Theme) -> Vec<Line<'st
             lines
         }
         PendingDialog::WorkspaceUnavailable => {
-            let mut lines = vec![primitives::header_line(
+            let mut lines = message_lines(
                 theme,
                 "Workspace Unavailable",
                 "esc",
-                width,
-            )];
-            primitives::wrap_text(
                 "This session is attached to a workspace that is no longer available. Would you like to restore this session into a new workspace?",
-                wrap_width,
-                &mut lines,
-                Style::new().fg(theme.text_muted.to_color()),
+                width,
             );
             lines.push(buttons(
                 theme,
@@ -1885,32 +2030,34 @@ fn content_lines(app: &App, dialog: &DialogFrame, theme: &Theme) -> Vec<Line<'st
             session_id,
             workspace,
         } => {
-            let mut lines = vec![primitives::header_line(
-                theme,
-                "Failed to Delete Session",
-                "esc",
-                width,
-            )];
+            let mut lines = vec![
+                primitives::header_line_padded(theme, "Failed to Delete Session", "esc", width, 2),
+                Line::raw(""),
+            ];
             let session = app
                 .state
                 .sync
                 .session(session_id)
                 .map(|session| session.title.clone())
                 .unwrap_or_default();
-            primitives::wrap_text(
+            primitives::wrap_indented(
                 &format!(
                     "The session \"{session}\" could not be deleted because the workspace \"{workspace}\" is not available."
                 ),
                 wrap_width,
+                2,
                 &mut lines,
                 Style::new().fg(theme.text_muted.to_color()),
             );
-            primitives::wrap_text(
+            lines.push(Line::raw(""));
+            primitives::wrap_indented(
                 "Choose how you want to recover this broken workspace session.",
                 wrap_width,
+                2,
                 &mut lines,
                 Style::new().fg(theme.text_muted.to_color()),
             );
+            lines.push(Line::raw(""));
             let options = [
                 (
                     "Delete workspace",
@@ -1942,24 +2089,35 @@ fn content_lines(app: &App, dialog: &DialogFrame, theme: &Theme) -> Vec<Line<'st
                 } else {
                     (theme.text.to_color(), theme.text_muted.to_color())
                 };
-                lines.push(Line::styled(" ".repeat(box_width), bg(Style::new())));
                 lines.push(Line::from(vec![
-                    Span::raw(" "),
+                    Span::raw("  "),
+                    Span::styled(" ".repeat(box_width), bg(Style::new())),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(" ", bg(Style::new())),
                     Span::styled(
                         (*title).to_string(),
                         bg(Style::new().fg(title_fg)).add_modifier(ratatui::style::Modifier::BOLD),
                     ),
-                    Span::raw(" "),
+                    Span::styled(
+                        " ".repeat(box_width.saturating_sub(1 + title.chars().count())),
+                        bg(Style::new()),
+                    ),
                 ]));
                 lines.push(Line::from(vec![
-                    Span::raw(" "),
+                    Span::raw("  "),
+                    Span::styled(" ", bg(Style::new())),
                     Span::styled(
                         (*description).to_string(),
                         bg(Style::new().fg(description_fg)),
                     ),
-                    Span::raw(" "),
+                    Span::styled(" ", bg(Style::new())),
                 ]));
-                lines.push(Line::styled(" ".repeat(box_width), bg(Style::new())));
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(" ".repeat(box_width), bg(Style::new())),
+                ]));
             }
             lines
         }
@@ -1969,13 +2127,7 @@ fn content_lines(app: &App, dialog: &DialogFrame, theme: &Theme) -> Vec<Line<'st
             label,
             ..
         } => {
-            let mut lines = vec![primitives::header_line(theme, title, "esc", width)];
-            primitives::wrap_text(
-                message,
-                wrap_width,
-                &mut lines,
-                Style::new().fg(theme.text_muted.to_color()),
-            );
+            let mut lines = message_lines(theme, title, "esc", message, width);
             lines.push(retry_buttons(theme, width, label, dialog.active));
             lines
         }
@@ -1986,16 +2138,28 @@ fn content_lines(app: &App, dialog: &DialogFrame, theme: &Theme) -> Vec<Line<'st
                 "Include assistant metadata",
                 "Open without saving",
             ];
-            let mut lines = vec![primitives::header_line(
-                theme,
-                "Export Options",
-                "esc",
-                width,
-            )];
-            lines.push(Line::styled(
-                format!("  Filename: {}", dialog.input),
-                Style::new().fg(theme.text.to_color()),
-            ));
+            let mut lines = vec![
+                primitives::header_line_padded(theme, "Export Options", "esc", width, 2),
+                Line::raw(""),
+            ];
+            let text = Style::new().fg(theme.text.to_color());
+            let label = "  Filename: ";
+            lines.push(if dialog.active == 0 {
+                let mut line = primitives::input_line(
+                    &dialog.input,
+                    "",
+                    text,
+                    text,
+                    primitives::cursor_style(theme, theme.primary),
+                    0,
+                    width.saturating_sub(label.len() as u16 + 2),
+                );
+                line.spans.insert(0, Span::styled(label, text));
+                line
+            } else {
+                Line::styled(format!("{label}{}", dialog.input), text)
+            });
+            lines.push(Line::raw(""));
             for (index, label) in labels.iter().enumerate() {
                 let on = dialog.checks.get(index).copied().unwrap_or(false);
                 lines.push(Line::styled(
@@ -2012,51 +2176,66 @@ fn content_lines(app: &App, dialog: &DialogFrame, theme: &Theme) -> Vec<Line<'st
         }
         PendingDialog::ConsoleOrg => vec![
             primitives::header_line(theme, "Switch org", "esc", width),
+            Line::raw(""),
             Line::styled(
-                "  No orgs found",
+                "    No orgs found",
                 Style::new().fg(theme.text_muted.to_color()),
             ),
         ],
-        _ => {
-            // The DialogSelect family.
-            let title = select_title(&dialog.kind);
-            let view = primitives::SelectView {
-                title: title.to_string(),
-                filter: true,
-                options: options(app, dialog),
-                actions: actions(app, dialog),
-                action_focused: dialog.focused_action.is_some(),
-            };
-            let mut lines = vec![primitives::header_line(theme, &view.title, "esc", width)];
-            if view.filter {
-                lines.push(primitives::filter_line(
-                    theme,
-                    &dialog.select,
-                    if matches!(dialog.kind, PendingDialog::Skill) {
-                        "Search skills…"
-                    } else {
-                        "Search"
-                    },
-                ));
-            }
-            primitives::render_options(
-                &dialog.select,
-                &view,
-                theme,
-                &mut lines,
-                width,
-                max_visible(app),
-            );
-            if !view.actions.is_empty() {
-                lines.push(primitives::render_actions(
-                    theme,
-                    &view.actions,
-                    dialog.focused_action,
-                ));
-            }
-            lines
-        }
+        _ => select_content(app, dialog, theme).0,
     }
+}
+
+/// The `DialogSelect` family (`dialog-select.tsx:556-730`): the header,
+/// the filter input, the option window and the footer actions, a blank
+/// row between each (`gap={1}`, the filter's `paddingTop={1}`). Returns
+/// the lines and the `(line index, option index)` of each option row.
+fn select_content(
+    app: &App,
+    dialog: &DialogFrame,
+    theme: &Theme,
+) -> (Vec<Line<'static>>, Vec<(usize, usize)>) {
+    let width = dialog_width(app);
+    let view = primitives::SelectView {
+        title: select_title(&dialog.kind).to_string(),
+        filter: true,
+        options: arranged(app, dialog),
+        actions: actions(app, dialog),
+        action_focused: dialog.focused_action.is_some(),
+    };
+    let mut lines = vec![primitives::header_line(theme, &view.title, "esc", width)];
+    if view.filter {
+        lines.push(Line::raw(""));
+        lines.push(primitives::filter_line(
+            theme,
+            &dialog.select,
+            if matches!(dialog.kind, PendingDialog::Skill) {
+                "Search skills…"
+            } else {
+                "Search"
+            },
+            width,
+        ));
+    }
+    lines.push(Line::raw(""));
+    let layout = primitives::render_options(
+        &dialog.select,
+        &view,
+        theme,
+        &mut lines,
+        width,
+        max_visible(app),
+    );
+    if !view.actions.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(primitives::render_actions(
+            theme,
+            &view.actions,
+            dialog.focused_action,
+            width,
+        ));
+    }
+    (lines, layout)
 }
 
 /// The `<DialogSelect title={...}>` of each dialog.
@@ -2086,10 +2265,83 @@ fn select_title(kind: &PendingDialog) -> &'static str {
     }
 }
 
+/// The header + message block of the alert-style dialogs
+/// (`dialog-alert.tsx:29-41`): `paddingLeft/Right 2`, `gap={1}`, the
+/// message's `paddingBottom={1}` — the button row goes after it.
+fn message_lines(
+    theme: &Theme,
+    title: &str,
+    hint: &str,
+    message: &str,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        primitives::header_line_padded(theme, title, hint, width, 2),
+        Line::raw(""),
+    ];
+    primitives::wrap_indented(
+        message,
+        width.saturating_sub(4),
+        2,
+        &mut lines,
+        Style::new().fg(theme.text_muted.to_color()),
+    );
+    lines.push(Line::raw(""));
+    lines.push(Line::raw(""));
+    lines
+}
+
+/// The `<textarea height={3}>` of `DialogPrompt` (`dialog-prompt.tsx:
+/// 108-121`): the input wrapped over three rows — its last three while
+/// longer, so the cursor stays in view — or the placeholder.
+fn textarea_lines(
+    input: &str,
+    placeholder: &str,
+    text: Style,
+    muted: Style,
+    cursor: Style,
+    width: u16,
+) -> Vec<Line<'static>> {
+    const ROWS: usize = 3;
+    let room = (width as usize).saturating_sub(4).max(1);
+    let mut lines = if input.is_empty() {
+        vec![primitives::input_line(
+            "",
+            placeholder,
+            text,
+            muted,
+            cursor,
+            2,
+            width,
+        )]
+    } else {
+        let chars: Vec<char> = input.chars().collect();
+        // One cell past the text for the cursor.
+        let rows = chars.len() / room + 1;
+        let first = rows.saturating_sub(ROWS);
+        (first..rows)
+            .map(|row| {
+                let start = (row * room).min(chars.len());
+                let end = ((row + 1) * room).min(chars.len());
+                let mut spans = vec![
+                    Span::raw("  "),
+                    Span::styled(chars[start..end].iter().collect::<String>(), text),
+                ];
+                if row + 1 == rows {
+                    spans.push(Span::styled(" ", cursor));
+                }
+                Line::from(spans)
+            })
+            .collect()
+    };
+    lines.resize(ROWS, Line::raw(""));
+    lines
+}
+
 /// The right-aligned primary-bg `ok` button
 /// (`dialog-alert.tsx:42-54`, `dialog-help.tsx:33-37`).
 fn ok_button(theme: &Theme, width: u16) -> Line<'static> {
-    let padding = (width as usize).saturating_sub(8);
+    let padding = (width as usize).saturating_sub(2 + 8);
     Line::from(vec![
         Span::raw(" ".repeat(padding)),
         Span::styled(
@@ -2120,7 +2372,10 @@ fn buttons(
         .map(|label| label.chars().count() + 2 * pad)
         .sum::<usize>()
         + gap * labels.len().saturating_sub(1);
-    let mut spans = vec![Span::raw(" ".repeat((width as usize).saturating_sub(used)))];
+    // `paddingRight={2}` of the dialog body.
+    let mut spans = vec![Span::raw(
+        " ".repeat((width as usize).saturating_sub(2 + used)),
+    )];
     for (index, label) in labels.iter().enumerate() {
         if index > 0 && gap > 0 {
             spans.push(Span::raw(" ".repeat(gap)));
@@ -2162,8 +2417,9 @@ fn retry_buttons(theme: &Theme, width: u16, label: &str, active: usize) -> Line<
     let action = button(label, active == 1, theme.text);
     let used = dismiss.content.chars().count() + action.content.chars().count();
     Line::from(vec![
+        Span::raw("  "),
         dismiss,
-        Span::raw(" ".repeat((width as usize).saturating_sub(used))),
+        Span::raw(" ".repeat((width as usize).saturating_sub(4 + used))),
         action,
     ])
 }

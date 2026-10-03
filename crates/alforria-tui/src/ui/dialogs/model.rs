@@ -10,16 +10,17 @@ use crate::state::route::Route;
 use crate::state::{App, Effect, PendingDialog, Toast, ToastVariant};
 use crate::ui::theme::Theme;
 
-/// `sortModelOptions` (`dialog-model.tsx:178-197`) — free models sort
-/// last, then by release date desc, then title.
-fn sort_model_options(options: Vec<SelectOption>, release: Vec<i64>) -> Vec<SelectOption> {
-    let mut keyed: Vec<(bool, i64, String, usize, SelectOption)> = options
+/// `sortModelOptions` (`dialog-model.tsx:186-197`) — `footer !== "Free"`
+/// ascending puts the free models first, then release date desc, then
+/// title.
+fn sort_model_options(options: Vec<SelectOption>, release: Vec<String>) -> Vec<SelectOption> {
+    let mut keyed: Vec<(bool, String, String, usize, SelectOption)> = options
         .into_iter()
         .enumerate()
         .zip(release)
         .map(|((index, option), release)| {
-            let free = option.footer.as_deref() == Some("Free");
-            (free, release, option.title.clone(), index, option)
+            let paid = option.footer.as_deref() != Some("Free");
+            (paid, release, option.title.clone(), index, option)
         })
         .collect();
     keyed.sort_by(|a, b| {
@@ -82,9 +83,13 @@ fn model_option(
     option
 }
 
-/// `DialogModel.options` (`dialog-model.tsx:26-135`).
-pub fn model_options(app: &App) -> Vec<SelectOption> {
+/// `DialogModel.options` (`dialog-model.tsx:26-135`): the Favorites and
+/// Recent sections (connected, not filtering), then every provider's
+/// models — providers `opencode` first then by name, each provider's
+/// models sorted on their own, so a provider is one block.
+pub fn model_options(app: &App, needle: &str) -> Vec<SelectOption> {
     let connected = crate::state::connected(app);
+    let sections = connected && needle.trim().is_empty();
     let favorites = app.state.local.model_favorite().to_vec();
     let recents = app.state.local.model_recent().to_vec();
     let current = app
@@ -92,10 +97,19 @@ pub fn model_options(app: &App) -> Vec<SelectOption> {
         .local
         .model_current(&app.state.sync, &app.state.args)
         .map(|model| model.key());
+    let provider_name = |provider: &Value| {
+        provider
+            .get("name")
+            .and_then(Value::as_str)
+            .or_else(|| provider.get("id").and_then(Value::as_str))
+            .unwrap_or_default()
+            .to_string()
+    };
 
     let mut options: Vec<SelectOption> = Vec::new();
-    // Favorites + Recent sections (`toOptions`).
-    if connected {
+    // Favorites + Recent sections (`toOptions`) — described by their
+    // provider's name.
+    if sections {
         let mut recent_only: Vec<ModelRef> = Vec::new();
         for item in &recents {
             if !favorites.iter().any(|favorite| {
@@ -117,21 +131,30 @@ pub fn model_options(app: &App) -> Vec<SelectOption> {
                 else {
                     continue;
                 };
-                options.push(
-                    model_option(provider, &model_id, &info, &favorites, current.as_deref())
-                        .with_category(category),
-                );
+                let option =
+                    model_option(provider, &model_id, &info, &favorites, current.as_deref());
+                options.push(SelectOption {
+                    description: Some(provider_name(provider)),
+                    ..option.with_category(category)
+                });
             }
         }
     }
 
-    let mut model_list: Vec<SelectOption> = Vec::new();
-    let mut release: Vec<i64> = Vec::new();
-    for provider in &app.state.sync.provider {
+    let mut providers: Vec<&Value> = app.state.sync.provider.iter().collect();
+    providers.sort_by_key(|provider| {
+        (
+            provider.get("id").and_then(Value::as_str) != Some("opencode"),
+            provider_name(provider),
+        )
+    });
+    for provider in providers {
         let provider_id = provider
             .get("id")
             .and_then(Value::as_str)
             .unwrap_or_default();
+        let mut model_list: Vec<SelectOption> = Vec::new();
+        let mut release: Vec<String> = Vec::new();
         for (model_id, info) in provider_models(provider) {
             if info.get("status").and_then(Value::as_str) == Some("deprecated") {
                 continue;
@@ -139,7 +162,7 @@ pub fn model_options(app: &App) -> Vec<SelectOption> {
             if provider_id == "opencode" && model_id.contains("-nano") {
                 continue;
             }
-            if connected {
+            if sections {
                 let known = favorites
                     .iter()
                     .chain(recents.iter())
@@ -148,31 +171,22 @@ pub fn model_options(app: &App) -> Vec<SelectOption> {
                     continue;
                 }
             }
+            let option = model_option(provider, &model_id, &info, &favorites, current.as_deref());
             model_list.push(if connected {
-                model_option(provider, &model_id, &info, &favorites, current.as_deref())
-                    .with_category(
-                        provider
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .unwrap_or(provider_id)
-                            .to_string(),
-                    )
+                option.with_category(provider_name(provider))
             } else {
-                model_option(provider, &model_id, &info, &favorites, current.as_deref())
+                option
             });
-            release.push(
-                info.get("release_date")
-                    .and_then(Value::as_i64)
-                    .or_else(|| {
-                        info.get("release_date")
-                            .and_then(Value::as_str)
-                            .and_then(|v| v.parse().ok())
-                    })
-                    .unwrap_or(0),
-            );
+            // `releaseDate` sorts as given — ISO dates as strings, numbers
+            // as numbers.
+            release.push(match info.get("release_date") {
+                Some(Value::Number(number)) => format!("{:>20}", number),
+                Some(Value::String(date)) => date.clone(),
+                _ => String::new(),
+            });
         }
+        options.extend(sort_model_options(model_list, release));
     }
-    options.extend(sort_model_options(model_list, release));
     // The `popularProviders` of the disconnected model dialog
     // (`dialog-model.tsx:108-117,129`).
     if !connected {

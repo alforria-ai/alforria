@@ -797,6 +797,11 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                 effects.extend(crate::attention::on_bus_event(app, &event.event));
             }
         }
+        // Only presses act. A release (reported where the terminal sends
+        // them, e.g. Windows consoles) must not land on the screen behind a
+        // dialog its press just closed — an `escape` release would reject
+        // the pending permission.
+        Msg::Key(key) if key.kind == crossterm::event::KeyEventKind::Release => {}
         Msg::Key(key) => {
             // Dialogs take the keyboard while the stack is open (the
             // pushed `modal` mode, `ui/dialog.tsx:105-137`).
@@ -893,6 +898,13 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                     crate::ui::dialogs::mouse_move_to(app, index);
                 }
             }
+            // The header's `esc` hint closes (`dialog-select.tsx:562-564`).
+            crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left)
+                if !app.ui.dialogs.is_empty()
+                    && crate::ui::dialogs::close_hint(app, mouse.column, mouse.row) =>
+            {
+                crate::ui::dialogs::clear(app);
+            }
             crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left)
                 if !app.ui.dialogs.is_empty()
                     && crate::ui::dialogs::option_row(app, mouse.column, mouse.row).is_some() =>
@@ -936,6 +948,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             // needs the width, the dialog frames the height.
             app.ui.terminal_width = columns;
             app.ui.terminal_height = rows;
+            crate::ui::dialogs::on_resize(app);
         }
         Msg::Paste(text) => {
             // Bracketed-paste normalization happens at the boundary

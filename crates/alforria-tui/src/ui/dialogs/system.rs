@@ -36,9 +36,10 @@ pub fn mcp_options(app: &App) -> Vec<SelectOption> {
 }
 
 /// `DialogThemeList.options` (`dialog-theme-list.tsx:8-13`) — sorted
-/// case-insensitively, `current` marked (`:9,27`).
-pub fn theme_options(app: &App) -> Vec<SelectOption> {
-    let current = app.ui.theme.active.clone();
+/// case-insensitively, `current` marked (`:9,27`): the theme the dialog
+/// opened on, not the one being previewed.
+pub fn theme_options(app: &App, initial: Option<&str>) -> Vec<SelectOption> {
+    let current = initial.unwrap_or(&app.ui.theme.active).to_string();
     let mut names: Vec<&str> = crate::ui::theme::all_themes()
         .into_iter()
         .map(|(name, _)| name)
@@ -230,14 +231,17 @@ fn plugin_entry(value: &str) -> (String, Option<String>) {
 
 /// `DialogStatus` (`dialog-status.tsx`) — MCP/LSP/formatter/plugin list.
 pub fn status_lines(app: &App, theme: &Theme, width: u16) -> Vec<ratatui::text::Line<'static>> {
-    let mut lines = vec![super::primitives::header_line(
-        theme, "Status", "esc", width,
+    // `paddingLeft/Right 2`, `gap={1}` between the sections
+    // (`dialog-status.tsx:44-56`).
+    let mut lines = vec![super::primitives::header_line_padded(
+        theme, "Status", "esc", width, 2,
     )];
     let text = Style::new().fg(theme.text.to_color());
     let muted = Style::new().fg(theme.text_muted.to_color());
     let bold_text = Style::new()
         .fg(theme.text.to_color())
         .add_modifier(Modifier::BOLD);
+    lines.push(Line::raw(""));
     if app.state.sync.mcp.is_empty() {
         lines.push(Line::styled("  No MCP Servers".to_string(), text));
     } else {
@@ -275,6 +279,7 @@ pub fn status_lines(app: &App, theme: &Theme, width: u16) -> Vec<ratatui::text::
         }
     }
     if !app.state.sync.lsp.is_empty() {
+        lines.push(Line::raw(""));
         lines.push(Line::styled(
             format!("  {} LSP Servers", app.state.sync.lsp.len()),
             text,
@@ -311,6 +316,7 @@ pub fn status_lines(app: &App, theme: &Theme, width: u16) -> Vec<ratatui::text::
         .iter()
         .filter(|f| f.get("enabled").and_then(Value::as_bool) == Some(true))
         .collect();
+    lines.push(Line::raw(""));
     if formatters.is_empty() {
         lines.push(Line::styled("  No Formatters".to_string(), text));
     } else {
@@ -336,6 +342,7 @@ pub fn status_lines(app: &App, theme: &Theme, width: u16) -> Vec<ratatui::text::
         }
     }
     let plugins = status_plugins(&app.state.sync.config);
+    lines.push(Line::raw(""));
     if plugins.is_empty() {
         lines.push(Line::styled("  No Plugins".to_string(), text));
     } else {
