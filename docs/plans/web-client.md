@@ -1,7 +1,8 @@
 # Web client: a new in-tree UI built for supervising a fleet
 
-Status: **approved 2026-10-03**. Supersedes the fork-and-grid approach in
-`docs/plans/web-ui.md` (M5/M6).
+Status: **landed 2026-10-03** (W1–W7). The new client is the UI embedded in
+`alforria serve`. Supersedes the fork-and-grid approach in `docs/plans/web-ui.md`
+(M5/M6). Open follow-ups are listed at the end.
 
 Design source of truth:
 - the prototype in `web/prototype/` (served with `python3 -m http.server` from that
@@ -146,6 +147,29 @@ Each milestone is one commit, following the chunked-factory discipline.
      `alforria-ai/web`.
    - Accept: `alforria serve` serves the new client, and the CI fmt, clippy and
      test gates stay green.
+
+## Status (2026-10-03)
+
+| Milestone | State | Notes |
+|---|---|---|
+| W1 Foundation | landed | typed client, `/global/event` with watchdog/backoff/resync-with-retry, normalized store, replay tests over four real recordings |
+| W2 Queue + table | landed | stamp/fold, read delay against accidental approvals, filters, stable order |
+| W3 Session focus | landed | id-keyed transcript (no remounts), markdown + Shiki, inline slips, composer with @files, /commands, attachments |
+| W4 Changes, files, terminal | landed | Changes falls back to the session's edit diffs while `session.diff` is empty server-side; xterm PTY columns |
+| W5 Settings + palette | landed | providers/auth, models, agents, MCP, permissions (effective defaults, confirm-to-loosen), appearance, server |
+| W6 Phone + polish | landed | tab/pane agreement, 40px targets, 16px inputs, axe-core clean, 20 sessions × 2k parts in ~90 ms through the reducer, design review fixes |
+| W7 Cutover | landed | `ui.tar.zst` 517 KB (was 9 MB); embedded e2e 26/26; docs point at `web/` |
+
+Gates: `bun run check` (prettier, tsc, vitest: 51 tests), `bun run e2e` (preview build,
+24 checks incl. axe) and `E2E_EMBEDDED=1 bun run e2e` (the binary itself, 26 checks).
+
+Follow-ups outside the client:
+- Archive `alforria-ai/web` (needs the owner's go-ahead; outward-facing).
+- Server gaps seen through the UI: `session.diff` is always empty and `file.edited`
+  is never emitted; open text parts read empty over REST until they finish; v1 can't
+  see exited PTYs (exit codes come from v2).
+- Fixed on the way: cross-site writes are now refused by the CORS middleware
+  (`POST /pty` from any website could spawn a command when no password was set).
 
 ## Open decisions
 
