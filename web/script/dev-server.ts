@@ -26,6 +26,7 @@ import {
   writeJson,
 } from "./lib/alforria"
 import { keyed, startBackend } from "./lib/backend"
+import { startLibertai } from "./lib/libertai"
 import { fleet, scripts, type State } from "./lib/fleet"
 
 const args = process.argv.slice(2)
@@ -52,7 +53,9 @@ const backend = startBackend({ ...routes, port: PORT + 1 })
 
 // The provider is global too, so sessions a human starts in any other
 // directory still reach the scripted backend.
-const env = isolatedEnv(STATE)
+// "Sign in with LibertAI" goes to a local stand-in, never the real console.
+const libertai = startLibertai(PORT + 2)
+const env = { ...isolatedEnv(STATE), ...libertai.env() }
 writeJson(join(env.XDG_CONFIG_HOME!, "opencode/opencode.json"), providerConfig(backend.url))
 for (const project of projects) {
   const dir = join(PROJECTS, project.name)
@@ -70,6 +73,7 @@ const serve = await spawnServe({
   log: join(STATE, "server.log"),
 }).catch((error) => {
   backend.stop()
+  libertai.stop()
   console.error(`could not start alforria serve on port ${PORT}: ${error.message}`)
   process.exit(1)
 })
@@ -81,6 +85,7 @@ async function shutdown(code = 0) {
   console.log("\nstopping…")
   await serve.stop()
   backend.stop()
+  libertai.stop()
   process.exit(code)
 }
 process.on("SIGINT", () => shutdown())
@@ -169,6 +174,7 @@ async function report(items: Seeded[]) {
   }
   console.log(`\nalforria dev server: ${urls.join("  ")}`)
   console.log(`scripted backend:    ${backend.url}`)
+  console.log(`libertai stand-in:   ${libertai.url}`)
   console.log(`state:               ${DEV} (log: ${join(STATE, "server.log")})\n`)
 
   for (const project of projects) {

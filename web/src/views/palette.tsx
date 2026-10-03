@@ -1,12 +1,13 @@
 // ⌘K: jump to any session, run a command, or open a file. Sessions and
 // commands match locally; files query the server for the active project.
-import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js"
+import { createEffect, createMemo, createSignal, For, onCleanup, Show } from "solid-js"
 import { api } from "../api/client"
 import { fleetState } from "../fleet/derive"
 import { displayTitle, projectName } from "../fleet/fleet"
 import { closeOtherColumns, nav, openSettings } from "../nav/route"
 import { state } from "../store/store"
 import { Icon } from "../ui/icons"
+import { DialogHead, dialogId, Modal } from "../ui/modal"
 import { theme, toggleTheme } from "../ui/theme"
 
 export interface PaletteActions {
@@ -151,69 +152,83 @@ export function Palette(props: { initial?: string; actions: PaletteActions }) {
     } else if (e.key === "Enter") {
       e.preventDefault()
       run(sel())
-    } else if (e.key === "Escape") {
+    } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
       e.preventDefault()
-      e.stopPropagation()
       props.actions.close()
     }
     queueMicrotask(() => list?.querySelector(".res.on")?.scrollIntoView({ block: "nearest" }))
   }
 
-  onMount(() => {
-    input.focus()
-    input.setSelectionRange(input.value.length, input.value.length)
-  })
+  const optionId = (i: number) => `pal-opt-${i}`
 
   return (
-    <div class="palette-scrim" onMouseDown={(e) => e.target === e.currentTarget && props.actions.close()}>
-      <div class="palette" role="dialog" aria-modal="true" aria-label="Command palette">
+    <Modal
+      class="palette"
+      label="Command palette"
+      onClose={props.actions.close}
+      initialFocus={() => {
+        input.setSelectionRange(input.value.length, input.value.length)
+        return input
+      }}
+    >
+      <div class="palette-input">
+        <Icon name="search" />
         <input
           ref={input}
           value={q()}
           placeholder="Jump to a session, file or command"
+          aria-label="Jump to a session, file or command"
           autocomplete="off"
           spellcheck={false}
           role="combobox"
           aria-expanded="true"
           aria-controls="palResults"
+          aria-autocomplete="list"
+          aria-activedescendant={items().length ? optionId(sel()) : undefined}
           onInput={(e) => {
             setQ(e.currentTarget.value)
             setSel(0)
           }}
           onKeyDown={onKey}
         />
-        <div class="results" id="palResults" role="listbox" ref={list}>
-          <Show when={items().length} fallback={<div class="empty">Nothing matches “{q()}”.</div>}>
-            <For each={sections()}>
-              {(sec) => (
-                // A listbox holds groups of options; the section title labels the group.
-                <div role="group" aria-label={sec.group}>
-                  <h4 role="presentation">{sec.group}</h4>
-                  <For each={sec.items}>
-                    {({ item, i }) => (
-                      <button
-                        class="res"
-                        classList={{ on: i === sel() }}
-                        role="option"
-                        aria-selected={i === sel()}
-                        onMouseMove={() => setSel(i)}
-                        onClick={() => run(i)}
-                      >
-                        <Show when={item.lamp} fallback={<Icon name={item.icon ?? "chev-right"} />}>
-                          <span class={`lamp ${item.lamp}`} />
-                        </Show>
-                        <span class="t">{item.label}</span>
-                        <span class="m">{item.meta}</span>
-                      </button>
-                    )}
-                  </For>
-                </div>
-              )}
-            </For>
-          </Show>
-        </div>
+        <button class="palette-esc" aria-label="Close" title="Close (Esc)" onClick={props.actions.close}>
+          <kbd>Esc</kbd>
+          <Icon name="close" />
+        </button>
       </div>
-    </div>
+      <div class="results" id="palResults" role="listbox" aria-label="Results" ref={list}>
+        <Show when={items().length} fallback={<div class="empty">Nothing matches “{q()}”.</div>}>
+          <For each={sections()}>
+            {(sec) => (
+              // A listbox holds groups of options; the section title labels the group.
+              <div role="group" aria-label={sec.group}>
+                <h4 role="presentation">{sec.group}</h4>
+                <For each={sec.items}>
+                  {({ item, i }) => (
+                    <button
+                      id={optionId(i)}
+                      tabindex="-1"
+                      class="res"
+                      classList={{ on: i === sel() }}
+                      role="option"
+                      aria-selected={i === sel()}
+                      onMouseMove={() => setSel(i)}
+                      onClick={() => run(i)}
+                    >
+                      <Show when={item.lamp} fallback={<Icon name={item.icon ?? "chev-right"} />}>
+                        <span class={`lamp ${item.lamp}`} />
+                      </Show>
+                      <span class="t">{item.label}</span>
+                      <span class="m">{item.meta}</span>
+                    </button>
+                  )}
+                </For>
+              </div>
+            )}
+          </For>
+        </Show>
+      </div>
+    </Modal>
   )
 }
 
@@ -261,6 +276,7 @@ const GROUPS: [string, [string[], string][]][] = [
 ]
 
 export function KeysSheet(props: { close: () => void }) {
+  const title = dialogId()
   const Row = (p: { keys: string[]; what: string }) => (
     <>
       <dt>
@@ -269,34 +285,32 @@ export function KeysSheet(props: { close: () => void }) {
       <dd>{p.what}</dd>
     </>
   )
-  onMount(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape" || e.key === "?") {
-        e.preventDefault()
-        e.stopPropagation()
-        props.close()
-      }
-    }
-    document.addEventListener("keydown", onKey, true)
-    onCleanup(() => document.removeEventListener("keydown", onKey, true))
-  })
   return (
-    <div class="keys-sheet" onMouseDown={(e) => e.target === e.currentTarget && props.close()}>
-      <div class="keys" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts">
-        <h3>Keys</h3>
-        <div class="keys-groups">
-          <For each={GROUPS}>
-            {([title, rows]) => (
-              <section>
-                <h4>{title}</h4>
-                <dl>
-                  <For each={rows}>{([keys, what]) => <Row keys={keys} what={what} />}</For>
-                </dl>
-              </section>
-            )}
-          </For>
-        </div>
+    <Modal
+      class="keys"
+      labelledBy={title}
+      onClose={props.close}
+      // The sheet scrolls with the arrow keys; "?" closes it like it opened it.
+      initialFocus={(panel) => panel}
+      onKey={(e) => {
+        if (e.key !== "?") return
+        e.preventDefault()
+        props.close()
+      }}
+    >
+      <DialogHead id={title} title="Keys" onClose={props.close} />
+      <div class="keys-groups">
+        <For each={GROUPS}>
+          {([title, rows]) => (
+            <section>
+              <h3>{title}</h3>
+              <dl>
+                <For each={rows}>{([keys, what]) => <Row keys={keys} what={what} />}</For>
+              </dl>
+            </section>
+          )}
+        </For>
       </div>
-    </div>
+    </Modal>
   )
 }

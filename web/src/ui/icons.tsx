@@ -5,6 +5,8 @@ import type { JSX } from "solid-js"
 const PATHS = {
   search: `<circle cx="7" cy="7" r="4.25"/><path d="M10.25 10.25 14 14"/>`,
   plus: `<path d="M8 2.5v11M2.5 8h11"/>`,
+  check: `<path d="M2.75 8.5 6.25 12l7-8"/>`,
+  external: `<path d="M9.25 2.75h4v4M13.25 2.75 7.5 8.5"/><path d="M11.25 9.5v3.75h-8.5v-8.5H6.5"/>`,
   close: `<path d="M3.75 3.75l8.5 8.5M12.25 3.75l-8.5 8.5"/>`,
   "chev-right": `<path d="M6 3.5 10.5 8 6 12.5"/>`,
   "chev-down": `<path d="M3.5 6 8 10.5 12.5 6"/>`,

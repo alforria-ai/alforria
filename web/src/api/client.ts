@@ -75,6 +75,17 @@ function safeJson(text: string): unknown {
   }
 }
 
+export interface AuthMethod {
+  type: "oauth" | "api"
+  label: string
+}
+
+export interface OAuthAuthorization {
+  url: string
+  method: "auto" | "code"
+  instructions: string
+}
+
 export interface PromptPart {
   type: "text" | "file" | "agent"
   text?: string
@@ -154,6 +165,24 @@ export const api = {
   setAuth: (providerID: string, key: string) =>
     request<boolean>("PUT", `/auth/${providerID}`, { body: { type: "api", key } }),
   removeAuth: (providerID: string) => request<boolean>("DELETE", `/auth/${providerID}`),
+  /** Sign-in methods per provider (plugins); a provider without an entry takes an API key. */
+  authMethods: (directory?: string) => request<Record<string, AuthMethod[]>>("GET", "/provider/auth", { directory }),
+  oauthAuthorize: (providerID: string, method: number, directory?: string) =>
+    request<OAuthAuthorization | null | undefined>("POST", `/provider/${providerID}/oauth/authorize`, {
+      directory,
+      body: { method },
+    }),
+  /** Without a code this waits for the browser leg to finish (the "auto" flow). */
+  oauthCallback: (
+    providerID: string,
+    method: number,
+    opts: { code?: string; directory?: string; signal?: AbortSignal },
+  ) =>
+    request<boolean>("POST", `/provider/${providerID}/oauth/callback`, {
+      directory: opts.directory,
+      signal: opts.signal,
+      body: { method, code: opts.code },
+    }),
   mcpStatus: (directory?: string) =>
     request<Record<string, { status: string; error?: string }>>("GET", "/mcp", { directory }),
   mcpConnect: (name: string, directory?: string) => request<boolean>("POST", `/mcp/${name}/connect`, { directory }),

@@ -9,6 +9,7 @@ import { fleetState, lastAssistant } from "../../fleet/derive"
 import { state } from "../../store/store"
 import { Icon } from "../../ui/icons"
 import { toast } from "../toast"
+import { ModelPicker } from "./model-picker"
 
 interface Attachment {
   name: string
@@ -188,6 +189,7 @@ export function Composer(props: { sessionID: string }) {
   }
 
   let picker!: HTMLInputElement
+  let modelBtn!: HTMLButtonElement
   const attach = async (list: FileList | File[]) => {
     for (const f of Array.from(list))
       try {
@@ -230,11 +232,6 @@ export function Composer(props: { sessionID: string }) {
     const m = model()
     return m ? (state.models[m]?.name ?? m.split("/").slice(1).join("/")) : "default model"
   }
-  const modelList = createMemo(() =>
-    Object.entries(state.models)
-      .map(([id, info]) => ({ id, name: info.name, provider: id.split("/")[0]! }))
-      .sort((a, b) => a.provider.localeCompare(b.provider) || a.name.localeCompare(b.name)),
-  )
 
   return (
     <div class="composer">
@@ -262,25 +259,19 @@ export function Composer(props: { sessionID: string }) {
         )}
       </Show>
       <Show when={modelPicker()}>
-        <div class="popover" role="listbox" aria-label="Model">
-          <header>Model for the next prompt</header>
-          <For each={modelList()} fallback={<div class="empty-pop">No models loaded</div>}>
-            {(m) => (
-              <button
-                class={m.id === model() ? "on" : ""}
-                onMouseDown={(e) => {
-                  e.preventDefault()
-                  setDraft({ model: m.id })
-                  setModelPicker(false)
-                  ta.focus()
-                }}
-              >
-                {m.name}
-                <span>{m.provider}</span>
-              </button>
-            )}
-          </For>
-        </div>
+        <ModelPicker
+          value={model()}
+          anchor={() => modelBtn}
+          onPick={(id) => {
+            setDraft({ model: id })
+            setModelPicker(false)
+            ta.focus()
+          }}
+          onClose={(refocus) => {
+            setModelPicker(false)
+            if (refocus) modelBtn.focus()
+          }}
+        />
       </Show>
       <Show when={draft().attachments?.length}>
         <div class="attachments" aria-label="Attachments">
@@ -349,7 +340,14 @@ export function Composer(props: { sessionID: string }) {
             )}
           </For>
         </div>
-        <button class="model-btn" title={`Model: ${modelName()}`} onClick={() => setModelPicker((v) => !v)}>
+        <button
+          ref={modelBtn}
+          class="model-btn"
+          title={`Model: ${modelName()}`}
+          aria-haspopup="listbox"
+          aria-expanded={modelPicker()}
+          onClick={() => setModelPicker((v) => !v)}
+        >
           <span class="m">{modelName()}</span>
           <Icon name="chev-down" />
         </button>

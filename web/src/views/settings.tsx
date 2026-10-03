@@ -2,13 +2,15 @@
 // permission rules, appearance, and the server itself. Config edits go to the
 // global config (every project; a project's opencode.json still overrides).
 import { createMemo, createResource, createSignal, For, Match, Show, Switch } from "solid-js"
-import { api } from "../api/client"
+import { api, type AuthMethod } from "../api/client"
 import { leaveSettings, nav, openSettings } from "../nav/route"
 import { state } from "../store/store"
 import { Icon } from "../ui/icons"
 import { setTheme, theme } from "../ui/theme"
 import { canNotify, enableNotifications, notifyOn } from "../platform"
 import { server } from "./server"
+import { ConnectDialog, type ConnectTarget } from "./connect"
+import { loadModels } from "../sync/sync"
 import { toast } from "./toast"
 
 const PAGES = [
@@ -77,31 +79,25 @@ export function Settings() {
 
 function Providers() {
   const [catalog, { refetch }] = createResource(() => api.providerCatalog(anyDir()))
-  const [editing, setEditing] = createSignal<string | null>(null)
-  const [key, setKey] = createSignal("")
+  const [methods] = createResource(() => api.authMethods(anyDir()).catch(() => ({}) as Record<string, AuthMethod[]>))
+  const [connecting, setConnecting] = createSignal<ConnectTarget | null>(null)
   const rows = createMemo(() => {
     const c = catalog()
     if (!c) return []
     const connected = new Set(c.connected)
-    return [...c.all].sort(
-      (a, b) => Number(connected.has(b.id)) - Number(connected.has(a.id)) || a.name.localeCompare(b.name),
-    )
+    // LibertAI leads (its sign-in is built in), then what's connected, then A–Z.
+    const rank = (id: string) => (id === "libertai" ? 0 : connected.has(id) ? 1 : 2)
+    return [...c.all].sort((a, b) => rank(a.id) - rank(b.id) || a.name.localeCompare(b.name))
   })
-  const save = async (id: string) => {
-    try {
-      await api.setAuth(id, key().trim())
-      setEditing(null)
-      setKey("")
-      toast("Credentials saved on the server")
-      void refetch()
-    } catch (err) {
-      toast(`Could not save: ${err instanceof Error ? err.message : err}`, "error")
-    }
+  const signsIn = (id: string) => (methods()?.[id] ?? []).some((m) => m.type === "oauth")
+  const refresh = () => {
+    void refetch()
+    void loadModels()
   }
   const remove = async (id: string) => {
     try {
       await api.removeAuth(id)
-      void refetch()
+      refresh()
     } catch (err) {
       toast(`Could not remove: ${err instanceof Error ? err.message : err}`, "error")
     }
@@ -123,63 +119,55 @@ function Providers() {
             {(p) => {
               const on = () => catalog()!.connected.includes(p.id)
               return (
-                <>
-                  <div class="row">
-                    <span class="n">{p.name}</span>
-                    <span class="d mono ep">{p.id}</span>
-                    <span class="d cr">
-                      {on() ? (p.source === "env" ? `env · ${p.env[0] ?? ""}` : p.source) : "Not configured"}
-                    </span>
-                    <span class="d mono r md">{Object.keys(p.models).length}</span>
-                    <Show
-                      when={on()}
-                      fallback={
-                        <button class="link-btn st" onClick={() => setEditing(p.id)}>
-                          Connect
+                <div class="row">
+                  <span class="n">{p.name}</span>
+                  <span class="d mono ep">{p.id}</span>
+                  <span class="d cr">
+                    {on() ? (p.source === "env" ? `env · ${p.env[0] ?? ""}` : p.source) : "Not configured"}
+                  </span>
+                  <span class="d mono r md">{Object.keys(p.models).length}</span>
+                  <Show
+                    when={on()}
+                    fallback={
+                      <button
+                        class="link-btn st"
+                        classList={{ primary: signsIn(p.id) }}
+                        aria-label={`${signsIn(p.id) ? "Sign in to" : "Connect"} ${p.name}`}
+                        onClick={() => setConnecting({ id: p.id, name: p.name, env: p.env })}
+                      >
+                        {signsIn(p.id) ? "Sign in" : "Connect"}
+                      </button>
+                    }
+                  >
+                    <span class="st settings-pair">
+                      <span class="pill-state on">Connected</span>
+                      <Show when={p.source === "api"}>
+                        <button
+                          class="link-btn"
+                          aria-label={`${signsIn(p.id) ? "Sign out of" : "Remove the key for"} ${p.name}`}
+                          onClick={() => void remove(p.id)}
+                        >
+                          {signsIn(p.id) ? "Sign out" : "Remove"}
                         </button>
-                      }
-                    >
-                      <span class="st settings-pair">
-                        <span class="pill-state on">Connected</span>
-                        <Show when={p.source === "api"}>
-                          <button class="link-btn" onClick={() => void remove(p.id)}>
-                            Remove
-                          </button>
-                        </Show>
-                      </span>
-                    </Show>
-                  </div>
-                  <Show when={editing() === p.id}>
-                    <form
-                      class="row key-form"
-                      onSubmit={(e) => {
-                        e.preventDefault()
-                        void save(p.id)
-                      }}
-                    >
-                      <input
-                        class="other-input"
-                        type="password"
-                        autocomplete="off"
-                        placeholder={`${p.name} API key`}
-                        aria-label={`${p.name} API key`}
-                        value={key()}
-                        onInput={(e) => setKey(e.currentTarget.value)}
-                        ref={(el) => setTimeout(() => el.focus())}
-                      />
-                      <button class="link-btn" type="submit" disabled={!key().trim()}>
-                        Save
-                      </button>
-                      <button class="link-btn" type="button" onClick={() => setEditing(null)}>
-                        Cancel
-                      </button>
-                    </form>
+                      </Show>
+                    </span>
                   </Show>
-                </>
+                </div>
               )
             }}
           </For>
         </div>
+      </Show>
+      <Show when={connecting()}>
+        {(target) => (
+          <ConnectDialog
+            provider={target()}
+            methods={methods()?.[target().id] ?? []}
+            directory={anyDir()}
+            onClose={() => setConnecting(null)}
+            onConnected={refresh}
+          />
+        )}
       </Show>
     </>
   )

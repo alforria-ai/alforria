@@ -1,6 +1,7 @@
 // The global keyboard map. Keys act only when focus is not in a text field
 // (except Esc, ⌘K and Alt+↑/↓, which work everywhere). Region-specific keys
 // (the queue's A/S/D, a column's composer) are handled by those regions.
+import { modalOpen } from "../ui/modal"
 
 export interface KeyActions {
   palette(): void
@@ -25,7 +26,8 @@ export function isTyping(el: Element | null) {
 
 export function bindKeys(view: () => "overview" | "focus" | "settings", a: KeyActions) {
   const onKey = (e: KeyboardEvent) => {
-    if (e.defaultPrevented) return
+    // An open dialog owns the keyboard; the app behind it is inert.
+    if (e.defaultPrevented || modalOpen()) return
     const k = e.key
     if ((e.metaKey || e.ctrlKey) && k.toLowerCase() === "k") {
       e.preventDefault()

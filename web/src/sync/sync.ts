@@ -111,7 +111,8 @@ async function loadBranches() {
   )
 }
 
-async function loadModels() {
+/** The model list behind the composer's picker; reload after credentials change. */
+export async function loadModels() {
   const dir = state.projectOrder.map((id) => state.projects[id]?.worktree).find(Boolean)
   const list = await api.providers(dir).catch(() => undefined)
   if (!list) return

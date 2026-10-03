@@ -196,6 +196,108 @@ try {
     await p.keyboard.press("Escape")
     await p.waitForTimeout(300)
     check((await p.locator("table.reg").count()) === 1, "Esc returns to the overview")
+
+    // Dialogs own the keyboard: the app behind them is inert, the queue's
+    // keys don't leak through, Tab stays inside, Esc closes, focus returns.
+    await p.keyboard.press("q")
+    await p.waitForTimeout(700)
+    const waitingBefore = await waiting()
+    await p.keyboard.press("?")
+    await p.locator(".keys").waitFor()
+    check(
+      await p.evaluate(() => document.getElementById("app")!.hasAttribute("inert")),
+      "an open dialog makes the app inert",
+    )
+    await p.keyboard.press("a")
+    await p.waitForTimeout(900)
+    check((await waiting()) === waitingBefore, "queue keys do nothing while a dialog is open")
+    const keysA11y = await a11y(p)
+    check(!keysA11y.length, `the keys sheet has no serious a11y violations ${keysA11y.join(" ")}`)
+    await p.keyboard.press("Escape")
+    await p.waitForTimeout(100)
+    check(
+      (await p.locator(".keys").count()) === 0 && (await p.evaluate(() => !!document.activeElement?.closest("#queue"))),
+      "Esc closes the sheet and focus returns to the queue",
+    )
+    await p.keyboard.press("Control+k")
+    await p.locator(".palette").waitFor()
+    for (let i = 0; i < 5; i++) await p.keyboard.press("Tab")
+    check(await p.evaluate(() => !!document.activeElement?.closest(".dialog")), "Tab stays inside the palette")
+    await p.locator(".scrim").click({ position: { x: 8, y: 8 } })
+    check((await p.locator(".palette").count()) === 0, "a press outside closes the palette")
+
+    // The model picker works from the keyboard.
+    await p.locator("tr.s-row", { hasText: "Scripted session" }).click()
+    await p.locator(".col.is-active .model-btn").click()
+    await p.locator(".popover.models").waitFor()
+    await p.keyboard.type("mock")
+    await p.keyboard.press("Enter")
+    check(
+      (await p.locator(".popover.models").count()) === 0 &&
+        (await p.evaluate(() => document.activeElement?.tagName === "TEXTAREA")),
+      "the model picker picks with Enter and hands focus back to the composer",
+    )
+    await p.locator(".col.is-active .model-btn").click()
+    await p.keyboard.press("Escape")
+    check(
+      await p.evaluate(() => !!document.activeElement?.classList.contains("model-btn")),
+      "Esc closes the model picker back to its button",
+    )
+
+    // Providers: LibertAI leads and offers a browser sign-in.
+    await p.goto(`${UI}/#/settings/providers`)
+    const first = p.locator(".spec.providers .row:not(.head)").first()
+    await first.waitFor()
+    check((await first.locator(".ep").textContent()) === "libertai", "LibertAI leads the provider list")
+    await first.locator(".link-btn.st").click()
+    await p.locator(".connect").waitFor()
+    check(
+      (await p.locator(".connect .connect-methods .stamp").textContent())?.includes("Sign in with LibertAI") ?? false,
+      "LibertAI's connect dialog offers Sign in with LibertAI",
+    )
+    const connectA11y = await a11y(p)
+    check(!connectA11y.length, `the connect dialog has no serious a11y violations ${connectA11y.join(" ")}`)
+    await p.keyboard.press("Escape")
+    check((await p.locator(".connect").count()) === 0, "Esc closes the connect dialog")
+
+    // Sign in through the LibertAI stand-in: the tab's redirect reaches the
+    // server's loopback and the dialog finishes on its own.
+    const libertaiRow = () => p.locator(".spec.providers .row:not(.head)").first()
+    await libertaiRow().locator(".link-btn.st").click()
+    const [tab] = await Promise.all([
+      p.context().waitForEvent("page"),
+      p.locator(".connect .connect-methods .stamp").click(),
+    ])
+    await tab.locator("#approve").click()
+    await p.locator(".connect").waitFor({ state: "detached", timeout: 15_000 })
+    await p.waitForTimeout(500)
+    check(
+      (await libertaiRow().locator(".pill-state.on").count()) === 1,
+      "Sign in with LibertAI connects through the browser redirect",
+    )
+    await tab.close()
+
+    // Signed out, then in again by pasting the address a remote browser
+    // would have been stuck on.
+    await libertaiRow()
+      .getByRole("button", { name: /Sign out/ })
+      .click()
+    await p.waitForTimeout(500)
+    await libertaiRow().locator(".link-btn.st").click()
+    const [tab2] = await Promise.all([
+      p.context().waitForEvent("page"),
+      p.locator(".connect .connect-methods .stamp").click(),
+    ])
+    const landing = await tab2.locator("#approve").getAttribute("href")
+    await tab2.close()
+    await p.locator(".connect .connect-wait input").fill(landing ?? "")
+    await p.locator(".connect .connect-wait button[type=submit]").click()
+    await p.locator(".connect").waitFor({ state: "detached", timeout: 15_000 })
+    await p.waitForTimeout(500)
+    check(
+      (await libertaiRow().locator(".pill-state.on").count()) === 1,
+      "pasting the landing address finishes the sign-in",
+    )
   }
 
   console.log("phone")
