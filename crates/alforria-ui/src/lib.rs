@@ -1,7 +1,7 @@
 //! Embedded alforria web UI.
 //!
-//! The UI is built in the `alforria-ai/web` repo (a fork of opencode's
-//! `packages/app`), packed to a deterministic zstd tarball by `script/pack.ts`,
+//! The UI is the client in `web/` (bun + Vite + SolidJS), packed to a
+//! deterministic zstd tarball by `web/script/pack.ts`,
 //! and committed at `assets/ui.tar.zst`. This crate embeds that tarball and
 //! exposes it as an in-memory `path -> asset` map, decompressed once on first
 //! use. The server adapts [`UiBundle`] into its `UiBackend` seam.
@@ -10,8 +10,8 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::sync::OnceLock;
 
-/// The committed UI bundle. Regenerate with `bun run pack` in `alforria-ai/web`
-/// and copy the result here.
+/// The committed UI bundle. Regenerate with `bun run build && bun run pack` in
+/// `web/`, which writes this file directly.
 static UI_TARBALL: &[u8] = include_bytes!("../assets/ui.tar.zst");
 
 /// One file served from the embedded UI map.

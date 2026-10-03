@@ -35,6 +35,8 @@ export function Transcript(props: { sessionID: string; onOpenSession: (id: strin
   let scroller!: HTMLDivElement
   let content!: HTMLDivElement
   const [stuck, setStuck] = createSignal(true)
+  // Long sessions render their most recent turns; older ones on request.
+  const [shown, setShown] = createSignal(40)
   const turns = createMemo(() => turnsOf(state.messages[props.sessionID] ?? []))
   const pending = createMemo(() => interruptsFor(state, props.sessionID))
   const busy = () => fleetState(state, props.sessionID) === "working"
@@ -80,11 +82,25 @@ export function Transcript(props: { sessionID: string; onOpenSession: (id: strin
               </div>
             }
           >
-            <For each={turns()}>
+            <Show when={turns().length > shown()}>
+              <button
+                class="link-btn earlier"
+                onClick={() => {
+                  // Keep the reader's place: grow the window, then restore the offset from the bottom.
+                  const fromBottom = scroller.scrollHeight - scroller.scrollTop
+                  setStuck(false)
+                  setShown((w) => w + 40)
+                  requestAnimationFrame(() => (scroller.scrollTop = scroller.scrollHeight - fromBottom))
+                }}
+              >
+                Show {Math.min(40, turns().length - shown())} earlier turns
+              </button>
+            </Show>
+            <For each={turns().slice(-shown())}>
               {(turn, ti) => (
                 <TurnView
                   turn={turn}
-                  last={ti() === turns().length - 1}
+                  last={ti() === Math.min(turns().length, shown()) - 1}
                   busy={busy()}
                   byCall={byCall()}
                   onOpenSession={props.onOpenSession}

@@ -89,6 +89,25 @@ async function loadModels() {
   setState("models", models)
 }
 
+/**
+ * A snapshot that fails (server restarting, network blip) must not leave the
+ * view on stale state while the stream looks live: retry with backoff until
+ * one lands. A newer call supersedes older retries.
+ */
+let generation = 0
+async function resyncWithRetry() {
+  const mine = ++generation
+  for (let attempt = 0; mine === generation; attempt++) {
+    try {
+      await resync()
+      return
+    } catch (err) {
+      console.warn(`resync failed (attempt ${attempt + 1})`, err)
+      await new Promise((r) => setTimeout(r, Math.min(15_000, 500 * 2 ** attempt)))
+    }
+  }
+}
+
 let stop: (() => void) | undefined
 export function startSync() {
   stop?.()
@@ -96,9 +115,9 @@ export function startSync() {
     onFrame: (frame) => {
       enqueue(frame)
       // A global config change disposes every instance server-side; re-read everything.
-      if (frame.payload.type === "global.disposed") void resync().catch(() => {})
+      if (frame.payload.type === "global.disposed") void resyncWithRetry()
     },
-    onOpen: () => void resync().catch((err) => console.error("resync failed", err)),
+    onOpen: () => void resyncWithRetry(),
     onState: (s, attempt, retryAt) => setConn({ state: s, attempt, retryAt }),
   })
   return stop

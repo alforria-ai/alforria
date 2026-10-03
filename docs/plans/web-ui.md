@@ -1,5 +1,7 @@
 # Web UI: reuse upstream `packages/app`, embed it, improve it
 
+> **Superseded (2026-10-03)** by `docs/plans/web-client.md`: the fork in `alforria-ai/web` and its iframe grid are replaced by a new in-tree client in `web/`. This document is kept for history.
+
 Status: M1 (fork + build + pack), M2 (embed + serve), M3 (branding/theme),
 M4 (wire parity) and M5 (multi-pane grid) **landed**; continuing on UX polish.
 

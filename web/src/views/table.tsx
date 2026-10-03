@@ -118,6 +118,7 @@ function SessionRow(props: {
       classList={{ sub: props.depth > 0, "is-waiting": st() === "waiting", "is-cursor": props.cursor }}
       data-sid={id()}
       tabindex="-1"
+      onMouseDown={(e) => e.shiftKey && e.preventDefault()}
       onClick={(e) => props.onOpen(id(), e.shiftKey)}
     >
       <td class="c-state">

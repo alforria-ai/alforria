@@ -367,7 +367,7 @@ pub struct EmptyUiBackend;
 impl UiBackend for EmptyUiBackend {}
 
 /// The production backend: serves the web UI bundled into the binary from
-/// `alforria-ai/web` (via `crates/alforria-ui/assets/ui.tar.zst`). Requests
+/// `web/` (via `crates/alforria-ui/assets/ui.tar.zst`). Requests
 /// are served from an in-memory map decompressed once per process.
 #[derive(Debug, Clone, Default)]
 pub struct EmbeddedUiBackend;

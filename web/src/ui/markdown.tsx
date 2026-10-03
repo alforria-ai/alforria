@@ -131,7 +131,10 @@ const THEME: ThemeRegistration = {
   settings: [
     { settings: { foreground: FG, background: "#000000" } },
     { scope: ["comment", "punctuation.definition.comment"], settings: { foreground: "#040404" } },
-    { scope: ["string", "punctuation.definition.string", "constant.character.escape"], settings: { foreground: "#030303" } },
+    {
+      scope: ["string", "punctuation.definition.string", "constant.character.escape"],
+      settings: { foreground: "#030303" },
+    },
     {
       scope: ["keyword", "storage", "keyword.operator.new", "keyword.operator.expression", "keyword.operator.word"],
       settings: { foreground: "#020202" },
@@ -188,7 +191,9 @@ export async function highlight(jobs: Job[]): Promise<void> {
     let html = esc(j.code)
     if (hl && ready.get(j.lang)) {
       try {
-        html = tokensHtml(hl.codeToTokensBase(j.code, { lang: j.lang, theme: THEME.name!, tokenizeMaxLineLength: 1000 }))
+        html = tokensHtml(
+          hl.codeToTokensBase(j.code, { lang: j.lang, theme: THEME.name!, tokenizeMaxLineLength: 1000 }),
+        )
       } catch {}
     }
     remember(key, html)
@@ -247,7 +252,12 @@ const renderer: RendererObject = {
     return url ? anchor(url, label) : label
   },
   code({ text, lang }) {
-    const label = (lang ?? "").trim().split(/\s/)[0]!.toLowerCase().replace(/[^\w.+#-]/g, "").slice(0, 24)
+    const label = (lang ?? "")
+      .trim()
+      .split(/\s/)[0]!
+      .toLowerCase()
+      .replace(/[^\w.+#-]/g, "")
+      .slice(0, 24)
     const code = text.replace(/\n$/, "")
     const grammar = grammarOf(label)
     const job = grammar && code.length <= MAX_CODE ? { lang: grammar, code } : undefined
@@ -307,6 +317,20 @@ function renderBlock(token: Token): Block {
 const waiting = (b: Block) => b.jobs.some((j) => highlighted.has(keyOf(j)))
 const isSpace = (b: Block) => b.token.type === "space"
 
+/**
+ * Whether the tokens' raw text tiles `src` exactly. marked garbles `raw` in a
+ * few cases (a quoted list with a lazy line, a repeated reference definition),
+ * and a tail lexed from a wrong offset would render the wrong text.
+ */
+function covers(tokens: Token[], src: string) {
+  let at = 0
+  for (const t of tokens) {
+    if (!src.startsWith(t.raw, at)) return false
+    at += t.raw.length
+  }
+  return at === src.length
+}
+
 /** Index of the `n`th non-blank block from the end, or 0. */
 function fromEnd(blocks: Block[], n: number) {
   for (let i = blocks.length - 1; i >= 0; i--) if (!isSpace(blocks[i]!) && --n === 0) return i
@@ -317,14 +341,15 @@ function fromEnd(blocks: Block[], n: number) {
  * A document that is re-rendered as it grows. When new text only appends, all
  * but the last two blocks are settled (a paragraph can still become a setext
  * heading or a table header once the next line arrives), so only the tail is
- * re-lexed. Unchanged blocks keep their identity, which lets the DOM keep them.
+ * re-lexed. Blocks whose output did not change keep their identity, which lets
+ * the DOM keep them.
  */
 export class MarkdownStream {
   private text = ""
   private blocks: Block[] = []
   /** Reference definitions make any block depend on the whole text: then always lex all of it. */
   private links = ""
-  /** False if the lexer ever failed to account for every character, which would misplace a tail. */
+  /** Whether block offsets can be trusted (see `covers`); if not, always lex all of it. */
   private exact = true
 
   update(next: string): Block[] {
@@ -334,21 +359,27 @@ export class MarkdownStream {
     let keep = !this.links && this.exact && next.startsWith(this.text) ? fromEnd(old, 2) : 0
     let offset = 0
     for (let i = 0; i < keep; i++) offset += old[i]!.token.raw.length
-    let tokens = md.lexer(next.slice(offset))
+    let src = next.slice(offset)
+    let tokens = md.lexer(src)
     let links = Object.keys(tokens.links).length ? JSON.stringify(tokens.links) : ""
     if (keep && links) {
-      keep = offset = 0
-      tokens = md.lexer(next)
+      keep = 0
+      src = next
+      tokens = md.lexer(src)
       links = JSON.stringify(tokens.links)
     }
-    let length = 0
-    for (const t of tokens) length += t.raw.length
-    if (length !== next.length - offset) this.exact = false
-    const reuse = links === this.links
+    this.exact = covers(tokens, src)
+    // Equal raw text is not enough to reuse a block: marked may tokenize it
+    // differently depending on what follows. Equal output is, and the block
+    // takes the new token so later offsets count the text it now covers.
     const out = old.slice(0, keep)
     for (const t of tokens) {
       const prev = old[out.length]
-      out.push(reuse && prev && prev.token.raw === t.raw && !waiting(prev) ? prev : renderBlock(t))
+      const block = renderBlock(t)
+      if (prev?.html === block.html) {
+        prev.token = t
+        out.push(prev)
+      } else out.push(block)
     }
     this.text = next
     this.blocks = out
@@ -466,5 +497,6 @@ export function Markdown(props: { text: string; streaming?: boolean }): JSX.Elem
     schedule(streaming)
   })
 
-  return <div ref={root} class="prose md" onClick={onCopy} />
+  // A native listener: delegation would touch `window` when this module loads.
+  return <div ref={root} class="prose md" on:click={onCopy} />
 }

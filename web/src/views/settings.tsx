@@ -7,6 +7,7 @@ import { leaveSettings, nav, openSettings } from "../nav/route"
 import { state } from "../store/store"
 import { Icon } from "../ui/icons"
 import { setTheme, theme } from "../ui/theme"
+import { canNotify, enableNotifications, notifyOn } from "../platform"
 import { server } from "./server"
 import { toast } from "./toast"
 
@@ -393,6 +394,22 @@ function Appearance() {
                 </button>
               )}
             </For>
+          </div>
+        </div>
+        <div class="row">
+          <span class="n">Notifications</span>
+          <span class="d">
+            {canNotify()
+              ? "Notify when an agent starts waiting on you while this tab is in the background."
+              : "This browser does not support notifications."}
+          </span>
+          <div class="seg" role="group" aria-label="Notifications">
+            <button aria-pressed={notifyOn()} disabled={!canNotify()} onClick={() => void enableNotifications(true)}>
+              on
+            </button>
+            <button aria-pressed={!notifyOn()} onClick={() => void enableNotifications(false)}>
+              off
+            </button>
           </div>
         </div>
       </div>

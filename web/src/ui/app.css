@@ -3436,3 +3436,7 @@ button.tool-row:hover {
   color: var(--ground);
   border-color: var(--ink);
 }
+.link-btn.earlier {
+  display: flex;
+  margin: 0 auto 18px;
+}

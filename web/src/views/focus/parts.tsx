@@ -6,7 +6,7 @@ import type { Part, ToolPart } from "../../api/types"
 import { fleetState, toolTarget, type Interrupt } from "../../fleet/derive"
 import { state } from "../../store/store"
 import { Diff, diffStats, parseUnifiedDiff } from "../../ui/diff"
-import { Markdown } from "../../ui/markdown-fallback"
+import { Markdown } from "../../ui/markdown"
 import { Icon } from "../../ui/icons"
 import { Slip } from "../queue/slip"
 

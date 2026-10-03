@@ -1,0 +1,178 @@
+/* Assistant markdown (markdown.tsx). Chat, not a document: headings stay at body
+   size, and every block is square, ruled and flat (DESIGN.md: Shapes, Elevation). */
+
+.prose.md > :first-child {
+  margin-top: 0;
+}
+.prose.md > :last-child {
+  margin-bottom: 0;
+}
+
+.prose.md :is(h1, h2, h3, h4, h5, h6) {
+  margin: 14px 0 6px;
+  font-size: 14px;
+  font-weight: 650;
+  line-height: 1.4;
+}
+.prose.md :is(h5, h6) {
+  color: var(--ink-2);
+}
+
+.prose.md a {
+  color: var(--ink);
+  text-decoration: underline;
+  text-decoration-color: var(--ink-3);
+  text-underline-offset: 3px;
+}
+.prose.md a:hover {
+  text-decoration-color: var(--ink);
+}
+.prose.md del {
+  color: var(--ink-3);
+}
+
+/* Lists. Ordered markers are numbered specifications, so they read in mono. */
+.prose.md ol {
+  margin: 4px 0 8px;
+  padding-left: 24px;
+}
+.prose.md ol > li::marker {
+  font: 400 12px var(--f-mono);
+}
+.prose.md li > :is(ul, ol) {
+  margin: 2px 0;
+}
+.prose.md li > p {
+  margin-bottom: 4px;
+}
+/* Task items: the checkbox takes the bullet's place, drawn like a todo box. */
+.prose.md li.task {
+  list-style: none;
+}
+.prose.md li.task input[type="checkbox"] {
+  appearance: none;
+  width: 10px;
+  height: 10px;
+  margin: 0 8px 0 -18px;
+  vertical-align: -1px;
+  border: 1px solid var(--rule-2);
+  border-radius: 0;
+}
+.prose.md li.task input[type="checkbox"]:checked {
+  background: var(--ink-3);
+  border-color: var(--ink-3);
+}
+
+.prose.md blockquote {
+  margin: 8px 0;
+  padding-left: 12px;
+  border-left: 1px solid var(--rule-2);
+  color: var(--ink-2);
+}
+
+.prose.md hr {
+  height: 0;
+  margin: 14px 0;
+  border: 0;
+  border-top: 1px solid var(--rule);
+}
+
+/* Tables: an ink rule on top, column-head caps, hairlines between rows. */
+.prose.md .table {
+  margin: 8px 0;
+  overflow-x: auto;
+}
+.prose.md table {
+  border-collapse: collapse;
+  border-top: 1px solid var(--ink);
+  font-size: 13px;
+  line-height: 1.45;
+}
+.prose.md :is(th, td) {
+  padding: 6px 16px 6px 0;
+  vertical-align: top;
+}
+.prose.md :is(th, td):last-child {
+  padding-right: 0;
+}
+.prose.md th {
+  padding-top: 8px;
+  font: 700 11.5px/1.2 var(--f-label);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--ink-3);
+  border-bottom: 1px solid var(--rule);
+}
+.prose.md th:not([align]) {
+  text-align: left;
+}
+.prose.md th code {
+  text-transform: none;
+  letter-spacing: 0;
+}
+.prose.md td {
+  border-bottom: 1px solid var(--rule-soft);
+}
+.prose.md tr:last-child td {
+  border-bottom-color: var(--rule);
+}
+.prose.md td.num {
+  font: 400 12px/1.55 var(--f-mono);
+}
+
+/* Code blocks: a plate with a ruled head carrying the language and Copy. */
+.prose.md .code-block {
+  margin: 8px 0;
+  background: var(--plate);
+  border: 1px solid var(--rule);
+  white-space: normal;
+}
+.prose.md .code-head {
+  display: flex;
+  align-items: stretch;
+  height: 28px;
+  border-bottom: 1px solid var(--rule);
+}
+.prose.md .code-head .lang {
+  flex: 1;
+  min-width: 0;
+  align-self: center;
+  padding-left: 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font: 400 11px/1 var(--f-mono);
+  color: var(--ink-3);
+}
+.prose.md .code-head .copy {
+  padding: 0 10px;
+  border-left: 1px solid var(--rule);
+  font: 700 12px/1 var(--f-label);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--ink-2);
+}
+.prose.md .code-head .copy:hover {
+  background: var(--ink);
+  color: var(--ground);
+}
+/* Wide code scrolls; it never wraps (DESIGN.md: Mid-Token Wrap). */
+.prose.md .code-block > code {
+  display: block;
+  padding: 8px 10px;
+  overflow-x: auto;
+  background: none;
+  font: 400 12px/1.6 var(--f-mono);
+  white-space: pre;
+  tab-size: 4;
+}
+.prose.md .code-block .kw {
+  color: var(--ink);
+  font-weight: 600;
+}
+.prose.md .code-block .st {
+  color: var(--ink-2);
+}
+.prose.md .code-block .cm {
+  color: var(--ink-3);
+}

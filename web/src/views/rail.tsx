@@ -77,6 +77,7 @@ export function Rail(props: {
                       tabindex="-1"
                       title={r.session.title}
                       data-rail={id}
+                      onMouseDown={(e) => e.shiftKey && e.preventDefault()}
                       onClick={(e) => props.onOpen(id, e.shiftKey)}
                     >
                       <span class={`lamp ${st()}`} />
@@ -132,6 +133,7 @@ export function Rail(props: {
                   (nav.columns[nav.active] as { session: string }).session === r.session.id,
               }}
               title={`${r.session.title} · ${fleetState(state, r.session.id)}`}
+              onMouseDown={(e) => e.shiftKey && e.preventDefault()}
               onClick={(e) => props.onOpen(r.session.id, e.shiftKey)}
             >
               <span class={`lamp ${fleetState(state, r.session.id)}`} />

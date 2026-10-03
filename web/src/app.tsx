@@ -20,6 +20,7 @@ import {
 } from "./nav/route"
 import { state } from "./store/store"
 import { startSync } from "./sync/sync"
+import { startPlatform } from "./platform"
 import { Band } from "./views/band"
 import { Focus } from "./views/focus/focus"
 import { MobileTabs } from "./views/mobile-tabs"
@@ -84,6 +85,7 @@ export function App() {
     const stopSync = startSync()
     const stopRouting = startRouting()
     void loadServerInfo()
+    startPlatform((id) => open(id))
     const mq = matchMedia(PHONE)
     const onPhone = () => setPhone(mq.matches)
     mq.addEventListener("change", onPhone)
