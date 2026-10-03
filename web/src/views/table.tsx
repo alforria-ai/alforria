@@ -5,6 +5,7 @@ import type { Session } from "../api/types"
 import {
   activity,
   contextUse,
+  displayTitle,
   filteredGroups,
   fleetState,
   projectName,
@@ -132,9 +133,9 @@ function SessionRow(props: {
       <td class="c-state">
         <StateCell state={st()} />
       </td>
-      <td class="c-session" title={props.session.title}>
+      <td class="c-session" title={displayTitle(props.session)}>
         <div class="title-cell">
-          <span class="t">{props.session.title || "Untitled session"}</span>
+          <span class="t">{displayTitle(props.session)}</span>
           <Show when={props.session.agent && props.session.agent !== "build"}>
             <span class="tag">{props.session.agent}</span>
           </Show>
@@ -194,7 +195,17 @@ export function SessionTable(props: {
                 <td colspan="7">
                   <div class="proj">
                     <h3>{projectName(g.project)}</h3>
-                    <span class="path">{tildify(g.project.worktree, server.home)}</span>
+                    <span class="path" title={g.project.worktree}>
+                      <bdi>{tildify(g.project.worktree, server.home)}</bdi>
+                    </span>
+                    <Show when={state.branches[g.project.id]}>
+                      {(b) => (
+                        <span class="branch">
+                          <Icon name="fork" />
+                          {b()}
+                        </span>
+                      )}
+                    </Show>
                     <span class="tally">
                       {g.rows.length} sessions
                       <Show when={g.rows.filter((r) => fleetState(state, r.session.id) === "waiting").length}>

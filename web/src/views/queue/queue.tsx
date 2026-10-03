@@ -2,7 +2,7 @@
 // oldest item is open; one key clears it and the next opens.
 import { createEffect, createMemo, createRoot, createSignal, For, on, onMount, Show } from "solid-js"
 import type { Interrupt } from "../../fleet/derive"
-import { counts, interrupts } from "../../fleet/fleet"
+import { counts, displayTitle, interrupts } from "../../fleet/fleet"
 import { Icon } from "../../ui/icons"
 import { act, ledger, selected, setSelected, stamped } from "./act"
 import { Slip, slipKeys, slipSummary } from "./slip"
@@ -90,7 +90,7 @@ export function Queue(props: {
     if (k === "k" || e.key === "ArrowUp") return (e.preventDefault(), move(-1))
     if (!item) return
     if (k === "o") return (e.preventDefault(), props.onOpenSession(item.sessionID))
-    const what = `${state.sessions[item.sessionID]?.title ?? ""}: ${slipSummary(item)}`
+    const what = `${displayTitle(state.sessions[item.sessionID])}: ${slipSummary(item)}`
     if (item.kind === "permission") {
       const v = k === "a" ? "once" : k === "s" ? "always" : k === "d" ? "reject" : null
       if (v && settled(e)) {

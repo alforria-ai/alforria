@@ -158,6 +158,22 @@ try {
     await p.waitForTimeout(2000)
     check((await p.locator(".col.is-active .msg-asst").count()) >= 2, "a sent prompt gets a reply")
 
+    // An attachment travels as a file part and shows in the transcript.
+    await p.locator('.col.is-active input[type="file"]').setInputFiles({
+      name: "notes.txt",
+      mimeType: "text/plain",
+      buffer: Buffer.from("remember the milk\n"),
+    })
+    check((await p.locator(".col.is-active .composer .attach-chip").count()) === 1, "an attached file shows as a chip")
+    await p.locator(".col.is-active textarea").fill("See the attached notes.")
+    await p.keyboard.press("Enter")
+    await p.locator(".col.is-active .msg-user", { hasText: "See the attached notes." }).waitFor()
+    await p.waitForTimeout(1200)
+    check(
+      (await p.locator(".col.is-active .msg-user .attach-chip", { hasText: "notes.txt" }).count()) === 1,
+      "the attachment is sent and shown in the transcript",
+    )
+
     // Subagent opens beside its parent.
     await p.locator(".rail-row", { hasText: "Consolidate color tokens" }).click()
     await p.locator(".col.is-active .subtask .link-btn").first().click()

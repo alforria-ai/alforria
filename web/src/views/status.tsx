@@ -5,7 +5,8 @@ import { state } from "../store/store"
 import { ktok, money, now } from "../ui/format"
 
 export function StatusLine(props: { onKeys: () => void }) {
-  const since = () => ((now() - state.conn.lastFrame) / 1000).toFixed(0)
+  // The clock ticks once a second; a frame can land after the last tick.
+  const since = () => Math.max(0, Math.round((now() - state.conn.lastFrame) / 1000))
   return (
     <footer class="status" id="status">
       <span title="Event stream">
@@ -22,8 +23,8 @@ export function StatusLine(props: { onKeys: () => void }) {
       <span>
         {counts().all} sessions · {counts().working} working · {counts().waiting} waiting
       </span>
-      <span>{ktok(totals().tokens)} tokens</span>
-      <span>{money(totals().cost)}</span>
+      <span title="Across the sessions listed (recent and live)">{ktok(totals().tokens)} tokens listed</span>
+      <span title="Across the sessions listed (recent and live)">{money(totals().cost)} listed</span>
       <span class="spacer" />
       <button onClick={props.onKeys} aria-label="Keyboard shortcuts">
         ? Keys

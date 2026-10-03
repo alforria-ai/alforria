@@ -3440,3 +3440,89 @@ button.tool-row:hover {
   display: flex;
   margin: 0 auto 18px;
 }
+
+/* ───────────── design review fixes ───────────── */
+
+/* Project header: the path gives way first (ellipsis at its start, so the
+   project-specific end stays visible); tally and New session never clip. */
+.proj > :not(.path) {
+  flex: none;
+}
+.proj .path {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  direction: rtl;
+  text-align: left;
+}
+
+/* Keys sheet: always reachable, two columns of groups on wide screens. */
+.keys {
+  max-height: calc(100dvh - 11vh - 24px);
+  overflow-y: auto;
+  width: min(880px, calc(100vw - 32px));
+}
+.keys-groups {
+  border-top: 1px solid var(--ink);
+}
+.keys-groups section {
+  break-inside: avoid;
+  padding-top: 10px;
+}
+.keys-groups h4 {
+  margin: 0 0 4px;
+  font: 700 12px/1 var(--f-label);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--ink-3);
+}
+.keys-groups dl {
+  border-top: 0;
+}
+@media (min-width: 900px) {
+  .keys-groups {
+    columns: 2;
+    column-gap: 32px;
+  }
+}
+
+/* A not-yet-ready primary is a quiet outlined plate, not a dimmed ink slab:
+   the moment it fills with ink is the moment the answer is ready. */
+.stamp.primary:disabled,
+.stamp.primary:disabled:hover {
+  background: var(--plate);
+  color: var(--ink-3);
+  box-shadow: inset 0 0 0 1px var(--rule-2);
+  opacity: 1;
+}
+.stamp.primary:disabled kbd {
+  color: var(--ink-3);
+  border-color: var(--rule-2);
+}
+
+/* Settings: the built-in (effective) value shows as a quiet pressed state. */
+.seg button.effective {
+  box-shadow: inset 0 0 0 1px var(--ink-3);
+  color: var(--ink);
+}
+.composer .attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+.composer .attach-chip button {
+  display: grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  color: var(--ink-3);
+}
+.composer .attach-chip button:hover {
+  color: var(--ink);
+}
+.composer .attach-chip .i {
+  width: 12px;
+  height: 12px;
+}

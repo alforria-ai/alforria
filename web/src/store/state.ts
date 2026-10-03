@@ -44,6 +44,8 @@ export interface State {
   errors: Record<string, SessionError>
   /** Sessions whose transcript has been fetched and is kept live. */
   loaded: Record<string, boolean>
+  /** projectID → current VCS branch (from GET /vcs, kept live by vcs.branch.updated). */
+  branches: Record<string, string>
   /** `providerID/modelID` → display info (context window for the ctx meter). */
   models: Record<string, ModelInfo>
   conn: { state: ConnState; lastFrame: number; attempt: number; retryAt: number }
@@ -65,6 +67,7 @@ export function emptyState(): State {
     diffs: {},
     errors: {},
     loaded: {},
+    branches: {},
     models: {},
     conn: { state: "connecting", lastFrame: 0, attempt: 0, retryAt: 0 },
   }

@@ -2,7 +2,7 @@
 // project. Click swaps the active column; shift-click or "open beside" adds a
 // column. Collapsed, it becomes a strip of status lamps.
 import { For, Show } from "solid-js"
-import { activity, counts, fleetState, groups, interrupts, projectName } from "../fleet/fleet"
+import { activity, counts, displayTitle, fleetState, groups, interrupts, projectName } from "../fleet/fleet"
 import { nav } from "../nav/route"
 import { state } from "../store/store"
 import { age, now } from "../ui/format"
@@ -34,7 +34,7 @@ export function Rail(props: {
           <button class="rail-next" onClick={props.onNextWaiting}>
             <span class="lamp waiting" />
             <span>
-              <b>{interrupts().length} waiting</b> · open {state.sessions[o().sessionID]?.title || "session"}
+              <b>{interrupts().length} waiting</b> · open {displayTitle(state.sessions[o().sessionID])}
             </span>
             <kbd>W</kbd>
           </button>
@@ -77,13 +77,13 @@ export function Rail(props: {
                       role="option"
                       aria-selected={cols().includes(nav.active)}
                       tabindex="-1"
-                      title={r.session.title}
+                      title={displayTitle(r.session)}
                       data-rail={id}
                       onMouseDown={(e) => e.shiftKey && e.preventDefault()}
                       onClick={(e) => props.onOpen(id, e.shiftKey)}
                     >
                       <span class={`lamp ${st()}`} />
-                      <span class="t">{r.session.title || "Untitled session"}</span>
+                      <span class="t">{displayTitle(r.session)}</span>
                       <span class="badges">
                         <For each={cols()}>
                           {(i) => (
@@ -99,7 +99,7 @@ export function Rail(props: {
                       </span>
                       <button
                         class="beside"
-                        aria-label={`Open ${r.session.title} beside`}
+                        aria-label={`Open ${displayTitle(r.session)} beside`}
                         title="Open beside (⇧ click)"
                         onClick={(e) => {
                           e.stopPropagation()
@@ -134,7 +134,7 @@ export function Rail(props: {
                   nav.columns[nav.active]?.kind === "session" &&
                   (nav.columns[nav.active] as { session: string }).session === r.session.id,
               }}
-              title={`${r.session.title} · ${fleetState(state, r.session.id)}`}
+              title={`${displayTitle(r.session)} · ${fleetState(state, r.session.id)}`}
               onMouseDown={(e) => e.shiftKey && e.preventDefault()}
               onClick={(e) => props.onOpen(r.session.id, e.shiftKey)}
             >

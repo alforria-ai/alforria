@@ -10,6 +10,16 @@ export function projectName(p: Project) {
   return p.name || basename(p.worktree)
 }
 
+/**
+ * A session's title for display. Subagent sessions arrive titled
+ * "<task> (@explore subagent)"; the agent is already shown as a tag, so the
+ * suffix only truncates the task text.
+ */
+export function displayTitle(s: Pick<Session, "title"> | undefined) {
+  const t = s?.title?.replace(/\s*\(@[\w-]+ subagent\)\s*$/, "") ?? ""
+  return t || "Untitled session"
+}
+
 export interface Row {
   session: Session
   depth: number
@@ -69,14 +79,9 @@ const memos = createRoot(() => {
       roots.forEach((s) => walk(s, 0))
       out.push({ project, rows })
     }
-    // Projects with something waiting or working float to the top.
-    const weight = (g: ProjectGroup) =>
-      g.rows.some((r) => fleetState(state, r.session.id) === "waiting")
-        ? 2
-        : g.rows.some((r) => fleetState(state, r.session.id) === "working")
-          ? 1
-          : 0
-    return out.sort((a, b) => weight(b) - weight(a))
+    // Order is stable: rows must not move under the cursor as sessions update.
+    // Surfacing what's waiting is the queue's and the Waiting filter's job.
+    return out
   })
 
   const counts = createMemo(() => {

@@ -20,6 +20,9 @@ const api = [
   "/find",
   "/file",
   "/pty",
+  "/vcs",
+  "/mcp",
+  "/auth",
   "/doc",
   "/openapi.json",
 ]

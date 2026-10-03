@@ -36,6 +36,7 @@ export async function resync() {
   await Promise.all([...viewers.keys()].map((id) => loadTranscript(id)))
   void loadModels()
   void loadRecentActivity()
+  void loadBranches()
 }
 
 /** How many views show each transcript; at zero it is unloaded. */
@@ -96,6 +97,17 @@ async function loadRecentActivity() {
           setState("parts", m.info.id, m.parts.map((p) => p.id).sort())
         }
       }),
+  )
+}
+
+async function loadBranches() {
+  await Promise.all(
+    state.projectOrder.map(async (id) => {
+      const p = state.projects[id]
+      if (!p || p.vcs !== "git") return
+      const info = await api.vcs(p.worktree).catch(() => undefined)
+      if (info?.branch) setState("branches", id, info.branch)
+    }),
   )
 }
 

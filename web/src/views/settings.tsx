@@ -303,6 +303,16 @@ const TOOLS = ["bash", "edit", "read", "webfetch", "websearch", "external_direct
 
 function Permissions() {
   const { config, patch } = useGlobalConfig()
+  // What applies today when the global config says nothing: the default
+  // agent's resolved ruleset (built-ins + project config), last match wins.
+  const [agents] = createResource(() => api.agents(anyDir()))
+  const effective = (tool: string): Action | undefined => {
+    const agent = (agents() ?? []).find((a) => a.name === "build") ?? agents()?.[0]
+    let action: Action | undefined
+    for (const rule of agent?.permission ?? [])
+      if ((rule.permission === tool || rule.permission === "*") && rule.pattern === "*") action = rule.action as Action
+    return action
+  }
   /** Flatten `permission` config into ordered rules: tool, pattern, action. */
   const rules = createMemo(() => {
     const perm = config()?.permission as string | Record<string, Action | Record<string, Action>> | undefined
@@ -338,12 +348,18 @@ function Permissions() {
               <span class="n">{r.tool}</span>
               <span class="d mono">
                 {r.pattern}
-                {(r.action as string) === "default" ? "  · built-in default" : ""}
+                {(r.action as string) === "default"
+                  ? `  · default${effective(r.tool) ? `: ${effective(r.tool)}` : ""}`
+                  : ""}
               </span>
               <div class="seg perm-seg" role="group" aria-label={`${r.tool} ${r.pattern}`}>
                 <For each={["allow", "ask", "deny"] as Action[]}>
                   {(a) => (
-                    <button aria-pressed={r.action === a} onClick={() => set(r.tool, r.pattern, a)}>
+                    <button
+                      aria-pressed={r.action === a}
+                      classList={{ effective: (r.action as string) === "default" && effective(r.tool) === a }}
+                      onClick={() => set(r.tool, r.pattern, a)}
+                    >
                       {a}
                     </button>
                   )}

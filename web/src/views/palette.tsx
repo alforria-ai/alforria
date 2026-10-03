@@ -3,7 +3,7 @@
 import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js"
 import { api } from "../api/client"
 import { fleetState } from "../fleet/derive"
-import { projectName } from "../fleet/fleet"
+import { displayTitle, projectName } from "../fleet/fleet"
 import { closeOtherColumns, nav, openSettings } from "../nav/route"
 import { state } from "../store/store"
 import { Icon } from "../ui/icons"
@@ -74,7 +74,7 @@ export function Palette(props: { initial?: string; actions: PaletteActions }) {
       if (query && !matches(query, `${s.title} ${name}`.toLowerCase())) continue
       out.push({
         group: "Sessions",
-        label: s.title || "Untitled session",
+        label: displayTitle(s),
         meta: `${name} · ${fleetState(state, s.id)}`,
         lamp: fleetState(state, s.id),
         run: () => props.actions.openSession(s.id),
@@ -217,6 +217,49 @@ export function Palette(props: { initial?: string; actions: PaletteActions }) {
   )
 }
 
+const GROUPS: [string, [string[], string][]][] = [
+  [
+    "Anywhere",
+    [
+      [["⌘K"], "Search sessions, files, commands"],
+      [["Q"], "Go to the queue"],
+      [["N"], "New session"],
+      [["Esc"], "Back (focus → overview, settings → where you were)"],
+      [["?"], "This sheet"],
+    ],
+  ],
+  [
+    "Queue",
+    [
+      [["A"], "Allow once / continue"],
+      [["S"], "Always allow this pattern"],
+      [["D"], "Deny / stop (⇧-click Deny to say why)"],
+      [["1", "–", "9"], "Pick an answer"],
+      [["↵"], "Submit answer"],
+      [["J", "K"], "Next / previous item"],
+      [["O"], "Open the session"],
+    ],
+  ],
+  [
+    "Sessions",
+    [
+      [["J", "K"], "Move through rows"],
+      [["↵"], "Open in focus"],
+      [["⇧", "↵"], "Open beside the current column"],
+      [["F"], "Back to focus"],
+    ],
+  ],
+  [
+    "Focus",
+    [
+      [["Alt", "↑", "↓"], "Previous / next session in the active column"],
+      [["W"], "Open the oldest waiting session"],
+      [["[", "]"], "Previous / next column"],
+      [["I"], "Write in the active column"],
+    ],
+  ],
+]
+
 export function KeysSheet(props: { close: () => void }) {
   const Row = (p: { keys: string[]; what: string }) => (
     <>
@@ -241,32 +284,18 @@ export function KeysSheet(props: { close: () => void }) {
     <div class="keys-sheet" onMouseDown={(e) => e.target === e.currentTarget && props.close()}>
       <div class="keys" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts">
         <h3>Keys</h3>
-        <dl>
-          <div class="grp">Anywhere</div>
-          <Row keys={["⌘K"]} what="Search sessions, files, commands" />
-          <Row keys={["Q"]} what="Go to the queue" />
-          <Row keys={["N"]} what="New session" />
-          <Row keys={["Esc"]} what="Back (focus → overview, settings → where you were)" />
-          <Row keys={["?"]} what="This sheet" />
-          <div class="grp">Queue</div>
-          <Row keys={["A"]} what="Allow once / continue" />
-          <Row keys={["S"]} what="Always allow this pattern" />
-          <Row keys={["D"]} what="Deny / stop (⇧-click Deny to say why)" />
-          <Row keys={["1", "–", "9"]} what="Pick an answer" />
-          <Row keys={["↵"]} what="Submit answer" />
-          <Row keys={["J", "K"]} what="Next / previous item" />
-          <Row keys={["O"]} what="Open the session" />
-          <div class="grp">Sessions</div>
-          <Row keys={["J", "K"]} what="Move through rows" />
-          <Row keys={["↵"]} what="Open in focus" />
-          <Row keys={["⇧", "↵"]} what="Open beside the current column" />
-          <Row keys={["F"]} what="Back to focus" />
-          <div class="grp">Focus</div>
-          <Row keys={["Alt", "↑", "↓"]} what="Previous / next session in the active column" />
-          <Row keys={["W"]} what="Open the oldest waiting session" />
-          <Row keys={["[", "]"]} what="Previous / next column" />
-          <Row keys={["I"]} what="Write in the active column" />
-        </dl>
+        <div class="keys-groups">
+          <For each={GROUPS}>
+            {([title, rows]) => (
+              <section>
+                <h4>{title}</h4>
+                <dl>
+                  <For each={rows}>{([keys, what]) => <Row keys={keys} what={what} />}</For>
+                </dl>
+              </section>
+            )}
+          </For>
+        </div>
       </div>
     </div>
   )

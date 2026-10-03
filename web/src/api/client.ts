@@ -103,6 +103,7 @@ export interface ProviderList {
 export const api = {
   health: () => request<{ healthy: boolean; version: string }>("GET", "/global/health"),
   projects: () => request<Project[]>("GET", "/project"),
+  vcs: (directory: string) => request<{ branch?: string; default_branch?: string }>("GET", "/vcs", { directory }),
   path: (directory?: string) =>
     request<{ home: string; state: string; config: string; worktree: string; directory: string }>("GET", "/path", {
       directory,

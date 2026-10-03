@@ -94,6 +94,12 @@ export function reduce(s: State, frame: GlobalEvent) {
     case "todo.updated":
       s.todos[ev.properties.sessionID] = ev.properties.todos
       return
+    case "vcs.branch.updated": {
+      const branch = (ev.properties as { branch?: string }).branch
+      const project = Object.values(s.projects).find((p) => p.worktree === frame.directory)
+      if (project && branch) s.branches[project.id] = branch
+      return
+    }
     case "project.updated": {
       const project = ev.properties as Project
       if (!s.projects[project.id]) s.projectOrder.push(project.id)

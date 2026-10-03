@@ -2,7 +2,7 @@
 // browser does through web APIs. Keep every call site going through here so a
 // shell can swap the implementation.
 import { createEffect, createRoot, createSignal, on } from "solid-js"
-import { interrupts } from "./fleet/fleet"
+import { displayTitle, interrupts } from "./fleet/fleet"
 import { state } from "./store/store"
 
 const KEY = "alforria.notify"
@@ -62,7 +62,7 @@ export function startPlatform(open: (sessionID: string) => void) {
         if (document.hidden)
           for (const i of list) {
             if (known.has(i.id)) continue
-            const title = state.sessions[i.sessionID]?.title || "A session"
+            const title = displayTitle(state.sessions[i.sessionID])
             const what =
               i.kind === "question"
                 ? (i.request.questions[0]?.question ?? "has a question")

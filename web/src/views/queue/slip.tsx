@@ -5,7 +5,7 @@
 import { createMemo, createSignal, For, Index, Match, Show, Switch } from "solid-js"
 import type { PermissionRequest, QuestionRequest } from "../../api/types"
 import { toolTarget } from "../../fleet/derive"
-import { projectName } from "../../fleet/fleet"
+import { displayTitle, projectName } from "../../fleet/fleet"
 import type { Interrupt } from "../../fleet/derive"
 import { state } from "../../store/store"
 import { Diff, parseUnifiedDiff, diffStats } from "../../ui/diff"
@@ -39,7 +39,7 @@ function sessionMeta(sessionID: string) {
   const s = state.sessions[sessionID]
   const p = s && state.projects[s.projectID]
   return {
-    title: s?.title || "Untitled session",
+    title: displayTitle(s),
     project: p ? projectName(p) : "",
     agent: s?.agent ?? "",
     model: s?.model?.id ?? "",

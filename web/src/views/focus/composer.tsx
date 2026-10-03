@@ -10,11 +10,39 @@ import { state } from "../../store/store"
 import { Icon } from "../../ui/icons"
 import { toast } from "../toast"
 
+interface Attachment {
+  name: string
+  mime: string
+  url: string
+}
+
 interface Draft {
   text: string
   agent?: string
   model?: string
   files: string[]
+  attachments?: Attachment[]
+}
+
+const MAX_ATTACHMENT = 5 * 1024 * 1024
+/** Text-like files go as text/plain so the server inlines them like a read. */
+function attachmentMime(f: File) {
+  if (f.type.startsWith("image/") || f.type === "application/pdf") return f.type
+  return "text/plain"
+}
+function readAttachment(f: File): Promise<Attachment> {
+  return new Promise((resolve, reject) => {
+    if (f.size > MAX_ATTACHMENT) return reject(new Error(`${f.name} is over 5 MB`))
+    const mime = attachmentMime(f)
+    const r = new FileReader()
+    r.onerror = () => reject(r.error ?? new Error(`Could not read ${f.name}`))
+    r.onload = () => {
+      // Re-tag the data URL with the mime the server expects.
+      const data = String(r.result).replace(/^data:[^;,]*/, `data:${mime}`)
+      resolve({ name: f.name || "pasted", mime, url: data })
+    }
+    r.readAsDataURL(f)
+  })
 }
 const [drafts, setDrafts] = createStore<Record<string, Draft>>({})
 
@@ -118,18 +146,19 @@ export function Composer(props: { sessionID: string }) {
     const text = ta.value.trim()
     if (!text || sending()) return
     const files = draft().files
+    const attachments = draft().attachments ?? []
     const m = model()
     const modelRef = m ? { providerID: m.split("/")[0]!, modelID: m.split("/").slice(1).join("/") } : undefined
     // Clear at once so typing can continue; restore only if the send fails and
     // the box is still empty (never overwrite what was typed meanwhile).
     ta.value = ""
-    setDraft({ text: "", files: [] })
+    setDraft({ text: "", files: [], attachments: [] })
     autosize()
     const restore = (err: unknown, what: string) => {
       toast(`Could not ${what}: ${err instanceof Error ? err.message : err}`, "error")
       if (!ta.value.trim()) {
         ta.value = text
-        setDraft({ text, files })
+        setDraft({ text, files, attachments })
         autosize()
       }
     }
@@ -149,6 +178,7 @@ export function Composer(props: { sessionID: string }) {
       for (const f of files)
         if (text.includes(`@${f}`))
           parts.push({ type: "file", mime: "text/plain", filename: f, url: `file://${dir().replace(/\/$/, "")}/${f}` })
+      for (const a of attachments) parts.push({ type: "file", mime: a.mime, filename: a.name, url: a.url })
       await api.promptAsync(props.sessionID, { parts, agent: agent(), model: modelRef })
     } catch (err) {
       restore(err, "send")
@@ -156,6 +186,18 @@ export function Composer(props: { sessionID: string }) {
       setSending(false)
     }
   }
+
+  let picker!: HTMLInputElement
+  const attach = async (list: FileList | File[]) => {
+    for (const f of Array.from(list))
+      try {
+        const a = await readAttachment(f)
+        setDraft({ attachments: [...(draft().attachments ?? []), a] })
+      } catch (err) {
+        toast(err instanceof Error ? err.message : String(err), "error")
+      }
+  }
+  const detach = (i: number) => setDraft({ attachments: (draft().attachments ?? []).filter((_, j) => j !== i) })
 
   const stop = () => api.abort(props.sessionID).catch((err) => toast(`Could not stop: ${err.message}`, "error"))
 
@@ -240,7 +282,46 @@ export function Composer(props: { sessionID: string }) {
           </For>
         </div>
       </Show>
+      <Show when={draft().attachments?.length}>
+        <div class="attachments" aria-label="Attachments">
+          <For each={draft().attachments}>
+            {(a, i) => (
+              <span class="attach-chip">
+                <Icon name="file" />
+                <span class="mono">{a.name}</span>
+                <button aria-label={`Remove ${a.name}`} onClick={() => detach(i())}>
+                  <Icon name="close" />
+                </button>
+              </span>
+            )}
+          </For>
+        </div>
+      </Show>
+      <input
+        ref={picker}
+        type="file"
+        multiple
+        hidden
+        onChange={(e) => {
+          if (e.currentTarget.files) void attach(e.currentTarget.files)
+          e.currentTarget.value = ""
+        }}
+      />
       <textarea
+        onPaste={(e) => {
+          const files = e.clipboardData?.files
+          if (files?.length) {
+            e.preventDefault()
+            void attach(files)
+          }
+        }}
+        onDrop={(e) => {
+          const files = e.dataTransfer?.files
+          if (files?.length) {
+            e.preventDefault()
+            void attach(files)
+          }
+        }}
         ref={ta}
         rows="2"
         value={draft().text}
@@ -271,6 +352,14 @@ export function Composer(props: { sessionID: string }) {
         <button class="model-btn" title={`Model: ${modelName()}`} onClick={() => setModelPicker((v) => !v)}>
           <span class="m">{modelName()}</span>
           <Icon name="chev-down" />
+        </button>
+        <button
+          class="icon-btn attach"
+          aria-label="Attach files"
+          title="Attach files (or paste / drop)"
+          onClick={() => picker.click()}
+        >
+          <Icon name="attach" />
         </button>
         <span class="spacer" />
         <span class="hint">↵ send · ⇧↵ newline</span>

@@ -4,7 +4,7 @@
 import { createEffect, For, lazy, Match, onCleanup, Show, Suspense, Switch } from "solid-js"
 import { api, ApiError } from "../../api/client"
 import { fleetState, interruptsFor, lastAssistant, sessionCost } from "../../fleet/derive"
-import { projectName } from "../../fleet/fleet"
+import { displayTitle, projectName } from "../../fleet/fleet"
 import { closeOtherColumns, nav, setActiveColumn, setColumnFile, setColumnTab, type Column } from "../../nav/route"
 import { setState, state } from "../../store/store"
 import { releaseTranscript, retainTranscript } from "../../sync/sync"
@@ -157,7 +157,7 @@ function SessionColumn(props: {
       class="col"
       classList={{ "is-active": nav.active === props.index }}
       data-col={props.index}
-      aria-label={s()?.title ?? "Session"}
+      aria-label={displayTitle(s())}
       onFocusIn={() => setActiveColumn(props.index)}
       onMouseDown={() => setActiveColumn(props.index)}
     >
@@ -187,7 +187,7 @@ function SessionColumn(props: {
             <Icon name="back" />
           </button>
           <span class={`lamp ${st()}`} title={st()} />
-          <h2 title={s()?.title}>{s()?.title || "Untitled session"}</h2>
+          <h2 title={displayTitle(s())}>{displayTitle(s())}</h2>
           <div class="acts">
             <Show when={props.onTerminal && project()}>
               <button
