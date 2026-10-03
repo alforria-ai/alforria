@@ -239,7 +239,12 @@ function TurnView(props: {
                         <Show when={state.part[pid]}>
                           {(p) => (
                             <>
-                              <PartView part={p()} streaming={streaming()} onOpenSession={props.onOpenSession} />
+                              {/* A call waiting on the human shows as its slip, not as a "running" row too. */}
+                              <Show
+                                when={!(p().type === "tool" && props.byCall.has((p() as { callID: string }).callID))}
+                              >
+                                <PartView part={p()} streaming={streaming()} onOpenSession={props.onOpenSession} />
+                              </Show>
                               <Show when={p().type === "tool" && props.byCall.get((p() as { callID: string }).callID)}>
                                 {(i) => (
                                   <Slip
