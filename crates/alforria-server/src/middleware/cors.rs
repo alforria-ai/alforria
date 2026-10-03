@@ -207,6 +207,24 @@ where
             return Box::pin(async move { Ok(response) });
         }
 
+        // Cross-site request forgery guard. Browsers attach `Origin` to every
+        // cross-site POST/PUT/PATCH/DELETE, including "simple" form posts that
+        // skip preflight, and the server parses bodies as JSON whatever their
+        // content type. Without a password such a request would reach
+        // state-changing routes (`POST /pty` spawns a process). Same-host,
+        // localhost and allowlisted origins pass, as do clients that send no
+        // `Origin` at all (CLI, TUI, SDKs).
+        if !matches!(*req.method(), Method::GET | Method::HEAD)
+            && !request_origin_allowed(req.headers(), &self.allowed_origins)
+        {
+            use axum::response::IntoResponse;
+            let response = crate::error::ServerError::from(crate::error::ApiError::Forbidden {
+                message: "Cross-origin request refused".to_string(),
+            })
+            .into_response();
+            return Box::pin(async move { Ok(response) });
+        }
+
         let mut inner = self.inner.clone();
         Box::pin(async move {
             let mut response = inner.call(req).await?;
@@ -302,6 +320,55 @@ mod tests {
     use super::*;
     use tower::Layer;
     use tower::ServiceExt;
+
+    /// A state-changing request from a foreign site never reaches the route;
+    /// reads, same-host, localhost and origin-less clients do.
+    #[tokio::test]
+    async fn cross_site_writes_are_refused() {
+        let reached = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = reached.clone();
+        let inner = tower::service_fn(move |_req: axum::http::Request<Body>| {
+            let seen = seen.clone();
+            async move {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok::<_, std::convert::Infallible>(Response::new(Body::empty()))
+            }
+        });
+        let svc = CorsLayer::new(vec![]).layer(inner);
+        let send = |method: &str, origin: Option<&str>| {
+            let mut req = axum::http::Request::builder()
+                .method(method)
+                .uri("/pty")
+                .header("host", "127.0.0.1:4096");
+            if let Some(origin) = origin {
+                req = req.header("origin", origin);
+            }
+            svc.clone().oneshot(req.body(Body::empty()).unwrap())
+        };
+        let status = |r: Response<Body>| r.status().as_u16();
+
+        assert_eq!(
+            status(send("POST", Some("https://evil.example")).await.unwrap()),
+            403
+        );
+        assert_eq!(status(send("DELETE", Some("null")).await.unwrap()), 403);
+        assert_eq!(reached.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        assert_eq!(status(send("POST", None).await.unwrap()), 200);
+        assert_eq!(
+            status(send("POST", Some("http://127.0.0.1:4096")).await.unwrap()),
+            200
+        );
+        assert_eq!(
+            status(send("PATCH", Some("http://localhost:5173")).await.unwrap()),
+            200
+        );
+        assert_eq!(
+            status(send("GET", Some("https://evil.example")).await.unwrap()),
+            200
+        );
+        assert_eq!(reached.load(std::sync::atomic::Ordering::SeqCst), 4);
+    }
 
     #[test]
     fn allowed_origin_matrix() {

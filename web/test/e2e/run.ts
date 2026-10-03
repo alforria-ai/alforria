@@ -104,7 +104,9 @@ try {
 
   console.log("desktop")
   {
-    const p = await (await browser.newContext({ viewport: { width: 1440, height: 900 } })).newPage()
+    // bypassCSP only lets the test inject axe-core; the CSP header itself is
+    // asserted separately in embedded mode.
+    const p = await (await browser.newContext({ viewport: { width: 1440, height: 900 }, bypassCSP: true })).newPage()
     watch(p, "desktop")
     const res = await p.goto(`${UI}/#/`)
     if (EMBEDDED) {

@@ -28,10 +28,23 @@ const api = [
   "/openapi.json",
 ]
 
-// The server checks the Origin of state-changing requests and PTY tickets
-// against its own host and localhost. Through the proxy (e.g. a phone on the
-// LAN hitting vite) the browser's origin is the proxy's, so present the
-// target's origin instead.
+// The server refuses state-changing requests and PTY tickets whose Origin is
+// not its own host or localhost. A page served by vite to a phone on the LAN
+// has vite's origin, so for requests *from vite's own pages* (Origin host ==
+// Host header) present the target's origin instead. Anything else keeps its
+// real Origin, so a foreign site can't use this proxy to get past the check.
+type Req = { headers: Record<string, string | string[] | undefined> }
+type ProxyReq = { setHeader(k: string, v: string): void }
+const fromOwnPage = (req: Req) => {
+  const origin = req.headers.origin
+  const host = req.headers.host
+  if (typeof origin !== "string" || typeof host !== "string") return false
+  try {
+    return new URL(origin).host === host
+  } catch {
+    return false
+  }
+}
 const proxy = Object.fromEntries(
   api.map((p) => [
     p,
@@ -39,11 +52,12 @@ const proxy = Object.fromEntries(
       target,
       changeOrigin: true,
       ws: p === "/pty",
-      configure: (server: {
-        on(event: string, cb: (req: { setHeader(k: string, v: string): void }) => void): void
-      }) => {
-        server.on("proxyReq", (req) => req.setHeader("origin", target))
-        server.on("proxyReqWs", (req) => req.setHeader("origin", target))
+      configure: (server: { on(event: string, cb: (proxyReq: ProxyReq, req: Req) => void): void }) => {
+        const rewrite = (proxyReq: ProxyReq, req: Req) => {
+          if (fromOwnPage(req)) proxyReq.setHeader("origin", target)
+        }
+        server.on("proxyReq", rewrite)
+        server.on("proxyReqWs", rewrite)
       },
     },
   ]),
