@@ -12,6 +12,7 @@
 
 pub mod app;
 pub mod attention;
+pub mod browser;
 pub mod clipboard;
 pub mod command;
 pub mod config;
@@ -201,6 +202,53 @@ async fn event_loop(
         epilogue: app::epilogue(&app),
         reason: app.ui.exit_reason.clone(),
     })
+}
+
+/// One `provider.oauth.callback` outcome. Success refreshes providers
+/// and models (`sync.bootstrap()`, `dialog-provider.tsx:278-279`; no
+/// `instance.dispose()` — the server's provider runtime picks up new
+/// credentials itself), then offers the model picker if the sign-in was
+/// still on screen. A failed wait goes back to the method list; a
+/// rejected paste only flags the dialog.
+async fn oauth_settled(
+    app: &Arc<tokio::sync::Mutex<App>>,
+    api: Arc<dyn ServerApi>,
+    provider_id: &str,
+    flow: u64,
+    result: Result<bool>,
+    pasted: bool,
+) {
+    let offer_models = {
+        let mut app = app.lock().await;
+        match result {
+            Ok(_) => {
+                match crate::ui::dialogs::model::oauth_succeeded(&mut app, provider_id, flow) {
+                    Some(offer_models) => offer_models,
+                    // Already settled — a paste and the wait both succeed.
+                    None => return,
+                }
+            }
+            Err(error) => {
+                if pasted {
+                    crate::ui::dialogs::model::oauth_rejected(&mut app, flow);
+                } else {
+                    crate::ui::dialogs::model::oauth_failed(
+                        &mut app,
+                        provider_id,
+                        flow,
+                        &error,
+                        false,
+                    );
+                }
+                return;
+            }
+        }
+    };
+    Box::pin(execute_effect(app, api, Effect::Bootstrap { fatal: false })).await;
+    let mut app = app.lock().await;
+    if offer_models && app.ui.dialogs.is_empty() {
+        crate::ui::dialogs::open(&mut app, crate::state::PendingDialog::Model);
+    }
 }
 
 /// The formatted transcript of the route session — the
@@ -563,6 +611,72 @@ pub async fn execute_effect(
             // state is credential-derived. Box::pin: the recursive async
             // call needs indirection.
             Box::pin(execute_effect(app, api, Effect::Bootstrap { fatal: false })).await;
+        }
+        Effect::AuthRemove { provider_id } => {
+            let result = api.auth_remove(&Location::default(), &provider_id).await;
+            let ok = result.is_ok();
+            crate::ui::dialogs::model::signed_out(&mut *app.lock().await, &provider_id, &result);
+            if ok {
+                // The connected set and the model list are credential-derived.
+                Box::pin(execute_effect(app, api, Effect::Bootstrap { fatal: false })).await;
+            }
+        }
+        Effect::ProviderOauthAuthorize {
+            provider_id,
+            method,
+            title,
+        } => {
+            let loc = Location::default();
+            let flow = crate::ui::dialogs::model::oauth_begin(&mut *app.lock().await);
+            let authorization = match api
+                .provider_oauth_authorize(&loc, &provider_id, method)
+                .await
+            {
+                Ok(authorization) => authorization,
+                Err(error) => {
+                    let mut app = app.lock().await;
+                    crate::ui::dialogs::model::oauth_failed(
+                        &mut app,
+                        &provider_id,
+                        flow,
+                        &error,
+                        true,
+                    );
+                    return;
+                }
+            };
+            {
+                let mut app = app.lock().await;
+                let Some(url) = crate::ui::dialogs::model::oauth_authorized(
+                    &mut app,
+                    &provider_id,
+                    method,
+                    flow,
+                    &title,
+                    &authorization,
+                ) else {
+                    return;
+                };
+                app.browser.open(&url);
+            }
+            // `AutoMethod` onMount (`dialog-provider.tsx:263-282`): wait
+            // for the provider's redirect. This task holds no lock while
+            // it waits, so the UI (and a pasted code) stays live.
+            let result = api
+                .provider_oauth_callback(&loc, &provider_id, method, None)
+                .await;
+            oauth_settled(app, api, &provider_id, flow, result, false).await;
+        }
+        Effect::ProviderOauthCallback {
+            provider_id,
+            method,
+            flow,
+            code,
+        } => {
+            let result = api
+                .provider_oauth_callback(&Location::default(), &provider_id, method, Some(&code))
+                .await;
+            oauth_settled(app, api, &provider_id, flow, result, true).await;
         }
         Effect::SessionDelete { session_id } => {
             let error = api
@@ -1062,15 +1176,48 @@ mod tests {
     }
 
     /// A `FakeApi` scripting the fork endpoint and (optionally) failing
-    /// the first bootstrap call (spec §8.1).
+    /// the first bootstrap call (spec §8.1), plus the provider OAuth
+    /// endpoints.
     struct FakeApi {
         fork_result: Result<alforria_schema::session_v1::V1SessionInfo, String>,
         fail_bootstrap: bool,
+        /// `provider.oauth.authorize`'s result.
+        oauth_authorize: Result<Value, String>,
+        /// A pasted code equal to this succeeds and releases the waiting
+        /// no-code callback, as the server does; other codes are rejected.
+        oauth_good_code: &'static str,
+        /// What the waiting no-code callback resolves with once released.
+        oauth_wait: std::sync::Mutex<Result<bool, String>>,
+        oauth_release: tokio::sync::Notify,
+        /// Every callback's code (`None` for the waiting call).
+        oauth_calls: std::sync::Mutex<Vec<Option<String>>>,
+        /// `path.get` calls — one per bootstrap attempt.
+        bootstraps: std::sync::atomic::AtomicUsize,
+        /// `auth.remove` calls.
+        removed: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl Default for FakeApi {
+        fn default() -> Self {
+            FakeApi {
+                fork_result: Ok(forked_session()),
+                fail_bootstrap: false,
+                oauth_authorize: Ok(Value::Null),
+                oauth_good_code: "good-code",
+                oauth_wait: std::sync::Mutex::new(Ok(true)),
+                oauth_release: tokio::sync::Notify::new(),
+                oauth_calls: std::sync::Mutex::new(Vec::new()),
+                bootstraps: std::sync::atomic::AtomicUsize::new(0),
+                removed: std::sync::Mutex::new(Vec::new()),
+            }
+        }
     }
 
     #[async_trait]
     impl ServerApi for FakeApi {
         async fn path_get(&self, _loc: &Location) -> Result<Value> {
+            self.bootstraps
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if self.fail_bootstrap {
                 return Err(anyhow::anyhow!("connect refused"));
             }
@@ -1318,6 +1465,48 @@ mod tests {
         async fn auth_set(&self, _loc: &Location, _provider_id: &str, _key: &str) -> Result<bool> {
             unreachable!("not under test")
         }
+        async fn auth_remove(&self, _loc: &Location, provider_id: &str) -> Result<bool> {
+            self.removed.lock().unwrap().push(provider_id.to_string());
+            Ok(true)
+        }
+        async fn provider_oauth_authorize(
+            &self,
+            _loc: &Location,
+            _provider_id: &str,
+            _method: usize,
+        ) -> Result<Value> {
+            self.oauth_authorize.clone().map_err(|e| anyhow::anyhow!(e))
+        }
+        async fn provider_oauth_callback(
+            &self,
+            _loc: &Location,
+            _provider_id: &str,
+            _method: usize,
+            code: Option<&str>,
+        ) -> Result<bool> {
+            self.oauth_calls
+                .lock()
+                .unwrap()
+                .push(code.map(str::to_string));
+            match code {
+                Some(code) if code == self.oauth_good_code => {
+                    self.oauth_release.notify_one();
+                    Ok(true)
+                }
+                Some(_) => Err(anyhow::anyhow!(
+                    "{}",
+                    r#"server error: 400: {"name":"ProviderAuthOauthCallbackFailed","data":{}}"#
+                )),
+                None => {
+                    self.oauth_release.notified().await;
+                    self.oauth_wait
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .map_err(|e| anyhow::anyhow!(e))
+                }
+            }
+        }
     }
 
     fn forked_session() -> alforria_schema::session_v1::V1SessionInfo {
@@ -1359,6 +1548,7 @@ mod tests {
         let api: Arc<dyn ServerApi> = Arc::new(FakeApi {
             fork_result: Ok(forked_session()),
             fail_bootstrap: false,
+            ..FakeApi::default()
         });
         execute_effect(
             &app,
@@ -1386,6 +1576,7 @@ mod tests {
         let api: Arc<dyn ServerApi> = Arc::new(FakeApi {
             fork_result: Err("fork failed".into()),
             fail_bootstrap: false,
+            ..FakeApi::default()
         });
         execute_effect(
             &app,
@@ -1415,6 +1606,7 @@ mod tests {
         let api: Arc<dyn ServerApi> = Arc::new(FakeApi {
             fork_result: Ok(forked_session()),
             fail_bootstrap: true,
+            ..FakeApi::default()
         });
         execute_effect(&app, api, Effect::Bootstrap { fatal: true }).await;
         let app = app.lock().await;
@@ -1425,5 +1617,258 @@ mod tests {
             .as_deref()
             .expect("reason")
             .contains("connect refused"));
+    }
+
+    // ------------------------------------------------- provider oauth
+
+    const AUTH_URL: &str =
+        "https://console.test/cli?redirect_uri=http%3A%2F%2F127.0.0.1%3A4242%2Fcallback&state=s";
+
+    fn oauth_api(method: &str) -> Arc<FakeApi> {
+        Arc::new(FakeApi {
+            // The post-sign-in bootstrap fails fast; only its attempt counts.
+            fail_bootstrap: true,
+            oauth_authorize: Ok(serde_json::json!({
+                "url": AUTH_URL,
+                "method": method,
+                "instructions": "Finish signing in in the browser tab that opened.",
+            })),
+            ..FakeApi::default()
+        })
+    }
+
+    fn oauth_app() -> (
+        Arc<tokio::sync::Mutex<App>>,
+        Arc<crate::browser::RecordingBrowser>,
+    ) {
+        let mut app = fake_app();
+        let browser = Arc::new(crate::browser::RecordingBrowser::default());
+        app.browser = browser.clone();
+        (Arc::new(tokio::sync::Mutex::new(app)), browser)
+    }
+
+    fn authorize_effect() -> Effect {
+        Effect::ProviderOauthAuthorize {
+            provider_id: "libertai".into(),
+            method: 0,
+            title: "Sign in with LibertAI".into(),
+        }
+    }
+
+    /// Run the authorize effect on its own task (it waits on the no-code
+    /// callback) until its sign-in dialog is up; returns the task and the
+    /// dialog's flow id.
+    async fn start_oauth(
+        app: &Arc<tokio::sync::Mutex<App>>,
+        api: &Arc<FakeApi>,
+    ) -> (tokio::task::JoinHandle<()>, u64) {
+        let task = {
+            let (app, api) = (app.clone(), api.clone() as Arc<dyn ServerApi>);
+            tokio::spawn(async move { execute_effect(&app, api, authorize_effect()).await })
+        };
+        for _ in 0..200 {
+            if let Some(crate::state::PendingDialog::ProviderOauth { flow, .. }) =
+                app.lock().await.ui.dialogs.top_kind()
+            {
+                return (task, *flow);
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("the sign-in dialog never opened");
+    }
+
+    fn paste_effect(flow: u64, code: &str) -> Effect {
+        Effect::ProviderOauthCallback {
+            provider_id: "libertai".into(),
+            method: 0,
+            flow,
+            code: code.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn oauth_auto_shows_the_url_opens_the_browser_and_waits() {
+        let (app, browser) = oauth_app();
+        let api = oauth_api("auto");
+        let (task, _) = start_oauth(&app, &api).await;
+        {
+            let app = app.lock().await;
+            let Some(crate::state::PendingDialog::ProviderOauth {
+                url,
+                title,
+                auto,
+                instructions,
+                ..
+            }) = app.ui.dialogs.top_kind()
+            else {
+                unreachable!()
+            };
+            assert_eq!(url, AUTH_URL);
+            assert_eq!(title, "Sign in with LibertAI");
+            assert!(*auto);
+            assert!(instructions.starts_with("Finish signing in"));
+        }
+        assert_eq!(browser.opened.lock().unwrap().clone(), vec![AUTH_URL]);
+        // The no-code callback is in flight and the UI isn't blocked on it.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!task.is_finished());
+        assert_eq!(api.oauth_calls.lock().unwrap().clone(), vec![None]);
+
+        // The browser redirect lands: the wait resolves.
+        api.oauth_release.notify_one();
+        task.await.unwrap();
+        let app = app.lock().await;
+        assert_eq!(app.ui.toasts[0].variant, ToastVariant::Success);
+        assert_eq!(app.ui.toasts[0].message, "Signed in to libertai");
+        assert_eq!(
+            api.bootstraps.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "providers and models refresh once"
+        );
+        assert!(matches!(
+            app.ui.dialogs.top_kind(),
+            Some(crate::state::PendingDialog::Model)
+        ));
+        assert_eq!(app.ui.oauth_flow, None);
+    }
+
+    #[tokio::test]
+    async fn oauth_pasted_code_finishes_the_flow_once() {
+        let (app, _) = oauth_app();
+        let api = oauth_api("auto");
+        let (task, flow) = start_oauth(&app, &api).await;
+
+        // A rejected paste flags the dialog; the wait goes on.
+        execute_effect(&app, api.clone(), paste_effect(flow, "wrong")).await;
+        {
+            let app = app.lock().await;
+            assert!(matches!(
+                app.ui.dialogs.top_kind(),
+                Some(crate::state::PendingDialog::ProviderOauth { rejected: true, .. })
+            ));
+            assert!(app.ui.toasts.is_empty());
+        }
+        assert!(!task.is_finished());
+
+        // An accepted paste settles it — and wakes the wait, which then
+        // finds the flow settled and does nothing more.
+        execute_effect(&app, api.clone(), paste_effect(flow, "good-code")).await;
+        task.await.unwrap();
+        let app = app.lock().await;
+        assert_eq!(app.ui.toasts.len(), 1);
+        assert_eq!(app.ui.toasts[0].message, "Signed in to libertai");
+        assert_eq!(api.bootstraps.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(matches!(
+            app.ui.dialogs.top_kind(),
+            Some(crate::state::PendingDialog::Model)
+        ));
+    }
+
+    #[tokio::test]
+    async fn oauth_failed_wait_offers_retry_or_api_key() {
+        let (app, _) = oauth_app();
+        let api = oauth_api("auto");
+        *api.oauth_wait.lock().unwrap() = Err(
+            r#"server error: 400: {"name":"ProviderAuthOauthCallbackFailed","data":{}}"#.into(),
+        );
+        let (task, _) = start_oauth(&app, &api).await;
+        api.oauth_release.notify_one();
+        task.await.unwrap();
+        let app = app.lock().await;
+        assert_eq!(app.ui.toasts[0].variant, ToastVariant::Error);
+        assert_eq!(
+            app.ui.toasts[0].message,
+            "Sign-in failed. Try again, or use an API key."
+        );
+        assert_eq!(
+            app.ui.dialogs.top_kind(),
+            Some(&crate::state::PendingDialog::ProviderAuthMethod {
+                provider_id: "libertai".into()
+            })
+        );
+        assert_eq!(api.bootstraps.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn oauth_wait_failing_after_dismissal_stays_quiet() {
+        let (app, _) = oauth_app();
+        let api = oauth_api("auto");
+        *api.oauth_wait.lock().unwrap() = Err("timed out".into());
+        let (task, _) = start_oauth(&app, &api).await;
+        crate::ui::dialogs::clear(&mut *app.lock().await);
+        api.oauth_release.notify_one();
+        task.await.unwrap();
+        let app = app.lock().await;
+        assert!(app.ui.toasts.is_empty());
+        assert!(app.ui.dialogs.is_empty());
+        assert_eq!(app.ui.oauth_flow, None);
+    }
+
+    #[tokio::test]
+    async fn oauth_code_method_is_a_paste_prompt_only() {
+        let (app, browser) = oauth_app();
+        let api = oauth_api("code");
+        execute_effect(&app, api.clone(), authorize_effect()).await;
+        let flow = {
+            let app = app.lock().await;
+            let Some(crate::state::PendingDialog::ProviderOauth { auto, flow, .. }) =
+                app.ui.dialogs.top_kind()
+            else {
+                panic!("no sign-in dialog");
+            };
+            assert!(!auto);
+            *flow
+        };
+        assert!(browser.opened.lock().unwrap().is_empty());
+        assert!(
+            api.oauth_calls.lock().unwrap().is_empty(),
+            "no waiting call"
+        );
+
+        execute_effect(&app, api.clone(), paste_effect(flow, "good-code")).await;
+        assert_eq!(
+            api.oauth_calls.lock().unwrap().clone(),
+            vec![Some("good-code".to_string())]
+        );
+        assert_eq!(
+            app.lock().await.ui.toasts[0].message,
+            "Signed in to libertai"
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_authorize_failure_returns_to_the_method_list() {
+        let (app, _) = oauth_app();
+        let api = Arc::new(FakeApi {
+            oauth_authorize: Err("server error: 500: defect".into()),
+            ..FakeApi::default()
+        });
+        execute_effect(&app, api, authorize_effect()).await;
+        let app = app.lock().await;
+        assert_eq!(app.ui.toasts[0].variant, ToastVariant::Error);
+        assert!(app.ui.toasts[0].message.contains("defect"));
+        assert!(matches!(
+            app.ui.dialogs.top_kind(),
+            Some(crate::state::PendingDialog::ProviderAuthMethod { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn auth_remove_signs_out_and_refreshes() {
+        let (app, _) = oauth_app();
+        let api = oauth_api("auto");
+        execute_effect(
+            &app,
+            api.clone(),
+            Effect::AuthRemove {
+                provider_id: "libertai".into(),
+            },
+        )
+        .await;
+        assert_eq!(api.removed.lock().unwrap().clone(), vec!["libertai"]);
+        assert_eq!(api.bootstraps.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let app = app.lock().await;
+        assert_eq!(app.ui.toasts[0].variant, ToastVariant::Success);
+        assert_eq!(app.ui.toasts[0].message, "Signed out of libertai");
     }
 }

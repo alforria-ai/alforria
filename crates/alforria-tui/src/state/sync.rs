@@ -2015,6 +2015,26 @@ mod tests {
         async fn auth_set(&self, _loc: &Location, _provider_id: &str, _key: &str) -> Result<bool> {
             Ok(true)
         }
+        async fn auth_remove(&self, _loc: &Location, _provider_id: &str) -> Result<bool> {
+            unreachable!("not under test")
+        }
+        async fn provider_oauth_authorize(
+            &self,
+            _loc: &Location,
+            _provider_id: &str,
+            _method: usize,
+        ) -> Result<Value> {
+            unreachable!("not under test")
+        }
+        async fn provider_oauth_callback(
+            &self,
+            _loc: &Location,
+            _provider_id: &str,
+            _method: usize,
+            _code: Option<&str>,
+        ) -> Result<bool> {
+            unreachable!("not under test")
+        }
     }
 
     #[tokio::test]

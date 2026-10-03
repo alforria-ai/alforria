@@ -328,6 +328,25 @@ pub trait ServerApi: Send + Sync {
     ) -> Result<bool>;
     async fn question_reject(&self, loc: &Location, request_id: &str) -> Result<bool>;
     async fn auth_set(&self, loc: &Location, provider_id: &str, key: &str) -> Result<bool>;
+    /// `auth.remove`.
+    async fn auth_remove(&self, loc: &Location, provider_id: &str) -> Result<bool>;
+    /// `provider.oauth.authorize` — the `ProviderAuthAuthorization`, or
+    /// `null` for a non-oauth method.
+    async fn provider_oauth_authorize(
+        &self,
+        loc: &Location,
+        provider_id: &str,
+        method: usize,
+    ) -> Result<Value>;
+    /// `provider.oauth.callback` — without `code` it waits for the
+    /// provider's own redirect (an `auto` flow), however long that takes.
+    async fn provider_oauth_callback(
+        &self,
+        loc: &Location,
+        provider_id: &str,
+        method: usize,
+        code: Option<&str>,
+    ) -> Result<bool>;
 }
 
 /// reqwest production impl of [`ServerApi`].
@@ -848,6 +867,51 @@ impl ServerApi for HttpServerApi {
         .json()
         .await
         .context("auth set response body read failed")
+    }
+
+    async fn auth_remove(&self, loc: &Location, provider_id: &str) -> Result<bool> {
+        self.json(
+            Method::DELETE,
+            &format!("/auth/{provider_id}"),
+            loc,
+            &[],
+            None,
+        )
+        .await
+    }
+
+    async fn provider_oauth_authorize(
+        &self,
+        loc: &Location,
+        provider_id: &str,
+        method: usize,
+    ) -> Result<Value> {
+        let body = json!({ "method": method });
+        self.post(
+            &format!("/provider/{provider_id}/oauth/authorize"),
+            loc,
+            Some(body),
+        )
+        .await
+    }
+
+    async fn provider_oauth_callback(
+        &self,
+        loc: &Location,
+        provider_id: &str,
+        method: usize,
+        code: Option<&str>,
+    ) -> Result<bool> {
+        let mut body = json!({ "method": method });
+        if let Some(code) = code {
+            body["code"] = json!(code);
+        }
+        self.post(
+            &format!("/provider/{provider_id}/oauth/callback"),
+            loc,
+            Some(body),
+        )
+        .await
     }
 }
 

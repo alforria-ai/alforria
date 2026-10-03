@@ -799,3 +799,54 @@ async fn error_responses_are_rejected() {
         "error names the route: {error}"
     );
 }
+
+#[tokio::test]
+async fn provider_oauth_requests_match_the_frozen_routes() {
+    let mut responses: BTreeMap<String, Value> = BTreeMap::new();
+    responses.insert(
+        "POST /provider/libertai/oauth/authorize".to_string(),
+        json!({"url": "https://console.test/cli", "method": "auto", "instructions": "i"}),
+    );
+    responses.insert(
+        "POST /provider/libertai/oauth/callback".to_string(),
+        json!(true),
+    );
+    responses.insert("DELETE /auth/libertai".to_string(), json!(true));
+    let (addr, recorder) = Recorder::spawn(responses, BTreeMap::new()).await;
+    let api = api(addr);
+
+    let authorization = api
+        .provider_oauth_authorize(EMPTY_LOC, "libertai", 0)
+        .await
+        .expect("ok");
+    assert_eq!(authorization["method"], "auto");
+    assert!(api
+        .provider_oauth_callback(EMPTY_LOC, "libertai", 0, None)
+        .await
+        .expect("ok"));
+    assert!(api
+        .provider_oauth_callback(EMPTY_LOC, "libertai", 0, Some("code=c&state=s"))
+        .await
+        .expect("ok"));
+
+    // Sign-out.
+    assert!(api.auth_remove(EMPTY_LOC, "libertai").await.expect("ok"));
+
+    let mut requests = recorder.recorded();
+    assert_against_frozen_routes(&requests);
+    let remove = requests.pop().expect("auth.remove");
+    assert_eq!(
+        (remove.method.as_str(), remove.path.as_str()),
+        ("DELETE", "/auth/libertai")
+    );
+    let bodies: Vec<&Value> = requests.iter().map(|request| &request.body).collect();
+    assert_eq!(
+        bodies,
+        [
+            &json!({"method": 0}),
+            // No code: wait for the provider's own redirect.
+            &json!({"method": 0}),
+            &json!({"method": 0, "code": "code=c&state=s"}),
+        ]
+    );
+}

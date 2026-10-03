@@ -158,9 +158,29 @@ pub enum PendingDialog {
     /// (`dialog-provider.tsx:129-141`).
     ProviderCustomId,
     /// `Select auth method` (`dialog-provider.tsx:166-175`); the "api"
-    /// method continues into [`PendingDialog::ProviderApiKey`].
+    /// method continues into [`PendingDialog::ProviderApiKey`], an
+    /// "oauth" method into [`PendingDialog::ProviderOauth`].
     ProviderAuthMethod {
         provider_id: String,
+    },
+    /// An OAuth sign-in in progress — `AutoMethod` / `CodeMethod`
+    /// (`dialog-provider.tsx:227-349`). `method: "auto"` shows the URL
+    /// while the no-code callback waits, and the input takes a pasted
+    /// redirect (a browser on another machine can't reach the server's
+    /// loopback); `method: "code"` is the paste input alone.
+    ProviderOauth {
+        provider_id: String,
+        /// The auth-method index (`callback({ method })`).
+        method: usize,
+        /// This sign-in's id — results of an older flow are dropped.
+        flow: u64,
+        title: String,
+        url: String,
+        instructions: String,
+        /// `authorization.method === "auto"`.
+        auto: bool,
+        /// The last pasted code was rejected (`Invalid code`).
+        rejected: bool,
     },
     /// The "api" auth-method prompt (`ApiMethod`,
     /// `dialog-provider.tsx:209-217`) — the entered key is stored through
@@ -418,6 +438,11 @@ pub struct UiState {
     /// `docs.open` etc. print their URL instead of opening a browser
     /// (spec §6 N6) — collected by the runtime after the loop.
     pub opened_urls: Vec<String>,
+    /// The OAuth sign-in still waiting for its result — the
+    /// [`PendingDialog::ProviderOauth`] `flow`; `None` once it settled.
+    pub oauth_flow: Option<u64>,
+    /// The last allocated OAuth flow id.
+    pub oauth_seq: u64,
     /// The transcript scrollbox (spec §7.2).
     pub session_scroll: SessionScroll,
     /// `session_mounted` — the sessionID whose mount effect already
@@ -618,6 +643,25 @@ pub enum Effect {
     /// `auth.set` (`dialog-provider.tsx:405-412`) — store the entered API
     /// key for the provider, then re-bootstrap.
     AuthSet { provider_id: String, key: String },
+    /// `auth.remove` — sign out of / drop the auth.json credential (the
+    /// server also revokes a LibertAI session), then re-bootstrap.
+    AuthRemove { provider_id: String },
+    /// `provider.oauth.authorize` (`dialog-provider.tsx:184-205`), then
+    /// for `method: "auto"` the no-code `provider.oauth.callback` wait
+    /// (`AutoMethod` onMount, `dialog-provider.tsx:263-282`).
+    ProviderOauthAuthorize {
+        provider_id: String,
+        method: usize,
+        title: String,
+    },
+    /// `provider.oauth.callback` with a pasted code (`CodeMethod`
+    /// onConfirm, and the remote-browser fallback of an auto flow).
+    ProviderOauthCallback {
+        provider_id: String,
+        method: usize,
+        flow: u64,
+        code: String,
+    },
     /// `session.delete` (`dialog-session-list.tsx:248-262`).
     SessionDelete { session_id: String },
     /// `local.mcp.toggle(name)` + `mcp.status` refresh
@@ -668,6 +712,8 @@ pub struct App {
     /// The attention seam (spec §2.3) — terminal BEL/OSC 9 in
     /// production, a recorder in tests.
     pub attention: std::sync::Arc<dyn crate::attention::Attention>,
+    /// The browser seam — provider sign-in URLs; a recorder in tests.
+    pub browser: std::sync::Arc<dyn crate::browser::Browser>,
     /// Bumped on every update — the redraw signal (§2.1).
     pub version: u64,
 }
@@ -712,6 +758,12 @@ impl App {
             config,
             keymap,
             attention: crate::attention::terminal_attention(),
+            // Unit tests never launch a real browser.
+            browser: if cfg!(test) {
+                std::sync::Arc::new(crate::browser::RecordingBrowser::default())
+            } else {
+                crate::browser::system_browser()
+            },
             version: 0,
         }
     }
@@ -890,7 +942,9 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             // (`prompt/index.tsx:1402-1405`); an empty paste falls back
             // to the clipboard-paste command (the win32 image quirk).
             let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-            if normalized.trim().is_empty() {
+            if crate::ui::dialogs::paste(app, &normalized) {
+                // A text-input dialog on top took it.
+            } else if normalized.trim().is_empty() {
                 effects.extend(crate::command::run(app, "prompt.paste"));
             } else {
                 prompt::paste_input_text(app, &normalized);

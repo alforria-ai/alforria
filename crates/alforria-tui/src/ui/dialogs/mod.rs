@@ -370,6 +370,7 @@ pub fn handle_key(app: &mut App, key: &crossterm::event::KeyEvent) -> Vec<Effect
         PendingDialog::SessionRename { .. }
         | PendingDialog::ProviderCustomId
         | PendingDialog::ProviderApiKey { .. } => prompt_key(app, key),
+        PendingDialog::ProviderOauth { .. } => oauth_key(app, key),
         PendingDialog::ExportOptions => export_key(app, key),
         PendingDialog::Alert {
             exit_on_confirm, ..
@@ -492,6 +493,106 @@ fn prompt_key(app: &mut App, key: &crossterm::event::KeyEvent) -> Vec<Effect> {
         }
     }
     Vec::new()
+}
+
+/// The OAuth sign-in dialog: the input takes the pasted redirect or code
+/// and the prompt submit sends it (the dialog stays up until the flow
+/// settles); `ctrl+y` copies the URL — `c` in `AutoMethod`
+/// (`dialog-provider.tsx:243-256`), moved off a printable key because
+/// this dialog types; escape closes without cancelling the server-side
+/// wait.
+fn oauth_key(app: &mut App, key: &crossterm::event::KeyEvent) -> Vec<Effect> {
+    let Some(PendingDialog::ProviderOauth {
+        provider_id,
+        method,
+        flow,
+        url,
+        ..
+    }) = app.ui.dialogs.top_kind().cloned()
+    else {
+        return Vec::new();
+    };
+    if app.keymap.matches("dialog.prompt.submit", key) {
+        let Some(frame) = app.ui.dialogs.top_mut() else {
+            return Vec::new();
+        };
+        let code = frame.input.trim().to_string();
+        if code.is_empty() {
+            return Vec::new();
+        }
+        frame.input.clear();
+        if let PendingDialog::ProviderOauth { rejected, .. } = &mut frame.kind {
+            *rejected = false;
+        }
+        return vec![Effect::ProviderOauthCallback {
+            provider_id,
+            method,
+            flow,
+            code,
+        }];
+    }
+    if key.code == crossterm::event::KeyCode::Esc || is_ctrl_c(key) {
+        app.ui.dialogs.stack.pop();
+        return Vec::new();
+    }
+    if key.code == crossterm::event::KeyCode::Char('y')
+        && key
+            .modifiers
+            .contains(crossterm::event::KeyModifiers::CONTROL)
+    {
+        return vec![Effect::ClipboardWrite {
+            text: url,
+            success: Some(Toast {
+                title: None,
+                variant: ToastVariant::Info,
+                message: "Copied to clipboard".to_string(),
+                duration_ms: 5000,
+            }),
+            failure: Some(Toast {
+                title: None,
+                variant: ToastVariant::Error,
+                message: "Failed to copy to clipboard".to_string(),
+                duration_ms: 5000,
+            }),
+        }];
+    }
+    if let Some(frame) = app.ui.dialogs.top_mut() {
+        match key.code {
+            crossterm::event::KeyCode::Backspace => {
+                frame.input.pop();
+            }
+            _ => {
+                if let Some(char) = typed_char(key) {
+                    frame.input.push(char);
+                }
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// A bracketed paste while a text-input dialog is on top lands in its
+/// input (single line) instead of the session prompt behind it. `false`
+/// when no such dialog is open.
+pub fn paste(app: &mut App, text: &str) -> bool {
+    let takes_text = matches!(
+        app.ui.dialogs.top_kind(),
+        Some(
+            PendingDialog::SessionRename { .. }
+                | PendingDialog::ProviderCustomId
+                | PendingDialog::ProviderApiKey { .. }
+                | PendingDialog::ProviderOauth { .. }
+        )
+    );
+    if !takes_text {
+        return false;
+    }
+    if let Some(frame) = app.ui.dialogs.top_mut() {
+        frame
+            .input
+            .extend(text.chars().filter(|char| *char != '\n'));
+    }
+    true
 }
 
 /// `DialogPrompt.onConfirm` for the two prompt dialogs.
@@ -875,6 +976,7 @@ fn is_select_kind(kind: &PendingDialog) -> bool {
             | PendingDialog::SessionRename { .. }
             | PendingDialog::ProviderCustomId
             | PendingDialog::ProviderApiKey { .. }
+            | PendingDialog::ProviderOauth { .. }
             | PendingDialog::UpdateAvailable { .. }
             | PendingDialog::ShareConsent { .. }
             | PendingDialog::WorkspaceUnavailable
@@ -1386,10 +1488,26 @@ fn submit(app: &mut App, kind: &PendingDialog) -> Vec<Effect> {
             );
         }
         PendingDialog::ProviderAuthMethod { provider_id } => {
-            // `method.type === "api"` (`dialog-provider.tsx:209-217`) — the
-            // api-key prompt. OAuth methods need the plugin-hook authorize
-            // flow (`provider.oauth.authorize`), still a recorded seam gap.
             let provider_id = provider_id.clone();
+            let value = option.value.unwrap_or_default();
+            if value == model::SIGN_OUT_OPTION_VALUE {
+                crate::ui::dialogs::clear(app);
+                return vec![Effect::AuthRemove { provider_id }];
+            }
+            let method = model::auth_method(app, &provider_id, &value);
+            // `method.type === "oauth"` (`dialog-provider.tsx:174-206`) —
+            // authorize, then the auto/code sign-in dialog. Method prompts
+            // are not collected: no built-in hook declares any.
+            if let Some(method) = method.filter(|method| method["type"] == "oauth") {
+                crate::ui::dialogs::clear(app);
+                return vec![Effect::ProviderOauthAuthorize {
+                    provider_id,
+                    method: value.parse().unwrap_or_default(),
+                    title: method["label"].as_str().unwrap_or("Sign in").to_string(),
+                }];
+            }
+            // `method.type === "api"` (`dialog-provider.tsx:209-217`) — the
+            // api-key prompt.
             return open(app, PendingDialog::ProviderApiKey { provider_id });
         }
         PendingDialog::Subagent { session_id } => {
@@ -1620,6 +1738,76 @@ fn content_lines(app: &App, dialog: &DialogFrame, theme: &Theme) -> Vec<Line<'st
                     Style::new().fg(theme.text.to_color()),
                 ),
             ]
+        }
+        PendingDialog::ProviderOauth {
+            title,
+            url,
+            instructions,
+            auto,
+            rejected,
+            ..
+        } => {
+            let muted = Style::new().fg(theme.text_muted.to_color());
+            let text = Style::new().fg(theme.text.to_color());
+            // Every row spans the frame (4-column gutters like the header),
+            // so nothing behind the dialog shows through.
+            let inner = (width as usize).saturating_sub(8).max(4);
+            let row = |spans: Vec<(String, Style)>| {
+                let used: usize = spans.iter().map(|(t, _)| t.chars().count()).sum();
+                let mut out = vec![Span::raw("    ")];
+                out.extend(spans.into_iter().map(|(t, style)| Span::styled(t, style)));
+                out.push(Span::raw(
+                    " ".repeat((width as usize).saturating_sub(4 + used)),
+                ));
+                Line::from(out)
+            };
+            let mut lines = vec![primitives::header_line(theme, title, "esc", width)];
+            // The URL hard-wraps: clipped, it could not be copied by hand.
+            let url_chars: Vec<char> = url.chars().collect();
+            for chunk in url_chars.chunks(inner) {
+                lines.push(row(vec![(
+                    chunk.iter().collect(),
+                    Style::new().fg(theme.primary.to_color()),
+                )]));
+            }
+            lines.push(row(Vec::new()));
+            let mut wrapped = Vec::new();
+            primitives::wrap_text(instructions, inner as u16, &mut wrapped, muted);
+            for line in wrapped {
+                let content: String = line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect();
+                lines.push(row(vec![(content, muted)]));
+            }
+            if *auto {
+                lines.push(row(Vec::new()));
+                lines.push(row(vec![("Waiting for authorization…".to_string(), muted)]));
+            }
+            lines.push(row(Vec::new()));
+            lines.push(if dialog.input.is_empty() {
+                row(vec![("Paste the address or code here".to_string(), muted)])
+            } else {
+                // The tail stays visible as the paste grows.
+                let input: Vec<char> = dialog.input.chars().collect();
+                let tail = &input[input.len().saturating_sub(inner)..];
+                row(vec![(tail.iter().collect(), text)])
+            });
+            if *rejected {
+                lines.push(row(vec![(
+                    "Invalid code".to_string(),
+                    Style::new().fg(theme.error.to_color()),
+                )]));
+            }
+            lines.push(row(Vec::new()));
+            lines.push(row(vec![
+                ("enter ".to_string(), text),
+                ("submit  ".to_string(), muted),
+                ("ctrl+y ".to_string(), text),
+                ("copy link".to_string(), muted),
+            ]));
+            lines
         }
         PendingDialog::UpdateAvailable { version } => {
             let mut lines = vec![primitives::header_line(

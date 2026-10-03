@@ -447,3 +447,213 @@ fn dialog_backdrop_dims_the_text_behind_it() {
         theme.background_panel.to_color()
     );
 }
+
+// ------------------------------------------------------ provider oauth
+
+fn key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Vec<Effect> {
+    update(
+        app,
+        crate::state::Msg::Key(crossterm::event::KeyEvent::new(code, modifiers)),
+    )
+}
+
+fn with_libertai_methods(app: &mut App) {
+    app.state.sync.provider_auth.insert(
+        "libertai".to_string(),
+        vec![
+            serde_json::json!({"type": "oauth", "label": "Sign in with LibertAI"}),
+            serde_json::json!({"type": "api", "label": "API key"}),
+        ],
+    );
+}
+
+const LONG_URL: &str = "https://console.libertai.io/cli?redirect_uri=http%3A%2F%2F127.0.0.1%3A41234%2Fcallback&state=AbCdEfGhIjKlMnOpQrStUv&challenge=0123456789abcdefghijklmnopqrstuvwxyzABCDEFG&client=Alforria";
+
+fn oauth_dialog(auto: bool, rejected: bool) -> PendingDialog {
+    PendingDialog::ProviderOauth {
+        provider_id: "libertai".to_string(),
+        method: 0,
+        flow: 7,
+        title: "Sign in with LibertAI".to_string(),
+        url: LONG_URL.to_string(),
+        instructions: "Finish signing in in the browser tab that opened. If your browser runs on another machine, paste the address it lands on.".to_string(),
+        auto,
+        rejected,
+    }
+}
+
+#[test]
+fn auth_method_selection_routes_oauth_and_api() {
+    let mut app = new_app();
+    with_libertai_methods(&mut app);
+
+    // The oauth method authorizes (`dialog-provider.tsx:184-205`).
+    open(
+        &mut app,
+        PendingDialog::ProviderAuthMethod {
+            provider_id: "libertai".to_string(),
+        },
+    );
+    let effects = key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::ProviderOauthAuthorize { provider_id, method: 0, title }]
+            if provider_id == "libertai" && title == "Sign in with LibertAI"
+    ));
+    assert!(app.ui.dialogs.is_empty());
+
+    // The api method opens the key prompt.
+    open(
+        &mut app,
+        PendingDialog::ProviderAuthMethod {
+            provider_id: "libertai".to_string(),
+        },
+    );
+    key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+    let effects = key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    assert!(effects.is_empty());
+    assert_eq!(
+        app.ui.dialogs.top_kind(),
+        Some(&PendingDialog::ProviderApiKey {
+            provider_id: "libertai".to_string()
+        })
+    );
+}
+
+#[test]
+fn oauth_dialog_takes_a_pasted_redirect() {
+    let mut app = new_app();
+    open(&mut app, oauth_dialog(true, true));
+
+    // A bracketed paste lands in the dialog input, on one line.
+    update(
+        &mut app,
+        crate::state::Msg::Paste("http://127.0.0.1:41234/callback?code=abc&state=xyz\n".into()),
+    );
+    assert_eq!(
+        app.ui.dialogs.top().unwrap().input,
+        "http://127.0.0.1:41234/callback?code=abc&state=xyz"
+    );
+
+    // Submit sends it; the dialog stays up (the flow settles it) with the
+    // input cleared and the previous rejection reset.
+    let effects = key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::ProviderOauthCallback { provider_id, method: 0, flow: 7, code }]
+            if provider_id == "libertai"
+                && code == "http://127.0.0.1:41234/callback?code=abc&state=xyz"
+    ));
+    let frame = app.ui.dialogs.top().unwrap();
+    assert!(frame.input.is_empty());
+    assert!(matches!(
+        frame.kind,
+        PendingDialog::ProviderOauth {
+            rejected: false,
+            ..
+        }
+    ));
+
+    // Nothing to submit → nothing sent; typed text goes in too.
+    assert!(key(&mut app, KeyCode::Enter, KeyModifiers::NONE).is_empty());
+    key(&mut app, KeyCode::Char('a'), KeyModifiers::NONE);
+    key(&mut app, KeyCode::Char('b'), KeyModifiers::NONE);
+    key(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+    assert_eq!(app.ui.dialogs.top().unwrap().input, "a");
+
+    // ctrl+y copies the link; escape closes.
+    let effects = key(&mut app, KeyCode::Char('y'), KeyModifiers::CONTROL);
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::ClipboardWrite { text, .. }] if text == LONG_URL
+    ));
+    key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+    assert!(app.ui.dialogs.is_empty());
+}
+
+#[test]
+fn paste_lands_in_prompt_dialogs_not_behind_them() {
+    let mut app = new_app();
+    open(
+        &mut app,
+        PendingDialog::ProviderApiKey {
+            provider_id: "libertai".to_string(),
+        },
+    );
+    update(&mut app, crate::state::Msg::Paste("LTAI_secret".into()));
+    assert_eq!(app.ui.dialogs.top().unwrap().input, "LTAI_secret");
+
+    // A select dialog doesn't take text: the paste goes to the prompt.
+    open(&mut app, PendingDialog::Model);
+    assert!(!paste(&mut app, "text"));
+}
+
+#[test]
+fn oauth_dialog_renders_the_link_instructions_and_state() {
+    for width in [80u16, 140] {
+        let mut app = new_app();
+        open(&mut app, oauth_dialog(true, true));
+        let text = rendered_text(&render_lines(&mut app, width, 40));
+        assert!(text.contains("Sign in with LibertAI"), "{text}");
+        assert!(text.contains("it lands on."), "{text}");
+        assert!(text.contains("Waiting for authorization…"), "{text}");
+        assert!(text.contains("Paste the address or code here"), "{text}");
+        assert!(text.contains("Invalid code"), "{text}");
+        assert!(text.contains("ctrl+y"), "{text}");
+        // The URL wraps rather than clipping: its head and tail both show.
+        assert!(text.contains("https://console.libertai.io/cli?"), "{text}");
+        assert!(text.contains("client=Alforria"), "{text}");
+
+        // The code method has no waiting line.
+        open(&mut app, oauth_dialog(false, false));
+        let text = rendered_text(&render_lines(&mut app, width, 40));
+        assert!(!text.contains("Waiting for authorization…"), "{text}");
+        assert!(!text.contains("Invalid code"), "{text}");
+    }
+}
+
+fn with_connected(app: &mut App) {
+    app.state.sync.provider_next = serde_json::json!({
+        "all": [
+            {"id": "libertai", "name": "LibertAI", "source": "api"},
+            {"id": "anthropic", "name": "Anthropic", "source": "api"},
+            {"id": "openai", "name": "OpenAI", "source": "env"},
+        ],
+        "connected": ["libertai", "anthropic", "openai"],
+    });
+}
+
+#[test]
+fn stored_credentials_offer_sign_out() {
+    let mut app = new_app();
+    with_libertai_methods(&mut app);
+    with_connected(&mut app);
+    let titles = |app: &App, id: &str| -> Vec<String> {
+        model::auth_method_options(app, id)
+            .into_iter()
+            .map(|option| option.title)
+            .collect()
+    };
+    assert_eq!(
+        titles(&app, "libertai"),
+        ["Sign in with LibertAI", "API key", "Sign out"]
+    );
+    // A key-only provider removes its key; an env key isn't ours to drop.
+    assert_eq!(titles(&app, "anthropic"), ["API key", "Remove API key"]);
+    assert_eq!(titles(&app, "openai"), ["API key"]);
+
+    open(
+        &mut app,
+        PendingDialog::ProviderAuthMethod {
+            provider_id: "libertai".to_string(),
+        },
+    );
+    key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+    key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+    let effects = key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::AuthRemove { provider_id }] if provider_id == "libertai"
+    ));
+    assert!(app.ui.dialogs.is_empty());
+}
