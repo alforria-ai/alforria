@@ -93,3 +93,15 @@ describe("hash routes", () => {
     expect(nav.view).toBe("overview")
   })
 })
+
+describe("review fixes", () => {
+  test("closing a column left of the active one keeps the same session active", () => {
+    openSession("a")
+    openSession("b", { mode: "beside" })
+    openSession("c", { mode: "beside" })
+    setActiveColumn(1)
+    closeColumn(0)
+    expect(sessions()).toEqual(["b", "c"])
+    expect(nav.active).toBe(0)
+  })
+})

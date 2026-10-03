@@ -23,9 +23,15 @@ const memos = createRoot(() => {
     const items = queueItems().filter((i) => !stamped[i.id])
     return items.find((i) => i.id === selected()) ?? items[0]
   })
-  return { queueItems, activeItem }
+  // Render by id: the Interrupt objects are rebuilt whenever any request
+  // changes, but a slip (and a half-answered question in it) must survive.
+  const queueIds = createMemo(() => queueItems().map((i) => i.id), [], {
+    equals: (a, b) => a.length === b.length && a.every((x, i) => x === b[i]),
+  })
+  const itemById = createMemo(() => new Map(queueItems().map((i) => [i.id, i])))
+  return { queueItems, activeItem, queueIds, itemById }
 })
-export const { queueItems, activeItem } = memos
+export const { queueItems, activeItem, queueIds, itemById } = memos
 
 export function Queue(props: {
   onOpenSession: (id: string) => void
@@ -129,18 +135,22 @@ export function Queue(props: {
             </div>
           }
         >
-          <For each={queueItems()}>
-            {(item) => (
-              <Slip
-                interrupt={item}
-                active={activeItem()?.id === item.id || !!stamped[item.id]}
-                arriving={arriving(item.id)}
-                onExpand={() => {
-                  setSelected(item.id)
-                  focusActive()
-                }}
-                onOpenSession={props.onOpenSession}
-              />
+          <For each={queueIds()}>
+            {(id) => (
+              <Show when={itemById().get(id)}>
+                {(item) => (
+                  <Slip
+                    interrupt={item()}
+                    active={activeItem()?.id === id || !!stamped[id]}
+                    arriving={arriving(id)}
+                    onExpand={() => {
+                      setSelected(id)
+                      focusActive()
+                    }}
+                    onOpenSession={props.onOpenSession}
+                  />
+                )}
+              </Show>
             )}
           </For>
         </Show>

@@ -17,6 +17,8 @@ if (!existsSync(path.join(dist, "index.html"))) {
 }
 
 rmSync(out, { force: true })
-await $`tar --zstd -cf ${out} -C ${dist} --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner --exclude=*.map .`
+// Interpolated, so Bun's shell passes the pattern to tar instead of globbing it.
+const exclude = "--exclude=*.map"
+await $`tar --zstd -cf ${out} -C ${dist} --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner ${exclude} .`
 const bytes = Bun.file(out).size
 console.log(`wrote ${path.relative(process.cwd(), out)} (${(bytes / 1024).toFixed(0)} KB)`)

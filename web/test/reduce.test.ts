@@ -233,3 +233,91 @@ describe("derive", () => {
     expect(fleetState(s, "ses")).toBe("fault")
   })
 })
+
+describe("review fixes", () => {
+  const assistant = (id: string, sessionID = "ses") =>
+    ({
+      id,
+      sessionID,
+      role: "assistant",
+      time: { created: 1 },
+      parentID: "x",
+      modelID: "m",
+      providerID: "p",
+      mode: "build",
+      agent: "build",
+      path: { cwd: "/p", root: "/p" },
+      cost: 0,
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    }) as never
+
+  test("a transcript reload keeps text that has streamed but not finished", () => {
+    const s = emptyState()
+    applyMessages(s, "ses", [
+      {
+        info: assistant("msg_1"),
+        parts: [
+          { id: "prt_1", sessionID: "ses", messageID: "msg_1", type: "text", text: "Hello wor", time: { start: 1 } },
+        ],
+      },
+    ])
+    // Mid-stream, the server's copy of an open text part is empty.
+    applyMessages(s, "ses", [
+      {
+        info: assistant("msg_1"),
+        parts: [{ id: "prt_1", sessionID: "ses", messageID: "msg_1", type: "text", text: "", time: { start: 1 } }],
+      },
+    ])
+    expect((s.part.prt_1 as { text: string }).text).toBe("Hello wor")
+    // A finished part from the server wins.
+    applyMessages(s, "ses", [
+      {
+        info: assistant("msg_1"),
+        parts: [
+          { id: "prt_1", sessionID: "ses", messageID: "msg_1", type: "text", text: "Hi", time: { start: 1, end: 2 } },
+        ],
+      },
+    ])
+    expect((s.part.prt_1 as { text: string }).text).toBe("Hi")
+  })
+
+  test("sessions nobody reads keep only their latest messages", () => {
+    const s = emptyState()
+    for (const id of ["msg_1", "msg_2", "msg_3", "msg_4"]) {
+      reduce(s, frame("message.updated", { sessionID: "ses", info: assistant(id) }))
+      reduce(
+        s,
+        frame("message.part.updated", {
+          sessionID: "ses",
+          time: 1,
+          part: { id: `p_${id}`, sessionID: "ses", messageID: id, type: "text", text: id },
+        }),
+      )
+    }
+    expect(s.messages.ses).toEqual(["msg_3", "msg_4"])
+    expect(s.part.p_msg_1).toBeUndefined()
+    // A late part for a trimmed message is not resurrected.
+    reduce(
+      s,
+      frame("message.part.updated", {
+        sessionID: "ses",
+        time: 1,
+        part: { id: "p_late", sessionID: "ses", messageID: "msg_1", type: "text", text: "x" },
+      }),
+    )
+    expect(s.part.p_late).toBeUndefined()
+  })
+
+  test("a snapshot keeps sessions a view has open, even beyond the list cutoff", () => {
+    const s = emptyState()
+    s.sessions.old = session("old")
+    s.loaded.old = true
+    s.sessions.gone = session("gone")
+    applySnapshot(
+      s,
+      [{ id: "prj", worktree: "/p", time: { created: 1, updated: 1 }, sandboxes: [] }],
+      [{ directory: "/p", sessions: [session("new")], status: {}, permissions: [], questions: [] }],
+    )
+    expect(Object.keys(s.sessions).sort()).toEqual(["new", "old"])
+  })
+})

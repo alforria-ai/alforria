@@ -117,31 +117,41 @@ export function Composer(props: { sessionID: string }) {
   const send = async () => {
     const text = ta.value.trim()
     if (!text || sending()) return
+    const files = draft().files
     const m = model()
     const modelRef = m ? { providerID: m.split("/")[0]!, modelID: m.split("/").slice(1).join("/") } : undefined
+    // Clear at once so typing can continue; restore only if the send fails and
+    // the box is still empty (never overwrite what was typed meanwhile).
+    ta.value = ""
+    setDraft({ text: "", files: [] })
+    autosize()
+    const restore = (err: unknown, what: string) => {
+      toast(`Could not ${what}: ${err instanceof Error ? err.message : err}`, "error")
+      if (!ta.value.trim()) {
+        ta.value = text
+        setDraft({ text, files })
+        autosize()
+      }
+    }
+    const cmd = /^\/(\S+)\s*([\s\S]*)$/.exec(text)
+    const commands = cmd ? await commandsFor(dir()) : []
+    if (cmd && commands.some((c) => c.name === cmd[1])) {
+      // The command endpoint answers when the whole turn ends; don't hold the
+      // composer for that, the transcript shows progress.
+      void api
+        .command(props.sessionID, { command: cmd[1]!, arguments: cmd[2] ?? "", agent: agent(), model: m })
+        .catch((err) => restore(err, `run /${cmd[1]}`))
+      return
+    }
     setSending(true)
     try {
-      const cmd = /^\/(\S+)\s*([\s\S]*)$/.exec(text)
-      const commands = cmd ? await commandsFor(dir()) : []
-      if (cmd && commands.some((c) => c.name === cmd[1])) {
-        await api.command(props.sessionID, { command: cmd[1]!, arguments: cmd[2] ?? "", agent: agent(), model: m })
-      } else {
-        const parts: PromptPart[] = [{ type: "text", text }]
-        for (const f of draft().files)
-          if (text.includes(`@${f}`))
-            parts.push({
-              type: "file",
-              mime: "text/plain",
-              filename: f,
-              url: `file://${dir().replace(/\/$/, "")}/${f}`,
-            })
-        await api.promptAsync(props.sessionID, { parts, agent: agent(), model: modelRef })
-      }
-      ta.value = ""
-      setDraft({ text: "", files: [] })
-      autosize()
+      const parts: PromptPart[] = [{ type: "text", text }]
+      for (const f of files)
+        if (text.includes(`@${f}`))
+          parts.push({ type: "file", mime: "text/plain", filename: f, url: `file://${dir().replace(/\/$/, "")}/${f}` })
+      await api.promptAsync(props.sessionID, { parts, agent: agent(), model: modelRef })
     } catch (err) {
-      toast(`Could not send: ${err instanceof Error ? err.message : err}`, "error")
+      restore(err, "send")
     } finally {
       setSending(false)
     }

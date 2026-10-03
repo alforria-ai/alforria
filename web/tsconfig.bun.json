@@ -1,0 +1,19 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "types": [
+      "bun"
+    ],
+    "lib": [
+      "ES2023",
+      "DOM",
+      "DOM.AsyncIterable"
+    ]
+  },
+  "include": [
+    "script",
+    "test/e2e",
+    "test/*.e2e.ts"
+  ],
+  "exclude": []
+}

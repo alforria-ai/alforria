@@ -1,5 +1,7 @@
-import { describe, expect, test } from "vitest"
-import { highlight, highlighterRequested, MarkdownStream, renderMarkdown } from "../src/ui/markdown"
+import { beforeAll, describe, expect, test } from "vitest"
+import { highlight, highlighterRequested, markdownReady, MarkdownStream, renderMarkdown } from "../src/ui/markdown"
+
+beforeAll(() => markdownReady)
 
 /** Every tag name the renderer may emit. Anything else came from the input. */
 const ALLOWED = new Set(
@@ -71,7 +73,7 @@ describe("sanitizing", () => {
       "<script>alert(1)</script>",
       "hello <script>alert(1)</script> world",
       '<img src=x onerror="alert(1)">',
-      'inline <img src=x onerror=alert(1)> image',
+      "inline <img src=x onerror=alert(1)> image",
       "<svg/onload=alert(1)>",
       "<iframe srcdoc='<script>alert(1)</script>'></iframe>",
       '<a href="javascript:alert(1)">x</a>',
@@ -85,7 +87,8 @@ describe("sanitizing", () => {
     for (const input of inputs) {
       const html = renderMarkdown(input)
       for (const t of tags(html)) expect(ALLOWED.has(t), `<${t}> from ${input}`).toBe(true)
-      for (const a of attrs(html)) expect(["href", "title", "target", "rel", "class", "type", "align", "start"]).toContain(a)
+      for (const a of attrs(html))
+        expect(["href", "title", "target", "rel", "class", "type", "align", "start"]).toContain(a)
       expect(html).not.toMatch(/<(script|img|svg|iframe)/i)
     }
     expect(renderMarkdown("<script>alert(1)</script>")).toContain("&lt;script&gt;alert(1)&lt;/script&gt;")
@@ -186,6 +189,13 @@ describe("code blocks", () => {
     // Cached now: a fresh render of the same code is highlighted synchronously.
     expect(renderMarkdown("```rs\n" + src + "\n```")).toContain('<span class="kw">')
   })
+
+  test("diff blocks take the diff tints, nothing else does", async () => {
+    await highlight([{ lang: "diff", code: "@@ -1 +1 @@\n-old\n+new" }])
+    const html = renderMarkdown("```diff\n@@ -1 +1 @@\n-old\n+new\n```")
+    expect(html).toContain('<span class="dl">-old</span>\n<span class="ad">+new</span>')
+    expect(html).toContain('<span class="cm">@@ -1 +1 @@</span>')
+  })
 })
 
 describe("streaming", () => {
@@ -202,11 +212,80 @@ describe("streaming", () => {
     }
   })
 
+  test("random streams of awkward fragments render like full renders", () => {
+    // Constructs where marked's view of a block depends on what follows it, or
+    // where its token `raw` stops matching the source.
+    const frags = [
+      "para\n-\n",
+      "para\n--\n",
+      "Title\n===\n",
+      "a | b\n-|-\n1 | 2\n",
+      "|a|b|\n|-|-|\n|1|2|\ntext\n",
+      "| x |\n",
+      "|---|\n",
+      "- a\n\n  more\n\n- b\n",
+      "* a\n* b\n\n\n* c\n",
+      "- a\n+ b\n* c\n",
+      "1. one\n2. two\n\n10. ten\n",
+      "1) paren\n",
+      "  - deep\n    - deeper\n",
+      "- [ ] t\n- [x] u\n",
+      "> quote\nlazy\n\n> again\n",
+      "> - quoted list\n> more\n",
+      "```\nunclosed code\n\nmore\n",
+      "    indented code\n\n    more\n",
+      "\tcode\n- \titem\n",
+      "~~~\ntilde\n~~~\n",
+      "para\n```js\ncode\n```\npara2\n",
+      "1. step\n   ```sh\n   run\n   ```\n",
+      "> ```py\n> x = 1\n> ```\n",
+      "<div>\n*x*\n</div>\n",
+      "<script>\nx\n</script>\n",
+      "<!-- c -->\n",
+      "<pre>\n\n</pre>\n",
+      "[ref]: https://r.example\n",
+      "[ref]\n",
+      "**bold\nacross** lines\n",
+      "`code` and ``a`b``\n",
+      "line  \nhard break\n",
+      "a\\\nb\n",
+      "* * *\n",
+      "text\n***\n",
+      "crlf\r\nline\r\n",
+      "plain words ",
+      "\n",
+      "\n\n",
+      "  \n",
+    ]
+    let seed = 7
+    const rand = (n: number) => ((seed = (seed * 16807) % 2147483647) % n) | 0
+    for (let run = 0; run < 300; run++) {
+      let doc = ""
+      for (let i = 3 + rand(10); i > 0; i--) doc += frags[rand(frags.length)]
+      const stream = new MarkdownStream()
+      const step = [1, 4, 16][run % 3]!
+      for (let at = 0; at < doc.length;) {
+        at = Math.min(doc.length, at + 1 + rand(step))
+        const prefix = doc.slice(0, at)
+        const html = stream
+          .update(prefix)
+          .map((b) => b.html)
+          .join("")
+        expect(html, JSON.stringify(prefix)).toBe(renderMarkdown(prefix))
+      }
+    }
+  })
+
   test("reference definitions arriving late re-render earlier blocks", () => {
     const doc = "See [the docs][d].\n\nMore text.\n\n[d]: https://example.com\n"
     const stream = new MarkdownStream()
     for (let i = 0; i <= doc.length; i++) {
-      expect(stream.update(doc.slice(0, i)).map((b) => b.html).join("")).toBe(renderMarkdown(doc.slice(0, i)))
+      expect(
+        stream
+          .update(doc.slice(0, i))
+          .map((b) => b.html)
+          .join(""),
+      ).toBe(renderMarkdown(doc.slice(0, i)))
     }
     expect(renderMarkdown(doc)).toContain('<a href="https://example.com"')
   })

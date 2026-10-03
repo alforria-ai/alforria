@@ -3,7 +3,7 @@
 // right after the tool call that raised it. The view sticks to the bottom
 // while the reader is there, and offers "Latest" when they have scrolled up.
 import { createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js"
-import type { AssistantMessage, Message, UserMessage } from "../../api/types"
+import type { AssistantMessage, UserMessage } from "../../api/types"
 import { fleetState, interruptsFor, type Interrupt } from "../../fleet/derive"
 import { state } from "../../store/store"
 import { hm, ktok, money } from "../../ui/format"
@@ -11,24 +11,39 @@ import { Icon } from "../../ui/icons"
 import { Slip } from "../queue/slip"
 import { PartView } from "./parts"
 
-interface Turn {
-  user?: UserMessage
-  replies: AssistantMessage[]
+/** Arrays of ids compare by content so memos only notify on real changes. */
+const sameIds = (a: string[], b: string[]) => a.length === b.length && a.every((x, i) => x === b[i])
+
+/**
+ * A turn is keyed by its first message id (the prompt, or the first reply when
+ * the transcript starts mid-turn). Rendering by these string keys keeps every
+ * turn's DOM, highlight state, open tool rows and half-typed answers alive
+ * while messages stream and update.
+ */
+function turnKeys(sessionID: string): string[] {
+  const keys: string[] = []
+  for (const id of state.messages[sessionID] ?? []) {
+    const m = state.message[id]
+    if (!m) continue
+    if (m.role === "user" || !keys.length) keys.push(id)
+  }
+  return keys
 }
 
-function turnsOf(ids: string[]): Turn[] {
-  const turns: Turn[] = []
-  for (const id of ids) {
-    const m: Message | undefined = state.message[id]
+/** The message ids of one turn: its prompt (if any) and the replies after it. */
+function turnIds(sessionID: string, key: string): { user?: string; replies: string[] } {
+  const ids = state.messages[sessionID] ?? []
+  const start = ids.indexOf(key)
+  const out: { user?: string; replies: string[] } = { replies: [] }
+  for (let i = Math.max(0, start); i < ids.length; i++) {
+    const m = state.message[ids[i]!]
     if (!m) continue
-    if (m.role === "user") turns.push({ user: m, replies: [] })
-    else {
-      const last = turns[turns.length - 1]
-      if (last) last.replies.push(m)
-      else turns.push({ replies: [m] })
-    }
+    if (m.role === "user") {
+      if (i !== start) break
+      out.user = m.id
+    } else out.replies.push(m.id)
   }
-  return turns
+  return out
 }
 
 export function Transcript(props: { sessionID: string; onOpenSession: (id: string, beside: boolean) => void }) {
@@ -37,8 +52,9 @@ export function Transcript(props: { sessionID: string; onOpenSession: (id: strin
   const [stuck, setStuck] = createSignal(true)
   // Long sessions render their most recent turns; older ones on request.
   const [shown, setShown] = createSignal(40)
-  const turns = createMemo(() => turnsOf(state.messages[props.sessionID] ?? []))
+  const turns = createMemo(() => turnKeys(props.sessionID), [], { equals: sameIds })
   const pending = createMemo(() => interruptsFor(state, props.sessionID))
+  const pendingById = createMemo(() => new Map(pending().map((i) => [i.id, i])))
   const busy = () => fleetState(state, props.sessionID) === "working"
 
   // Interrupts tied to a tool call render after that call; the rest go last.
@@ -50,15 +66,21 @@ export function Transcript(props: { sessionID: string; onOpenSession: (id: strin
     }
     return m
   })
-  const orphans = createMemo(() => {
-    const calls = new Set<string>()
-    for (const mid of state.messages[props.sessionID] ?? [])
-      for (const pid of state.parts[mid] ?? []) {
-        const p = state.part[pid]
-        if (p?.type === "tool") calls.add(p.callID)
-      }
-    return pending().filter((i) => !i.request.tool?.callID || !calls.has(i.request.tool.callID))
-  })
+  const orphans = createMemo(
+    () => {
+      const calls = new Set<string>()
+      for (const mid of state.messages[props.sessionID] ?? [])
+        for (const pid of state.parts[mid] ?? []) {
+          const p = state.part[pid]
+          if (p?.type === "tool") calls.add(p.callID)
+        }
+      return pending()
+        .filter((i) => !i.request.tool?.callID || !calls.has(i.request.tool.callID))
+        .map((i) => i.id)
+    },
+    [],
+    { equals: sameIds },
+  )
 
   const atBottom = () => scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 32
   const toBottom = () => (scroller.scrollTop = scroller.scrollHeight)
@@ -97,10 +119,11 @@ export function Transcript(props: { sessionID: string; onOpenSession: (id: strin
               </button>
             </Show>
             <For each={turns().slice(-shown())}>
-              {(turn, ti) => (
+              {(key) => (
                 <TurnView
-                  turn={turn}
-                  last={ti() === Math.min(turns().length, shown()) - 1}
+                  sessionID={props.sessionID}
+                  turnKey={key}
+                  last={key === turns()[turns().length - 1]}
                   busy={busy()}
                   byCall={byCall()}
                   onOpenSession={props.onOpenSession}
@@ -109,7 +132,11 @@ export function Transcript(props: { sessionID: string; onOpenSession: (id: strin
             </For>
           </Show>
           <For each={orphans()}>
-            {(i) => <Slip interrupt={i} active inline onOpenSession={(id) => props.onOpenSession(id, false)} />}
+            {(id) => (
+              <Show when={pendingById().get(id)}>
+                {(i) => <Slip interrupt={i()} active inline onOpenSession={(sid) => props.onOpenSession(sid, false)} />}
+              </Show>
+            )}
           </For>
         </Show>
       </div>
@@ -130,28 +157,44 @@ export function Transcript(props: { sessionID: string; onOpenSession: (id: strin
 }
 
 function TurnView(props: {
-  turn: Turn
+  sessionID: string
+  turnKey: string
   last: boolean
   busy: boolean
   byCall: Map<string, Interrupt>
   onOpenSession: (id: string, beside: boolean) => void
 }) {
-  const head = () => props.turn.replies[0]
+  const ids = createMemo(() => turnIds(props.sessionID, props.turnKey), undefined, {
+    equals: (a, b) => !!a && a.user === b.user && sameIds(a.replies, b.replies),
+  })
+  const user = () => {
+    const id = ids().user
+    return id ? (state.message[id] as UserMessage | undefined) : undefined
+  }
+  const replies = () => ids().replies
+  const reply = (id: string) => state.message[id] as AssistantMessage | undefined
+  const head = () => {
+    const first = replies()[0]
+    return first ? reply(first) : undefined
+  }
   const totals = createMemo(() => {
     let tokens = 0
     let cost = 0
-    for (const r of props.turn.replies) {
+    for (const id of replies()) {
+      const r = reply(id)
+      if (!r) continue
       tokens += r.tokens.input + r.tokens.output + r.tokens.reasoning + r.tokens.cache.read + r.tokens.cache.write
       cost += r.cost
     }
-    const first = props.turn.replies[0]?.time.created
-    const end = props.turn.replies[props.turn.replies.length - 1]?.time.completed
+    const first = head()?.time.created
+    const lastId = replies()[replies().length - 1]
+    const end = lastId ? reply(lastId)?.time.completed : undefined
     return { tokens, cost, ms: first && end ? end - first : 0 }
   })
   const streaming = () => props.last && props.busy
   return (
     <>
-      <Show when={props.turn.user}>
+      <Show when={user()}>
         {(u) => (
           <div class="msg msg-user">
             <div class="msg-label">
@@ -188,10 +231,10 @@ function TurnView(props: {
               </span>
             </div>
             <div class="parts">
-              <For each={props.turn.replies}>
-                {(reply) => (
+              <For each={replies()}>
+                {(rid) => (
                   <>
-                    <For each={state.parts[reply.id] ?? []}>
+                    <For each={state.parts[rid] ?? []}>
                       {(pid) => (
                         <Show when={state.part[pid]}>
                           {(p) => (
@@ -212,7 +255,9 @@ function TurnView(props: {
                         </Show>
                       )}
                     </For>
-                    <Show when={reply.error}>{(err) => <ErrorPlate error={err()} sessionID={reply.sessionID} />}</Show>
+                    <Show when={reply(rid)?.error}>
+                      {(err) => <ErrorPlate error={err()} sessionID={props.sessionID} />}
+                    </Show>
                   </>
                 )}
               </For>

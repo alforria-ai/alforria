@@ -10,12 +10,16 @@ export const [state, setState] = createStore<State>(emptyState())
 
 let queue: GlobalEvent[] = []
 let timer: ReturnType<typeof setTimeout> | undefined
-/** Frames seen while a REST snapshot is in flight; replayed after it lands. */
-let replay: GlobalEvent[] | undefined
+/**
+ * One buffer per in-flight REST snapshot: the frames that raced it, replayed
+ * after it lands. Snapshots overlap (a resync and a transcript load), so each
+ * records and clears only its own buffer.
+ */
+const recorders = new Set<GlobalEvent[]>()
 
 export function enqueue(frame: GlobalEvent) {
   queue.push(frame)
-  replay?.push(frame)
+  for (const r of recorders) r.push(frame)
   timer ??= setTimeout(flush, 16)
 }
 
@@ -33,10 +37,17 @@ export function flush() {
  * on replay (they are not idempotent, and snapshots never carry part text
  * mid-stream anyway; the next `message.part.updated` settles it).
  */
-export async function withSnapshot<T>(fetch: () => Promise<T>, apply: (d: State, data: T) => void) {
-  const own = (replay ??= [])
+export async function withSnapshot<T>(
+  fetch: () => Promise<T>,
+  apply: (d: State, data: T) => void,
+  /** Checked when the data arrives; false drops it (e.g. the view went away). */
+  wanted: () => boolean = () => true,
+) {
+  const own: GlobalEvent[] = []
+  recorders.add(own)
   try {
     const data = await fetch()
+    if (!wanted()) return
     flush()
     setState(
       produce((d) => {
@@ -45,7 +56,7 @@ export async function withSnapshot<T>(fetch: () => Promise<T>, apply: (d: State,
       }),
     )
   } finally {
-    if (replay === own) replay = undefined
+    recorders.delete(own)
   }
 }
 

@@ -1,0 +1,157 @@
+/* Terminal column (views/focus/terminal.tsx): an xterm.js screen in the plate
+   well, a state pill while (re)connecting, and a foot bar once the shell has
+   ended. Ships in the terminal chunk, never in the main bundle. */
+
+.pty {
+  /* The ANSI palette, read by terminal.tsx into the xterm theme (with --plate,
+     --ink, --rule-2 and --f-mono). Muted cool hues that sit on the plate. Red
+     leans crimson and yellow leans straw so neither reads as orange: orange
+     means "waiting on you" and nothing else. */
+  --pty-black: #3a454c;
+  --pty-red: #d9818a;
+  --pty-green: #8fbf98;
+  --pty-yellow: #cdc07e;
+  --pty-blue: #82a7c9;
+  --pty-magenta: #b39ac6;
+  --pty-cyan: #7fb8b8;
+  --pty-white: #a3aeb4;
+  --pty-bright-black: #7d8a91;
+  --pty-bright-red: #eba3aa;
+  --pty-bright-green: #a9d4b1;
+  --pty-bright-yellow: #e0d59d;
+  --pty-bright-blue: #a2c0db;
+  --pty-bright-magenta: #cab4d9;
+  --pty-bright-cyan: #9fcfcf;
+  --pty-bright-white: #e3e8ea;
+
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--plate);
+}
+
+/* Light: the same hues deepened to hold contrast on the pale plate. "White"
+   text becomes the gray ramp, as light terminal themes conventionally do. */
+:root[data-theme="light"] .pty {
+  --pty-black: #14191c;
+  --pty-red: #a8323e;
+  --pty-green: #2e6b3e;
+  --pty-yellow: #6f6413;
+  --pty-blue: #2d5c88;
+  --pty-magenta: #74508c;
+  --pty-cyan: #22696c;
+  --pty-white: #5e6a72;
+  --pty-bright-black: #7d8a91;
+  --pty-bright-red: #c2404c;
+  --pty-bright-green: #3a8450;
+  --pty-bright-yellow: #857819;
+  --pty-bright-blue: #3a72a6;
+  --pty-bright-magenta: #8c62a8;
+  --pty-bright-cyan: #2d8085;
+  --pty-bright-white: #4b555c;
+}
+
+.pty-screen {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+}
+/* xterm's parent. FitAddon measures this box and subtracts the .xterm
+   padding, so the gutter lives on .xterm and this element stays unpadded. */
+.pty-host {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+}
+.pty-host .xterm {
+  height: 100%;
+  padding: 8px 0 0 16px;
+}
+/* xterm.css paints the viewport #000 and it spans the padding box; let the
+   plate show through the gutter instead. */
+.pty-host .xterm .xterm-viewport {
+  background-color: transparent;
+}
+/* Flat Plate Rule: no scroll shadow under the top edge. */
+.pty .pty-host .xterm .xterm-scrollable-element > .shadow {
+  display: none;
+}
+
+/* Starting / reconnecting: a state pill over the screen, so the terminal's
+   size (and the PTY's) does not change while the socket comes and goes. */
+.pty-state {
+  position: absolute;
+  top: 8px;
+  right: 22px;
+  z-index: 12;
+  padding: 4px 6px;
+  background: var(--ground);
+  border: 1px solid var(--rule-2);
+  color: var(--ink-2);
+  font: 500 10.5px/1 var(--f-mono);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  pointer-events: none;
+}
+
+/* Ended or failed: the foot of the well, under a rule. */
+.pty-bar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 40px;
+  padding: 6px 8px 6px 16px;
+  border-top: 1px solid var(--rule);
+}
+.pty-bar .note {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ink-2);
+  font: 400 12px/1.4 var(--f-mono);
+}
+.pty-bar .note.prose {
+  white-space: normal;
+  font: 400 13.5px/1.4 var(--f-body);
+}
+.pty-act {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 28px;
+  padding: 0 12px;
+  background: var(--ink);
+  color: var(--ground);
+  font: 700 13px/1 var(--f-label);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  transition: transform var(--t-feedback) var(--ease-out);
+}
+.pty-act:hover {
+  background: var(--ink-2);
+}
+.pty-act:active {
+  transform: translate(1px, 1px) scale(0.985);
+}
+.pty-act kbd {
+  color: var(--ground);
+  border-color: var(--ground);
+}
+
+@media (max-width: 760px) {
+  /* iOS zooms into any field under 16px, xterm's hidden input included. */
+  .pty .xterm .xterm-helper-textarea {
+    font-size: 16px;
+  }
+  .pty-act {
+    height: 40px;
+  }
+  .pty-act kbd {
+    display: none;
+  }
+}

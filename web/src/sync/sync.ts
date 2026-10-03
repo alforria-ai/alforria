@@ -2,7 +2,8 @@
 // stream in between, and per-session transcript loads on demand.
 import { api, apiUrl } from "../api/client"
 import type { Project } from "../api/types"
-import { applyMessages, applySnapshot, type ProjectSnapshot } from "../store/reduce"
+import { produce } from "solid-js/store"
+import { applyMessages, applySnapshot, trimToTail, type ProjectSnapshot } from "../store/reduce"
 import { enqueue, setConn, setState, state, withSnapshot } from "../store/store"
 import type { ModelInfo } from "../store/state"
 import { connectEvents } from "./stream"
@@ -32,21 +33,40 @@ export async function resync() {
     (d, { projects, snaps }) => applySnapshot(d, projects, snaps),
   )
   // Re-fetch every transcript a view is showing; anything else stays lazy.
-  await Promise.all(Object.keys(state.loaded).map((id) => loadTranscript(id)))
+  await Promise.all([...viewers.keys()].map((id) => loadTranscript(id)))
   void loadModels()
   void loadRecentActivity()
 }
+
+/** How many views show each transcript; at zero it is unloaded. */
+const viewers = new Map<string, number>()
 
 export async function loadTranscript(sessionID: string) {
   await withSnapshot(
     () => api.messages(sessionID),
     (d, list) => applyMessages(d, sessionID, list),
+    // A view may close while the fetch is in flight: don't resurrect it.
+    () => (viewers.get(sessionID) ?? 0) > 0,
   )
 }
 
-/** Unload a transcript a view no longer shows (keeps memory flat at fleet scale). */
+/** A view starts showing a transcript: load it and keep it live. */
+export function retainTranscript(sessionID: string) {
+  viewers.set(sessionID, (viewers.get(sessionID) ?? 0) + 1)
+  return loadTranscript(sessionID)
+}
+
+/** A view stops showing it: at zero viewers, drop all but the latest turn. */
 export function releaseTranscript(sessionID: string) {
-  setState("loaded", sessionID, undefined!)
+  const n = (viewers.get(sessionID) ?? 1) - 1
+  if (n > 0) return void viewers.set(sessionID, n)
+  viewers.delete(sessionID)
+  setState(
+    produce((d) => {
+      delete d.loaded[sessionID]
+      trimToTail(d, sessionID)
+    }),
+  )
 }
 
 /**

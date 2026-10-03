@@ -32,6 +32,8 @@ describe.each(scenarios)("replay %s", (name) => {
 
   const replay = (onFrame?: (s: ReturnType<typeof emptyState>, f: GlobalEvent) => void) => {
     const s = emptyState()
+    // As if a view had every recorded transcript open (unread ones are trimmed).
+    for (const id of Object.keys(final.messages)) s.loaded[id] = true
     applySnapshot(s, boot.project, [
       {
         directory: boot.meta.directory,

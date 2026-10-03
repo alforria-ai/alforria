@@ -7,7 +7,7 @@ import { fleetState, interruptsFor, lastAssistant, sessionCost } from "../../fle
 import { projectName } from "../../fleet/fleet"
 import { closeOtherColumns, nav, setActiveColumn, setColumnFile, setColumnTab, type Column } from "../../nav/route"
 import { setState, state } from "../../store/store"
-import { loadTranscript, releaseTranscript } from "../../sync/sync"
+import { releaseTranscript, retainTranscript } from "../../sync/sync"
 import { ktok, money } from "../../ui/format"
 import { Icon } from "../../ui/icons"
 import { slipKind } from "../queue/slip"
@@ -18,6 +18,9 @@ import { Transcript } from "./transcript"
 
 const Changes = lazy(() => import("./changes"))
 const Files = lazy(() => import("./files"))
+const TerminalView = lazy(() => import("./terminal"))
+// The close action needs the module too; import it lazily alongside the view.
+const closeTerminal = (projectID: string) => import("./terminal").then((m) => m.closeTerminal(projectID))
 
 export function Focus(props: {
   maxColumns: number
@@ -60,7 +63,14 @@ export function Focus(props: {
                 )}
               </Match>
               <Match when={col.kind === "terminal" && (col as Extract<Column, { kind: "terminal" }>)}>
-                {(c) => <TerminalPlaceholder index={i()} project={c().project} onClose={() => props.onClose(i())} />}
+                {(c) => (
+                  <TerminalColumn
+                    index={i()}
+                    project={c().project}
+                    onClose={() => props.onClose(i())}
+                    onBack={props.onBack}
+                  />
+                )}
               </Match>
             </Switch>
           )}
@@ -93,7 +103,7 @@ function SessionColumn(props: {
             props.onClose()
           }
         })
-    void loadTranscript(sid).catch((err) => toast(`Could not load the transcript: ${err.message}`, "error"))
+    void retainTranscript(sid).catch((err) => toast(`Could not load the transcript: ${err.message}`, "error"))
     onCleanup(() => releaseTranscript(sid))
   })
   // Deleted elsewhere (a `session.deleted` event): close rather than show a husk.
@@ -264,24 +274,46 @@ function SessionColumn(props: {
   )
 }
 
-function TerminalPlaceholder(props: { index: number; project: string; onClose: () => void }) {
+function TerminalColumn(props: { index: number; project: string; onClose: () => void; onBack: () => void }) {
+  const project = () => state.projects[props.project]
   return (
-    <section class="col" classList={{ "is-active": nav.active === props.index }} data-col={props.index}>
+    <section
+      class="col"
+      classList={{ "is-active": nav.active === props.index }}
+      data-col={props.index}
+      aria-label={`Terminal in ${project() ? projectName(project()!) : "project"}`}
+      onFocusIn={() => setActiveColumn(props.index)}
+      onMouseDown={() => setActiveColumn(props.index)}
+    >
       <div class="col-head">
         <div class="l1">
+          <button class="icon-btn back-btn" aria-label="Back to sessions" onClick={props.onBack}>
+            <Icon name="back" />
+          </button>
           <Icon name="terminal" />
           <h2>Terminal</h2>
           <div class="acts">
-            <button aria-label="Close column" onClick={props.onClose}>
+            <button
+              aria-label="Close terminal"
+              title="Close terminal (ends the shell)"
+              onClick={() => {
+                void closeTerminal(props.project)
+                props.onClose()
+              }}
+            >
               <Icon name="close" />
             </button>
           </div>
         </div>
+        <div class="l2">
+          <span class="grow">{project() ? `${projectName(project()!)} · ${project()!.worktree}` : props.project}</span>
+        </div>
       </div>
-      <div class="q-empty">
-        <h3>Terminal</h3>
-        <p>PTY terminals arrive with milestone W4.</p>
-      </div>
+      <Show when={project()} fallback={<div class="transcript-loading">Unknown project</div>}>
+        <Suspense fallback={<div class="transcript-loading">Starting the terminal…</div>}>
+          <TerminalView projectID={props.project} directory={project()!.worktree} active={nav.active === props.index} />
+        </Suspense>
+      </Show>
     </section>
   )
 }

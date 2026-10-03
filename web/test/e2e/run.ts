@@ -11,7 +11,10 @@ import { tmpdir } from "node:os"
 const WEB = join(import.meta.dir, "../..")
 const API_PORT = Number(process.env.E2E_API_PORT ?? 4797)
 const UI_PORT = Number(process.env.E2E_UI_PORT ?? 4711)
-const UI = `http://127.0.0.1:${UI_PORT}`
+// E2E_EMBEDDED=1 tests the UI as `alforria serve` embeds it (after `bun run
+// pack` + `cargo build -p alforria`): real CSP, real SPA fallback, no proxy.
+const EMBEDDED = process.env.E2E_EMBEDDED === "1"
+const UI = EMBEDDED ? `http://127.0.0.1:${API_PORT}` : `http://127.0.0.1:${UI_PORT}`
 
 let pass = 0
 let fail = 0
@@ -56,8 +59,10 @@ async function waitForLine(stream: ReadableStream<Uint8Array>, needle: string, m
   throw new Error(`server never printed "${needle}":\n${text}`)
 }
 
-const build = Bun.spawnSync(["bun", "run", "build"], { cwd: WEB, stdout: "pipe", stderr: "pipe" })
-if (build.exitCode !== 0) throw new Error(`build failed:\n${build.stderr.toString()}`)
+if (!EMBEDDED) {
+  const build = Bun.spawnSync(["bun", "run", "build"], { cwd: WEB, stdout: "pipe", stderr: "pipe" })
+  if (build.exitCode !== 0) throw new Error(`build failed:\n${build.stderr.toString()}`)
+}
 
 const devDir = mkdtempSync(join(tmpdir(), "alforria-e2e-"))
 const server = Bun.spawn(["bun", "script/dev-server.ts", "--busy-seconds", "300"], {
@@ -66,12 +71,14 @@ const server = Bun.spawn(["bun", "script/dev-server.ts", "--busy-seconds", "300"
   stdout: "pipe",
   stderr: "inherit",
 })
-const preview = Bun.spawn(["bunx", "vite", "preview", "--port", String(UI_PORT), "--strictPort"], {
-  cwd: WEB,
-  env: { ...process.env, ALFORRIA_URL: `http://127.0.0.1:${API_PORT}` },
-  stdout: "ignore",
-  stderr: "inherit",
-})
+const preview = EMBEDDED
+  ? undefined
+  : Bun.spawn(["bunx", "vite", "preview", "--port", String(UI_PORT), "--strictPort"], {
+      cwd: WEB,
+      env: { ...process.env, ALFORRIA_URL: `http://127.0.0.1:${API_PORT}` },
+      stdout: "ignore",
+      stderr: "inherit",
+    })
 
 const watch = (p: Page, tag: string) => {
   p.on("pageerror", (e) => errors.push(`${tag} pageerror: ${e.message}`))
@@ -87,7 +94,13 @@ try {
   {
     const p = await (await browser.newContext({ viewport: { width: 1440, height: 900 } })).newPage()
     watch(p, "desktop")
-    await p.goto(`${UI}/#/`)
+    const res = await p.goto(`${UI}/#/`)
+    if (EMBEDDED) {
+      const csp = res?.headers()["content-security-policy"] ?? ""
+      check(/script-src 'self' 'wasm-unsafe-eval' 'sha256-/.test(csp), "embedded: CSP hashes the theme-preload script")
+      const deep = await fetch(`${UI}/some/deep/link`)
+      check(deep.ok && (await deep.text()).includes('id="root"'), "embedded: unknown paths fall back to index.html")
+    }
     await p.locator("tr.s-row").first().waitFor()
     await p.waitForTimeout(800)
     const waiting = async () => Number(await p.locator(".wait-count .n").textContent())
@@ -95,18 +108,18 @@ try {
     check((await waiting()) === 3, "band counts 3 waiting")
     check((await p.locator(".q-list .slip").count()) === 3, "queue holds 3 slips, oldest open")
 
-    // Approve with the keyboard: needs the slip to have been readable for a moment.
+    // Approve with the keyboard: needs the slip to have been readable for a
+    // moment. A double-press 100 ms later must not approve the next item,
+    // which has just slid in under the same finger.
     await p.keyboard.press("q")
     await p.waitForTimeout(600)
     await p.keyboard.press("a")
-    await p.waitForTimeout(200)
+    await p.waitForTimeout(100)
+    await p.keyboard.press("a")
+    await p.waitForTimeout(100)
     check((await p.locator(".verdict-stamp b").first().textContent()) === "Allowed once", "A stamps the verdict")
     await p.waitForTimeout(1500)
-    check((await waiting()) === 2, "approval clears one waiting item")
-    // A second, immediate press must not approve the item that just slid in.
-    await p.keyboard.press("a")
-    await p.waitForTimeout(300)
-    check((await waiting()) === 2, "an immediate second press does not approve the next item")
+    check((await waiting()) === 2, "a double-press approves exactly one item")
 
     // Answer the question: pick an option and submit.
     await p.locator(".q-list .slip", { hasText: "Question" }).first().click()
@@ -192,7 +205,7 @@ try {
   await browser.close()
 } finally {
   server.kill("SIGINT")
-  preview.kill()
+  preview?.kill()
   await server.exited
 }
 

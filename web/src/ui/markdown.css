@@ -1,6 +1,11 @@
 /* Assistant markdown (markdown.tsx). Chat, not a document: headings stay at body
    size, and every block is square, ruled and flat (DESIGN.md: Shapes, Elevation). */
 
+/* Unparsed text, shown only until marked has loaded. */
+.prose.md.plain {
+  white-space: pre-wrap;
+}
+
 .prose.md > :first-child {
   margin-top: 0;
 }
@@ -175,4 +180,10 @@
 }
 .prose.md .code-block .cm {
   color: var(--ink-3);
+}
+.prose.md .code-block .ad {
+  color: var(--add-mark);
+}
+.prose.md .code-block .dl {
+  color: var(--del-mark);
 }

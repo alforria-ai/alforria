@@ -8,12 +8,12 @@
     "build": "vite build",
     "pack": "bun script/pack.ts",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.bun.json",
     "gen:api": "openapi-typescript ../fixtures/openapi/openapi.json -o src/api/schema.d.ts",
     "server": "bun script/dev-server.ts",
     "record": "bun script/record.ts",
     "format": "prettier --write .",
-    "check": "prettier --check . && tsc --noEmit && vitest run",
+    "check": "prettier --check . && tsc --noEmit && tsc --noEmit -p tsconfig.bun.json && vitest run",
     "e2e": "bun test/e2e/run.ts"
   },
   "dependencies": {

@@ -4,8 +4,8 @@
 // shiki, loaded on first need, with a monochrome theme mapped onto classes
 // (DESIGN.md: Diffs and Code). While text streams, only its unsettled tail is
 // re-lexed and re-rendered, so settled blocks keep their DOM and highlighting.
-import { Marked, type RendererObject, type Token, type Tokens } from "marked"
-import { createEffect, onCleanup, type JSX } from "solid-js"
+import type { Marked, RendererObject, Token, Tokens } from "marked"
+import { createEffect, createSignal, onCleanup, type JSX } from "solid-js"
 import type { HighlighterCore, LanguageRegistration, ThemedToken, ThemeRegistration } from "shiki/core"
 import "./markdown.css"
 
@@ -25,6 +25,7 @@ const NUMERIC = /^[~≈±+\-−]?[$€£¥]?\d[\d\s,.:/'_+\-−×x]*(?:%|[a-zA-Z
 
 // ---- highlighting ----------------------------------------------------------
 
+// Each grammar is its own lazy chunk (jsx uses javascript's, which reads JSX).
 type Grammar = () => Promise<{ default: LanguageRegistration[] }>
 const GRAMMARS: Record<string, Grammar> = {
   c: () => import("shiki/langs/c.mjs"),
@@ -36,7 +37,6 @@ const GRAMMARS: Record<string, Grammar> = {
   dotenv: () => import("shiki/langs/dotenv.mjs"),
   elixir: () => import("shiki/langs/elixir.mjs"),
   go: () => import("shiki/langs/go.mjs"),
-  graphql: () => import("shiki/langs/graphql.mjs"),
   haskell: () => import("shiki/langs/haskell.mjs"),
   hcl: () => import("shiki/langs/hcl.mjs"),
   html: () => import("shiki/langs/html.mjs"),
@@ -45,7 +45,6 @@ const GRAMMARS: Record<string, Grammar> = {
   javascript: () => import("shiki/langs/javascript.mjs"),
   json: () => import("shiki/langs/json.mjs"),
   jsonc: () => import("shiki/langs/jsonc.mjs"),
-  jsx: () => import("shiki/langs/jsx.mjs"),
   kotlin: () => import("shiki/langs/kotlin.mjs"),
   lua: () => import("shiki/langs/lua.mjs"),
   make: () => import("shiki/langs/make.mjs"),
@@ -55,7 +54,6 @@ const GRAMMARS: Record<string, Grammar> = {
   powershell: () => import("shiki/langs/powershell.mjs"),
   proto: () => import("shiki/langs/proto.mjs"),
   python: () => import("shiki/langs/python.mjs"),
-  ruby: () => import("shiki/langs/ruby.mjs"),
   rust: () => import("shiki/langs/rust.mjs"),
   scss: () => import("shiki/langs/scss.mjs"),
   shellscript: () => import("shiki/langs/shellscript.mjs"),
@@ -89,12 +87,12 @@ const ALIASES: Record<string, string> = {
   ex: "elixir",
   exs: "elixir",
   golang: "go",
-  gql: "graphql",
   hs: "haskell",
   htm: "html",
   js: "javascript",
   mjs: "javascript",
   cjs: "javascript",
+  jsx: "javascript",
   json5: "jsonc",
   kt: "kotlin",
   kts: "kotlin",
@@ -105,7 +103,6 @@ const ALIASES: Record<string, string> = {
   pwsh: "powershell",
   protobuf: "proto",
   py: "python",
-  rb: "ruby",
   rs: "rust",
   tf: "terraform",
   ts: "typescript",
@@ -121,8 +118,15 @@ const grammarOf = (label: string) => {
 
 // The theme paints token kinds with sentinel colours that map back to classes,
 // so markdown.css owns the actual colours and the light theme follows for free.
+// Monochrome, except that diff lines take the diff tints (DESIGN.md: Diff-Tint Rule).
 const FG = "#010101"
-const CLASS: Record<string, string> = { "#020202": "kw", "#030303": "st", "#040404": "cm" }
+const CLASS: Record<string, string> = {
+  "#020202": "kw",
+  "#030303": "st",
+  "#040404": "cm",
+  "#050505": "ad",
+  "#060606": "dl",
+}
 const THEME: ThemeRegistration = {
   name: "alforria-mono",
   type: "dark",
@@ -130,16 +134,26 @@ const THEME: ThemeRegistration = {
   bg: "#000000",
   settings: [
     { settings: { foreground: FG, background: "#000000" } },
-    { scope: ["comment", "punctuation.definition.comment"], settings: { foreground: "#040404" } },
+    { scope: ["comment", "punctuation.definition.comment", "meta.diff.range"], settings: { foreground: "#040404" } },
     {
-      scope: ["string", "punctuation.definition.string", "constant.character.escape"],
+      scope: ["string", "punctuation.definition.string", "constant.character.escape", "markup.inline.raw"],
       settings: { foreground: "#030303" },
     },
     {
-      scope: ["keyword", "storage", "keyword.operator.new", "keyword.operator.expression", "keyword.operator.word"],
+      scope: [
+        "keyword",
+        "storage",
+        "keyword.operator.new",
+        "keyword.operator.expression",
+        "keyword.operator.word",
+        "markup.heading",
+        "markup.bold",
+      ],
       settings: { foreground: "#020202" },
     },
     { scope: ["keyword.operator", "string.regexp"], settings: { foreground: FG } },
+    { scope: "markup.inserted", settings: { foreground: "#050505" } },
+    { scope: "markup.deleted", settings: { foreground: "#060606" } },
   ],
 }
 
@@ -283,14 +297,26 @@ const renderer: RendererObject = {
   },
 }
 
-const md = new Marked({ gfm: true, breaks: false, renderer })
+// marked is most of this module's weight, so it loads beside the app rather
+// than inside it, starting as soon as the app does. Text shows plain until then.
+let md: Marked | undefined
+const [parsing, setParsing] = createSignal(false)
+/** Resolves once marked has loaded. Before then `renderMarkdown` returns escaped text and `MarkdownStream` no blocks. */
+export const markdownReady: Promise<void> = import("marked").then(
+  ({ Marked }) => {
+    md = new Marked({ gfm: true, breaks: false, renderer })
+    setParsing(true)
+  },
+  () => {},
+)
+
 const normalize = (text: string) => text.replace(/\r\n?/g, "\n")
 
 /** Render a whole document. Pure: it uses highlighting already cached, and never loads any. */
 export function renderMarkdown(text: string): string {
   found = []
   try {
-    return md.parser(md.lexer(normalize(text)))
+    return md!.parser(md!.lexer(normalize(text)))
   } catch {
     return `<p>${esc(text)}</p>`
   }
@@ -307,7 +333,7 @@ function renderBlock(token: Token): Block {
   found = []
   let html: string
   try {
-    html = md.parser([token])
+    html = md!.parser([token])
   } catch {
     html = `<p>${esc(token.raw)}</p>`
   }
@@ -354,18 +380,19 @@ export class MarkdownStream {
 
   update(next: string): Block[] {
     next = normalize(next)
-    if (next === this.text) return this.blocks
+    const marked = md
+    if (next === this.text || !marked) return this.blocks
     const old = this.blocks
     let keep = !this.links && this.exact && next.startsWith(this.text) ? fromEnd(old, 2) : 0
     let offset = 0
     for (let i = 0; i < keep; i++) offset += old[i]!.token.raw.length
     let src = next.slice(offset)
-    let tokens = md.lexer(src)
+    let tokens = marked.lexer(src)
     let links = Object.keys(tokens.links).length ? JSON.stringify(tokens.links) : ""
     if (keep && links) {
       keep = 0
       src = next
-      tokens = md.lexer(src)
+      tokens = marked.lexer(src)
       links = JSON.stringify(tokens.links)
     }
     this.exact = covers(tokens, src)
@@ -493,10 +520,12 @@ export function Markdown(props: { text: string; streaming?: boolean }): JSX.Elem
 
   createEffect(() => {
     const streaming = !!props.streaming
+    if (!parsing()) return void (root.textContent = props.text)
+    if (!shown.length) root.textContent = ""
     shown = patch(root, shown, stream.update(props.text))
     schedule(streaming)
   })
 
   // A native listener: delegation would touch `window` when this module loads.
-  return <div ref={root} class="prose md" on:click={onCopy} />
+  return <div ref={root} class="prose md" classList={{ plain: !parsing() }} on:click={onCopy} />
 }

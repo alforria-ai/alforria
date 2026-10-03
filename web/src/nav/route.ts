@@ -188,6 +188,8 @@ export function closeColumn(i: number) {
   setNav(
     produce((n) => {
       n.columns.splice(i, 1)
+      // Closing a column left of the active one shifts it down by one.
+      if (i < n.active) n.active--
       n.active = Math.max(0, Math.min(n.active, n.columns.length - 1))
       if (!n.columns.length) n.view = "overview"
     }),
@@ -220,19 +222,6 @@ export function setColumnTab(i: number, tab: ColumnTab) {
 export function setColumnFile(i: number, file: string) {
   const col = nav.columns[i]
   if (col?.kind === "session") setNav("columns", i, { ...col, tab: "files", file })
-}
-
-/** Drop columns whose session no longer exists (deleted elsewhere). */
-export function pruneColumns(exists: (session: string) => boolean) {
-  if (!nav.columns.some((c) => c.kind === "session" && !exists(c.session))) return
-  setNav(
-    produce((n) => {
-      n.columns = n.columns.filter((c) => c.kind !== "session" || exists(c.session))
-      n.active = Math.max(0, Math.min(n.active, n.columns.length - 1))
-      if (!n.columns.length && n.view === "focus") n.view = "overview"
-    }),
-  )
-  if (typeof history !== "undefined") history.replaceState(null, "", routeHash())
 }
 
 export function startRouting() {

@@ -46,8 +46,12 @@ export function reduce(s: State, frame: GlobalEvent) {
     case "message.updated": {
       const info = ev.properties.info
       s.message[info.id] = info
-      insertSorted((s.messages[info.sessionID] ??= []), info.id)
+      const ids = (s.messages[info.sessionID] ??= [])
+      insertSorted(ids, info.id)
       if (info.role === "user") delete s.errors[info.sessionID]
+      // Sessions nobody is reading keep only their latest turn (for the
+      // table's "now" column); memory stays flat at fleet scale.
+      if (!s.loaded[info.sessionID]) trimToTail(s, info.sessionID)
       return
     }
     case "message.removed": {
@@ -55,9 +59,13 @@ export function reduce(s: State, frame: GlobalEvent) {
       dropMessage(s, sessionID, messageID)
       return
     }
-    case "message.part.updated":
-      upsertPart(s, ev.properties.part)
+    case "message.part.updated": {
+      const part = ev.properties.part
+      // A part for a message we trimmed (or never saw) of an unread session.
+      if (!s.loaded[part.sessionID] && !s.message[part.messageID]) return
+      upsertPart(s, part)
       return
+    }
     case "message.part.delta": {
       const { partID, field, delta } = ev.properties
       const part = s.part[partID] as Record<string, unknown> | undefined
@@ -107,6 +115,15 @@ function dropMessage(s: State, sessionID: string, messageID: string) {
   removeId(s.messages[sessionID], messageID)
 }
 
+/** Messages kept for sessions without an open transcript. */
+export const UNREAD_TAIL = 2
+
+export function trimToTail(s: State, sessionID: string, keep = UNREAD_TAIL) {
+  const ids = s.messages[sessionID]
+  if (!ids || ids.length <= keep) return
+  for (const mid of ids.slice(0, ids.length - keep)) dropMessage(s, sessionID, mid)
+}
+
 function dropSession(s: State, sessionID: string) {
   for (const mid of [...(s.messages[sessionID] ?? [])]) dropMessage(s, sessionID, mid)
   delete s.messages[sessionID]
@@ -147,6 +164,9 @@ export function applySnapshot(s: State, projects: Project[], snaps: ProjectSnaps
     for (const p of snap.permissions) permissions[p.id] = p
     for (const q of snap.questions) questions[q.id] = q
   }
+  // The snapshot lists the 100 most recent sessions per directory. Sessions
+  // a view has open (fetched on demand, maybe older) are kept, not dropped.
+  for (const id of Object.keys(s.loaded)) if (!sessions[id] && s.sessions[id]) sessions[id] = s.sessions[id]
   s.sessions = sessions
   s.status = status
   s.permissions = permissions
@@ -155,6 +175,14 @@ export function applySnapshot(s: State, projects: Project[], snaps: ProjectSnaps
 
 /** Replace one session's transcript with `GET /session/{id}/message`. */
 export function applyMessages(s: State, sessionID: string, list: MessageWithParts[]) {
+  // The server returns unfinished text parts with empty text (only deltas
+  // carry progress). Keep what has already streamed in rather than wiping it.
+  const streamed = new Map<string, string>()
+  for (const mid of s.messages[sessionID] ?? [])
+    for (const pid of s.parts[mid] ?? []) {
+      const p = s.part[pid]
+      if (p && (p.type === "text" || p.type === "reasoning")) streamed.set(pid, p.text)
+    }
   for (const mid of [...(s.messages[sessionID] ?? [])]) dropMessage(s, sessionID, mid)
   const ids: string[] = []
   for (const { info, parts } of list) {
@@ -162,7 +190,9 @@ export function applyMessages(s: State, sessionID: string, list: MessageWithPart
     insertSorted(ids, info.id)
     const pids: string[] = []
     for (const part of parts) {
-      s.part[part.id] = part
+      const prev = streamed.get(part.id)
+      const open = (part.type === "text" || part.type === "reasoning") && !part.time?.end
+      s.part[part.id] = open && prev && prev.length > part.text.length ? { ...part, text: prev } : part
       insertSorted(pids, part.id)
     }
     s.parts[info.id] = pids
