@@ -67,7 +67,7 @@ const memos = createRoot(() => {
       const ids = new Set(list.map((s) => s.id))
       const roots = list
         .filter((s) => !s.parentID || !ids.has(s.parentID))
-        .sort((a, b) => b.time.updated - a.time.updated)
+        .sort((a, b) => b.time.created - a.time.created)
       const rows: Row[] = []
       const walk = (s: Session, depth: number) => {
         rows.push({ session: s, depth })

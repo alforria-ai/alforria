@@ -3526,3 +3526,10 @@ button.tool-row:hover {
   width: 12px;
   height: 12px;
 }
+/* Key caps stay one line tall when the description wraps. */
+.keys dt {
+  align-items: flex-start;
+}
+.keys dt kbd {
+  align-self: flex-start;
+}

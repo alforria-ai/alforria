@@ -23,8 +23,9 @@ export function StatusLine(props: { onKeys: () => void }) {
       <span>
         {counts().all} sessions · {counts().working} working · {counts().waiting} waiting
       </span>
-      <span title="Across the sessions listed (recent and live)">{ktok(totals().tokens)} tokens listed</span>
-      <span title="Across the sessions listed (recent and live)">{money(totals().cost)} listed</span>
+      <span title="Summed over the sessions in the table: everything live plus the last 3 days">
+        {ktok(totals().tokens)} tokens · {money(totals().cost)} across {counts().all} sessions
+      </span>
       <span class="spacer" />
       <button onClick={props.onKeys} aria-label="Keyboard shortcuts">
         ? Keys

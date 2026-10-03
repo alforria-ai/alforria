@@ -122,6 +122,9 @@ try {
     const overviewA11y = await a11y(p)
     check(!overviewA11y.length, `overview has no serious a11y violations ${overviewA11y.join(" ")}`)
 
+    const order = () => p.locator("tr.s-row .title-cell .t").allTextContents()
+    const before = await order()
+
     // Approve with the keyboard: needs the slip to have been readable for a
     // moment. A double-press 100 ms later must not approve the next item,
     // which has just slid in under the same finger.
@@ -134,6 +137,10 @@ try {
     check((await p.locator(".verdict-stamp b").first().textContent()) === "Allowed once", "A stamps the verdict")
     await p.waitForTimeout(1500)
     check((await waiting()) === 2, "a double-press approves exactly one item")
+    check(
+      JSON.stringify(await order()) === JSON.stringify(before),
+      "table rows keep their order when a session updates",
+    )
 
     // Answer the question: pick an option and submit.
     await p.locator(".q-list .slip", { hasText: "Question" }).first().click()
