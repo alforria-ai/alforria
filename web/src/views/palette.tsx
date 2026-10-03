@@ -123,6 +123,16 @@ export function Palette(props: { initial?: string; actions: PaletteActions }) {
     items()
     setSel((v) => Math.min(v, Math.max(0, items().length - 1)))
   })
+  /** Items grouped for rendering, each keeping its flat index for selection. */
+  const sections = createMemo(() => {
+    const out: { group: string; items: { item: Item; i: number }[] }[] = []
+    items().forEach((item, i) => {
+      const last = out[out.length - 1]
+      if (last?.group === item.group) last.items.push({ item, i })
+      else out.push({ group: item.group, items: [{ item, i }] })
+    })
+    return out
+  })
 
   const run = (i: number) => {
     const item = items()[i]
@@ -173,29 +183,34 @@ export function Palette(props: { initial?: string; actions: PaletteActions }) {
           onKeyDown={onKey}
         />
         <div class="results" id="palResults" role="listbox" ref={list}>
-          <For each={items()} fallback={<div class="empty">Nothing matches “{q()}”.</div>}>
-            {(item, i) => (
-              <>
-                <Show when={i() === 0 || items()[i() - 1]!.group !== item.group}>
-                  <h4>{item.group}</h4>
-                </Show>
-                <button
-                  class="res"
-                  classList={{ on: i() === sel() }}
-                  role="option"
-                  aria-selected={i() === sel()}
-                  onMouseMove={() => setSel(i())}
-                  onClick={() => run(i())}
-                >
-                  <Show when={item.lamp} fallback={<Icon name={item.icon ?? "chev-right"} />}>
-                    <span class={`lamp ${item.lamp}`} />
-                  </Show>
-                  <span class="t">{item.label}</span>
-                  <span class="m">{item.meta}</span>
-                </button>
-              </>
-            )}
-          </For>
+          <Show when={items().length} fallback={<div class="empty">Nothing matches “{q()}”.</div>}>
+            <For each={sections()}>
+              {(sec) => (
+                // A listbox holds groups of options; the section title labels the group.
+                <div role="group" aria-label={sec.group}>
+                  <h4 role="presentation">{sec.group}</h4>
+                  <For each={sec.items}>
+                    {({ item, i }) => (
+                      <button
+                        class="res"
+                        classList={{ on: i === sel() }}
+                        role="option"
+                        aria-selected={i === sel()}
+                        onMouseMove={() => setSel(i)}
+                        onClick={() => run(i)}
+                      >
+                        <Show when={item.lamp} fallback={<Icon name={item.icon ?? "chev-right"} />}>
+                          <span class={`lamp ${item.lamp}`} />
+                        </Show>
+                        <span class="t">{item.label}</span>
+                        <span class="m">{item.meta}</span>
+                      </button>
+                    )}
+                  </For>
+                </div>
+              )}
+            </For>
+          </Show>
         </div>
       </div>
     </div>

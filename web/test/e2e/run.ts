@@ -5,7 +5,7 @@
 // navigation contract. Exits non-zero on any failed check or page error.
 import { chromium, type Page } from "playwright"
 import { join } from "node:path"
-import { mkdtempSync } from "node:fs"
+import { mkdtempSync, readFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 
 const WEB = join(import.meta.dir, "../..")
@@ -80,6 +80,18 @@ const preview = EMBEDDED
       stderr: "inherit",
     })
 
+const AXE = readFileSync(join(WEB, "node_modules/axe-core/axe.min.js"), "utf8")
+/** Serious and critical axe-core violations on the current page. */
+async function a11y(p: Page) {
+  await p.addScriptTag({ content: AXE })
+  return p.evaluate(async () => {
+    const r = await (
+      window as unknown as { axe: { run(d: Document): Promise<{ violations: { id: string; impact: string }[] }> } }
+    ).axe.run(document)
+    return r.violations.filter((v) => v.impact === "serious" || v.impact === "critical").map((v) => v.id)
+  })
+}
+
 const watch = (p: Page, tag: string) => {
   p.on("pageerror", (e) => errors.push(`${tag} pageerror: ${e.message}`))
   p.on("console", (m) => m.type() === "error" && errors.push(`${tag} console: ${m.text()}`))
@@ -107,6 +119,8 @@ try {
     check((await p.locator("tr.s-row").count()) === 10, "overview lists the 10 seeded sessions")
     check((await waiting()) === 3, "band counts 3 waiting")
     check((await p.locator(".q-list .slip").count()) === 3, "queue holds 3 slips, oldest open")
+    const overviewA11y = await a11y(p)
+    check(!overviewA11y.length, `overview has no serious a11y violations ${overviewA11y.join(" ")}`)
 
     // Approve with the keyboard: needs the slip to have been readable for a
     // moment. A double-press 100 ms later must not approve the next item,
@@ -134,6 +148,8 @@ try {
     await p.locator(".col.is-active .msg-user").first().waitFor()
     check(/#\/focus\/ses_/.test(p.url()), "opening a session gives it a URL")
     check((await p.locator("#queue .rail-row").count()) === 10, "focus shows the live session list")
+    const focusA11y = await a11y(p)
+    check(!focusA11y.length, `focus has no serious a11y violations ${focusA11y.join(" ")}`)
 
     // Prompt round-trip through the scripted backend.
     await p.locator(".col.is-active textarea").fill("Summarize what changed.")

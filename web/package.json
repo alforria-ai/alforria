@@ -25,6 +25,7 @@
   },
   "devDependencies": {
     "@types/bun": "^1.4.2",
+    "axe-core": "4",
     "openapi-typescript": "^7",
     "playwright": "1.59.1",
     "prettier": "^3",

@@ -115,7 +115,7 @@ export function Queue(props: {
           <Icon name="panel" />
         </button>
       </div>
-      <div class="q-list" role="list" aria-labelledby="queueTitle" ref={listEl}>
+      <div class="q-list" role="region" aria-labelledby="queueTitle" ref={listEl}>
         <Show
           when={queueItems().length}
           fallback={

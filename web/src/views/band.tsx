@@ -31,6 +31,7 @@ export function Band(props: {
   )
   return (
     <header class="band" id="band">
+      <h1 class="sr-only">alforria: agents waiting on you, and every session on this server</h1>
       <a class="wordmark" href="#/" aria-label="alforria, fleet overview">
         alforria
       </a>

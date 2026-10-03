@@ -310,7 +310,8 @@ export default function TerminalView(props: {
     ws.onclose = (e) => {
       if (socket !== ws) return
       socket = undefined
-      if (disposed) return
+      // closeTerminal() ended it on purpose: no exit line, no reconnect.
+      if (disposed || closed.has(p.id)) return
       if (e.code === 1000 || e.code === 4404) void ended(p)
       else retry()
     }
@@ -416,7 +417,7 @@ export default function TerminalView(props: {
     sizeTimer = setTimeout(
       () => {
         const p = current
-        if (!term || !p || phase().kind !== "live") return
+        if (!term || !p || closed.has(p.id) || phase().kind !== "live") return
         const size = `${term.rows}x${term.cols}`
         if (size === sentSize) return
         sentSize = size

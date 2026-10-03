@@ -43,9 +43,11 @@ export function Rail(props: {
       <div class="rail-list" role="listbox" aria-labelledby="railTitle">
         <For each={groups()}>
           {(g) => (
-            <>
-              <div class="rail-proj">
-                <h3>{projectName(g.project)}</h3>
+            // A listbox may only hold options and groups: each project is a
+            // labelled group, its header presentational.
+            <div role="group" aria-label={projectName(g.project)}>
+              <div class="rail-proj" role="presentation">
+                <h3 role="presentation">{projectName(g.project)}</h3>
                 <span class="tally">
                   {g.rows.length}
                   <Show when={g.rows.filter((r) => fleetState(state, r.session.id) === "waiting").length}>
@@ -110,7 +112,7 @@ export function Rail(props: {
                   )
                 }}
               </For>
-            </>
+            </div>
           )}
         </For>
       </div>
