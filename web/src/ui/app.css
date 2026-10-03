@@ -3338,8 +3338,12 @@ button.tool-row:hover {
   border: 1px solid var(--rule-2);
   padding: 2px 4px;
 }
-.send:disabled {
-  opacity: 0.6;
+/* Ready-Fill: a primary that can't act yet is an outlined plate, not a faded slab. */
+.send:disabled,
+.send:disabled:hover {
+  background: var(--plate);
+  color: var(--ink-3);
+  box-shadow: inset 0 0 0 1px var(--rule-2);
   cursor: default;
 }
 .slip.inline + .slip.inline {

@@ -68,4 +68,4 @@ These elements are not in the contract; the finish review accepted them as suppo
 ## Unresolved
 
 - Cloud machine switcher: design deferred to the LibertAI product.
-- Icon set: authored 1.5-stroke SVG in the prototype; a library choice for the build.
+- Icon set: settled — the authored 1.5-stroke set in `web/src/ui/icons.tsx` (no library).

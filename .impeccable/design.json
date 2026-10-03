@@ -221,12 +221,22 @@
       {
         "name": "active-column",
         "value": "inset 0 2px 0 var(--ink)",
-        "purpose": "Active focus column and current mobile tab."
+        "purpose": "Active focus column, current mobile tab, and the error toast's top line."
       },
       {
-        "name": "palette-selection",
+        "name": "selection-ring",
         "value": "inset 0 0 0 1px var(--rule-2)",
-        "purpose": "Selected command palette result."
+        "purpose": "Selected palette result, active rail row, and the disabled primary stamp's outline."
+      },
+      {
+        "name": "effective-default",
+        "value": "inset 0 0 0 1px var(--ink-3)",
+        "purpose": "Settings segment a value falls back to when unset."
+      },
+      {
+        "name": "open-lamp",
+        "value": "inset 0 0 0 1px var(--ink)",
+        "purpose": "Collapsed-rail lamp whose session is open in a column."
       }
     ],
     "motion": [
@@ -286,16 +296,41 @@
         "purpose": "Hover and selection fills are immediate."
       },
       {
+        "name": "toast-arrive",
+        "value": "200ms",
+        "purpose": "Toast slides in (the arrive keyframes)."
+      },
+      {
+        "name": "toast-life",
+        "value": "6000ms",
+        "purpose": "Toast removed after six seconds."
+      },
+      {
+        "name": "read-delay",
+        "value": "500ms",
+        "purpose": "A verdict key acts only after the active slip has been on screen this long; auto-repeat never acts (views/queue/queue.tsx)."
+      },
+      {
+        "name": "arrival-boot-grace",
+        "value": "1500ms",
+        "purpose": "Slips present at load do not play the arrival slide."
+      },
+      {
         "name": "reduced-motion",
         "value": "0.001ms",
-        "purpose": "All animation/transition durations collapse; stamp resolves immediately."
+        "purpose": "All animation/transition durations collapse and run once; smooth scroll off. The verdict still holds 480ms; the fold is instant."
       }
     ],
     "breakpoints": [
       {
+        "name": "band-compact",
+        "value": "1520px",
+        "purpose": "max-width: New session and designation drop labels."
+      },
+      {
         "name": "wide",
         "value": "1280px",
-        "purpose": "max-width: queue-w 360px, server address hidden."
+        "purpose": "max-width: queue-w 360px, server address and band-tab keys hidden."
       },
       {
         "name": "medium",
@@ -303,9 +338,14 @@
         "purpose": "max-width: context column hidden, New session icon-only, focus columns min 380px."
       },
       {
+        "name": "keys-two-column",
+        "value": "900px",
+        "purpose": "min-width: keys sheet groups flow into two columns."
+      },
+      {
         "name": "mobile",
         "value": "760px",
-        "purpose": "max-width: single pane, 48px band, 56px bottom tabs, card rows, 50px stamps."
+        "purpose": "max-width: single pane, 48px band, 56px bottom tabs, card rows, 50px stamps, 40px touch targets, 16px inputs."
       },
       {
         "name": "column-narrow",
@@ -321,15 +361,90 @@
           800
         ],
         "files": [
-          "web/prototype/fonts/barlow-condensed-latin-700.woff2",
-          "web/prototype/fonts/barlow-condensed-latin-800.woff2"
+          "web/src/ui/fonts/barlow-condensed-latin-700.woff2",
+          "web/src/ui/fonts/barlow-condensed-latin-800.woff2"
         ],
-        "license": "OFL (web/prototype/fonts/OFL-Barlow-Condensed.txt)"
+        "license": "OFL (web/src/ui/fonts/OFL-Barlow-Condensed.txt)"
       }
     ],
     "icons": {
       "style": "16px viewBox, 1.5 stroke, square caps, miter joins, no fill except solid blocks",
-      "source": "web/prototype/index.html sprite; build library undecided"
+      "source": "web/src/ui/icons.tsx (authored set; no library)"
+    },
+    "layout": {
+      "columns": {
+        "max": 3,
+        "perWidth": "one per 400px of workspace",
+        "phone": 1,
+        "openDefault": "replace the active column",
+        "openBeside": "shift-click or the row's open-beside control; terminals always open beside"
+      },
+      "routes": {
+        "overview": "#/",
+        "focus": "#/focus/<col>,<col> (session id or term:<projectID>)",
+        "settings": "#/settings/<page>"
+      },
+      "touchTarget": "40px on phones",
+      "phoneInputFontSize": "16px"
+    },
+    "terminalPalette": {
+      "source": "web/src/ui/terminal.css (.pty)",
+      "xtermTheme": {
+        "background": "--plate",
+        "foreground": "--ink",
+        "cursor": "--ink",
+        "cursorAccent": "--plate",
+        "selectionBackground": "--rule-2",
+        "selectionInactiveBackground": "--plate-3",
+        "scrollbarSlider": "--rule-2",
+        "scrollbarSliderHover": "--ink-3",
+        "scrollbarSliderActive": "--ink-2"
+      },
+      "dark": {
+        "black": "#3a454c",
+        "red": "#d9818a",
+        "green": "#8fbf98",
+        "yellow": "#cdc07e",
+        "blue": "#82a7c9",
+        "magenta": "#b39ac6",
+        "cyan": "#7fb8b8",
+        "white": "#a3aeb4",
+        "brightBlack": "#7d8a91",
+        "brightRed": "#eba3aa",
+        "brightGreen": "#a9d4b1",
+        "brightYellow": "#e0d59d",
+        "brightBlue": "#a2c0db",
+        "brightMagenta": "#cab4d9",
+        "brightCyan": "#9fcfcf",
+        "brightWhite": "#e3e8ea"
+      },
+      "light": {
+        "black": "#14191c",
+        "red": "#a8323e",
+        "green": "#2e6b3e",
+        "yellow": "#6f6413",
+        "blue": "#2d5c88",
+        "magenta": "#74508c",
+        "cyan": "#22696c",
+        "white": "#5e6a72",
+        "brightBlack": "#7d8a91",
+        "brightRed": "#c2404c",
+        "brightGreen": "#3a8450",
+        "brightYellow": "#857819",
+        "brightBlue": "#3a72a6",
+        "brightMagenta": "#8c62a8",
+        "brightCyan": "#2d8085",
+        "brightWhite": "#4b555c"
+      },
+      "note": "Program output colours, scoped to the terminal well. Red leans crimson and yellow straw so neither reads as orange."
+    },
+    "syntax": {
+      "engine": "shiki (lazy), monochrome theme mapped to classes",
+      "kw": "ink, 600",
+      "st": "ink-2",
+      "cm": "ink-3",
+      "ad": "add-mark (diff blocks only)",
+      "dl": "del-mark (diff blocks only)"
     }
   },
   "components": [
@@ -404,23 +519,72 @@
       "description": "Mono diff on a plate; green/red tints exist only here.",
       "html": "<div class=\"ds-diff\"><div class=\"ds-ln ds-h\">@@ -12,4 +12,5 @@</div><div class=\"ds-ln\"><span>12</span><span></span><span>let token = cache.get(&amp;key);</span></div><div class=\"ds-ln ds-del\"><span>13</span><span>-</span><span>if token.expired() { refresh() }</span></div><div class=\"ds-ln ds-add\"><span>13</span><span>+</span><span>if token.expires_within(SKEW) { refresh().await? }</span></div></div>",
       "css": ":host{--ground:#0b0e10;--plate:#121619;--plate-2:#181d21;--rule:#232b30;--rule-2:#35414a;--ink:#e3e8ea;--ink-2:#a3aeb4;--ink-3:#7d8a91;--accent:#e25303;--accent-ink:#0b0e10;--accent-text:#ff7a33;--accent-veil:rgba(226,83,3,.09);--add-bg:rgba(84,170,110,.13);--add-mark:#8fd19e;--del-bg:rgba(226,92,80,.13);--del-mark:#f0a39b;--f-label:'Barlow Condensed','Arial Narrow',sans-serif;--f-body:system-ui,-apple-system,'Segoe UI',sans-serif;--f-mono:ui-monospace,'SF Mono',Menlo,Consolas,monospace;--ease-out:cubic-bezier(0.16,1,0.3,1);--t-feedback:150ms}.ds-diff{width:480px;background:var(--plate);color:var(--ink);font:400 12px/1.6 var(--f-mono)}.ds-ln{display:grid;grid-template-columns:44px 16px 1fr;white-space:pre}.ds-ln>span:first-child{text-align:right;padding-right:8px;color:var(--ink-3)}.ds-ln>span:nth-child(2){text-align:center}.ds-add{background:var(--add-bg)}.ds-add>span:nth-child(2){color:var(--add-mark)}.ds-del{background:var(--del-bg)}.ds-del>span:nth-child(2){color:var(--del-mark)}.ds-h{grid-template-columns:1fr;padding:2px 10px;color:var(--ink-3);background:var(--plate-2)}"
+    },
+    {
+      "name": "Band View Tabs",
+      "kind": "nav",
+      "refersTo": "band-tab-current",
+      "description": "Overview / Focus cells in the band; the current view is inverted to ink, keys reverse with it.",
+      "html": "<nav class=\"ds-bnav\"><button>Overview<kbd class=\"ds-kbd\">Esc</kbd></button><button aria-current=\"true\">Focus <span class=\"ds-c\">2</span><kbd class=\"ds-kbd\">F</kbd></button></nav>",
+      "css": ":host{--ground:#0b0e10;--plate:#121619;--plate-2:#181d21;--rule:#232b30;--rule-2:#35414a;--ink:#e3e8ea;--ink-2:#a3aeb4;--ink-3:#7d8a91;--accent:#e25303;--accent-ink:#0b0e10;--accent-text:#ff7a33;--accent-veil:rgba(226,83,3,.09);--add-bg:rgba(84,170,110,.13);--add-mark:#8fd19e;--del-bg:rgba(226,92,80,.13);--del-mark:#f0a39b;--f-label:'Barlow Condensed','Arial Narrow',sans-serif;--f-body:system-ui,-apple-system,'Segoe UI',sans-serif;--f-mono:ui-monospace,'SF Mono',Menlo,Consolas,monospace;--ease-out:cubic-bezier(0.16,1,0.3,1);--t-feedback:150ms}.ds-kbd{font:500 10.5px/1 var(--f-mono);color:var(--ink-3);border:1px solid var(--rule-2);padding:2px 4px;min-width:16px;display:inline-block;text-align:center}.ds-bnav{display:flex;height:44px;background:var(--ground);border-left:1px solid var(--rule)}.ds-bnav button{display:flex;align-items:center;gap:8px;padding:0 14px;border:0;border-right:1px solid var(--rule);background:none;color:var(--ink-2);font:700 14px/1 var(--f-label);text-transform:uppercase;letter-spacing:.03em;cursor:pointer}.ds-bnav button:hover{background:var(--plate);color:var(--ink)}.ds-bnav button[aria-current=true]{background:var(--ink);color:var(--ground)}.ds-bnav button[aria-current=true] .ds-kbd{color:var(--ground);border-color:var(--ground)}.ds-c{font:400 11px/1 var(--f-mono);letter-spacing:0}:focus-visible{outline:2px solid var(--ink);outline-offset:-2px}"
+    },
+    {
+      "name": "Session Rail",
+      "kind": "custom",
+      "refersTo": "rail-row",
+      "description": "Focus-mode session list: orange waiting bar, project group, two-line rows with column badges; active row ringed, waiting row veiled.",
+      "html": "<div class=\"ds-rail\"><button class=\"ds-next\"><span class=\"ds-lamp ds-ink\"></span><span><b>2 waiting</b> · open Audit secrets in .env</span><kbd class=\"ds-kbd\">W</kbd></button><div class=\"ds-proj\"><h3>ferrite-cli</h3><span>3 · <b>1 waiting</b></span></div><div class=\"ds-row ds-act\"><span class=\"ds-lamp ds-idle\"></span><span class=\"ds-t\">Fix flaky config test</span><span class=\"ds-bdg\"><i class=\"on\">2</i></span><span class=\"ds-age\">2m</span><span class=\"ds-now\"><b>Done</b> Fixed: the test now writes to a per-process dir</span></div><div class=\"ds-row ds-wait\"><span class=\"ds-lamp ds-or\"></span><span class=\"ds-t\">Audit secrets in .env</span><span class=\"ds-bdg\"></span><span class=\"ds-age\">2m</span><span class=\"ds-now\"><b>Approve</b> read .env</span></div><div class=\"ds-hint\">Click to switch the active column · ⇧ click to open beside</div></div>",
+      "css": ":host{--ground:#0b0e10;--plate:#121619;--plate-2:#181d21;--rule:#232b30;--rule-2:#35414a;--ink:#e3e8ea;--ink-2:#a3aeb4;--ink-3:#7d8a91;--accent:#e25303;--accent-ink:#0b0e10;--accent-text:#ff7a33;--accent-veil:rgba(226,83,3,.09);--add-bg:rgba(84,170,110,.13);--add-mark:#8fd19e;--del-bg:rgba(226,92,80,.13);--del-mark:#f0a39b;--f-label:'Barlow Condensed','Arial Narrow',sans-serif;--f-body:system-ui,-apple-system,'Segoe UI',sans-serif;--f-mono:ui-monospace,'SF Mono',Menlo,Consolas,monospace;--ease-out:cubic-bezier(0.16,1,0.3,1);--t-feedback:150ms}.ds-kbd{font:500 10.5px/1 var(--f-mono);color:var(--ink-3);border:1px solid var(--rule-2);padding:2px 4px;min-width:16px;display:inline-block;text-align:center}.ds-rail{width:312px;background:var(--ground);color:var(--ink);font:400 13.5px/1.5 var(--f-body)}.ds-next{display:flex;align-items:center;gap:10px;width:100%;min-height:36px;padding:6px 12px 6px 16px;border:0;background:var(--accent);color:var(--accent-ink);font-size:12.5px;line-height:1.3;text-align:left;cursor:pointer}.ds-next>span:nth-child(2){flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.ds-next b{font:700 13.5px/1 var(--f-label);text-transform:uppercase;letter-spacing:.03em}.ds-next .ds-kbd{color:var(--accent-ink);border-color:var(--accent-ink)}.ds-next:hover span:nth-child(2){text-decoration:underline;text-underline-offset:3px}.ds-proj{display:flex;align-items:baseline;gap:10px;padding:14px 16px 6px;border-bottom:1px solid var(--rule)}.ds-proj h3{margin:0;font:700 14px/1 var(--f-label);text-transform:uppercase;letter-spacing:.03em}.ds-proj span{font:400 11px/1 var(--f-mono);color:var(--ink-3)}.ds-proj b{color:var(--accent-text);font-weight:500}.ds-row{display:grid;grid-template-columns:9px minmax(0,1fr) auto auto;grid-template-areas:'l t b a' '. n n n';align-items:center;gap:3px 10px;padding:7px 12px 7px 16px;border-bottom:1px solid var(--rule-soft);cursor:pointer}.ds-row:hover{background:var(--plate)}.ds-lamp{grid-area:l;width:9px;height:9px;border-radius:50%;display:inline-block}.ds-ink{background:var(--accent-ink)}.ds-or{background:var(--accent)}.ds-idle{border:1.5px solid var(--ink-3)}.ds-t{grid-area:t;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.ds-bdg{grid-area:b;display:inline-flex;gap:2px}.ds-bdg i{font:500 10px/14px var(--f-mono);font-style:normal;width:14px;text-align:center;border:1px solid var(--ink-3);color:var(--ink-2)}.ds-bdg i.on{background:var(--ink);border-color:var(--ink);color:var(--ground)}.ds-age{grid-area:a;font:400 11px/1 var(--f-mono);color:var(--ink-3)}.ds-now{grid-area:n;font:400 11.5px/1.3 var(--f-mono);color:var(--ink-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.ds-now b{font:700 11.5px/1 var(--f-label);text-transform:uppercase;letter-spacing:.04em;color:var(--ink-2);margin-right:4px}.ds-act{background:var(--plate-2);box-shadow:inset 0 0 0 1px var(--rule-2)}.ds-act .ds-t{font-weight:650}.ds-wait{background:var(--accent-veil)}.ds-wait:hover{background:var(--accent-veil-2)}.ds-wait .ds-now,.ds-wait .ds-now b{color:var(--accent-text)}.ds-hint{padding:8px 16px;border-top:1px solid var(--rule);font-size:11.5px;color:var(--ink-3)}:focus-visible{outline:2px solid var(--ink);outline-offset:-2px}"
+    },
+    {
+      "name": "Settings Segment with Effective Default and Confirm-to-Loosen",
+      "kind": "custom",
+      "refersTo": "seg-button-effective",
+      "description": "Unset value shows its fallback as an ink-3 inset ring; loosening to allow asks in place under a 1px ink border.",
+      "html": "<div class=\"ds-set\"><div class=\"ds-seg\"><button class=\"eff\">Ask</button><button>Allow</button><button>Deny</button></div><div class=\"ds-confirm\" role=\"alert\"><span>Allow every <b>bash</b> call without asking, in every project on this server?</span><button class=\"ds-lb ds-danger\">Allow without asking</button><button class=\"ds-lb\">Cancel</button></div></div>",
+      "css": ":host{--ground:#0b0e10;--plate:#121619;--plate-2:#181d21;--rule:#232b30;--rule-2:#35414a;--ink:#e3e8ea;--ink-2:#a3aeb4;--ink-3:#7d8a91;--accent:#e25303;--accent-ink:#0b0e10;--accent-text:#ff7a33;--accent-veil:rgba(226,83,3,.09);--add-bg:rgba(84,170,110,.13);--add-mark:#8fd19e;--del-bg:rgba(226,92,80,.13);--del-mark:#f0a39b;--f-label:'Barlow Condensed','Arial Narrow',sans-serif;--f-body:system-ui,-apple-system,'Segoe UI',sans-serif;--f-mono:ui-monospace,'SF Mono',Menlo,Consolas,monospace;--ease-out:cubic-bezier(0.16,1,0.3,1);--t-feedback:150ms}.ds-set{width:520px;padding:12px;background:var(--ground);color:var(--ink);font:400 13px/1.4 var(--f-body)}.ds-seg{display:inline-flex}.ds-seg button{height:26px;padding:0 9px;border:1px solid var(--rule-2);margin-left:-1px;background:none;color:var(--ink-2);font:700 12px/1 var(--f-label);text-transform:uppercase;letter-spacing:.03em;cursor:pointer}.ds-seg button:first-child{margin-left:0}.ds-seg button:hover{color:var(--ink);background:var(--plate)}.ds-seg button.eff{box-shadow:inset 0 0 0 1px var(--ink-3);color:var(--ink)}.ds-seg button[aria-pressed=true]{background:var(--ink);color:var(--ground);border-color:var(--ink)}.ds-confirm{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin-top:10px;padding:10px 12px;border:1px solid var(--ink)}.ds-confirm span{flex:1;min-width:220px}.ds-lb{padding:4px 6px;border:1px solid var(--rule-2);background:none;color:var(--ink-2);font:700 12px/1 var(--f-label);text-transform:uppercase;letter-spacing:.04em;cursor:pointer}.ds-lb:hover{background:var(--ink);color:var(--ground);border-color:var(--ink)}.ds-danger{background:var(--ink);color:var(--ground);border-color:var(--ink)}:focus-visible{outline:2px solid var(--ink);outline-offset:-2px}"
+    },
+    {
+      "name": "Primary Stamp, not ready",
+      "kind": "button",
+      "refersTo": "stamp-primary-disabled",
+      "description": "A primary that cannot act yet is an outlined plate; it fills with ink when ready.",
+      "html": "<div class=\"ds-acts\"><button class=\"ds-stamp\" disabled><kbd class=\"ds-kbd\">⏎</kbd>Submit answer</button><button class=\"ds-stamp ds-2\"><kbd class=\"ds-kbd\">X</kbd>Dismiss</button></div>",
+      "css": ":host{--ground:#0b0e10;--plate:#121619;--plate-2:#181d21;--rule:#232b30;--rule-2:#35414a;--ink:#e3e8ea;--ink-2:#a3aeb4;--ink-3:#7d8a91;--accent:#e25303;--accent-ink:#0b0e10;--accent-text:#ff7a33;--accent-veil:rgba(226,83,3,.09);--add-bg:rgba(84,170,110,.13);--add-mark:#8fd19e;--del-bg:rgba(226,92,80,.13);--del-mark:#f0a39b;--f-label:'Barlow Condensed','Arial Narrow',sans-serif;--f-body:system-ui,-apple-system,'Segoe UI',sans-serif;--f-mono:ui-monospace,'SF Mono',Menlo,Consolas,monospace;--ease-out:cubic-bezier(0.16,1,0.3,1);--t-feedback:150ms}.ds-kbd{font:500 10.5px/1 var(--f-mono);color:var(--ink-3);border:1px solid var(--rule-2);padding:2px 4px;min-width:16px;display:inline-block;text-align:center}.ds-acts{display:grid;grid-template-columns:1.3fr .7fr;width:400px;background:var(--ground);border-top:1px solid var(--rule)}.ds-stamp{display:flex;align-items:center;justify-content:center;gap:8px;min-height:40px;border:0;background:var(--ink);color:var(--ground);font:700 14px/1 var(--f-label);text-transform:uppercase;letter-spacing:.03em;cursor:pointer}.ds-stamp:disabled{background:var(--plate);color:var(--ink-3);box-shadow:inset 0 0 0 1px var(--rule-2);cursor:default}.ds-2{background:none;color:var(--ink);border-left:1px solid var(--rule)}.ds-2:hover{background:var(--plate-2)}:focus-visible{outline:2px solid var(--ink);outline-offset:-2px}"
+    },
+    {
+      "name": "Markdown Code Block",
+      "kind": "custom",
+      "refersTo": "code-head-copy",
+      "description": "Plate with a 28px ruled head (mono language, COPY label button); monochrome highlighting; scrolls, never wraps.",
+      "html": "<div class=\"ds-cb\"><div class=\"ds-ch\"><span>rust</span><button>Copy</button></div><code><span class=\"kw\">let</span> dir = std::env::temp_dir(); <span class=\"cm\">// per process</span>\n<span class=\"kw\">fn</span> load() -&gt; &amp;<span class=\"kw\">str</span> { <span class=\"st\">\"a\\nb\"</span> }</code></div>",
+      "css": ":host{--ground:#0b0e10;--plate:#121619;--plate-2:#181d21;--rule:#232b30;--rule-2:#35414a;--ink:#e3e8ea;--ink-2:#a3aeb4;--ink-3:#7d8a91;--accent:#e25303;--accent-ink:#0b0e10;--accent-text:#ff7a33;--accent-veil:rgba(226,83,3,.09);--add-bg:rgba(84,170,110,.13);--add-mark:#8fd19e;--del-bg:rgba(226,92,80,.13);--del-mark:#f0a39b;--f-label:'Barlow Condensed','Arial Narrow',sans-serif;--f-body:system-ui,-apple-system,'Segoe UI',sans-serif;--f-mono:ui-monospace,'SF Mono',Menlo,Consolas,monospace;--ease-out:cubic-bezier(0.16,1,0.3,1);--t-feedback:150ms}.ds-cb{width:460px;background:var(--plate);border:1px solid var(--rule);color:var(--ink)}.ds-ch{display:flex;height:28px;border-bottom:1px solid var(--rule)}.ds-ch span{flex:1;align-self:center;padding-left:10px;font:400 11px/1 var(--f-mono);color:var(--ink-3)}.ds-ch button{padding:0 10px;border:0;border-left:1px solid var(--rule);background:none;color:var(--ink-2);font:700 12px/1 var(--f-label);text-transform:uppercase;letter-spacing:.05em;cursor:pointer}.ds-ch button:hover{background:var(--ink);color:var(--ground)}.ds-cb code{display:block;padding:8px 10px;overflow-x:auto;font:400 12px/1.6 var(--f-mono);white-space:pre}.kw{font-weight:600}.st{color:var(--ink-2)}.cm{color:var(--ink-3)}:focus-visible{outline:2px solid var(--ink);outline-offset:-2px}"
+    },
+    {
+      "name": "Error Toast",
+      "kind": "custom",
+      "refersTo": "toast",
+      "description": "Failure notice: ground, ink border and 2px inset ink top line; never orange, green or red.",
+      "html": "<div class=\"ds-toast\">Could not send “Allowed once”: network error</div>",
+      "css": ":host{--ground:#0b0e10;--plate:#121619;--plate-2:#181d21;--rule:#232b30;--rule-2:#35414a;--ink:#e3e8ea;--ink-2:#a3aeb4;--ink-3:#7d8a91;--accent:#e25303;--accent-ink:#0b0e10;--accent-text:#ff7a33;--accent-veil:rgba(226,83,3,.09);--add-bg:rgba(84,170,110,.13);--add-mark:#8fd19e;--del-bg:rgba(226,92,80,.13);--del-mark:#f0a39b;--f-label:'Barlow Condensed','Arial Narrow',sans-serif;--f-body:system-ui,-apple-system,'Segoe UI',sans-serif;--f-mono:ui-monospace,'SF Mono',Menlo,Consolas,monospace;--ease-out:cubic-bezier(0.16,1,0.3,1);--t-feedback:150ms}.ds-toast{max-width:420px;padding:10px 14px;background:var(--ground);color:var(--ink);border:1px solid var(--ink);box-shadow:inset 0 2px 0 var(--ink);font:400 13px/1.4 var(--f-body);animation:ds-arr 200ms var(--ease-out)}@keyframes ds-arr{from{transform:translateY(-12px);opacity:0}}@media (prefers-reduced-motion:reduce){.ds-toast{animation-duration:.001ms}}"
     }
   ],
   "narrative": {
     "northStar": "The Operating Datasheet",
-    "overview": "**Creative North Star: \"The Operating Datasheet\"**\n\nThe alforria website is a component datasheet: an orange identifier band, condensed caps, numbered specifications and square stamped controls on cool paper. The web client is that same datasheet put into service. It is dense and dark-first, read for hours, and its job is to clear a queue of waiting agents and scan a table of live ones. It keeps the website's materials and inverts their emphasis. On the website orange announces the product. Here orange is silent until an agent needs the human, and then it is the only orange on screen.\n\nThe surface is flat and ruled. A cool near-black ground carries slightly lifted plates, and 1px cool-gray rules divide every region, row and cell. Pale ink carries the text. Barlow Condensed caps name things (panes, columns, tools, verdicts, controls). System sans carries sentences. Mono carries only what is data or code: paths, commands, costs, ages, token counts and state codes. Density is set by a 32px row and a 16px gutter. Motion is a grammar of immediate fills plus one signature: the 150ms registration-offset stamp that marks a cleared slip.\n\nThis record was taken from the shipped prototype: `web/prototype/proto.css` (tokens on `:root`, light theme on `:root[data-theme=\"light\"]`), `app.js`, the icon sprite in `index.html`, and the self-hosted fonts in `web/prototype/fonts/`. Brand lineage: `~/repos/alforria-website/DESIGN.md`. Every color key in the frontmatter maps to a CSS custom property of the same name prefixed with `--`. Keys ending in `-light` are the same property's value under `[data-theme=\"light\"]`, and `accent` is identical in both themes. The SolidJS build should keep these property names unchanged.",
+    "overview": "**Creative North Star: \"The Operating Datasheet\"**\n\nThe alforria website is a component datasheet: an orange identifier band, condensed caps, numbered specifications and square stamped controls on cool paper. The web client is that same datasheet put into service. It is dense and dark-first, read for hours, and its job is to clear a queue of waiting agents and scan a table of live ones. It keeps the website's materials and inverts their emphasis. On the website orange announces the product. Here orange is silent until an agent needs the human, and then it is the only orange on screen.\n\nThe surface is flat and ruled. A cool near-black ground carries slightly lifted plates, and 1px cool-gray rules divide every region, row and cell. Pale ink carries the text. Barlow Condensed caps name things (panes, columns, tools, verdicts, controls). System sans carries sentences. Mono carries only what is data or code: paths, commands, costs, ages, token counts and state codes. Density is set by a 32px row and a 16px gutter. Motion is a grammar of immediate fills plus one signature: the 150ms registration-offset stamp that marks a cleared slip.\n\nThis record is taken from the shipped SolidJS build in `web/src/`: tokens and components in `ui/app.css` (tokens on `:root`, light theme on `:root[data-theme=\"light\"]`), `ui/markdown.css`, `ui/terminal.css`, the authored icon set in `ui/icons.tsx`, diff rendering in `ui/diff.tsx`, the views under `views/`, and the self-hosted fonts in `ui/fonts/`. The first record was taken from the prototype (`web/prototype/`); the build ported its tokens unchanged and extended the system with navigation, the session rail, markdown, the terminal, toasts and settings controls. Brand lineage: `~/repos/alforria-website/DESIGN.md`. Every color key in the frontmatter maps to a CSS custom property of the same name prefixed with `--`. Keys ending in `-light` are the same property's value under `[data-theme=\"light\"]`, and `accent` is identical in both themes.",
     "keyCharacteristics": [
       "Dark-first, with a light theme that returns to the website's paper and ink.",
       "Orange means \"waiting on you\" and nothing else, always with ink on top.",
       "Square corners, 1px rules, and flat tonal plates. No drop shadows and no gradients.",
       "Condensed caps for names, system sans for prose, and mono only for data and code.",
       "Ink-filled controls: the primary action is an ink stamp, never an orange button.",
-      "One signature motion: the registration-offset stamp."
+      "One signature motion: the registration-offset stamp.",
+      "Nothing moves under the cursor: rows keep their order, and a verdict key never lands on an item the human has not seen."
     ],
     "rules": [
       {
         "name": "The One Signal Rule",
-        "body": "Orange means \"an agent is waiting on the human\" and nothing else. If the waiting state goes away, the orange goes with it: after the last slip clears, the band counter returns to ink-3 on the ground. Primary actions, selection, focus, progress and errors never use orange.",
+        "body": "Orange means \"an agent is waiting on the human\" and nothing else. If the waiting state goes away, the orange goes with it: after the last slip clears, the band counter returns to ink-3 on the ground. Primary actions, selection, focus, progress, errors and toasts never use orange.",
         "section": "colors"
       },
       {
@@ -430,17 +594,17 @@
       },
       {
         "name": "The Diff-Tint Rule",
-        "body": "Green and red exist only to describe added and deleted lines. They never mark status, success, failure or cost.",
+        "body": "Green and red exist only to describe added and deleted lines. They never mark status, success, failure or cost. The terminal is the one exception, because its colours belong to the program being run, not to the interface.",
         "section": "colors"
       },
       {
         "name": "The Never-Colour-Alone Rule",
-        "body": "Every state pairs its colour with a shape and a word. Lamps differ by form: filled for waiting, filled with a pulsing ring for working, half-filled for retry, hollow for idle, and slashed for fault. They always sit next to a mono state code (WAITING, WORKING, RETRY, IDLE, FAULT).",
+        "body": "Every state pairs its colour with a shape and a word. Lamps differ by form: filled for waiting, filled with a pulsing ring for working, half-filled for retry, hollow for idle, and slashed for fault. They always sit next to a mono state code (WAITING, WORKING, RETRY, IDLE, FAULT). Where a row is too narrow for the code (the rail, phone cards), the \"now\" line carries the word.",
         "section": "colors"
       },
       {
         "name": "The Three Voices Rule",
-        "body": "Barlow names, sans explains, mono measures. A sentence is never set in mono. Question text and permission explanations use sans even inside slips. A path, command, cost or count is never set in sans.",
+        "body": "Barlow names, sans explains, mono measures. A sentence is never set in mono. Question text, permission explanations, fault recovery copy and toasts use sans. A path, command, cost or count is never set in sans.",
         "section": "typography"
       },
       {
@@ -450,36 +614,68 @@
       },
       {
         "name": "The Mid-Token Wrap Rule",
-        "body": "Code never breaks inside an identifier. When a diff line wraps inside a narrow slip, break opportunities are inserted only at token boundaries (after `::`, `.`, `(` and `,`, and around spaced operators). Continuation lines hang 2ch past the line's own indent. Wide views scroll horizontally and do not wrap.",
+        "body": "Code never breaks inside an identifier. When a diff line wraps inside a narrow slip, break opportunities are inserted only at token boundaries (after `::`, `.`, `(` and `,`, and around spaced operators). Continuation lines hang 2ch past the line's own indent. Wide views (the Changes view, code viewer and markdown code blocks) scroll horizontally and do not wrap unless the reader turns wrapping on.",
         "section": "typography"
+      },
+      {
+        "name": "The Stable Order Rule",
+        "body": "Rows never move under the cursor. The table and the rail order sessions by creation, with subagents under their parent, and a state change never reorders them. Surfacing what waits is the queue's and the Waiting filter's job, not the row order's.",
+        "section": "layout"
+      },
+      {
+        "name": "The Replace-by-Default Rule",
+        "body": "Opening a session swaps it into the active column. Adding a column is always a deliberate act (shift-click, \"open beside\", or a terminal).",
+        "section": "layout"
       },
       {
         "name": "The Flat Plate Rule",
         "body": "If something needs to stand forward, give it a tonal step or an ink rule, never a shadow. The only offset in the system is the stamp's registration line, and it is a 1px rule, not a shadow.",
         "section": "elevation"
+      },
+      {
+        "name": "The Read Delay Rule",
+        "body": "A verdict key acts only on a slip that has been on screen for 500ms, and never on keyboard auto-repeat. After a verdict the next slip slides in under the same finger, and a new arrival can replace the active slip; a held or quick second key press must not approve something the human has not read.",
+        "section": "components"
+      },
+      {
+        "name": "The Ready-Fill Rule",
+        "body": "A primary control that cannot act yet is an outlined plate, never a dimmed ink slab. Ink fill means \"this will do something now\".",
+        "section": "components"
+      },
+      {
+        "name": "The Confirm-to-Loosen Rule",
+        "body": "Any change that removes the human from the loop asks first, in place, in a sentence that names its scope. Any change that puts the human back in applies at once.",
+        "section": "components"
       }
     ],
     "dos": [
-      "Do reserve `accent` for things waiting on the human: the lit counter, the active and inline slip heads, the column band, the waiting lamp, the pending tool mark, waiting-row veils, and the mobile queue badge.",
+      "Do reserve `accent` for things waiting on the human: the lit counter, the active and inline slip heads, the column band, the rail's waiting bar, the waiting lamp, the pending tool mark, waiting-row veils, and the mobile queue badge.",
       "Do put `accent-ink` on every orange fill, and use `accent-text` for orange words on the ground.",
       "Do make primary actions ink-filled with ground text. Selection and the current item are also ink fills.",
+      "Do show a primary that cannot act yet as an outlined `plate` (1px `rule-2` inset ring, ink-3 text), and fill it with ink when it can.",
       "Do draw focus as a 2px ink outline inset by 2px (`outline-offset: -2px`).",
       "Do set every name and control in uppercase Barlow Condensed (700, or 800 for the wordmark, counter, verdict and display). Set sentences in system sans, and data and code in mono.",
       "Do separate everything with 1px rules (`rule`, `rule-soft` between rows, `rule-2` for control outlines). Head spec lists with a 1px ink rule.",
       "Do pair every state colour with a lamp shape and a mono state code.",
       "Do keep hover fills immediate, and spend motion only on the stamp grammar (150ms feedback, 200ms fold, 260ms arrival).",
       "Do break code only at token boundaries, with a 2ch hanging indent in narrow views.",
-      "Do keep the 16px left gutter and 32px rows when adding panes or tables."
+      "Do keep the 16px left gutter and 32px rows when adding panes or tables.",
+      "Do keep row order stable as sessions change state, and open sessions into the active column unless the human asks for another.",
+      "Do gate verdict keys behind the 500ms read delay and ignore auto-repeat.",
+      "Do ask in place before any setting loosens the human's control, and apply tightening at once.",
+      "Do give every view a hash route, and every control on a phone a 40px target and 16px text fields."
     ],
     "donts": [
-      "Don't use orange for primary buttons, links, selection, focus, progress, errors, brand decoration or input carets.",
-      "Don't use green or red outside diff lines and diff counts. Success and failure are told with ink, shape and words.",
+      "Don't use orange for primary buttons, links, selection, focus, progress, errors, toasts, brand decoration or input carets.",
+      "Don't use green or red outside diff lines, diff counts and the terminal's program output. Success and failure are told with ink, shape and words.",
       "Don't round corners. The only round form is the 9px status lamp.",
       "Don't add drop shadows, blurs or gradients. Inset 1 to 2px box-shadow lines are rules, and are the only permitted `box-shadow`.",
       "Don't set prose in mono or data in sans.",
       "Don't set Barlow Condensed in lowercase or sentence case, except the `alforria` wordmark.",
-      "Don't wrap code mid-identifier, and don't let wide code views wrap. They scroll.",
-      "Don't put kickers or eyebrow labels above titles. Pane heads and slip heads are functional labels that carry state, counts or keys."
+      "Don't wrap code mid-identifier, and don't let wide code views wrap unless the reader asks. They scroll.",
+      "Don't put kickers or eyebrow labels above titles. Pane heads and slip heads are functional labels that carry state, counts or keys.",
+      "Don't reorder rows to surface waiting sessions; that is the queue's job.",
+      "Don't report success in a toast. Show it in place."
     ]
   }
 }
