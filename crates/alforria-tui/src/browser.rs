@@ -18,6 +18,11 @@ pub struct SystemBrowser;
 
 impl Browser for SystemBrowser {
     fn open(&self, url: &str) {
+        // The URL comes from the server, which may be remote: only a plain
+        // web URL reaches the desktop's URL handler.
+        if !launchable_url(url) {
+            return;
+        }
         let (program, args): (&str, Vec<&str>) = if cfg!(target_os = "macos") {
             ("open", vec![url])
         } else if cfg!(windows) {
@@ -43,6 +48,26 @@ impl Browser for SystemBrowser {
     }
 }
 
+/// A plain `http(s)://host…` URL with no whitespace or control characters.
+/// The URL handlers launch whatever a scheme maps to (a `file:` path, an
+/// app's custom protocol) and read a leading `-` as an option, so nothing
+/// else is passed on. Mirrors `alforria_core::browser::launchable_url`
+/// (the TUI doesn't link core).
+pub fn launchable_url(url: &str) -> bool {
+    let lower = url.get(..8).unwrap_or(url).to_ascii_lowercase();
+    let rest = if lower.starts_with("https://") {
+        &url[8..]
+    } else if lower.starts_with("http://") {
+        &url[7..]
+    } else {
+        return false;
+    };
+    let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    url.len() <= 8 * 1024
+        && !host.is_empty()
+        && !url.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
 fn has_display() -> bool {
     ["DISPLAY", "WAYLAND_DISPLAY"]
         .iter()
@@ -66,5 +91,27 @@ impl Browser for RecordingBrowser {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push(url.to_string());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::launchable_url;
+
+    #[test]
+    fn only_plain_web_urls_reach_the_url_handler() {
+        assert!(launchable_url(
+            "https://console.libertai.io/cli?state=a&challenge=b"
+        ));
+        assert!(launchable_url("http://127.0.0.1:4699/cli"));
+        for bad in [
+            "file:///etc/passwd",
+            "ms-msdt:/id PCWDiagnostic",
+            "-a Calculator",
+            "https://",
+            "https://example.com/a b",
+        ] {
+            assert!(!launchable_url(bad), "{bad:?}");
+        }
     }
 }

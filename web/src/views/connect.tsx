@@ -78,6 +78,10 @@ export function ConnectDialog(props: {
     try {
       auth = await api.oauthAuthorize(props.provider.id, method, props.directory)
       if (!auth) throw new Error("The server offered no sign-in page for this method.")
+      // Only a web page may open in the tab or sit behind the link (never
+      // javascript:, file: or an app's custom scheme).
+      if (!/^https?:\/\/[^/?#\s]/i.test(auth.url))
+        throw new Error("The server's sign-in address isn't a web page, so it wasn't opened.")
     } catch (err) {
       tab?.close()
       return fail(method, err)

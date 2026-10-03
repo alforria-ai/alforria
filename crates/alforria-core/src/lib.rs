@@ -6,6 +6,7 @@
 //! `EventV2` bus. Wire compatibility with the pinned TS commit is the law:
 //! every JSON shape emitted here must match what the TS reference accepts.
 
+pub mod browser;
 pub mod catalog;
 pub mod config;
 pub mod control_plane;

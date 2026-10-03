@@ -698,26 +698,7 @@ fn hostname_from_file() -> Option<String> {
 // ---------------------------------------------------------------------------
 
 pub fn open_browser(url: &str) {
-    let command = if cfg!(target_os = "macos") {
-        "open"
-    } else if cfg!(target_os = "windows") {
-        return;
-    } else {
-        "xdg-open"
-    };
-    if cfg!(target_os = "windows") {
-        let _ = std::process::Command::new("cmd")
-            .args(["/C", "start", "", url])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-        return;
-    }
-    let _ = std::process::Command::new(command)
-        .arg(url)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
+    crate::browser::open_url(url);
 }
 
 #[cfg(test)]
