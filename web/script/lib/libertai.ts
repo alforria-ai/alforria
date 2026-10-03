@@ -12,13 +12,19 @@ import { createHash, randomBytes } from "node:crypto"
 const LOOPBACK = new Set(["127.0.0.1", "localhost", "::1", "[::1]"])
 const b64url = (buf: Buffer) => buf.toString("base64url")
 
-export function startLibertai(port: number) {
+/**
+ * `publicHost` (with `--lan`): listen on every interface and hand out the
+ * console at that address, so a browser on another machine can open it. The
+ * redirect back still targets the server's loopback, which that browser
+ * can't reach — exactly the case the paste field is for.
+ */
+export function startLibertai(port: number, publicHost?: string) {
   const challenges = new Map<string, string>()
   const issued: string[] = []
 
   const server = Bun.serve({
     port,
-    hostname: "127.0.0.1",
+    hostname: publicHost ? "0.0.0.0" : "127.0.0.1",
     async fetch(req) {
       const url = new URL(req.url)
       if (req.method === "GET" && url.pathname === "/cli") {
@@ -76,10 +82,10 @@ a{display:inline-block;margin-top:16px;padding:12px 18px;background:#e7ecef;colo
     },
   })
   return {
-    url: `http://127.0.0.1:${server.port}`,
+    url: `http://${publicHost ?? "127.0.0.1"}:${server.port}`,
     issued,
     env: (): Record<string, string> => ({
-      LIBERTAI_CONSOLE_URL: `http://127.0.0.1:${server.port}`,
+      LIBERTAI_CONSOLE_URL: `http://${publicHost ?? "127.0.0.1"}:${server.port}`,
       LIBERTAI_ACCOUNT_BASE: `http://127.0.0.1:${server.port}`,
     }),
     stop: () => server.stop(true),

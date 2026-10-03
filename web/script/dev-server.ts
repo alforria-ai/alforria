@@ -53,8 +53,9 @@ const backend = startBackend({ ...routes, port: PORT + 1 })
 
 // The provider is global too, so sessions a human starts in any other
 // directory still reach the scripted backend.
-// "Sign in with LibertAI" goes to a local stand-in, never the real console.
-const libertai = startLibertai(PORT + 2)
+// "Sign in with LibertAI" goes to a local stand-in, never the real console;
+// with --lan it is served on the LAN address so a phone or laptop can open it.
+const libertai = startLibertai(PORT + 2, lan ? lanAddress() : undefined)
 const env = { ...isolatedEnv(STATE), ...libertai.env() }
 writeJson(join(env.XDG_CONFIG_HOME!, "opencode/opencode.json"), providerConfig(backend.url))
 for (const project of projects) {
@@ -161,6 +162,15 @@ async function seed(): Promise<Seeded[]> {
   stream.close()
   writeJson(FLEET, out)
   return out
+}
+
+/** The LAN address to advertise: a private 192.168/10 address first. */
+function lanAddress() {
+  const all = Object.values(networkInterfaces())
+    .flatMap((nets) => nets ?? [])
+    .filter((n) => n.family === "IPv4" && !n.internal)
+    .map((n) => n.address)
+  return all.find((a) => a.startsWith("192.168.")) ?? all.find((a) => a.startsWith("10.")) ?? all[0]
 }
 
 // Print where to connect and what the fleet looks like right now.
