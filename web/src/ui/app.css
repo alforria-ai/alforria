@@ -3417,3 +3417,22 @@ button.tool-row:hover {
 .settings nav button[aria-current="false"] {
   background: none;
 }
+.spec .row .confirm-row {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--ink);
+  font-size: 13px;
+}
+.spec .row .confirm-row span {
+  flex: 1;
+  min-width: 220px;
+}
+.link-btn.danger {
+  background: var(--ink);
+  color: var(--ground);
+  border-color: var(--ink);
+}

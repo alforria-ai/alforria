@@ -315,8 +315,16 @@ function Permissions() {
     }
     return out
   })
-  const set = (tool: string, pattern: string, action: Action) =>
+  const apply = (tool: string, pattern: string, action: Action) =>
     void patch({ permission: { [tool]: pattern === "*" ? action : { [pattern]: action } } })
+  // Tightening (ask / deny) applies at once; loosening to "allow" removes the
+  // human from the loop for every project, so it needs an explicit confirm.
+  const [confirm, setConfirm] = createSignal<{ tool: string; pattern: string } | null>(null)
+  const set = (tool: string, pattern: string, action: Action) => {
+    if (action === "allow") return setConfirm({ tool, pattern })
+    setConfirm(null)
+    apply(tool, pattern, action)
+  }
   return (
     <>
       <h3>Permissions</h3>
@@ -327,7 +335,10 @@ function Permissions() {
             <div class="row">
               <span class="no">{String(i() + 1).padStart(2, "0")}</span>
               <span class="n">{r.tool}</span>
-              <span class="d mono">{r.pattern}</span>
+              <span class="d mono">
+                {r.pattern}
+                {(r.action as string) === "default" ? "  · built-in default" : ""}
+              </span>
               <div class="seg perm-seg" role="group" aria-label={`${r.tool} ${r.pattern}`}>
                 <For each={["allow", "ask", "deny"] as Action[]}>
                   {(a) => (
@@ -337,6 +348,26 @@ function Permissions() {
                   )}
                 </For>
               </div>
+              <Show when={confirm()?.tool === r.tool && confirm()?.pattern === r.pattern}>
+                <div class="confirm-row" role="alert">
+                  <span>
+                    Allow every <b>{r.tool}</b> call{r.pattern === "*" ? "" : ` matching ${r.pattern}`} without asking,
+                    in every project on this server?
+                  </span>
+                  <button
+                    class="link-btn danger"
+                    onClick={() => {
+                      setConfirm(null)
+                      apply(r.tool, r.pattern, "allow")
+                    }}
+                  >
+                    Allow without asking
+                  </button>
+                  <button class="link-btn" onClick={() => setConfirm(null)}>
+                    Cancel
+                  </button>
+                </div>
+              </Show>
             </div>
           )}
         </For>

@@ -169,7 +169,8 @@ function ToolView(props: {
     if (props.part.tool === "bash") return (meta().output as string | undefined) ?? st().output ?? ""
     return st().output ?? ""
   }
-  const childSession = () => (meta().sessionId as string | undefined) ?? undefined
+  const childSession = () =>
+    (meta().sessionId as string | undefined) ?? /<task id="([^"]+)"/.exec(st().output ?? "")?.[1] ?? undefined
 
   const kind = () => {
     if (props.part.tool === "todowrite") return "todos"
@@ -329,10 +330,11 @@ function TaskRow(props: { part: ToolPart; child?: string; onOpen: (id: string, b
   const child = () => (props.child ? state.sessions[props.child] : undefined)
   const result = () => {
     if (st().status === "completed") {
+      // Output is `<task id=… state=…><task_result>…</task_result></task>`.
       const out = st().output ?? ""
+      const inner = /<task_result>([\s\S]*?)<\/task_result>/.exec(out)?.[1] ?? out.replace(/<\/?task[^>]*>/g, "")
       return (
-        out
-          .replace(/<\/?task_result>/g, "")
+        inner
           .trim()
           .split("\n")
           .find((l) => l.trim()) ?? ""

@@ -1,6 +1,6 @@
 // The interrupt queue: everything waiting on the human, oldest first. The
 // oldest item is open; one key clears it and the next opens.
-import { createMemo, createRoot, createSignal, For, onMount, Show } from "solid-js"
+import { createEffect, createMemo, createRoot, createSignal, For, on, onMount, Show } from "solid-js"
 import type { Interrupt } from "../../fleet/derive"
 import { counts, interrupts } from "../../fleet/fleet"
 import { Icon } from "../../ui/icons"
@@ -55,6 +55,25 @@ export function Queue(props: {
   const focusActive = () =>
     queueMicrotask(() => listEl?.querySelector<HTMLElement>(".slip.is-active:not(.is-stamped)")?.focus())
 
+  // A verdict key only acts on an item that has been on screen long enough to
+  // read: after a verdict the next item slides in under the same finger, and a
+  // new arrival can replace the active item. Auto-repeat never acts.
+  const READ_DELAY = 500
+  let activeSince = Date.now()
+  createEffect(
+    on(
+      () => activeItem()?.id,
+      () => (activeSince = Date.now()),
+    ),
+  )
+  const settled = (e: KeyboardEvent) => {
+    if (e.repeat || Date.now() - activeSince < READ_DELAY) {
+      e.preventDefault()
+      return false
+    }
+    return true
+  }
+
   const onKey = (e: KeyboardEvent) => {
     if (e.metaKey || e.ctrlKey || e.altKey) return
     const t = e.target as HTMLElement
@@ -68,7 +87,7 @@ export function Queue(props: {
     const what = `${state.sessions[item.sessionID]?.title ?? ""}: ${slipSummary(item)}`
     if (item.kind === "permission") {
       const v = k === "a" ? "once" : k === "s" ? "always" : k === "d" ? "reject" : null
-      if (v) {
+      if (v && settled(e)) {
         e.preventDefault()
         void act(item, v, { what }).then(focusActive)
       }
@@ -76,8 +95,8 @@ export function Queue(props: {
     }
     const slip = slipKeys(listEl.querySelector<HTMLElement>(`[data-slip="${item.id}"]`))
     if (/^[1-9]$/.test(e.key)) return (e.preventDefault(), slip?.pick(Number(e.key) - 1))
-    if (e.key === "Enter") return (e.preventDefault(), slip?.submit() && focusActive())
-    if (k === "x") return (e.preventDefault(), void act(item, "dismiss", { what }).then(focusActive))
+    if (e.key === "Enter") return settled(e) && (e.preventDefault(), slip?.submit() && focusActive())
+    if (k === "x") return settled(e) && (e.preventDefault(), void act(item, "dismiss", { what }).then(focusActive))
   }
 
   return (

@@ -2,6 +2,7 @@
 // Backed by GET /session/{id}/diff and kept fresh by `session.diff` events.
 import { createEffect, createMemo, createSignal, For, Show } from "solid-js"
 import { api } from "../../api/client"
+import type { FileDiff, ToolPart } from "../../api/types"
 import { setState, state } from "../../store/store"
 import { Diff, parseUnifiedDiff } from "../../ui/diff"
 import { Icon } from "../../ui/icons"
@@ -22,7 +23,13 @@ export default function Changes(props: { sessionID: string }) {
       .finally(() => setLoading(false))
   })
 
-  const files = createMemo(() => state.diffs[props.sessionID] ?? [])
+  // The server's snapshot diff is the authority; when it is empty (alforria
+  // does not compute it yet), rebuild the picture from the session's own
+  // edit/write/apply_patch calls.
+  const fromServer = () => state.diffs[props.sessionID] ?? []
+  const fromTools = createMemo(() => toolDiffs(props.sessionID))
+  const derived = () => !fromServer().length && fromTools().length > 0
+  const files = createMemo(() => (fromServer().length ? fromServer() : fromTools()))
   const totals = createMemo(() =>
     files().reduce((a, f) => ({ add: a.add + f.additions, del: a.del + f.deletions }), { add: 0, del: 0 }),
   )
@@ -57,6 +64,7 @@ export default function Changes(props: { sessionID: string }) {
             <span>
               {files().length} files · <span class="add-n">+{totals().add}</span>{" "}
               <span class="del-n">−{totals().del}</span>
+              {derived() ? " · from this session's edits" : ""}
             </span>
             <span class="spacer" />
             <Show
@@ -95,4 +103,39 @@ export default function Changes(props: { sessionID: string }) {
       </Show>
     </div>
   )
+}
+
+/** Per-file changes from the session's completed edit tools, in call order. */
+function toolDiffs(sessionID: string): FileDiff[] {
+  const root = state.sessions[sessionID]?.directory ?? ""
+  const rel = (p: string) => (root && p.startsWith(`${root}/`) ? p.slice(root.length + 1) : p)
+  const byFile = new Map<string, FileDiff>()
+  for (const mid of state.messages[sessionID] ?? [])
+    for (const pid of state.parts[mid] ?? []) {
+      const part = state.part[pid]
+      if (part?.type !== "tool") continue
+      const tool = part as ToolPart
+      const st = tool.state as { status: string; input?: Record<string, unknown>; metadata?: Record<string, unknown> }
+      if (st.status !== "completed" || !["edit", "write", "apply_patch"].includes(tool.tool)) continue
+      const meta = st.metadata ?? {}
+      const path = rel(String(meta.filepath ?? st.input?.filePath ?? ""))
+      if (!path) continue
+      let patch = typeof meta.diff === "string" ? meta.diff : ""
+      if (!patch && tool.tool === "write" && typeof st.input?.content === "string") {
+        const lines = st.input.content.replace(/\n$/, "").split("\n")
+        patch = `@@ -0,0 +1,${lines.length} @@\n${lines.map((l) => `+${l}`).join("\n")}`
+      }
+      const rows = parseUnifiedDiff(patch)
+      const add = rows.filter((r) => r.kind === "add").length
+      const del = rows.filter((r) => r.kind === "del").length
+      const prev = byFile.get(path)
+      byFile.set(path, {
+        path,
+        status: prev ? prev.status : meta.exists === false ? "added" : "modified",
+        additions: (prev?.additions ?? 0) + add,
+        deletions: (prev?.deletions ?? 0) + del,
+        patch: prev ? `${prev.patch}\n${patch}` : patch,
+      })
+    }
+  return [...byFile.values()]
 }
