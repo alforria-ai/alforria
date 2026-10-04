@@ -44,8 +44,45 @@ fn write_command(text: &str, args: &[&str]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The OSC 52 escape that asks the terminal itself to set its clipboard —
+/// the only copy that reaches the user's machine over SSH. Inside tmux the
+/// sequence goes both plain and wrapped in tmux's passthrough; inside
+/// screen only wrapped (`writeOsc52`, clipboard.ts:23-28).
+pub fn osc52(text: &str, tmux: bool, screen: bool) -> String {
+    let sequence = format!("\x1b]52;c;{}\x07", base64_encode(text.as_bytes()));
+    let passthrough = format!("\x1bPtmux;\x1b{sequence}\x1b\\");
+    if tmux {
+        format!("{sequence}{passthrough}")
+    } else if screen {
+        passthrough
+    } else {
+        sequence
+    }
+}
+
+/// Write [`osc52`] to the terminal the TUI draws on; `false` when stdout
+/// isn't a terminal. One locked write, so it never lands inside a frame's
+/// escape sequence.
+fn write_osc52(text: &str) -> bool {
+    use std::io::IsTerminal;
+    let stdout = std::io::stdout();
+    if !stdout.is_terminal() {
+        return false;
+    }
+    let payload = osc52(
+        text,
+        std::env::var_os("TMUX").is_some(),
+        std::env::var_os("STY").is_some(),
+    );
+    let mut out = stdout.lock();
+    out.write_all(payload.as_bytes()).is_ok() && out.flush().is_ok()
+}
+
 impl Clipboard for SystemClipboard {
+    /// OSC 52 first, then a native tool, like TS's `write` — a copy
+    /// counts once either reached the terminal or a tool took it.
     fn write(&self, text: &str) -> anyhow::Result<()> {
+        let via_terminal = write_osc52(text);
         let mut candidates: Vec<Vec<&str>> = vec![vec!["pbcopy"], vec!["wl-copy"]];
         if std::env::var("DISPLAY").is_ok() || std::env::var("WAYLAND_DISPLAY").is_ok() {
             candidates.push(vec!["xclip", "-selection", "clipboard"]);
@@ -56,6 +93,9 @@ impl Clipboard for SystemClipboard {
                 Ok(()) => return Ok(()),
                 Err(error) => errors.push(format!("{}: {error}", args[0])),
             }
+        }
+        if via_terminal {
+            return Ok(());
         }
         anyhow::bail!("no clipboard available ({})", errors.join(", "))
     }
@@ -149,5 +189,19 @@ mod tests {
         // surface the error, not crash.
         let result = SystemClipboard.write("x");
         let _ = result;
+    }
+
+    #[test]
+    fn osc52_matches_ts_including_multiplexer_passthrough() {
+        // "hi" → base64 "aGk=".
+        assert_eq!(osc52("hi", false, false), "\x1b]52;c;aGk=\x07");
+        assert_eq!(
+            osc52("hi", false, true),
+            "\x1bPtmux;\x1b\x1b]52;c;aGk=\x07\x1b\\"
+        );
+        assert_eq!(
+            osc52("hi", true, false),
+            "\x1b]52;c;aGk=\x07\x1bPtmux;\x1b\x1b]52;c;aGk=\x07\x1b\\"
+        );
     }
 }
