@@ -164,7 +164,7 @@ Gates: `bun run check` (prettier, tsc, vitest: 51 tests), `bun run e2e` (preview
 24 checks incl. axe) and `E2E_EMBEDDED=1 bun run e2e` (the binary itself, 26 checks).
 
 Follow-ups outside the client:
-- Archive `alforria-ai/web` (needs the owner's go-ahead; outward-facing).
+- ~~Archive `alforria-ai/web`~~: archived 2026-10-04, its description pointing here.
 - Server gaps seen through the UI: `session.diff` is always empty and `file.edited`
   is never emitted; open text parts read empty over REST until they finish; v1 can't
   see exited PTYs (exit codes come from v2).
