@@ -11,6 +11,7 @@ use serde_json::Value;
 use alforria_schema::session_v1::{AssistantError, V1Message, V1Part};
 
 use super::parts;
+use super::render_cache::{self, Segmented};
 use crate::state::{kv, App};
 use crate::ui::theme::{Rgba, Theme};
 
@@ -128,39 +129,43 @@ pub fn render(
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let messages = app
-        .state
-        .sync
-        .message
-        .get(session_id)
-        .cloned()
-        .unwrap_or_default();
-    let session = app.state.sync.session(session_id).cloned();
-    let pending = pending_index(&messages);
-
-    // `revert()` + `revertMessageIndex()` (`session/index.tsx:1122-1150`).
-    let revert = session
-        .as_ref()
-        .and_then(|session| session.revert.clone())
-        .filter(|revert| !revert.message_id.is_empty());
-    let revert_index = revert.as_ref().and_then(|revert| {
-        messages
-            .iter()
-            .position(|message| message_id(message) == revert.message_id)
-    });
-
     let mut clicks = Vec::new();
-    let (lines, children) = build_lines(
-        app,
-        theme,
-        &messages,
-        session_id,
-        content_width,
-        revert.as_ref(),
-        revert_index,
-        pending,
-        &mut clicks,
-    );
+    let (lines, children) = {
+        let app: &App = app;
+        let messages: &[V1Message] = app
+            .state
+            .sync
+            .message
+            .get(session_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let pending = pending_index(messages);
+
+        // `revert()` + `revertMessageIndex()` (`session/index.tsx:1122-1150`).
+        let revert = app
+            .state
+            .sync
+            .session(session_id)
+            .and_then(|session| session.revert.as_ref())
+            .filter(|revert| !revert.message_id.is_empty());
+        let revert_index = revert.and_then(|revert| {
+            messages
+                .iter()
+                .position(|message| message_id(message) == revert.message_id)
+        });
+
+        build_lines(
+            app,
+            theme,
+            messages,
+            session_id,
+            content_width,
+            revert,
+            revert_index,
+            pending,
+            &mut clicks,
+        )
+    };
 
     super::memo_scroll(
         &mut app.ui.session_scroll,
@@ -172,13 +177,9 @@ pub fn render(
     app.ui.session_scroll.clicks = clicks;
     app.ui.session_scroll.area_y = area.y;
 
+    // Only the visible rows are cloned out of the cached blocks.
     let top = app.ui.session_scroll.effective_y();
-    let visible: Vec<Line<'static>> = lines
-        .iter()
-        .skip(top)
-        .take(area.height as usize)
-        .cloned()
-        .collect();
+    let visible = lines.window(top, area.height as usize);
     Paragraph::new(visible).render(area, frame.buffer_mut());
 }
 
@@ -193,9 +194,10 @@ fn build_lines(
     revert_index: Option<usize>,
     pending: Option<usize>,
     clicks: &mut Vec<crate::state::ClickTarget>,
-) -> (Vec<Line<'static>>, Vec<(String, usize)>) {
+) -> (Segmented, Vec<(String, usize)>) {
     let ctx = Ctx::new(app, theme, session_id, content_width);
-    let mut lines: Vec<Line<'static>> = Vec::new();
+    render_cache::begin(render_cache::FrameKey::new(&ctx));
+    let mut lines = Segmented::default();
     let mut children: Vec<(String, usize)> = Vec::new();
 
     // `<box height={1} />` (`session/index.tsx:1198`).
@@ -216,20 +218,20 @@ fn build_lines(
             }
             break;
         }
-        let parts = app
+        let parts: &[V1Part] = app
             .state
             .sync
             .part
             .get(message_id(message))
-            .cloned()
-            .unwrap_or_default();
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
         match message {
             V1Message::User { .. } => {
                 user_message_lines(
                     &ctx,
                     theme,
                     message,
-                    &parts,
+                    parts,
                     index,
                     pending,
                     content_width,
@@ -239,12 +241,13 @@ fn build_lines(
             }
             V1Message::Assistant { .. } => {
                 assistant_message_lines(
-                    app, &ctx, theme, messages, message, &parts, &mut lines, clicks,
+                    app, &ctx, theme, messages, message, parts, &mut lines, clicks,
                 );
             }
         }
     }
 
+    render_cache::end();
     (lines, children)
 }
 
@@ -327,7 +330,7 @@ fn user_message_lines(
     index: usize,
     pending: Option<usize>,
     content_width: u16,
-    lines: &mut Vec<Line<'static>>,
+    lines: &mut Segmented,
     children: &mut Vec<(String, usize)>,
 ) {
     let V1Message::User {
@@ -361,23 +364,39 @@ fn user_message_lines(
         children.push((id.clone(), lines.len()));
         let color = ctx.agent_color(agent);
         let border = Style::new().fg(color.to_color());
+        let bordered = |mut row: Line<'static>| {
+            row.spans.insert(0, Span::raw("  "));
+            row.spans.insert(0, Span::styled(SPLIT_VERTICAL, border));
+            row
+        };
 
-        let mut rows: Vec<Line<'static>> = Vec::new();
         // paddingTop={1}
-        rows.push(blank());
+        lines.push(bordered(blank()));
         // The `<text>` wraps at the box width (border + 2 padding
-        // columns, like the assistant markdown: `parts.rs`).
+        // columns, like the assistant markdown: `parts.rs`); the wrapped
+        // rows are cached per message (the border colour is part of the
+        // key: the agent can change).
         let wrap_width = content_width.saturating_sub(3);
-        for row in text.split('\n') {
-            if row.is_empty() {
-                rows.push(blank());
-                continue;
+        let key = format!("{color:?}\u{0}{text}");
+        lines.extend_shared(render_cache::text_lines(id, &key, wrap_width, || {
+            let mut rows: Vec<Line<'static>> = Vec::new();
+            for row in text.split('\n') {
+                if row.is_empty() {
+                    rows.push(bordered(blank()));
+                    continue;
+                }
+                rows.extend(
+                    crate::ui::markdown::wrap_spans(
+                        vec![styled(row.to_string(), theme.text)],
+                        wrap_width,
+                    )
+                    .into_iter()
+                    .map(bordered),
+                );
             }
-            rows.extend(crate::ui::markdown::wrap_spans(
-                vec![styled(row.to_string(), theme.text)],
-                wrap_width,
-            ));
-        }
+            rows
+        }));
+        let mut rows: Vec<Line<'static>> = Vec::new();
         // QUEUED beyond the pending index, else the timestamp (`:1437-1452`).
         let queued = pending.is_some() && index > pending.unwrap();
         let timestamps = ctx
@@ -437,11 +456,7 @@ fn user_message_lines(
         }
         // paddingBottom={1}
         rows.push(blank());
-        for mut row in rows {
-            row.spans.insert(0, Span::raw("  "));
-            row.spans.insert(0, Span::styled(SPLIT_VERTICAL, border));
-            lines.push(row);
-        }
+        lines.extend(rows.into_iter().map(bordered));
     }
 
     // The compaction separator (`:1456-1464`).
@@ -472,7 +487,7 @@ fn assistant_message_lines(
     messages: &[V1Message],
     message: &V1Message,
     parts: &[V1Part],
-    lines: &mut Vec<Line<'static>>,
+    lines: &mut Segmented,
     clicks: &mut Vec<crate::state::ClickTarget>,
 ) {
     let V1Message::Assistant {
@@ -502,7 +517,7 @@ fn assistant_message_lines(
         // The clickable part ranges (BlockTool/InlineTool/ReasoningPart
         // onClick, session/index.tsx:1822,1900,1609).
         let start = lines.len();
-        lines.extend(parts::render_part(part, &ctx));
+        lines.extend_shared(render_cache::part_lines(part, &ctx));
         let id = match part {
             V1Part::Reasoning { id, .. } | V1Part::Tool { id, .. } => Some(id.clone()),
             _ => None,
@@ -970,6 +985,214 @@ mod tests {
                 }),
             ),
         ]
+    }
+
+    /// A realistic transcript of about `bytes` bytes: turns of prose,
+    /// lists, code, a table, shell output and an edit diff.
+    pub(crate) fn big_transcript(bytes: usize) -> App {
+        let prose = "The renderer walks every part of the session and lays it out \
+            at the content width, wrapping words, styling `inline code`, **bold** and \
+            *emphasis*, and keeping lists hanging under their markers. ";
+        let mut text = String::new();
+        text.push_str("## Findings\n\n");
+        for _ in 0..6 {
+            text.push_str(prose);
+        }
+        text.push_str("\n\n- first item with some words\n- second item that is long enough to wrap around the column\n  - nested item\n\n");
+        text.push_str("```rust\nfn main() {\n\tlet value = compute(42);\n\tprintln!(\"{value}\");\n}\n```\n\n");
+        text.push_str("| name | kind | notes |\n|---|---|---|\n| alpha | a | first row of the table |\n| beta | b | second |\n\n");
+        let output: String = (0..40)
+            .map(|index| {
+                format!("line {index}: drwxr-xr-x  2 user user 4096 Oct 12 file_{index}.rs\n")
+            })
+            .collect();
+        let mut diff = String::from("Index: a.rs\n====\n--- a.rs\n+++ a.rs\n@@ -1,30 +1,30 @@\n");
+        for index in 0..15 {
+            diff.push_str(&format!(
+                " context line {index} stays\n-old line {index}\n+new line {index} changed\n"
+            ));
+        }
+        let mut messages = Vec::new();
+        let mut parts = Vec::new();
+        let mut size = 0;
+        let mut turn = 0;
+        while size < bytes {
+            let user = format!("msg_{turn:05}_u");
+            let assistant = format!("msg_{turn:05}_a");
+            messages.push(user_message(&user, turn as f64));
+            messages.push(assistant_message(&assistant, Some(turn as u64 + 1)));
+            parts.push((
+                user.clone(),
+                vec![part(serde_json::json!({
+                    "id": format!("prt_{user}"), "sessionID": "ses_a", "messageID": user,
+                    "type": "text", "text": "Please look at the renderer and tell me what is slow.",
+                }))],
+            ));
+            let common = |suffix: &str| {
+                serde_json::json!({
+                    "id": format!("prt_{assistant}_{suffix}"),
+                    "sessionID": "ses_a",
+                    "messageID": assistant,
+                })
+            };
+            let with = |suffix: &str, extra: serde_json::Value| {
+                let mut value = common(suffix);
+                for (key, field) in extra.as_object().unwrap() {
+                    value[key] = field.clone();
+                }
+                part(value)
+            };
+            parts.push((
+                assistant.clone(),
+                vec![
+                    with(
+                        "r",
+                        serde_json::json!({
+                            "type": "reasoning",
+                            "text": format!("**Planning**\n\n{prose}{prose}"),
+                            "time": { "start": 0, "end": 1500 },
+                        }),
+                    ),
+                    with("t", serde_json::json!({ "type": "text", "text": text })),
+                    with(
+                        "b",
+                        serde_json::json!({
+                            "type": "tool", "callID": "call_b", "tool": "bash",
+                            "state": {
+                                "status": "completed", "input": { "command": "ls -la" },
+                                "output": "", "title": "ls",
+                                "metadata": { "output": output }, "time": { "start": 0, "end": 1 },
+                            },
+                        }),
+                    ),
+                    with(
+                        "e",
+                        serde_json::json!({
+                            "type": "tool", "callID": "call_e", "tool": "edit",
+                            "state": {
+                                "status": "completed", "input": { "filePath": "/repo/a.rs" },
+                                "output": "", "title": "a.rs",
+                                "metadata": { "diff": diff }, "time": { "start": 0, "end": 1 },
+                            },
+                        }),
+                    ),
+                ],
+            ));
+            size += text.len() + output.len() + diff.len() + 2 * prose.len() + 60;
+            turn += 1;
+        }
+        let mut app = app_with_messages(messages);
+        for (id, list) in parts {
+            app.state.sync.part.insert(id, list);
+        }
+        app
+    }
+
+    /// The per-frame cost of a ~400 KB transcript (T2: < 2 ms in
+    /// release). `cargo test -p alforria-tui --release -- --ignored
+    /// transcript_frame_time --nocapture`.
+    #[test]
+    #[ignore]
+    fn transcript_frame_time() {
+        let mut app = big_transcript(400 * 1024);
+        let backend = ratatui::backend::TestBackend::new(140, 50);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let theme = app.ui.theme.resolve(&app.state.kv).unwrap();
+        let mut times = Vec::new();
+        for frame_index in 0..60 {
+            // Scroll around now and then, like a reader would.
+            if frame_index % 20 == 10 {
+                app.ui.session_scroll.sticky = false;
+                app.ui.session_scroll.y /= 2;
+            }
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    let start = std::time::Instant::now();
+                    render(&mut app, frame, &theme, area, "ses_a", 136);
+                    times.push(start.elapsed());
+                })
+                .unwrap();
+        }
+        let first = times[0];
+        let mut rest: Vec<_> = times[1..].to_vec();
+        rest.sort();
+        let median = rest[rest.len() / 2];
+        let worst = *rest.last().unwrap();
+        eprintln!(
+            "transcript: {} lines; first frame {first:?}, median {median:?}, worst {worst:?}",
+            app.ui.session_scroll.content_height
+        );
+        if !cfg!(debug_assertions) {
+            assert!(median < std::time::Duration::from_millis(2), "{median:?}");
+        }
+    }
+
+    #[test]
+    fn cached_parts_follow_their_inputs() {
+        let mut app = app_with_messages(vec![
+            user_message("msg_1", 1.0),
+            assistant_message("msg_2", Some(2)),
+        ]);
+        let text_part = |text: &str| {
+            part(serde_json::json!({
+                "id": "prt_t", "sessionID": "ses_a", "messageID": "msg_2",
+                "type": "text", "text": text,
+            }))
+        };
+        let output: String = (0..30).map(|index| format!("out {index}\n")).collect();
+        let bash = part(serde_json::json!({
+            "id": "prt_b", "sessionID": "ses_a", "messageID": "msg_2",
+            "type": "tool", "callID": "call_b", "tool": "bash",
+            "state": {
+                "status": "completed", "input": { "command": "ls" }, "output": "",
+                "title": "ls", "metadata": { "output": output }, "time": { "start": 0, "end": 1 },
+            },
+        }));
+        app.state.sync.part.insert(
+            "msg_2".to_string(),
+            vec![text_part("first version"), bash.clone()],
+        );
+        let text = render_lines(&mut app, 80, 60);
+        assert!(text.contains("first version"), "{text}");
+        assert!(text.contains("Click to expand"), "{text}");
+
+        // The content changes: the part re-renders.
+        app.state
+            .sync
+            .part
+            .insert("msg_2".to_string(), vec![text_part("second version"), bash]);
+        let text = render_lines(&mut app, 80, 60);
+        assert!(text.contains("second version") && !text.contains("first version"));
+
+        // Expanding a tool re-renders it.
+        app.ui.expanded.insert("prt_b".to_string());
+        let text = render_lines(&mut app, 80, 60);
+        assert!(text.contains("Click to collapse"), "{text}");
+        assert!(text.contains("out 29"), "{text}");
+
+        // A narrower frame re-wraps.
+        app.state.sync.part.get_mut("msg_2").unwrap()[0] =
+            text_part("aaaa bbbb cccc dddd eeee ffff");
+        let wide = render_lines(&mut app, 80, 60);
+        assert!(wide.contains("aaaa bbbb cccc dddd eeee ffff"), "{wide}");
+        let narrow = render_lines(&mut app, 16, 60);
+        assert!(!narrow.contains("aaaa bbbb cccc dddd"), "{narrow}");
+        assert!(narrow.contains("aaaa bbbb"), "{narrow}");
+
+        // The thinking toggle is a frame-wide input.
+        app.state.sync.part.get_mut("msg_2").unwrap()[0] = part(serde_json::json!({
+            "id": "prt_r", "sessionID": "ses_a", "messageID": "msg_2",
+            "type": "reasoning", "text": "hidden body", "time": { "start": 0, "end": 1000 },
+        }));
+        let text = render_lines(&mut app, 80, 60);
+        assert!(!text.contains("hidden body"), "{text}");
+        app.state.kv.set(
+            crate::state::kv::keys::THINKING_MODE,
+            serde_json::json!("show"),
+        );
+        let text = render_lines(&mut app, 80, 60);
+        assert!(text.contains("hidden body"), "{text}");
     }
 
     #[test]

@@ -12,6 +12,7 @@ pub mod prompt;
 pub mod question;
 #[cfg(test)]
 mod question_tests;
+pub mod render_cache;
 pub mod sidebar;
 pub mod subagent_footer;
 pub mod transcript;

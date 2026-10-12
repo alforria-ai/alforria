@@ -411,7 +411,7 @@ impl Mode {
 
 /// The resolved `Theme` (`theme/index.ts:36-91`) — keys keep their TS names
 /// for [`Theme::get`].
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Theme {
     pub primary: Rgba,
     pub secondary: Rgba,
