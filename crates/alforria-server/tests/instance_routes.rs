@@ -41,6 +41,10 @@ fn fixture() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let worktree = dir.path().join("repo");
     std::fs::create_dir_all(&worktree).unwrap();
+    // macOS resolves TMPDIR through a symlink (/var/folders ->
+    // /private/var/folders): canonicalize so the fixture matches the
+    // resolved directories the routes report.
+    let worktree = std::fs::canonicalize(&worktree).unwrap();
     let storage = Arc::new(Storage::open(dir.path().join("db.sqlite")).unwrap());
     let agent_input = alforria_core::AgentRegistryInput {
         config: serde_json::from_value(serde_json::json!({})).unwrap(),
