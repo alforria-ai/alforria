@@ -3,16 +3,19 @@
 import { createEffect, createMemo, createSignal, For, onCleanup, Show } from "solid-js"
 import { api } from "../api/client"
 import { fleetState } from "../fleet/derive"
-import { displayTitle, projectName } from "../fleet/fleet"
+import { displayTitle, GLOBAL_PROJECT, placeOf, places, projectName } from "../fleet/fleet"
 import { closeOtherColumns, nav, openSettings } from "../nav/route"
 import { state } from "../store/store"
 import { Icon } from "../ui/icons"
 import { DialogHead, dialogId, Modal } from "../ui/modal"
+import { tildify } from "../ui/format"
 import { theme, toggleTheme } from "../ui/theme"
+import { server } from "./server"
 
 export interface PaletteActions {
   openSession(id: string): void
-  newSession(projectID: string): void
+  newSession(directory: string): void
+  openFolder(): void
   openTerminal(projectID: string): void
   openFile(sessionID: string, path: string): void
   showKeys(): void
@@ -24,7 +27,7 @@ interface Item {
   label: string
   meta: string
   lamp?: string
-  icon?: "file" | "chev-right" | "plus" | "terminal"
+  icon?: "file" | "chev-right" | "plus" | "terminal" | "folder"
   run: () => void
 }
 
@@ -44,7 +47,9 @@ export function Palette(props: { initial?: string; actions: PaletteActions }) {
   const fileDir = () => {
     const sid = activeSession()
     if (sid) return state.sessions[sid]?.directory
-    return state.projects[state.projectOrder[0] ?? ""]?.worktree
+    // Never search the whole disk: the non-git project's worktree is "/".
+    const id = state.projectOrder.find((id) => id !== GLOBAL_PROJECT)
+    return id ? state.projects[id]?.worktree : undefined
   }
 
   let timer: ReturnType<typeof setTimeout> | undefined
@@ -70,8 +75,7 @@ export function Palette(props: { initial?: string; actions: PaletteActions }) {
       .filter((s) => !s.time.archived)
       .sort((a, b) => b.time.updated - a.time.updated)
     for (const s of sessions) {
-      const p = state.projects[s.projectID]
-      const name = p ? projectName(p) : ""
+      const name = placeOf(s).name
       if (query && !matches(query, `${s.title} ${name}`.toLowerCase())) continue
       out.push({
         group: "Sessions",
@@ -83,24 +87,26 @@ export function Palette(props: { initial?: string; actions: PaletteActions }) {
       if (out.length >= 30) break
     }
     const commands: Omit<Item, "group">[] = [
-      ...state.projectOrder.flatMap((id) => {
-        const p = state.projects[id]
-        if (!p) return []
-        return [
-          {
-            label: `New session in ${projectName(p)}`,
-            meta: "N",
-            icon: "plus" as const,
-            run: () => props.actions.newSession(id),
-          },
-          {
-            label: `Open terminal in ${projectName(p)}`,
-            meta: "",
-            icon: "terminal" as const,
-            run: () => props.actions.openTerminal(id),
-          },
-        ]
-      }),
+      ...places().map((p) => ({
+        label: `New session in ${p.name}`,
+        meta: tildify(p.directory, server.home),
+        icon: "plus" as const,
+        run: () => props.actions.newSession(p.directory),
+      })),
+      {
+        label: "New session in another folder…",
+        meta: "",
+        icon: "folder" as const,
+        run: props.actions.openFolder,
+      },
+      ...state.projectOrder
+        .filter((id) => id !== GLOBAL_PROJECT && state.projects[id])
+        .map((id) => ({
+          label: `Open terminal in ${projectName(state.projects[id]!)}`,
+          meta: "",
+          icon: "terminal" as const,
+          run: () => props.actions.openTerminal(id),
+        })),
       { label: `Switch to ${theme() === "dark" ? "light" : "dark"} theme`, meta: "", run: toggleTheme },
       { label: "Open settings", meta: "", run: () => openSettings() },
       { label: "Keyboard shortcuts", meta: "?", run: props.actions.showKeys },
@@ -219,7 +225,9 @@ export function Palette(props: { initial?: string; actions: PaletteActions }) {
                         <span class={`lamp ${item.lamp}`} />
                       </Show>
                       <span class="t">{item.label}</span>
-                      <span class="m">{item.meta}</span>
+                      <span class="m">
+                        <bdi>{item.meta}</bdi>
+                      </span>
                     </button>
                   )}
                 </For>

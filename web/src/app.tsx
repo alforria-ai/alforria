@@ -3,7 +3,7 @@
 // phone tab bar. All navigation state lives in nav/route.ts.
 import { createMemo, createSignal, Match, onCleanup, onMount, Show, Switch } from "solid-js"
 import { api } from "./api/client"
-import { counts, filter, filteredGroups, fleetState, groups, interrupts, setFilter } from "./fleet/fleet"
+import { counts, filter, filteredGroups, fleetState, interrupts, setFilter } from "./fleet/fleet"
 import { bindKeys } from "./nav/keys"
 import {
   closeColumn,
@@ -19,6 +19,7 @@ import {
   startRouting,
 } from "./nav/route"
 import { state } from "./store/store"
+import { Icon } from "./ui/icons"
 import { startSync } from "./sync/sync"
 import { startPlatform } from "./platform"
 import { Band } from "./views/band"
@@ -31,6 +32,7 @@ import { StatusLine } from "./views/status"
 import { SessionTable } from "./views/table"
 import { toast, Toasts } from "./views/toast"
 import { KeysSheet, Palette } from "./views/palette"
+import { OpenFolder } from "./views/open-folder"
 import { Settings } from "./views/settings"
 
 const PHONE = "(max-width: 760px)"
@@ -42,6 +44,7 @@ export function App() {
   const [cursor, setCursor] = createSignal<string | null>(null)
   const [palette, setPalette] = createSignal<string | null>(null)
   const [keysOpen, setKeysOpen] = createSignal(false)
+  const [folderOpen, setFolderOpen] = createSignal(false)
   let queueEl: HTMLElement | undefined
   let workspaceEl!: HTMLElement
 
@@ -69,18 +72,15 @@ export function App() {
     setPanelOpen(true)
     focusQueue(queueEl)
   }
-  const newSession = async (projectID?: string) => {
-    const pid = projectID ?? groups()[0]?.project.id ?? state.projectOrder[0]
-    const project = pid ? state.projects[pid] : undefined
-    if (!project) return toast("No project to start a session in", "error")
-    try {
-      const s = await api.createSession(project.worktree)
-      open(s.id)
-      requestAnimationFrame(() => document.querySelector<HTMLTextAreaElement>(".col.is-active textarea")?.focus())
-    } catch (err) {
-      toast(`Could not create a session: ${err instanceof Error ? err.message : err}`, "error")
-    }
+  const startSession = async (directory: string) => {
+    const s = await api.createSession(directory)
+    open(s.id)
+    requestAnimationFrame(() => document.querySelector<HTMLTextAreaElement>(".col.is-active textarea")?.focus())
   }
+  const newSession = (directory: string) =>
+    void startSession(directory).catch((err) =>
+      toast(`Could not create a session: ${err instanceof Error ? err.message : err}`, "error"),
+    )
 
   onMount(() => {
     const stopSync = startSync()
@@ -195,6 +195,10 @@ export function App() {
                     </button>
                   ))}
                 </div>
+                <button class="ws-folder" title="Start a session in any folder" onClick={() => setFolderOpen(true)}>
+                  <Icon name="folder" />
+                  <span>Open folder</span>
+                </button>
               </div>
               <div class="ws-body">
                 <Show
@@ -203,6 +207,12 @@ export function App() {
                     <div class="q-empty">
                       <h3>{state.conn.state === "live" ? "No sessions yet" : "Connecting…"}</h3>
                       <p>Sessions from every project on this server appear here as they start.</p>
+                      <Show when={state.conn.state === "live"}>
+                        <button class="link-btn" onClick={() => setFolderOpen(true)}>
+                          <Icon name="folder" />
+                          Open a folder
+                        </button>
+                      </Show>
                       <Show when={state.conn.state === "live" && !Object.keys(state.models).length}>
                         <p>No model is connected yet. Sign in with LibertAI or add an API key first.</p>
                         <button class="link-btn primary" onClick={() => openSettings("providers")}>
@@ -212,7 +222,7 @@ export function App() {
                     </div>
                   }
                 >
-                  <SessionTable cursor={cursor()} onOpen={open} onNewSession={(pid) => void newSession(pid)} />
+                  <SessionTable cursor={cursor()} onOpen={open} onNewSession={newSession} />
                 </Show>
               </div>
             </Match>
@@ -236,7 +246,8 @@ export function App() {
           initial={palette()!}
           actions={{
             openSession: (id) => open(id),
-            newSession: (pid) => void newSession(pid),
+            newSession,
+            openFolder: () => setFolderOpen(true),
             openTerminal: (pid) => openTerminal(pid, { maxColumns: maxColumns() }),
             openFile: (sid, path) => {
               open(sid)
@@ -246,6 +257,9 @@ export function App() {
             close: () => setPalette(null),
           }}
         />
+      </Show>
+      <Show when={folderOpen()}>
+        <OpenFolder onStart={startSession} close={() => setFolderOpen(false)} />
       </Show>
       <Show when={keysOpen()}>
         <KeysSheet close={() => setKeysOpen(false)} />

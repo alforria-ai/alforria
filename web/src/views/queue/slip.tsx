@@ -5,7 +5,7 @@
 import { createMemo, createSignal, For, Index, Match, Show, Switch } from "solid-js"
 import type { PermissionRequest, QuestionRequest } from "../../api/types"
 import { toolTarget } from "../../fleet/derive"
-import { displayTitle, projectName } from "../../fleet/fleet"
+import { displayTitle, placeOf } from "../../fleet/fleet"
 import type { Interrupt } from "../../fleet/derive"
 import { state } from "../../store/store"
 import { Diff, parseUnifiedDiff, diffStats } from "../../ui/diff"
@@ -37,10 +37,9 @@ export function slipSummary(i: Interrupt) {
 
 function sessionMeta(sessionID: string) {
   const s = state.sessions[sessionID]
-  const p = s && state.projects[s.projectID]
   return {
     title: displayTitle(s),
-    project: p ? projectName(p) : "",
+    project: s ? placeOf(s).name : "",
     agent: s?.agent ?? "",
     model: s?.model?.id ?? "",
   }

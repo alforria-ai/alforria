@@ -122,7 +122,9 @@ export const api = {
     }),
 
   // Sessions
-  sessions: (directory: string) => request<Session[]>("GET", "/session", { directory }),
+  /** `scope: "project"` lists the project's sessions in every directory, not just this one. */
+  sessions: (directory: string, query: { scope?: "project" } = {}) =>
+    request<Session[]>("GET", "/session", { directory, query }),
   sessionStatus: (directory: string) => request<Record<string, SessionStatus>>("GET", "/session/status", { directory }),
   session: (id: string) => request<Session>("GET", `/session/${id}`),
   createSession: (directory: string, body: { title?: string; parentID?: string } = {}) =>

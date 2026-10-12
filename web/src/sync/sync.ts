@@ -1,7 +1,7 @@
 // Keeps the store in step with the server: snapshot on every (re)connect,
 // stream in between, and per-session transcript loads on demand.
 import { api, apiUrl } from "../api/client"
-import type { Project } from "../api/types"
+import type { Project, Session } from "../api/types"
 import { produce } from "solid-js/store"
 import { applyMessages, applySnapshot, trimToTail, type ProjectSnapshot } from "../store/reduce"
 import { enqueue, setConn, setState, state, withSnapshot } from "../store/store"
@@ -13,9 +13,8 @@ export function projectDirs(p: Project) {
   return [p.worktree, ...(p.sandboxes ?? [])]
 }
 
-async function snapshotDir(directory: string): Promise<ProjectSnapshot> {
-  const [sessions, status, permissions, questions] = await Promise.all([
-    api.sessions(directory),
+async function snapshotDir(directory: string, sessions: Session[]): Promise<ProjectSnapshot> {
+  const [status, permissions, questions] = await Promise.all([
     api.sessionStatus(directory),
     api.permissions(directory),
     api.questions(directory),
@@ -23,11 +22,27 @@ async function snapshotDir(directory: string): Promise<ProjectSnapshot> {
   return { directory, sessions, status, permissions, questions }
 }
 
+/** Sessions this old only need their row, not their (idle) directory's state. */
+const LIVE_WINDOW = 7 * 86_400_000
+
+/**
+ * A project's sessions can live outside its worktree: in a subfolder of the
+ * repo, or anywhere at all for the non-git "global" project. List them
+ * project-wide, then read status and pending requests per directory in use.
+ */
+async function snapshotProject(p: Project): Promise<ProjectSnapshot[]> {
+  const sessions = await api.sessions(p.worktree, { scope: "project" })
+  const recent = Date.now() - LIVE_WINDOW
+  const dirs = new Set(projectDirs(p))
+  for (const s of sessions) if (s.time.updated > recent) dirs.add(s.directory)
+  return Promise.all([...dirs].map((d, i) => snapshotDir(d, i === 0 ? sessions : [])))
+}
+
 export async function resync() {
   await withSnapshot(
     async () => {
       const projects = await api.projects()
-      const snaps = await Promise.all(projects.flatMap(projectDirs).map(snapshotDir))
+      const snaps = (await Promise.all(projects.map(snapshotProject))).flat()
       return { projects, snaps }
     },
     (d, { projects, snaps }) => applySnapshot(d, projects, snaps),

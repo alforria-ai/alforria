@@ -8,7 +8,6 @@ import {
   displayTitle,
   filteredGroups,
   fleetState,
-  projectName,
   sessionCost,
   todoProgress,
 } from "../fleet/fleet"
@@ -163,7 +162,7 @@ function SessionRow(props: {
 export function SessionTable(props: {
   cursor: string | null
   onOpen: (id: string, beside: boolean) => void
-  onNewSession: (projectID: string) => void
+  onNewSession: (directory: string) => void
 }) {
   return (
     <table class="reg" aria-label="Sessions by project">
@@ -194,9 +193,9 @@ export function SessionTable(props: {
               <tr class="proj-row">
                 <td colspan="7">
                   <div class="proj">
-                    <h3>{projectName(g.project)}</h3>
-                    <span class="path" title={g.project.worktree}>
-                      <bdi>{tildify(g.project.worktree, server.home)}</bdi>
+                    <h3>{g.name}</h3>
+                    <span class="path" title={g.directory}>
+                      <bdi>{tildify(g.directory, server.home)}</bdi>
                     </span>
                     <Show when={state.branches[g.project.id]}>
                       {(b) => (
@@ -219,8 +218,8 @@ export function SessionTable(props: {
                     </span>
                     <button
                       class="add"
-                      aria-label={`New session in ${projectName(g.project)}`}
-                      onClick={() => props.onNewSession(g.project.id)}
+                      aria-label={`New session in ${g.name}`}
+                      onClick={() => props.onNewSession(g.directory)}
                     >
                       <Icon name="plus" />
                       <span>New session</span>

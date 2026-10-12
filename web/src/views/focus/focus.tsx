@@ -4,7 +4,7 @@
 import { createEffect, For, lazy, Match, onCleanup, Show, Suspense, Switch } from "solid-js"
 import { api, ApiError } from "../../api/client"
 import { fleetState, interruptsFor, lastAssistant, sessionCost, turnDiffs } from "../../fleet/derive"
-import { displayTitle, projectName } from "../../fleet/fleet"
+import { displayTitle, GLOBAL_PROJECT, placeOf, projectName } from "../../fleet/fleet"
 import { closeOtherColumns, nav, setActiveColumn, setColumnFile, setColumnTab, type Column } from "../../nav/route"
 import { setState, state } from "../../store/store"
 import { releaseTranscript, retainTranscript } from "../../sync/sync"
@@ -117,7 +117,8 @@ function SessionColumn(props: {
     }
   })
   const s = () => state.sessions[id()]
-  const project = () => (s() ? state.projects[s()!.projectID] : undefined)
+  // Terminals are per project; outside git the "global" project's worktree is "/".
+  const project = () => (s() && s()!.projectID !== GLOBAL_PROJECT ? state.projects[s()!.projectID] : undefined)
   const st = () => fleetState(state, id())
   const waiting = () => interruptsFor(state, id())[0]
   const model = () => {
@@ -216,7 +217,7 @@ function SessionColumn(props: {
         </div>
         <div class="l2">
           <span class="grow">
-            {[project() ? projectName(project()!) : "", s()?.agent ?? lastAssistant(state, id())?.agent, model()]
+            {[s() ? placeOf(s()!).name : "", s()?.agent ?? lastAssistant(state, id())?.agent, model()]
               .filter(Boolean)
               .join(" · ")}
           </span>

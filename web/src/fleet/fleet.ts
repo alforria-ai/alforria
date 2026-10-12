@@ -1,5 +1,5 @@
 // Reactive fleet selectors over the store: which sessions to show, in which
-// order, grouped by project. Views read these instead of walking the store.
+// order, grouped by project (or by folder, outside git). Views read these instead of walking the store.
 import { createMemo, createRoot, createSignal } from "solid-js"
 import type { Project, Session } from "../api/types"
 import { state } from "../store/store"
@@ -8,6 +8,37 @@ import { activity, allInterrupts, contextUse, fleetState, sessionCost, todoProgr
 
 export function projectName(p: Project) {
   return p.name || basename(p.worktree)
+}
+
+/** The server's project for every folder outside git; its worktree is "/". */
+export const GLOBAL_PROJECT = "global"
+
+/**
+ * Where a session lives for display: its git project, or for a session
+ * outside git its own folder, since the "global" project spans them all.
+ */
+export function placeOf(s: Session) {
+  if (s.projectID === GLOBAL_PROJECT)
+    return { key: `${GLOBAL_PROJECT}:${s.directory}`, name: basename(s.directory), directory: s.directory }
+  const p = state.projects[s.projectID]
+  return { key: s.projectID, name: p ? projectName(p) : "", directory: p?.worktree ?? s.directory }
+}
+
+/** Every folder a new session can start in: each git project, and each plain folder with a session. */
+export function places() {
+  const out = new Map<string, { key: string; name: string; directory: string }>()
+  for (const id of state.projectOrder) {
+    const p = state.projects[id]
+    if (p && id !== GLOBAL_PROJECT) out.set(id, { key: id, name: projectName(p), directory: p.worktree })
+  }
+  const recent = Object.values(state.sessions)
+    .filter((s) => s.projectID === GLOBAL_PROJECT && !s.time.archived)
+    .sort((a, b) => b.time.updated - a.time.updated)
+  for (const s of recent) {
+    const place = placeOf(s)
+    if (!out.has(place.key)) out.set(place.key, place)
+  }
+  return [...out.values()]
 }
 
 /**
@@ -26,7 +57,12 @@ export interface Row {
 }
 
 export interface ProjectGroup {
+  /** A project id, or `global:<directory>` for a folder outside git. */
+  key: string
   project: Project
+  name: string
+  /** Where the group's sessions live, and where a new one starts. */
+  directory: string
   rows: Row[]
 }
 
@@ -51,18 +87,15 @@ const memos = createRoot(() => {
 
   const groups = createMemo<ProjectGroup[]>(() => {
     const live = liveIds()
-    const byProject = new Map<string, Session[]>()
+    const byPlace = new Map<string, Session[]>()
     for (const s of Object.values(state.sessions)) {
       if (!visible(s, live)) continue
-      const list = byProject.get(s.projectID) ?? []
+      const key = placeOf(s).key
+      const list = byPlace.get(key) ?? []
       list.push(s)
-      byProject.set(s.projectID, list)
+      byPlace.set(key, list)
     }
-    const out: ProjectGroup[] = []
-    for (const pid of state.projectOrder) {
-      const project = state.projects[pid]
-      const list = byProject.get(pid)
-      if (!project || !list?.length) continue
+    const group = (project: Project, list: Session[]): ProjectGroup => {
       // Parents newest first; each parent's subagents nested under it.
       const ids = new Set(list.map((s) => s.id))
       const roots = list
@@ -77,7 +110,22 @@ const memos = createRoot(() => {
           .forEach((c) => walk(c, depth + 1))
       }
       roots.forEach((s) => walk(s, 0))
-      out.push({ project, rows })
+      return { ...placeOf(list[0]!), project, rows }
+    }
+    const out: ProjectGroup[] = []
+    for (const pid of state.projectOrder) {
+      const project = state.projects[pid]
+      if (!project) continue
+      if (pid !== GLOBAL_PROJECT) {
+        const list = byPlace.get(pid)
+        if (list?.length) out.push(group(project, list))
+        continue
+      }
+      // Folders outside git, in path order.
+      const folders = [...byPlace.entries()]
+        .filter(([key]) => key.startsWith(`${GLOBAL_PROJECT}:`))
+        .sort(([a], [b]) => a.localeCompare(b))
+      for (const [, list] of folders) out.push(group(project, list))
     }
     // Order is stable: rows must not move under the cursor as sessions update.
     // Surfacing what's waiting is the queue's and the Waiting filter's job.

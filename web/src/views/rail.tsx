@@ -2,7 +2,7 @@
 // project. Click swaps the active column; shift-click or "open beside" adds a
 // column. Collapsed, it becomes a strip of status lamps.
 import { For, Show } from "solid-js"
-import { activity, counts, displayTitle, fleetState, groups, interrupts, projectName } from "../fleet/fleet"
+import { activity, counts, displayTitle, fleetState, groups, interrupts } from "../fleet/fleet"
 import { nav } from "../nav/route"
 import { state } from "../store/store"
 import { age, now } from "../ui/format"
@@ -45,9 +45,9 @@ export function Rail(props: {
           {(g) => (
             // A listbox may only hold options and groups: each project is a
             // labelled group, its header presentational.
-            <div role="group" aria-label={projectName(g.project)}>
+            <div role="group" aria-label={g.name}>
               <div class="rail-proj" role="presentation">
-                <h3 role="presentation">{projectName(g.project)}</h3>
+                <h3 role="presentation">{g.name}</h3>
                 <span class="tally">
                   {g.rows.length}
                   <Show when={g.rows.filter((r) => fleetState(state, r.session.id) === "waiting").length}>
