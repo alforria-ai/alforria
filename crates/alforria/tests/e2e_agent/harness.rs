@@ -180,6 +180,11 @@ impl Env {
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
         if stdin.is_some() {
             command.stdin(Stdio::piped());
+        } else {
+            // An explicit null stdin: on Windows the inherited handle is
+            // an open pipe that never EOFs, and the CLI's piped-stdin
+            // read (run.ts:416) would block forever.
+            command.stdin(Stdio::null());
         }
         let mut child = command.spawn().expect("spawn opencode");
         if let Some(stdin) = stdin {
@@ -225,6 +230,7 @@ impl Serve {
         let mut child = env
             .command(&["serve", "--port", "0"])
             .env("OPENCODE_SERVER_PASSWORD", "")
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()

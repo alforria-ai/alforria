@@ -167,6 +167,7 @@ fn spawn_serve(
         command.env("OPENCODE_SERVER_PASSWORD", password);
     }
     let mut child = command
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
