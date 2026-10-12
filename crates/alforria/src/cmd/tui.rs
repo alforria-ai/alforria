@@ -6,6 +6,8 @@ use std::path::Path;
 use clap::ArgMatches;
 
 use super::network;
+
+pub mod config;
 use crate::client::{auth_header, OpencodeClient};
 use crate::error::{CliError, TypedError};
 use crate::network::has_arg;
@@ -52,6 +54,11 @@ fn default_tui_runner(
     // models, favorites, prompt history) persists under the XDG state dir.
     let paths = alforria_core::paths::GlobalPaths::from_env();
     let state_dir = paths.state.clone();
+    let log_file = paths.data.join("log").join("tui.log");
+    // Config warnings land in the log, not over the TUI.
+    alforria_tui::log::init(&log_file);
+    let cwd = std::env::current_dir().unwrap_or_else(|_| paths.home.clone());
+    let tui_config = config::load(&cwd, &paths, &config::Flags::from_env());
     let backend = match target {
         TuiTarget::Url(_) => None,
         TuiTarget::InProcess(backend) => Some(backend.clone()),
@@ -61,11 +68,11 @@ fn default_tui_runner(
         directory,
         headers,
         args,
-        config: alforria_tui::config::TuiConfig::default(),
+        config: tui_config,
         state_dir: Some(state_dir),
         backend,
         // `Global.Path.log` (`global.ts`): the data dir's `log/`.
-        log_file: Some(paths.data.join("log").join("tui.log")),
+        log_file: Some(log_file),
     })
     .map_err(|err| TypedError::Unknown {
         raw: err.to_string(),

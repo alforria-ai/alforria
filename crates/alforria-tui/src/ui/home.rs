@@ -619,8 +619,8 @@ fn render_prompt(app: &App, frame: &mut ratatui::Frame, theme: &Theme, area: Rec
     // `cursor.blinking` — the same block cursor as the session prompt.
     // An open dialog holds the focus — the prompt behind it shows no
     // cursor (`focus?.blur()`, `ui/dialog.tsx:150-156`).
-    let blink = app.ui.prompt_focused && (app.ui.tick_ms / 530).is_multiple_of(2);
-    let cursor = crate::ui::textarea::cursor_cell_style(theme);
+    let blink = app.prompt_cursor_shown();
+    let cursor = app.prompt_cursor_style(crate::ui::textarea::cursor_cell_style(theme));
     let mut lines: Vec<Line> = Vec::new();
     if placeholder {
         let mut spans: Vec<Span> = Vec::new();

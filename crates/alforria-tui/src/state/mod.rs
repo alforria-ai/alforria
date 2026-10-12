@@ -381,6 +381,8 @@ pub struct AttentionSets {
 /// the app-shell bookkeeping of M8.3.
 #[derive(Debug, Default)]
 pub struct UiState {
+    /// The wheel's acceleration state (`scroll_acceleration.enabled`).
+    pub scroll_accel: ScrollAccel,
     /// One current toast at a time (`ui/toast.tsx:66-69`).
     pub toasts: Vec<Toast>,
     /// `toast.show`'s `setTimeout` deadline (`ui/toast.tsx:70-74`).
@@ -909,10 +911,12 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                 crate::ui::dialogs::wheel_scroll(app, 1);
             }
             crossterm::event::MouseEventKind::ScrollUp => {
-                app.ui.session_scroll.scroll_by(-(scroll_speed(app) as i64));
+                let speed = scroll_speed(app) as i64;
+                app.ui.session_scroll.scroll_by(-speed);
             }
             crossterm::event::MouseEventKind::ScrollDown => {
-                app.ui.session_scroll.scroll_by(scroll_speed(app) as i64);
+                let speed = scroll_speed(app) as i64;
+                app.ui.session_scroll.scroll_by(speed);
             }
             // Dialog option rows are mouse-interactive
             // (`dialog-select.tsx:640-676`): hover and press move the
@@ -1148,7 +1152,7 @@ pub fn next_tick_in(app: &App, now_ms: u64) -> Option<u64> {
         app.ui.startup_loading.deadline(),
         app.keymap.pending_deadline(),
     ];
-    if app.ui.prompt_focused {
+    if app.ui.prompt_focused && app.config.cursor_blinks() {
         deadlines.push(Some((now_ms / BLINK_MS + 1) * BLINK_MS));
     }
     deadlines
@@ -1182,12 +1186,83 @@ pub fn connected(app: &App) -> bool {
     })
 }
 
-/// `getScrollAcceleration(tuiConfig)` (`util/scroll.ts`): the default
-/// is a fixed `scroll_speed` of 3. The macOS acceleration curve lives
-/// in `@opentui/core` and cannot be ported verbatim — when enabled the
-/// port keeps the fixed speed (recorded as a documented divergence).
-fn scroll_speed(app: &App) -> u32 {
+/// `getScrollAcceleration(tuiConfig)` (`util/scroll.ts`): a fixed
+/// `scroll_speed` (default 3), or with `scroll_acceleration.enabled` the
+/// `MacOSScrollAccel` curve.
+fn scroll_speed(app: &mut App) -> u32 {
+    if app.config.scroll_acceleration_enabled {
+        let now = app.ui.tick_ms;
+        return app.ui.scroll_accel.tick(now).round().max(1.0) as u32;
+    }
     app.config.scroll_speed.round().max(1.0) as u32
+}
+
+/// `MacOSScrollAccel` (`@opentui/core`): wheel ticks in a quick streak
+/// scroll further. The multiplier grows exponentially with the tick rate
+/// over the last three intervals (`1 + A·(e^(v/τ) − 1)`, `v` = 100 ms ÷
+/// average interval), capped at 6; a pause over 150 ms resets it.
+#[derive(Debug, Default)]
+pub struct ScrollAccel {
+    last_tick_ms: Option<u64>,
+    intervals: Vec<u64>,
+}
+
+impl ScrollAccel {
+    const A: f64 = 0.8;
+    const TAU: f64 = 3.0;
+    const MAX_MULTIPLIER: f64 = 6.0;
+    const STREAK_TIMEOUT_MS: u64 = 150;
+    const MIN_TICK_INTERVAL_MS: u64 = 6;
+    const HISTORY: usize = 3;
+
+    pub fn tick(&mut self, now_ms: u64) -> f64 {
+        let Some(last) = self.last_tick_ms else {
+            self.last_tick_ms = Some(now_ms);
+            self.intervals.clear();
+            return 1.0;
+        };
+        let interval = now_ms.saturating_sub(last);
+        if interval > Self::STREAK_TIMEOUT_MS {
+            self.last_tick_ms = Some(now_ms);
+            self.intervals.clear();
+            return 1.0;
+        }
+        if interval < Self::MIN_TICK_INTERVAL_MS {
+            return 1.0;
+        }
+        self.last_tick_ms = Some(now_ms);
+        self.intervals.push(interval);
+        if self.intervals.len() > Self::HISTORY {
+            self.intervals.remove(0);
+        }
+        let average = self.intervals.iter().sum::<u64>() as f64 / self.intervals.len() as f64;
+        let velocity = 100.0 / average;
+        let multiplier = 1.0 + Self::A * ((velocity / Self::TAU).exp() - 1.0);
+        multiplier.min(Self::MAX_MULTIPLIER)
+    }
+}
+
+impl App {
+    /// The prompt cursor cell shows now: focused, and in the visible half
+    /// of the blink unless `cursor.blinking` is off.
+    pub fn prompt_cursor_shown(&self) -> bool {
+        self.ui.prompt_focused
+            && (!self.config.cursor_blinks() || (self.ui.tick_ms / BLINK_MS).is_multiple_of(2))
+    }
+
+    /// The prompt cursor cell's style for `cursor.style`: `block` (and
+    /// `default`) is the given block style; `underline` underlines the
+    /// cell. A one-column bar cannot be drawn in a cell, so `line`
+    /// underlines too.
+    pub fn prompt_cursor_style(&self, block: ratatui::style::Style) -> ratatui::style::Style {
+        use crate::config::CursorStyle;
+        match self.config.cursor.map(|cursor| cursor.style) {
+            Some(CursorStyle::Underline | CursorStyle::Line) => {
+                ratatui::style::Style::new().add_modifier(ratatui::style::Modifier::UNDERLINED)
+            }
+            _ => block,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1217,6 +1292,55 @@ mod tests {
             Some(FRAME_INTERVAL_MS),
             "a spinner animates"
         );
+    }
+
+    #[test]
+    fn scroll_acceleration_grows_in_a_streak_and_resets_after_a_pause() {
+        let mut accel = ScrollAccel::default();
+        assert_eq!(accel.tick(1000), 1.0, "first tick");
+        let mut last = 1.0;
+        for step in 1..=4 {
+            let next = accel.tick(1000 + step * 20);
+            assert!(next >= last, "{next} < {last}");
+            last = next;
+        }
+        assert!(last > 1.0 && last <= 6.0, "{last}");
+        assert_eq!(accel.tick(2000), 1.0, "a pause resets");
+
+        let config = crate::config::TuiConfig {
+            scroll_acceleration_enabled: true,
+            ..crate::config::TuiConfig::default()
+        };
+        let mut app = App::new(config, Args::default(), None);
+        app.ui.tick_ms = 5000;
+        assert_eq!(
+            scroll_speed(&mut app),
+            1,
+            "acceleration replaces scroll_speed"
+        );
+    }
+
+    #[test]
+    fn cursor_config_controls_the_blink() {
+        let config = crate::config::TuiConfig {
+            cursor: Some(crate::config::CursorConfig {
+                style: crate::config::CursorStyle::Underline,
+                blinking: false,
+            }),
+            ..crate::config::TuiConfig::default()
+        };
+        let mut app = App::new(config, Args::default(), None);
+        app.ui.startup_ready = true;
+        app.ui.prompt_focused = true;
+        for tick in [0, 530, 1060, 1590] {
+            app.ui.tick_ms = tick;
+            assert!(app.prompt_cursor_shown(), "steady cursor at {tick}");
+        }
+        assert_eq!(next_tick_in(&app, 10_000), None, "no blink to wake for");
+        let style = app.prompt_cursor_style(ratatui::style::Style::new());
+        assert!(style
+            .add_modifier
+            .contains(ratatui::style::Modifier::UNDERLINED));
     }
 
     #[test]
