@@ -1085,7 +1085,9 @@ mod tests {
             panic!("expected a transport error, got {:?}", error.reason);
         };
         assert_eq!(kind.as_deref(), Some("ConnectError"));
-        assert!(message.contains("Connection refused"), "{message}");
+        // Linux says "Connection refused (os error 111)"; Windows says
+        // "...actively refused it. (os error 10061)".
+        assert!(message.contains("refused"), "{message}");
         assert_eq!(
             url.as_deref(),
             Some(format!("http://{addr}/v1/chat").as_str())

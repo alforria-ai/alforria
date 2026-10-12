@@ -1634,23 +1634,29 @@ mod tests {
 
     #[test]
     fn resolve_directory_matches_fsutil_resolve() {
-        assert_eq!(
-            resolve_directory(Path::new("/repo/../other")),
-            PathBuf::from("/other")
-        );
-        assert_eq!(
-            resolve_directory(Path::new("/repo/./x/")),
-            PathBuf::from("/repo/x")
-        );
-        // `..` above the root clamps to the root (path.resolve).
-        assert_eq!(resolve_directory(Path::new("/..")), PathBuf::from("/"));
+        // Posix-style absolute-path examples; a leading `/` is
+        // drive-relative on Windows with different semantics.
+        #[cfg(not(windows))]
+        {
+            assert_eq!(
+                resolve_directory(Path::new("/repo/../other")),
+                PathBuf::from("/other")
+            );
+            assert_eq!(
+                resolve_directory(Path::new("/repo/./x/")),
+                PathBuf::from("/repo/x")
+            );
+            // `..` above the root clamps to the root (path.resolve).
+            assert_eq!(resolve_directory(Path::new("/..")), PathBuf::from("/"));
+        }
         // Relative paths resolve against the cwd.
         assert!(resolve_directory(Path::new("some/dir")).is_absolute());
-        // An existing directory resolves through its real path.
+        // An existing directory resolves through its real path (the
+        // Windows verbatim prefix stripped, like Node's realpath).
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
             resolve_directory(&dir.path().join("sub/../")),
-            dir.path().canonicalize().unwrap()
+            alforria_core::filesystem::strip_verbatim(dir.path().canonicalize().unwrap())
         );
     }
 
