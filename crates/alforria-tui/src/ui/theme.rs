@@ -4,13 +4,18 @@
 //! Every `theme/assets/*.json` ships verbatim (embedded via
 //! `include_str!`); [`resolve_theme`] ports the TS color resolution
 //! (hex → ref-name → `{dark, light}` variant, `transparent`/`none`).
-//! Palette keys keep their TS names for [`Theme::get`].
+//! Palette keys keep their TS names for [`Theme::get`]. Custom
+//! `themes/*.json` files and the terminal colours behind `system` live
+//! in [`registry`]; [`probe`] asks the terminal for its palette.
 
 use std::collections::BTreeMap;
 
 use serde_json::Value;
 
 use crate::state::kv::keys;
+
+pub mod probe;
+pub mod registry;
 
 macro_rules! theme_asset {
     ($file:literal) => {
@@ -175,9 +180,9 @@ pub fn ansi_to_rgba(code: i64) -> Rgba {
     Rgba::from_ints(0, 0, 0)
 }
 
-/// `TerminalColors` from `@opentui/core` — the live terminal palette.
-/// The Rust runtime has no `renderer.getPalette()` seam, so only the
-/// `system` theme generation consumes this and callers pass defaults.
+/// `TerminalColors` from `@opentui/core` — the live terminal palette:
+/// probed ([`probe`]) when the terminal answers, else the `COLORFGBG`
+/// defaults over the xterm palette ([`registry::env_terminal_colors`]).
 #[derive(Debug, Clone, Default)]
 pub struct TerminalColors {
     pub default_background: Option<String>,
@@ -280,10 +285,9 @@ fn generate_muted_text_color(bg: Rgba, is_dark: bool) -> Rgba {
 }
 
 /// `generateSystem` (`theme/index.ts:360-469`) — a palette built from
-/// the terminal colours. The Rust runtime cannot query the live
-/// terminal palette (`renderer.getPalette`), so callers pass
-/// [`TerminalColors::defaults`] and the ANSI-256 fallbacks are used
-/// (recorded divergence from the TS reference).
+/// the terminal colours. Palette slots the terminal did not report fall
+/// back to the xterm ANSI-256 values (TS drops the `system` theme when
+/// the probe fails; the port keeps it on the fallbacks).
 pub fn generate_system(colors: &TerminalColors, mode: Mode) -> Value {
     let bg = colors
         .default_background
@@ -629,11 +633,17 @@ pub fn resolve_theme(raw: &Value, mode: Mode) -> anyhow::Result<Theme> {
     let has_selected_list_item_text = entries.contains_key("selectedListItemText");
     let selected = match entries.get("selectedListItemText") {
         Some(value) => resolve_color(value, mode, defs, entries, &[])?,
-        None => map.get("background").copied().unwrap(),
+        None => map
+            .get("background")
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("theme has no background"))?,
     };
     let background_menu = match entries.get("backgroundMenu") {
         Some(value) => resolve_color(value, mode, defs, entries, &[])?,
-        None => map.get("backgroundElement").copied().unwrap(),
+        None => map
+            .get("backgroundElement")
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("theme has no backgroundElement"))?,
     };
     let thinking_opacity = entries
         .get("thinkingOpacity")
@@ -720,19 +730,52 @@ pub fn selected_foreground(theme: &Theme, bg: Option<Rgba>) -> Rgba {
 }
 
 /// The `system` palette (`theme/index.ts:360-469`) — generated from
-/// the terminal colours, here the ANSI-256 defaults.
+/// the terminal colours ([`registry::terminal_colors`]).
 pub fn system_theme(mode: Mode) -> Value {
-    generate_system(&TerminalColors::defaults(), mode)
+    generate_system(&registry::terminal_colors(), mode)
 }
 
-/// `allThemes()` — the built-in registry (custom/plugin themes are not
-/// part of the Rust runtime) plus the generated `system` palette.
-pub fn all_themes() -> Vec<(&'static str, Value)> {
-    let mut themes: Vec<(&'static str, Value)> = DEFAULT_THEMES
+/// `terminalMode(colors)` (`theme/index.ts:353-358`): light when the
+/// default background's luminance is above one half.
+pub fn terminal_mode(colors: &TerminalColors) -> Option<Mode> {
+    let bg = Rgba::from_hex(colors.default_background.as_deref()?)?;
+    Some(if 0.299 * bg.r + 0.587 * bg.g + 0.114 * bg.b > 0.5 {
+        Mode::Light
+    } else {
+        Mode::Dark
+    })
+}
+
+/// A theme's raw JSON by name: custom files first (they override the
+/// built-ins, `listThemes`), then the built-ins, then `system`.
+fn raw_theme(name: &str, mode: Mode) -> Option<Value> {
+    if name == "system" {
+        return Some(system_theme(mode));
+    }
+    if let Some(theme) = registry::custom_theme(name) {
+        return Some(theme);
+    }
+    DEFAULT_THEMES
         .iter()
-        .filter_map(|(name, raw)| serde_json::from_str(raw).ok().map(|v| (*name, v)))
+        .find(|(candidate, _)| *candidate == name)
+        .and_then(|(_, raw)| serde_json::from_str(raw).ok())
+}
+
+/// `allThemes()` (`theme/index.ts:166-192`): defaults < custom files <
+/// the generated `system` palette.
+pub fn all_themes() -> Vec<(String, Value)> {
+    let custom = registry::custom_themes();
+    let mut themes: Vec<(String, Value)> = DEFAULT_THEMES
+        .iter()
+        .filter(|(name, _)| custom.iter().all(|(custom, _)| custom != name))
+        .filter_map(|(name, raw)| {
+            serde_json::from_str(raw)
+                .ok()
+                .map(|value| (name.to_string(), value))
+        })
         .collect();
-    themes.push(("system", system_theme(Mode::Dark)));
+    themes.extend(custom.into_iter().filter(|(name, _)| name != "system"));
+    themes.push(("system".to_string(), system_theme(Mode::Dark)));
     themes
 }
 
@@ -742,6 +785,7 @@ pub fn has_theme(name: &str) -> bool {
         || DEFAULT_THEMES
             .iter()
             .any(|(candidate, _)| *candidate == name)
+        || registry::custom_theme(name).is_some()
 }
 
 /// The theme context state (`context/theme.tsx:84-98`): active theme name,
@@ -763,13 +807,15 @@ impl Default for ThemeStore {
     }
 }
 
-/// `terminalMode(colors)` (`theme/index.ts:353-358`), inverted: the
-/// Rust runtime cannot query the terminal palette live, so the
-/// background is detected from the `COLORFGBG` env signal (set by
-/// terminals/multiplexers that know the background). Unknown
+/// The startup mode: `terminalMode` of the probed palette when the
+/// terminal answered ([`probe`]), else the `COLORFGBG` env signal (set
+/// by terminals/multiplexers that know the background). Unknown
 /// backgrounds default to dark.
 fn detected_mode() -> Mode {
-    detected_mode_with(std::env::var("COLORFGBG").ok().as_deref())
+    registry::probed_colors()
+        .as_ref()
+        .and_then(terminal_mode)
+        .unwrap_or_else(|| detected_mode_with(std::env::var("COLORFGBG").ok().as_deref()))
 }
 
 fn detected_mode_with(colorfgbg: Option<&str>) -> Mode {
@@ -842,23 +888,18 @@ impl ThemeStore {
     }
 
     /// The `values()` memo (`context/theme.tsx:256-267`): active theme,
-    /// kv-saved fallback, then `opencode`.
+    /// kv-saved fallback, then `opencode`. A custom theme that fails to
+    /// resolve (a dangling reference, a bad colour) falls through too.
     pub fn resolve(&self, kv: &crate::state::kv::Kv) -> anyhow::Result<Theme> {
-        if let Some((_, raw)) = DEFAULT_THEMES
-            .iter()
-            .find(|(name, _)| *name == self.active.as_str())
+        let saved = kv.get(keys::THEME, Value::Null);
+        for name in [Some(self.active.as_str()), saved.as_str()]
+            .into_iter()
+            .flatten()
         {
-            return resolve_theme(&serde_json::from_str::<Value>(raw)?, self.mode);
-        }
-        if self.active == "system" {
-            return resolve_theme(&system_theme(self.mode), self.mode);
-        }
-        if let Some(saved) = kv.get(keys::THEME, Value::Null).as_str() {
-            if saved == "system" {
-                return resolve_theme(&system_theme(self.mode), self.mode);
-            }
-            if let Some((_, raw)) = DEFAULT_THEMES.iter().find(|(name, _)| *name == saved) {
-                return resolve_theme(&serde_json::from_str::<Value>(raw)?, self.mode);
+            if let Some(theme) =
+                raw_theme(name, self.mode).and_then(|raw| resolve_theme(&raw, self.mode).ok())
+            {
+                return Ok(theme);
             }
         }
         resolve_theme(
@@ -881,7 +922,14 @@ mod tests {
     #[test]
     fn loads_every_builtin_theme() {
         assert_eq!(DEFAULT_THEMES.len(), 33);
-        assert_eq!(all_themes().len(), 34);
+        // Other tests register `zz-test-*` custom themes concurrently.
+        assert_eq!(
+            all_themes()
+                .iter()
+                .filter(|(name, _)| !name.starts_with("zz-test-"))
+                .count(),
+            34
+        );
         for (name, _) in DEFAULT_THEMES {
             let (name, raw) = DEFAULT_THEMES
                 .iter()
@@ -1170,5 +1218,79 @@ mod tests {
         store.set_mode(&mut kv, Mode::Light);
         assert_eq!(store.mode, Mode::Light);
         assert_eq!(store.lock, Some(Mode::Light));
+    }
+
+    #[test]
+    fn custom_themes_list_select_and_resolve() {
+        // The opencode palette with two keys changed, under a unique
+        // name (the registry is process-wide).
+        let mut custom: Value = serde_json::from_str(
+            DEFAULT_THEMES
+                .iter()
+                .find(|(name, _)| *name == "opencode")
+                .unwrap()
+                .1,
+        )
+        .unwrap();
+        custom["defs"]["zzInk"] = serde_json::json!("#123456");
+        custom["theme"]["primary"] = serde_json::json!("zzInk");
+        custom["theme"]["background"] =
+            serde_json::json!({ "dark": "#010203", "light": "#fefefe" });
+        assert!(registry::upsert_custom_theme("zz-test-custom", custom));
+        assert!(!registry::upsert_custom_theme(
+            "zz-test-bad",
+            serde_json::json!({ "defs": {} })
+        ));
+        assert!(has_theme("zz-test-custom"));
+        assert!(!has_theme("zz-test-bad"));
+        assert!(all_themes()
+            .iter()
+            .any(|(name, _)| name == "zz-test-custom"));
+
+        let mut kv = crate::state::kv::Kv::in_memory();
+        let mut store = ThemeStore::init(&mut kv, None);
+        assert!(store.set(&mut kv, "zz-test-custom"));
+        store.apply(Mode::Dark);
+        let theme = store.resolve(&kv).unwrap();
+        assert_eq!(theme.primary, Rgba::from_hex("#123456").unwrap());
+        assert_eq!(theme.background, Rgba::from_hex("#010203").unwrap());
+    }
+
+    #[test]
+    fn a_broken_custom_theme_falls_back_instead_of_panicking() {
+        // A dangling reference, and a theme missing most keys.
+        let broken = serde_json::json!({ "theme": { "primary": "no-such-ref" } });
+        assert!(resolve_theme(&serde_json::json!({ "theme": {} }), Mode::Dark).is_err());
+        assert!(registry::upsert_custom_theme("zz-test-broken", broken));
+        let mut kv = crate::state::kv::Kv::in_memory();
+        let mut store = ThemeStore::init(&mut kv, None);
+        store.active = "zz-test-broken".to_string();
+        let theme = store.resolve(&kv).expect("falls back to opencode");
+        let mut fallback = ThemeStore::init(&mut kv, None);
+        fallback.active = DEFAULT_THEME.to_string();
+        fallback.mode = store.mode;
+        assert_eq!(theme, fallback.resolve(&kv).unwrap());
+        // An unknown name too.
+        store.active = "zz-test-missing".to_string();
+        assert_eq!(store.resolve(&kv).unwrap(), theme);
+    }
+
+    #[test]
+    fn terminal_mode_follows_the_background_luminance() {
+        let colors = |bg: &str| TerminalColors {
+            default_background: Some(bg.to_string()),
+            ..TerminalColors::default()
+        };
+        assert_eq!(terminal_mode(&colors("#1e1e2e")), Some(Mode::Dark));
+        assert_eq!(terminal_mode(&colors("#fdf6e3")), Some(Mode::Light));
+        assert_eq!(terminal_mode(&TerminalColors::default()), None);
+        // The system palette is built from the probed colours.
+        let probed = TerminalColors {
+            default_background: Some("#1e1e2e".into()),
+            default_foreground: Some("#cdd6f4".into()),
+            palette: (0..16).map(|index| format!("#0000{index:02x}")).collect(),
+        };
+        let theme = resolve_theme(&generate_system(&probed, Mode::Dark), Mode::Dark).unwrap();
+        assert_eq!(theme.text, Rgba::from_hex("#cdd6f4").unwrap());
     }
 }

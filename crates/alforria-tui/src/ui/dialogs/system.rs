@@ -40,7 +40,7 @@ pub fn mcp_options(app: &App) -> Vec<SelectOption> {
 /// opened on, not the one being previewed.
 pub fn theme_options(app: &App, initial: Option<&str>) -> Vec<SelectOption> {
     let current = initial.unwrap_or(&app.ui.theme.active).to_string();
-    let mut names: Vec<&str> = crate::ui::theme::all_themes()
+    let mut names: Vec<String> = crate::ui::theme::all_themes()
         .into_iter()
         .map(|(name, _)| name)
         .collect();
@@ -48,9 +48,10 @@ pub fn theme_options(app: &App, initial: Option<&str>) -> Vec<SelectOption> {
     names
         .into_iter()
         .map(|name| {
-            SelectOption::new(name.to_string())
-                .with_value(name.to_string())
-                .with_current(name == current)
+            let is_current = name == current;
+            SelectOption::new(name.clone())
+                .with_value(name)
+                .with_current(is_current)
         })
         .collect()
 }
