@@ -301,3 +301,57 @@ async fn sync_start_is_gated_on_experimental_workspaces() {
     until(move || source_after.sync_starts.load(Ordering::SeqCst) >= 1).await;
     assert_eq!(source.sync_starts.load(Ordering::SeqCst), 1);
 }
+
+// ------------------------------------------- in-memory transport + watchdog
+
+fn connected_sse_frame() -> String {
+    format!(
+        "data: {}\n\n",
+        json!({"payload": {"id": "evt_1", "type": "server.connected", "properties": {}}})
+    )
+}
+
+/// The in-memory backend streams SSE like a socket: the frame arrives
+/// while the response body is still open; then a silent stream is
+/// dropped by the heartbeat watchdog so the reconnect loop takes over.
+#[tokio::test]
+async fn in_memory_sse_streams_and_the_watchdog_drops_silence() {
+    use futures::StreamExt as _;
+    let app = axum::Router::new().route(
+        "/global/event",
+        axum::routing::get(|| async {
+            let frames = futures::stream::once(async {
+                Ok::<_, std::convert::Infallible>(connected_sse_frame())
+            })
+            .chain(futures::stream::pending());
+            Response::builder()
+                .header("content-type", "text/event-stream")
+                .body(Body::from_stream(frames))
+                .unwrap()
+        }),
+    );
+    let backend = Arc::new(alforria_tui::transport::backend::ServiceBackend::new(app));
+    let source = SseEventSource::with_backend(
+        HttpClientConfig {
+            base_url: alforria_tui::transport::backend::IN_PROCESS_BASE_URL.to_string(),
+            directory: None,
+            headers: Vec::new(),
+        },
+        backend,
+    )
+    .with_watchdog(std::time::Duration::from_millis(300));
+
+    let (tx, mut rx) = unbounded_channel();
+    source.stream(tx).await.expect("stream connects");
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .expect("frame before the watchdog")
+        .expect("event");
+    assert!(matches!(event.event, Event::ServerConnected(_)));
+    let started = std::time::Instant::now();
+    let end = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .expect("the watchdog ends a silent stream");
+    assert!(end.is_none());
+    assert!(started.elapsed() >= std::time::Duration::from_millis(250));
+}

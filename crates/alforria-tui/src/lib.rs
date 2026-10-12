@@ -18,6 +18,7 @@ pub mod command;
 pub mod config;
 pub mod editor;
 pub mod keymap;
+pub mod log;
 pub mod state;
 pub mod transcript;
 pub mod transport;
@@ -53,6 +54,8 @@ pub struct TuiInput {
     /// The transport under `url`: `None` is real HTTP; `Some` is the
     /// in-process server router (plain `alforria`, no listener).
     pub backend: Option<transport::backend::SharedBackend>,
+    /// Where warnings go while the TUI owns the terminal.
+    pub log_file: Option<PathBuf>,
 }
 
 /// `run()`'s result (`app.tsx:188, 354`).
@@ -104,6 +107,9 @@ async fn run_inner(input: TuiInput) -> Result<Exit> {
     // The `system` theme's palette: ask the terminal (OSC 10/11/4) before
     // anything else reads stdin, so the startup theme mode sees it.
     ui::theme::probe::probe_and_install(Duration::from_millis(100));
+    if let Some(file) = &input.log_file {
+        log::init(file);
+    }
     let _guard = TerminalGuard::enter(input.config.mouse)?;
 
     let http_config = HttpClientConfig {
@@ -956,6 +962,20 @@ pub async fn execute_effect(
                 }
             }
         }
+        Effect::SessionStatusRefresh => {
+            let workspace = app.lock().await.state.project.workspace.current.clone();
+            let loc = Location {
+                directory: None,
+                workspace,
+            };
+            if let Ok(status) = api.session_status(&loc).await {
+                app.lock().await.state.sync.session_status = status;
+            }
+        }
+        Effect::SessionResync { session_id } => {
+            app.lock().await.state.sync.full_synced.remove(&session_id);
+            let _ = state::sync::session_sync_shared(&**app, api.as_ref(), &session_id).await;
+        }
         Effect::SessionHydrate { session_id } => {
             let _ = state::sync::session_sync_shared(&**app, api.as_ref(), &session_id).await;
         }
@@ -989,25 +1009,25 @@ pub async fn execute_effect(
                 Ok(crate::clipboard::ClipboardContent::Text(text)) => {
                     crate::state::prompt::paste_input_text(&mut app, &text);
                 }
-                Ok(crate::clipboard::ClipboardContent::Image { mime, data_base64 }) => {
+                Ok(crate::clipboard::ClipboardContent::Image { mime, data }) => {
                     crate::state::prompt::paste_attachment(
                         &mut app,
                         &crate::state::prompt::Attachment {
                             filename: Some("clipboard".to_string()),
                             filepath: None,
                             mime,
-                            content: data_base64.into_bytes(),
+                            content: data,
                         },
                     );
                 }
-                Ok(crate::clipboard::ClipboardContent::Pdf { data_base64 }) => {
+                Ok(crate::clipboard::ClipboardContent::Pdf { data }) => {
                     crate::state::prompt::paste_attachment(
                         &mut app,
                         &crate::state::prompt::Attachment {
                             filename: Some("clipboard".to_string()),
                             filepath: None,
                             mime: "application/pdf".to_string(),
-                            content: data_base64.into_bytes(),
+                            content: data,
                         },
                     );
                 }
@@ -1476,6 +1496,9 @@ mod tests {
         questions: Vec<alforria_schema::question_v1::QuestionV1Request>,
         /// `permission.reply` calls — `(request id, reply)`.
         replied: std::sync::Mutex<Vec<(String, alforria_schema::permission_v1::PermissionV1Reply)>>,
+        /// What `session.status` returns.
+        status:
+            std::collections::BTreeMap<String, alforria_schema::session_status::SessionStatusInfo>,
     }
 
     impl Default for FakeApi {
@@ -1493,6 +1516,7 @@ mod tests {
                 permissions: Vec::new(),
                 questions: Vec::new(),
                 replied: std::sync::Mutex::new(Vec::new()),
+                status: std::collections::BTreeMap::new(),
             }
         }
     }
@@ -1724,7 +1748,7 @@ mod tests {
         ) -> Result<
             std::collections::BTreeMap<String, alforria_schema::session_status::SessionStatusInfo>,
         > {
-            unreachable!("not under test")
+            Ok(self.status.clone())
         }
         async fn permission_list(
             &self,
@@ -1840,6 +1864,37 @@ mod tests {
 
     fn fake_app() -> App {
         App::new(crate::config::TuiConfig::default(), Args::default(), None)
+    }
+
+    /// After an SSE reconnect the statuses missed while offline are
+    /// re-read: a session that went busy meanwhile shows busy.
+    #[tokio::test]
+    async fn reconnect_refetches_the_session_status() {
+        let app = Arc::new(tokio::sync::Mutex::new(fake_app()));
+        let api: Arc<dyn ServerApi> = Arc::new(FakeApi {
+            status: [(
+                "ses_a".to_string(),
+                alforria_schema::session_status::SessionStatusInfo::Busy,
+            )]
+            .into_iter()
+            .collect(),
+            ..FakeApi::default()
+        });
+        let connected = || {
+            crate::transport::events::parse_global_frame(
+                r#"{"payload":{"id":"evt_1","type":"server.connected","properties":{}}}"#,
+            )
+            .expect("frame")
+        };
+        let first = state::update(&mut *app.lock().await, Msg::Bus(vec![connected()]));
+        assert_eq!(first, vec![Effect::PromptsRefresh], "first connect");
+        let again = state::update(&mut *app.lock().await, Msg::Bus(vec![connected()]));
+        assert!(again.contains(&Effect::SessionStatusRefresh), "{again:?}");
+        execute_effect(&app, Arc::clone(&api), Effect::SessionStatusRefresh).await;
+        assert_eq!(
+            app.lock().await.state.sync.session_status.get("ses_a"),
+            Some(&alforria_schema::session_status::SessionStatusInfo::Busy)
+        );
     }
 
     #[tokio::test]

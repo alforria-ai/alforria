@@ -32,6 +32,11 @@ pub const COALESCE_WINDOW_MS: u64 = 16;
 pub const RETRY_DELAY_MS: u64 = 1000;
 /// `sdk.tsx:52` (`maxRetryDelay`).
 pub const MAX_RETRY_DELAY_MS: u64 = 30000;
+/// The server sends `server.heartbeat` every 10 s on `/global/event`; a
+/// connection silent for three of them is dead (a sleeping laptop, a
+/// dropped NAT entry) even if the socket never closed. Dropping it lets
+/// the reconnect loop take over.
+pub const HEARTBEAT_WATCHDOG_MS: u64 = 30_000;
 
 /// `EventMetadata` (`event.ts:4-7`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -219,6 +224,7 @@ pub struct SseEventSource {
     backend: Arc<dyn Backend>,
     config: HttpClientConfig,
     experimental_workspaces: bool,
+    watchdog: std::time::Duration,
 }
 
 impl SseEventSource {
@@ -236,7 +242,14 @@ impl SseEventSource {
             backend,
             experimental_workspaces: experimental_workspaces_from_env(),
             config,
+            watchdog: std::time::Duration::from_millis(HEARTBEAT_WATCHDOG_MS),
         }
+    }
+
+    /// Override the silence limit (tests).
+    pub fn with_watchdog(mut self, watchdog: std::time::Duration) -> SseEventSource {
+        self.watchdog = watchdog;
+        self
     }
 }
 
@@ -263,9 +276,11 @@ impl EventSource for SseEventSource {
             return Err(anyhow!("/global/event: {}", response.status));
         }
         let stream = response.body.eventsource();
+        let watchdog = self.watchdog;
         tokio::spawn(async move {
             let mut stream = stream;
-            while let Some(event) = stream.next().await {
+            // Every frame counts as life, heartbeats included.
+            while let Ok(Some(event)) = tokio::time::timeout(watchdog, stream.next()).await {
                 match event {
                     Ok(event) => {
                         if let Some(bus_event) = parse_global_frame(&event.data) {

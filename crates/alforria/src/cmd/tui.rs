@@ -50,7 +50,8 @@ fn default_tui_runner(
 ) -> Result<(), TypedError> {
     // `paths.state` (`global.ts:14`): TUI state (pinned sessions, recent
     // models, favorites, prompt history) persists under the XDG state dir.
-    let state_dir = alforria_core::paths::GlobalPaths::from_env().state;
+    let paths = alforria_core::paths::GlobalPaths::from_env();
+    let state_dir = paths.state.clone();
     let backend = match target {
         TuiTarget::Url(_) => None,
         TuiTarget::InProcess(backend) => Some(backend.clone()),
@@ -63,6 +64,8 @@ fn default_tui_runner(
         config: alforria_tui::config::TuiConfig::default(),
         state_dir: Some(state_dir),
         backend,
+        // `Global.Path.log` (`global.ts`): the data dir's `log/`.
+        log_file: Some(paths.data.join("log").join("tui.log")),
     })
     .map_err(|err| TypedError::Unknown {
         raw: err.to_string(),

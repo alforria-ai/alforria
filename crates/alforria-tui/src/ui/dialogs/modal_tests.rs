@@ -239,9 +239,11 @@ fn no_key_reaches_the_screen_behind_any_dialog() {
             effects.extend(press(&mut app, code, KeyModifiers::NONE));
         }
         // The leader, the palette, the exit chord and a leader sequence.
+        // (`app.global` sequences such as `<leader>n` do act from a
+        // dialog, as in TS — see `state/routing_tests.rs`.)
         for (code, modifiers) in [
             (KeyCode::Char('x'), KeyModifiers::CONTROL),
-            (KeyCode::Char('n'), KeyModifiers::NONE),
+            (KeyCode::Char('e'), KeyModifiers::NONE),
             (KeyCode::Char('x'), KeyModifiers::CONTROL),
             (KeyCode::Char('q'), KeyModifiers::NONE),
             (KeyCode::Char('p'), KeyModifiers::CONTROL),

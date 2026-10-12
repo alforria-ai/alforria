@@ -326,7 +326,13 @@ impl Kv {
                 _ => bail!("kv.json is not an object"),
             })
             .unwrap_or_else(|error| {
-                eprintln!("Failed to read Kv state: {error}");
+                // A first run has no kv.json yet: nothing to report.
+                let missing = error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+                if !missing {
+                    crate::log::warn(&format!("Failed to read Kv state: {error}"));
+                }
                 Map::new()
             });
         Kv {
@@ -448,7 +454,7 @@ mod writer {
             super::write_json_atomic(file, &Value::Object(data))
         });
         if let Err(error) = result {
-            eprintln!("Failed to write Kv state: {error}");
+            crate::log::warn(&format!("Failed to write Kv state: {error}"));
         }
     }
 

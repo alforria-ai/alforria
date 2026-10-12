@@ -666,7 +666,7 @@ impl LocalState {
             "variant": self.model.variant,
         });
         if let Err(error) = write_json_atomic(&dir.join("model.json"), &value) {
-            eprintln!("Failed to write model state: {error}");
+            crate::log::warn(&format!("Failed to write model state: {error}"));
         }
     }
 
@@ -678,7 +678,7 @@ impl LocalState {
             "pinned": self.session.pinned,
         });
         if let Err(error) = write_json_atomic(&dir.join("session.json"), &value) {
-            eprintln!("Failed to write session state: {error}");
+            crate::log::warn(&format!("Failed to write session state: {error}"));
         }
     }
 }

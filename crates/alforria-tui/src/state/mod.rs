@@ -10,6 +10,8 @@ pub mod kv;
 pub mod local;
 pub mod prompt;
 pub mod route;
+#[cfg(test)]
+mod routing_tests;
 pub mod sync;
 
 use std::collections::HashSet;
@@ -629,6 +631,11 @@ pub enum Effect {
     /// `sync.session.sync(sessionID)` — the `task` tool hydrates its
     /// child session on mount (`session/index.tsx:2221-2224`).
     SessionHydrate { session_id: String },
+    /// After an SSE reconnect: `GET /session/status` replaces the statuses.
+    SessionStatusRefresh,
+    /// After an SSE reconnect: hydrate the session again, even if it was
+    /// fully synced (the events in between are lost).
+    SessionResync { session_id: String },
     /// `prompt.paste` — read the clipboard, run the paste pipeline
     /// (`prompt/index.tsx:374-391`).
     PromptPaste,
@@ -821,7 +828,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             // Dialogs take the keyboard while the stack is open (the
             // pushed `modal` mode, `ui/dialog.tsx:105-137`).
             if !app.ui.dialogs.is_empty() {
-                effects.extend(crate::ui::dialogs::handle_key(app, &key));
+                effects.extend(dialog_key(app, &key));
             } else if let Some(handled) = crate::ui::session::permission::handle_key(app, &key) {
                 effects.extend(handled);
             } else if let Some(handled) = crate::ui::session::question::handle_key(app, &key) {
@@ -835,11 +842,18 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                     foreground_tasks: crate::command::foreground_tasks(app) > 0,
                     prompt_mounted: !crate::ui::session::prompt_replaced(app),
                 };
-                let commands = app.keymap.dispatch(&context, &key, app.ui.tick_ms);
-                // While the autocomplete is open it takes the keyboard
-                // (§5.2 escape priority).
-                let (mut handled, autocomplete_effects) = prompt::autocomplete_key(app, &key);
+                // While the autocomplete is open it takes the keys it
+                // handles (§5.2 escape priority): Enter selects instead of
+                // submitting, ctrl+p moves instead of opening the palette,
+                // Esc hides instead of interrupting.
+                let (autocompleted, autocomplete_effects) = prompt::autocomplete_key(app, &key);
                 effects.extend(autocomplete_effects);
+                let commands = if autocompleted {
+                    Vec::new()
+                } else {
+                    app.keymap.dispatch(&context, &key, app.ui.tick_ms)
+                };
+                let mut handled = false;
                 // TS dispatch evaluates every layer's `enabled()` gate before
                 // running handlers, then fires ALL enabled bindings
                 // (`keymap.tsx:229-232` + `app.tsx:975-985`) — snapshot the
@@ -878,7 +892,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                     effects.extend(crate::command::run(app, name));
                     handled = true;
                 }
-                if !handled && commands.is_empty() {
+                if !autocompleted && !handled && commands.is_empty() {
                     prompt::text_input(app, &key);
                 }
             }
@@ -987,6 +1001,9 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
             if crate::ui::dialogs::paste(app, &normalized) {
                 // A text-input dialog on top took it.
+            } else if paste_into_bottom_bar(app, &normalized) {
+                // The permission reject message or the question's "Other"
+                // answer has the focus.
             } else if normalized.trim().is_empty() {
                 effects.extend(crate::command::run(app, "prompt.paste"));
             } else {
@@ -1040,6 +1057,60 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
     app.version += 1;
     effects.extend(crate::app::post_update(app));
     effects
+}
+
+/// A key while the dialog stack is open: the `app.global` bindings
+/// (session list, new session, quick switch) still fire, as in TS; every
+/// other key belongs to the dialog.
+fn dialog_key(app: &mut App, key: &crossterm::event::KeyEvent) -> Vec<Effect> {
+    let context = crate::keymap::DispatchContext {
+        route_is_session: matches!(app.state.route.data, Route::Session { .. }),
+        prompt_focused: false,
+        foreground_tasks: crate::command::foreground_tasks(app) > 0,
+        prompt_mounted: !crate::ui::session::prompt_replaced(app),
+    };
+    let was_pending = app.keymap.leader_active();
+    let commands = app.keymap.dispatch_in(
+        &context,
+        key,
+        app.ui.tick_ms,
+        &[crate::keymap::Scope::AppGlobal],
+    );
+    if !commands.is_empty() {
+        let mut effects = Vec::new();
+        for name in commands {
+            if crate::command::is_enabled(app, name) {
+                effects.extend(crate::command::run(app, name));
+            }
+        }
+        return effects;
+    }
+    // A key that armed or extended a leader sequence, or cancelled one
+    // (Esc/Backspace), was the keymap's.
+    let cancelled = was_pending
+        && matches!(
+            key.code,
+            crossterm::event::KeyCode::Esc | crossterm::event::KeyCode::Backspace
+        );
+    if app.keymap.leader_active() || cancelled {
+        return Vec::new();
+    }
+    crate::ui::dialogs::handle_key(app, key)
+}
+
+/// Bracketed paste into a focused bottom-bar field.
+fn paste_into_bottom_bar(app: &mut App, text: &str) -> bool {
+    if crate::ui::session::permission::visible(app).is_some()
+        && app.ui.permission.stage == crate::ui::session::permission::PermissionStage::Reject
+    {
+        app.ui.permission.reject_input.push_str(text);
+        return true;
+    }
+    if crate::ui::session::question::visible(app).is_some() && app.ui.question.editing {
+        app.ui.question.input.push_str(text);
+        return true;
+    }
+    false
 }
 
 /// The animation frame interval (the TS spinner `interval={40}`).

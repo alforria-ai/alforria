@@ -79,6 +79,8 @@ pub struct SyncState {
     /// The live prompt events seen while a pending-prompt listing is in
     /// flight — see [`prompts_fetched`].
     pub prompts_fetch: PromptsFetch,
+    /// A `server.connected` arrived before: the next one is a reconnect.
+    pub connected_once: bool,
 }
 
 /// The `permission.*`/`question.*` request ids seen live while a `GET
@@ -337,7 +339,20 @@ pub fn apply_event(state: &mut State, bus_event: BusEvent) -> Vec<Effect> {
         }
         // Every (re)connect: the requests asked or answered while the
         // stream was down never arrive as events — list them.
-        Event::ServerConnected(_) => vec![Effect::PromptsRefresh],
+        // A reconnect also missed every status change and part update in
+        // between: re-read the statuses and re-hydrate the open session.
+        Event::ServerConnected(_) => {
+            let mut effects = vec![Effect::PromptsRefresh];
+            if std::mem::replace(&mut sync.connected_once, true) {
+                effects.push(Effect::SessionStatusRefresh);
+                if let crate::state::route::Route::Session { session_id, .. } = &state.route.data {
+                    effects.push(Effect::SessionResync {
+                        session_id: session_id.clone(),
+                    });
+                }
+            }
+            effects
+        }
         Event::PermissionReplied(data) => {
             sync.prompts_fetch.resolved(&data.request_id);
             let Some(requests) = sync.permission.get_mut(&data.session_id) else {
@@ -916,7 +931,7 @@ pub async fn bootstrap_shared<S: StateCell>(
     match result {
         Ok(()) => Ok(()),
         Err(error) => {
-            eprintln!("tui bootstrap failed: {error:#}");
+            crate::log::warn(&format!("tui bootstrap failed: {error:#}"));
             if fatal {
                 Err(error.context("fatal"))
             } else {

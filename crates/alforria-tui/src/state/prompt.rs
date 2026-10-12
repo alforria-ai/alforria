@@ -45,11 +45,15 @@ pub struct TextSource {
     pub value: String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct FileSource {
     pub kind: Option<String>,
     pub path: Option<String>,
     pub text: Option<TextSource>,
+    /// Every other source member, verbatim: symbol sources carry
+    /// `range`/`name`/`kind`, resource sources `clientName`/`uri`. TS
+    /// keeps the whole object, so entries it wrote must round-trip.
+    pub extra: serde_json::Map<String, Value>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -109,7 +113,7 @@ impl PromptPart {
                 }
                 object.insert("url".into(), json!(url));
                 if let Some(source) = source {
-                    let mut source_object = serde_json::Map::new();
+                    let mut source_object = source.extra.clone();
                     if let Some(kind) = &source.kind {
                         source_object.insert("type".into(), json!(kind));
                     }
@@ -177,6 +181,18 @@ impl PromptPart {
                         .get("text")
                         .and_then(span_from_value)
                         .map(|(start, end, value)| TextSource { start, end, value }),
+                    extra: source
+                        .as_object()
+                        .map(|object| {
+                            object
+                                .iter()
+                                .filter(|(key, _)| {
+                                    !matches!(key.as_str(), "type" | "path" | "text")
+                                })
+                                .map(|(key, value)| (key.clone(), value.clone()))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
                 }),
             }),
             "agent" => Some(PromptPart::Agent {
@@ -336,12 +352,40 @@ pub const MAX_HISTORY_ENTRIES: usize = 50;
 
 /// `parsePromptHistory` (`prompt/history.tsx:40-52`).
 pub fn parse_prompt_history(text: &str) -> Vec<PromptEntry> {
-    text.split('\n')
-        .filter(|line| !line.is_empty())
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .filter_map(|line| PromptEntry::from_value(&line))
-        .take(MAX_HISTORY_ENTRIES)
-        .collect()
+    parse_lines(text, PromptEntry::from_value, MAX_HISTORY_ENTRIES).entries
+}
+
+/// One `*.jsonl` read: the newest `max` entries (`.slice(-max)`), and
+/// whether rewriting the file is safe and useful.
+struct Parsed<T> {
+    entries: Vec<T>,
+    /// Self-heal on load (`history.tsx:75-81`) only when something needs
+    /// healing (corrupt lines, over the limit) and nothing would be lost:
+    /// a line that is valid JSON this port cannot represent stays.
+    rewrite: bool,
+}
+
+fn parse_lines<T>(text: &str, parse: impl Fn(&Value) -> Option<T>, max: usize) -> Parsed<T> {
+    let mut entries = Vec::new();
+    let mut corrupt = false;
+    let mut unrepresentable = false;
+    for line in text.split('\n').filter(|line| !line.is_empty()) {
+        match serde_json::from_str::<Value>(line) {
+            Ok(value) => match parse(&value) {
+                Some(entry) => entries.push(entry),
+                None => unrepresentable = true,
+            },
+            Err(_) => corrupt = true,
+        }
+    }
+    let over = entries.len() > max;
+    if over {
+        entries.drain(..entries.len() - max);
+    }
+    Parsed {
+        rewrite: !entries.is_empty() && (corrupt || over) && !unrepresentable,
+        entries,
+    }
 }
 
 /// `usePromptHistory` (`prompt/history.tsx:54-103`) — one entry per
@@ -367,12 +411,14 @@ impl History {
                 .as_ref()
                 .and_then(|file| std::fs::read_to_string(file).ok())
                 .unwrap_or_default();
-            history.entries = parse_prompt_history(&text);
+            let parsed = parse_lines(&text, PromptEntry::from_value, MAX_HISTORY_ENTRIES);
             // Rewrite valid entries to self-heal corruption and
-            // enforce the limit (`history.tsx:75-81`).
-            let entries = std::mem::take(&mut history.entries);
-            history.write_all(&entries);
-            history.entries = entries;
+            // enforce the limit (`history.tsx:75-81`) — never an empty
+            // or unreadable file into nothing.
+            if parsed.rewrite {
+                history.write_all(&parsed.entries);
+            }
+            history.entries = parsed.entries;
         }
         history
     }
@@ -499,17 +545,14 @@ impl StashEntry {
 
 /// `parsePromptStash` (`prompt/stash.tsx:29-43`).
 pub fn parse_prompt_stash(text: &str) -> Vec<StashEntry> {
-    text.split('\n')
-        .filter(|line| !line.is_empty())
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .filter_map(|line| {
-            Some(StashEntry {
-                entry: PromptEntry::from_value(&line)?,
-                timestamp: line.get("timestamp").and_then(Value::as_u64)?,
-            })
-        })
-        .take(MAX_STASH_ENTRIES)
-        .collect()
+    parse_lines(text, stash_entry_from_value, MAX_STASH_ENTRIES).entries
+}
+
+fn stash_entry_from_value(line: &Value) -> Option<StashEntry> {
+    Some(StashEntry {
+        entry: PromptEntry::from_value(line)?,
+        timestamp: line.get("timestamp").and_then(Value::as_u64)?,
+    })
 }
 
 /// `usePromptStash` (`prompt/stash.tsx`) — `<state>/prompt-stash.jsonl`.
@@ -532,7 +575,12 @@ impl Stash {
                 .as_ref()
                 .and_then(|file| std::fs::read_to_string(file).ok())
                 .unwrap_or_default();
-            stash.entries = parse_prompt_stash(&text);
+            let parsed = parse_lines(&text, stash_entry_from_value, MAX_STASH_ENTRIES);
+            stash.entries = parsed.entries;
+            // `stash.tsx` onMount: the same guarded self-heal as history.
+            if parsed.rewrite {
+                stash.write_all();
+            }
         }
         stash
     }
@@ -1125,6 +1173,7 @@ pub fn paste_attachment(app: &mut App, file: &Attachment) {
                 end,
                 value: virtual_text,
             }),
+            extra: Default::default(),
         }),
     };
     let part_index = app.ui.prompt.parts.len();
@@ -1325,6 +1374,9 @@ pub fn submit(app: &mut App) -> Vec<crate::state::Effect> {
     });
 
     let dispatch = if app.ui.prompt.mode == PromptMode::Shell {
+        // `setStore("mode", "normal")` right after the fire-and-forget
+        // shell call (`prompt/index.tsx:1059-1070`), not when it returns.
+        app.ui.prompt.mode = PromptMode::Normal;
         SubmitDispatch::Shell {
             command: input_text,
         }
@@ -1493,8 +1545,6 @@ pub async fn run_submit(
                     },
                 )
                 .await;
-            let mut app = app.lock().await;
-            app.ui.prompt.mode = PromptMode::Normal;
         }
         SubmitDispatch::Command {
             command,
@@ -2028,6 +2078,100 @@ pub fn text_input(app: &mut App, key: &crossterm::event::KeyEvent) -> bool {
 mod tests {
     use super::*;
 
+    /// A `prompt-history.jsonl` the TS TUI wrote: 60 entries, the newest
+    /// with an LSP symbol mention (`source.range`/`name`/`kind`).
+    fn ts_history_file(dir: &Path) -> String {
+        let mut lines: Vec<String> = (0..59)
+            .map(|index| json!({"input": format!("prompt {index}"), "parts": []}).to_string())
+            .collect();
+        lines.push(
+            json!({
+                "input": "look at @Foo",
+                "parts": [{
+                    "type": "file",
+                    "mime": "text/plain",
+                    "filename": "foo.rs",
+                    "url": "file:///repo/foo.rs",
+                    "source": {
+                        "type": "symbol",
+                        "path": "/repo/foo.rs",
+                        "name": "Foo",
+                        "kind": 5,
+                        "range": {"start": {"line": 1, "character": 0}, "end": {"line": 9, "character": 1}},
+                        "text": {"start": 8, "end": 12, "value": "@Foo"},
+                    },
+                }],
+                "mode": "normal",
+            })
+            .to_string(),
+        );
+        let text = lines.join("\n") + "\n";
+        std::fs::write(dir.join("prompt-history.jsonl"), &text).unwrap();
+        text
+    }
+
+    #[test]
+    fn history_keeps_the_newest_50_and_ts_entries_survive() {
+        let dir = tempfile::tempdir().unwrap();
+        ts_history_file(dir.path());
+        let mut history = History::new(Some(dir.path()));
+        assert_eq!(history.len(), MAX_HISTORY_ENTRIES);
+        // Newest first going up: the symbol mention, then prompt 58.
+        let newest = history.move_direction(-1, "").expect("newest");
+        assert_eq!(newest.input, "look at @Foo");
+        let oldest_kept = history.lookup(0).unwrap();
+        assert_eq!(oldest_kept.input, "prompt 10", "the oldest ten are dropped");
+        // The trimmed rewrite kept every member of the TS source.
+        let text = std::fs::read_to_string(dir.path().join("prompt-history.jsonl")).unwrap();
+        assert_eq!(text.lines().count(), MAX_HISTORY_ENTRIES);
+        let last: Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+        let source = &last["parts"][0]["source"];
+        assert_eq!(source["type"], "symbol");
+        assert_eq!(source["name"], "Foo");
+        assert_eq!(source["kind"], 5);
+        assert_eq!(source["range"]["end"]["line"], 9);
+        assert_eq!(source["text"]["value"], "@Foo");
+    }
+
+    #[test]
+    fn history_never_rewrites_what_it_cannot_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("prompt-history.jsonl");
+        // Missing file: nothing is created.
+        let _ = History::new(Some(dir.path()));
+        assert!(!file.exists());
+        // Only garbage: left alone, not truncated to nothing.
+        std::fs::write(&file, "not json\n").unwrap();
+        let history = History::new(Some(dir.path()));
+        assert!(history.is_empty());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "not json\n");
+        // An entry this port cannot represent (a future part shape)
+        // blocks the self-heal rewrite.
+        let text = format!(
+            "{}\nbroken\n{}\n",
+            json!({"input": "ok", "parts": []}),
+            json!({"parts": "future"})
+        );
+        std::fs::write(&file, &text).unwrap();
+        let history = History::new(Some(dir.path()));
+        assert_eq!(history.len(), 1);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), text);
+    }
+
+    #[test]
+    fn stash_keeps_the_newest_50() {
+        let lines: Vec<String> = (0..60)
+            .map(|index| {
+                json!({"input": format!("stash {index}"), "parts": [], "timestamp": index})
+                    .to_string()
+            })
+            .collect();
+        let entries = parse_prompt_stash(&lines.join("\n"));
+        assert_eq!(entries.len(), MAX_STASH_ENTRIES);
+        assert_eq!(entries[0].entry.input, "stash 10");
+        assert_eq!(entries.last().unwrap().entry.input, "stash 59");
+    }
+
     #[test]
     fn empty_select_autocomplete_hides_popup() {
         // A zero-match popup must not eat Enter forever — selecting
@@ -2142,6 +2286,7 @@ mod tests {
                     end: 8,
                     value: "[Image 1]".into(),
                 }),
+                extra: Default::default(),
             }),
         };
         let value = part.to_value();

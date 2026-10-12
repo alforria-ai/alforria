@@ -453,6 +453,19 @@ impl Keymap {
         key: &KeyEvent,
         now_ms: u64,
     ) -> Vec<&'static str> {
+        self.dispatch_in(ctx, key, now_ms, &ALL_SCOPES)
+    }
+
+    /// [`Self::dispatch`] over a subset of the layers — the dialog stack
+    /// lets only the `app.global` bindings through (`app.tsx:973-975`
+    /// registers them with no mode, so the pushed `modal` mode keeps them).
+    pub fn dispatch_in(
+        &mut self,
+        ctx: &DispatchContext,
+        key: &KeyEvent,
+        now_ms: u64,
+        scopes: &[Scope],
+    ) -> Vec<&'static str> {
         if key.kind == crossterm::event::KeyEventKind::Release {
             return Vec::new();
         }
@@ -480,16 +493,7 @@ impl Keymap {
         };
         let mut commands: Vec<(Scope, &'static str)> = Vec::new();
         let mut extends = false;
-        for scope in [
-            Scope::Modal,
-            Scope::Input,
-            Scope::SessionUnfocused,
-            Scope::SessionGlobal,
-            Scope::Prompt,
-            Scope::Session,
-            Scope::AppGlobal,
-            Scope::App,
-        ] {
+        for &scope in scopes {
             if !self.scope_active(ctx, scope) {
                 continue;
             }
@@ -532,6 +536,17 @@ impl Keymap {
         commands.into_iter().map(|(_, command)| command).collect()
     }
 }
+
+const ALL_SCOPES: [Scope; 8] = [
+    Scope::Modal,
+    Scope::Input,
+    Scope::SessionUnfocused,
+    Scope::SessionGlobal,
+    Scope::Prompt,
+    Scope::Session,
+    Scope::AppGlobal,
+    Scope::App,
+];
 
 fn scope_priority(scope: Scope) -> u8 {
     match scope {

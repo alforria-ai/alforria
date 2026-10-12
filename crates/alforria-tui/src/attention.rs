@@ -66,6 +66,92 @@ impl Attention for TerminalAttention {
     }
 }
 
+/// `TITLE_LIMIT` / `MESSAGE_LIMIT` (`attention.ts:44-45`).
+const TITLE_LIMIT: usize = 80;
+const MESSAGE_LIMIT: usize = 240;
+
+/// `normalizeText` (`attention.ts:69-76`): strip ANSI, fold line breaks
+/// (and the blanks around them) to one space, drop C0/C1 controls, trim,
+/// fall back when empty, cap at `limit` characters.
+pub fn normalize_text(input: Option<&str>, fallback: &str, limit: usize) -> String {
+    let stripped = strip_ansi(input.unwrap_or_default());
+    let mut folded = String::with_capacity(stripped.len());
+    let mut chars = stripped.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\r' || c == '\n' {
+            while folded.ends_with([' ', '\t']) {
+                folded.pop();
+            }
+            while matches!(chars.peek(), Some('\r' | '\n' | ' ' | '\t')) {
+                chars.next();
+            }
+            folded.push(' ');
+            continue;
+        }
+        folded.push(c);
+    }
+    let cleaned: String = folded
+        .chars()
+        .filter(|&c| {
+            let code = c as u32;
+            // [\u0000-\u0009\u000B\u000C\u000E-\u001F\u007F-\u009F]
+            let control = code <= 0x09
+                || code == 0x0b
+                || code == 0x0c
+                || (0x0e..=0x1f).contains(&code)
+                || (0x7f..=0x9f).contains(&code);
+            !control
+        })
+        .collect();
+    let trimmed = cleaned.trim();
+    let text = if trimmed.is_empty() {
+        fallback
+    } else {
+        trimmed
+    };
+    text.chars().take(limit).collect()
+}
+
+/// `strip-ansi`: CSI (`ESC [ … final`), OSC (`ESC ] … BEL|ST`) and
+/// two-byte escapes.
+fn strip_ansi(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' && c != '\u{9b}' {
+            out.push(c);
+            continue;
+        }
+        let csi = c == '\u{9b}' || chars.peek() == Some(&'[');
+        if c == '\x1b' && chars.peek() == Some(&']') {
+            chars.next();
+            while let Some(c) = chars.next() {
+                if c == '\x07' {
+                    break;
+                }
+                if c == '\x1b' && chars.peek() == Some(&'\\') {
+                    chars.next();
+                    break;
+                }
+            }
+            continue;
+        }
+        if csi {
+            if c == '\x1b' {
+                chars.next();
+            }
+            for c in chars.by_ref() {
+                if ('@'..='~').contains(&c) {
+                    break;
+                }
+            }
+            continue;
+        }
+        chars.next();
+    }
+    out
+}
+
 /// The `notify()` gate chain (`attention.ts:184-235`): `enabled`, then
 /// `notifications`/`sound` config, per request.
 pub fn notify(
@@ -76,10 +162,16 @@ pub fn notify(
     if !config.enabled {
         return NotifyOutcome::default();
     }
+    // The text rides inside an OSC 9 sequence: a stray BEL or ESC from a
+    // session title would end it early and leak the rest to the screen.
+    let message = normalize_text(Some(&request.message), "", MESSAGE_LIMIT);
+    if message.is_empty() {
+        return NotifyOutcome::default();
+    }
     let mut outcome = NotifyOutcome::default();
     if request.notification && config.notifications {
-        let title = request.title.as_deref().unwrap_or(DEFAULT_TITLE);
-        outcome.notification = attention.trigger_notification(&request.message, title);
+        let title = normalize_text(request.title.as_deref(), DEFAULT_TITLE, TITLE_LIMIT);
+        outcome.notification = attention.trigger_notification(&message, &title);
     }
     if request.bell && config.sound {
         outcome.bell = attention.bell();
@@ -260,6 +352,18 @@ pub fn terminal_attention() -> Arc<dyn Attention> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notification_text_is_sanitized_like_ts() {
+        assert_eq!(
+            normalize_text(Some("  \x1b[31mred\x1b[0m title \n\t next\x07 "), "x", 80),
+            "red title next"
+        );
+        assert_eq!(normalize_text(Some("\x1b]9;inject\x07ok"), "x", 80), "ok");
+        assert_eq!(normalize_text(Some(" \r\n "), "fallback", 80), "fallback");
+        assert_eq!(normalize_text(None, "alforria", 80), "alforria");
+        assert_eq!(normalize_text(Some("ééééé"), "", 3), "ééé");
+    }
     use crate::state::{App, Args};
     use alforria_schema::session_status::SessionStatusData;
     use alforria_schema::session_v1::{AssistantError, SessionErrorData};

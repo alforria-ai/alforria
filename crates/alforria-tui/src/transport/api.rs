@@ -65,6 +65,12 @@ pub fn percent_encode(input: &str) -> String {
     out
 }
 
+/// One path segment, encoded: an id or MCP server name with `/`, `?`
+/// or `#` must not reshape the URL.
+fn seg(value: &str) -> String {
+    percent_encode(value)
+}
+
 fn non_empty(value: Option<&str>) -> Option<&str> {
     value.filter(|value| !value.is_empty())
 }
@@ -515,7 +521,7 @@ impl ServerApi for HttpServerApi {
     }
 
     async fn project_directories(&self, loc: &Location, project_id: &str) -> Result<Value> {
-        self.get(&format!("/project/{project_id}/directories"), loc)
+        self.get(&format!("/project/{}/directories", seg(project_id)), loc)
             .await
     }
 
@@ -560,11 +566,12 @@ impl ServerApi for HttpServerApi {
     }
 
     async fn mcp_connect(&self, loc: &Location, name: &str) -> Result<bool> {
-        self.post(&format!("/mcp/{name}/connect"), loc, None).await
+        self.post(&format!("/mcp/{}/connect", seg(name)), loc, None)
+            .await
     }
 
     async fn mcp_disconnect(&self, loc: &Location, name: &str) -> Result<bool> {
-        self.post(&format!("/mcp/{name}/disconnect"), loc, None)
+        self.post(&format!("/mcp/{}/disconnect", seg(name)), loc, None)
             .await
     }
 
@@ -594,7 +601,7 @@ impl ServerApi for HttpServerApi {
         session_id: &str,
     ) -> Result<bool> {
         self.post(
-            &format!("/experimental/session/{session_id}/background"),
+            &format!("/experimental/session/{}/background", seg(session_id)),
             loc,
             None,
         )
@@ -638,7 +645,8 @@ impl ServerApi for HttpServerApi {
     }
 
     async fn session_get(&self, loc: &Location, session_id: &str) -> Result<V1SessionInfo> {
-        self.get(&format!("/session/{session_id}"), loc).await
+        self.get(&format!("/session/{}", seg(session_id)), loc)
+            .await
     }
 
     async fn session_messages(
@@ -652,7 +660,7 @@ impl ServerApi for HttpServerApi {
             .unwrap_or_default();
         self.json(
             Method::GET,
-            &format!("/session/{session_id}/message"),
+            &format!("/session/{}/message", seg(session_id)),
             loc,
             &extra,
             None,
@@ -661,7 +669,8 @@ impl ServerApi for HttpServerApi {
     }
 
     async fn session_todo(&self, loc: &Location, session_id: &str) -> Result<Vec<TodoInfo>> {
-        self.get(&format!("/session/{session_id}/todo"), loc).await
+        self.get(&format!("/session/{}/todo", seg(session_id)), loc)
+            .await
     }
 
     async fn session_diff(
@@ -675,7 +684,7 @@ impl ServerApi for HttpServerApi {
             .unwrap_or_default();
         self.json(
             Method::GET,
-            &format!("/session/{session_id}/diff"),
+            &format!("/session/{}/diff", seg(session_id)),
             loc,
             &extra,
             None,
@@ -695,7 +704,7 @@ impl ServerApi for HttpServerApi {
         req: SessionPrompt,
     ) -> Result<MessageWithParts> {
         self.post(
-            &format!("/session/{session_id}/message"),
+            &format!("/session/{}/message", seg(session_id)),
             loc,
             Some(serde_json::to_value(&req)?),
         )
@@ -709,7 +718,7 @@ impl ServerApi for HttpServerApi {
         req: SessionCommand,
     ) -> Result<MessageWithParts> {
         self.post(
-            &format!("/session/{session_id}/command"),
+            &format!("/session/{}/command", seg(session_id)),
             loc,
             Some(serde_json::to_value(&req)?),
         )
@@ -723,7 +732,7 @@ impl ServerApi for HttpServerApi {
         req: SessionShell,
     ) -> Result<MessageWithParts> {
         self.post(
-            &format!("/session/{session_id}/shell"),
+            &format!("/session/{}/shell", seg(session_id)),
             loc,
             Some(serde_json::to_value(&req)?),
         )
@@ -731,7 +740,7 @@ impl ServerApi for HttpServerApi {
     }
 
     async fn session_abort(&self, loc: &Location, session_id: &str) -> Result<bool> {
-        self.post(&format!("/session/{session_id}/abort"), loc, None)
+        self.post(&format!("/session/{}/abort", seg(session_id)), loc, None)
             .await
     }
 
@@ -748,7 +757,7 @@ impl ServerApi for HttpServerApi {
             body.insert("partID".to_string(), json!(part_id));
         }
         self.post(
-            &format!("/session/{session_id}/revert"),
+            &format!("/session/{}/revert", seg(session_id)),
             loc,
             Some(Value::Object(body)),
         )
@@ -756,7 +765,7 @@ impl ServerApi for HttpServerApi {
     }
 
     async fn session_unrevert(&self, loc: &Location, session_id: &str) -> Result<V1SessionInfo> {
-        self.post(&format!("/session/{session_id}/unrevert"), loc, None)
+        self.post(&format!("/session/{}/unrevert", seg(session_id)), loc, None)
             .await
     }
 
@@ -768,19 +777,23 @@ impl ServerApi for HttpServerApi {
         model_id: &str,
     ) -> Result<bool> {
         let body = json!({ "providerID": provider_id, "modelID": model_id });
-        self.post(&format!("/session/{session_id}/summarize"), loc, Some(body))
-            .await
+        self.post(
+            &format!("/session/{}/summarize", seg(session_id)),
+            loc,
+            Some(body),
+        )
+        .await
     }
 
     async fn session_share(&self, loc: &Location, session_id: &str) -> Result<V1SessionInfo> {
-        self.post(&format!("/session/{session_id}/share"), loc, None)
+        self.post(&format!("/session/{}/share", seg(session_id)), loc, None)
             .await
     }
 
     async fn session_unshare(&self, loc: &Location, session_id: &str) -> Result<V1SessionInfo> {
         self.json(
             Method::DELETE,
-            &format!("/session/{session_id}/share"),
+            &format!("/session/{}/share", seg(session_id)),
             loc,
             &[],
             None,
@@ -798,8 +811,12 @@ impl ServerApi for HttpServerApi {
             Some(message_id) => json!({ "messageID": message_id }),
             None => json!({}),
         };
-        self.post(&format!("/session/{session_id}/fork"), loc, Some(body))
-            .await
+        self.post(
+            &format!("/session/{}/fork", seg(session_id)),
+            loc,
+            Some(body),
+        )
+        .await
     }
 
     async fn session_rename(
@@ -811,7 +828,7 @@ impl ServerApi for HttpServerApi {
         let body = json!({ "title": title });
         self.json(
             Method::PATCH,
-            &format!("/session/{session_id}"),
+            &format!("/session/{}", seg(session_id)),
             loc,
             &[],
             Some(body),
@@ -822,7 +839,7 @@ impl ServerApi for HttpServerApi {
     async fn session_delete(&self, loc: &Location, session_id: &str) -> Result<bool> {
         self.json(
             Method::DELETE,
-            &format!("/session/{session_id}"),
+            &format!("/session/{}", seg(session_id)),
             loc,
             &[],
             None,
@@ -855,7 +872,7 @@ impl ServerApi for HttpServerApi {
             body.insert("message".to_string(), json!(message));
         }
         self.post(
-            &format!("/permission/{request_id}/reply"),
+            &format!("/permission/{}/reply", seg(request_id)),
             loc,
             Some(Value::Object(body)),
         )
@@ -869,12 +886,16 @@ impl ServerApi for HttpServerApi {
         answers: Vec<QuestionV1Answer>,
     ) -> Result<bool> {
         let body = json!({ "answers": answers });
-        self.post(&format!("/question/{request_id}/reply"), loc, Some(body))
-            .await
+        self.post(
+            &format!("/question/{}/reply", seg(request_id)),
+            loc,
+            Some(body),
+        )
+        .await
     }
 
     async fn question_reject(&self, loc: &Location, request_id: &str) -> Result<bool> {
-        self.post(&format!("/question/{request_id}/reject"), loc, None)
+        self.post(&format!("/question/{}/reject", seg(request_id)), loc, None)
             .await
     }
 
@@ -882,7 +903,7 @@ impl ServerApi for HttpServerApi {
         let body = json!({ "type": "api", "key": key });
         self.json(
             Method::PUT,
-            &format!("/auth/{provider_id}"),
+            &format!("/auth/{}", seg(provider_id)),
             loc,
             &[],
             Some(body),
@@ -893,7 +914,7 @@ impl ServerApi for HttpServerApi {
     async fn auth_remove(&self, loc: &Location, provider_id: &str) -> Result<bool> {
         self.json(
             Method::DELETE,
-            &format!("/auth/{provider_id}"),
+            &format!("/auth/{}", seg(provider_id)),
             loc,
             &[],
             None,
@@ -909,7 +930,7 @@ impl ServerApi for HttpServerApi {
     ) -> Result<Value> {
         let body = json!({ "method": method });
         self.post(
-            &format!("/provider/{provider_id}/oauth/authorize"),
+            &format!("/provider/{}/oauth/authorize", seg(provider_id)),
             loc,
             Some(body),
         )
@@ -928,7 +949,7 @@ impl ServerApi for HttpServerApi {
             body["code"] = json!(code);
         }
         self.post(
-            &format!("/provider/{provider_id}/oauth/callback"),
+            &format!("/provider/{}/oauth/callback", seg(provider_id)),
             loc,
             Some(body),
         )
@@ -939,6 +960,24 @@ impl ServerApi for HttpServerApi {
 #[cfg(test)]
 mod tests {
     use super::percent_encode;
+
+    #[test]
+    fn path_segments_are_encoded() {
+        let config = super::HttpClientConfig {
+            base_url: "http://h".to_string(),
+            directory: None,
+            headers: Vec::new(),
+        };
+        let path = format!("/mcp/{}/connect", super::seg("a/b?c"));
+        let url = super::build_url(
+            &config,
+            &path,
+            &reqwest::Method::POST,
+            &super::Location::default(),
+            &[],
+        );
+        assert_eq!(url, "http://h/mcp/a%2Fb%3Fc/connect");
+    }
 
     #[test]
     fn percent_encode_matches_encode_uri_component() {

@@ -1,6 +1,6 @@
-//! Clipboard seam (§2.3) — `util/clipboard.ts` (`clipboard.ts`):
-//! probe `pbcopy`/`wl-copy`/`xclip` with no new dependency; the test
-//! double records writes in memory.
+//! Clipboard seam (§2.3) — `clipboard.ts`: OSC 52 plus the platform
+//! tools (`osascript`, `wl-copy`/`wl-paste`, `xclip`, `xsel`), with no new
+//! dependency; the test double records writes in memory.
 
 use std::io::Write;
 
@@ -9,8 +9,15 @@ use std::io::Write;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClipboardContent {
     Text(String),
-    Image { mime: String, data_base64: String },
-    Pdf { data_base64: String },
+    /// Raw image bytes (the attachment encodes them once).
+    Image {
+        mime: String,
+        data: Vec<u8>,
+    },
+    /// Raw PDF bytes.
+    Pdf {
+        data: Vec<u8>,
+    },
 }
 
 pub trait Clipboard {
@@ -30,18 +37,88 @@ pub fn system_clipboard() -> impl Clipboard {
 
 pub struct SystemClipboard;
 
-fn write_command(text: &str, args: &[&str]) -> anyhow::Result<()> {
+/// Run a tool, feeding `input` on stdin; its stdout on exit status 0
+/// (`command()`, clipboard.ts:9-21).
+fn run_command(args: &[&str], input: Option<&str>) -> anyhow::Result<Vec<u8>> {
     let mut child = std::process::Command::new(args[0])
         .args(&args[1..])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
+        .stdin(if input.is_some() {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        })
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn()?;
-    if let Some(stdin) = child.stdin.as_mut() {
-        stdin.write_all(text.as_bytes())?;
+    if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+        stdin.write_all(input.as_bytes())?;
     }
-    child.wait()?;
-    Ok(())
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        anyhow::bail!("{} exited with {}", args[0], output.status);
+    }
+    Ok(output.stdout)
+}
+
+/// `which(name)`: an executable `name` on `$PATH`.
+fn has(name: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| {
+        let candidate = dir.join(name);
+        candidate.is_file()
+            && std::fs::metadata(&candidate)
+                .map(|meta| {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt as _;
+                        meta.permissions().mode() & 0o111 != 0
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        let _ = meta;
+                        true
+                    }
+                })
+                .unwrap_or(false)
+    })
+}
+
+/// `copyCommand` (clipboard.ts:83-101): the native copy tool for this
+/// platform — `wl-copy` only under Wayland, then `xclip`, then `xsel`.
+pub fn copy_command(
+    os: &str,
+    wayland: bool,
+    has: impl Fn(&str) -> bool,
+) -> Option<Vec<&'static str>> {
+    if os == "macos" && has("osascript") {
+        return Some(vec!["osascript"]);
+    }
+    if os == "linux" && wayland && has("wl-copy") {
+        return Some(vec!["wl-copy"]);
+    }
+    if os == "linux" && has("xclip") {
+        return Some(vec!["xclip", "-selection", "clipboard"]);
+    }
+    if os == "linux" && has("xsel") {
+        return Some(vec!["xsel", "--clipboard", "--input"]);
+    }
+    if os == "windows" && has("powershell.exe") {
+        return Some(vec![
+            "powershell.exe",
+            "-NonInteractive",
+            "-NoProfile",
+            "-Command",
+            "[Console]::InputEncoding = [System.Text.Encoding]::UTF8; Set-Clipboard -Value ([Console]::In.ReadToEnd())",
+        ]);
+    }
+    None
+}
+
+/// The AppleScript string literal for `set the clipboard to "…"`.
+fn applescript_string(text: &str) -> String {
+    text.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 /// The OSC 52 escape that asks the terminal itself to set its clipboard —
@@ -79,76 +156,126 @@ fn write_osc52(text: &str) -> bool {
 }
 
 impl Clipboard for SystemClipboard {
-    /// OSC 52 first, then a native tool, like TS's `write` — a copy
-    /// counts once either reached the terminal or a tool took it.
+    /// OSC 52 first, then the native tool, like TS's `write` — a copy
+    /// counts once either reached the terminal or a tool exited 0.
     fn write(&self, text: &str) -> anyhow::Result<()> {
         let via_terminal = write_osc52(text);
-        let mut candidates: Vec<Vec<&str>> = vec![vec!["pbcopy"], vec!["wl-copy"]];
-        if std::env::var("DISPLAY").is_ok() || std::env::var("WAYLAND_DISPLAY").is_ok() {
-            candidates.push(vec!["xclip", "-selection", "clipboard"]);
+        let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
+        let native = copy_command(std::env::consts::OS, wayland, has)
+            // clipboardy's fallbacks (no osascript: pbcopy).
+            .or_else(|| has("pbcopy").then(|| vec!["pbcopy"]));
+        let result = match native.as_deref() {
+            Some(["osascript"]) => run_command(
+                &[
+                    "osascript",
+                    "-e",
+                    &format!("set the clipboard to \"{}\"", applescript_string(text)),
+                ],
+                None,
+            )
+            .map(|_| ()),
+            Some(args) => run_command(args, Some(text)).map(|_| ()),
+            None => Err(anyhow::anyhow!("no clipboard tool found")),
+        };
+        match result {
+            Ok(()) => Ok(()),
+            Err(_) if via_terminal => Ok(()),
+            Err(error) => Err(error),
         }
-        let mut errors = Vec::new();
-        for args in candidates {
-            match write_command(text, &args) {
-                Ok(()) => return Ok(()),
-                Err(error) => errors.push(format!("{}: {error}", args[0])),
-            }
-        }
-        if via_terminal {
-            return Ok(());
-        }
-        anyhow::bail!("no clipboard available ({})", errors.join(", "))
     }
 
+    /// `read()` (clipboard.ts:30-74): an image first (`osascript` PNGf on
+    /// macOS, `wl-paste`/`xclip -t image/png` on Linux), then text.
     fn read(&self) -> anyhow::Result<ClipboardContent> {
-        let candidates: Vec<Vec<&str>> = vec![
-            vec!["pbpaste"],
-            vec!["wl-paste"],
-            vec!["xclip", "-selection", "clipboard", "-o"],
-        ];
-        let mut last = String::new();
-        for args in candidates {
-            match std::process::Command::new(args[0])
-                .args(&args[1..])
-                .output()
-            {
-                Ok(output) if output.status.success() && !output.stdout.is_empty() => {
-                    return Ok(sniff(output.stdout));
-                }
-                Ok(_) => continue,
-                Err(_) => last = args[0].to_string(),
+        if cfg!(target_os = "macos") {
+            if let Some(data) = macos_png() {
+                return Ok(ClipboardContent::Image {
+                    mime: "image/png".to_string(),
+                    data,
+                });
             }
         }
-        anyhow::bail!("no clipboard available ({last})")
+        if cfg!(target_os = "linux") {
+            for args in [
+                &["wl-paste", "-t", "image/png"][..],
+                &["xclip", "-selection", "clipboard", "-t", "image/png", "-o"][..],
+            ] {
+                if let Ok(data) = run_command(args, None) {
+                    if !data.is_empty() {
+                        return Ok(ClipboardContent::Image {
+                            mime: "image/png".to_string(),
+                            data,
+                        });
+                    }
+                }
+            }
+        }
+        let candidates: [&[&str]; 4] = [
+            &["pbpaste"],
+            &["wl-paste", "--no-newline"],
+            &["xclip", "-selection", "clipboard", "-o"],
+            &["xsel", "--clipboard", "--output"],
+        ];
+        for args in candidates {
+            if let Ok(data) = run_command(args, None) {
+                if !data.is_empty() {
+                    return Ok(sniff(data));
+                }
+            }
+        }
+        anyhow::bail!("no clipboard available")
     }
+}
+
+/// The macOS image read: AppleScript writes the clipboard's PNG to a
+/// temporary file.
+fn macos_png() -> Option<Vec<u8>> {
+    let file = std::env::temp_dir().join(format!("opencode-clipboard-{}.png", std::process::id()));
+    let display = file.display().to_string();
+    let result = run_command(
+        &[
+            "osascript",
+            "-e",
+            "set imageData to the clipboard as \"PNGf\"",
+            "-e",
+            &format!(
+                "set fileRef to open for access POSIX file \"{display}\" with write permission"
+            ),
+            "-e",
+            "set eof fileRef to 0",
+            "-e",
+            "write imageData to fileRef",
+            "-e",
+            "close access fileRef",
+        ],
+        None,
+    )
+    .ok()
+    .and_then(|_| std::fs::read(&file).ok())
+    .filter(|data| !data.is_empty());
+    let _ = std::fs::remove_file(&file);
+    result
 }
 
 /// Sniff binary magic like the platform clipboards do for images/pdfs
 /// (`content.mime.startsWith("image/")`, `prompt/index.tsx:379`).
 fn sniff(bytes: Vec<u8>) -> ClipboardContent {
     let starts_with = |magic: &[u8]| bytes.starts_with(magic);
+    let image = |mime: &str| ClipboardContent::Image {
+        mime: mime.to_string(),
+        data: bytes.clone(),
+    };
     if starts_with(b"\x89PNG\r\n\x1a\n") {
-        return ClipboardContent::Image {
-            mime: "image/png".to_string(),
-            data_base64: base64_encode(&bytes),
-        };
+        return image("image/png");
     }
     if starts_with(b"\xff\xd8\xff") {
-        return ClipboardContent::Image {
-            mime: "image/jpeg".to_string(),
-            data_base64: base64_encode(&bytes),
-        };
+        return image("image/jpeg");
     }
     if starts_with(b"GIF87a") || starts_with(b"GIF89a") {
-        return ClipboardContent::Image {
-            mime: "image/gif".to_string(),
-            data_base64: base64_encode(&bytes),
-        };
+        return image("image/gif");
     }
     if starts_with(b"%PDF-") {
-        return ClipboardContent::Pdf {
-            data_base64: base64_encode(&bytes),
-        };
+        return ClipboardContent::Pdf { data: bytes };
     }
     ClipboardContent::Text(String::from_utf8_lossy(&bytes).into_owned())
 }
@@ -189,6 +316,47 @@ mod tests {
         // surface the error, not crash.
         let result = SystemClipboard.write("x");
         let _ = result;
+    }
+
+    #[test]
+    fn copy_command_matches_ts() {
+        let all = |_: &str| true;
+        let only = |names: &'static [&'static str]| move |name: &str| names.contains(&name);
+        assert_eq!(copy_command("macos", false, all), Some(vec!["osascript"]));
+        assert_eq!(copy_command("linux", true, all), Some(vec!["wl-copy"]));
+        // wl-copy only under Wayland.
+        assert_eq!(
+            copy_command("linux", false, all),
+            Some(vec!["xclip", "-selection", "clipboard"])
+        );
+        assert_eq!(
+            copy_command("linux", false, only(&["wl-copy", "xsel"])),
+            Some(vec!["xsel", "--clipboard", "--input"])
+        );
+        assert_eq!(copy_command("linux", false, only(&[])), None);
+    }
+
+    #[test]
+    fn copy_fails_when_the_tool_exits_non_zero() {
+        assert!(run_command(&["false"], Some("x")).is_err());
+        assert_eq!(run_command(&["cat"], Some("x")).unwrap(), b"x");
+    }
+
+    #[test]
+    fn sniffed_images_keep_raw_bytes() {
+        let png = b"\x89PNG\r\n\x1a\nrest".to_vec();
+        assert_eq!(
+            sniff(png.clone()),
+            ClipboardContent::Image {
+                mime: "image/png".to_string(),
+                data: png
+            }
+        );
+    }
+
+    #[test]
+    fn applescript_text_is_escaped() {
+        assert_eq!(applescript_string(r#"a"b\c"#), r#"a\"b\\c"#);
     }
 
     #[test]

@@ -1279,6 +1279,8 @@ pub fn parse_binding_value(value: &str, leader: &str) -> BindingValue {
 pub fn event_to_stroke(event: &KeyEvent) -> Option<KeyStroke> {
     let mut shift = false;
     let key = match event.code {
+        // Bindings name the space bar `space` (`dialog.mcp.toggle`, …).
+        KeyCode::Char(' ') => "space".to_string(),
         KeyCode::Char(c) => {
             if c.is_ascii_uppercase() {
                 shift = true;
