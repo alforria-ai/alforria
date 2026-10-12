@@ -1,12 +1,14 @@
 // The composer's model picker: a filterable listbox over every model the
-// server offers, grouped by provider. Typing filters, ↑↓ move, ↵ picks, Esc
+// session's directory offers, grouped by provider. Typing filters, ↑↓ move, ↵ picks, Esc
 // closes back to the button; a press anywhere else closes it.
 import { createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js"
 import { openSettings } from "../../nav/route"
-import { state } from "../../store/store"
+import { modelsFor } from "../../sync/catalog"
 import { Icon } from "../../ui/icons"
 
 export function ModelPicker(props: {
+  /** The session's directory: each one's instance has its own models. */
+  directory: string
   value?: string
   anchor: () => HTMLElement | undefined
   onPick: (id: string) => void
@@ -17,7 +19,7 @@ export function ModelPicker(props: {
   let list!: HTMLDivElement
   const [q, setQ] = createSignal("")
   const all = createMemo(() =>
-    Object.entries(state.models)
+    Object.entries(modelsFor(props.directory))
       .map(([id, info]) => ({ id, name: info.name, provider: id.split("/")[0]! }))
       .sort((a, b) => a.provider.localeCompare(b.provider) || a.name.localeCompare(b.name)),
   )

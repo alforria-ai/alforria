@@ -237,7 +237,10 @@ export function contextUse(s: State, sessionID: string): { tokens: number; fract
   const t = m.tokens
   const tokens = t.input + t.output + t.reasoning + t.cache.read + t.cache.write
   if (!tokens) return null
-  const window = s.models[`${m.providerID}/${m.modelID}`]?.context
+  // The session's directory may offer models the server-wide list doesn't (as modelsFor).
+  const dir = s.sessions[sessionID]?.directory
+  const models = (dir && s.catalogs[dir]?.models) || s.models
+  const window = models[`${m.providerID}/${m.modelID}`]?.context
   return { tokens, fraction: window ? tokens / window : null }
 }
 

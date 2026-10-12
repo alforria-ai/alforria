@@ -23,6 +23,8 @@ export interface SessionError {
 export interface ModelInfo {
   name: string
   context?: number
+  /** The reasoning variants it offers (disabled ones left out); absent when none. */
+  variants?: string[]
 }
 
 /** What one directory's instance offers; each list is absent until read. */

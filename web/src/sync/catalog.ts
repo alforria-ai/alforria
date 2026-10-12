@@ -33,11 +33,18 @@ function cached<T>(cache: Map<string, Promise<T[]>>, dir: string, load: () => Pr
 export const agentsFor = (dir: string) => cached(agents, dir, () => api.agents(dir))
 export const commandsFor = (dir: string) => cached(commands, dir, () => api.commands(dir))
 
-/** `providerID/modelID` → display info, from GET /config/providers. */
+/** `providerID/modelID` → display info and reasoning variants, from GET /config/providers. */
 export function modelMap(list: ProviderList) {
   const models: Record<string, ModelInfo> = {}
   for (const p of list.providers)
-    for (const m of Object.values(p.models)) models[`${p.id}/${m.id}`] = { name: m.name, context: m.limit?.context }
+    for (const m of Object.values(p.models)) {
+      const info: ModelInfo = { name: m.name, context: m.limit?.context }
+      const variants = Object.entries(m.variants ?? {})
+        .filter(([, v]) => !v?.disabled)
+        .map(([name]) => name)
+      if (variants.length) info.variants = variants
+      models[`${p.id}/${m.id}`] = info
+    }
   return models
 }
 

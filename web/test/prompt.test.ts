@@ -10,7 +10,6 @@ import {
   looksBinary,
   MENTION,
   promptBody,
-  variantIndex,
   type Draft,
 } from "../src/views/focus/prompt"
 
@@ -107,25 +106,6 @@ describe("the session's model", () => {
 })
 
 describe("variants", () => {
-  test("indexed per model, disabled ones left out", () => {
-    expect(
-      variantIndex({
-        providers: [
-          {
-            id: "p",
-            name: "P",
-            models: {
-              a: { id: "a", name: "A", variants: { low: {}, high: {}, max: { disabled: true } } },
-              b: { id: "b", name: "B", variants: {} },
-              c: { id: "c", name: "C" },
-            },
-          },
-        ],
-        default: {},
-      }),
-    ).toEqual({ "p/a": ["low", "high"] })
-  })
-
   test("cycle: default → each → default", () => {
     const v = ["low", "high"]
     expect(cycleVariant(v, undefined)).toBe("low")

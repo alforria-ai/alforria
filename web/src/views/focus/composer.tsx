@@ -4,9 +4,10 @@
 import { createMemo, createResource, createSignal, For, onCleanup, Show } from "solid-js"
 import { createStore, unwrap } from "solid-js/store"
 import { api } from "../../api/client"
-import type { Agent, Command } from "../../api/types"
+import type { Agent } from "../../api/types"
 import { lastAssistant } from "../../fleet/derive"
 import { state } from "../../store/store"
+import { agentsFor, catalogEpoch, commandsFor, modelsFor, useCatalog } from "../../sync/catalog"
 import { Icon } from "../../ui/icons"
 import { toast } from "../toast"
 import { addComment, clearComments, comments, commentsText } from "./comments"
@@ -21,7 +22,6 @@ import {
   looksBinary,
   MENTION,
   promptBody,
-  variantIndex,
   type Attachment,
   type Draft as Body,
 } from "./prompt"
@@ -70,42 +70,6 @@ addEventListener("pagehide", () => {
   saveDrafts(unwrap(drafts))
 })
 
-const agentCache = new Map<string, Promise<Agent[]>>()
-const commandCache = new Map<string, Promise<Command[]>>()
-const agentsFor = (dir: string) => {
-  if (!agentCache.has(dir))
-    agentCache.set(
-      dir,
-      api.agents(dir).catch(() => []),
-    )
-  return agentCache.get(dir)!
-}
-const commandsFor = (dir: string) => {
-  if (!commandCache.has(dir))
-    commandCache.set(
-      dir,
-      api.commands(dir).catch(() => []),
-    )
-  return commandCache.get(dir)!
-}
-/** null: the catalog could not be read, so which variants exist is unknown. */
-const variantCache = new Map<string, Promise<Record<string, string[]> | null>>()
-const variantsFor = (dir: string) => {
-  if (!variantCache.has(dir))
-    variantCache.set(
-      dir,
-      api
-        .providers(dir)
-        .then(variantIndex)
-        .catch(() => {
-          // Not cached: the next column to ask tries again.
-          variantCache.delete(dir)
-          return null
-        }),
-    )
-  return variantCache.get(dir)!
-}
-
 /** Fill a session's composer: a fork carries its prompt over, with the agent and model it used. */
 export function setComposerDraft(
   sessionID: string,
@@ -130,7 +94,14 @@ export function Composer(props: { sessionID: string }) {
     persist()
   }
 
-  const [agents] = createResource(dir, agentsFor)
+  // Keyed on the epoch too: an instance disposal re-reads its config, so the lists may change.
+  const [agents] = createResource(
+    () => [dir(), catalogEpoch()] as const,
+    ([d]) => agentsFor(d),
+  )
+  useCatalog(dir)
+  /** This directory's models once read; undefined while loading or unreadable. */
+  const ownModels = () => state.catalogs[dir()]?.models
   const primary = createMemo(() => (agents() ?? []).filter((a) => a.mode !== "subagent" && !a.hidden))
   const last = createMemo(() => lastAssistant(state, props.sessionID))
   const agent = () => draft().agent ?? session()?.agent ?? last()?.agent ?? primary()[0]?.name ?? "build"
@@ -140,9 +111,8 @@ export function Composer(props: { sessionID: string }) {
     (session()?.model ? `${session()!.model!.providerID}/${session()!.model!.id}` : undefined) ??
     (lastUser() ? `${lastUser()!.providerID}/${lastUser()!.modelID}` : undefined) ??
     (last() ? `${last()!.providerID}/${last()!.modelID}` : undefined)
-  const [variantIndex] = createResource(dir, variantsFor)
   /** The current model's reasoning variants; empty when it has none (or they're not known yet). */
-  const variants = () => variantIndex()?.[model() ?? ""] ?? []
+  const variants = () => ownModels()?.[model() ?? ""]?.variants ?? []
   /**
    * The reasoning variant: the one picked here, else the one the session last
    * used while the model stays the same. Dropped when the model doesn't offer it.
@@ -159,8 +129,8 @@ export function Composer(props: { sessionID: string }) {
       else if (sm && m === `${sm.providerID}/${sm.id}`) v = sm.variant
     }
     // Unknown catalog (loading or unreadable): trust the session. Known: only what the model offers.
-    const index = variantIndex()
-    return v && (!index || index[m ?? ""]?.includes(v)) ? v : undefined
+    const index = ownModels()
+    return v && (!index || index[m ?? ""]?.variants?.includes(v)) ? v : undefined
   }
   /** "" picks the model's default explicitly (so a restored variant doesn't come back). */
   const pickVariant = (v: string | undefined) => setDraft({ variant: v ?? "" })
@@ -425,7 +395,7 @@ export function Composer(props: { sessionID: string }) {
 
   const modelName = () => {
     const m = model()
-    return m ? (state.models[m]?.name ?? m.split("/").slice(1).join("/")) : "default model"
+    return m ? (modelsFor(dir())[m]?.name ?? m.split("/").slice(1).join("/")) : "default model"
   }
 
   return (
@@ -516,6 +486,7 @@ export function Composer(props: { sessionID: string }) {
       </Show>
       <Show when={modelPicker()}>
         <ModelPicker
+          directory={dir()}
           value={model()}
           anchor={() => modelBtn}
           onPick={(id) => {

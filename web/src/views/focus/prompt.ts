@@ -1,6 +1,6 @@
 // What the composer sends: request bodies for a prompt or a slash command,
 // built from the draft. Pure, so the wire shapes are tested on their own.
-import type { PromptInput, PromptPart, ProviderList } from "../../api/client"
+import type { PromptInput, PromptPart } from "../../api/client"
 import type { UserMessage } from "../../api/types"
 import type { State } from "../../store/state"
 
@@ -105,19 +105,6 @@ export function attachmentKind(name: string, mime: string): AttachmentKind | und
 
 /** A NUL in the first 8 KB marks a binary, as git and grep decide. */
 export const looksBinary = (bytes: Uint8Array) => bytes.subarray(0, 8192).includes(0)
-
-/** `providerID/modelID` → the reasoning variants it offers (disabled ones left out). */
-export function variantIndex(list: ProviderList): Record<string, string[]> {
-  const out: Record<string, string[]> = {}
-  for (const p of list.providers)
-    for (const [id, m] of Object.entries(p.models)) {
-      const names = Object.entries(m.variants ?? {})
-        .filter(([, v]) => !v?.disabled)
-        .map(([name]) => name)
-      if (names.length) out[`${p.id}/${id}`] = names
-    }
-  return out
-}
 
 /** The next variant, as upstream cycles: default → first → … → last → default. */
 export function cycleVariant(variants: string[], current?: string): string | undefined {

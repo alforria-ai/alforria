@@ -10,7 +10,7 @@ vi.mock("../src/api/client", async (original) => ({
   api,
 }))
 
-const { loadCatalog, modelsFor, useCatalog } = await import("../src/sync/catalog")
+const { loadCatalog, modelMap, modelsFor, useCatalog } = await import("../src/sync/catalog")
 const { onFrame } = await import("../src/sync/sync")
 const { flush, setState, state } = await import("../src/store/store")
 const { emptyState } = await import("../src/store/state")
@@ -65,5 +65,28 @@ describe("catalogs", () => {
     onFrame(frame("server.instance.disposed", { directory: "/a" }, "/a"))
     await settle()
     expect(api.providers!.mock.calls.length).toBe(calls + 1)
+  })
+
+  test("a model's reasoning variants, disabled ones left out", () => {
+    expect(
+      modelMap({
+        providers: [
+          {
+            id: "p",
+            name: "P",
+            models: {
+              a: { id: "a", name: "A", variants: { low: {}, high: {}, max: { disabled: true } } },
+              b: { id: "b", name: "B", variants: {} },
+              c: { id: "c", name: "C" },
+            },
+          },
+        ],
+        default: {},
+      }),
+    ).toEqual({
+      "p/a": { name: "A", context: undefined, variants: ["low", "high"] },
+      "p/b": { name: "B", context: undefined },
+      "p/c": { name: "C", context: undefined },
+    })
   })
 })

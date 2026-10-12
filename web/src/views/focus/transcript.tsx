@@ -7,6 +7,7 @@ import { api } from "../../api/client"
 import type { AssistantMessage, UserMessage } from "../../api/types"
 import { fleetState, interruptsFor, type Interrupt } from "../../fleet/derive"
 import { state } from "../../store/store"
+import { loadEarlier } from "../../sync/sync"
 import { hm, ktok, money } from "../../ui/format"
 import { Icon } from "../../ui/icons"
 import { writeClipboard } from "../../ui/markdown"
@@ -119,6 +120,34 @@ export function Transcript(props: { sessionID: string; onOpenSession: (id: strin
     { equals: sameIds },
   )
 
+  /**
+   * Hold the reader's place while turns are added above them: note the offset
+   * from the bottom now, and the returned function restores it once they render.
+   */
+  const holdPlace = () => {
+    const fromBottom = scroller.scrollHeight - scroller.scrollTop
+    setStuck(false)
+    return () => requestAnimationFrame(() => (scroller.scrollTop = scroller.scrollHeight - fromBottom))
+  }
+  // Older messages from the server (a transcript loads a page at a time).
+  const [loadingEarlier, setLoadingEarlier] = createSignal(false)
+  const earlier = async () => {
+    if (loadingEarlier()) return
+    setLoadingEarlier(true)
+    const before = turns().length
+    const restore = holdPlace()
+    try {
+      await loadEarlier(props.sessionID)
+      // The page lands above the render window: widen it so the new turns show.
+      setShown((w) => w + Math.max(0, turns().length - before))
+      restore()
+    } catch (err) {
+      toast(`Could not load earlier messages: ${err instanceof Error ? err.message : err}`, "error")
+    } finally {
+      setLoadingEarlier(false)
+    }
+  }
+
   const atBottom = () => scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 32
   const toBottom = () => (scroller.scrollTop = scroller.scrollHeight)
   onMount(() => {
@@ -144,15 +173,22 @@ export function Transcript(props: { sessionID: string; onOpenSession: (id: strin
               </div>
             }
           >
-            <Show when={turns().length > shown()}>
+            <Show
+              when={turns().length > shown()}
+              fallback={
+                <Show when={state.earlier[props.sessionID]}>
+                  <button class="link-btn earlier" disabled={loadingEarlier()} onClick={() => void earlier()}>
+                    {loadingEarlier() ? "Loading earlier messages…" : "Load earlier messages"}
+                  </button>
+                </Show>
+              }
+            >
               <button
                 class="link-btn earlier"
                 onClick={() => {
-                  // Keep the reader's place: grow the window, then restore the offset from the bottom.
-                  const fromBottom = scroller.scrollHeight - scroller.scrollTop
-                  setStuck(false)
+                  const restore = holdPlace()
                   setShown((w) => w + 40)
-                  requestAnimationFrame(() => (scroller.scrollTop = scroller.scrollHeight - fromBottom))
+                  restore()
                 }}
               >
                 Show {Math.min(40, turns().length - shown())} earlier turns
