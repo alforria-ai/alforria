@@ -62,7 +62,19 @@ export function breakable(code: string): JSX.Element {
   return out
 }
 
-export function Diff(props: { rows: DiffRow[] }) {
+export type LineRow = Exclude<DiffRow, { kind: "hunk" }>
+
+/**
+ * `onLine` makes each line number a button (the Changes view comments on
+ * lines with it); `after` renders under a line (its comments, an editor).
+ */
+export function Diff(props: {
+  rows: DiffRow[]
+  onLine?: (r: LineRow) => void
+  after?: (r: LineRow) => JSX.Element
+  /** Lines carrying a comment: their number stays lit. */
+  marked?: (r: LineRow) => boolean
+}) {
   return (
     <div class="diff">
       <For each={props.rows}>
@@ -70,13 +82,22 @@ export function Diff(props: { rows: DiffRow[] }) {
           r.kind === "hunk" ? (
             <div class="ln hunk">{r.text}</div>
           ) : (
-            <div class={`ln ${r.kind}`}>
-              <span>{r.line}</span>
-              <span>{r.kind === "add" ? "+" : r.kind === "del" ? "−" : " "}</span>
-              <span class="src" style={{ "--ind": String(r.text.match(/^\s*/)![0].replace(/\t/g, "    ").length) }}>
-                {breakable(r.text.trimStart())}
-              </span>
-            </div>
+            <>
+              <div class={`ln ${r.kind}`} classList={{ commented: !!props.marked?.(r) }}>
+                {props.onLine ? (
+                  <button class="ln-pick" aria-label={`Comment on line ${r.line}`} onClick={() => props.onLine!(r)}>
+                    {r.line}
+                  </button>
+                ) : (
+                  <span>{r.line}</span>
+                )}
+                <span>{r.kind === "add" ? "+" : r.kind === "del" ? "−" : " "}</span>
+                <span class="src" style={{ "--ind": String(r.text.match(/^\s*/)![0].replace(/\t/g, "    ").length) }}>
+                  {breakable(r.text.trimStart())}
+                </span>
+              </div>
+              {props.after?.(r)}
+            </>
           )
         }
       </For>

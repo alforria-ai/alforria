@@ -272,6 +272,7 @@ function SessionColumn(props: {
         <Match when={props.column.tab === "files" && s()}>
           <Suspense fallback={<div class="transcript-loading">Loading files…</div>}>
             <Files
+              sessionID={id()}
               directory={s()!.directory}
               file={props.column.file}
               onOpen={(path) => setColumnFile(props.index, path)}

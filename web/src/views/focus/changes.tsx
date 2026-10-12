@@ -11,10 +11,12 @@ import { api } from "../../api/client"
 import type { ToolPart } from "../../api/types"
 import { turnDiffs } from "../../fleet/derive"
 import { state } from "../../store/store"
-import { Diff, parseUnifiedDiff } from "../../ui/diff"
+import { Diff, parseUnifiedDiff, type LineRow } from "../../ui/diff"
 import { Icon } from "../../ui/icons"
 import { toast } from "../toast"
+import { addComment, comments, commentsAt } from "./comments"
 import { toolChanges } from "./edits"
+import { CommentBox, CommentNotes } from "./line-comments"
 import { canRestoreFiles, isBusy, isReverted, revertTo, unrevert } from "./revert"
 
 interface Change {
@@ -106,6 +108,29 @@ export default function Changes(props: { sessionID: string }) {
   )
   const current = () => files()[Math.min(selected(), files().length - 1)]
   const rows = createMemo(() => (current()?.patch ? parseUnifiedDiff(current()!.patch) : []))
+
+  // Review comments: a line number opens a box under its line; what's left
+  // there goes with the next prompt (the composer says how many).
+  const side = (r: LineRow) => (r.kind === "del" ? "old" : "new")
+  const lineKey = (r: LineRow) => `${current()?.file}:${side(r)}:${r.line}`
+  const [editing, setEditing] = createSignal<string | null>(null)
+  const notes = (r: LineRow) => commentsAt(comments[props.sessionID], current()?.file ?? "", r.line, side(r))
+  const marked = (r: LineRow) => notes(r).length > 0
+  const lineExtras = (r: LineRow) => (
+    <>
+      <CommentNotes sessionID={props.sessionID} list={notes(r)} />
+      <Show when={editing() === lineKey(r)}>
+        <CommentBox
+          where={`${current()?.file}:${r.line}`}
+          onCancel={() => setEditing(null)}
+          onSave={(text) => {
+            addComment(props.sessionID, { file: current()!.file, line: r.line, side: side(r), code: r.text, text })
+            setEditing(null)
+          }}
+        />
+      </Show>
+    </>
+  )
 
   /** Revert target: before the picked turn, or before the session's first prompt. */
   const revertTarget = () => {
@@ -236,7 +261,7 @@ export default function Changes(props: { sessionID: string }) {
         }
       >
         <div class="change-diff">
-          <Diff rows={rows()} />
+          <Diff rows={rows()} onLine={(r) => setEditing(lineKey(r))} after={lineExtras} marked={marked} />
         </div>
       </Show>
     </div>

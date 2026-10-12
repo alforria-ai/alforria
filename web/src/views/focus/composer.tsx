@@ -9,6 +9,7 @@ import { lastAssistant } from "../../fleet/derive"
 import { state } from "../../store/store"
 import { Icon } from "../../ui/icons"
 import { toast } from "../toast"
+import { addComment, clearComments, comments, commentsText } from "./comments"
 import { historyStep, loadDrafts, saveDrafts } from "./drafts"
 import { enqueue, followupLine, pause, queue, resume, sendNow, take } from "./followups"
 import { ModelPicker, VariantPicker } from "./model-picker"
@@ -281,7 +282,16 @@ export function Composer(props: { sessionID: string }) {
       }
     }
     hist = undefined
-    if (later && busy() && !shellMode(text) && !text.startsWith("/")) return enqueue(props.sessionID, body)
+    // Review comments ride along with a plain prompt (queued or sent), then clear.
+    const review = comments[props.sessionID] ?? []
+    const withReview = () => {
+      body.context = commentsText(review) || undefined
+      if (review.length) clearComments(props.sessionID)
+    }
+    if (later && busy() && !shellMode(text) && !text.startsWith("/")) {
+      withReview()
+      return enqueue(props.sessionID, body)
+    }
     resume(props.sessionID)
     if (shellMode(text)) {
       // `!cmd` runs in the session's shell as its own turn; like a command it
@@ -305,8 +315,11 @@ export function Composer(props: { sessionID: string }) {
     }
     setSending(true)
     try {
+      withReview()
       await api.promptAsync(props.sessionID, promptBody(body))
     } catch (err) {
+      // The comments come back with the text.
+      for (const c of review) addComment(props.sessionID, c)
       restore(err, "send")
     } finally {
       setSending(false)
@@ -529,6 +542,20 @@ export function Composer(props: { sessionID: string }) {
             if (refocus) variantBtn.focus()
           }}
         />
+      </Show>
+      <Show when={comments[props.sessionID]?.length}>
+        {(n) => (
+          <div class="review-note" role="status">
+            <span class="k">Review</span>
+            <span class="t">
+              {n()} line {n() === 1 ? "comment goes" : "comments go"} with your next prompt
+            </span>
+            <span class="spacer" />
+            <button class="link-btn" onClick={() => clearComments(props.sessionID)}>
+              Discard
+            </button>
+          </div>
+        )}
       </Show>
       <Show when={draft().attachments?.length}>
         <div class="attachments" aria-label="Attachments">

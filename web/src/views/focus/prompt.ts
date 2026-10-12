@@ -38,6 +38,8 @@ export interface Draft {
   /** `providerID/modelID`. */
   model?: string
   variant?: string
+  /** Extra context sent as its own text part after the prompt (review comments). */
+  context?: string
 }
 
 const modelRef = (m?: string) =>
@@ -45,7 +47,11 @@ const modelRef = (m?: string) =>
 
 export function promptBody(d: Draft): PromptInput {
   return {
-    parts: [{ type: "text", text: d.text }, ...fileParts(d.text, d.files, d.attachments, d.directory)],
+    parts: [
+      { type: "text", text: d.text },
+      ...(d.context ? [{ type: "text" as const, text: d.context }] : []),
+      ...fileParts(d.text, d.files, d.attachments, d.directory),
+    ],
     agent: d.agent,
     model: modelRef(d.model),
     ...(d.variant ? { variant: d.variant } : {}),

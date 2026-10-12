@@ -11,7 +11,9 @@ import { api } from "../../api/client"
 import type { ToolPart } from "../../api/types"
 import { state } from "../../store/store"
 import { Icon } from "../../ui/icons"
+import { addComment, comments, commentsAt } from "./comments"
 import { toolChanges } from "./edits"
+import { CommentBox, CommentNotes } from "./line-comments"
 
 type Node = { name: string; path: string; type: "file" | "directory"; ignored: boolean }
 
@@ -43,7 +45,12 @@ function editedFiles(directory: string) {
   return out
 }
 
-export default function Files(props: { directory: string; file?: string; onOpen: (path: string) => void }) {
+export default function Files(props: {
+  sessionID: string
+  directory: string
+  file?: string
+  onOpen: (path: string) => void
+}) {
   const tree = () => trees[props.directory] ?? { open: {}, children: {}, failed: {} }
   const setTree = (
     f: (t: { open: Record<string, boolean>; children: Record<string, Node[]>; failed: Record<string, string> }) => void,
@@ -168,7 +175,7 @@ export default function Files(props: { directory: string; file?: string; onOpen:
           </div>
         }
       >
-        {(f) => <Viewer directory={props.directory} path={f()} revision={revision()} />}
+        {(f) => <Viewer sessionID={props.sessionID} directory={props.directory} path={f()} revision={revision()} />}
       </Show>
     </div>
   )
@@ -176,12 +183,14 @@ export default function Files(props: { directory: string; file?: string; onOpen:
 
 const MAX_LINES = 5000
 
-function Viewer(props: { directory: string; path: string; revision: number }) {
+function Viewer(props: { sessionID: string; directory: string; path: string; revision: number }) {
   const [content, { refetch }] = createResource(
     () => [props.directory, props.path, props.revision] as const,
     ([dir, path]) => api.readFile(dir, path),
   )
   const [wrap, setWrap] = createSignal(false)
+  /** The line a review comment is being written on. */
+  const [editing, setEditing] = createSignal<number | null>(null)
   const lines = () => {
     const c = content()
     if (!c || c.type !== "text") return []
@@ -220,12 +229,31 @@ function Viewer(props: { directory: string; path: string; revision: number }) {
           >
             <div class="code" classList={{ wrap: wrap() }} tabindex="0" aria-label={props.path}>
               <For each={lines()}>
-                {(l, i) => (
-                  <div class="ln">
-                    <span>{i() + 1}</span>
-                    <span>{l}</span>
-                  </div>
-                )}
+                {(l, i) => {
+                  const n = () => i() + 1
+                  const notes = () => commentsAt(comments[props.sessionID], props.path, n(), "new")
+                  return (
+                    <>
+                      <div class="ln" classList={{ commented: notes().length > 0 }}>
+                        <button class="ln-pick" aria-label={`Comment on line ${n()}`} onClick={() => setEditing(n())}>
+                          {n()}
+                        </button>
+                        <span>{l}</span>
+                      </div>
+                      <CommentNotes sessionID={props.sessionID} list={notes()} />
+                      <Show when={editing() === n()}>
+                        <CommentBox
+                          where={`${props.path}:${n()}`}
+                          onCancel={() => setEditing(null)}
+                          onSave={(text) => {
+                            addComment(props.sessionID, { file: props.path, line: n(), side: "new", code: l, text })
+                            setEditing(null)
+                          }}
+                        />
+                      </Show>
+                    </>
+                  )
+                }}
               </For>
             </div>
           </Show>

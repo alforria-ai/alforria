@@ -54,6 +54,14 @@ describe("prompt body", () => {
     })
   })
 
+  test("review comments go as a second text part", () => {
+    const parts = promptBody(draft({ text: "fix these", files: [], context: "Review comments…" })).parts
+    expect(parts).toEqual([
+      { type: "text", text: "fix these" },
+      { type: "text", text: "Review comments…" },
+    ])
+  })
+
   test("no variant key without a variant", () => {
     expect("variant" in promptBody(draft())).toBe(false)
   })
