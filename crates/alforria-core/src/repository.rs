@@ -502,12 +502,20 @@ impl RepositoryCache {
         // Discovery walks upward, so an enclosing repository with a
         // matching origin could masquerade as the cache entry; reuse
         // requires the checkout to live exactly at the cache path.
-        let reuse = existing
+        let worktree_matches = existing
             .as_ref()
-            .is_some_and(|repo| repo.worktree == resolve_local(&local_path))
-            && origin_reference
-                .as_ref()
-                .is_some_and(|reference| same(reference, &clone_target));
+            .is_some_and(|repo| repo.worktree == resolve_local(&local_path));
+        // `parse()` never recognises a raw local-filesystem remote — the
+        // same case the clone-target fallback above covers — so fall back
+        // to comparing the raw origin string with the requested remote.
+        let origin_matches = origin_reference
+            .as_ref()
+            .map(|reference| same(reference, &clone_target))
+            .unwrap_or_else(|| {
+                origin.as_deref().map(normalize_input)
+                    == Some(normalize_input(&input.reference.remote))
+            });
+        let reuse = worktree_matches && origin_matches;
         if !reuse && local_path.exists() {
             std::fs::remove_dir_all(&local_path)
                 .or_else(|_| std::fs::remove_file(&local_path))
@@ -880,12 +888,15 @@ mod tests {
     fn cache_clones_and_refreshes() {
         let source = TempDir::new("cache-source");
         make_repo(source.path());
+        // macOS resolves TMPDIR through a symlink (/var/folders ->
+        // /private/var/folders): canonicalize the paths the test hands to
+        // git so stored origins and discovered worktrees agree with the
+        // cache's canonicalized lookups.
+        let source_path = std::fs::canonicalize(source.path()).unwrap();
 
         let cache_root = TempDir::new("cache-root");
-        let cache = RepositoryCache::new(
-            Arc::new(crate::git::SubprocessGit),
-            cache_root.path().to_path_buf(),
-        );
+        let cache_root_path = std::fs::canonicalize(cache_root.path()).unwrap();
+        let cache = RepositoryCache::new(Arc::new(crate::git::SubprocessGit), cache_root_path);
         // A direct remote pointing at the local filesystem — parse() never
         // produces it, but ensure() only shells out to `git clone <remote>`.
         let reference = RemoteReference {
@@ -894,7 +905,7 @@ mod tests {
             segments: vec!["a".into(), "b".into()],
             owner: Some("a".into()),
             repo: "b".into(),
-            remote: source.path().to_string_lossy().into_owned(),
+            remote: source_path.to_string_lossy().into_owned(),
             label: "example.com/a/b".into(),
             protocol: None,
         };
