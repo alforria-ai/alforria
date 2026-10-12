@@ -408,7 +408,7 @@ impl<S> LocationService<S> {
         let directory = decode_best_effort(&directory);
         let services = self.load(&directory)?;
         Ok(LocationContext {
-            directory: PathBuf::from(directory),
+            directory: crate::state::resolve_directory(Path::new(&directory)),
             workspace_id: env_workspace_id.or(workspace_id),
             services,
         })
@@ -453,7 +453,7 @@ impl<S> LocationService<S> {
         };
         let services = self.load(&directory)?;
         Ok(LocationContext {
-            directory: PathBuf::from(directory),
+            directory: crate::state::resolve_directory(Path::new(&directory)),
             workspace_id,
             services,
         })
@@ -483,7 +483,7 @@ impl<S> LocationService<S> {
         let workspace_id = info.workspace_id.clone();
         let services = self.load(&directory)?;
         Ok(LocationContext {
-            directory: PathBuf::from(directory),
+            directory: crate::state::resolve_directory(Path::new(&directory)),
             workspace_id,
             services,
         })
