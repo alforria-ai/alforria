@@ -962,6 +962,17 @@ pub async fn execute_effect(
                 }
             }
         }
+        Effect::SessionSearch { query } => {
+            let filter = {
+                let app = app.lock().await;
+                state::sync::session_list_query(&app.state.kv, &app.state.project)
+            };
+            let list_query = state::session_search::list_query(&query, filter);
+            if let Ok(mut sessions) = api.session_list(&Location::default(), list_query).await {
+                sessions.sort_by(|a, b| a.id.cmp(&b.id));
+                state::session_search::found(&mut *app.lock().await, &query, sessions);
+            }
+        }
         Effect::FindFiles { query, workspace } => {
             let loc = Location {
                 directory: None,

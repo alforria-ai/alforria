@@ -364,6 +364,7 @@ async fn request_shapes_match_frozen_routes() {
             start: Some(1_000),
             scope: Some("project".to_string()),
             path: None,
+            ..SessionListQuery::default()
         },
     )
     .await

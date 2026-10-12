@@ -12,33 +12,23 @@ use crate::ui::dialogs::DialogFrame;
 use alforria_schema::session_v1::V1Message;
 
 /// `DialogSessionList.options` (`dialog-session-list.tsx:157-289`) —
-/// pinned first, then recency-grouped; the browse list is the sync store
-/// (the port filters client-side; the TS server search is a recorded
-/// divergence).
+/// pinned first, then recency-grouped; the browse list is the sync store,
+/// replaced by the server search results while a query is typed
+/// ([`crate::state::session_search`]).
 pub fn session_list_options(app: &App, frame: &DialogFrame) -> Vec<SelectOption> {
     let query = frame.select.filter.to_lowercase();
+    let listed = crate::state::session_search::sessions(app, &frame.select.filter);
     let pinned: Vec<String> = app
         .state
         .local
         .session_pinned()
         .iter()
-        .filter(|id| {
-            app.state
-                .sync
-                .session
-                .iter()
-                .any(|session| session.id == **id)
-        })
+        .filter(|id| listed.iter().any(|session| session.id == **id))
         .cloned()
         .collect();
     let mut options = Vec::new();
     let build = |id: &str, category: &str| -> Option<SelectOption> {
-        let session = app
-            .state
-            .sync
-            .session
-            .iter()
-            .find(|session| session.id == id)?;
+        let session = listed.iter().find(|session| session.id == id)?;
         if session.parent_id.is_some() {
             return None;
         }
@@ -116,11 +106,9 @@ pub fn session_list_options(app: &App, frame: &DialogFrame) -> Vec<SelectOption>
             options.push(option);
         }
     }
-    let mut sorted: Vec<&alforria_schema::session_v1::V1SessionInfo> = app
-        .state
-        .sync
-        .session
+    let mut sorted: Vec<&alforria_schema::session_v1::V1SessionInfo> = listed
         .iter()
+        .copied()
         .filter(|session| session.parent_id.is_none())
         .collect();
     sorted.sort_by_key(|session| std::cmp::Reverse(session.time.updated));

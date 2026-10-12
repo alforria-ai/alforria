@@ -109,6 +109,11 @@ pub struct SessionListQuery {
     pub start: Option<i64>,
     pub scope: Option<String>,
     pub path: Option<String>,
+    /// `roots: true` — top-level sessions only (the session list).
+    pub roots: Option<bool>,
+    pub limit: Option<u32>,
+    /// Server-side title search (`dialog-session-list.tsx`).
+    pub search: Option<String>,
 }
 
 /// `session.create` body model: `{ id, providerID, variant? }` (openapi
@@ -666,6 +671,15 @@ impl ServerApi for HttpServerApi {
         }
         if let Some(path) = non_empty(query.path.as_deref()) {
             extra.push(("path", percent_encode(path)));
+        }
+        if let Some(roots) = query.roots {
+            extra.push(("roots", roots.to_string()));
+        }
+        if let Some(limit) = query.limit {
+            extra.push(("limit", limit.to_string()));
+        }
+        if let Some(search) = non_empty(query.search.as_deref()) {
+            extra.push(("search", percent_encode(search)));
         }
         self.json(Method::GET, "/session", loc, &extra, None).await
     }

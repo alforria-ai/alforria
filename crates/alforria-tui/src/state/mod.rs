@@ -13,6 +13,7 @@ pub mod prompt;
 pub mod route;
 #[cfg(test)]
 mod routing_tests;
+pub mod session_search;
 pub mod sync;
 
 use std::collections::HashSet;
@@ -382,6 +383,8 @@ pub struct AttentionSets {
 /// the app-shell bookkeeping of M8.3.
 #[derive(Debug, Default)]
 pub struct UiState {
+    /// The session list's server search (debounce and results).
+    pub session_search: session_search::SessionSearch,
     /// The wheel's acceleration state (`scroll_acceleration.enabled`).
     pub scroll_accel: ScrollAccel,
     /// One current toast at a time (`ui/toast.tsx:66-69`).
@@ -634,6 +637,8 @@ pub enum Effect {
     /// `sync.session.sync(sessionID)` — the `task` tool hydrates its
     /// child session on mount (`session/index.tsx:2221-2224`).
     SessionHydrate { session_id: String },
+    /// The session list's server search (`GET /session?search=…`).
+    SessionSearch { query: String },
     /// `GET /api/fs/find?query=…&limit=20` for the `@` popup.
     FindFiles {
         query: String,
@@ -1066,6 +1071,9 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
     }
     // The `@` popup's file search (`sdk.client.v2.fs.find`) runs as an
     // effect; its answer lands through `prompt::files_found`.
+    if let Some(search) = session_search::observe(app) {
+        effects.push(search);
+    }
     if let Some(query) = app.ui.prompt.autocomplete.file_request.take() {
         effects.push(Effect::FindFiles {
             query,
@@ -1165,6 +1173,7 @@ pub fn next_tick_in(app: &App, now_ms: u64) -> Option<u64> {
         app.ui.footer_flip_at,
         app.ui.startup_loading.deadline(),
         app.keymap.pending_deadline(),
+        app.ui.session_search.due_at,
     ];
     if app.ui.prompt_focused && app.config.cursor_blinks() {
         deadlines.push(Some((now_ms / BLINK_MS + 1) * BLINK_MS));
