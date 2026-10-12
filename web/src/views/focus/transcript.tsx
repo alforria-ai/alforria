@@ -91,8 +91,11 @@ export function Transcript(props: { sessionID: string; onOpenSession: (id: strin
   const toBottom = () => (scroller.scrollTop = scroller.scrollHeight)
   onMount(() => {
     toBottom()
+    // Content growth (streaming) and scroller shrink (the composer growing,
+    // a phone keyboard opening) both keep a reader at the bottom there.
     const ro = new ResizeObserver(() => stuck() && toBottom())
     ro.observe(content)
+    ro.observe(scroller)
     onCleanup(() => ro.disconnect())
   })
 

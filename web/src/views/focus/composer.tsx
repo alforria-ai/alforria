@@ -3,20 +3,24 @@
 // columns never loses text.
 import { createMemo, createResource, createSignal, For, onCleanup, Show } from "solid-js"
 import { createStore } from "solid-js/store"
-import { api, type PromptPart } from "../../api/client"
+import { api } from "../../api/client"
 import type { Agent, Command } from "../../api/types"
-import { fleetState, lastAssistant } from "../../fleet/derive"
+import { lastAssistant } from "../../fleet/derive"
 import { state } from "../../store/store"
 import { Icon } from "../../ui/icons"
 import { toast } from "../toast"
 import { ModelPicker } from "./model-picker"
-import { canRestoreFiles, revertedPrompts, unrevert } from "./revert"
-
-interface Attachment {
-  name: string
-  mime: string
-  url: string
-}
+import {
+  attachmentKind,
+  commandBody,
+  lastUserModel,
+  looksBinary,
+  MENTION,
+  promptBody,
+  type Attachment,
+  type Draft as Body,
+} from "./prompt"
+import { canRestoreFiles, isBusy, revertedPrompts, unrevert } from "./revert"
 
 interface Draft {
   text: string
@@ -27,21 +31,22 @@ interface Draft {
 }
 
 const MAX_ATTACHMENT = 5 * 1024 * 1024
-/** Text-like files go as text/plain so the server inlines them like a read. */
-function attachmentMime(f: File) {
-  if (f.type.startsWith("image/") || f.type === "application/pdf") return f.type
-  return "text/plain"
-}
-function readAttachment(f: File): Promise<Attachment> {
+async function readAttachment(f: File): Promise<Attachment> {
+  const name = f.name || "pasted"
+  if (f.size > MAX_ATTACHMENT) throw new Error(`${name} is over 5 MB`)
+  let kind = attachmentKind(name, f.type)
+  if (kind === "maybe-text")
+    kind = looksBinary(new Uint8Array(await f.slice(0, 8192).arrayBuffer())) ? undefined : "text"
+  if (!kind) throw new Error(`${name} can't be attached: only text, images (PNG, JPEG, GIF, WebP) and PDFs`)
+  // Text goes as text/plain so the server inlines it like a read.
+  const mime = kind === "text" ? "text/plain" : f.type
   return new Promise((resolve, reject) => {
-    if (f.size > MAX_ATTACHMENT) return reject(new Error(`${f.name} is over 5 MB`))
-    const mime = attachmentMime(f)
     const r = new FileReader()
     r.onerror = () => reject(r.error ?? new Error(`Could not read ${f.name}`))
     r.onload = () => {
       // Re-tag the data URL with the mime the server expects.
       const data = String(r.result).replace(/^data:[^;,]*/, `data:${mime}`)
-      resolve({ name: f.name || "pasted", mime, url: data })
+      resolve({ name, mime, url: data })
     }
     r.readAsDataURL(f)
   })
@@ -80,14 +85,24 @@ export function Composer(props: { sessionID: string }) {
   const primary = createMemo(() => (agents() ?? []).filter((a) => a.mode !== "subagent" && !a.hidden))
   const last = createMemo(() => lastAssistant(state, props.sessionID))
   const agent = () => draft().agent ?? session()?.agent ?? last()?.agent ?? primary()[0]?.name ?? "build"
+  const lastUser = createMemo(() => lastUserModel(state, props.sessionID))
   const model = () =>
     draft().model ??
     (session()?.model ? `${session()!.model!.providerID}/${session()!.model!.id}` : undefined) ??
+    (lastUser() ? `${lastUser()!.providerID}/${lastUser()!.modelID}` : undefined) ??
     (last() ? `${last()!.providerID}/${last()!.modelID}` : undefined)
-  const busy = () => {
-    const st = fleetState(state, props.sessionID)
-    return st === "working" || st === "retry"
+  /** The reasoning variant the session last used, kept while the model stays the same. */
+  const variant = () => {
+    const m = model()
+    const u = lastUser()
+    if (u && m === `${u.providerID}/${u.modelID}`) return u.variant
+    const sm = session()?.model
+    if (sm && m === `${sm.providerID}/${sm.id}`) return sm.variant
   }
+  // The server's word, not the fleet's: a turn waiting on a permission is
+  // still running and can be stopped.
+  const busy = () => isBusy(state, props.sessionID)
+  const coarse = matchMedia("(pointer: coarse)").matches
 
   const [pop, setPop] = createSignal<Pop | null>(null)
   const [modelPicker, setModelPicker] = createSignal(false)
@@ -98,7 +113,7 @@ export function Composer(props: { sessionID: string }) {
   const updatePopover = async () => {
     const caret = ta.selectionStart
     const before = ta.value.slice(0, caret)
-    const at = /(^|\s)@([\w./-]*)$/.exec(before)
+    const at = MENTION.exec(before)
     const slash = /^\/(\S*)$/.exec(before)
     if (at) {
       const query = at[2]!
@@ -149,8 +164,15 @@ export function Composer(props: { sessionID: string }) {
     if (!text || sending()) return
     const files = draft().files
     const attachments = draft().attachments ?? []
-    const m = model()
-    const modelRef = m ? { providerID: m.split("/")[0]!, modelID: m.split("/").slice(1).join("/") } : undefined
+    const body: Body = {
+      text,
+      files,
+      attachments,
+      directory: dir(),
+      agent: agent(),
+      model: model(),
+      variant: variant(),
+    }
     // Clear at once so typing can continue; restore only if the send fails and
     // the box is still empty (never overwrite what was typed meanwhile).
     ta.value = ""
@@ -170,18 +192,13 @@ export function Composer(props: { sessionID: string }) {
       // The command endpoint answers when the whole turn ends; don't hold the
       // composer for that, the transcript shows progress.
       void api
-        .command(props.sessionID, { command: cmd[1]!, arguments: cmd[2] ?? "", agent: agent(), model: m })
+        .command(props.sessionID, commandBody(body, cmd[1]!, cmd[2] ?? ""))
         .catch((err) => restore(err, `run /${cmd[1]}`))
       return
     }
     setSending(true)
     try {
-      const parts: PromptPart[] = [{ type: "text", text }]
-      for (const f of files)
-        if (text.includes(`@${f}`))
-          parts.push({ type: "file", mime: "text/plain", filename: f, url: `file://${dir().replace(/\/$/, "")}/${f}` })
-      for (const a of attachments) parts.push({ type: "file", mime: a.mime, filename: a.name, url: a.url })
-      await api.promptAsync(props.sessionID, { parts, agent: agent(), model: modelRef })
+      await api.promptAsync(props.sessionID, promptBody(body))
     } catch (err) {
       restore(err, "send")
     } finally {
@@ -245,7 +262,8 @@ export function Composer(props: { sessionID: string }) {
         return setPop(null)
       }
     }
-    if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
+    // An IME commit (keyCode 229) is not a send; on touch, Enter is a newline and Send sends.
+    if (e.key === "Enter" && !e.shiftKey && !e.isComposing && e.keyCode !== 229 && !coarse) {
       e.preventDefault()
       void send()
     }
@@ -402,19 +420,19 @@ export function Composer(props: { sessionID: string }) {
           <Icon name="attach" />
         </button>
         <span class="spacer" />
-        <span class="hint">↵ send · ⇧↵ newline</span>
-        <Show
-          when={busy() && !draft().text.trim()}
-          fallback={
-            <button class="send" disabled={sending()} onClick={() => void send()}>
-              <Icon name="send" />
-              Send
-            </button>
-          }
-        >
+        <Show when={!coarse}>
+          <span class="hint">↵ send · ⇧↵ newline</span>
+        </Show>
+        <Show when={busy()}>
           <button class="send stop" onClick={() => void stop()}>
             <Icon name="stop" />
             Stop
+          </button>
+        </Show>
+        <Show when={!busy() || draft().text.trim()}>
+          <button class="send" disabled={sending()} onClick={() => void send()}>
+            <Icon name="send" />
+            Send
           </button>
         </Show>
       </div>

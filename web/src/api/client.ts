@@ -108,17 +108,39 @@ export interface PromptInput {
   parts: PromptPart[]
   agent?: string
   model?: { providerID: string; modelID: string }
+  /** The model's reasoning variant (`variants` keys in ProviderList). */
+  variant?: string
   messageID?: string
 }
 
 /** A session from `GET /experimental/session`, with its project's name and worktree. */
 export type GlobalSession = Session & { project?: { id: string; name?: string; worktree: string } }
 
+export interface CommandInput {
+  command: string
+  arguments: string
+  agent?: string
+  /** `providerID/modelID`. */
+  model?: string
+  variant?: string
+  /** File parts sent beside the arguments (mentions, attachments). */
+  parts?: { type: "file"; mime: string; filename?: string; url: string }[]
+}
+
 export interface ProviderList {
   providers: {
     id: string
     name: string
-    models: Record<string, { id: string; name: string; limit?: { context?: number; output?: number } }>
+    models: Record<
+      string,
+      {
+        id: string
+        name: string
+        limit?: { context?: number; output?: number }
+        /** Reasoning variants by name (e.g. "high"); a disabled one is not offered. */
+        variants?: Record<string, { disabled?: boolean } & Record<string, unknown>>
+      }
+    >
   }[]
   default: Record<string, string>
 }
@@ -170,8 +192,7 @@ export const api = {
   /** Uncommitted changes in the working tree (git projects). */
   vcsDiff: (directory: string) => request<VcsFileDiff[]>("GET", "/vcs/diff", { directory, query: { mode: "git" } }),
   promptAsync: (id: string, body: PromptInput) => request<void>("POST", `/session/${id}/prompt_async`, { body }),
-  command: (id: string, body: { command: string; arguments: string; agent?: string; model?: string }) =>
-    request<MessageWithParts>("POST", `/session/${id}/command`, { body }),
+  command: (id: string, body: CommandInput) => request<MessageWithParts>("POST", `/session/${id}/command`, { body }),
   abort: (id: string) => request<boolean>("POST", `/session/${id}/abort`),
   fork: (id: string, messageID?: string) => request<Session>("POST", `/session/${id}/fork`, { body: { messageID } }),
   revert: (id: string, messageID: string, partID?: string) =>

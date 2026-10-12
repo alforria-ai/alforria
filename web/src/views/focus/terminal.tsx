@@ -275,6 +275,10 @@ export default function TerminalView(props: {
       return retry()
     }
     if (disposed || g !== gen) return
+    // A socket that dropped mid-replay left part of the backlog on screen with
+    // the cursor still at its old value; resuming from there would print that
+    // part twice. Replay everything into a clean screen instead.
+    if (!synced) cursor = 0
     if (cursor === 0) {
       // A full replay (or a replay cut short) redraws from a clean screen.
       term.reset()
