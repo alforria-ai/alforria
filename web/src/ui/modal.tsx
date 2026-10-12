@@ -11,8 +11,18 @@ const [depth, setDepth] = createRoot(() => createSignal(0))
 /** True while any modal is open; the global keymap checks it. */
 export const modalOpen = () => depth() > 0
 
-const FOCUSABLE =
-  'a[href],button:not([disabled]),input:not([disabled]):not([type="hidden"]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])'
+// Tab order only: a control taken out of it (tabindex="-1", like the palette's
+// results) is never a wrap point.
+const FOCUSABLE = [
+  "a[href]",
+  "button:not([disabled])",
+  'input:not([disabled]):not([type="hidden"])',
+  "select:not([disabled])",
+  "textarea:not([disabled])",
+  "[tabindex]",
+]
+  .map((s) => `${s}:not([tabindex="-1"])`)
+  .join(",")
 
 /** Captured when the first modal opens, restored when the last one closes. */
 let returnTo: HTMLElement | null = null

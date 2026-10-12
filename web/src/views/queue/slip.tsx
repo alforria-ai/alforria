@@ -11,6 +11,7 @@ import { state } from "../../store/store"
 import { Diff, parseUnifiedDiff, diffStats } from "../../ui/diff"
 import { now, waited } from "../../ui/format"
 import { act, stamped, type Verdict } from "./act"
+import { questionDraft } from "./drafts"
 
 export function slipKind(i: Interrupt) {
   if (i.kind === "question") return "Question"
@@ -227,34 +228,27 @@ function doomTarget(meta: Record<string, unknown>) {
 
 function QuestionBody(props: { interrupt: Extract<Interrupt, { kind: "question" }> }) {
   const q = (): QuestionRequest => props.interrupt.request
-  // answers[i] = selected option labels for question i; custom[i] = free text.
-  const [answers, setAnswers] = createSignal<string[][]>(q().questions.map(() => []))
-  const [custom, setCustom] = createSignal<string[]>(q().questions.map(() => ""))
-  const toggle = (qi: number, label: string, multiple: boolean) =>
-    setAnswers((a) =>
-      a.map((sel, i) =>
-        i !== qi ? sel : multiple ? (sel.includes(label) ? sel.filter((l) => l !== label) : [...sel, label]) : [label],
-      ),
-    )
-  const final = () => answers().map((sel, i) => (custom()[i]?.trim() ? [...sel, custom()[i]!.trim()] : sel))
-  const ready = () => final().every((a) => a.length > 0)
+  // Shared with the other place this request renders (queue or transcript).
+  const d = questionDraft(q)
+  const answers = () => d.draft().answers
+  const custom = () => d.draft().custom
+  const ready = () => d.final().every((a) => a.length > 0)
   const submit = () => {
     if (!ready()) return false
+    const final = d.final()
     void act(props.interrupt, "answer", {
-      answers: final(),
-      what: `${sessionMeta(q().sessionID).title}: ${final()
-        .map((a) => a.join(", "))
-        .join(" / ")}`,
+      answers: final,
+      what: `${sessionMeta(q().sessionID).title}: ${final.map((a) => a.join(", ")).join(" / ")}`,
     })
     return true
   }
   // Exposed for the queue's keyboard handler (1–9, ↵, X).
   const api = {
     pick: (n: number) => {
-      const qi = answers().findIndex((a) => !a.length)
+      const qi = d.final().findIndex((a) => !a.length)
       const at = qi < 0 ? 0 : qi
       const opt = q().questions[at]?.options[n]
-      if (opt) toggle(at, opt.label, !!q().questions[at]?.multiple)
+      if (opt) d.toggle(at, opt.label)
     },
     submit,
   }
@@ -272,7 +266,7 @@ function QuestionBody(props: { interrupt: Extract<Interrupt, { kind: "question" 
                       class="option"
                       role={question().multiple ? "checkbox" : "radio"}
                       aria-checked={answers()[qi]?.includes(o.label) ?? false}
-                      onClick={() => toggle(qi, o.label, !!question().multiple)}
+                      onClick={() => d.toggle(qi, o.label)}
                     >
                       <kbd class="k">{oi() + 1}</kbd>
                       <b>{o.label}</b>
@@ -287,10 +281,7 @@ function QuestionBody(props: { interrupt: Extract<Interrupt, { kind: "question" 
                   placeholder="Or type your own answer…"
                   aria-label="Custom answer"
                   value={custom()[qi] ?? ""}
-                  onInput={(e) => {
-                    const v = e.currentTarget.value
-                    setCustom((c) => c.map((x, i) => (i === qi ? v : x)))
-                  }}
+                  onInput={(e) => d.type(qi, e.currentTarget.value)}
                   onKeyDown={(e) => {
                     if (e.key === "Enter") {
                       e.preventDefault()

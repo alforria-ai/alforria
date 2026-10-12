@@ -1,12 +1,15 @@
 // Acting on a waiting item: one code path for the queue and the inline slips
 // in transcripts. The verdict stamp has to outlive the record: the server's
 // `permission.replied` usually lands before the stamp has been seen, so acted
-// items are held here for the stamp + fold and merged back into the list.
-import { createRoot, createSignal } from "solid-js"
+// items are held here for the stamp + fold and merged back into the list. A
+// folded item stays held (as replied) until it leaves the pending lists, so a
+// slow event stream can't bring it back for a second reply.
+import { createEffect, createRoot, createSignal } from "solid-js"
 import { createStore, produce } from "solid-js/store"
 import { api } from "../../api/client"
 import type { PermissionReply } from "../../api/types"
 import type { Interrupt } from "../../fleet/derive"
+import { interrupts } from "../../fleet/fleet"
 import { state } from "../../store/store"
 import { clock } from "../../ui/format"
 import { toast } from "../toast"
@@ -22,6 +25,8 @@ export interface Stamped {
   label: string
   time: string
   folding: boolean
+  /** Folded away; dropped once the server no longer lists the item. */
+  done: boolean
 }
 
 export interface Cleared {
@@ -34,6 +39,16 @@ export const [stamped, setStamped] = createStore<Record<string, Stamped>>({})
 export const [ledger, setLedger] = createStore<Cleared[]>([])
 /** Which queue item is expanded; null means "the oldest". */
 export const [selected, setSelected] = createRoot(() => createSignal<string | null>(null))
+
+/** True once the item was replied to here and until the server drops it. */
+export const replied = (id: string) => !!stamped[id]
+
+createRoot(() =>
+  createEffect(() => {
+    const live = new Set(interrupts().map((i) => i.id))
+    for (const [id, s] of Object.entries(stamped)) if (s.done && !live.has(id)) setStamped(produce((x) => delete x[id]))
+  }),
+)
 
 export function verdictLabel(i: Interrupt, v: Verdict) {
   const doom = i.kind === "permission" && i.request.permission === "doom_loop"
@@ -67,7 +82,7 @@ export async function act(
   if (stamped[i.id]) return
   const label = verdictLabel(i, verdict)
   const time = clock(Date.now())
-  setStamped(i.id, { interrupt: i, verdict, label, time, folding: false })
+  setStamped(i.id, { interrupt: i, verdict, label, time, folding: false, done: false })
   const dir = directoryOf(i.sessionID)
   try {
     if (i.kind === "permission") await api.replyPermission(i.id, verdict as PermissionReply, extra.message, dir)
@@ -86,5 +101,12 @@ export async function act(
   )
   if (selected() === i.id) setSelected(null)
   setTimeout(() => setStamped(i.id, "folding", true), STAMP_HOLD)
-  setTimeout(() => setStamped(produce((s) => delete s[i.id])), STAMP_HOLD + FOLD + 40)
+  setTimeout(
+    () => {
+      if (!stamped[i.id]) return
+      if (interrupts().some((x) => x.id === i.id)) setStamped(i.id, "done", true)
+      else setStamped(produce((s) => delete s[i.id]))
+    },
+    STAMP_HOLD + FOLD + 40,
+  )
 }

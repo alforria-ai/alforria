@@ -173,9 +173,21 @@ function Providers() {
   )
 }
 
+/** True when every value in `body` is already what `config` holds. */
+function unchanged(config: unknown, body: Record<string, unknown>): boolean {
+  const cur = (config ?? {}) as Record<string, unknown>
+  return Object.entries(body).every(([k, v]) =>
+    v !== null && typeof v === "object"
+      ? typeof cur[k] === "object" && unchanged(cur[k], v as Record<string, unknown>)
+      : cur[k] === v,
+  )
+}
+
 function useGlobalConfig() {
   const [config, { refetch, mutate }] = createResource(() => api.globalConfig())
   const patch = async (body: Record<string, unknown>) => {
+    // Saving reloads every instance; a click that changes nothing sends nothing.
+    if (config() && unchanged(config(), body)) return
     try {
       mutate(await api.patchGlobalConfig(body))
       toast("Saved")
@@ -315,8 +327,13 @@ function Permissions() {
     }
     return out
   })
-  const apply = (tool: string, pattern: string, action: Action) =>
-    void patch({ permission: { [tool]: pattern === "*" ? action : { [pattern]: action } } })
+  // A tool with per-pattern rules keeps them: its "*" row is one more pattern,
+  // since a plain action would replace the whole object.
+  const apply = (tool: string, pattern: string, action: Action) => {
+    const perm = config()?.permission
+    const patterned = typeof perm === "object" && typeof (perm as Record<string, unknown>)[tool] === "object"
+    void patch({ permission: { [tool]: pattern === "*" && !patterned ? action : { [pattern]: action } } })
+  }
   // Tightening (ask / deny) applies at once; loosening to "allow" removes the
   // human from the loop for every project, so it needs an explicit confirm.
   const [confirm, setConfirm] = createSignal<{ tool: string; pattern: string } | null>(null)

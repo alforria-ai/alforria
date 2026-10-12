@@ -1,7 +1,7 @@
 // The interrupt queue: everything waiting on the human, oldest first. The
 // oldest item is open; one key clears it and the next opens.
 import { createEffect, createMemo, createRoot, createSignal, For, on, onMount, Show } from "solid-js"
-import type { Interrupt } from "../../fleet/derive"
+import { byAge, type Interrupt } from "../../fleet/derive"
 import { counts, displayTitle, interrupts } from "../../fleet/fleet"
 import { Icon } from "../../ui/icons"
 import { act, ledger, selected, setSelected, stamped } from "./act"
@@ -11,12 +11,12 @@ import { state } from "../../store/store"
 const memos = createRoot(() => {
   /** Live items plus ones still showing their verdict stamp, in age order. */
   const queueItems = createMemo(() => {
-    const live = interrupts()
-    const ids = new Set(live.map((i) => i.id))
+    const live = interrupts().filter((i) => !stamped[i.id]?.done)
+    const ids = new Set(interrupts().map((i) => i.id))
     const leaving = Object.values(stamped)
+      .filter((s) => !s.done && !ids.has(s.interrupt.id))
       .map((s) => s.interrupt)
-      .filter((i) => !ids.has(i.id))
-    return [...live, ...leaving].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+    return [...live, ...leaving].sort(byAge)
   })
 
   const activeItem = createMemo<Interrupt | undefined>(() => {
@@ -90,6 +90,9 @@ export function Queue(props: {
     if (k === "k" || e.key === "ArrowUp") return (e.preventDefault(), move(-1))
     if (!item) return
     if (k === "o") return (e.preventDefault(), props.onOpenSession(item.sessionID))
+    // Verdicts and picks act from the slip itself: Enter on a button, link or
+    // summary inside the queue does what that control says.
+    if (!t.matches(".slip")) return
     const what = `${displayTitle(state.sessions[item.sessionID])}: ${slipSummary(item)}`
     if (item.kind === "permission") {
       const v = k === "a" ? "once" : k === "s" ? "always" : k === "d" ? "reject" : null

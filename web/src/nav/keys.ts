@@ -24,6 +24,10 @@ export function isTyping(el: Element | null) {
   return t === "INPUT" || t === "TEXTAREA" || t === "SELECT" || (el as HTMLElement).isContentEditable
 }
 
+function onTable(el: Element | null) {
+  return !el || el === document.body || el.matches("table.reg, tr.s-row")
+}
+
 export function bindKeys(view: () => "overview" | "focus" | "settings", a: KeyActions) {
   const onKey = (e: KeyboardEvent) => {
     // An open dialog owns the keyboard; the app behind it is inert.
@@ -58,7 +62,9 @@ export function bindKeys(view: () => "overview" | "focus" | "settings", a: KeyAc
     if (view() === "overview") {
       if (lower === "j" || k === "ArrowDown") return go(() => a.cursor(1))
       if (lower === "k" || k === "ArrowUp") return go(() => a.cursor(-1))
-      if (k === "Enter") return go(() => a.openCursor(e.shiftKey))
+      // Enter opens the cursor row only from the table (or nothing focused);
+      // on a focused button it presses that button.
+      if (k === "Enter" && onTable(document.activeElement)) return go(() => a.openCursor(e.shiftKey))
       if (lower === "f") return go(a.focusView)
     }
     if (view() === "focus") {

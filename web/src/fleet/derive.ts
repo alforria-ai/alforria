@@ -32,9 +32,19 @@ export function interruptsFor(s: State, sessionID: string): Interrupt[] {
 }
 
 /**
- * Every pending permission and question, oldest first. Request ids are
- * time-ordered (`per_…`/`que_…` ULIDs), so sorting by id is sorting by age;
- * `since` is best-effort from the session's last update.
+ * Oldest first. Request ids are time-ordered behind their prefix (`per_…`,
+ * `que_…`), so the body after it sorts by age; the raw id would put every
+ * permission before every question.
+ */
+export function byAge(a: { id: string }, b: { id: string }) {
+  const x = a.id.slice(4)
+  const y = b.id.slice(4)
+  return x < y ? -1 : x > y ? 1 : 0
+}
+
+/**
+ * Every pending permission and question, oldest first (`byAge`); `since` is
+ * best-effort from the session's last update.
  */
 export function allInterrupts(s: State): Interrupt[] {
   const out: Interrupt[] = []
@@ -54,7 +64,7 @@ export function allInterrupts(s: State): Interrupt[] {
       request,
       since: askedAt(s, request.sessionID, request.tool?.messageID),
     })
-  return out.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+  return out.sort(byAge)
 }
 
 function askedAt(s: State, sessionID: string, messageID?: string) {
@@ -89,6 +99,15 @@ export function lastAssistant(s: State, sessionID: string): AssistantMessage | u
   }
 }
 
+function lastAssistantWithOutput(s: State, sessionID: string): AssistantMessage | undefined {
+  const ids = s.messages[sessionID]
+  if (!ids) return
+  for (let i = ids.length - 1; i >= 0; i--) {
+    const m = s.message[ids[i]!]
+    if (m?.role === "assistant" && m.tokens.output > 0) return m
+  }
+}
+
 function lastPart(s: State, messageID: string): Part | undefined {
   const ids = s.parts[messageID]
   if (!ids) return
@@ -99,15 +118,23 @@ function lastPart(s: State, messageID: string): Part | undefined {
   }
 }
 
+/** Stop interrupts a turn on purpose; it is not a fault. */
+const ABORTED = "MessageAbortedError"
+
+function sessionError(s: State, sessionID: string) {
+  const err = s.errors[sessionID]
+  return err && err.name !== ABORTED ? err : undefined
+}
+
 export function fleetState(s: State, sessionID: string): FleetState {
   if (Object.values(s.permissions).some((p) => p.sessionID === sessionID)) return "waiting"
   if (Object.values(s.questions).some((q) => q.sessionID === sessionID)) return "waiting"
   const st = s.status[sessionID]
   if (st?.type === "busy") return "working"
   if (st?.type === "retry") return "retry"
-  if (s.errors[sessionID]) return "fault"
+  if (sessionError(s, sessionID)) return "fault"
   const last = lastAssistant(s, sessionID)
-  if (last?.error && last.error.name !== "MessageAbortedError") return "fault"
+  if (last?.error && last.error.name !== ABORTED) return "fault"
   return "idle"
 }
 
@@ -124,7 +151,7 @@ export function activity(s: State, sessionID: string): Activity {
     return { kind: "retry", text: `${st.message} · attempt ${st.attempt}${wait ? ` in ${wait}s` : ""}`, prose: true }
   }
   if (state === "fault") {
-    const err = s.errors[sessionID] ?? errorOf(lastAssistant(s, sessionID))
+    const err = sessionError(s, sessionID) ?? errorOf(lastAssistant(s, sessionID))
     return { kind: "fault", text: [err?.name, err?.message].filter(Boolean).join(" · "), prose: false }
   }
   const last = lastAssistant(s, sessionID)
@@ -199,9 +226,13 @@ export function todoProgress(s: State, sessionID: string): [done: number, total:
   return [live.filter((t) => t.status === "completed").length, live.length]
 }
 
-/** Context use of the latest assistant turn, as a fraction of the model window. */
+/**
+ * Context use of the latest assistant turn that produced output, as a fraction
+ * of the model window: a turn still streaming (or stopped before any output)
+ * reports zero tokens and would blank the meter.
+ */
 export function contextUse(s: State, sessionID: string): { tokens: number; fraction: number | null } | null {
-  const m = lastAssistant(s, sessionID)
+  const m = lastAssistantWithOutput(s, sessionID)
   if (!m) return null
   const t = m.tokens
   const tokens = t.input + t.output + t.reasoning + t.cache.read + t.cache.write

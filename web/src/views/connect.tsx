@@ -52,18 +52,26 @@ export function ConnectDialog(props: {
   const [pasted, setPasted] = createSignal("")
   let waiting: AbortController | undefined
   let done = false
-  onCleanup(() => waiting?.abort())
+  // Set when the dialog closes: a sign-in or save still in flight must not
+  // open tabs, flip state or report back afterwards.
+  let disposed = false
+  onCleanup(() => {
+    disposed = true
+    waiting?.abort()
+  })
 
   const finish = () => {
     if (done) return
     done = true
     waiting?.abort()
-    toast(`${props.provider.name} connected`)
+    // A key saved after the dialog closed still refreshes the list.
     props.onConnected()
+    if (disposed) return
+    toast(`${props.provider.name} connected`)
     props.onClose()
   }
   const fail = (method: number, err: unknown) => {
-    if (done) return
+    if (done || disposed) return
     waiting?.abort()
     setFlow({ step: "failed", method, message: describe(err) })
   }
@@ -86,6 +94,7 @@ export function ConnectDialog(props: {
       tab?.close()
       return fail(method, err)
     }
+    if (disposed) return void tab?.close()
     let opened = false
     if (tab && !tab.closed) {
       tab.opener = null
@@ -127,9 +136,9 @@ export function ConnectDialog(props: {
       await api.setAuth(props.provider.id, value)
       finish()
     } catch (err) {
-      toast(`Could not save: ${describe(err)}`, "error")
+      if (!disposed) toast(`Could not save: ${describe(err)}`, "error")
     } finally {
-      setSaving(false)
+      if (!disposed) setSaving(false)
     }
   }
 

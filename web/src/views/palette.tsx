@@ -53,16 +53,21 @@ export function Palette(props: { initial?: string; actions: PaletteActions }) {
   }
 
   let timer: ReturnType<typeof setTimeout> | undefined
+  // Only the latest query's answer lands; a slow earlier one is dropped.
+  let asked = 0
   createEffect(() => {
     const query = q().trim()
+    const dir = fileDir()
+    const ask = ++asked
     clearTimeout(timer)
-    if (query.length < 2 || !fileDir()) return setFiles([])
+    if (query.length < 2 || !dir) return setFiles([])
+    const land = (list: string[]) => ask === asked && setFiles(list)
     timer = setTimeout(
       () =>
         api
-          .findFiles(fileDir()!, query, 8)
-          .then(setFiles)
-          .catch(() => setFiles([])),
+          .findFiles(dir, query, 8)
+          .then(land)
+          .catch(() => land([])),
       120,
     )
   })
