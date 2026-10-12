@@ -1,0 +1,15 @@
+name: windows-debug
+
+on:
+  workflow_dispatch:
+
+jobs:
+  debug:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run one wire scenario
+        run: cargo test --verbose -p alforria --test e2e_agent a3_permission_once_asks_for_every_call -- --nocapture --test-threads=1
