@@ -316,6 +316,8 @@ impl Kv {
     /// Load `<state>/kv.json` under flock (`kv.tsx:22-31`). Read errors
     /// are logged by TS and leave the store empty.
     pub fn load(state_dir: &Path) -> Kv {
+        // A write still queued from this process must land first.
+        flush_writes();
         let file = state_dir.join("kv.json");
         let lock = format!("tui-kv:{}", file.display());
         let data = with_flock(state_dir, &lock, || read_json(&file))
@@ -377,18 +379,107 @@ impl Kv {
         self.file.as_deref()
     }
 
+    /// The write half of `kv.set`: the snapshot goes to the background
+    /// writer, so a contended flock (another TUI holding it, a stale lock
+    /// waiting out its timeout) never stalls a keypress.
     fn persist(&self) {
         let (Some(file), Some(state_dir)) = (&self.file, &self.state_dir) else {
             return;
         };
-        let snapshot = self.data.clone();
-        let file = file.clone();
+        writer::submit(writer::Job::Write {
+            file: file.clone(),
+            state_dir: state_dir.clone(),
+            data: self.data.clone(),
+        });
+    }
+}
+
+/// Wait until every `kv.set` issued so far is on disk (shutdown, and
+/// before a load reads the file back).
+pub fn flush_writes() {
+    writer::flush();
+}
+
+/// The single background writer: jobs run in order on one thread; a
+/// burst of writes to the same file collapses to the newest snapshot.
+mod writer {
+    use std::path::PathBuf;
+    use std::sync::mpsc::{channel, Receiver, Sender};
+    use std::sync::{Mutex, OnceLock};
+
+    use serde_json::{Map, Value};
+
+    pub(super) enum Job {
+        Write {
+            file: PathBuf,
+            state_dir: PathBuf,
+            data: Map<String, Value>,
+        },
+        Flush(Sender<()>),
+    }
+
+    fn sender() -> &'static Mutex<Sender<Job>> {
+        static SENDER: OnceLock<Mutex<Sender<Job>>> = OnceLock::new();
+        SENDER.get_or_init(|| {
+            let (tx, rx) = channel();
+            std::thread::Builder::new()
+                .name("tui-kv-writer".to_string())
+                .spawn(move || run(rx))
+                .expect("kv writer thread");
+            Mutex::new(tx)
+        })
+    }
+
+    pub(super) fn submit(job: Job) {
+        if let Ok(tx) = sender().lock() {
+            let _ = tx.send(job);
+        }
+    }
+
+    pub(super) fn flush() {
+        let (tx, rx) = channel();
+        submit(Job::Flush(tx));
+        let _ = rx.recv();
+    }
+
+    fn write(file: &std::path::Path, state_dir: &std::path::Path, data: Map<String, Value>) {
         let lock = format!("tui-kv:{}", file.display());
-        let result = with_flock(state_dir, &lock, || {
-            write_json_atomic(&file, &Value::Object(snapshot.clone()))
+        let result = super::with_flock(state_dir, &lock, || {
+            super::write_json_atomic(file, &Value::Object(data))
         });
         if let Err(error) = result {
             eprintln!("Failed to write Kv state: {error}");
+        }
+    }
+
+    fn run(rx: Receiver<Job>) {
+        while let Ok(job) = rx.recv() {
+            let mut jobs = vec![job];
+            while let Ok(next) = rx.try_recv() {
+                jobs.push(next);
+            }
+            // Newest snapshot per file; flushes ack after the writes.
+            let mut latest: Vec<(PathBuf, PathBuf, Map<String, Value>)> = Vec::new();
+            let mut acks = Vec::new();
+            for job in jobs {
+                match job {
+                    Job::Write {
+                        file,
+                        state_dir,
+                        data,
+                    } => {
+                        latest.retain(|(existing, _, _)| *existing != file);
+                        latest.push((file, state_dir, data));
+                    }
+                    Job::Flush(ack) => acks.push(ack),
+                }
+            }
+            for (file, state_dir, data) in latest {
+                write(&file, &state_dir, data);
+            }
+            for ack in acks {
+                let _ = ack.send(());
+            }
         }
     }
 }

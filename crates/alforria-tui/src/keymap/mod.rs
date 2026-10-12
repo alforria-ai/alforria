@@ -392,6 +392,13 @@ impl Keymap {
 
     /// The timed-leader `setTimeout` (`registerTimedLeader`) — clears
     /// the pending sequence once the timeout elapses.
+    /// When a pending leader sequence times out (the next [`Self::poll`]
+    /// that changes anything).
+    pub fn pending_deadline(&self) -> Option<u64> {
+        self.pending_since
+            .map(|since| since.saturating_add(self.leader_timeout_ms))
+    }
+
     pub fn poll(&mut self, now_ms: u64) {
         if let Some(since) = self.pending_since {
             if now_ms.saturating_sub(since) >= self.leader_timeout_ms {

@@ -41,9 +41,6 @@ use crate::transport::api::{
 use crate::transport::events::{spawn_event_loop, EventSource, SseEventSource, TokioClock};
 use crate::ui::view;
 
-/// The 40 ms frame tick (the TS spinner `interval={40}`).
-const FRAME_INTERVAL_MS: u64 = 40;
-
 /// `TuiInput` (`app.tsx:142-152`): the CLI handoff.
 #[derive(Debug, Clone, Default)]
 pub struct TuiInput {
@@ -130,10 +127,10 @@ async fn run_inner(input: TuiInput) -> Result<Exit> {
     let app = Arc::new(tokio::sync::Mutex::new(app));
 
     let (msg_tx, msg_rx) = tokio::sync::mpsc::unbounded_channel::<Msg>();
+    term::set_wake(msg_tx.clone());
     spawn_sse(source, msg_tx.clone());
     spawn_input_pump(msg_tx.clone());
-    spawn_tick(msg_tx.clone());
-    spawn_sighup(msg_tx.clone());
+    spawn_signals(msg_tx.clone());
     // crossterm only reports resizes (SIGWINCH) — the terminal size at
     // startup has to be fed to the app explicitly, or the layout stays
     // at the 80x1 default until the user resizes.
@@ -144,6 +141,8 @@ async fn run_inner(input: TuiInput) -> Result<Exit> {
     let mut terminal =
         ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(io::stdout()))?;
     let exit = event_loop(&app, api, msg_rx, &mut terminal).await;
+    // `kv.set` writes run in the background; land them before exiting.
+    state::kv::flush_writes();
 
     // §6 N6: `docs.open` prints the URL instead of opening a browser —
     // after the alternate screen is gone.
@@ -161,10 +160,15 @@ async fn run_inner(input: TuiInput) -> Result<Exit> {
     Ok(exit)
 }
 
-/// One `update` pass per message. Effects run as spawned tasks
-/// (spec §2.1 — "a driver executor turns each into a task"): a turn
-/// that blocks on a permission/question reply keeps the message pump
-/// running, exactly like the TS fire-and-forget `sdk.client.*` calls.
+/// The driver loop. Effects run as spawned tasks (spec §2.1 — "a
+/// driver executor turns each into a task"): a turn that blocks on a
+/// permission/question reply keeps the message pump running, exactly
+/// like the TS fire-and-forget `sdk.client.*` calls.
+///
+/// Every queued message is applied before the next draw, a frame is
+/// drawn only after something was applied, and the loop sleeps until
+/// the next message or timer ([`state::next_tick_in`]): an idle TUI does
+/// no work between keystrokes beyond the cursor blink.
 async fn event_loop(
     app: &Arc<tokio::sync::Mutex<App>>,
     api: Arc<dyn ServerApi>,
@@ -174,6 +178,8 @@ async fn event_loop(
     let title_disabled = app::terminal_title_disabled_from_env();
     let mut last_title: Option<String> = None;
     let mut pending = vec![Effect::Bootstrap { fatal: true }, Effect::PromptsRefresh];
+    let start = Instant::now();
+    let now_ms = || start.elapsed().as_millis() as u64;
 
     loop {
         for effect in pending.drain(..) {
@@ -183,28 +189,46 @@ async fn event_loop(
                 execute_effect(&app, api, effect).await;
             });
         }
-        let exited = {
+        let wait_ms = {
             let mut app = app.lock().await;
             if app.ui.exit {
-                true
-            } else {
-                terminal.draw(|frame| view(&mut app, frame))?;
-                apply_title(&app, title_disabled, &mut last_title)?;
-                false
+                break;
             }
+            // Only reached after something was applied.
+            draw(&mut app, terminal)?;
+            apply_title(&app, title_disabled, &mut last_title)?;
+            state::next_tick_in(&app, now_ms())
         };
-        if exited {
-            break;
-        }
 
-        let Some(msg) = messages.recv().await else {
+        let first = match wait_ms {
+            Some(wait_ms) => tokio::select! {
+                msg = messages.recv() => msg,
+                () = tokio::time::sleep(Duration::from_millis(wait_ms)) => {
+                    Some(Msg::Tick(start.elapsed()))
+                }
+            },
+            None => messages.recv().await,
+        };
+        let Some(first) = first else {
             app.lock().await.exit(None);
             break;
         };
-        pending = {
-            let mut app = app.lock().await;
-            state::update(&mut app, msg)
-        };
+        let mut batch = vec![first];
+        while batch.len() < 512 {
+            match messages.try_recv() {
+                Ok(msg) => batch.push(msg),
+                Err(_) => break,
+            }
+        }
+        let mut app = app.lock().await;
+        // Timers (leader timeout, toasts) see the current time before any
+        // key or event in the batch, ticking or not.
+        if !matches!(batch[0], Msg::Tick(_)) {
+            pending.extend(state::update(&mut app, Msg::Tick(start.elapsed())));
+        }
+        for msg in batch {
+            pending.extend(state::update(&mut app, msg));
+        }
     }
 
     let app = app.lock().await;
@@ -212,6 +236,30 @@ async fn event_loop(
         epilogue: app::epilogue(&app),
         reason: app.ui.exit_reason.clone(),
     })
+}
+
+/// One frame — skipped while a child process owns the terminal; cleared
+/// first when it just gave it back.
+fn draw(
+    app: &mut App,
+    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
+) -> Result<()> {
+    let _drawing = term::begin_draw();
+    if term::suspended() {
+        return Ok(());
+    }
+    if term::take_needs_clear() {
+        // Not `terminal.clear()`: it queries the cursor position, which
+        // can time out and abort. Clear the screen and drop the last
+        // frame so the next draw repaints every cell.
+        crossterm::execute!(
+            io::stdout(),
+            crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
+        )?;
+        terminal.swap_buffers();
+    }
+    terminal.draw(|frame| view(app, frame))?;
+    Ok(())
 }
 
 /// One `provider.oauth.callback` outcome. Success refreshes providers
@@ -369,14 +417,14 @@ async fn export_transcript(
         .unwrap_or_else(|| export_dir.clone());
 
     if open_without_saving {
-        let _ = editor::open_editor(&text, Some(&cwd));
+        let _ = edit_suspended(text, Some(cwd)).await;
         return;
     }
 
     let filename = filename.trim().to_string();
     let filepath = export_dir.join(&filename);
     let write_result = std::fs::write(&filepath, &text);
-    let edited = editor::open_editor(&text, Some(&cwd));
+    let edited = edit_suspended(text, Some(cwd)).await;
     let mut app = app.lock().await;
     if write_result.is_err() {
         app.show_toast(Toast {
@@ -398,6 +446,17 @@ async fn export_transcript(
     });
 }
 
+/// `openEditor` with the terminal handed over (`editor.ts:40` suspends
+/// the renderer): runs on a blocking thread so the runtime keeps going.
+async fn edit_suspended(text: String, cwd: Option<PathBuf>) -> Option<String> {
+    tokio::task::spawn_blocking(move || {
+        term::suspend(|| editor::open_editor(&text, cwd.as_deref()))
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 /// Execute one effect against the server seam. Effects that can block
 /// on a user reply (the submit pipeline) release the app lock across
 /// their awaits; the rest hold it for the duration.
@@ -408,10 +467,11 @@ pub async fn execute_effect(
 ) {
     match effect {
         Effect::Bootstrap { fatal } => {
-            let mut app = app.lock().await;
-            if let Err(error) = state::sync::bootstrap(&mut app.state, api.as_ref(), fatal).await {
+            // Fetch, then apply under short locks: the UI and the live
+            // events keep running while a slow endpoint answers.
+            if let Err(error) = state::sync::bootstrap_shared(&**app, api.as_ref(), fatal).await {
                 if fatal {
-                    app.exit(Some(format!("{error:#}")));
+                    app.lock().await.exit(Some(format!("{error:#}")));
                 }
             }
         }
@@ -489,7 +549,7 @@ pub async fn execute_effect(
             }
         }
         Effect::SuspendTerminal => {
-            suspend::terminal_suspend_and_resume().await;
+            let _ = tokio::task::spawn_blocking(|| term::suspend(term::stop_process)).await;
         }
         Effect::SessionShare { session_id } => {
             let result = api.session_share(&Location::default(), &session_id).await;
@@ -727,16 +787,20 @@ pub async fn execute_effect(
         }
         Effect::McpToggle { name } => {
             // `dialog-mcp.tsx:49-66`: toggle then refresh the MCP
-            // status from the server.
-            let mut app = app.lock().await;
-            let action = app.state.local.mcp_toggle(&app.state.sync, &name);
+            // status from the server. A connect can take as long as the
+            // MCP server does; the lock is not held across it.
+            let action = {
+                let mut app = app.lock().await;
+                let app = &mut *app;
+                app.state.local.mcp_toggle(&app.state.sync, &name)
+            };
             let result = match &action {
                 McpAction::Connect(name) => api.mcp_connect(&Location::default(), name).await,
                 McpAction::Disconnect(name) => api.mcp_disconnect(&Location::default(), name).await,
             };
             if result.is_ok() {
                 if let Ok(status) = api.mcp_status(&Location::default()).await {
-                    app.state.sync.mcp = object_of(status);
+                    app.lock().await.state.sync.mcp = object_of(status);
                 }
             }
         }
@@ -829,15 +893,13 @@ pub async fn execute_effect(
             .await;
         }
         Effect::SessionRefresh => {
-            let mut app = app.lock().await;
-            let sessions = state::sync::list_sessions(
-                api.as_ref(),
-                &Location::default(),
-                &app.state.kv,
-                &app.state.project,
-            )
-            .await;
-            app.state.sync.session = sessions;
+            let query = {
+                let app = app.lock().await;
+                state::sync::session_list_query(&app.state.kv, &app.state.project)
+            };
+            let sessions =
+                state::sync::fetch_sessions(api.as_ref(), &Location::default(), query).await;
+            app.lock().await.state.sync.session = sessions;
         }
         Effect::SessionBackground { session_id } => {
             let _ = api
@@ -865,21 +927,22 @@ pub async fn execute_effect(
         } => {
             // `createEffect` (`session/index.tsx:286-324`).
             let info = api.session_get(&Location::default(), &session_id).await;
-            let mut app = app.lock().await;
             match info {
                 Ok(info) => {
                     if info.workspace_id != previous_workspace {
-                        app.state.project.workspace.current = info.workspace_id.clone();
+                        app.lock().await.state.project.workspace.current =
+                            info.workspace_id.clone();
                         // Non-fatal: the workspace may no longer exist —
                         // the session still renders, non-interactive.
-                        let _ = state::sync::bootstrap(&mut app.state, api.as_ref(), false).await;
+                        let _ = state::sync::bootstrap_shared(&**app, api.as_ref(), false).await;
                     }
                     let _ =
-                        state::sync::session_sync(&mut app.state, api.as_ref(), &session_id).await;
+                        state::sync::session_sync_shared(&**app, api.as_ref(), &session_id).await;
                     // `scroll.scrollBy(100_000)` — snap to bottom.
-                    app.ui.session_scroll.snap_to_bottom();
+                    app.lock().await.ui.session_scroll.snap_to_bottom();
                 }
                 Err(_) => {
+                    let mut app = app.lock().await;
                     app.show_toast(Toast {
                         title: None,
                         variant: ToastVariant::Error,
@@ -891,8 +954,7 @@ pub async fn execute_effect(
             }
         }
         Effect::SessionHydrate { session_id } => {
-            let mut app = app.lock().await;
-            let _ = state::sync::session_sync(&mut app.state, api.as_ref(), &session_id).await;
+            let _ = state::sync::session_sync_shared(&**app, api.as_ref(), &session_id).await;
         }
         Effect::ClipboardWrite {
             text,
@@ -961,11 +1023,7 @@ pub async fn execute_effect(
                     .clone()
                     .or_else(|| app.state.project.instance_path.directory.clone())
             };
-            crossterm::terminal::disable_raw_mode().ok();
-            crossterm::execute!(io::stdout(), crossterm::terminal::LeaveAlternateScreen).ok();
-            let edited = editor::open_editor(&value, cwd.as_deref().map(Path::new));
-            crossterm::terminal::enable_raw_mode().ok();
-            crossterm::execute!(io::stdout(), crossterm::terminal::EnterAlternateScreen).ok();
+            let edited = edit_suspended(value, cwd.map(PathBuf::from)).await;
             if let Some(content) = edited {
                 let normalized = editor::normalize_prompt_content(&content);
                 let mut app = app.lock().await;
@@ -1046,83 +1104,169 @@ fn spawn_sse(source: Arc<dyn EventSource>, messages: tokio::sync::mpsc::Unbounde
     });
 }
 
+/// The crossterm reader. It polls instead of blocking in `read` so it can
+/// park while a child process (`$EDITOR`, a shell after ctrl+z) owns the
+/// terminal: otherwise it would steal the child's keystrokes.
 fn spawn_input_pump(messages: tokio::sync::mpsc::UnboundedSender<Msg>) {
     std::thread::spawn(move || loop {
-        match crossterm::event::read() {
-            Ok(crossterm::event::Event::Key(key)) => {
-                if messages.send(Msg::Key(key)).is_err() {
-                    return;
-                }
-            }
-            Ok(crossterm::event::Event::Mouse(mouse)) => {
-                if messages.send(Msg::Mouse(mouse)).is_err() {
-                    return;
-                }
-            }
-            Ok(crossterm::event::Event::Resize(columns, rows)) => {
-                if messages.send(Msg::Resize(columns, rows)).is_err() {
-                    return;
-                }
-            }
-            // Bracketed paste (`prompt/index.tsx:1396-1420`).
-            Ok(crossterm::event::Event::Paste(text)) => {
-                if messages.send(Msg::Paste(text)).is_err() {
-                    return;
-                }
-            }
-            Ok(_) => {}
+        if messages.is_closed() {
+            return;
+        }
+        if term::park_if_paused() {
+            continue;
+        }
+        match crossterm::event::poll(Duration::from_millis(50)) {
+            Ok(true) => {}
+            Ok(false) => continue,
             Err(_) => return,
         }
-    });
-}
-
-fn spawn_tick(messages: tokio::sync::mpsc::UnboundedSender<Msg>) {
-    tokio::spawn(async move {
-        let start = Instant::now();
-        let mut interval = tokio::time::interval(Duration::from_millis(FRAME_INTERVAL_MS));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            interval.tick().await;
-            if messages.send(Msg::Tick(start.elapsed())).is_err() {
-                return;
-            }
+        if term::paused() {
+            continue;
+        }
+        let msg = match crossterm::event::read() {
+            Ok(crossterm::event::Event::Key(key)) => Msg::Key(key),
+            Ok(crossterm::event::Event::Mouse(mouse)) => Msg::Mouse(mouse),
+            Ok(crossterm::event::Event::Resize(columns, rows)) => Msg::Resize(columns, rows),
+            // Bracketed paste (`prompt/index.tsx:1396-1420`).
+            Ok(crossterm::event::Event::Paste(text)) => Msg::Paste(text),
+            Ok(_) => continue,
+            Err(_) => return,
+        };
+        if messages.send(msg).is_err() {
+            return;
         }
     });
 }
 
-/// SIGHUP destroys the renderer (`app.tsx:231-235`) — here it exits the
-/// loop for the scoped teardown.
+/// SIGHUP: the terminal is gone — exit (`app.tsx:231-235`), whatever is on
+/// screen (a synthesized key could land in a dialog). SIGTERM: restore
+/// the terminal and exit at once, so a killed TUI never leaves the shell
+/// in raw mode on the alternate screen.
 #[cfg(unix)]
-fn spawn_sighup(messages: tokio::sync::mpsc::UnboundedSender<Msg>) {
-    tokio::spawn(async move {
-        let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
-            .expect("SIGHUP handler");
-        sighup.recv().await;
-        let _ = messages.send(Msg::Key(crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Char('d'),
-            crossterm::event::KeyModifiers::CONTROL,
-        )));
-    });
+fn spawn_signals(messages: tokio::sync::mpsc::UnboundedSender<Msg>) {
+    use tokio::signal::unix::{signal, SignalKind};
+    if let Ok(mut sighup) = signal(SignalKind::hangup()) {
+        tokio::spawn(async move {
+            sighup.recv().await;
+            let _ = messages.send(Msg::Hangup);
+        });
+    }
+    if let Ok(mut sigterm) = signal(SignalKind::terminate()) {
+        tokio::spawn(async move {
+            sigterm.recv().await;
+            term::restore();
+            state::kv::flush_writes();
+            std::process::exit(143);
+        });
+    }
 }
 
 #[cfg(not(unix))]
-fn spawn_sighup(_messages: tokio::sync::mpsc::UnboundedSender<Msg>) {}
+fn spawn_signals(_messages: tokio::sync::mpsc::UnboundedSender<Msg>) {}
 
 /// Raw mode + alternate screen + optional mouse capture + the kitty
-/// keyboard protocol (`app.tsx:186-213`).
-struct TerminalGuard {
-    mouse: bool,
-}
+/// keyboard protocol (`app.tsx:186-213`), undone on drop, on panic and on
+/// SIGTERM.
+struct TerminalGuard;
 
 impl TerminalGuard {
     fn enter(mouse: bool) -> Result<TerminalGuard> {
+        let mouse = mouse && !mouse_disabled_from_env();
+        term::install(mouse);
+        term::enter(mouse)?;
+        Ok(TerminalGuard)
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = write_ansi("\x1b]2;\x07");
+        term::restore();
+    }
+}
+
+/// `Flag.OPENCODE_DISABLE_MOUSE` (`app.tsx:202`).
+fn mouse_disabled_from_env() -> bool {
+    std::env::var("OPENCODE_DISABLE_MOUSE").is_ok_and(|v| !v.is_empty() && v != "0")
+}
+
+/// Terminal ownership, shared by the event loop (draws), the input pump
+/// (reads) and the effects that hand the terminal to a child process.
+mod term {
+    use std::io;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
+    use std::time::{Duration, Instant};
+
+    use crate::state::Msg;
+
+    struct Control {
+        mouse: bool,
+        /// The terminal is in TUI mode (raw, alternate screen).
+        entered: AtomicBool,
+        /// The input pump must not read.
+        paused: AtomicBool,
+        /// The pump is parked (not inside `read`).
+        parked: Mutex<bool>,
+        parked_changed: Condvar,
+        /// A child owns the terminal: draws are skipped.
+        suspended: AtomicBool,
+        /// Held across each draw, so a suspend never cuts one in half.
+        drawing: Mutex<()>,
+        /// The child scribbled on the screen: clear before the next draw.
+        needs_clear: AtomicBool,
+        /// Wakes the loop after a resume so it repaints.
+        wake: Mutex<Option<tokio::sync::mpsc::UnboundedSender<Msg>>>,
+    }
+
+    static CONTROL: OnceLock<Control> = OnceLock::new();
+
+    fn control() -> Option<&'static Control> {
+        CONTROL.get()
+    }
+
+    /// Install the shared state and the panic hook (once per process).
+    pub fn install(mouse: bool) {
+        let mut installed = false;
+        CONTROL.get_or_init(|| {
+            installed = true;
+            Control {
+                mouse,
+                entered: AtomicBool::new(false),
+                paused: AtomicBool::new(false),
+                parked: Mutex::new(false),
+                parked_changed: Condvar::new(),
+                suspended: AtomicBool::new(false),
+                drawing: Mutex::new(()),
+                needs_clear: AtomicBool::new(false),
+                wake: Mutex::new(None),
+            }
+        });
+        if installed {
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                // The message must land on the normal screen, readable.
+                restore();
+                previous(info);
+            }));
+        }
+    }
+
+    pub fn set_wake(wake: tokio::sync::mpsc::UnboundedSender<Msg>) {
+        if let Some(control) = control() {
+            *control.wake.lock().unwrap_or_else(|e| e.into_inner()) = Some(wake);
+        }
+    }
+
+    fn mouse() -> bool {
+        control().is_some_and(|control| control.mouse)
+    }
+
+    /// Put the terminal in TUI mode.
+    pub fn enter(mouse: bool) -> io::Result<()> {
         crossterm::terminal::enable_raw_mode()?;
         crossterm::execute!(io::stdout(), crossterm::terminal::EnterAlternateScreen)?;
         let _ = crossterm::execute!(io::stdout(), crossterm::event::EnableBracketedPaste);
-        let mut mouse = mouse;
-        if mouse_disabled_from_env() {
-            mouse = false;
-        }
         if mouse {
             crossterm::execute!(io::stdout(), crossterm::event::EnableMouseCapture)?;
         }
@@ -1133,47 +1277,136 @@ impl TerminalGuard {
                 crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
             )
         )?;
-        Ok(TerminalGuard { mouse })
+        if let Some(control) = control() {
+            control.entered.store(true, Ordering::SeqCst);
+        }
+        Ok(())
     }
-}
 
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        let _ = write_ansi("\x1b]2;\x07");
+    /// Undo [`enter`]; idempotent (drop, panic and SIGTERM may all run).
+    pub fn restore() {
+        if let Some(control) = control() {
+            if !control.entered.swap(false, Ordering::SeqCst) {
+                return;
+            }
+        }
+        leave(mouse());
+    }
+
+    fn leave(mouse: bool) {
         let _ = crossterm::execute!(io::stdout(), crossterm::event::DisableBracketedPaste);
         #[cfg(unix)]
         let _ = crossterm::execute!(io::stdout(), crossterm::event::PopKeyboardEnhancementFlags);
-        if self.mouse {
+        if mouse {
             let _ = crossterm::execute!(io::stdout(), crossterm::event::DisableMouseCapture);
         }
-        let _ = crossterm::execute!(io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+        let _ = crossterm::execute!(
+            io::stdout(),
+            crossterm::cursor::Show,
+            crossterm::terminal::LeaveAlternateScreen
+        );
         let _ = crossterm::terminal::disable_raw_mode();
     }
-}
 
-/// `Flag.OPENCODE_DISABLE_MOUSE` (`app.tsx:202`).
-fn mouse_disabled_from_env() -> bool {
-    std::env::var("OPENCODE_DISABLE_MOUSE").is_ok_and(|v| !v.is_empty() && v != "0")
-}
+    /// Hand the terminal to `f` (`$EDITOR`, ctrl+z): park the input pump,
+    /// stop drawing, leave TUI mode; then restore and repaint from a
+    /// cleared screen. Blocking — run it off the async workers. Without a
+    /// TUI (tests) it just runs `f`.
+    pub fn suspend<T>(f: impl FnOnce() -> T) -> T {
+        let Some(control) = control().filter(|c| c.entered.load(Ordering::SeqCst)) else {
+            return f();
+        };
+        control.suspended.store(true, Ordering::SeqCst);
+        drop(control.drawing.lock().unwrap_or_else(|e| e.into_inner()));
+        control.paused.store(true, Ordering::SeqCst);
+        {
+            // The pump parks within one poll interval; a dead pump never
+            // does, so the wait is bounded.
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let mut parked = control.parked.lock().unwrap_or_else(|e| e.into_inner());
+            while !*parked && Instant::now() < deadline {
+                parked = control
+                    .parked_changed
+                    .wait_timeout(parked, Duration::from_millis(20))
+                    .unwrap_or_else(|e| e.into_inner())
+                    .0;
+            }
+        }
+        control.entered.store(false, Ordering::SeqCst);
+        leave(control.mouse);
 
-/// `terminal.suspend` (`app.tsx:870-879`): leave raw mode, `SIGTSTP` the
-/// process group, then restore — `SIGCONT` resumes mid-`kill`.
-mod suspend {
+        let result = f();
+
+        let _ = enter(control.mouse);
+        control.needs_clear.store(true, Ordering::SeqCst);
+        control.suspended.store(false, Ordering::SeqCst);
+        control.paused.store(false, Ordering::SeqCst);
+        control.parked_changed.notify_all();
+        if let Some(wake) = control
+            .wake
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            if let Ok((columns, rows)) = crossterm::terminal::size() {
+                let _ = wake.send(Msg::Resize(columns, rows));
+            }
+        }
+        result
+    }
+
+    /// Input-pump side of [`suspend`]: while paused, report parked and
+    /// wait. Returns whether it parked.
+    pub fn park_if_paused() -> bool {
+        let Some(control) = control() else {
+            return false;
+        };
+        if !control.paused.load(Ordering::SeqCst) {
+            return false;
+        }
+        let mut parked = control.parked.lock().unwrap_or_else(|e| e.into_inner());
+        *parked = true;
+        control.parked_changed.notify_all();
+        while control.paused.load(Ordering::SeqCst) {
+            parked = control
+                .parked_changed
+                .wait_timeout(parked, Duration::from_millis(100))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        *parked = false;
+        true
+    }
+
+    pub fn paused() -> bool {
+        control().is_some_and(|control| control.paused.load(Ordering::SeqCst))
+    }
+
+    pub fn suspended() -> bool {
+        control().is_some_and(|control| control.suspended.load(Ordering::SeqCst))
+    }
+
+    pub fn take_needs_clear() -> bool {
+        control().is_some_and(|control| control.needs_clear.swap(false, Ordering::SeqCst))
+    }
+
+    pub fn begin_draw() -> Option<MutexGuard<'static, ()>> {
+        control().map(|control| control.drawing.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// `terminal.suspend` (`app.tsx:870-879`): `SIGTSTP` the process
+    /// group; `SIGCONT` resumes mid-`kill`.
     #[cfg(unix)]
-    pub async fn terminal_suspend_and_resume() {
-        crossterm::terminal::disable_raw_mode().ok();
-        crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen).ok();
+    pub fn stop_process() {
         unsafe {
             libc::kill(0, libc::SIGTSTP);
         }
-        crossterm::terminal::enable_raw_mode().ok();
-        crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen).ok();
     }
 
     // No terminal suspend on Windows — the keybinding is already disabled
     // (`terminal_suspend_supported`).
     #[cfg(not(unix))]
-    pub async fn terminal_suspend_and_resume() {}
+    pub fn stop_process() {}
 }
 
 #[cfg(test)]

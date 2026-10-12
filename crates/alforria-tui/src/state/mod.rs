@@ -524,6 +524,14 @@ impl StartupLoading {
         self.show
     }
 
+    /// The next show/hide deadline, if one is armed.
+    pub fn deadline(&self) -> Option<u64> {
+        match (self.wait, self.hold) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
     pub fn text(&self) -> &'static str {
         if self.ready {
             "Finishing startup…"
@@ -545,6 +553,8 @@ pub enum Msg {
     Paste(String),
     /// 40 ms frame tick (`app.tsx:196` `targetFps: 60`).
     Tick(std::time::Duration),
+    /// SIGHUP: the terminal is gone — exit (`app.tsx:231-235`).
+    Hangup,
 }
 
 /// Async work fired by [`update`] — the runtime loop executes each
@@ -983,6 +993,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                 prompt::paste_input_text(app, &normalized);
             }
         }
+        Msg::Hangup => app.exit(None),
         Msg::Tick(elapsed) => {
             let now_ms = elapsed.as_millis() as u64;
             app.ui.tick_ms = now_ms;
@@ -1031,6 +1042,52 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
     effects
 }
 
+/// The animation frame interval (the TS spinner `interval={40}`).
+pub const FRAME_INTERVAL_MS: u64 = 40;
+/// The prompt cursor blink half-period (`ui/session/prompt.rs`).
+const BLINK_MS: u64 = 530;
+
+/// Whether something on screen moves by itself: a spinner (a busy or
+/// retrying session, a prompt being submitted) or the startup overlay.
+pub fn animating(app: &App) -> bool {
+    !app.ui.startup_ready
+        || app.ui.startup_loading.visible()
+        || app.ui.prompt.submitting
+        || app.state.sync.session_status.values().any(|status| {
+            matches!(
+                status,
+                alforria_schema::session_status::SessionStatusInfo::Busy
+                    | alforria_schema::session_status::SessionStatusInfo::Retry { .. }
+            )
+        })
+}
+
+/// How long the loop may sleep before the next [`Msg::Tick`]: one frame
+/// while [`animating`], otherwise until the nearest timer (toast, leader,
+/// interrupt reset, footer rotation, startup overlay, cursor blink).
+/// `None`: nothing moves until the next message.
+pub fn next_tick_in(app: &App, now_ms: u64) -> Option<u64> {
+    if animating(app) {
+        return Some(FRAME_INTERVAL_MS);
+    }
+    let mut deadlines = vec![
+        app.ui.toast_deadline_ms,
+        app.ui.interrupt_reset_at,
+        app.ui.footer_flip_at,
+        app.ui.startup_loading.deadline(),
+        app.keymap.pending_deadline(),
+    ];
+    if app.ui.prompt_focused {
+        deadlines.push(Some((now_ms / BLINK_MS + 1) * BLINK_MS));
+    }
+    deadlines
+        .into_iter()
+        .flatten()
+        .map(|deadline| deadline.saturating_sub(now_ms))
+        .min()
+        .map(|delay| delay.max(1))
+}
+
 /// `useConnected()` (`component/use-connected.tsx`): some provider
 /// other than `opencode`, or an `opencode` model with a nonzero input
 /// cost.
@@ -1065,6 +1122,38 @@ fn scroll_speed(app: &App) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_app_sleeps_until_a_timer() {
+        let mut app = App::new(crate::config::TuiConfig::default(), Args::default(), None);
+        app.ui.startup_ready = true;
+        app.ui.prompt_focused = false;
+        assert_eq!(next_tick_in(&app, 10_000), None, "nothing moves");
+        app.ui.prompt_focused = true;
+        assert_eq!(
+            next_tick_in(&app, 10_000),
+            Some(70),
+            "next blink edge (19 × 530)"
+        );
+        app.ui.toast_deadline_ms = Some(10_050);
+        assert_eq!(next_tick_in(&app, 10_000), Some(50), "toast dismissal");
+        app.state.sync.session_status.insert(
+            "ses_a".to_string(),
+            alforria_schema::session_status::SessionStatusInfo::Busy,
+        );
+        assert_eq!(
+            next_tick_in(&app, 10_000),
+            Some(FRAME_INTERVAL_MS),
+            "a spinner animates"
+        );
+    }
+
+    #[test]
+    fn hangup_exits() {
+        let mut app = App::new(crate::config::TuiConfig::default(), Args::default(), None);
+        update(&mut app, Msg::Hangup);
+        assert!(app.ui.exit);
+    }
 
     #[test]
     fn permission_mode_from_args() {

@@ -302,6 +302,14 @@ fn part_message_id(part: &V1Part) -> &str {
 /// = (part[field] ?? "") + delta`. The part round-trips through JSON so
 /// the append applies to any top-level string field.
 fn append_delta(part: &mut V1Part, field: &str, delta: &str) {
+    // Fast path: streamed text and reasoning append in place instead of
+    // round-tripping the whole (growing) part through JSON per token.
+    if field == "text" {
+        if let V1Part::Text { text, .. } | V1Part::Reasoning { text, .. } = part {
+            text.push_str(delta);
+            return;
+        }
+    }
     let Ok(mut value) = serde_json::to_value(&*part) else {
         return;
     };
@@ -724,9 +732,17 @@ pub async fn list_sessions(
     kv: &Kv,
     project: &ProjectState,
 ) -> Vec<V1SessionInfo> {
-    let now_ms = now_epoch_ms();
-    let mut query = session_list_query(kv, project);
-    query.start = Some(now_ms - 30 * 24 * 60 * 60 * 1000);
+    fetch_sessions(api, loc, session_list_query(kv, project)).await
+}
+
+/// The request half of [`list_sessions`]: callers compute the query
+/// under the app lock, then fetch without it.
+pub async fn fetch_sessions(
+    api: &dyn ServerApi,
+    loc: &Location,
+    mut query: SessionListQuery,
+) -> Vec<V1SessionInfo> {
+    query.start = Some(now_epoch_ms() - 30 * 24 * 60 * 60 * 1000);
     let mut sessions = api.session_list(loc, query).await.unwrap_or_default();
     sessions.sort_by(|a, b| a.id.cmp(&b.id));
     sessions
@@ -753,22 +769,70 @@ pub(crate) fn object_of(value: Value) -> BTreeMap<String, Value> {
     }
 }
 
+/// Short, synchronous access to the store. The bootstrap and hydrate
+/// flows fetch without holding it and apply each result under one short
+/// access, so live events (and the UI) keep flowing while a request
+/// waits — a slow MCP server or provider list never freezes the TUI.
+pub trait StateCell: Sync {
+    fn with<R, F>(&self, f: F) -> impl std::future::Future<Output = R> + Send
+    where
+        R: Send,
+        F: FnOnce(&mut State) -> R + Send;
+}
+
+impl StateCell for tokio::sync::Mutex<crate::state::App> {
+    async fn with<R, F>(&self, f: F) -> R
+    where
+        R: Send,
+        F: FnOnce(&mut State) -> R + Send,
+    {
+        let mut app = self.lock().await;
+        f(&mut app.state)
+    }
+}
+
+/// A [`StateCell`] over a store the caller owns outright (tests, the
+/// `&mut State` entry points).
+pub struct Exclusive<'a>(tokio::sync::Mutex<&'a mut State>);
+
+impl<'a> Exclusive<'a> {
+    pub fn new(state: &'a mut State) -> Exclusive<'a> {
+        Exclusive(tokio::sync::Mutex::new(state))
+    }
+}
+
+impl StateCell for Exclusive<'_> {
+    async fn with<R, F>(&self, f: F) -> R
+    where
+        R: Send,
+        F: FnOnce(&mut State) -> R + Send,
+    {
+        let mut state = self.0.lock().await;
+        f(&mut state)
+    }
+}
+
 /// `project.sync()` (`context/project.tsx:38-52`).
-async fn project_sync(state: &mut State, api: &dyn ServerApi, loc: &Location) -> Result<()> {
+async fn project_sync<S: StateCell>(cell: &S, api: &dyn ServerApi, loc: &Location) -> Result<()> {
     let (path, project) = tokio_join!(api.path_get(loc), api.project_current(loc));
     let path = path.context("tui bootstrap failed: path.get")?;
     let project = project.context("tui bootstrap failed: project.current")?;
-    state.project.instance_path = project_instance_path(&path);
-    state.project.project_id = project
+    let project_id = project
         .get("id")
         .and_then(Value::as_str)
         .map(str::to_string);
-    state.project.worktree = project
-        .get("worktree")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    if let Some(project_id) = &state.project.project_id {
-        if let Ok(directories) = api.project_directories(loc, project_id).await {
+    let directories = match &project_id {
+        Some(project_id) => api.project_directories(loc, project_id).await.ok(),
+        None => None,
+    };
+    cell.with(move |state| {
+        state.project.instance_path = project_instance_path(&path);
+        state.project.project_id = project_id;
+        state.project.worktree = project
+            .get("worktree")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if let Some(directories) = directories {
             state.project.main_dir = directories.as_array().and_then(|items| {
                 items
                     .iter()
@@ -779,7 +843,8 @@ async fn project_sync(state: &mut State, api: &dyn ServerApi, loc: &Location) ->
                     .map(str::to_string)
             });
         }
-    }
+    })
+    .await;
     Ok(())
 }
 
@@ -801,41 +866,53 @@ fn project_instance_path(path: &Value) -> crate::state::InstancePath {
 
 /// `project.workspace.sync()` (`context/project.tsx:54-70`) —
 /// best-effort; failures leave workspace state untouched.
-async fn workspace_sync(state: &mut State, api: &dyn ServerApi, loc: &Location) {
+async fn workspace_sync<S: StateCell>(cell: &S, api: &dyn ServerApi, loc: &Location) {
     let Ok(listed) = api.experimental_workspace_list(loc).await else {
         return;
     };
     let status = api.experimental_workspace_status(loc).await.ok();
-    let Some(list) = listed.as_array() else {
+    let Some(list) = listed.as_array().cloned() else {
         return;
     };
-    state.project.workspace.list = list.to_vec();
-    if let Some(status) = status.and_then(|s| s.as_array().cloned()) {
-        let next: BTreeMap<String, String> = status
-            .iter()
-            .filter_map(|item| {
-                let id = item.get("workspaceID").and_then(Value::as_str)?;
-                let s = item.get("status").and_then(Value::as_str)?;
-                Some((id.to_string(), s.to_string()))
-            })
-            .collect();
-        state.project.workspace.status = next;
-    }
-    if let Some(current) = state.project.workspace.current.clone() {
-        let exists = list
-            .iter()
-            .any(|item| item.get("id").and_then(Value::as_str) == Some(current.as_str()));
-        if !exists {
-            state.project.workspace.current = None;
+    cell.with(move |state| {
+        if let Some(status) = status.and_then(|s| s.as_array().cloned()) {
+            let next: BTreeMap<String, String> = status
+                .iter()
+                .filter_map(|item| {
+                    let id = item.get("workspaceID").and_then(Value::as_str)?;
+                    let s = item.get("status").and_then(Value::as_str)?;
+                    Some((id.to_string(), s.to_string()))
+                })
+                .collect();
+            state.project.workspace.status = next;
         }
-    }
+        if let Some(current) = state.project.workspace.current.clone() {
+            let exists = list
+                .iter()
+                .any(|item| item.get("id").and_then(Value::as_str) == Some(current.as_str()));
+            if !exists {
+                state.project.workspace.current = None;
+            }
+        }
+        state.project.workspace.list = list;
+    })
+    .await;
 }
 
 /// `bootstrap()` (`sync.tsx:451-552`). Phase 1 is blocking: failures
 /// return `Err` — the TS caller exits when `fatal`, rethrows otherwise
 /// (`:546-551`). Phase 2 failures are logged, not fatal (`:519-539`).
 pub async fn bootstrap(state: &mut State, api: &dyn ServerApi, fatal: bool) -> Result<()> {
-    let result = bootstrap_inner(state, api).await;
+    bootstrap_shared(&Exclusive::new(state), api, fatal).await
+}
+
+/// [`bootstrap`] over a shared store: no access is held across a request.
+pub async fn bootstrap_shared<S: StateCell>(
+    cell: &S,
+    api: &dyn ServerApi,
+    fatal: bool,
+) -> Result<()> {
+    let result = bootstrap_inner(cell, api).await;
     match result {
         Ok(()) => Ok(()),
         Err(error) => {
@@ -849,14 +926,19 @@ pub async fn bootstrap(state: &mut State, api: &dyn ServerApi, fatal: bool) -> R
     }
 }
 
-async fn bootstrap_inner(state: &mut State, api: &dyn ServerApi) -> Result<()> {
+async fn bootstrap_inner<S: StateCell>(cell: &S, api: &dyn ServerApi) -> Result<()> {
     let loc = Location {
         directory: None,
-        workspace: state.project.workspace.current.clone(),
+        workspace: cell
+            .with(|state| state.project.workspace.current.clone())
+            .await,
     };
 
-    project_sync(state, api, &loc).await?;
-    let sessions = list_sessions(api, &loc, &state.kv, &state.project).await;
+    project_sync(cell, api, &loc).await?;
+    let query = cell
+        .with(|state| session_list_query(&state.kv, &state.project))
+        .await;
+    let sessions = fetch_sessions(api, &loc, query).await;
 
     let (providers, provider_list, capabilities, console, agents, config) = tokio_join!(
         api.config_providers(&loc),
@@ -873,30 +955,38 @@ async fn bootstrap_inner(state: &mut State, api: &dyn ServerApi) -> Result<()> {
     let capabilities = capabilities.ok();
     let console_state = console.unwrap_or_else(|_| empty_console_state());
 
-    let sync = &mut state.sync;
-    sync.provider = providers
-        .get("providers")
-        .cloned()
-        .map(array_of)
-        .unwrap_or_default();
-    if let Some(default) = providers.get("default") {
-        sync.provider_default = serde_json::from_value(default.clone()).unwrap_or_default();
-    }
-    sync.provider_next = provider_list;
-    sync.capabilities = capabilities
-        .as_ref()
-        .and_then(|c| c.get("backgroundSubagents"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    sync.console_state = console_state;
-    sync.agent = array_of(agents);
-    sync.config = config;
-    if state.args.continue_ {
-        sync.session = sessions.clone();
-    }
-    if sync.status != Some(SyncStatus::Complete) {
-        sync.status = Some(SyncStatus::Partial);
-    }
+    let continue_ = cell
+        .with(move |state| {
+            let continue_ = state.args.continue_;
+            let sync = &mut state.sync;
+            sync.provider = providers
+                .get("providers")
+                .cloned()
+                .map(array_of)
+                .unwrap_or_default();
+            if let Some(default) = providers.get("default") {
+                sync.provider_default = serde_json::from_value(default.clone()).unwrap_or_default();
+            }
+            sync.provider_next = provider_list;
+            sync.capabilities = capabilities
+                .as_ref()
+                .and_then(|c| c.get("backgroundSubagents"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            sync.console_state = console_state;
+            sync.agent = array_of(agents);
+            sync.config = config;
+            if continue_ {
+                sync.session = sessions.clone();
+            }
+            // Phase 1 is in: the UI is usable while phase 2 loads.
+            if sync.status != Some(SyncStatus::Complete) {
+                sync.status = Some(SyncStatus::Partial);
+            }
+            (continue_, sessions)
+        })
+        .await;
+    let (continue_, sessions) = continue_;
 
     // Non-blocking phase (`sync.tsx:519-539`).
     let (command, lsp, mcp, mcp_resource, formatter, session_status, provider_auth, vcs) = tokio_join!(
@@ -909,7 +999,7 @@ async fn bootstrap_inner(state: &mut State, api: &dyn ServerApi) -> Result<()> {
         api.provider_auth(&loc),
         api.vcs_get(&loc),
     );
-    {
+    cell.with(move |state| {
         let sync = &mut state.sync;
         if let Ok(v) = command {
             sync.command = array_of(v);
@@ -935,12 +1025,16 @@ async fn bootstrap_inner(state: &mut State, api: &dyn ServerApi) -> Result<()> {
         if let Ok(v) = vcs {
             sync.vcs = if v.is_null() { None } else { Some(v) };
         }
-    }
-    workspace_sync(state, api, &loc).await;
-    if !state.args.continue_ {
-        state.sync.session = sessions;
-    }
-    state.sync.status = Some(SyncStatus::Complete);
+    })
+    .await;
+    workspace_sync(cell, api, &loc).await;
+    cell.with(move |state| {
+        if !continue_ {
+            state.sync.session = sessions;
+        }
+        state.sync.status = Some(SyncStatus::Complete);
+    })
+    .await;
     Ok(())
 }
 
@@ -966,20 +1060,33 @@ fn parse_auth_map(value: Value) -> BTreeMap<String, Vec<Value>> {
 /// wins for messages/parts already streamed in. Runs at most once per
 /// session (`fullSyncedSessions`).
 pub async fn session_sync(state: &mut State, api: &dyn ServerApi, session_id: &str) -> Result<()> {
-    if state.sync.full_synced.contains(session_id) {
-        return Ok(());
-    }
-    state
-        .sync
-        .hydrating_sessions
-        .entry(session_id.to_string())
-        .or_default();
-    let result = hydrate(state, api, session_id).await;
-    state.sync.hydrating_sessions.remove(session_id);
-    result
+    session_sync_shared(&Exclusive::new(state), api, session_id).await
 }
 
-async fn hydrate(state: &mut State, api: &dyn ServerApi, session_id: &str) -> Result<()> {
+/// [`session_sync`] over a shared store: the requests run without the
+/// store, and the live events that land meanwhile are tracked so they win
+/// over the (older) fetched copies.
+pub async fn session_sync_shared<S: StateCell>(
+    cell: &S,
+    api: &dyn ServerApi,
+    session_id: &str,
+) -> Result<()> {
+    let start = cell
+        .with(|state| {
+            if state.sync.full_synced.contains(session_id) {
+                return false;
+            }
+            state
+                .sync
+                .hydrating_sessions
+                .entry(session_id.to_string())
+                .or_default();
+            true
+        })
+        .await;
+    if !start {
+        return Ok(());
+    }
     let loc = Location::default();
     let (session, messages, todo, diff) = tokio_join!(
         api.session_get(&loc, session_id),
@@ -987,11 +1094,44 @@ async fn hydrate(state: &mut State, api: &dyn ServerApi, session_id: &str) -> Re
         api.session_todo(&loc, session_id),
         api.session_diff(&loc, session_id, None),
     );
-    let session = session?; // `throwOnError: true` (`sync.tsx:602`)
-    let messages = messages.unwrap_or_default();
-    let todo = todo.unwrap_or_default();
-    let diff = diff.unwrap_or_default();
+    cell.with(|state| {
+        let result = match session {
+            // `throwOnError: true` (`sync.tsx:602`)
+            Err(error) => Err(error),
+            Ok(session) => {
+                apply_hydrate(
+                    state,
+                    session_id,
+                    Hydrated {
+                        session,
+                        messages: messages.unwrap_or_default(),
+                        todo: todo.unwrap_or_default(),
+                        diff: diff.unwrap_or_default(),
+                    },
+                );
+                Ok(())
+            }
+        };
+        state.sync.hydrating_sessions.remove(session_id);
+        result
+    })
+    .await
+}
 
+struct Hydrated {
+    session: V1SessionInfo,
+    messages: Vec<crate::transport::api::MessageWithParts>,
+    todo: Vec<TodoInfo>,
+    diff: Vec<SnapshotFileDiff>,
+}
+
+fn apply_hydrate(state: &mut State, session_id: &str, fetched: Hydrated) {
+    let Hydrated {
+        session,
+        messages,
+        todo,
+        diff,
+    } = fetched;
     let tracker = state
         .sync
         .hydrating_sessions
@@ -1089,7 +1229,6 @@ async fn hydrate(state: &mut State, api: &dyn ServerApi, session_id: &str) -> Re
     sync.message.insert(session_id.to_string(), visible);
     sync.session_diff.insert(session_id.to_string(), diff);
     sync.full_synced.insert(session_id.to_string());
-    Ok(())
 }
 
 fn is_text_or_reasoning(part: &V1Part) -> bool {
@@ -2085,6 +2224,8 @@ mod tests {
         todos: Vec<TodoInfo>,
         diffs: Vec<SnapshotFileDiff>,
         calls: Mutex<Vec<String>>,
+        /// `mcp.status` hangs until notified (a stalled MCP server).
+        stall_mcp: Option<std::sync::Arc<tokio::sync::Notify>>,
     }
 
     impl FakeApi {
@@ -2151,6 +2292,9 @@ mod tests {
             Ok(json!([{"id": "lsp"}]))
         }
         async fn mcp_status(&self, _loc: &Location) -> Result<Value> {
+            if let Some(stall) = &self.stall_mcp {
+                stall.notified().await;
+            }
             Ok(json!({"mcp": {"status": "connected"}}))
         }
         async fn mcp_connect(&self, _loc: &Location, _name: &str) -> Result<bool> {
@@ -2410,6 +2554,49 @@ mod tests {
         );
         assert_eq!(state.project.project_id.as_deref(), Some("prj_1"));
         assert_eq!(state.project.main_dir.as_deref(), Some("/repo/sub"));
+    }
+
+    /// A stalled phase-2 endpoint (an MCP server that never answers) must
+    /// not hold the app: phase 1 lands as `Partial` and the lock is free.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stalled_mcp_server_leaves_the_app_usable() {
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let api = std::sync::Arc::new(FakeApi {
+            stall_mcp: Some(release.clone()),
+            ..FakeApi::default()
+        });
+        let app = std::sync::Arc::new(tokio::sync::Mutex::new(crate::state::App::new(
+            crate::config::TuiConfig::default(),
+            Args::default(),
+            None,
+        )));
+        let task = tokio::spawn({
+            let app = app.clone();
+            let api = api.clone();
+            async move { bootstrap_shared(&*app, api.as_ref(), true).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if app.lock().await.state.sync.status == Some(SyncStatus::Partial) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("phase 1 applies while MCP stalls");
+        {
+            let app = app
+                .try_lock()
+                .expect("no lock held across the stalled request");
+            assert_eq!(app.state.sync.provider.len(), 1);
+        }
+        release.notify_one();
+        task.await.unwrap().expect("bootstraps");
+        assert_eq!(
+            app.lock().await.state.sync.status,
+            Some(SyncStatus::Complete)
+        );
     }
 
     #[tokio::test]
