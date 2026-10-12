@@ -193,6 +193,9 @@ export const api = {
   vcsDiff: (directory: string) => request<VcsFileDiff[]>("GET", "/vcs/diff", { directory, query: { mode: "git" } }),
   promptAsync: (id: string, body: PromptInput) => request<void>("POST", `/session/${id}/prompt_async`, { body }),
   command: (id: string, body: CommandInput) => request<MessageWithParts>("POST", `/session/${id}/command`, { body }),
+  /** Runs `command` in the session's shell as a turn; answers when it ends. */
+  shell: (id: string, body: { command: string; agent: string; model?: { providerID: string; modelID: string } }) =>
+    request<MessageWithParts>("POST", `/session/${id}/shell`, { body }),
   abort: (id: string) => request<boolean>("POST", `/session/${id}/abort`),
   fork: (id: string, messageID?: string) => request<Session>("POST", `/session/${id}/fork`, { body: { messageID } }),
   revert: (id: string, messageID: string, partID?: string) =>

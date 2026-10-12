@@ -2,13 +2,14 @@
 // for the next prompt, send / stop. Drafts are kept per session so switching
 // columns never loses text.
 import { createMemo, createResource, createSignal, For, onCleanup, Show } from "solid-js"
-import { createStore } from "solid-js/store"
+import { createStore, unwrap } from "solid-js/store"
 import { api } from "../../api/client"
 import type { Agent, Command } from "../../api/types"
 import { lastAssistant } from "../../fleet/derive"
 import { state } from "../../store/store"
 import { Icon } from "../../ui/icons"
 import { toast } from "../toast"
+import { historyStep, loadDrafts, saveDrafts } from "./drafts"
 import { ModelPicker, VariantPicker } from "./model-picker"
 import {
   attachmentKind,
@@ -22,7 +23,7 @@ import {
   type Attachment,
   type Draft as Body,
 } from "./prompt"
-import { canRestoreFiles, isBusy, revertedPrompts, unrevert } from "./revert"
+import { canRestoreFiles, isBusy, promptText, revertedPrompts, unrevert } from "./revert"
 
 interface Draft {
   text: string
@@ -55,7 +56,17 @@ async function readAttachment(f: File): Promise<Attachment> {
     r.readAsDataURL(f)
   })
 }
-const [drafts, setDrafts] = createStore<Record<string, Draft>>({})
+const [drafts, setDrafts] = createStore<Record<string, Draft>>(loadDrafts())
+let saveTimer: ReturnType<typeof setTimeout> | undefined
+const persist = () => {
+  clearTimeout(saveTimer)
+  saveTimer = setTimeout(() => saveDrafts(unwrap(drafts)), 300)
+}
+// A reload right after typing still keeps the last keystrokes.
+addEventListener("pagehide", () => {
+  clearTimeout(saveTimer)
+  saveDrafts(unwrap(drafts))
+})
 
 const agentCache = new Map<string, Promise<Agent[]>>()
 const commandCache = new Map<string, Promise<Command[]>>()
@@ -92,6 +103,9 @@ const variantsFor = (dir: string) => {
   return variantCache.get(dir)!
 }
 
+/** A draft starting with `!` is a shell command (POST /session/:id/shell), as upstream. */
+const shellMode = (text: string) => text.startsWith("!")
+
 type Pop = { kind: "file" | "command"; items: { value: string; hint: string }[]; sel: number; start: number }
 
 export function Composer(props: { sessionID: string }) {
@@ -99,7 +113,10 @@ export function Composer(props: { sessionID: string }) {
   const session = () => state.sessions[props.sessionID]
   const dir = () => session()?.directory ?? ""
   const draft = () => drafts[props.sessionID] ?? { text: "", files: [] }
-  const setDraft = (d: Partial<Draft>) => setDrafts(props.sessionID, { ...draft(), ...d })
+  const setDraft = (d: Partial<Draft>) => {
+    setDrafts(props.sessionID, { ...draft(), ...d })
+    persist()
+  }
 
   const [agents] = createResource(dir, agentsFor)
   const primary = createMemo(() => (agents() ?? []).filter((a) => a.mode !== "subagent" && !a.hidden))
@@ -195,9 +212,39 @@ export function Composer(props: { sessionID: string }) {
     ta.style.height = `${Math.min(220, ta.scrollHeight + 2)}px`
   }
 
+  // ↑/↓ walk this session's earlier prompts. ↑ starts only at the very start
+  // of the box (so it still moves the caret within text), ↓ only while
+  // walking and on the last line; the draft comes back past the newest.
+  const history = createMemo(() =>
+    (state.messages[props.sessionID] ?? [])
+      .filter((id) => state.message[id]?.role === "user")
+      .map((id) => promptText(state, id))
+      .filter((t) => t.trim()),
+  )
+  let hist: number | undefined
+  let stash = ""
+  const walkHistory = (e: KeyboardEvent) => {
+    const up = e.key === "ArrowUp"
+    const v = ta.value
+    if (up ? ta.selectionStart !== 0 && hist === undefined : v.slice(ta.selectionEnd).includes("\n")) return false
+    if (up && v.slice(0, ta.selectionStart).includes("\n")) return false
+    const step = historyStep(history(), hist, up ? "up" : "down")
+    if (step === "stay") return false
+    e.preventDefault()
+    if (hist === undefined) stash = v
+    hist = step.index
+    const text = hist === undefined ? stash : history()[hist]!
+    ta.value = text
+    setDraft({ text })
+    autosize()
+    const pos = up ? 0 : text.length
+    ta.setSelectionRange(pos, pos)
+    return true
+  }
+
   const send = async () => {
     const text = ta.value.trim()
-    if (!text || sending()) return
+    if (!text || sending() || (shellMode(text) && !text.slice(1).trim())) return
     const files = draft().files
     const attachments = draft().attachments ?? []
     const body: Body = {
@@ -221,6 +268,17 @@ export function Composer(props: { sessionID: string }) {
         setDraft({ text, files, attachments })
         autosize()
       }
+    }
+    hist = undefined
+    if (shellMode(text)) {
+      // `!cmd` runs in the session's shell as its own turn; like a command it
+      // answers only when it ends, so don't hold the composer.
+      const command = text.slice(1).trim()
+      const m = promptBody(body).model
+      void api
+        .shell(props.sessionID, { command, agent: agent(), model: m })
+        .catch((err) => restore(err, "run the shell command"))
+      return
     }
     const cmd = /^\/(\S+)\s*([\s\S]*)$/.exec(text)
     const commands = cmd ? await commandsFor(dir()) : []
@@ -305,6 +363,15 @@ export function Composer(props: { sessionID: string }) {
       e.stopPropagation()
       return pickVariant(cycleVariant(variants(), variant()))
     }
+    if (
+      (e.key === "ArrowUp" || e.key === "ArrowDown") &&
+      !e.shiftKey &&
+      !e.altKey &&
+      !e.metaKey &&
+      !e.ctrlKey &&
+      walkHistory(e)
+    )
+      return
     // An IME commit (keyCode 229) is not a send; on touch, Enter is a newline and Send sends.
     if (e.key === "Enter" && !e.shiftKey && !e.isComposing && e.keyCode !== 229 && !coarse) {
       e.preventDefault()
@@ -318,7 +385,7 @@ export function Composer(props: { sessionID: string }) {
   }
 
   return (
-    <div class="composer">
+    <div class="composer" classList={{ shell: shellMode(draft().text) }}>
       <Show when={rolledBack().length}>
         <div class="revert-dock" role="status">
           <Icon name="undo" />
@@ -438,6 +505,7 @@ export function Composer(props: { sessionID: string }) {
         placeholder={`Message ${agent()} — @ for files, / for commands`}
         aria-label={`Message ${session()?.title ?? "session"}`}
         onInput={() => {
+          hist = undefined
           setDraft({ text: ta.value })
           autosize()
           void updatePopover()
@@ -492,8 +560,15 @@ export function Composer(props: { sessionID: string }) {
           <Icon name="attach" />
         </button>
         <span class="spacer" />
+        <Show when={shellMode(draft().text)}>
+          <span class="shell-tag" title={`Runs in ${dir()}`}>
+            Shell
+          </span>
+        </Show>
         <Show when={!coarse}>
-          <span class="hint">↵ send · ⇧↵ newline</span>
+          <span class="hint">
+            {shellMode(draft().text) ? "↵ run" : "↵ send"} · ⇧↵ newline{history().length ? " · ↑ earlier" : ""}
+          </span>
         </Show>
         <Show when={busy()}>
           <button class="send stop" onClick={() => void stop()}>

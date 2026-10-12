@@ -2226,6 +2226,18 @@ button.tool-row:hover {
   height: 28px;
   border: 0;
 }
+/* `!command`: the box reads as a command line, and the row says so. */
+.composer.shell textarea {
+  font-family: var(--f-mono);
+}
+.composer .shell-tag {
+  padding: 4px 6px;
+  font: 500 10.5px/1 var(--f-mono);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  background: var(--ink);
+  color: var(--ground);
+}
 /* Shown while the session is reverted: what the next prompt will discard. */
 .revert-dock {
   display: flex;

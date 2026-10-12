@@ -215,7 +215,14 @@ function TurnView(props: {
             <div class="msg-label">
               You<span class="mono">{hm(u().time.created)}</span>
             </div>
-            <div class="body">
+            {/* A shell turn's prompt is only the server's synthetic note: no empty plate. */}
+            <div
+              class="body"
+              hidden={(state.parts[u().id] ?? []).every((pid) => {
+                const p = state.part[pid]
+                return !p || (p.type === "text" && !!(p as { synthetic?: boolean }).synthetic)
+              })}
+            >
               <For each={state.parts[u().id] ?? []}>
                 {(pid) => (
                   <Show when={state.part[pid]}>
