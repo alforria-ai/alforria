@@ -506,6 +506,23 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn plain_tui_runs_the_server_in_process_without_a_listener() {
+        // Other tests in this binary open listeners concurrently, so the
+        // check runs alone in a child test process.
+        const ALONE: &str = "ALFORRIA_TEST_NO_LISTENER_ALONE";
+        if std::env::var_os(ALONE).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "cmd::tui::tests::plain_tui_runs_the_server_in_process_without_a_listener",
+                    "--exact",
+                    "--test-threads=1",
+                ])
+                .env(ALONE, "1")
+                .stdin(std::process::Stdio::null())
+                .status()
+                .expect("re-run the test alone");
+            assert!(status.success(), "the isolated run failed");
+            return;
+        }
         let before = listening_inodes();
         let matches = parse_args(&[]);
         let (mut ui, _captured) = crate::ui::Ui::capture(false);
