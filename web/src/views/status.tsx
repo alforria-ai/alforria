@@ -1,6 +1,7 @@
 // The status line: link state, fleet counts, today's totals. Mono data only.
 import { Match, Switch } from "solid-js"
 import { counts, totals } from "../fleet/fleet"
+import { unseenOrder } from "../nav/unseen"
 import { state } from "../store/store"
 import { ktok, money, now } from "../ui/format"
 
@@ -22,6 +23,7 @@ export function StatusLine(props: { onKeys: () => void }) {
       </span>
       <span>
         {counts().all} sessions · {counts().working} working · {counts().waiting} waiting
+        {unseenOrder().length ? ` · ${unseenOrder().length} new (U)` : ""}
       </span>
       <span title="Summed over the sessions in the table: everything live plus the last 3 days">
         {ktok(totals().tokens)} tokens · {money(totals().cost)} across {counts().all} sessions

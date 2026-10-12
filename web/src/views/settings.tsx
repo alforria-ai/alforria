@@ -459,7 +459,7 @@ function Appearance() {
           <span class="n">Notifications</span>
           <span class="d">
             {canNotify()
-              ? "Notify when an agent starts waiting on you while this tab is in the background."
+              ? "Notify when an agent waits on you, finishes or fails while this tab is in the background."
               : "This browser does not support notifications."}
           </span>
           <div class="seg" role="group" aria-label="Notifications">

@@ -6,10 +6,28 @@
 import { createSignal, For, Show } from "solid-js"
 import { activity, counts, displayTitle, fleetState, groups, interrupts } from "../fleet/fleet"
 import { nav } from "../nav/route"
+import { unseen } from "../nav/unseen"
 import { state } from "../store/store"
 import { age, now } from "../ui/format"
 import { Icon } from "../ui/icons"
 import { nowLabel } from "./table"
+
+/** A session that finished or failed while nobody was looking: an ink block and a word. */
+export function UnseenMark(props: { id: string }) {
+  return (
+    <Show when={unseen[props.id]}>
+      {(u) => (
+        <span
+          class="unseen-mark"
+          classList={{ fault: u().outcome === "fault" }}
+          title={u().outcome === "fault" ? "Failed while you were away" : "Finished while you were away"}
+        >
+          <span class="sr-only">{u().outcome === "fault" ? "New failure: " : "New: "}</span>
+        </span>
+      )}
+    </Show>
+  )
+}
 
 export function Rail(props: {
   onOpen: (id: string, beside: boolean) => void
@@ -130,7 +148,10 @@ export function Rail(props: {
                       onClick={(e) => props.onOpen(id, e.shiftKey)}
                     >
                       <span class={`lamp ${st()}`} />
-                      <span class="t">{displayTitle(r.session)}</span>
+                      <span class="t">
+                        <UnseenMark id={id} />
+                        {displayTitle(r.session)}
+                      </span>
                       <span class="badges">
                         <For each={cols()}>
                           {(i) => (

@@ -281,6 +281,38 @@ try {
     await p.keyboard.press("Escape")
   }
 
+  console.log("unseen")
+  {
+    await p.goto(`${UI}/#/`)
+    const row = p.locator("tr.s-row", { hasText: "Consolidate color tokens" })
+    await row.waitFor()
+    // A turn that ends while only the overview is showing.
+    const sid = await row.getAttribute("data-sid")
+    await p.evaluate(
+      (id) =>
+        fetch(`/session/${id}/prompt_async`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ parts: [{ type: "text", text: "One more pass, please." }] }),
+        }),
+      sid,
+    )
+    await row.locator(".unseen-mark").waitFor({ timeout: 15_000 })
+    check(true, "a turn that finished unseen marks its row")
+    check(/\d+ new/.test((await p.locator(".status").textContent()) ?? ""), "the status line counts it")
+    // Earlier checks ended turns unseen too; U walks them oldest first.
+    for (let i = 0; i < 6 && !p.url().includes(sid!); i++) {
+      if (i) await p.keyboard.press("Escape")
+      await p.locator("body").click({ position: { x: 700, y: 880 } })
+      await p.keyboard.press("u")
+      await p.waitForURL(/#\/focus\/ses_/)
+    }
+    check(p.url().includes(sid!), "U opens the oldest unseen session")
+    await p.waitForTimeout(300)
+    check(!(await p.locator(`[data-rail="${sid}"] .unseen-mark`).count()), "…and showing it clears the mark")
+    await p.keyboard.press("Escape")
+  }
+
   console.log("a11y")
   for (const theme of ["dark", "light"]) {
     await p.evaluate((t) => (document.documentElement.dataset.theme = t), theme)

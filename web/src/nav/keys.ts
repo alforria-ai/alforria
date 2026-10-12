@@ -18,6 +18,8 @@ export interface KeyActions {
   compose(): void
   /** F2: rename, archive or delete the cursor row's or active column's session. */
   manage(): void
+  /** U: open the oldest session that finished or failed unseen. */
+  nextUnseen(): void
 }
 
 export function isTyping(el: Element | null) {
@@ -58,6 +60,7 @@ export function bindKeys(view: () => "overview" | "focus" | "settings", a: KeyAc
     }
     if (k === "?") return go(a.keys)
     if (k === "F2") return go(a.manage)
+    if (lower === "u" && view() !== "settings") return go(a.nextUnseen)
     if (k === "/") return go(a.palette)
     if (lower === "q") return go(a.queue)
     if (lower === "n") return go(a.newSession)

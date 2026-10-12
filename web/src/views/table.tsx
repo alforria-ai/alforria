@@ -16,6 +16,7 @@ import { state } from "../store/store"
 import { age, money, now, tildify } from "../ui/format"
 import { Icon } from "../ui/icons"
 import { server } from "./server"
+import { UnseenMark } from "./rail"
 
 const STATE_WORD: Record<FleetState, string> = {
   waiting: "Waiting",
@@ -135,6 +136,7 @@ function SessionRow(props: {
       </td>
       <td class="c-session" title={displayTitle(props.session)}>
         <div class="title-cell">
+          <UnseenMark id={id()} />
           <span class="t">{displayTitle(props.session)}</span>
           <Show when={props.session.agent && props.session.agent !== "build"}>
             <span class="tag">{props.session.agent}</span>

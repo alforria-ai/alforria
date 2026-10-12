@@ -1437,6 +1437,23 @@ kbd {
   flex: none;
   color: var(--ink-3);
 }
+/* Finished (solid) or failed (hollow) while nobody looked; cleared once shown. */
+.unseen-mark {
+  flex: none;
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-right: 6px;
+  vertical-align: 1px;
+  background: var(--ink);
+}
+.unseen-mark.fault {
+  background: none;
+  box-shadow: inset 0 0 0 1.5px var(--ink);
+}
+.title-cell .unseen-mark {
+  margin-right: -2px;
+}
 /* Rename / archive / delete: shown on the row under the pointer or the cursor. */
 .title-cell .row-more {
   flex: none;

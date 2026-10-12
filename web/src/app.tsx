@@ -35,6 +35,7 @@ import { KeysSheet, Palette } from "./views/palette"
 import { OpenFolder } from "./views/open-folder"
 import { Settings } from "./views/settings"
 import { ArchivedSessions, ManageSession } from "./views/manage"
+import { unseenOrder } from "./nav/unseen"
 
 const PHONE = "(max-width: 760px)"
 
@@ -133,6 +134,11 @@ export function App() {
       },
       compose: () => document.querySelector<HTMLTextAreaElement>(".col.is-active textarea")?.focus(),
       manage: () => setManaging(manageTarget() ?? null),
+      nextUnseen: () => {
+        const id = unseenOrder()[0]
+        if (!id) return toast("No session has news")
+        open(id)
+      },
     })
     onCleanup(() => {
       stopSync()

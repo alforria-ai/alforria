@@ -264,6 +264,7 @@ const GROUPS: [string, [string[], string][]][] = [
       [["⌘K"], "Search sessions, files, commands"],
       [["Q"], "Go to the queue"],
       [["N"], "New session"],
+      [["U"], "Open the oldest session that finished or failed while you were away"],
       [["Esc"], "Back (focus → overview, settings → where you were)"],
       [["F2"], "Rename, archive or delete the cursor row's or active column's session"],
       [["?"], "This sheet"],

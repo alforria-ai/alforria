@@ -3,6 +3,7 @@
 // shell can swap the implementation.
 import { createEffect, createRoot, createSignal, on } from "solid-js"
 import { displayTitle, interrupts } from "./fleet/fleet"
+import { watchOutcomes } from "./nav/unseen"
 import { state } from "./store/store"
 
 const KEY = "alforria.notify"
@@ -46,8 +47,9 @@ function notify(title: string, body: string, onClick: () => void) {
 }
 
 /**
- * Background signals: the tab title carries the waiting count, and a new
- * waiting item raises an OS notification while the tab is hidden.
+ * Background signals: the tab title carries the waiting count, and while the
+ * tab is hidden a new waiting item, a finished turn or a failure raises an OS
+ * notification.
  */
 export function startPlatform(open: (sessionID: string) => void) {
   createRoot(() => {
@@ -74,5 +76,13 @@ export function startPlatform(open: (sessionID: string) => void) {
         known = ids
       }),
     )
+  })
+  watchOutcomes((id, outcome) => {
+    if (!document.hidden) return
+    const title = displayTitle(state.sessions[id])
+    const err = state.errors[id]
+    if (outcome === "fault")
+      notify(`${title} failed`, err ? `${err.name}: ${err.message}` : "The turn ended in an error", () => open(id))
+    else notify(`${title} finished`, "Its turn is done", () => open(id))
   })
 }
