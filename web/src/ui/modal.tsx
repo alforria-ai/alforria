@@ -45,14 +45,24 @@ export function Modal(props: {
   let panel!: HTMLDivElement
   if (depth() === 0 && !returnTo) returnTo = document.activeElement as HTMLElement | null
   setDepth((d) => d + 1)
+  const level = depth()
   const app = document.getElementById("app")
   app?.setAttribute("inert", "")
 
+  // A control that removes itself (a deleted row) drops focus to <body>,
+  // outside the panel: the top dialog still takes the keys and pulls focus back.
+  const onStray = (e: KeyboardEvent) => {
+    if (level !== depth() || panel.contains(document.activeElement)) return
+    panel.focus({ preventScroll: true })
+    onKeyDown(e)
+  }
   onMount(() => {
     const first = props.initialFocus?.(panel) ?? panel.querySelector<HTMLElement>(FOCUSABLE) ?? panel
     first.focus({ preventScroll: true })
+    document.addEventListener("keydown", onStray)
   })
   onCleanup(() => {
+    document.removeEventListener("keydown", onStray)
     setDepth((d) => d - 1)
     // Defer: one modal may hand over to another (palette → keys sheet).
     queueMicrotask(() => {

@@ -34,6 +34,7 @@ import { toast, Toasts } from "./views/toast"
 import { KeysSheet, Palette } from "./views/palette"
 import { OpenFolder } from "./views/open-folder"
 import { Settings } from "./views/settings"
+import { ArchivedSessions, ManageSession } from "./views/manage"
 
 const PHONE = "(max-width: 760px)"
 
@@ -45,6 +46,16 @@ export function App() {
   const [palette, setPalette] = createSignal<string | null>(null)
   const [keysOpen, setKeysOpen] = createSignal(false)
   const [folderOpen, setFolderOpen] = createSignal(false)
+  const [managing, setManaging] = createSignal<string | null>(null)
+  const [archivedOpen, setArchivedOpen] = createSignal(false)
+  /** F2's target: a focused session-list row, the table's cursor row, or the active column. */
+  const manageTarget = () => {
+    const rail = (document.activeElement as HTMLElement | null)?.closest<HTMLElement>("[data-rail]")
+    if (rail) return rail.dataset.rail
+    if (nav.view === "overview") return cursor() ?? undefined
+    const col = nav.columns[nav.active]
+    return col?.kind === "session" ? col.session : undefined
+  }
   let queueEl: HTMLElement | undefined
   let workspaceEl!: HTMLElement
 
@@ -121,6 +132,7 @@ export function App() {
         if (next) open(next)
       },
       compose: () => document.querySelector<HTMLTextAreaElement>(".col.is-active textarea")?.focus(),
+      manage: () => setManaging(manageTarget() ?? null),
     })
     onCleanup(() => {
       stopSync()
@@ -158,7 +170,12 @@ export function App() {
             />
           }
         >
-          <Rail onOpen={open} onNextWaiting={openNextWaiting} onCollapse={() => setPanelOpen((v) => !v)} />
+          <Rail
+            onOpen={open}
+            onNextWaiting={openNextWaiting}
+            onCollapse={() => setPanelOpen((v) => !v)}
+            onManage={setManaging}
+          />
         </Show>
         <section class="workspace" id="workspace" aria-label="Workspace" ref={workspaceEl}>
           <Switch>
@@ -222,7 +239,7 @@ export function App() {
                     </div>
                   }
                 >
-                  <SessionTable cursor={cursor()} onOpen={open} onNewSession={newSession} />
+                  <SessionTable cursor={cursor()} onOpen={open} onNewSession={newSession} onManage={setManaging} />
                 </Show>
               </div>
             </Match>
@@ -254,12 +271,20 @@ export function App() {
               setColumnFile(nav.active, path)
             },
             showKeys: () => setKeysOpen(true),
+            manage: setManaging,
+            archived: () => setArchivedOpen(true),
             close: () => setPalette(null),
           }}
         />
       </Show>
       <Show when={folderOpen()}>
         <OpenFolder onStart={startSession} close={() => setFolderOpen(false)} />
+      </Show>
+      <Show when={state.sessions[managing() ?? ""]}>
+        {(s) => <ManageSession session={s()} close={() => setManaging(null)} />}
+      </Show>
+      <Show when={archivedOpen()}>
+        <ArchivedSessions onOpen={(id) => open(id)} close={() => setArchivedOpen(false)} />
       </Show>
       <Show when={keysOpen()}>
         <KeysSheet close={() => setKeysOpen(false)} />

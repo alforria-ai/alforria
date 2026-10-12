@@ -16,6 +16,8 @@ export interface KeyActions {
   column(delta: number): void
   stepSession(delta: number): void
   compose(): void
+  /** F2: rename, archive or delete the cursor row's or active column's session. */
+  manage(): void
 }
 
 export function isTyping(el: Element | null) {
@@ -55,6 +57,7 @@ export function bindKeys(view: () => "overview" | "focus" | "settings", a: KeyAc
       fn()
     }
     if (k === "?") return go(a.keys)
+    if (k === "F2") return go(a.manage)
     if (k === "/") return go(a.palette)
     if (lower === "q") return go(a.queue)
     if (lower === "n") return go(a.newSession)

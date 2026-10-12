@@ -178,6 +178,15 @@ export const api = {
     request<Session>("POST", "/session", { directory, body }),
   updateSession: (id: string, body: { title?: string }) => request<Session>("PATCH", `/session/${id}`, { body }),
   deleteSession: (id: string) => request<boolean>("DELETE", `/session/${id}`),
+  archiveSession: (id: string, at = Date.now()) =>
+    request<Session>("PATCH", `/session/${id}`, { body: { time: { archived: at } } }),
+  /** Sessions across every project, newest first; `next` is the cursor for the page after. */
+  sessionsAcrossProjects: async (query: { archived?: boolean; roots?: boolean; cursor?: number; limit?: number }) => {
+    const res = await fetch(apiUrl("/experimental/session", query), { credentials: "same-origin" })
+    if (!res.ok) throw new ApiError(res.status, undefined, `GET /experimental/session → ${res.status}`)
+    const next = Number(res.headers.get("x-next-cursor")) || undefined
+    return { sessions: (await res.json()) as Session[], next }
+  },
   messages: (id: string, opts: { limit?: number; before?: string } = {}) =>
     request<MessageWithParts[]>("GET", `/session/${id}/message`, { query: opts }),
   /** The newest `limit` messages before `before` (oldest first); `next` reads the page before, absent at the start. */

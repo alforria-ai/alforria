@@ -197,6 +197,14 @@ export function closeColumn(i: number) {
   push()
 }
 
+/** Close every column showing one of these sessions (before deleting them). */
+export function closeSessionColumns(sessions: string[]) {
+  for (let i = nav.columns.length - 1; i >= 0; i--) {
+    const col = nav.columns[i]!
+    if (col.kind === "session" && sessions.includes(col.session)) closeColumn(i)
+  }
+}
+
 export function closeOtherColumns() {
   setNav(
     produce((n) => {

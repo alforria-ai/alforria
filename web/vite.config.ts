@@ -32,6 +32,7 @@ const api = [
   "/lsp",
   "/auth",
   "/api",
+  "/experimental",
   "/doc",
   "/openapi.json",
 ]

@@ -212,6 +212,75 @@ try {
     await p.keyboard.press("Escape")
   }
 
+  console.log("session management")
+  {
+    await p.goto(`${UI}/#/`)
+    const row = (title: string) => p.locator("tr.s-row", { hasText: title })
+    await row("Trailing slash").first().waitFor()
+    await row("Trailing slash").hover()
+    await row("Trailing slash").locator(".row-more").click()
+    await p.locator(".dialog.manage").waitFor()
+    const dlg = await a11y(p)
+    check(!dlg.length, "the session dialog has no serious a11y violations", dlg)
+    await p.locator(".dialog.manage input").fill("Renamed from the table")
+    await p.keyboard.press("Enter")
+    await row("Renamed from the table").waitFor({ timeout: 5000 })
+    check((await p.locator(".dialog.manage").count()) === 0, "rename from the row's ⋯ updates the row in place")
+
+    // F2 on the cursor row, then archive: the row leaves the table.
+    await row("Bump clap").click()
+    await p.waitForURL(/#\/focus\/ses_/)
+    await p.keyboard.press("Escape")
+    await p.locator("tr.s-row").first().waitFor()
+    await p.keyboard.press("F2")
+    await p.locator(".dialog.manage").waitFor()
+    check(
+      (await p.locator(".dialog.manage input").inputValue()) === "Bump clap to 5.0",
+      "F2 manages the cursor row's session",
+    )
+    await p.locator(".dialog.manage .link-btn", { hasText: "Archive" }).click()
+    await row("Bump clap").waitFor({ state: "detached", timeout: 5000 })
+    check(true, "Archive takes the session out of the table")
+
+    // The archived view lists it, and deletes it after a confirm.
+    await p.keyboard.press("Control+k")
+    await p.keyboard.type("archived")
+    await p.keyboard.press("Enter")
+    const item = p.locator(".archived-list li", { hasText: "Bump clap" })
+    await item.waitFor({ timeout: 5000 })
+    check(true, "the archived view lists the archived session")
+    await item.locator(".link-btn", { hasText: "Delete" }).click()
+    check(
+      (await item.locator(".confirm-row[role=alert]").count()) === 1,
+      "Delete asks first, in place, naming the session",
+    )
+    await item.locator(".link-btn.danger").click()
+    await item.waitFor({ state: "detached", timeout: 5000 })
+    check(true, "a confirmed delete removes it")
+    await p.keyboard.press("Escape")
+
+    // The session list: right-click or F2 on a row.
+    await row("Fix flaky").click()
+    await p.waitForURL(/#\/focus\/ses_/)
+    await p.locator(".rail-row", { hasText: "Fix flaky" }).click({ button: "right" })
+    await p.locator(".dialog.manage").waitFor()
+    check(true, "right-click on a session-list row opens the session dialog")
+    await p.keyboard.press("Escape")
+    await p.locator(".rail-list [tabindex='0']").focus()
+    await p.keyboard.press("F2")
+    await p.locator(".dialog.manage").waitFor()
+    check(true, "F2 on a session-list row opens it too")
+    await p.keyboard.press("Escape")
+    await p.keyboard.press("Control+k")
+    await p.keyboard.type("archive or delete")
+    check(
+      ((await p.locator(".palette .res.on .t").textContent()) ?? "").includes("Fix flaky"),
+      "the palette offers to manage the active column's session",
+    )
+    await p.keyboard.press("Escape")
+    await p.keyboard.press("Escape")
+  }
+
   console.log("a11y")
   for (const theme of ["dark", "light"]) {
     await p.evaluate((t) => (document.documentElement.dataset.theme = t), theme)

@@ -30,6 +30,7 @@ const PATHS = {
   columns: `<rect x="1.75" y="2.75" width="12.5" height="10.5"/><path d="M6 2.75v10.5M10 2.75v10.5"/>`,
   compact: `<path d="M2.75 3.5h10.5M4.75 8h6.5M6.75 12.5h2.5"/>`,
   server: `<rect x="1.75" y="2.25" width="12.5" height="5"/><rect x="1.75" y="8.75" width="12.5" height="5"/><path d="M4.5 4.75h1M4.5 11.25h1"/>`,
+  more: `<rect x="2.25" y="7.25" width="2" height="2" fill="currentColor" stroke="none"/><rect x="7" y="7.25" width="2" height="2" fill="currentColor" stroke="none"/><rect x="11.75" y="7.25" width="2" height="2" fill="currentColor" stroke="none"/>`,
   queue: `<rect x="1.75" y="1.75" width="12.5" height="4.5"/><path d="M1.75 9h12.5M1.75 12.5h12.5"/>`,
 } as const
 

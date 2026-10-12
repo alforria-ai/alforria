@@ -117,6 +117,7 @@ function SessionRow(props: {
   depth: number
   cursor: boolean
   onOpen: (id: string, beside: boolean) => void
+  onManage: (id: string) => void
 }) {
   const id = () => props.session.id
   const st = () => fleetState(state, id())
@@ -138,6 +139,17 @@ function SessionRow(props: {
           <Show when={props.session.agent && props.session.agent !== "build"}>
             <span class="tag">{props.session.agent}</span>
           </Show>
+          <button
+            class="row-more"
+            aria-label={`Rename, archive or delete ${displayTitle(props.session)}`}
+            title="Rename, archive or delete (F2)"
+            onClick={(e) => {
+              e.stopPropagation()
+              props.onManage(id())
+            }}
+          >
+            <Icon name="more" />
+          </button>
         </div>
       </td>
       <td class="c-now">
@@ -162,6 +174,7 @@ function SessionRow(props: {
 export function SessionTable(props: {
   cursor: string | null
   onOpen: (id: string, beside: boolean) => void
+  onManage: (id: string) => void
   onNewSession: (directory: string) => void
 }) {
   return (
@@ -234,6 +247,7 @@ export function SessionTable(props: {
                     depth={r.depth}
                     cursor={props.cursor === r.session.id}
                     onOpen={props.onOpen}
+                    onManage={props.onManage}
                   />
                 )}
               </For>

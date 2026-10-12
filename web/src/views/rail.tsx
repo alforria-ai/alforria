@@ -15,6 +15,8 @@ export function Rail(props: {
   onOpen: (id: string, beside: boolean) => void
   onNextWaiting: () => void
   onCollapse: () => void
+  /** Rename, archive or delete (a row's context menu, or F2 on it). */
+  onManage: (id: string) => void
 }) {
   const oldest = () => interrupts()[0]
   const colsOf = (id: string) =>
@@ -120,6 +122,10 @@ export function Rail(props: {
                       title={displayTitle(r.session)}
                       data-rail={id}
                       onFocus={() => setRoving(id)}
+                      onContextMenu={(e) => {
+                        e.preventDefault()
+                        props.onManage(id)
+                      }}
                       onMouseDown={(e) => e.shiftKey && e.preventDefault()}
                       onClick={(e) => props.onOpen(id, e.shiftKey)}
                     >

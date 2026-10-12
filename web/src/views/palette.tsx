@@ -19,6 +19,8 @@ export interface PaletteActions {
   openTerminal(projectID: string): void
   openFile(sessionID: string, path: string): void
   showKeys(): void
+  manage(sessionID: string): void
+  archived(): void
   close(): void
 }
 
@@ -112,6 +114,16 @@ export function Palette(props: { initial?: string; actions: PaletteActions }) {
           icon: "terminal" as const,
           run: () => props.actions.openTerminal(id),
         })),
+      ...(activeSession() && state.sessions[activeSession()!]
+        ? [
+            {
+              label: `Rename, archive or delete “${displayTitle(state.sessions[activeSession()!])}”…`,
+              meta: "F2",
+              run: () => props.actions.manage(activeSession()!),
+            },
+          ]
+        : []),
+      { label: "Archived sessions…", meta: "", run: props.actions.archived },
       { label: `Switch to ${theme() === "dark" ? "light" : "dark"} theme`, meta: "", run: toggleTheme },
       { label: "Open settings", meta: "", run: () => openSettings() },
       { label: "Keyboard shortcuts", meta: "?", run: props.actions.showKeys },
@@ -253,6 +265,7 @@ const GROUPS: [string, [string[], string][]][] = [
       [["Q"], "Go to the queue"],
       [["N"], "New session"],
       [["Esc"], "Back (focus → overview, settings → where you were)"],
+      [["F2"], "Rename, archive or delete the cursor row's or active column's session"],
       [["?"], "This sheet"],
     ],
   ],
