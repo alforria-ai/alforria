@@ -1,13 +1,13 @@
 // Focus: up to three columns, each a session (transcript / changes / files) or
 // a terminal. Columns are keyed components over the shared store, so nothing
 // reloads when you switch, split or close.
-import { createEffect, For, lazy, Match, onCleanup, Show, Suspense, Switch } from "solid-js"
-import { api, ApiError } from "../../api/client"
+import { createEffect, For, lazy, Match, Show, Suspense, Switch } from "solid-js"
+import { api } from "../../api/client"
 import { fleetState, interruptsFor, lastAssistant, sessionCost, turnDiffs } from "../../fleet/derive"
 import { displayTitle, GLOBAL_PROJECT, placeOf, projectName } from "../../fleet/fleet"
 import { closeOtherColumns, nav, setActiveColumn, setColumnFile, setColumnTab, type Column } from "../../nav/route"
-import { setState, state } from "../../store/store"
-import { releaseTranscript, retainTranscript } from "../../sync/sync"
+import { state } from "../../store/store"
+import { useTranscript } from "../../sync/sync"
 import { ktok, money } from "../../ui/format"
 import { Icon } from "../../ui/icons"
 import { slipKind } from "../queue/slip"
@@ -89,22 +89,14 @@ function SessionColumn(props: {
   onTerminal?: (projectID: string) => void
 }) {
   const id = () => props.column.session
-  createEffect(() => {
-    const sid = id()
-    // The fleet snapshot holds the 100 most recent sessions per directory; an
-    // older one opened by URL is fetched on demand. A 404 means it was deleted.
-    if (!state.sessions[sid])
-      api
-        .session(sid)
-        .then((s) => setState("sessions", s.id, s))
-        .catch((err) => {
-          if (err instanceof ApiError && err.status === 404) {
-            toast("That session no longer exists")
-            props.onClose()
-          }
-        })
-    void retainTranscript(sid).catch((err) => toast(`Could not load the transcript: ${err.message}`, "error"))
-    onCleanup(() => releaseTranscript(sid))
+  // Keyed on the id only. The fleet snapshot holds the history window; an
+  // older session opened by URL is fetched on demand.
+  useTranscript(id, {
+    missing: () => {
+      toast("That session no longer exists")
+      props.onClose()
+    },
+    error: (err) => toast(`Could not load the transcript: ${err.message}`, "error"),
   })
   // Deleted elsewhere (a `session.deleted` event): close rather than show a husk.
   let seen = false

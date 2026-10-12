@@ -55,11 +55,13 @@ export function startPlatform(open: (sessionID: string) => void) {
       const n = interrupts().length
       document.title = n ? `(${n}) alforria` : "alforria"
     })
-    let known = new Set(interrupts().map((i) => i.id))
+    // Seeded from the first snapshot: what was already waiting at load isn't news.
+    let known: Set<string> | undefined
     createEffect(
-      on(interrupts, (list) => {
+      on([interrupts, () => state.synced], ([list, synced]) => {
+        if (!synced) return
         const ids = new Set(list.map((i) => i.id))
-        if (document.hidden)
+        if (known && document.hidden)
           for (const i of list) {
             if (known.has(i.id)) continue
             const title = displayTitle(state.sessions[i.sessionID])

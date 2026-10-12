@@ -49,6 +49,8 @@ export interface State {
   branches: Record<string, string>
   /** `providerID/modelID` → display info (context window for the ctx meter). */
   models: Record<string, ModelInfo>
+  /** A fleet snapshot has landed since the page loaded. */
+  synced: boolean
   conn: { state: ConnState; lastFrame: number; attempt: number; retryAt: number }
 }
 
@@ -70,6 +72,7 @@ export function emptyState(): State {
     loaded: {},
     branches: {},
     models: {},
+    synced: false,
     conn: { state: "connecting", lastFrame: 0, attempt: 0, retryAt: 0 },
   }
 }

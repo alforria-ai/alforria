@@ -42,6 +42,15 @@ export function places() {
 }
 
 /**
+ * A folder to ask server-wide questions in (models, providers, agents): a
+ * real place, never the "global" project's "/", which would boot an instance
+ * at the root. Undefined (the server's own directory) when there is none yet.
+ */
+export function anyDirectory(): string | undefined {
+  return places()[0]?.directory
+}
+
+/**
  * A session's title for display. Subagent sessions arrive titled
  * "<task> (@explore subagent)"; the agent is already shown as a tag, so the
  * suffix only truncates the task text.
@@ -66,8 +75,11 @@ export interface ProjectGroup {
   rows: Row[]
 }
 
-/** Sessions shown in the fleet: live ones always, history for a while. */
-const HISTORY_WINDOW = 3 * 86_400_000
+/**
+ * Sessions shown in the fleet: live ones always, history for a while. The
+ * snapshot lists exactly this window (plus whatever is live or open).
+ */
+export const HISTORY_WINDOW = 3 * 86_400_000
 
 function visible(s: Session, live: Set<string>) {
   if (s.time.archived) return false
@@ -98,15 +110,23 @@ const memos = createRoot(() => {
     const group = (project: Project, list: Session[]): ProjectGroup => {
       // Parents newest first; each parent's subagents nested under it.
       const ids = new Set(list.map((s) => s.id))
-      const roots = list
-        .filter((s) => !s.parentID || !ids.has(s.parentID))
-        .sort((a, b) => b.time.created - a.time.created)
+      const roots: Session[] = []
+      const children = new Map<string, Session[]>()
+      for (const s of list) {
+        if (!s.parentID || !ids.has(s.parentID)) roots.push(s)
+        else {
+          const siblings = children.get(s.parentID)
+          if (siblings) siblings.push(s)
+          else children.set(s.parentID, [s])
+        }
+      }
+      roots.sort((a, b) => b.time.created - a.time.created)
       const rows: Row[] = []
       const walk = (s: Session, depth: number) => {
         rows.push({ session: s, depth })
-        list
-          .filter((c) => c.parentID === s.id)
-          .sort((a, b) => a.time.created - b.time.created)
+        children
+          .get(s.id)
+          ?.sort((a, b) => a.time.created - b.time.created)
           .forEach((c) => walk(c, depth + 1))
       }
       roots.forEach((s) => walk(s, 0))

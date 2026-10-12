@@ -320,4 +320,23 @@ describe("review fixes", () => {
     )
     expect(Object.keys(s.sessions).sort()).toEqual(["new", "old"])
   })
+
+  test("a snapshot drops the records of sessions that left it, but keeps viewed and waiting ones", () => {
+    const s = emptyState()
+    for (const id of ["gone", "viewed", "waiting"]) {
+      s.sessions[id] = session(id)
+      s.todos[id] = []
+      s.errors[id] = { name: "E", message: "" }
+    }
+    applySnapshot(
+      s,
+      [{ id: "prj", worktree: "/p", time: { created: 1, updated: 1 }, sandboxes: [] }],
+      [{ directory: "/p", sessions: [], status: {}, permissions: [permission("per", "waiting")], questions: [] }],
+      ["viewed"],
+    )
+    expect(Object.keys(s.sessions).sort()).toEqual(["viewed", "waiting"])
+    expect(Object.keys(s.errors).sort()).toEqual(["viewed", "waiting"])
+    expect(s.todos.gone).toBeUndefined()
+    expect(s.synced).toBe(true)
+  })
 })

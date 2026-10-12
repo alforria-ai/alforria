@@ -50,6 +50,14 @@ export function apiUrl(path: string, query: Query = {}) {
 }
 
 async function request<T>(method: string, path: string, opts: RequestOptions = {}): Promise<T> {
+  return (await send<T>(method, path, opts)).body
+}
+
+async function send<T>(
+  method: string,
+  path: string,
+  opts: RequestOptions = {},
+): Promise<{ body: T; headers: Headers }> {
   const query = { ...opts.query, directory: opts.directory }
   const res = await fetch(apiUrl(path, query), {
     method,
@@ -58,14 +66,14 @@ async function request<T>(method: string, path: string, opts: RequestOptions = {
     headers: opts.body === undefined ? undefined : { "content-type": "application/json" },
     body: opts.body === undefined ? undefined : JSON.stringify(opts.body),
   })
-  if (res.status === 204) return undefined as T
+  if (res.status === 204) return { body: undefined as T, headers: res.headers }
   const text = await res.text()
   const body = text ? safeJson(text) : undefined
   if (!res.ok) {
     const detail = typeof body === "object" && body && "message" in body ? String(body.message) : text.slice(0, 200)
     throw new ApiError(res.status, body, `${method} ${path} → ${res.status}${detail ? `: ${detail}` : ""}`)
   }
-  return body as T
+  return { body: body as T, headers: res.headers }
 }
 
 function safeJson(text: string): unknown {
@@ -103,6 +111,9 @@ export interface PromptInput {
   messageID?: string
 }
 
+/** A session from `GET /experimental/session`, with its project's name and worktree. */
+export type GlobalSession = Session & { project?: { id: string; name?: string; worktree: string } }
+
 export interface ProviderList {
   providers: {
     id: string
@@ -122,9 +133,23 @@ export const api = {
     }),
 
   // Sessions
-  /** `scope: "project"` lists the project's sessions in every directory, not just this one. */
-  sessions: (directory: string, query: { scope?: "project" } = {}) =>
+  /**
+   * `scope: "project"` lists the project's sessions in every directory, not
+   * just this one. Newest first; `start` keeps those updated since then, and
+   * the server stops at `limit` (100 when unset).
+   */
+  sessions: (directory: string, query: { scope?: "project"; start?: number; limit?: number } = {}) =>
     request<Session[]>("GET", "/session", { directory, query }),
+  /**
+   * Sessions of every project, newest first, one page at a time: `next` is
+   * the cursor for the following page, absent on the last. No directory, so
+   * it boots no instance.
+   */
+  allSessions: async (query: { start?: number; cursor?: number; limit?: number; search?: string } = {}) => {
+    const { body, headers } = await send<GlobalSession[]>("GET", "/experimental/session", { query })
+    const next = headers.get("x-next-cursor")
+    return { items: body, next: next ? Number(next) : undefined }
+  },
   sessionStatus: (directory: string) => request<Record<string, SessionStatus>>("GET", "/session/status", { directory }),
   session: (id: string) => request<Session>("GET", `/session/${id}`),
   createSession: (directory: string, body: { title?: string; parentID?: string } = {}) =>
