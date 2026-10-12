@@ -668,7 +668,7 @@ fn current_millis() -> u64 {
 // ------------------------------------------------------------- autocomplete
 
 /// One autocomplete row (`AutocompleteOption`).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct AutocompleteOption {
     pub display: String,
     pub description: Option<String>,
@@ -679,11 +679,37 @@ pub struct AutocompleteOption {
     /// A TUI command name for `/` completions (dispatched on select,
     /// `useCommandSlashes` → `keymap.dispatchCommand`).
     pub tui_command: Option<&'static str>,
+    /// A file, directory or MCP resource mention, inserted as a `file`
+    /// part.
+    pub file: Option<FileMention>,
+}
+
+/// What an `@` file/resource row inserts (`createFilePart`,
+/// `autocomplete.tsx:244-284`; the MCP resource part, `:336-360`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileMention {
+    /// The mention text after `@` (`path#start-end` for a line range).
+    pub filename: String,
+    /// The `file` part, its `source.text` filled at insertion.
+    pub part: Value,
+    pub is_directory: bool,
+}
+
+/// One `GET /api/fs/find` hit.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FoundEntry {
+    pub path: String,
+    pub is_directory: bool,
 }
 
 /// The model half of `prompt/autocomplete.tsx`.
 #[derive(Debug, Default)]
 pub struct Autocomplete {
+    /// The `fs.find` query last asked for, and the one waiting to be sent.
+    pub files_requested: Option<String>,
+    pub file_request: Option<String>,
+    /// The answered query, its location directory and hits.
+    pub files: Option<(String, String, Vec<FoundEntry>)>,
     /// `false | "@" | "/"`.
     pub visible: Option<char>,
     /// Char offset of the trigger character.
@@ -714,6 +740,102 @@ pub fn mention_trigger_index(value: &str, offset: usize) -> Option<usize> {
     } else {
         None
     }
+}
+
+/// `extractLineRange` (`autocomplete.tsx:32-56`): the base query and a
+/// `#start` / `#start-end` range (`end` only when after `start`).
+pub fn extract_line_range(input: &str) -> (String, Option<(u64, Option<u64>)>) {
+    let Some(hash) = input.rfind('#') else {
+        return (input.to_string(), None);
+    };
+    let base = input[..hash].to_string();
+    let line_part = &input[hash + 1..];
+    let (start, end) = match line_part.split_once('-') {
+        Some((start, end)) => (start, Some(end)),
+        None => (line_part, None),
+    };
+    let Ok(start) = start.parse::<u64>() else {
+        return (base, None);
+    };
+    if start.to_string().len() != start_len(line_part) {
+        return (base, None);
+    }
+    let end = match end {
+        None | Some("") => None,
+        Some(end) => match end.parse::<u64>() {
+            Ok(end) if end > start => Some(end),
+            Ok(_) => None,
+            Err(_) => return (base, None),
+        },
+    };
+    (base, Some((start, end)))
+}
+
+/// The digits before an optional `-` (the `^(\d+)` of the TS regex).
+fn start_len(line_part: &str) -> usize {
+    line_part.split('-').next().map_or(0, str::len)
+}
+
+/// `pathToFileURL(path).href`: `file://` plus the path, percent-encoded
+/// per the WHATWG path set (spaces, `#`, `?`, `%`, quotes, braces, …).
+pub fn file_url(path: &str) -> String {
+    let mut out = String::from("file://");
+    for byte in path.as_bytes() {
+        match byte {
+            b' ' | b'"' | b'#' | b'%' | b'<' | b'>' | b'?' | b'`' | b'{' | b'}' | b'\\' => {
+                out.push_str(&format!("%{byte:02X}"))
+            }
+            0x00..=0x1f | 0x7f..=0xff => out.push_str(&format!("%{byte:02X}")),
+            _ => out.push(*byte as char),
+        }
+    }
+    out
+}
+
+/// `createFilePart` (`autocomplete.tsx:244-284`).
+fn file_mention(
+    entry: &FoundEntry,
+    absolute: &str,
+    line_range: Option<(u64, Option<u64>)>,
+) -> FileMention {
+    let range = line_range.filter(|_| !entry.is_directory);
+    let filename = match range {
+        Some((start, Some(end))) => format!("{}#{start}-{end}", entry.path),
+        Some((start, None)) => format!("{}#{start}", entry.path),
+        None => entry.path.clone(),
+    };
+    let mut url = file_url(absolute);
+    if let Some((start, end)) = range {
+        url.push_str(&format!("?start={start}"));
+        if let Some(end) = end {
+            url.push_str(&format!("&end={end}"));
+        }
+    }
+    FileMention {
+        filename: filename.clone(),
+        part: json!({
+            "type": "file",
+            "mime": if entry.is_directory { "application/x-directory" } else { "text/plain" },
+            "filename": filename,
+            "url": url,
+            "source": {
+                "type": "file",
+                "text": {"start": 0, "end": 0, "value": ""},
+                "path": entry.path,
+            },
+        }),
+        is_directory: entry.is_directory,
+    }
+}
+
+/// An `fs.find` answer: kept if it is still the query on screen.
+pub fn files_found(app: &mut App, query: &str, directory: &str, entries: Vec<FoundEntry>) {
+    let auto = &mut app.ui.prompt.autocomplete;
+    if auto.visible != Some('@') || auto.files_requested.as_deref() != Some(query) {
+        return;
+    }
+    auto.files = Some((query.to_string(), directory.to_string(), entries));
+    rebuild_options(app);
 }
 
 /// `removeLineRange` (`prompt/autocomplete.tsx:27-30`).
@@ -830,6 +952,8 @@ pub struct PromptState {
     pub history: History,
     pub stash: Stash,
     pub autocomplete: Autocomplete,
+    /// `<state>/frecency.jsonl` (`prompt/frecency.tsx`).
+    pub frecency: crate::state::frecency::Frecency,
     /// The `submitting` double-submit guard (`prompt/index.tsx:930-945`).
     pub submitting: bool,
     /// The placeholder roll (`store.placeholder`).
@@ -852,6 +976,7 @@ impl PromptState {
             history: History::new(state_dir),
             stash: Stash::new(state_dir),
             autocomplete: Autocomplete::default(),
+            frecency: crate::state::frecency::Frecency::load(state_dir),
             submitting: false,
             placeholder: 0,
         }
@@ -1628,7 +1753,11 @@ fn after_content_change(app: &mut App) {
 
 fn rebuild_options(app: &mut App) {
     let Some(visible) = app.ui.prompt.autocomplete.visible else {
-        app.ui.prompt.autocomplete.options.clear();
+        let auto = &mut app.ui.prompt.autocomplete;
+        auto.options.clear();
+        // A reopened popup asks again (the TS resource refetches).
+        auto.files_requested = None;
+        auto.files = None;
         return;
     };
     let value = app.ui.prompt.input().to_owned();
@@ -1644,10 +1773,8 @@ fn rebuild_options(app: &mut App) {
                 };
                 options.push(AutocompleteOption {
                     display: format!("/{name}"),
-                    description: None,
-                    agent: None,
-                    command: None,
                     tui_command: Some(command.name),
+                    ..AutocompleteOption::default()
                 });
             }
             for command in &app.state.sync.command {
@@ -1668,13 +1795,27 @@ fn rebuild_options(app: &mut App) {
                         .get("description")
                         .and_then(Value::as_str)
                         .map(str::to_string),
-                    agent: None,
                     command: Some(name.to_string()),
-                    tui_command: None,
+                    ..AutocompleteOption::default()
                 });
             }
         }
         '@' => {
+            let (base, line_range) = extract_line_range(&search);
+            if auto.files_requested.as_deref() != Some(base.as_str()) {
+                auto.files_requested = Some(base.clone());
+                auto.file_request = Some(base.clone());
+            }
+            let answered = auto
+                .files
+                .as_ref()
+                .filter(|(query, _, _)| *query == base)
+                .cloned();
+            // `files.loading && prev`: keep the rows on screen until the
+            // new query answers.
+            if answered.is_none() && !search.is_empty() && !auto.options.is_empty() {
+                return;
+            }
             for agent in &app.state.sync.agent {
                 if agent.get("hidden").and_then(Value::as_bool) == Some(true)
                     || agent.get("mode").and_then(Value::as_str) == Some("primary")
@@ -1686,12 +1827,78 @@ fn rebuild_options(app: &mut App) {
                 };
                 options.push(AutocompleteOption {
                     display: format!("@{name}"),
-                    description: None,
                     agent: Some(name.to_string()),
-                    command: None,
-                    tui_command: None,
+                    ..AutocompleteOption::default()
                 });
             }
+            // MCP resources (`autocomplete.tsx:330-364`), matched on name.
+            for resource in app.state.sync.mcp_resource.values() {
+                let (Some(name), Some(uri)) = (
+                    resource.get("name").and_then(Value::as_str),
+                    resource.get("uri").and_then(Value::as_str),
+                ) else {
+                    continue;
+                };
+                options.push(AutocompleteOption {
+                    display: name.to_string(),
+                    description: resource
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    file: Some(FileMention {
+                        filename: name.to_string(),
+                        part: json!({
+                            "type": "file",
+                            "mime": resource
+                                .get("mimeType")
+                                .and_then(Value::as_str)
+                                .unwrap_or("text/plain"),
+                            "filename": name,
+                            "url": uri,
+                            "source": {
+                                "type": "resource",
+                                "text": {"start": 0, "end": 0, "value": ""},
+                                "clientName": resource.get("client").cloned().unwrap_or(Value::Null),
+                                "uri": uri,
+                            },
+                        }),
+                        is_directory: false,
+                    }),
+                    ..AutocompleteOption::default()
+                });
+            }
+            // Files arrive ranked by the server; they follow, unsorted.
+            let files: Vec<AutocompleteOption> = answered
+                .map(|(_, directory, entries)| {
+                    entries
+                        .iter()
+                        .map(|entry| {
+                            let absolute = Path::new(&directory)
+                                .join(&entry.path)
+                                .to_string_lossy()
+                                .into_owned();
+                            let mention = file_mention(entry, &absolute, line_range);
+                            AutocompleteOption {
+                                display: mention.filename.clone(),
+                                file: Some(mention),
+                                ..AutocompleteOption::default()
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut options = if search.is_empty() {
+                options
+            } else {
+                fuzzy_filter(options, &search)
+            };
+            options.extend(files);
+            if !search.is_empty() {
+                options.truncate(10);
+            }
+            app.ui.prompt.autocomplete.options = options;
+            app.ui.prompt.autocomplete.selected = 0;
+            return;
         }
         _ => {}
     }
@@ -1700,7 +1907,17 @@ fn rebuild_options(app: &mut App) {
     let options = if search.is_empty() {
         options
     } else {
-        let search = remove_line_range(&search);
+        fuzzy_filter(options, &search)
+    };
+    app.ui.prompt.autocomplete.options = options;
+    app.ui.prompt.autocomplete.selected = 0;
+    let _ = cursor;
+}
+
+/// The fuzzy pass over the non-file rows: best first, ten at most.
+fn fuzzy_filter(options: Vec<AutocompleteOption>, search: &str) -> Vec<AutocompleteOption> {
+    {
+        let search = remove_line_range(search);
         let mut matched: Vec<(f64, AutocompleteOption)> = options
             .into_iter()
             .filter_map(|option| {
@@ -1719,10 +1936,7 @@ fn rebuild_options(app: &mut App) {
             .map(|(_, option)| option)
             .take(10)
             .collect()
-    };
-    app.ui.prompt.autocomplete.options = options;
-    app.ui.prompt.autocomplete.selected = 0;
-    let _ = cursor;
+    }
 }
 
 fn start_bonus(target: &str, search: &str) -> f64 {
@@ -1773,6 +1987,20 @@ pub fn autocomplete_key(
         hide_autocomplete(app);
         return (true, Vec::new());
     }
+    if matches("prompt.autocomplete.complete") {
+        let selected = app
+            .ui
+            .prompt
+            .autocomplete
+            .options
+            .get(app.ui.prompt.autocomplete.selected)
+            .and_then(|option| option.file.clone())
+            .filter(|mention| mention.is_directory);
+        if let Some(mention) = selected {
+            expand_directory(app, &mention);
+            return (true, Vec::new());
+        }
+    }
     if matches("prompt.autocomplete.select") || matches("prompt.autocomplete.complete") {
         let effects = select_autocomplete(app);
         return (true, effects);
@@ -1794,6 +2022,8 @@ pub fn hide_autocomplete(app: &mut App) {
     app.ui.prompt.autocomplete.visible = None;
     app.ui.prompt.autocomplete.selected = 0;
     app.ui.prompt.autocomplete.options.clear();
+    app.ui.prompt.autocomplete.files_requested = None;
+    app.ui.prompt.autocomplete.files = None;
 }
 
 /// `select()` (`autocomplete.tsx:553-558` + `insertPart`).
@@ -1828,7 +2058,81 @@ fn select_autocomplete(app: &mut App) -> Vec<crate::state::Effect> {
     if let Some(agent) = option.agent {
         insert_agent_part(app, &agent);
     }
+    if let Some(mention) = option.file {
+        insert_file_part(app, &mention);
+    }
     Vec::new()
+}
+
+/// `insertPart` for files and resources (`autocomplete.tsx:172-240`): the
+/// `@filename` text, an extmark over it, the part — or, when the same
+/// URL is already attached, only its span moves.
+fn insert_file_part(app: &mut App, mention: &FileMention) {
+    let cursor = app.ui.prompt.textarea.cursor();
+    let char_after = app.ui.prompt.textarea.char_at(cursor);
+    let needs_space = char_after != Some(' ');
+    let virtual_text = format!("@{}", mention.filename);
+    let append = format!("{virtual_text}{}", if needs_space { " " } else { "" });
+    let index = app.ui.prompt.autocomplete.index;
+    app.ui.prompt.textarea.delete_range(index, cursor);
+    app.ui.prompt.textarea.insert_text(&append);
+    let end = index + unicode_width::UnicodeWidthStr::width(virtual_text.as_str());
+    let id = app.ui.prompt.textarea.create_extmark(index, end);
+
+    let mut part = mention.part.clone();
+    part["source"]["text"] = json!({"start": index, "end": end, "value": virtual_text});
+    let url = part.get("url").cloned();
+    let existing = app.ui.prompt.parts.iter_mut().find(|existing| {
+        matches!(existing, PromptPart::File { url: existing_url, .. } if Some(json!(existing_url)) == url)
+    });
+    if let Some(PromptPart::File {
+        source: Some(source),
+        ..
+    }) = existing
+    {
+        if let Some(text) = &mut source.text {
+            text.start = index;
+            text.end = end;
+            text.value = virtual_text;
+        }
+        return;
+    }
+    let Some(part) = PromptPart::from_value(&part) else {
+        return;
+    };
+    let file_path = match &part {
+        PromptPart::File {
+            source: Some(source),
+            ..
+        } if source.kind.as_deref() == Some("file") => source.path.clone(),
+        _ => None,
+    };
+    let part_index = app.ui.prompt.parts.len();
+    app.ui.prompt.parts.push(part);
+    app.ui.prompt.extmark_to_part.insert(id, part_index);
+    // `frecency.updateFrecency(source.path)`, resolved against the cwd.
+    if let Some(file_path) = file_path {
+        let absolute = std::env::current_dir()
+            .map(|cwd| cwd.join(&file_path))
+            .unwrap_or_else(|_| PathBuf::from(&file_path));
+        app.ui.prompt.frecency.update(&absolute.to_string_lossy());
+    }
+}
+
+/// `expandDirectory` (`autocomplete.tsx:551-570`): Tab on a directory
+/// row types `@dir/` and searches inside it.
+fn expand_directory(app: &mut App, mention: &FileMention) {
+    let cursor = app.ui.prompt.textarea.cursor();
+    let index = app.ui.prompt.autocomplete.index;
+    let path = mention
+        .filename
+        .strip_prefix('@')
+        .unwrap_or(&mention.filename)
+        .trim_end_matches('/');
+    app.ui.prompt.textarea.delete_range(index, cursor);
+    app.ui.prompt.textarea.insert_text(&format!("@{path}/"));
+    app.ui.prompt.autocomplete.selected = 0;
+    after_content_change(app);
 }
 
 /// `insertPart` for agents (`autocomplete.tsx:172-240`).
@@ -2170,6 +2474,113 @@ mod tests {
         assert_eq!(entries.len(), MAX_STASH_ENTRIES);
         assert_eq!(entries[0].entry.input, "stash 10");
         assert_eq!(entries.last().unwrap().entry.input, "stash 59");
+    }
+
+    #[test]
+    fn line_ranges_parse_like_ts() {
+        assert_eq!(extract_line_range("src/a.rs"), ("src/a.rs".into(), None));
+        assert_eq!(
+            extract_line_range("a.rs#10"),
+            ("a.rs".into(), Some((10, None)))
+        );
+        assert_eq!(
+            extract_line_range("a.rs#10-20"),
+            ("a.rs".into(), Some((10, Some(20))))
+        );
+        // An end before the start is dropped; a trailing dash is fine.
+        assert_eq!(
+            extract_line_range("a.rs#10-5"),
+            ("a.rs".into(), Some((10, None)))
+        );
+        assert_eq!(
+            extract_line_range("a.rs#10-"),
+            ("a.rs".into(), Some((10, None)))
+        );
+        assert_eq!(extract_line_range("a.rs#x"), ("a.rs".into(), None));
+        assert_eq!(file_url("/r/a b#c.rs"), "file:///r/a%20b%23c.rs");
+    }
+
+    fn mention_app() -> App {
+        let mut app = crate::state::App::new(
+            crate::config::TuiConfig::default(),
+            crate::state::Args::default(),
+            None,
+        );
+        app.ui.prompt_focused = true;
+        app
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        for char in text.chars() {
+            text_input(app, &KeyEvent::new(KeyCode::Char(char), KeyModifiers::NONE));
+        }
+    }
+
+    #[test]
+    fn tab_on_a_directory_searches_inside_it() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = mention_app();
+        type_text(&mut app, "@sr");
+        assert_eq!(
+            app.ui.prompt.autocomplete.file_request.take().as_deref(),
+            Some("sr")
+        );
+        files_found(
+            &mut app,
+            "sr",
+            "/repo",
+            vec![FoundEntry {
+                path: "src/".into(),
+                is_directory: true,
+            }],
+        );
+        assert_eq!(app.ui.prompt.autocomplete.options[0].display, "src/");
+        let (handled, _) =
+            autocomplete_key(&mut app, &KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(handled);
+        assert_eq!(app.ui.prompt.input(), "@src/");
+        assert!(app.ui.prompt.parts.is_empty(), "nothing attached yet");
+        assert_eq!(
+            app.ui.prompt.autocomplete.file_request.as_deref(),
+            Some("src/"),
+            "the next search runs inside it"
+        );
+    }
+
+    #[test]
+    fn mcp_resources_attach_as_resource_parts() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = mention_app();
+        app.state.sync.mcp_resource.insert(
+            "docs:readme".into(),
+            json!({
+                "name": "readme",
+                "uri": "docs://readme",
+                "client": "docs",
+                "mimeType": "text/markdown",
+                "description": "The readme",
+            }),
+        );
+        type_text(&mut app, "@read");
+        let index = app
+            .ui
+            .prompt
+            .autocomplete
+            .options
+            .iter()
+            .position(|option| option.display == "readme")
+            .expect("the resource row");
+        app.ui.prompt.autocomplete.selected = index;
+        autocomplete_key(&mut app, &KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.ui.prompt.input(), "@readme ");
+        let value = app.ui.prompt.parts[0].to_value();
+        assert_eq!(value["mime"], "text/markdown");
+        assert_eq!(value["url"], "docs://readme");
+        assert_eq!(value["source"]["type"], "resource");
+        assert_eq!(value["source"]["clientName"], "docs");
+        assert_eq!(value["source"]["uri"], "docs://readme");
+        assert_eq!(value["source"]["text"]["value"], "@readme");
     }
 
     #[test]

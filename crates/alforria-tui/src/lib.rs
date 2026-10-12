@@ -962,6 +962,38 @@ pub async fn execute_effect(
                 }
             }
         }
+        Effect::FindFiles { query, workspace } => {
+            let loc = Location {
+                directory: None,
+                workspace,
+            };
+            let Ok(found) = api.fs_find(&loc, &query, 20).await else {
+                return;
+            };
+            let directory = found
+                .pointer("/location/directory")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let entries = found
+                .get("data")
+                .and_then(serde_json::Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| {
+                            Some(crate::state::prompt::FoundEntry {
+                                path: item.get("path")?.as_str()?.to_string(),
+                                is_directory: item.get("type").and_then(serde_json::Value::as_str)
+                                    == Some("directory"),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut app = app.lock().await;
+            crate::state::prompt::files_found(&mut app, &query, &directory, entries);
+        }
         Effect::SessionStatusRefresh => {
             let workspace = app.lock().await.state.project.workspace.current.clone();
             let loc = Location {

@@ -68,10 +68,8 @@ fn app_with_popup() -> App {
         .iter()
         .map(|name| AutocompleteOption {
             display: format!("@{name}"),
-            description: None,
             agent: Some(name.to_string()),
-            command: None,
-            tui_command: None,
+            ..AutocompleteOption::default()
         })
         .collect();
     app

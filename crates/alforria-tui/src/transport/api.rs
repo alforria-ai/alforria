@@ -352,6 +352,13 @@ pub trait ServerApi: Send + Sync {
         provider_id: &str,
         method: usize,
     ) -> Result<Value>;
+    /// v2 `fs.find` (`GET /api/fs/find`): files and directories matching
+    /// `query`, ranked by the server. The answer is the v2 envelope
+    /// `{ location, data: [{ path, type }] }`.
+    async fn fs_find(&self, loc: &Location, query: &str, limit: u32) -> Result<Value> {
+        let _ = (loc, query, limit);
+        Err(anyhow!("fs.find is not supported by this server API"))
+    }
     /// `provider.oauth.callback` — without `code` it waits for the
     /// provider's own redirect (an `auto` flow), however long that takes.
     async fn provider_oauth_callback(
@@ -512,6 +519,25 @@ impl HttpServerApi {
 
 #[async_trait]
 impl ServerApi for HttpServerApi {
+    async fn fs_find(&self, loc: &Location, query: &str, limit: u32) -> Result<Value> {
+        // v2 routes read `location[…]`, not the v1 `directory` param.
+        let mut extra: Vec<(&str, String)> = vec![
+            ("query", percent_encode(query)),
+            ("limit", limit.to_string()),
+        ];
+        if let Some(directory) =
+            non_empty(loc.directory.as_deref()).or(non_empty(self.config.directory.as_deref()))
+        {
+            extra.push(("location%5Bdirectory%5D", percent_encode(directory)));
+        }
+        if let Some(workspace) = non_empty(loc.workspace.as_deref()) {
+            extra.push(("location%5Bworkspace%5D", percent_encode(workspace)));
+        }
+        let loc = Location::default();
+        self.json(Method::GET, "/api/fs/find", &loc, &extra, None)
+            .await
+    }
+
     async fn path_get(&self, loc: &Location) -> Result<Value> {
         self.get("/path", loc).await
     }

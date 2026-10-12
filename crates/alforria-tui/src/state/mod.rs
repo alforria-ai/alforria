@@ -6,6 +6,7 @@
 //! Async happens only in effects: `update` returns `Vec<Effect>`, the
 //! runtime loop turns each into a task and feeds results back.
 
+pub mod frecency;
 pub mod kv;
 pub mod local;
 pub mod prompt;
@@ -633,6 +634,11 @@ pub enum Effect {
     /// `sync.session.sync(sessionID)` — the `task` tool hydrates its
     /// child session on mount (`session/index.tsx:2221-2224`).
     SessionHydrate { session_id: String },
+    /// `GET /api/fs/find?query=…&limit=20` for the `@` popup.
+    FindFiles {
+        query: String,
+        workspace: Option<String>,
+    },
     /// After an SSE reconnect: `GET /session/status` replaces the statuses.
     SessionStatusRefresh,
     /// After an SSE reconnect: hydrate the session again, even if it was
@@ -1057,6 +1063,14 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                 app.ui.footer_flip_at = None;
             }
         }
+    }
+    // The `@` popup's file search (`sdk.client.v2.fs.find`) runs as an
+    // effect; its answer lands through `prompt::files_found`.
+    if let Some(query) = app.ui.prompt.autocomplete.file_request.take() {
+        effects.push(Effect::FindFiles {
+            query,
+            workspace: app.state.project.workspace.current.clone(),
+        });
     }
     app.version += 1;
     effects.extend(crate::app::post_update(app));
