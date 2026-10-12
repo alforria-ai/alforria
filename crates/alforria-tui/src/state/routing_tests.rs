@@ -211,3 +211,70 @@ fn shell_mode_resets_on_submit() {
     );
     assert_eq!(app.ui.prompt.mode, crate::state::route::PromptMode::Normal);
 }
+
+fn mouse(
+    app: &mut App,
+    kind: crossterm::event::MouseEventKind,
+    column: u16,
+    row: u16,
+) -> Vec<Effect> {
+    update(
+        app,
+        Msg::Mouse(crossterm::event::MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }),
+    )
+}
+
+fn screen_with(lines: &[&str]) -> ratatui::buffer::Buffer {
+    let mut buffer =
+        ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 20, lines.len() as u16));
+    for (row, line) in lines.iter().enumerate() {
+        buffer.set_string(0, row as u16, line, ratatui::style::Style::new());
+    }
+    buffer
+}
+
+#[test]
+fn a_drag_copies_on_release() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let mut app = app();
+    mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 0, 0);
+    // The frame drawn after the press is what gets copied.
+    app.ui.selection.screen = Some(screen_with(&["copy this text", "and this"]));
+    mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), 2, 1);
+    let effects = mouse(&mut app, MouseEventKind::Up(MouseButton::Left), 2, 1);
+    let copied = effects.iter().find_map(|effect| match effect {
+        Effect::ClipboardWrite { text, success, .. } => Some((text.clone(), success.clone())),
+        _ => None,
+    });
+    let (text, toast) = copied.expect("copied on release");
+    assert_eq!(text, "copy this text\nand");
+    assert_eq!(toast.unwrap().message, "Copied to clipboard");
+    assert!(!app.ui.selection.active(), "cleared after the copy");
+}
+
+#[test]
+fn ctrl_y_copies_a_kept_selection() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let mut app = app();
+    app.ui.copy_on_select_disabled = true;
+    mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 0, 0);
+    app.ui.selection.screen = Some(screen_with(&["kept"]));
+    mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), 3, 0);
+    let effects = mouse(&mut app, MouseEventKind::Up(MouseButton::Left), 3, 0);
+    assert!(effects.is_empty(), "no copy on release: {effects:?}");
+    assert!(app.ui.selection.active(), "the selection stays");
+    let effects = key(&mut app, KeyCode::Char('y'), KeyModifiers::CONTROL);
+    assert!(
+        effects.iter().any(|effect| matches!(
+            effect,
+            Effect::ClipboardWrite { text, .. } if text == "kept"
+        )),
+        "{effects:?}"
+    );
+    assert!(!app.ui.selection.active());
+}

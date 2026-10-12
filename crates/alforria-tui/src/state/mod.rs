@@ -13,6 +13,7 @@ pub mod prompt;
 pub mod route;
 #[cfg(test)]
 mod routing_tests;
+pub mod selection;
 pub mod session_search;
 pub mod sync;
 
@@ -383,6 +384,11 @@ pub struct AttentionSets {
 /// the app-shell bookkeeping of M8.3.
 #[derive(Debug, Default)]
 pub struct UiState {
+    /// Mouse text selection (copy-on-select).
+    pub selection: selection::Selection,
+    /// `OPENCODE_EXPERIMENTAL_DISABLE_COPY_ON_SELECT`: a selection stays
+    /// until a key copies or dismisses it.
+    pub copy_on_select_disabled: bool,
     /// The session list's server search (debounce and results).
     pub session_search: session_search::SessionSearch,
     /// The wheel's acceleration state (`scroll_acceleration.enabled`).
@@ -787,6 +793,7 @@ impl App {
             ..UiState::default()
         };
         ui.home_tip = rand::random::<usize>();
+        ui.copy_on_select_disabled = selection::copy_on_select_disabled_from_env();
         App {
             state,
             ui,
@@ -837,6 +844,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         // dialog its press just closed — an `escape` release would reject
         // the pending permission.
         Msg::Key(key) if key.kind == crossterm::event::KeyEventKind::Release => {}
+        Msg::Key(key) if selection_key(app, &key, &mut effects) => {}
         Msg::Key(key) => {
             // Dialogs take the keyboard while the stack is open (the
             // pushed `modal` mode, `ui/dialog.tsx:105-137`).
@@ -910,6 +918,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                 }
             }
         }
+        Msg::Mouse(mouse) if selection_mouse(app, &mouse, &mut effects) => {}
         Msg::Mouse(mouse) => match mouse.kind {
             // TODO(M8.5), hover handling; the transcript wheel uses the
             // config `scroll_speed`. Dialogs get the wheel first —
@@ -973,9 +982,9 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                 effects.extend(crate::ui::dialogs::mouse_submit(app, index));
             }
             // Backdrop click-through (`dialog.tsx:30-38`): a release
-            // outside the frame pops the top dialog. The port has no
-            // mouse text selection (recorded divergence §7.8), so a
-            // selection never blocks the close.
+            // outside the frame pops the top dialog. The release that ends
+            // a selection drag never gets here (`selection_mouse`), so a
+            // selection never closes the dialog.
             crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left)
                 if !app.ui.dialogs.is_empty()
                     && !crate::ui::dialogs::hit_test(app, mouse.column, mouse.row) =>
@@ -1083,6 +1092,94 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
     app.version += 1;
     effects.extend(crate::app::post_update(app));
     effects
+}
+
+/// `Selection.copy` (`util/selection.ts`): the selected text to the
+/// clipboard with the "Copied to clipboard" toast, then clear.
+fn copy_selection(app: &mut App) -> Option<Effect> {
+    let text = app.ui.selection.text();
+    app.ui.selection.clear();
+    Some(Effect::ClipboardWrite {
+        text: text?,
+        success: Some(Toast {
+            title: None,
+            variant: ToastVariant::Info,
+            message: "Copied to clipboard".to_string(),
+            duration_ms: 3000,
+        }),
+        failure: Some(Toast {
+            title: None,
+            variant: ToastVariant::Error,
+            message: "Failed to copy to clipboard".to_string(),
+            duration_ms: 5000,
+        }),
+    })
+}
+
+/// The mouse half of the selection. Returns whether it took the event.
+fn selection_mouse(
+    app: &mut App,
+    mouse: &crossterm::event::MouseEvent,
+    effects: &mut Vec<Effect>,
+) -> bool {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            // A press may start a selection; the press itself still acts.
+            app.ui.selection.begin((mouse.column, mouse.row));
+            false
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            app.ui.selection.extend((mouse.column, mouse.row));
+            true
+        }
+        MouseEventKind::Up(MouseButton::Left) if app.ui.selection.active() => {
+            // The end of a drag is not a click.
+            if !app.ui.copy_on_select_disabled {
+                effects.extend(copy_selection(app));
+            }
+            true
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            app.ui.selection.clear();
+            false
+        }
+        // Right click copies a kept selection (`app.tsx` onMouseDown).
+        MouseEventKind::Down(MouseButton::Right) if app.ui.selection.active() => {
+            effects.extend(copy_selection(app));
+            true
+        }
+        _ => false,
+    }
+}
+
+/// A key while a selection is kept (`handleSelectionKey`): ctrl+c and
+/// ctrl+y copy, Esc dismisses (and is consumed), any other key dismisses
+/// and goes on. Returns whether the key was consumed.
+fn selection_key(
+    app: &mut App,
+    key: &crossterm::event::KeyEvent,
+    effects: &mut Vec<Effect>,
+) -> bool {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    if !app.ui.selection.active() {
+        return false;
+    }
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Char('c' | 'y') if ctrl => {
+            effects.extend(copy_selection(app));
+            true
+        }
+        KeyCode::Esc => {
+            app.ui.selection.clear();
+            true
+        }
+        _ => {
+            app.ui.selection.clear();
+            false
+        }
+    }
 }
 
 /// A key while the dialog stack is open: the `app.global` bindings

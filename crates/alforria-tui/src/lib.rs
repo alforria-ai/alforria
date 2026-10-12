@@ -267,7 +267,14 @@ fn draw(
         )?;
         terminal.swap_buffers();
     }
-    terminal.draw(|frame| view(app, frame))?;
+    let completed = terminal.draw(|frame| {
+        view(app, frame);
+        app.ui.selection.paint(frame.buffer_mut());
+    })?;
+    // Keep the frame a selection copies from (only while one can exist).
+    if app.ui.selection.tracking() {
+        app.ui.selection.screen = Some(completed.buffer.clone());
+    }
     Ok(())
 }
 
