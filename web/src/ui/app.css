@@ -2294,9 +2294,60 @@ button.tool-row:hover {
 .revert-dock .spacer {
   flex: 1;
 }
+/* Follow-ups held until the turn ends, oldest first. */
+.queue-dock {
+  margin-bottom: 8px;
+  border: 1px solid var(--rule-2);
+  font: 400 12.5px/1.35 var(--f-body);
+  color: var(--ink-2);
+}
+.queue-dock .qd-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 6px 10px;
+}
+.queue-dock .k {
+  font: 700 12.5px/1 var(--f-label);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--ink);
+}
+.queue-dock .qd-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 4px 4px 10px;
+  border-top: 1px solid var(--rule-soft);
+}
+.queue-dock .qd-item .n {
+  font: 400 11px/1 var(--f-mono);
+  color: var(--ink-3);
+}
+.queue-dock .qd-item .line {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ink);
+}
+.queue-dock .qd-item.failed .line {
+  text-decoration: underline wavy var(--ink-3);
+}
+.queue-dock .icon-btn {
+  width: 24px;
+  height: 24px;
+}
 @media (max-width: 760px) {
-  .revert-dock .link-btn {
+  .revert-dock .link-btn,
+  .queue-dock .link-btn,
+  .composer .queue-btn {
     min-height: 40px;
+  }
+  .queue-dock .icon-btn {
+    width: 40px;
+    height: 40px;
   }
 }
 .model-btn .m {

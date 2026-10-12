@@ -10,6 +10,7 @@ import { state } from "../../store/store"
 import { Icon } from "../../ui/icons"
 import { toast } from "../toast"
 import { historyStep, loadDrafts, saveDrafts } from "./drafts"
+import { enqueue, followupLine, pause, queue, resume, sendNow, take } from "./followups"
 import { ModelPicker, VariantPicker } from "./model-picker"
 import {
   attachmentKind,
@@ -251,7 +252,8 @@ export function Composer(props: { sessionID: string }) {
     return true
   }
 
-  const send = async () => {
+  /** `later`: while the session works, hold a plain prompt until the turn ends (⌥↵). */
+  const send = async (later = false) => {
     const text = ta.value.trim()
     if (!text || sending() || (shellMode(text) && !text.slice(1).trim())) return
     const files = draft().files
@@ -279,6 +281,8 @@ export function Composer(props: { sessionID: string }) {
       }
     }
     hist = undefined
+    if (later && busy() && !shellMode(text) && !text.startsWith("/")) return enqueue(props.sessionID, body)
+    resume(props.sessionID)
     if (shellMode(text)) {
       // `!cmd` runs in the session's shell as its own turn; like a command it
       // answers only when it ends, so don't hold the composer.
@@ -345,7 +349,23 @@ export function Composer(props: { sessionID: string }) {
     }
   }
 
-  const stop = () => api.abort(props.sessionID).catch((err) => toast(`Could not stop: ${err.message}`, "error"))
+  // Stopping a turn holds the queue: the next follow-up shouldn't start by itself.
+  const stop = () => {
+    pause(props.sessionID)
+    return api.abort(props.sessionID).catch((err) => toast(`Could not stop: ${err.message}`, "error"))
+  }
+
+  const queued = () => queue.items[props.sessionID] ?? []
+  /** Back into the box to edit; only into an empty box, so nothing typed is lost. */
+  const editQueued = (id: string) => {
+    if (ta.value.trim()) return toast("Send or clear the current draft first, then edit the queued one", "error")
+    const f = take(props.sessionID, id)
+    if (!f) return
+    ta.value = f.body.text
+    setDraft({ text: f.body.text, files: f.body.files, attachments: f.body.attachments })
+    autosize()
+    ta.focus()
+  }
 
   const onKey = (e: KeyboardEvent) => {
     const p = pop()
@@ -384,7 +404,7 @@ export function Composer(props: { sessionID: string }) {
     // An IME commit (keyCode 229) is not a send; on touch, Enter is a newline and Send sends.
     if (e.key === "Enter" && !e.shiftKey && !e.isComposing && e.keyCode !== 229 && !coarse) {
       e.preventDefault()
-      void send()
+      void send(e.altKey)
     }
   }
 
@@ -412,6 +432,48 @@ export function Composer(props: { sessionID: string }) {
           <button class="link-btn" disabled={unreverting()} onClick={() => void undoRevert()}>
             Unrevert
           </button>
+        </div>
+      </Show>
+      <Show when={queued().length}>
+        <div class="queue-dock" aria-label="Queued follow-ups">
+          <div class="qd-head">
+            <span class="k">Queued</span>
+            <span class="t">
+              {queue.paused[props.sessionID]
+                ? "Held after Stop. Send one to resume."
+                : busy()
+                  ? "Sent in order when this turn ends."
+                  : "Sending…"}
+            </span>
+          </div>
+          <For each={queued()}>
+            {(f) => (
+              <div class="qd-item" classList={{ failed: queue.failed[props.sessionID] === f.id }}>
+                <span class="mono n">{queued().indexOf(f) + 1}</span>
+                <span class="line">{followupLine(f)}</span>
+                <Show when={queue.failed[props.sessionID] === f.id}>
+                  <span class="mono">failed</span>
+                </Show>
+                <button
+                  class="link-btn"
+                  disabled={!!queue.sending[props.sessionID]}
+                  onClick={() => void sendNow(props.sessionID, f.id)}
+                >
+                  Send now
+                </button>
+                <button class="link-btn" onClick={() => editQueued(f.id)}>
+                  Edit
+                </button>
+                <button
+                  class="icon-btn"
+                  aria-label={`Remove “${followupLine(f)}”`}
+                  onClick={() => take(props.sessionID, f.id)}
+                >
+                  <Icon name="close" />
+                </button>
+              </div>
+            )}
+          </For>
         </div>
       </Show>
       <Show when={pop()}>
@@ -576,13 +638,19 @@ export function Composer(props: { sessionID: string }) {
         </Show>
         <Show when={!coarse}>
           <span class="hint">
-            {shellMode(draft().text) ? "↵ run" : "↵ send"} · ⇧↵ newline{history().length ? " · ↑ earlier" : ""}
+            {shellMode(draft().text) ? "↵ run" : busy() ? "↵ send now · ⌥↵ after this turn" : "↵ send"} · ⇧↵ newline
+            {history().length ? " · ↑ earlier" : ""}
           </span>
         </Show>
         <Show when={busy()}>
           <button class="send stop" onClick={() => void stop()}>
             <Icon name="stop" />
             Stop
+          </button>
+        </Show>
+        <Show when={busy() && draft().text.trim() && !shellMode(draft().text) && !draft().text.startsWith("/")}>
+          <button class="link-btn queue-btn" title="Send when this turn ends (⌥↵)" onClick={() => void send(true)}>
+            Queue
           </button>
         </Show>
         <Show when={!busy() || draft().text.trim()}>
