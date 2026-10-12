@@ -11,7 +11,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use eventsource_stream::Eventsource;
 use futures::StreamExt;
@@ -22,6 +22,8 @@ use alforria_schema::event::LegacyEnvelope;
 use alforria_schema::event_manifest::Event;
 
 use crate::transport::api::{percent_encode, HttpClientConfig, Location};
+use crate::transport::backend::{Backend, BackendRequest, ReqwestBackend};
+use reqwest::Method;
 
 /// `sdk.tsx:68-80` — if the last flush was < 16 ms ago, events batch on a
 /// 16 ms timer; otherwise they flush immediately.
@@ -211,47 +213,56 @@ pub trait EventSource: Send + Sync {
 }
 
 /// Production [`EventSource`]: one GET per connection to
-/// `{base_url}/global/event`, framed by the `eventsource-stream` crate.
+/// `{base_url}/global/event`, framed by the `eventsource-stream` crate,
+/// over any [`Backend`] (HTTP or the in-process router).
 pub struct SseEventSource {
-    client: reqwest::Client,
+    backend: Arc<dyn Backend>,
     config: HttpClientConfig,
     experimental_workspaces: bool,
 }
 
 impl SseEventSource {
+    /// Over real HTTP.
     pub fn new(config: HttpClientConfig) -> Result<SseEventSource> {
-        Ok(SseEventSource {
-            client: reqwest::Client::builder().build()?,
-            experimental_workspaces: experimental_workspaces_from_env(),
+        Ok(SseEventSource::with_backend(
             config,
-        })
+            Arc::new(ReqwestBackend::new()?),
+        ))
     }
 
-    fn request(&self, path: &str) -> Result<reqwest::RequestBuilder> {
-        let url = crate::transport::api::build_url(
-            &self.config,
-            path,
-            &reqwest::Method::GET,
-            &Location::default(),
-            &[],
-        );
-        let mut request = self.client.get(url);
-        for (name, value) in &self.config.headers {
-            request = request.header(name.as_str(), value.as_str());
+    /// Over any [`Backend`].
+    pub fn with_backend(config: HttpClientConfig, backend: Arc<dyn Backend>) -> SseEventSource {
+        SseEventSource {
+            backend,
+            experimental_workspaces: experimental_workspaces_from_env(),
+            config,
         }
-        Ok(request)
     }
 }
 
 #[async_trait]
 impl EventSource for SseEventSource {
     async fn stream(&self, tx: UnboundedSender<BusEvent>) -> Result<()> {
+        let url = crate::transport::api::build_url(
+            &self.config,
+            "/global/event",
+            &Method::GET,
+            &Location::default(),
+            &[],
+        );
         let response = self
-            .request("/global/event")?
-            .send()
-            .await?
-            .error_for_status()?;
-        let stream = response.bytes_stream().eventsource();
+            .backend
+            .send(BackendRequest {
+                method: Method::GET,
+                url,
+                headers: self.config.headers.clone(),
+                json: None,
+            })
+            .await?;
+        if !response.is_success() {
+            return Err(anyhow!("/global/event: {}", response.status));
+        }
+        let stream = response.body.eventsource();
         tokio::spawn(async move {
             let mut stream = stream;
             while let Some(event) = stream.next().await {
@@ -274,28 +285,35 @@ impl EventSource for SseEventSource {
         let url = crate::transport::api::build_url(
             &self.config,
             "/sync/start",
-            &reqwest::Method::POST,
+            &Method::POST,
             &Location::default(),
             &[],
         );
-        let mut request = self.client.post(url);
+        let mut headers = self.config.headers.clone();
         if let Some(directory) = self
             .config
             .directory
             .as_deref()
             .filter(|value| !value.is_empty())
         {
-            request = request.header("x-opencode-directory", percent_encode(directory));
+            headers.push((
+                "x-opencode-directory".to_string(),
+                percent_encode(directory),
+            ));
         }
-        for (name, value) in &self.config.headers {
-            request = request.header(name.as_str(), value.as_str());
+        let response = self
+            .backend
+            .send(BackendRequest {
+                method: Method::POST,
+                url,
+                headers,
+                json: None,
+            })
+            .await?;
+        if !response.is_success() {
+            return Err(anyhow!("/sync/start: {}", response.status));
         }
-        request
-            .send()
-            .await?
-            .error_for_status()
-            .map(|_| ())
-            .map_err(Into::into)
+        Ok(())
     }
 
     fn experimental_workspaces(&self) -> bool {

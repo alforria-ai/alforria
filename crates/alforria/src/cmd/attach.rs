@@ -5,7 +5,7 @@ use std::ffi::OsString;
 
 use clap::ArgMatches;
 
-use super::tui::{handoff, validate_session};
+use super::tui::{handoff, validate_session, TuiTarget};
 use crate::error::{CliError, TypedError};
 use crate::ui::Ui;
 
@@ -64,7 +64,7 @@ pub fn run(matches: &ArgMatches, ui: &mut Ui, _raw: &[OsString]) -> Result<(), T
         return Err(cli_error("--fork requires --continue or --session"));
     }
 
-    let url = matches.get_one::<String>("url").expect("url").clone();
+    let target = TuiTarget::Url(matches.get_one::<String>("url").expect("url").clone());
     let password = matches
         .get_one::<String>("password")
         .cloned()
@@ -75,7 +75,7 @@ pub fn run(matches: &ArgMatches, ui: &mut Ui, _raw: &[OsString]) -> Result<(), T
         .or_else(|| std::env::var("OPENCODE_SERVER_USERNAME").ok());
 
     validate_session(
-        &url,
+        &target,
         password.as_deref(),
         username.as_deref(),
         directory.as_deref(),
@@ -87,7 +87,7 @@ pub fn run(matches: &ArgMatches, ui: &mut Ui, _raw: &[OsString]) -> Result<(), T
         .unwrap_or_default();
 
     handoff(
-        &url,
+        &target,
         directory,
         headers,
         alforria_tui::state::Args {

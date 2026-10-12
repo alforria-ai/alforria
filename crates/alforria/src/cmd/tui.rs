@@ -11,12 +11,30 @@ use crate::error::{CliError, TypedError};
 use crate::network::has_arg;
 use crate::ui::Ui;
 
+/// Where the TUI's server lives: a URL over HTTP (`attach`, the network
+/// flags) or the router called in memory (plain `alforria`).
+#[derive(Debug, Clone)]
+pub enum TuiTarget {
+    Url(String),
+    InProcess(alforria_tui::transport::backend::SharedBackend),
+}
+
+impl TuiTarget {
+    /// The base URL the clients address (`http://localhost` in process).
+    pub fn url(&self) -> &str {
+        match self {
+            TuiTarget::Url(url) => url,
+            TuiTarget::InProcess(_) => alforria_tui::transport::backend::IN_PROCESS_BASE_URL,
+        }
+    }
+}
+
 /// The TUI handoff seam. The TS worker-thread + RPC machinery
-/// (tui.ts:24-57,210-228) is an implementation detail; the Rust port
-/// runs `alforria_tui::run` in-process. Tests replace the runner.
+/// (tui.ts:24-57,210-228) becomes the in-memory router backend; the
+/// Rust port runs `alforria_tui::run` in-process. Tests replace the runner.
 pub type TuiRunner = Box<
     dyn Fn(
-            &str,
+            &TuiTarget,
             Option<String>,
             Vec<(String, String)>,
             alforria_tui::state::Args,
@@ -25,7 +43,7 @@ pub type TuiRunner = Box<
 >;
 
 fn default_tui_runner(
-    url: &str,
+    target: &TuiTarget,
     directory: Option<String>,
     headers: Vec<(String, String)>,
     args: alforria_tui::state::Args,
@@ -33,13 +51,18 @@ fn default_tui_runner(
     // `paths.state` (`global.ts:14`): TUI state (pinned sessions, recent
     // models, favorites, prompt history) persists under the XDG state dir.
     let state_dir = alforria_core::paths::GlobalPaths::from_env().state;
+    let backend = match target {
+        TuiTarget::Url(_) => None,
+        TuiTarget::InProcess(backend) => Some(backend.clone()),
+    };
     let _exit = alforria_tui::run(alforria_tui::TuiInput {
-        url: url.to_string(),
+        url: target.url().to_string(),
         directory,
         headers,
         args,
         config: alforria_tui::config::TuiConfig::default(),
         state_dir: Some(state_dir),
+        backend,
     })
     .map_err(|err| TypedError::Unknown {
         raw: err.to_string(),
@@ -63,15 +86,30 @@ pub fn with_tui_runner<T>(runner: TuiRunner, f: impl FnOnce() -> T) -> T {
 
 /// Run the installed TUI runner (the seam both `$0` and `attach` use).
 pub fn handoff(
-    url: &str,
+    target: &TuiTarget,
     directory: Option<String>,
     headers: Vec<(String, String)>,
     args: alforria_tui::state::Args,
 ) -> Result<(), TypedError> {
     TUI_RUNNER.with(|cell| {
         let runner = cell.borrow();
-        runner(url, directory, headers, args)
+        runner(target, directory, headers, args)
     })
+}
+
+/// The URL a TUI reaches a listener on: the bound address, except that
+/// an unspecified bind (`0.0.0.0`, `::`) is reached over loopback. A
+/// specific IP is used as is: a server bound to `192.168.1.5` does not
+/// answer on `127.0.0.1`.
+pub fn listener_url(hostname: &str, port: u16) -> String {
+    let host = match hostname.parse::<std::net::IpAddr>() {
+        Ok(ip) if ip.is_unspecified() && ip.is_ipv4() => "127.0.0.1".to_string(),
+        Ok(ip) if ip.is_unspecified() => "[::1]".to_string(),
+        Ok(std::net::IpAddr::V6(ip)) => format!("[{ip}]"),
+        Ok(std::net::IpAddr::V4(ip)) => ip.to_string(),
+        Err(_) => hostname.to_string(),
+    };
+    format!("http://{host}:{port}")
 }
 
 fn cli_error(message: impl Into<String>) -> TypedError {
@@ -118,7 +156,7 @@ fn piped_stdin() -> Option<String> {
 /// `validateSession` (`tui/validate-session.ts`): the `ses…` prefix
 /// check, then `session.get` with `throwOnError`.
 pub fn validate_session(
-    url: &str,
+    target: &TuiTarget,
     password: Option<&str>,
     username: Option<&str>,
     directory: Option<&str>,
@@ -132,17 +170,42 @@ pub fn validate_session(
             "Invalid session ID: Expected a string starting with 'ses', but got '{session_id}'"
         )));
     }
-    let client = OpencodeClient::new(
-        url.to_string(),
-        directory.map(str::to_string),
-        password,
-        username,
-    );
     let runtime = super::runtime()?;
-    let found = runtime
-        .block_on(client.session_get(session_id))
-        .map_err(|error| cli_error(error.message))?;
-    if found.is_none() {
+    let found = match target {
+        TuiTarget::Url(url) => {
+            let client = OpencodeClient::new(
+                url.to_string(),
+                directory.map(str::to_string),
+                password,
+                username,
+            );
+            runtime
+                .block_on(client.session_get(session_id))
+                .map_err(|error| cli_error(error.message))?
+                .is_some()
+        }
+        TuiTarget::InProcess(backend) => {
+            use alforria_tui::transport::api::percent_encode;
+            use alforria_tui::transport::backend::BackendRequest;
+            let mut url = format!("{}/session/{}", target.url(), percent_encode(session_id));
+            if let Some(directory) = directory {
+                url.push_str(&format!("?directory={}", percent_encode(directory)));
+            }
+            let headers = auth_header(password, username)
+                .map(|header| vec![("authorization".to_string(), header)])
+                .unwrap_or_default();
+            let response = runtime
+                .block_on(backend.0.send(BackendRequest {
+                    method: reqwest::Method::GET,
+                    url,
+                    headers,
+                    json: None,
+                }))
+                .map_err(|_| cli_error("session get failed"))?;
+            response.is_success()
+        }
+    };
+    if !found {
         return Err(cli_error("Session not found"));
     }
     Ok(())
@@ -237,22 +300,39 @@ pub fn run(matches: &ArgMatches, ui: &mut Ui, raw: &[OsString]) -> Result<(), Ty
         .map(|header| vec![("authorization".to_string(), header)])
         .unwrap_or_default();
 
+    // Plain `alforria` runs the server in process with no listener
+    // (upstream: a worker reached over RPC, tui.ts:236-246); only the
+    // network flags bind a real socket. The runtime stays alive for the
+    // whole TUI: tasks the server spawns while booting run on it.
     let runtime = super::runtime()?;
-    let listener = runtime
-        .block_on(alforria_server::listen(&resolved.listen_options()))
-        .map_err(|err| TypedError::Unknown {
-            raw: err.to_string(),
-        })?;
-    let url = format!("http://127.0.0.1:{}", listener.port);
-
-    let (url, directory) = if external {
-        (url, None)
+    // Held until the TUI exits: dropping it stops the server.
+    let mut _listener = None;
+    let (target, directory) = if external {
+        let listener = runtime
+            .block_on(alforria_server::listen(&resolved.listen_options()))
+            .map_err(|err| TypedError::Unknown {
+                raw: err.to_string(),
+            })?;
+        let url = listener_url(&listener.hostname, listener.port);
+        _listener = Some(listener);
+        (TuiTarget::Url(url), None)
     } else {
-        (url, Some(cwd.clone()))
+        let router = runtime
+            .block_on(async { alforria_server::in_process_router(&resolved.listen_options()) })
+            .map_err(|err| TypedError::Unknown {
+                raw: err.to_string(),
+            })?;
+        let backend = alforria_tui::transport::backend::ServiceBackend::new(router);
+        (
+            TuiTarget::InProcess(alforria_tui::transport::backend::SharedBackend(
+                std::sync::Arc::new(backend),
+            )),
+            Some(cwd.clone()),
+        )
     };
 
     validate_session(
-        &url,
+        &target,
         password.as_deref(),
         username.as_deref(),
         directory.as_deref(),
@@ -260,7 +340,7 @@ pub fn run(matches: &ArgMatches, ui: &mut Ui, raw: &[OsString]) -> Result<(), Ty
     )?;
 
     handoff(
-        &url,
+        &target,
         directory,
         headers,
         alforria_tui::state::Args {
@@ -371,6 +451,86 @@ mod tests {
             "{}",
             err_text(&err)
         );
+    }
+
+    #[test]
+    fn listener_url_uses_the_bound_address() {
+        assert_eq!(listener_url("127.0.0.1", 4096), "http://127.0.0.1:4096");
+        assert_eq!(listener_url("0.0.0.0", 4096), "http://127.0.0.1:4096");
+        assert_eq!(listener_url("::", 4096), "http://[::1]:4096");
+        assert_eq!(listener_url("192.168.1.5", 80), "http://192.168.1.5:80");
+        assert_eq!(listener_url("fe80::1", 80), "http://[fe80::1]:80");
+        assert_eq!(listener_url("localhost", 80), "http://localhost:80");
+    }
+
+    /// Inodes of the TCP sockets this process has in LISTEN state.
+    #[cfg(target_os = "linux")]
+    fn listening_inodes() -> std::collections::BTreeSet<String> {
+        let owned: std::collections::BTreeSet<String> = std::fs::read_dir("/proc/self/fd")
+            .map(|dir| {
+                dir.filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+                    .filter_map(|link| {
+                        let link = link.to_string_lossy().into_owned();
+                        let inode = link.strip_prefix("socket:[")?.strip_suffix(']')?;
+                        Some(inode.to_string())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut listening = std::collections::BTreeSet::new();
+        for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
+            let Ok(text) = std::fs::read_to_string(table) else {
+                continue;
+            };
+            for line in text.lines().skip(1) {
+                let fields: Vec<&str> = line.split_whitespace().collect();
+                // `st` 0A = LISTEN; field 9 is the inode.
+                if fields.len() > 9 && fields[3] == "0A" && owned.contains(fields[9]) {
+                    listening.insert(fields[9].to_string());
+                }
+            }
+        }
+        listening
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn plain_tui_runs_the_server_in_process_without_a_listener() {
+        let before = listening_inodes();
+        let matches = parse_args(&[]);
+        let (mut ui, _captured) = crate::ui::Ui::capture(false);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let record = std::sync::Arc::clone(&seen);
+        let result = with_tui_runner(
+            Box::new(move |target, directory, _headers, _args| {
+                let TuiTarget::InProcess(backend) = target else {
+                    panic!("plain alforria must not use HTTP: {target:?}");
+                };
+                // The router answers in memory.
+                let runtime = super::super::runtime().expect("runtime");
+                let response =
+                    runtime
+                        .block_on(backend.0.send(
+                            alforria_tui::transport::backend::BackendRequest {
+                                method: reqwest::Method::GET,
+                                url: format!("{}/global/health", target.url()),
+                                headers: Vec::new(),
+                                json: None,
+                            },
+                        ))
+                        .expect("in-process request");
+                let status = response.status;
+                *record.lock().unwrap() = Some((status, directory.is_some(), listening_inodes()));
+                Ok(())
+            }),
+            || run(&matches, &mut ui, &[]),
+        );
+        result.expect("tui run");
+        let (status, has_directory, during) = seen.lock().unwrap().take().expect("runner ran");
+        assert_eq!(status, 200);
+        assert!(has_directory, "the in-process TUI is scoped to the cwd");
+        let opened: Vec<_> = during.difference(&before).collect();
+        assert!(opened.is_empty(), "no TCP listener opened: {opened:?}");
     }
 
     #[test]

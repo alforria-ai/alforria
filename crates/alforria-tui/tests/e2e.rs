@@ -224,6 +224,8 @@ impl ShareHttp for StubShareHttp {
 
 struct Server {
     base_url: String,
+    /// The same router, called in memory (the plain-`alforria` backend).
+    in_process: Arc<dyn alforria_tui::transport::backend::Backend>,
     directory: std::path::PathBuf,
     _dir: tempfile::TempDir,
 }
@@ -247,6 +249,9 @@ async fn spawn_server(llm_text: &'static str) -> Server {
     Arc::get_mut(&mut ctx).expect("sole owner").auth =
         alforria_server::state::AuthConfig::new("alforria", None);
     let router = routes::build_router(ctx);
+    let in_process = Arc::new(alforria_tui::transport::backend::ServiceBackend::new(
+        router.clone(),
+    ));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
@@ -256,6 +261,7 @@ async fn spawn_server(llm_text: &'static str) -> Server {
     });
     Server {
         base_url: format!("http://127.0.0.1:{port}"),
+        in_process,
         directory: dir.path().join("repo"),
         _dir: dir,
     }
@@ -304,6 +310,13 @@ async fn pump_until(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wire_e2e_bootstrap_prompt_stream_share_export() {
+    scenario(false).await;
+    scenario(true).await;
+}
+
+/// The scripted scenario over HTTP (`attach`, the network flags) or over
+/// the in-memory router (plain `alforria`).
+async fn scenario(in_process: bool) {
     // `config.providers` returns only *connected* providers — without
     // credentials in the environment the list is empty and bootstrap
     // yields no providers (the dev machine's LIBERTAI_API_KEY must not
@@ -313,13 +326,25 @@ async fn wire_e2e_bootstrap_prompt_stream_share_export() {
 
     let server = spawn_server("Hello from the mock").await;
 
+    let backend: Arc<dyn alforria_tui::transport::backend::Backend> = if in_process {
+        Arc::clone(&server.in_process)
+    } else {
+        Arc::new(alforria_tui::transport::backend::ReqwestBackend::new().expect("http"))
+    };
     let http_config = HttpClientConfig {
-        base_url: server.base_url.clone(),
+        base_url: if in_process {
+            alforria_tui::transport::backend::IN_PROCESS_BASE_URL.to_string()
+        } else {
+            server.base_url.clone()
+        },
         directory: Some(server.directory.to_string_lossy().into_owned()),
         headers: Vec::new(),
     };
-    let api: Arc<dyn ServerApi> = Arc::new(HttpServerApi::new(http_config.clone()).expect("api"));
-    let source: Arc<dyn EventSource> = Arc::new(SseEventSource::new(http_config).expect("sse"));
+    let api: Arc<dyn ServerApi> = Arc::new(HttpServerApi::with_backend(
+        http_config.clone(),
+        Arc::clone(&backend),
+    ));
+    let source: Arc<dyn EventSource> = Arc::new(SseEventSource::with_backend(http_config, backend));
 
     let state_dir = tempfile::tempdir().unwrap();
     let app = Arc::new(tokio::sync::Mutex::new(App::new(

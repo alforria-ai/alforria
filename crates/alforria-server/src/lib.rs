@@ -125,6 +125,14 @@ pub async fn listen(opts: &ListenOptions) -> io::Result<Listener> {
     listen_with(opts, ctx).await
 }
 
+/// The server as a tower `Service`, with no listener: the router over a
+/// fresh environment-derived context. The TUI calls it in memory (upstream
+/// runs the server in a worker and talks to it over RPC, `cli/cmd/tui.ts`),
+/// so plain `alforria` opens no socket.
+pub fn in_process_router(opts: &ListenOptions) -> io::Result<axum::Router> {
+    Ok(routes::build_router(default_context(opts)?))
+}
+
 /// The UI backend: the binary-embedded web UI unless disabled. TS
 /// `flags.disableEmbeddedWebUi` (`OPENCODE_DISABLE_EMBEDDED_WEB_UI`,
 /// `runtime-flags.ts:20`); when disabled the UI catch-all falls through to the

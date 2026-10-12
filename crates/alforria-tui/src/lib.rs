@@ -53,6 +53,9 @@ pub struct TuiInput {
     pub args: Args,
     pub config: config::TuiConfig,
     pub state_dir: Option<PathBuf>,
+    /// The transport under `url`: `None` is real HTTP; `Some` is the
+    /// in-process server router (plain `alforria`, no listener).
+    pub backend: Option<transport::backend::SharedBackend>,
 }
 
 /// `run()`'s result (`app.tsx:188, 354`).
@@ -108,8 +111,15 @@ async fn run_inner(input: TuiInput) -> Result<Exit> {
         directory: input.directory.clone(),
         headers: input.headers.clone(),
     };
-    let api: Arc<dyn ServerApi> = Arc::new(HttpServerApi::new(http_config.clone())?);
-    let source: Arc<dyn EventSource> = Arc::new(SseEventSource::new(http_config)?);
+    let backend: Arc<dyn transport::backend::Backend> = match &input.backend {
+        Some(backend) => Arc::clone(&backend.0),
+        None => Arc::new(transport::backend::ReqwestBackend::new()?),
+    };
+    let api: Arc<dyn ServerApi> = Arc::new(HttpServerApi::with_backend(
+        http_config.clone(),
+        Arc::clone(&backend),
+    ));
+    let source: Arc<dyn EventSource> = Arc::new(SseEventSource::with_backend(http_config, backend));
 
     let mut app = App::new(
         input.config.clone(),

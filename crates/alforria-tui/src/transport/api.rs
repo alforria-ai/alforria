@@ -32,12 +32,16 @@
 
 use std::collections::BTreeMap;
 
+use std::sync::Arc;
+
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use reqwest::Method;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+
+use crate::transport::backend::{Backend, BackendRequest, BackendResponse, ReqwestBackend};
 
 use alforria_schema::file_diff::SnapshotFileDiff;
 use alforria_schema::permission_v1::{PermissionV1Reply, PermissionV1Request};
@@ -47,7 +51,7 @@ use alforria_schema::session_todo::TodoInfo;
 use alforria_schema::session_v1::{V1Message, V1Part, V1SessionInfo};
 
 /// `encodeURIComponent` unreserved set: everything else is percent-encoded.
-pub(crate) fn percent_encode(input: &str) -> String {
+pub fn percent_encode(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for byte in input.as_bytes() {
         match byte {
@@ -354,10 +358,18 @@ pub trait ServerApi: Send + Sync {
 }
 
 /// reqwest production impl of [`ServerApi`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HttpServerApi {
-    client: reqwest::Client,
+    backend: Arc<dyn Backend>,
     config: HttpClientConfig,
+}
+
+impl std::fmt::Debug for HttpServerApi {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpServerApi")
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
 }
 
 pub(crate) fn build_url(
@@ -405,11 +417,17 @@ pub(crate) fn build_url(
 }
 
 impl HttpServerApi {
+    /// Over real HTTP.
     pub fn new(config: HttpClientConfig) -> Result<HttpServerApi> {
-        Ok(HttpServerApi {
-            client: reqwest::Client::builder().build()?,
+        Ok(HttpServerApi::with_backend(
             config,
-        })
+            Arc::new(ReqwestBackend::new()?),
+        ))
+    }
+
+    /// Over any [`Backend`] (the in-process router, a test double).
+    pub fn with_backend(config: HttpClientConfig, backend: Arc<dyn Backend>) -> HttpServerApi {
+        HttpServerApi { backend, config }
     }
 
     async fn request(
@@ -419,22 +437,25 @@ impl HttpServerApi {
         loc: &Location,
         extra_query: &[(&str, String)],
         body: Option<Value>,
-    ) -> Result<reqwest::Response> {
+    ) -> Result<BackendResponse> {
         let url = build_url(&self.config, path, &method, loc, extra_query);
-        let mut request = self.client.request(method.clone(), &url);
-        for (name, value) in &self.config.headers {
-            request = request.header(name.as_str(), value.as_str());
-        }
+        let mut headers = self.config.headers.clone();
         if method != Method::GET && method != Method::HEAD {
             if let Some(directory) = non_empty(self.config.directory.as_deref()) {
-                request = request.header("x-opencode-directory", percent_encode(directory));
+                headers.push((
+                    "x-opencode-directory".to_string(),
+                    percent_encode(directory),
+                ));
             }
         }
-        if let Some(body) = body {
-            request = request.json(&body);
-        }
-        request
-            .send()
+        let json = body.map(|body| serde_json::to_vec(&body)).transpose()?;
+        self.backend
+            .send(BackendRequest {
+                method: method.clone(),
+                url,
+                headers,
+                json,
+            })
             .await
             .with_context(|| format!("{} {path} request failed", method.as_str()))
     }
@@ -448,16 +469,13 @@ impl HttpServerApi {
         body: Option<Value>,
     ) -> Result<T> {
         let response = self.request(method, path, loc, extra_query, body).await?;
-        let status = response.status();
+        let status = response.status;
         let text = response
             .text()
             .await
             .with_context(|| format!("{path} response body read failed"))?;
-        if !status.is_success() {
-            return Err(anyhow!(
-                "server error on {path}: {}: {text}",
-                status.as_str()
-            ));
+        if !(200..300).contains(&status) {
+            return Err(anyhow!("server error on {path}: {status}: {text}"));
         }
         serde_json::from_str(&text).with_context(|| format!("{path} response decode failed"))
     }
@@ -478,10 +496,10 @@ impl HttpServerApi {
     /// POST whose response body is dropped (openapi `move-session` has an
     /// empty 200 body).
     async fn post_ignored(&self, path: &str, loc: &Location, body: Option<Value>) -> Result<()> {
-        self.request(Method::POST, path, loc, &[], body)
-            .await?
-            .error_for_status()
-            .with_context(|| format!("POST {path} failed"))?;
+        let response = self.request(Method::POST, path, loc, &[], body).await?;
+        if !response.is_success() {
+            return Err(anyhow!("POST {path} failed: {}", response.status));
+        }
         Ok(())
     }
 }
@@ -760,17 +778,14 @@ impl ServerApi for HttpServerApi {
     }
 
     async fn session_unshare(&self, loc: &Location, session_id: &str) -> Result<V1SessionInfo> {
-        self.request(
+        self.json(
             Method::DELETE,
             &format!("/session/{session_id}/share"),
             loc,
             &[],
             None,
         )
-        .await?
-        .json()
         .await
-        .context("unshare response body read failed")
     }
 
     async fn session_fork(
@@ -805,17 +820,14 @@ impl ServerApi for HttpServerApi {
     }
 
     async fn session_delete(&self, loc: &Location, session_id: &str) -> Result<bool> {
-        self.request(
+        self.json(
             Method::DELETE,
             &format!("/session/{session_id}"),
             loc,
             &[],
             None,
         )
-        .await?
-        .json()
         .await
-        .context("delete response body read failed")
     }
 
     async fn session_status(&self, loc: &Location) -> Result<BTreeMap<String, SessionStatusInfo>> {
@@ -868,17 +880,14 @@ impl ServerApi for HttpServerApi {
 
     async fn auth_set(&self, loc: &Location, provider_id: &str, key: &str) -> Result<bool> {
         let body = json!({ "type": "api", "key": key });
-        self.request(
+        self.json(
             Method::PUT,
             &format!("/auth/{provider_id}"),
             loc,
             &[],
             Some(body),
         )
-        .await?
-        .json()
         .await
-        .context("auth set response body read failed")
     }
 
     async fn auth_remove(&self, loc: &Location, provider_id: &str) -> Result<bool> {

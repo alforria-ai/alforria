@@ -171,11 +171,15 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "bytes",
  "chrono",
  "crossterm",
  "eventsource-stream",
  "futures",
  "hex",
+ "http",
+ "http-body",
+ "http-body-util",
  "libc",
  "rand 0.8.8",
  "ratatui",
@@ -185,6 +189,7 @@ dependencies = [
  "sha1",
  "tempfile",
  "tokio",
+ "tower",
  "unicode-width",
 ]
 
