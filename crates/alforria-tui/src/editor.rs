@@ -99,11 +99,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))] // the fake editor is sed; not on PATH on Windows
     fn editor_round_trip_with_a_fake_editor() {
         // The fake editor is `sed -i` — it rewrites the seeded content
         // deterministically. `openEditor` returns the raw file contents;
-        // callers apply `normalize_prompt_content`.
-        let editor = "sed -i s/old/new/g";
+        // callers apply `normalize_prompt_content`. `-i.bak` because BSD
+        // sed (macOS) requires `-i` to carry a suffix argument.
+        let editor = "sed -i.bak s/old/new/g";
         let content = open_editor_with("the old text\n", editor, None).expect("editor ran");
         assert_eq!(normalize_prompt_content(&content), "the new text");
     }
