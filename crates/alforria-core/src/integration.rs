@@ -193,7 +193,7 @@ impl IntegrationService {
                 .map(|remove_at| remove_at > now)
                 .unwrap_or(true)
         });
-        for (_, attempt) in attempts.iter_mut() {
+        for attempt in attempts.values_mut() {
             if attempt.status == Status::Pending
                 && attempt.time["expires"].as_u64().unwrap_or(0) <= now
             {

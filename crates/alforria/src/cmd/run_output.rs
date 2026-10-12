@@ -677,7 +677,7 @@ mod tests {
     #[test]
     fn inline_line_joins_icon_and_title() {
         let line = inline_line(&Inline::new_inline("→", "Read x".to_string()));
-        assert_eq!(line, format!("\x1b[0m→ \x1b[0mRead x"),);
+        assert_eq!(line, "\x1b[0m→ \x1b[0mRead x");
     }
 
     #[test]
@@ -687,7 +687,7 @@ mod tests {
             ..Inline::new_inline("→", "Read x".to_string())
         };
         let line = inline_line(&inline);
-        assert_eq!(line, format!("\x1b[0m→ \x1b[0mRead x\x1b[90m extra\x1b[0m"),);
+        assert_eq!(line, "\x1b[0m→ \x1b[0mRead x\x1b[90m extra\x1b[0m");
     }
 
     #[test]
