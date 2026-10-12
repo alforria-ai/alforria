@@ -81,6 +81,11 @@ impl ResolvedNetworkOptions {
             port: self.port,
             hostname: self.hostname.clone(),
             cors: self.cors.clone(),
+            hosts: if self.mdns {
+                vec![self.mdns_domain.clone()]
+            } else {
+                Vec::new()
+            },
         }
     }
 }

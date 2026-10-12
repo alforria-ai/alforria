@@ -763,3 +763,29 @@ literally inside cells. Cells now go through the inline markdown
 renderer (bold/italic/code/links) before wrapping and alignment, and
 column widths are measured on the marker-stripped rendered cells the
 way OpenTUI measures its text buffers.
+
+## Server boundary (improvement plan S1, decided 2026-10-12)
+
+Deliberate deviations from the pinned TS server:
+
+- **Host allowlist without a password** (`middleware/host.rs`). A request
+  whose `Host` is not loopback (`localhost`, `127.0.0.1`, `[::1]`), the
+  bound `--hostname`, the mDNS name or a `--cors` origin's host gets a 403
+  `ForbiddenError`. A listener on `0.0.0.0` / `::` also accepts any IP
+  literal (LAN clients by address; an address can't be rebound). TS has no
+  check, so a DNS-rebound page passes `sameHost` and can spawn PTYs. With a
+  password the check is off. A LAN client that uses a machine name on a
+  password-less server needs `--cors http://<name>:<port>`.
+- **The UI can't be framed**: `frame-ancestors 'none'` in its CSP and
+  `X-Frame-Options: DENY`.
+- **CORS is the server's own origin plus `--cors`.** Dropped from upstream:
+  `*.opencode.ai`, `tauri://localhost`, `http(s)://tauri.localhost`,
+  `oc://renderer`, and `http://localhost:*` / `http://127.0.0.1:*` on other
+  ports. alforria has no hosted or desktop client, and "any local port"
+  hands the agent to every local dev server. The same allowlist gates the
+  cross-site write guard and PTY tickets; the vite dev proxy presents the
+  server's own origin for its pages.
+- **PTY tickets are checked at the auth boundary.** TS lets any non-empty
+  `?ticket=` on `…/pty/:id/connect` past auth and validates in the handler;
+  here the ticket must be live and issued for that PTY before the request
+  passes auth (the handler still consumes it against the full scope).

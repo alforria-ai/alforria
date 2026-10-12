@@ -31,8 +31,9 @@ const api = [
 ]
 
 // The server refuses state-changing requests and PTY tickets whose Origin is
-// not its own host or localhost. A page served by vite to a phone on the LAN
-// has vite's origin, so for requests *from vite's own pages* (Origin host ==
+// not its own (or a --cors origin), and answers only to loopback Host names
+// (changeOrigin rewrites Host to the target). Vite's pages have vite's
+// origin, so for requests *from vite's own pages* (Origin host ==
 // Host header) present the target's origin instead. Anything else keeps its
 // real Origin, so a foreign site can't use this proxy to get past the check.
 type Req = { headers: Record<string, string | string[] | undefined> }

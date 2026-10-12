@@ -161,6 +161,7 @@ async fn options_requests_short_circuit_into_cors_preflight() {
                 .method("OPTIONS")
                 .uri("/session")
                 .header("origin", "http://localhost:3000")
+                .header("host", "localhost:3000")
                 .header("access-control-request-method", "GET")
                 .header("access-control-request-headers", "authorization")
                 .body(Body::empty())
@@ -196,6 +197,7 @@ async fn simple_get_receives_cors_headers() {
             Request::builder()
                 .uri("/session")
                 .header("origin", "http://localhost:1234")
+                .header("host", "localhost:1234")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -241,6 +243,7 @@ async fn layers_apply_to_the_ui_fallback() {
             Request::builder()
                 .uri("/definitely-not-a-route")
                 .header("origin", "http://localhost:3000")
+                .header("host", "localhost:3000")
                 .body(Body::empty())
                 .unwrap(),
         )

@@ -1366,6 +1366,9 @@ pub struct ServerContext {
     pub bus: Arc<EventBus>,
     /// Additional allowed CORS origins (CLI `--cors` list).
     pub cors: Vec<String>,
+    /// The `Host` names a password-less server answers to (DNS-rebinding
+    /// guard, `middleware::host`). Loopback only unless a listener sets it.
+    pub hosts: crate::middleware::host::HostAllowlist,
     pub ui: Arc<dyn UiBackend>,
     /// The GlobalBus feeding `/global/event` + the v1 `/event` disposal
     /// terminator, bridged onto `bus` (`bus/global.ts`, `event-v2-bridge.ts`).
@@ -1491,6 +1494,7 @@ impl ServerContext {
             provider_auth: Arc::new(ProviderAuthService::new()),
             v2_permissions: Arc::new(crate::routes::v2::permission::PermissionRegistry::default()),
             pty_tickets: crate::pty::ticket::TicketCache::default(),
+            hosts: crate::middleware::host::HostAllowlist::loopback(),
             ptys: crate::pty::PtyRegistry::default(),
             websockets: WebSocketTracker::default(),
             projects,

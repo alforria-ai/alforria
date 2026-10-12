@@ -638,7 +638,7 @@ async fn execute(
             alforria_server::listen(&alforria_server::ListenOptions {
                 port: args.port,
                 hostname: "127.0.0.1".to_string(),
-                cors: Vec::new(),
+                ..alforria_server::ListenOptions::default()
             })
             .await
             .map_err(|err| TypedError::Unknown {

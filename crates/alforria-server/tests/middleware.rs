@@ -261,6 +261,7 @@ async fn cors_vary_fix_runs_after_cors() {
             Request::builder()
                 .uri("/session")
                 .header("origin", "http://localhost:3000")
+                .header("host", "localhost:3000")
                 .body(Body::empty())
                 .unwrap(),
         )

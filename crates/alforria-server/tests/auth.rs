@@ -342,31 +342,59 @@ async fn public_ui_paths_bypass_auth() {
 
 #[tokio::test]
 async fn pty_connect_ticket_bypasses_credentials() {
-    let router = router(Some(PASSWORD));
+    let ctx =
+        ServerContext::for_tests_with_auth(AuthConfig::new("alforria", Some(PASSWORD.to_string())));
+    let ticket = ctx
+        .pty_tickets
+        .issue(alforria_server::pty::ticket::Scope {
+            pty_id: "pty_1".to_string(),
+            directory: None,
+            workspace_id: None,
+        })
+        .ticket;
+    let router = routes::build_router(Arc::new(ctx));
 
-    // Browsers cannot set headers on WebSocket upgrades — a non-empty
-    // `ticket` query param skips the credential check entirely.
+    // Browsers cannot set headers on WebSocket upgrades — a live ticket for
+    // the PTY skips the credential check (deviation: TS lets any non-empty
+    // `ticket` through and leaves validation to the handler).
     for (path, expected) in [
         (
-            "/pty/pty_1/connect?ticket=tkt_1",
+            format!("/pty/pty_1/connect?ticket={ticket}"),
             StatusCode::INTERNAL_SERVER_ERROR,
         ),
         (
-            "/api/pty/pty_1/connect?ticket=tkt_1",
+            format!("/api/pty/pty_1/connect?ticket={ticket}"),
             StatusCode::INTERNAL_SERVER_ERROR,
         ),
-        ("/pty/pty_1/connect?ticket=", StatusCode::UNAUTHORIZED),
-        ("/pty/pty_1/connect", StatusCode::UNAUTHORIZED),
-        ("/api/pty/pty_1/connect", StatusCode::UNAUTHORIZED),
-        ("/pty/pty_1?ticket=tkt_1", StatusCode::UNAUTHORIZED),
         (
-            "/api/pty/pty_1/connect-token?ticket=tkt_1",
+            "/pty/pty_1/connect?ticket=tkt_1".to_string(),
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            format!("/pty/pty_2/connect?ticket={ticket}"),
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "/pty/pty_1/connect?ticket=".to_string(),
+            StatusCode::UNAUTHORIZED,
+        ),
+        ("/pty/pty_1/connect".to_string(), StatusCode::UNAUTHORIZED),
+        (
+            "/api/pty/pty_1/connect".to_string(),
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            format!("/pty/pty_1?ticket={ticket}"),
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            format!("/api/pty/pty_1/connect-token?ticket={ticket}"),
             StatusCode::UNAUTHORIZED,
         ),
     ] {
         let response = router
             .clone()
-            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .oneshot(Request::builder().uri(&path).body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(response.status(), expected, "{path}");
@@ -427,6 +455,7 @@ async fn options_preflight_skips_auth() {
                 .method("OPTIONS")
                 .uri("/session")
                 .header("origin", "http://localhost:3000")
+                .header("host", "localhost:3000")
                 .header("access-control-request-method", "GET")
                 .body(Body::empty())
                 .unwrap(),
@@ -444,6 +473,7 @@ async fn auth_401s_still_receive_cors_headers() {
             Request::builder()
                 .uri("/session")
                 .header("origin", "http://localhost:3000")
+                .header("host", "localhost:3000")
                 .body(Body::empty())
                 .unwrap(),
         )

@@ -82,6 +82,18 @@ impl TicketCache {
         }
     }
 
+    /// Whether `ticket` is live and was issued for `pty_id`, without
+    /// consuming it. The auth middleware lets a ticketed websocket through
+    /// only on this (the handler consumes it against the full scope).
+    pub fn is_live_for(&self, ticket: &str, pty_id: &str) -> bool {
+        let now = self.clock.now_ms();
+        let entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        entries
+            .map
+            .get(ticket)
+            .is_some_and(|stored| stored.expires_at_ms > now && stored.scope.pty_id == pty_id)
+    }
+
     /// `consume` (`ticket.ts:48-50`): removes the ticket iff it is live and
     /// the stored scope matches; a mismatched ticket is *not* consumed.
     pub fn consume(&self, ticket: &str, scope: &Scope) -> bool {
@@ -205,6 +217,19 @@ mod tests {
         // The first 10 tickets were evicted; the rest are still consumable.
         assert!(!cache.consume(&tickets[0], &scope()));
         assert!(cache.consume(&tickets[CAPACITY + 9], &scope()));
+    }
+
+    #[test]
+    fn liveness_peek_checks_pty_and_expiry_without_consuming() {
+        let (cache, clock) = cache();
+        let token = cache.issue(scope());
+        assert!(cache.is_live_for(&token.ticket, "pty_1"));
+        assert!(!cache.is_live_for(&token.ticket, "pty_2"));
+        assert!(!cache.is_live_for("nope", "pty_1"));
+        assert!(cache.consume(&token.ticket, &scope()), "peeking keeps it");
+        let token = cache.issue(scope());
+        *clock.0.lock().unwrap() += 60_000;
+        assert!(!cache.is_live_for(&token.ticket, "pty_1"));
     }
 
     #[test]

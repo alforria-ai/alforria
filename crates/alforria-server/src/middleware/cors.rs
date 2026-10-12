@@ -6,40 +6,25 @@
 //! `allowedOrigins`, `maxAge: 86_400`, and every other option left at its
 //! default (`allowedMethods: ["GET", "HEAD", "PUT", "PATCH", "POST", "DELETE"]`,
 //! `credentials: false`, `allowedHeaders: []`).
+//!
+//! The allowlist itself is narrowed to the server's own origin plus `--cors`
+//! (see [`is_allowed_cors_origin`]).
 
-use std::sync::LazyLock;
 use std::task::{Context, Poll};
 
 use axum::body::Body;
 use axum::http::{HeaderValue, Method, Response};
 use futures::future::BoxFuture;
-use regex::Regex;
 use tower::Service;
 
-static OPENCODE_ORIGIN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^https://([a-z0-9-]+\.)*opencode\.ai$").unwrap());
-
-/// `isAllowedCorsOrigin` (`cors.ts:11-19`).
+/// `isAllowedCorsOrigin` (`cors.ts:11-19`), narrowed: only the `--cors`
+/// list. Deliberate deviation (decided 2026-10-12, `review-findings.md`):
+/// TS also admits `*.opencode.ai`, the tauri and `oc://renderer` desktop
+/// shells and every `localhost` / `127.0.0.1` port. alforria has no hosted or
+/// desktop client, and "any local port" lets every local dev server or
+/// rogue local page drive the agent.
 pub fn is_allowed_cors_origin(input: Option<&str>, opts: &[String]) -> bool {
     let Some(input) = input else { return true };
-    if input.starts_with("http://localhost:") {
-        return true;
-    }
-    if input.starts_with("http://127.0.0.1:") {
-        return true;
-    }
-    if input.starts_with("oc://renderer") {
-        return true;
-    }
-    if input == "tauri://localhost"
-        || input == "http://tauri.localhost"
-        || input == "https://tauri.localhost"
-    {
-        return true;
-    }
-    if OPENCODE_ORIGIN.is_match(input) {
-        return true;
-    }
     opts.iter().any(|origin| origin == input)
 }
 
@@ -166,7 +151,8 @@ where
             .get("origin")
             .and_then(|v| v.to_str().ok())
             .map(|v| v.to_string());
-        let allowed = is_allowed_cors_origin(origin.as_deref(), &self.allowed_origins);
+        // The server's own origin (same host) or a `--cors` origin.
+        let allowed = request_origin_allowed(req.headers(), &self.allowed_origins);
 
         if req.method() == Method::OPTIONS {
             let mut response = Response::builder()
@@ -211,8 +197,8 @@ where
         // cross-site POST/PUT/PATCH/DELETE, including "simple" form posts that
         // skip preflight, and the server parses bodies as JSON whatever their
         // content type. Without a password such a request would reach
-        // state-changing routes (`POST /pty` spawns a process). Same-host,
-        // localhost and allowlisted origins pass, as do clients that send no
+        // state-changing routes (`POST /pty` spawns a process). Same-host and
+        // allowlisted origins pass, as do clients that send no
         // `Origin` at all (CLI, TUI, SDKs).
         if !matches!(*req.method(), Method::GET | Method::HEAD)
             && !request_origin_allowed(req.headers(), &self.allowed_origins)
@@ -359,42 +345,50 @@ mod tests {
             status(send("POST", Some("http://127.0.0.1:4096")).await.unwrap()),
             200
         );
+        // Another local port is another origin (upstream admits it).
         assert_eq!(
             status(send("PATCH", Some("http://localhost:5173")).await.unwrap()),
-            200
+            403
         );
         assert_eq!(
             status(send("GET", Some("https://evil.example")).await.unwrap()),
             200
         );
-        assert_eq!(reached.load(std::sync::atomic::Ordering::SeqCst), 4);
+        assert_eq!(reached.load(std::sync::atomic::Ordering::SeqCst), 3);
     }
 
+    /// Only `--cors` origins: every upstream origin is dropped.
     #[test]
     fn allowed_origin_matrix() {
         let none: Option<&str> = None;
         assert!(is_allowed_cors_origin(none, &[]));
-        assert!(is_allowed_cors_origin(Some("http://localhost:3000"), &[]));
-        assert!(is_allowed_cors_origin(Some("http://127.0.0.1:8080"), &[]));
-        assert!(is_allowed_cors_origin(Some("oc://renderer"), &[]));
-        assert!(is_allowed_cors_origin(Some("tauri://localhost"), &[]));
-        assert!(is_allowed_cors_origin(Some("http://tauri.localhost"), &[]));
-        assert!(is_allowed_cors_origin(Some("https://tauri.localhost"), &[]));
-        assert!(is_allowed_cors_origin(Some("https://opencode.ai"), &[]));
-        assert!(is_allowed_cors_origin(Some("https://foo.opencode.ai"), &[]));
-        assert!(is_allowed_cors_origin(Some("https://app.opencode.ai"), &[]));
-        assert!(!is_allowed_cors_origin(Some("https://evil.com"), &[]));
-        assert!(!is_allowed_cors_origin(
-            Some("https://opencode.ai.evil.com"),
-            &[]
-        ));
-        assert!(!is_allowed_cors_origin(
-            Some("https://opencode-ai.com"),
-            &[]
-        ));
+        for origin in [
+            "http://localhost:3000",
+            "http://127.0.0.1:8080",
+            "oc://renderer",
+            "tauri://localhost",
+            "http://tauri.localhost",
+            "https://tauri.localhost",
+            "https://opencode.ai",
+            "https://app.opencode.ai",
+            "https://evil.com",
+        ] {
+            assert!(!is_allowed_cors_origin(Some(origin), &[]), "{origin}");
+        }
         assert!(is_allowed_cors_origin(
             Some("https://evil.com"),
             &["https://evil.com".to_string()]
+        ));
+        // The server's own origin passes without being listed.
+        assert!(is_allowed_request_origin(
+            Some("http://127.0.0.1:4096"),
+            Some("127.0.0.1:4096"),
+            &[]
+        ));
+        assert!(!is_allowed_request_origin(
+            Some("http://127.0.0.1:4097"),
+            Some("127.0.0.1:4096"),
+            &[]
         ));
     }
 
@@ -409,6 +403,7 @@ mod tests {
                     .method("GET")
                     .uri("/session")
                     .header("origin", "http://localhost:3000")
+                    .header("host", "localhost:3000")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -455,6 +450,7 @@ mod tests {
                     .method("OPTIONS")
                     .uri("/session")
                     .header("origin", "http://localhost:3000")
+                    .header("host", "localhost:3000")
                     .header("access-control-request-method", "GET")
                     .header("access-control-request-headers", "content-type")
                     .body(Body::empty())
@@ -499,6 +495,7 @@ mod tests {
                     .method("OPTIONS")
                     .uri("/session")
                     .header("origin", "http://localhost:3000")
+                    .header("host", "localhost:3000")
                     .body(Body::empty())
                     .unwrap(),
             )

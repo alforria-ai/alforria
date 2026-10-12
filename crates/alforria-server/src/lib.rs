@@ -39,6 +39,9 @@ pub struct ListenOptions {
     pub hostname: String,
     /// Additional allowed CORS origins (CLI `--cors`).
     pub cors: Vec<String>,
+    /// Extra `Host` names the server answers to besides loopback, the bound
+    /// hostname and the `--cors` hosts (the mDNS name).
+    pub hosts: Vec<String>,
 }
 
 impl Default for ListenOptions {
@@ -47,6 +50,7 @@ impl Default for ListenOptions {
             port: DEFAULT_PORT,
             hostname: DEFAULT_HOSTNAME.to_string(),
             cors: Vec::new(),
+            hosts: Vec::new(),
         }
     }
 }
@@ -183,6 +187,7 @@ pub fn production_context(
         opts.cors.clone(),
         ui_backend(),
     );
+    ctx.hosts = middleware::host::HostAllowlist::new(&opts.hostname, &opts.hosts, &opts.cors);
     ctx.engine_factory = engines.factory();
     ctx.tools = engines.tools();
     ctx.mcp = engines.mcp_source();

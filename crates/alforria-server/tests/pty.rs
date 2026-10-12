@@ -323,14 +323,24 @@ async fn connect_token_enforcement() {
     .await;
     assert_eq!(forbidden.status(), 403);
 
-    // Allowed origin.
-    let ok = connect_ticket(
+    // Another local port is a foreign origin.
+    let forbidden = connect_ticket(
         &fx,
         &path,
         &[
             ("x-opencode-ticket", "1"),
             ("origin", "http://localhost:3000"),
         ],
+    )
+    .await;
+    assert_eq!(forbidden.status(), 403);
+
+    // The server's own origin.
+    let own = fx.base();
+    let ok = connect_ticket(
+        &fx,
+        &path,
+        &[("x-opencode-ticket", "1"), ("origin", own.as_str())],
     )
     .await;
     assert_eq!(ok.status(), 200);
@@ -438,7 +448,8 @@ async fn ws_handshake(fx: &Fixture, path: &str, origin: Option<&str>, host: Opti
 }
 
 /// A foreign `Origin` never gets a terminal socket, ticket or no ticket;
-/// origin-less clients, localhost and same-host pages do.
+/// origin-less clients and the server's own pages do. A rebound `Host`
+/// (DNS rebinding: origin and host both name the attacker) is refused.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ws_connect_refuses_foreign_origins() {
     let fx = fixture().await;
@@ -458,9 +469,10 @@ async fn ws_connect_refuses_foreign_origins() {
         );
         assert_eq!(ws_handshake(&fx, path, Some("null"), None).await, 403);
         assert_eq!(ws_handshake(&fx, path, None, None).await, 101);
+        assert_eq!(ws_handshake(&fx, path, Some(&fx.base()), None).await, 101);
         assert_eq!(
             ws_handshake(&fx, path, Some("http://localhost:4610"), None).await,
-            101
+            403
         );
         assert_eq!(
             ws_handshake(
@@ -470,7 +482,7 @@ async fn ws_connect_refuses_foreign_origins() {
                 Some("alforria.lan:4096")
             )
             .await,
-            101
+            403
         );
     }
 
@@ -491,7 +503,7 @@ async fn ws_connect_refuses_foreign_origins() {
         403
     );
     assert_eq!(
-        ws_handshake(&fx, &ticketed, Some("http://127.0.0.1:4610"), None).await,
+        ws_handshake(&fx, &ticketed, Some(&fx.base()), None).await,
         101
     );
 

@@ -27,6 +27,7 @@ use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
 use base64::Engine;
 use tower::Service;
 
+use crate::pty::ticket::TicketCache;
 use crate::routes::{ui, v1, v2};
 use crate::state::AuthConfig;
 
@@ -239,16 +240,18 @@ fn segment_matches(pattern: &str, seg: &str) -> bool {
 }
 
 /// `isPtyConnectPath` (`shared/pty-ticket.ts:9-11`; v2: protocol
-/// `groups/pty.ts:18-21`) — `^(/api)?/pty/[^/]+/connect$`.
-fn is_pty_connect_path(path: &str, prefix: &str) -> bool {
-    let Some(rest) = path.strip_prefix(prefix) else {
-        return false;
-    };
-    let Some((pty_id, tail)) = rest.split_once('/') else {
-        return false;
-    };
+/// `groups/pty.ts:18-21`) — `^(/api)?/pty/[^/]+/connect$`. Returns the
+/// (still percent-encoded) PTY id.
+fn pty_connect_id<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
+    let rest = path.strip_prefix(prefix)?;
+    let (pty_id, tail) = rest.split_once('/')?;
     // `^/pty/[^/]+/connect$` — the id must be non-empty.
-    !pty_id.is_empty() && tail == "connect"
+    (!pty_id.is_empty() && tail == "connect").then_some(pty_id)
+}
+
+#[cfg(test)]
+fn is_pty_connect_path(path: &str, prefix: &str) -> bool {
+    pty_connect_id(path, prefix).is_some()
 }
 
 /// `isPublicUIPath` (`shared/public-ui.ts:10-12`).
@@ -272,6 +275,7 @@ enum Rejection {
 
 fn check(
     auth: &AuthConfig,
+    tickets: &TicketCache,
     method: &Method,
     uri: &Uri,
     headers: &HeaderMap,
@@ -290,8 +294,15 @@ fn check(
             Surface::V2Api => "/api/pty/",
             Surface::Raw => unreachable!(),
         };
-        let ticketed = is_pty_connect_path(path, prefix)
-            && query_param(uri.query(), "ticket").is_some_and(|ticket| !ticket.is_empty());
+        // Deliberate deviation: TS lets any non-empty `?ticket=` through and
+        // leaves validation to the handler; here the ticket must be live and
+        // issued for this PTY before the request gets past auth (the handler
+        // still consumes it against the full scope).
+        let ticketed = pty_connect_id(path, prefix).is_some_and(|pty_id| {
+            query_param(uri.query(), "ticket").is_some_and(|ticket| {
+                !ticket.is_empty() && tickets.is_live_for(&ticket, &url_decode(pty_id))
+            })
+        });
         if ticketed {
             return Ok(());
         }
@@ -340,11 +351,12 @@ fn unauthorized_v2() -> Response<Body> {
 #[derive(Clone)]
 pub struct AuthLayer {
     auth: AuthConfig,
+    tickets: TicketCache,
 }
 
 impl AuthLayer {
-    pub fn new(auth: AuthConfig) -> AuthLayer {
-        AuthLayer { auth }
+    pub fn new(auth: AuthConfig, tickets: TicketCache) -> AuthLayer {
+        AuthLayer { auth, tickets }
     }
 }
 
@@ -355,6 +367,7 @@ impl<S> tower::Layer<S> for AuthLayer {
         AuthService {
             inner,
             auth: self.auth.clone(),
+            tickets: self.tickets.clone(),
         }
     }
 }
@@ -363,6 +376,7 @@ impl<S> tower::Layer<S> for AuthLayer {
 pub struct AuthService<S> {
     inner: S,
     auth: AuthConfig,
+    tickets: TicketCache,
 }
 
 impl<S> Service<axum::http::Request<Body>> for AuthService<S>
@@ -383,7 +397,13 @@ where
         if !self.auth.required() {
             return Box::pin(async move { inner.call(req).await });
         }
-        let result = check(&self.auth, req.method(), req.uri(), req.headers());
+        let result = check(
+            &self.auth,
+            &self.tickets,
+            req.method(),
+            req.uri(),
+            req.headers(),
+        );
         Box::pin(async move {
             match result {
                 Ok(()) => inner.call(req).await,

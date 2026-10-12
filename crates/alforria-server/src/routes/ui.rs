@@ -53,13 +53,21 @@ pub fn serve_ui(ctx: &Arc<ServerContext>, path: &str) -> Response<Body> {
                     .headers_mut()
                     .insert("content-security-policy", value);
             }
+            // Deliberate deviation: the UI must never be framed (a framing
+            // page could click-jack permission and terminal controls). The
+            // CSP carries `frame-ancestors 'none'`; this covers browsers
+            // that ignore it.
+            response
+                .headers_mut()
+                .insert("x-frame-options", HeaderValue::from_static("DENY"));
         }
         return response;
     }
     not_found()
 }
 
-/// `themePreloadHash` + `csp` (ui.ts:14-19, 26-27).
+/// `themePreloadHash` + `csp` (ui.ts:14-19, 26-27), plus
+/// `frame-ancestors 'none'` (deviation: TS lets any page frame the UI).
 fn csp_for_html(body: &str) -> String {
     let hash = theme_preload_script(body)
         .map(|script| {
@@ -74,10 +82,10 @@ fn csp_for_html(body: &str) -> String {
 
 fn csp(hash: &str) -> String {
     if hash.is_empty() {
-        "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https: blob:; font-src 'self' data:; media-src 'self' data:; connect-src * data: blob:"
+        "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https: blob:; font-src 'self' data:; media-src 'self' data:; connect-src * data: blob:; frame-ancestors 'none'"
             .to_string()
     } else {
-        format!("default-src 'self'; script-src 'self' 'wasm-unsafe-eval' 'sha256-{hash}'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https: blob:; font-src 'self' data:; media-src 'self' data:; connect-src * data: blob:")
+        format!("default-src 'self'; script-src 'self' 'wasm-unsafe-eval' 'sha256-{hash}'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https: blob:; font-src 'self' data:; media-src 'self' data:; connect-src * data: blob:; frame-ancestors 'none'")
     }
 }
 
@@ -207,6 +215,8 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(csp.contains("sha256-"), "csp: {csp}");
+        assert!(csp.ends_with("; frame-ancestors 'none'"), "csp: {csp}");
+        assert_eq!(response.headers()["x-frame-options"], "DENY");
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -260,6 +270,7 @@ mod tests {
         let csp = csp_for_html("<html><body></body></html>");
         assert!(csp.contains("wasm-unsafe-eval"));
         assert!(!csp.contains("sha256-"));
+        assert!(csp.contains("frame-ancestors 'none'"));
     }
 
     #[test]

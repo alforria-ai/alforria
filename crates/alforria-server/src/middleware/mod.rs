@@ -8,6 +8,7 @@ pub mod auth;
 pub mod compression;
 pub mod cors;
 pub mod fence;
+pub mod host;
 pub mod location;
 
 use std::sync::Arc;
@@ -20,16 +21,23 @@ use crate::state::ServerContext;
 ///
 /// `Router::layer` wraps outside-in: added first = closest to the handlers,
 /// so the request path is panic catcher → compression → cors-vary → fence →
-/// cors → auth → location → route handlers, matching the TS stack exactly.
+/// host → cors → auth → location → route handlers: the TS stack plus the
+/// host check.
 pub fn apply_stack(router: Router, ctx: &Arc<ServerContext>) -> Router {
     router
         // workspace-routing + instance-context (v1) / location (v2) run
         // inside authorization.
         .layer(location::LocationLayer::new(ctx.clone()))
         // authorizationLayer — TS bakes it into route handlers.
-        .layer(auth::AuthLayer::new(ctx.auth.clone()))
+        .layer(auth::AuthLayer::new(
+            ctx.auth.clone(),
+            ctx.pty_tickets.clone(),
+        ))
         // cors — short-circuits every OPTIONS request.
         .layer(cors::CorsLayer::new(ctx.cors.clone()))
+        // Host allowlist (no TS counterpart): a rebound name never reaches
+        // cors' same-host pass, preflights included.
+        .layer(host::HostLayer::new(ctx.auth.clone(), ctx.hosts.clone()))
         // fenceLayer
         .layer(fence::FenceLayer::from_env(ctx.storage.clone()))
         // corsVaryFix
