@@ -46,7 +46,7 @@ pub fn parse_frecency(text: &str) -> Vec<(String, Entry)> {
         );
     }
     let mut entries: Vec<(String, Entry)> = latest.into_iter().collect();
-    entries.sort_by(|a, b| b.1.last_open.cmp(&a.1.last_open));
+    entries.sort_by_key(|e| std::cmp::Reverse(e.1.last_open));
     entries.truncate(MAX_FRECENCY_ENTRIES);
     entries
 }
@@ -118,7 +118,7 @@ impl Frecency {
             return;
         }
         let mut sorted: Vec<(String, Entry)> = std::mem::take(&mut self.data).into_iter().collect();
-        sorted.sort_by(|a, b| b.1.last_open.cmp(&a.1.last_open));
+        sorted.sort_by_key(|e| std::cmp::Reverse(e.1.last_open));
         sorted.truncate(MAX_FRECENCY_ENTRIES);
         let text = sorted
             .iter()
