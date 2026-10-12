@@ -9,6 +9,7 @@ const api = [
   "/global",
   "/event",
   "/session",
+  "/experimental",
   "/project",
   "/permission",
   "/question",
