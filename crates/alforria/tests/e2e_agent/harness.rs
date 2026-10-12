@@ -292,7 +292,17 @@ pub fn wait(child: &mut Child, timeout: Duration) -> ProcOutput {
                 };
             }
             None => {
-                assert!(Instant::now() < deadline, "opencode timed out");
+                if Instant::now() >= deadline {
+                    // Kill the hung child and surface everything it said,
+                    // so a platform-specific stall is diagnosable from CI.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!(
+                        "opencode timed out after {timeout:?} — stdout:\n{}\nstderr:\n{}",
+                        stdout.map(read_pump).unwrap_or_default(),
+                        stderr.map(read_pump).unwrap_or_default(),
+                    );
+                }
                 std::thread::sleep(Duration::from_millis(50));
             }
         }
