@@ -806,6 +806,9 @@ pub async fn a11_session_diff(backend: &impl LlmBackend) {
     let dump = || serde_json::to_string_pretty(&events).expect("events");
 
     let file = a_txt.display().to_string();
+    // The patch files list uses the wire's forward-slash convention on
+    // every platform; Windows display paths use backslashes.
+    let file_slashes = file.replace('\\', "/");
     let edited: Vec<&Value> = events
         .iter()
         .filter(|event| event["type"] == json!("file.edited"))
@@ -860,7 +863,7 @@ pub async fn a11_session_diff(backend: &impl LlmBackend) {
         .filter(|part| part["type"] == json!("patch"))
         .collect();
     assert_eq!(patches.len(), 1, "{messages:?}");
-    assert_eq!(patches[0]["files"], json!([file]));
+    assert_eq!(patches[0]["files"], json!([file_slashes]));
 
     let diff = |query: String| {
         let api = &sess.api;
