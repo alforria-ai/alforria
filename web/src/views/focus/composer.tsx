@@ -88,7 +88,8 @@ const commandsFor = (dir: string) => {
     )
   return commandCache.get(dir)!
 }
-const variantCache = new Map<string, Promise<Record<string, string[]>>>()
+/** null: the catalog could not be read, so which variants exist is unknown. */
+const variantCache = new Map<string, Promise<Record<string, string[]> | null>>()
 const variantsFor = (dir: string) => {
   if (!variantCache.has(dir))
     variantCache.set(
@@ -99,7 +100,7 @@ const variantsFor = (dir: string) => {
         .catch(() => {
           // Not cached: the next column to ask tries again.
           variantCache.delete(dir)
-          return {}
+          return null
         }),
     )
   return variantCache.get(dir)!
@@ -157,8 +158,9 @@ export function Composer(props: { sessionID: string }) {
       if (u && m === `${u.providerID}/${u.modelID}`) v = u.variant
       else if (sm && m === `${sm.providerID}/${sm.id}`) v = sm.variant
     }
-    const known = variantIndex()?.[m ?? ""]
-    return v && (!variantIndex() || !known || known.includes(v)) ? v : undefined
+    // Unknown catalog (loading or unreadable): trust the session. Known: only what the model offers.
+    const index = variantIndex()
+    return v && (!index || index[m ?? ""]?.includes(v)) ? v : undefined
   }
   /** "" picks the model's default explicitly (so a restored variant doesn't come back). */
   const pickVariant = (v: string | undefined) => setDraft({ variant: v ?? "" })
