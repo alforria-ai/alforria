@@ -26,7 +26,8 @@ use crate::state::ServerContext;
 // ---------------------------------------------------------------------------
 
 /// `Config.Service.update` (config.ts:637-668): merge the payload into
-/// `<directory>/config.json`, pretty-printed JSON.
+/// `<directory>/config.json`, pretty-printed JSON. A `null` value deletes its
+/// key (deviation, see `alforria_core::merge_patch`).
 fn update_config_file(directory: &Path, payload: &Value) -> Result<(), ServerError> {
     let file = directory.join("config.json");
     let original = match std::fs::read_to_string(&file) {
@@ -35,7 +36,7 @@ fn update_config_file(directory: &Path, payload: &Value) -> Result<(), ServerErr
         _ => json!({}),
     };
     let mut merged = original;
-    alforria_core::merge_deep(&mut merged, payload);
+    alforria_core::merge_patch(&mut merged, payload);
     std::fs::write(
         &file,
         serde_json::to_string_pretty(&merged).expect("serialization"),
@@ -64,8 +65,12 @@ pub async fn config_update(
     if !payload.is_object() {
         return Err(payload_error("Expected an object"));
     }
-    decode_config(&payload, &location.directory.join("opencode.json"))
-        .map_err(|err| payload_error(err.to_string()))?;
+    // The nulls only clear keys; what's left must be valid config.
+    decode_config(
+        &alforria_core::strip_nulls(&payload),
+        &location.directory.join("opencode.json"),
+    )
+    .map_err(|err| payload_error(err.to_string()))?;
     update_config_file(&location.directory, &payload)?;
     let response = json_ok(&payload);
     ctx.instances.dispose_directory(&location.directory);

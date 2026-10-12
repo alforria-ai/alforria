@@ -33,6 +33,48 @@ pub fn merge_deep(target: &mut Value, source: &Value) {
     }
 }
 
+/// The config `PATCH` merge: [`merge_deep`], except that a JSON `null` in
+/// `source` deletes the key from `target`, at any depth (RFC 7386 style).
+/// Deliberate deviation (open decision 1 of the improvement plan,
+/// `review-findings.md`): TS `mergeDeep` writes the `null`, so a client can
+/// never clear a setting such as `model`. Nulls never reach the result.
+pub fn merge_patch(target: &mut Value, source: &Value) {
+    let Value::Object(s) = source else {
+        *target = strip_nulls(source);
+        return;
+    };
+    if !target.is_object() {
+        *target = Value::Object(Map::new());
+    }
+    let t = target.as_object_mut().expect("made an object above");
+    for (key, value) in s {
+        if value.is_null() {
+            t.remove(key);
+            continue;
+        }
+        match t.get_mut(key) {
+            Some(existing) if value.is_object() => merge_patch(existing, value),
+            _ => {
+                t.insert(key.clone(), strip_nulls(value));
+            }
+        }
+    }
+}
+
+/// `value` without the object keys whose value is `null`, at any depth —
+/// what a [`merge_patch`] payload contributes to an empty target.
+pub fn strip_nulls(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .filter(|(_, v)| !v.is_null())
+                .map(|(k, v)| (k.clone(), strip_nulls(v)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
 /// `mergeConfigConcatArrays` from `config.ts:46-52`: `merge_deep`, then if
 /// BOTH sides carry an `instructions` array, replace the result with a
 /// concatenation of the two, deduplicated with first-occurrence-wins order
@@ -105,6 +147,49 @@ mod tests {
         let source = json!({ "v": { "deep": 1 } });
         merge_deep(&mut target, &source);
         assert_eq!(target, json!({ "v": { "deep": 1 } }));
+    }
+
+    #[test]
+    fn patch_null_deletes_at_any_depth() {
+        let mut target = json!({
+            "model": "a/b",
+            "keep": 1,
+            "provider": { "x": { "options": { "baseURL": "u", "apiKey": "k" } } },
+        });
+        let source = json!({
+            "model": null,
+            "absent": null,
+            "provider": { "x": { "options": { "baseURL": null } } },
+        });
+        merge_patch(&mut target, &source);
+        assert_eq!(
+            target,
+            json!({ "keep": 1, "provider": { "x": { "options": { "apiKey": "k" } } } })
+        );
+    }
+
+    #[test]
+    fn patch_merges_like_merge_deep_otherwise() {
+        let mut target = json!({ "nested": { "x": 1, "y": 2 }, "arr": [1], "s": { "o": 1 } });
+        let source = json!({
+            "nested": { "y": 3 },
+            "arr": [2],
+            "s": "scalar",
+            "new": { "a": null, "b": 1 },
+        });
+        merge_patch(&mut target, &source);
+        assert_eq!(
+            target,
+            json!({ "nested": { "x": 1, "y": 3 }, "arr": [2], "s": "scalar", "new": { "b": 1 } })
+        );
+
+        // A scalar target replaced by an object keeps no nulls either.
+        let mut target = json!({ "v": 1 });
+        merge_patch(
+            &mut target,
+            &json!({ "v": { "a": null, "b": { "c": null } } }),
+        );
+        assert_eq!(target, json!({ "v": { "b": {} } }));
     }
 
     #[test]

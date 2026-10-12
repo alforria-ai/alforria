@@ -51,7 +51,7 @@ pub use event::{
 pub use format::Formatter;
 pub use git::{GitResult, GitRunner, Repository, SubprocessGit};
 pub use jsonc::parse_jsonc;
-pub use merge::{merge_config_concat_arrays, merge_deep};
+pub use merge::{merge_config_concat_arrays, merge_deep, merge_patch, strip_nulls};
 pub use paths::GlobalPaths;
 pub use project::registry::{ProjectRegistry, RegistryError as ProjectRegistryError};
 pub use project::GLOBAL_ID;

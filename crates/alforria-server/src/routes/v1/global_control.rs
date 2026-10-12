@@ -119,7 +119,8 @@ pub async fn global_config_get() -> Result<Response, ServerError> {
 }
 
 /// `configUpdate` (`handlers/global.ts:68-71`) — merge into the global config
-/// file; a change disposes every instance and emits `global.disposed`.
+/// file; a change disposes every instance and emits `global.disposed`. A
+/// `null` value deletes its key (deviation, see `alforria_core::merge_patch`).
 pub async fn global_config_update(
     State(ctx): State<Arc<ServerContext>>,
     body: Bytes,
@@ -136,7 +137,7 @@ pub async fn global_config_update(
     } else {
         json!({})
     };
-    alforria_core::merge_deep(&mut merged, &payload);
+    alforria_core::merge_patch(&mut merged, &payload);
     alforria_core::config::schema::decode_config(&merged, &file)?;
     // `writableGlobal` — a cleared `shell` drops the key (config.ts:148-157).
     if merged["shell"] == json!("") {

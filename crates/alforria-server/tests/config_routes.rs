@@ -172,6 +172,49 @@ async fn config_update_merges_into_config_json() {
     assert!(!f.worktree.join("config.json").exists());
 }
 
+/// A `null` clears its key (deviation: TS writes the null), deep too; the
+/// rest of the payload must still be valid config.
+#[tokio::test]
+async fn config_update_null_clears_a_key() {
+    let f = fixture();
+    let router = routes::build_router(f.ctx.clone());
+    let uri = instance_uri(&f.worktree, "config");
+    let response = send(
+        &router,
+        "PATCH",
+        &uri,
+        r#"{"model":"a/b","theme":"dark","provider":{"x":{"options":{"baseURL":"u","apiKey":"k"}}}}"#,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = send(
+        &router,
+        "PATCH",
+        &uri,
+        r#"{"model":null,"provider":{"x":{"options":{"baseURL":null}}}}"#,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let written: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(f.worktree.join("config.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        written,
+        serde_json::json!({"theme":"dark","provider":{"x":{"options":{"apiKey":"k"}}}})
+    );
+
+    // Nulls don't excuse an invalid rest.
+    let response = send(
+        &router,
+        "PATCH",
+        &uri,
+        r#"{"theme":null,"autoupdate":"yes-please"}"#,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
 #[tokio::test]
 async fn config_providers_shape() {
     let f = fixture();

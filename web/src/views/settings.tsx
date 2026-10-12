@@ -202,7 +202,8 @@ function Models() {
         class="select"
         aria-label={p.label}
         value={(config()?.[p.field] as string | undefined) ?? ""}
-        onChange={(e) => void patch({ [p.field]: e.currentTarget.value || undefined })}
+        // null clears the key (the server deletes it); undefined would serialize away.
+        onChange={(e) => void patch({ [p.field]: e.currentTarget.value || null })}
       >
         <option value="">Server default</option>
         <For each={models()}>{(m) => <option value={m.id}>{m.id}</option>}</For>

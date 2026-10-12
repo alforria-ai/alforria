@@ -796,3 +796,7 @@ Deliberate deviations from the pinned TS server:
   parity harnesses use. `attach --password` / `run --attach` take it as
   before; `bun run server` and the web e2e use a fixed dev password that the
   vite proxy presents.
+- **A `null` in `PATCH /global/config` or `PATCH /config` deletes the key**
+  (open decision 1), at any depth; TS `mergeDeep` writes the `null`, so a
+  setting could never be cleared. The rest of the payload is still
+  validated. The web client's "Server default" model sends `null`.
