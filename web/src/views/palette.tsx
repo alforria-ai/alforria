@@ -21,6 +21,7 @@ export interface PaletteActions {
   showKeys(): void
   manage(sessionID: string): void
   archived(): void
+  worktrees(projectID: string): void
   close(): void
 }
 
@@ -113,6 +114,14 @@ export function Palette(props: { initial?: string; actions: PaletteActions }) {
           meta: "",
           icon: "terminal" as const,
           run: () => props.actions.openTerminal(id),
+        })),
+      ...state.projectOrder
+        .filter((id) => id !== GLOBAL_PROJECT && state.projects[id]?.vcs === "git")
+        .map((id) => ({
+          label: `Worktrees in ${projectName(state.projects[id]!)}…`,
+          meta: "",
+          icon: "folder" as const,
+          run: () => props.actions.worktrees(id),
         })),
       ...(activeSession() && state.sessions[activeSession()!]
         ? [

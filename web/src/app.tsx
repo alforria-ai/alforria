@@ -37,6 +37,7 @@ import { Settings } from "./views/settings"
 import { ArchivedSessions, ManageSession } from "./views/manage"
 import { unseenOrder } from "./nav/unseen"
 import { startAutoAccept } from "./views/queue/auto"
+import { Worktrees } from "./views/worktrees"
 
 const PHONE = "(max-width: 760px)"
 
@@ -50,6 +51,7 @@ export function App() {
   const [folderOpen, setFolderOpen] = createSignal(false)
   const [managing, setManaging] = createSignal<string | null>(null)
   const [archivedOpen, setArchivedOpen] = createSignal(false)
+  const [worktreesOf, setWorktreesOf] = createSignal<string | null>(null)
   /** F2's target: a focused session-list row, the table's cursor row, or the active column. */
   const manageTarget = () => {
     const rail = (document.activeElement as HTMLElement | null)?.closest<HTMLElement>("[data-rail]")
@@ -247,7 +249,13 @@ export function App() {
                     </div>
                   }
                 >
-                  <SessionTable cursor={cursor()} onOpen={open} onNewSession={newSession} onManage={setManaging} />
+                  <SessionTable
+                    cursor={cursor()}
+                    onOpen={open}
+                    onNewSession={newSession}
+                    onManage={setManaging}
+                    onWorktrees={setWorktreesOf}
+                  />
                 </Show>
               </div>
             </Match>
@@ -281,6 +289,7 @@ export function App() {
             showKeys: () => setKeysOpen(true),
             manage: setManaging,
             archived: () => setArchivedOpen(true),
+            worktrees: setWorktreesOf,
             close: () => setPalette(null),
           }}
         />
@@ -290,6 +299,9 @@ export function App() {
       </Show>
       <Show when={state.sessions[managing() ?? ""]}>
         {(s) => <ManageSession session={s()} close={() => setManaging(null)} />}
+      </Show>
+      <Show when={state.projects[worktreesOf() ?? ""]}>
+        {(p) => <Worktrees project={p()} onStart={startSession} close={() => setWorktreesOf(null)} />}
       </Show>
       <Show when={archivedOpen()}>
         <ArchivedSessions onOpen={(id) => open(id)} close={() => setArchivedOpen(false)} />

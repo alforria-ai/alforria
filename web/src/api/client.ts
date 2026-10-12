@@ -180,6 +180,17 @@ export const api = {
   deleteSession: (id: string) => request<boolean>("DELETE", `/session/${id}`),
   archiveSession: (id: string, at = Date.now()) =>
     request<Session>("PATCH", `/session/${id}`, { body: { time: { archived: at } } }),
+  /** A git project's extra worktrees (sandboxes), by directory. */
+  worktrees: (directory: string) => request<string[]>("GET", "/experimental/worktree", { directory }),
+  /** `git worktree add` on a new `opencode/<name>` branch, checked out and booted before it answers. */
+  createWorktree: (directory: string, name?: string) =>
+    request<{ name: string; branch?: string; directory: string }>("POST", "/experimental/worktree", {
+      directory,
+      body: name ? { name } : {},
+    }),
+  /** Force-removes the worktree and deletes its branch. */
+  removeWorktree: (directory: string, worktree: string) =>
+    request<boolean>("DELETE", "/experimental/worktree", { directory, body: { directory: worktree } }),
   /** Sessions across every project, newest first; `next` is the cursor for the page after. */
   sessionsAcrossProjects: async (query: { archived?: boolean; roots?: boolean; cursor?: number; limit?: number }) => {
     const res = await fetch(apiUrl("/experimental/session", query), { credentials: "same-origin" })

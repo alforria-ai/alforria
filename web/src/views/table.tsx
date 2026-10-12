@@ -8,6 +8,7 @@ import {
   displayTitle,
   filteredGroups,
   fleetState,
+  GLOBAL_PROJECT,
   sessionCost,
   todoProgress,
 } from "../fleet/fleet"
@@ -178,6 +179,7 @@ export function SessionTable(props: {
   cursor: string | null
   onOpen: (id: string, beside: boolean) => void
   onManage: (id: string) => void
+  onWorktrees: (projectID: string) => void
   onNewSession: (directory: string) => void
 }) {
   return (
@@ -232,6 +234,16 @@ export function SessionTable(props: {
                         )}
                       </Show>
                     </span>
+                    <Show when={g.project.id !== GLOBAL_PROJECT && g.project.vcs === "git"}>
+                      <button
+                        class="add wt"
+                        aria-label={`Worktrees in ${g.name}`}
+                        title="Worktrees: create one and start a session in it"
+                        onClick={() => props.onWorktrees(g.project.id)}
+                      >
+                        <Icon name="fork" />
+                      </button>
+                    </Show>
                     <button
                       class="add"
                       aria-label={`New session in ${g.name}`}

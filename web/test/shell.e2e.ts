@@ -117,7 +117,7 @@ try {
     )
     await p.keyboard.press("Enter")
 
-    await p.locator(".proj .add").first().focus()
+    await p.locator(".proj .add:not(.wt)").first().focus()
     await p.keyboard.press("Enter")
     await p.waitForURL(/#\/focus\/ses_/)
     check(true, "Enter on a project's New session starts one")
@@ -344,6 +344,43 @@ try {
     await row.locator(".row-more").click()
     await p.locator(".dialog.manage .link-btn", { hasText: "Ask again" }).click()
     check((await row.locator(".auto-tag").count()) === 0, "Ask again applies at once")
+    await p.keyboard.press("Escape")
+  }
+
+  console.log("worktrees")
+  {
+    await p.goto(`${UI}/#/`)
+    await p.locator("tr.s-row").first().waitFor()
+    await p.getByRole("button", { name: "Worktrees in atlas-api" }).click()
+    await p.locator(".dialog.worktrees").waitFor()
+    const wt = await a11y(p)
+    check(!wt.length, "the worktrees dialog has no serious a11y violations", wt)
+    await p.locator(".dialog.worktrees input").fill("E2E tree")
+    await p.keyboard.press("Enter")
+    await p.waitForURL(/#\/focus\/ses_/, { timeout: 30_000 }).catch(async () => {
+      throw new Error(`no session started: ${await p.locator(".toast").allTextContents()}`)
+    })
+    const sid = p.url().split("/").pop()!
+    const dir = await p.evaluate(
+      (id) =>
+        fetch(`/session/${id}`)
+          .then((r) => r.json())
+          .then((s: { directory: string }) => s.directory),
+      sid,
+    )
+    check(dir.endsWith("/e2e-tree"), "Create and start makes the worktree and starts a session in it", dir)
+    // The composer has focus: the first Esc leaves it, the second the column.
+    await p.keyboard.press("Escape")
+    await p.keyboard.press("Escape")
+    await p.getByRole("button", { name: "Worktrees in atlas-api" }).click()
+    const item = p.locator(".dialog.worktrees li", { hasText: "e2e-tree" })
+    await item.waitFor()
+    check(true, "the worktree is listed")
+    await item.locator(".link-btn", { hasText: "Remove" }).click()
+    check((await item.locator(".confirm-row[role=alert]").count()) === 1, "Remove asks first, in place")
+    await item.locator(".link-btn.danger").click()
+    await item.waitFor({ state: "detached", timeout: 10_000 })
+    check(true, "a confirmed remove deletes it")
     await p.keyboard.press("Escape")
   }
 
