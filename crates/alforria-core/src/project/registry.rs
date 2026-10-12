@@ -864,6 +864,10 @@ mod tests {
         let (dir, storage, emitted) = harness();
         let repo = dir.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
+        // macOS resolves TMPDIR through a symlink (/var/folders ->
+        // /private/var/folders): canonicalize so the expected paths match
+        // what the registry (and git) report.
+        let repo = std::fs::canonicalize(&repo).unwrap();
         init_repo(&repo);
         set_remote(&repo, "https://github.com/acme/widgets.git");
         let registry = registry(&storage, &emitted);
@@ -927,6 +931,10 @@ mod tests {
         let (dir, storage, emitted) = harness();
         let repo = dir.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
+        // macOS resolves TMPDIR through a symlink (/var/folders ->
+        // /private/var/folders): canonicalize so the expected paths match
+        // what the registry (and git) report.
+        let repo = std::fs::canonicalize(&repo).unwrap();
         init_repo(&repo);
         set_remote(&repo, "https://github.com/acme/widgets.git");
         let registry = registry(&storage, &emitted);
@@ -947,6 +955,7 @@ mod tests {
             .unwrap();
         let moved = dir.path().join("moved");
         std::fs::rename(&repo, &moved).unwrap();
+        let moved = std::fs::canonicalize(&moved).unwrap();
         let (project, sandbox) = registry.from_directory(&moved).unwrap();
         assert_eq!(sandbox, moved);
         assert_eq!(

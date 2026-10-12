@@ -562,6 +562,10 @@ mod tests {
         // A git repository is the copy source.
         let source = dir.path().join("source");
         std::fs::create_dir_all(&source).unwrap();
+        // macOS resolves TMPDIR through a symlink (/var/folders ->
+        // /private/var/folders): canonicalize so the stored rows and the
+        // expected values match what git worktree discovery reports.
+        let source = std::fs::canonicalize(&source).unwrap();
         git(&source, &["init", "--initial-branch", "main"]);
         std::fs::write(source.join("README.md"), "hi").unwrap();
         git(&source, &["add", "."]);
@@ -633,6 +637,7 @@ mod tests {
                 "HEAD",
             ],
         );
+        let external = std::fs::canonicalize(&external).unwrap();
         let result = service.refresh("proj").unwrap();
         assert_eq!(
             result.updated,

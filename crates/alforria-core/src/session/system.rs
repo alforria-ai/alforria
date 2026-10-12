@@ -371,7 +371,7 @@ mod tests {
             "  Working directory: /repo",
             "  Workspace root folder: /repo",
             "  Is directory a git repo: yes",
-            "  Platform: linux",
+            &format!("  Platform: {}", platform()),
             &format!("  Today's date: {}", to_date_string(1_000_000_000_000)),
             "</env>",
         ]
