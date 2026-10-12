@@ -4,11 +4,13 @@ import { emptyState } from "../src/store/state"
 import {
   attachmentKind,
   commandBody,
+  cycleVariant,
   fileUrl,
   lastUserModel,
   looksBinary,
   MENTION,
   promptBody,
+  variantIndex,
   type Draft,
 } from "../src/views/focus/prompt"
 
@@ -93,6 +95,36 @@ describe("the session's model", () => {
     } as Message
     s.message.msg_3 = { id: "msg_3", role: "assistant" } as Message
     expect(lastUserModel(s, "ses")).toEqual({ providerID: "a", modelID: "m", variant: "high" })
+  })
+})
+
+describe("variants", () => {
+  test("indexed per model, disabled ones left out", () => {
+    expect(
+      variantIndex({
+        providers: [
+          {
+            id: "p",
+            name: "P",
+            models: {
+              a: { id: "a", name: "A", variants: { low: {}, high: {}, max: { disabled: true } } },
+              b: { id: "b", name: "B", variants: {} },
+              c: { id: "c", name: "C" },
+            },
+          },
+        ],
+        default: {},
+      }),
+    ).toEqual({ "p/a": ["low", "high"] })
+  })
+
+  test("cycle: default → each → default", () => {
+    const v = ["low", "high"]
+    expect(cycleVariant(v, undefined)).toBe("low")
+    expect(cycleVariant(v, "low")).toBe("high")
+    expect(cycleVariant(v, "high")).toBeUndefined()
+    expect(cycleVariant(v, "gone")).toBe("low")
+    expect(cycleVariant([], "low")).toBeUndefined()
   })
 })
 

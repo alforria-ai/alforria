@@ -143,3 +143,75 @@ export function ModelPicker(props: {
     </div>
   )
 }
+
+/**
+ * The reasoning-variant listbox: "default" (the model's own setting) and each
+ * variant the model offers. ↑↓ move, ↵ picks, Esc closes back to the button.
+ */
+export function VariantPicker(props: {
+  options: string[]
+  value?: string
+  anchor: () => HTMLElement | undefined
+  onPick: (variant: string | undefined) => void
+  onClose: (refocus: boolean) => void
+}) {
+  let root!: HTMLDivElement
+  const all = () => [undefined, ...props.options]
+  const [sel, setSel] = createSignal(Math.max(0, all().indexOf(props.value)))
+  onMount(() => {
+    root.focus()
+    const outside = (e: PointerEvent) => {
+      const t = e.target as Node
+      if (!root.contains(t) && !props.anchor()?.contains(t)) props.onClose(false)
+    }
+    document.addEventListener("pointerdown", outside, true)
+    onCleanup(() => document.removeEventListener("pointerdown", outside, true))
+  })
+  const onKey = (e: KeyboardEvent) => {
+    const n = all().length
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault()
+      setSel((v) => (v + (e.key === "ArrowDown" ? 1 : -1) + n) % n)
+    } else if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault()
+      props.onPick(all()[sel()])
+    } else if (e.key === "Escape") {
+      e.preventDefault()
+      e.stopPropagation()
+      props.onClose(true)
+    } else if (e.key === "Tab") props.onClose(false)
+  }
+  return (
+    <div
+      class="popover variants"
+      ref={root}
+      role="listbox"
+      tabindex="-1"
+      aria-label="Reasoning variant"
+      aria-activedescendant={`var-${sel()}`}
+      onKeyDown={onKey}
+    >
+      <header role="presentation">Reasoning variant</header>
+      <For each={all()}>
+        {(v, i) => (
+          <button
+            id={`var-${i()}`}
+            tabindex="-1"
+            role="option"
+            aria-selected={i() === sel()}
+            classList={{ on: i() === sel() }}
+            onMouseMove={() => setSel(i())}
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={() => props.onPick(v)}
+          >
+            {v ?? "default"}
+            <span>{v ? "" : "the model's own setting"}</span>
+            <Show when={v === props.value}>
+              <Icon name="check" />
+            </Show>
+          </button>
+        )}
+      </For>
+    </div>
+  )
+}

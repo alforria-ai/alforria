@@ -3457,6 +3457,14 @@ button.tool-row:hover {
 .popover.models button span {
   font: 400 11.5px/1.3 var(--f-mono);
 }
+/* The reasoning-variant list: a handful of rows, as wide as it needs. */
+.popover.variants {
+  right: auto;
+  min-width: 240px;
+}
+.popover.variants button .i {
+  margin-left: auto;
+}
 .pop-list {
   flex: 1;
   min-height: 0;

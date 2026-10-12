@@ -9,14 +9,16 @@ import { lastAssistant } from "../../fleet/derive"
 import { state } from "../../store/store"
 import { Icon } from "../../ui/icons"
 import { toast } from "../toast"
-import { ModelPicker } from "./model-picker"
+import { ModelPicker, VariantPicker } from "./model-picker"
 import {
   attachmentKind,
   commandBody,
+  cycleVariant,
   lastUserModel,
   looksBinary,
   MENTION,
   promptBody,
+  variantIndex,
   type Attachment,
   type Draft as Body,
 } from "./prompt"
@@ -26,6 +28,8 @@ interface Draft {
   text: string
   agent?: string
   model?: string
+  /** Picked here; "" is the model's default. Unset follows the session's last prompt. */
+  variant?: string
   files: string[]
   attachments?: Attachment[]
 }
@@ -71,6 +75,22 @@ const commandsFor = (dir: string) => {
     )
   return commandCache.get(dir)!
 }
+const variantCache = new Map<string, Promise<Record<string, string[]>>>()
+const variantsFor = (dir: string) => {
+  if (!variantCache.has(dir))
+    variantCache.set(
+      dir,
+      api
+        .providers(dir)
+        .then(variantIndex)
+        .catch(() => {
+          // Not cached: the next column to ask tries again.
+          variantCache.delete(dir)
+          return {}
+        }),
+    )
+  return variantCache.get(dir)!
+}
 
 type Pop = { kind: "file" | "command"; items: { value: string; hint: string }[]; sel: number; start: number }
 
@@ -91,14 +111,30 @@ export function Composer(props: { sessionID: string }) {
     (session()?.model ? `${session()!.model!.providerID}/${session()!.model!.id}` : undefined) ??
     (lastUser() ? `${lastUser()!.providerID}/${lastUser()!.modelID}` : undefined) ??
     (last() ? `${last()!.providerID}/${last()!.modelID}` : undefined)
-  /** The reasoning variant the session last used, kept while the model stays the same. */
+  const [variantIndex] = createResource(dir, variantsFor)
+  /** The current model's reasoning variants; empty when it has none (or they're not known yet). */
+  const variants = () => variantIndex()?.[model() ?? ""] ?? []
+  /**
+   * The reasoning variant: the one picked here, else the one the session last
+   * used while the model stays the same. Dropped when the model doesn't offer it.
+   */
   const variant = () => {
     const m = model()
-    const u = lastUser()
-    if (u && m === `${u.providerID}/${u.modelID}`) return u.variant
-    const sm = session()?.model
-    if (sm && m === `${sm.providerID}/${sm.id}`) return sm.variant
+    const picked = draft().variant
+    let v: string | undefined
+    if (picked !== undefined) v = picked || undefined
+    else {
+      const u = lastUser()
+      const sm = session()?.model
+      if (u && m === `${u.providerID}/${u.modelID}`) v = u.variant
+      else if (sm && m === `${sm.providerID}/${sm.id}`) v = sm.variant
+    }
+    const known = variantIndex()?.[m ?? ""]
+    return v && (!variantIndex() || !known || known.includes(v)) ? v : undefined
   }
+  /** "" picks the model's default explicitly (so a restored variant doesn't come back). */
+  const pickVariant = (v: string | undefined) => setDraft({ variant: v ?? "" })
+  const [variantPop, setVariantPop] = createSignal(false)
   // The server's word, not the fleet's: a turn waiting on a permission is
   // still running and can be stopped.
   const busy = () => isBusy(state, props.sessionID)
@@ -208,6 +244,7 @@ export function Composer(props: { sessionID: string }) {
 
   let picker!: HTMLInputElement
   let modelBtn!: HTMLButtonElement
+  let variantBtn!: HTMLButtonElement
   const attach = async (list: FileList | File[]) => {
     for (const f of Array.from(list))
       try {
@@ -261,6 +298,12 @@ export function Composer(props: { sessionID: string }) {
         e.stopPropagation()
         return setPop(null)
       }
+    }
+    // ⇧⌘D cycles the reasoning variant, as upstream.
+    if (e.shiftKey && (e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "d" && variants().length) {
+      e.preventDefault()
+      e.stopPropagation()
+      return pickVariant(cycleVariant(variants(), variant()))
     }
     // An IME commit (keyCode 229) is not a send; on touch, Enter is a newline and Send sends.
     if (e.key === "Enter" && !e.shiftKey && !e.isComposing && e.keyCode !== 229 && !coarse) {
@@ -323,13 +366,29 @@ export function Composer(props: { sessionID: string }) {
           value={model()}
           anchor={() => modelBtn}
           onPick={(id) => {
-            setDraft({ model: id })
+            setDraft({ model: id, variant: undefined })
             setModelPicker(false)
             ta.focus()
           }}
           onClose={(refocus) => {
             setModelPicker(false)
             if (refocus) modelBtn.focus()
+          }}
+        />
+      </Show>
+      <Show when={variantPop() && variants().length}>
+        <VariantPicker
+          options={variants()}
+          value={variant()}
+          anchor={() => variantBtn}
+          onPick={(v) => {
+            pickVariant(v)
+            setVariantPop(false)
+            ta.focus()
+          }}
+          onClose={(refocus) => {
+            setVariantPop(false)
+            if (refocus) variantBtn.focus()
           }}
         />
       </Show>
@@ -411,6 +470,19 @@ export function Composer(props: { sessionID: string }) {
           <span class="m">{modelName()}</span>
           <Icon name="chev-down" />
         </button>
+        <Show when={variants().length}>
+          <button
+            ref={variantBtn}
+            class="model-btn variant-btn"
+            title="Reasoning variant (⇧⌘D cycles)"
+            aria-haspopup="listbox"
+            aria-expanded={variantPop()}
+            onClick={() => setVariantPop((v) => !v)}
+          >
+            <span class="m">{variant() ?? "default"}</span>
+            <Icon name="chev-down" />
+          </button>
+        </Show>
         <button
           class="icon-btn attach"
           aria-label="Attach files"
