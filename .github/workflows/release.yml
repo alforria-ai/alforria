@@ -112,16 +112,16 @@ jobs:
 
       # The alforria-core unit tests hardcode POSIX path expectations and
       # have never run on Windows (CI never reached them before 2026-10);
-      # tracked as windows unit-test debt. Everything else — the CLI e2e
-      # and wire-scenario suites, the server and TUI test binaries — runs
-      # in full on every OS.
+      # the pty tests shell out to /bin/sh. Both are tracked as windows
+      # test debt. Everything else — the CLI e2e and wire-scenario suites,
+      # the server and TUI test binaries — runs in full on every OS.
       - name: Run tests
         if: runner.os != 'Windows'
         run: cargo nextest run --retries 2 || cargo test --workspace
 
-      - name: Run tests (windows, core unit tests deferred)
+      - name: Run tests (windows, core unit + pty tests deferred)
         if: runner.os == 'Windows'
-        run: cargo nextest run --retries 2 -E 'not package(alforria-core)' || cargo test --workspace
+        run: cargo nextest run --retries 2 -E 'not (package(alforria-core) or test(pty::tests))' || cargo test --workspace --exclude alforria-core
 
   # 4. Cross-build and attach binaries + sha256 sidecars.
   build-binaries:
