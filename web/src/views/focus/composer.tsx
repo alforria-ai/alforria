@@ -10,6 +10,7 @@ import { state } from "../../store/store"
 import { Icon } from "../../ui/icons"
 import { toast } from "../toast"
 import { ModelPicker } from "./model-picker"
+import { canRestoreFiles, revertedPrompts, unrevert } from "./revert"
 
 interface Attachment {
   name: string
@@ -201,6 +202,28 @@ export function Composer(props: { sessionID: string }) {
   }
   const detach = (i: number) => setDraft({ attachments: (draft().attachments ?? []).filter((_, j) => j !== i) })
 
+  // A reverted session: what was rolled back, its first prompt back into the
+  // box, or everything back as it was.
+  const rolledBack = createMemo(() => revertedPrompts(state, props.sessionID))
+  const [unreverting, setUnreverting] = createSignal(false)
+  const restorePrompt = () => {
+    const text = rolledBack()[0]?.text ?? ""
+    ta.value = text
+    setDraft({ text })
+    autosize()
+    ta.focus()
+  }
+  const undoRevert = async () => {
+    setUnreverting(true)
+    try {
+      await unrevert(props.sessionID)
+    } catch (err) {
+      toast(`Could not unrevert: ${err instanceof Error ? err.message : err}`, "error")
+    } finally {
+      setUnreverting(false)
+    }
+  }
+
   const stop = () => api.abort(props.sessionID).catch((err) => toast(`Could not stop: ${err.message}`, "error"))
 
   const onKey = (e: KeyboardEvent) => {
@@ -235,6 +258,25 @@ export function Composer(props: { sessionID: string }) {
 
   return (
     <div class="composer">
+      <Show when={rolledBack().length}>
+        <div class="revert-dock" role="status">
+          <Icon name="undo" />
+          <span class="k">Rolled back</span>
+          <span class="t">
+            {rolledBack().length} {rolledBack().length === 1 ? "turn" : "turns"}
+            {canRestoreFiles(state, props.sessionID) ? " and their file changes" : ""}. Sending a prompt discards them.
+          </span>
+          <span class="spacer" />
+          <Show when={rolledBack()[0]?.text}>
+            <button class="link-btn" onClick={restorePrompt}>
+              Restore prompt
+            </button>
+          </Show>
+          <button class="link-btn" disabled={unreverting()} onClick={() => void undoRevert()}>
+            Unrevert
+          </button>
+        </div>
+      </Show>
       <Show when={pop()}>
         {(p) => (
           <div class="popover" role="listbox">

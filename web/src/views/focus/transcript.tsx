@@ -10,6 +10,7 @@ import { hm, ktok, money } from "../../ui/format"
 import { Icon } from "../../ui/icons"
 import { Slip } from "../queue/slip"
 import { PartView } from "./parts"
+import { isReverted, revertBoundary } from "./revert"
 
 /** Arrays of ids compare by content so memos only notify on real changes. */
 const sameIds = (a: string[], b: string[]) => a.length === b.length && a.every((x, i) => x === b[i])
@@ -56,6 +57,10 @@ export function Transcript(props: { sessionID: string; onOpenSession: (id: strin
   const pending = createMemo(() => interruptsFor(state, props.sessionID))
   const pendingById = createMemo(() => new Map(pending().map((i) => [i.id, i])))
   const busy = () => fleetState(state, props.sessionID) === "working"
+  /** The first rolled-back turn; it and every later turn render dimmed under a rule. */
+  const firstReverted = createMemo(() =>
+    revertBoundary(state, props.sessionID) ? turns().find((k) => isReverted(state, props.sessionID, k)) : undefined,
+  )
 
   // Interrupts tied to a tool call render after that call; the rest go last.
   const byCall = createMemo(() => {
@@ -120,14 +125,20 @@ export function Transcript(props: { sessionID: string; onOpenSession: (id: strin
             </Show>
             <For each={turns().slice(-shown())}>
               {(key) => (
-                <TurnView
-                  sessionID={props.sessionID}
-                  turnKey={key}
-                  last={key === turns()[turns().length - 1]}
-                  busy={busy()}
-                  byCall={byCall()}
-                  onOpenSession={props.onOpenSession}
-                />
+                <>
+                  <Show when={key === firstReverted()}>
+                    <div class="compacted-rule reverted-rule">Rolled back · the next prompt discards these turns</div>
+                  </Show>
+                  <TurnView
+                    sessionID={props.sessionID}
+                    turnKey={key}
+                    last={key === turns()[turns().length - 1]}
+                    busy={busy()}
+                    reverted={!!firstReverted() && key >= firstReverted()!}
+                    byCall={byCall()}
+                    onOpenSession={props.onOpenSession}
+                  />
+                </>
               )}
             </For>
           </Show>
@@ -161,6 +172,7 @@ function TurnView(props: {
   turnKey: string
   last: boolean
   busy: boolean
+  reverted: boolean
   byCall: Map<string, Interrupt>
   onOpenSession: (id: string, beside: boolean) => void
 }) {
@@ -196,7 +208,7 @@ function TurnView(props: {
     <>
       <Show when={user()}>
         {(u) => (
-          <div class="msg msg-user">
+          <div class="msg msg-user" classList={{ reverted: props.reverted }}>
             <div class="msg-label">
               You<span class="mono">{hm(u().time.created)}</span>
             </div>
@@ -223,7 +235,7 @@ function TurnView(props: {
       </Show>
       <Show when={head()}>
         {(h) => (
-          <div class="msg msg-asst">
+          <div class="msg msg-asst" classList={{ reverted: props.reverted }}>
             <div class="msg-label">
               {h().agent}
               <span class="mono">

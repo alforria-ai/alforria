@@ -1722,6 +1722,13 @@ kbd {
   line-height: 1.55;
   max-width: 78ch;
 }
+/* Rolled back by a revert: still readable, plainly not in effect. */
+.msg.reverted {
+  opacity: 0.45;
+}
+.reverted-rule {
+  margin: 22px 0;
+}
 .parts {
   display: flex;
   flex-direction: column;
@@ -2218,6 +2225,35 @@ button.tool-row:hover {
   width: 28px;
   height: 28px;
   border: 0;
+}
+/* Shown while the session is reverted: what the next prompt will discard. */
+.revert-dock {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  margin-bottom: 8px;
+  padding: 6px 8px 6px 10px;
+  border: 1px solid var(--rule-2);
+  font: 400 12.5px/1.35 var(--f-body);
+  color: var(--ink-2);
+}
+.revert-dock .k {
+  font: 700 12.5px/1 var(--f-label);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--ink);
+}
+.revert-dock .t {
+  min-width: 0;
+}
+.revert-dock .spacer {
+  flex: 1;
+}
+@media (max-width: 760px) {
+  .revert-dock .link-btn {
+    min-height: 40px;
+  }
 }
 .model-btn .m {
   min-width: 0;

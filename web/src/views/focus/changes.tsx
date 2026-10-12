@@ -3,7 +3,9 @@
 // the view walks turns, newest first, and reverts to before one. A git
 // project can also show the working tree (GET /vcs/diff), which includes
 // edits made outside this session. A project without snapshots (not git)
-// falls back to this session's own edit/write/apply_patch calls.
+// falls back to this session's own edit/write/apply_patch calls, and offers
+// no revert: the server could not put the files back, and the next prompt
+// would still discard the rolled-back turns.
 import { createEffect, createMemo, createResource, createSignal, For, Show } from "solid-js"
 import { api } from "../../api/client"
 import type { ToolPart } from "../../api/types"
@@ -12,6 +14,8 @@ import { state } from "../../store/store"
 import { Diff, parseUnifiedDiff } from "../../ui/diff"
 import { Icon } from "../../ui/icons"
 import { toast } from "../toast"
+import { toolChanges } from "./edits"
+import { canRestoreFiles, isBusy, isReverted, revertTo, unrevert } from "./revert"
 
 interface Change {
   file: string
@@ -36,7 +40,7 @@ export default function Changes(props: { sessionID: string }) {
   const session = () => state.sessions[props.sessionID]
   const turns = createMemo(() => turnDiffs(state, props.sessionID))
   const edits = createMemo(() => toolDiffs(props.sessionID))
-  const isGit = () => state.projects[session()?.projectID ?? ""]?.vcs === "git"
+  const isGit = () => canRestoreFiles(state, props.sessionID)
   /** Turn number (1-based, oldest first) and prompt excerpt for a user message. */
   const turnLabel = (messageID: string) => {
     const users = (state.messages[props.sessionID] ?? []).filter((m) => state.message[m]?.role === "user")
@@ -47,13 +51,17 @@ export default function Changes(props: { sessionID: string }) {
     return `Turn ${n}${text?.text ? ` · ${excerpt(text.text)}` : ""}`
   }
 
+  /** The sources the picker renders; a pick outside them (a turn that left) falls back. */
+  const options = createMemo<Source[]>(() => [
+    ...turns().map((t) => `turn:${t.message.id}`),
+    ...(!turns().length && edits().length ? ["edits"] : []),
+    ...(isGit() ? ["tree"] : []),
+  ])
   // Default: the newest turn with changes; else this session's edits; else the tree.
   const source = (): Source => {
     const p = picked()
-    if (p && (p === "tree" || p === "edits" || turns().some((t) => `turn:${t.message.id}` === p))) return p
-    if (turns()[0]) return `turn:${turns()[0]!.message.id}`
-    if (edits().length) return "edits"
-    return isGit() ? "tree" : "edits"
+    if (p && options().includes(p)) return p
+    return options()[0] ?? "edits"
   }
 
   const [tree, { refetch: refetchTree }] = createResource(
@@ -100,26 +108,41 @@ export default function Changes(props: { sessionID: string }) {
   const rows = createMemo(() => (current()?.patch ? parseUnifiedDiff(current()!.patch) : []))
 
   /** Revert target: before the picked turn, or before the session's first prompt. */
-  const revertTo = () => {
+  const revertTarget = () => {
     const src = source()
     if (src.startsWith("turn:")) return src.slice(5)
     if (src === "edits") return (state.messages[props.sessionID] ?? []).find((m) => state.message[m]?.role === "user")
   }
+  // Success shows in place: the turn reads "Rolled back" here, and the
+  // transcript dims it above the composer's revert dock.
+  const [reverting, setReverting] = createSignal(false)
   const revert = async () => {
-    const to = revertTo()
+    const to = revertTarget()
     if (!to) return toast("Nothing to revert to yet", "error")
+    setReverting(true)
     try {
-      await api.revert(props.sessionID, to)
+      await revertTo(props.sessionID, to)
       setConfirm(false)
-      toast("Reverted the session's file changes")
     } catch (err) {
       toast(`Could not revert: ${err instanceof Error ? err.message : err}`, "error")
+    } finally {
+      setReverting(false)
     }
   }
+  const undoRevert = () =>
+    unrevert(props.sessionID).catch((err) =>
+      toast(`Could not unrevert: ${err instanceof Error ? err.message : err}`, "error"),
+    )
+  /** The picked turn (or the whole session) is already rolled back. */
+  const rolledBack = () => {
+    const to = revertTarget()
+    return !!to && isReverted(state, props.sessionID, to)
+  }
   const revertQuestion = () =>
-    source() === "edits"
+    (source() === "edits"
       ? `Restore ${files().length} files to before this session?`
-      : `Restore files to before this turn? Later turns are undone too.`
+      : `Restore files to before this turn? Later turns are undone too.`) +
+    (isBusy(state, props.sessionID) ? " The running turn stops first." : "")
 
   const empty = () => {
     if (source() === "tree") return tree.loading ? "Loading…" : "The working tree is clean"
@@ -156,7 +179,16 @@ export default function Changes(props: { sessionID: string }) {
               Refresh
             </button>
           </Show>
-          <Show when={source() !== "tree" && files().length}>
+          <Show when={source() !== "tree" && files().length && !isGit()}>
+            <span class="note">Not a git repository: files can't be restored, so there is no revert.</span>
+          </Show>
+          <Show when={source() !== "tree" && files().length && isGit() && rolledBack()}>
+            <span class="mono">Rolled back</span>
+            <button class="link-btn" onClick={() => void undoRevert()}>
+              Unrevert
+            </button>
+          </Show>
+          <Show when={source() !== "tree" && files().length && isGit() && !rolledBack()}>
             <Show
               when={confirm()}
               fallback={
@@ -167,7 +199,7 @@ export default function Changes(props: { sessionID: string }) {
               }
             >
               <span role="alert">{revertQuestion()}</span>
-              <button class="link-btn" onClick={() => void revert()}>
+              <button class="link-btn primary" disabled={reverting()} onClick={() => void revert()}>
                 Revert
               </button>
               <button class="link-btn" onClick={() => setConfirm(false)}>
@@ -223,24 +255,20 @@ function toolDiffs(sessionID: string): Change[] {
       const tool = part as ToolPart
       const st = tool.state as { status: string; input?: Record<string, unknown>; metadata?: Record<string, unknown> }
       if (st.status !== "completed" || !["edit", "write", "apply_patch"].includes(tool.tool)) continue
-      const meta = st.metadata ?? {}
-      const file = rel(String(meta.filepath ?? st.input?.filePath ?? ""))
-      if (!file) continue
-      let patch = typeof meta.diff === "string" ? meta.diff : ""
-      if (!patch && tool.tool === "write" && typeof st.input?.content === "string") {
-        const lines = st.input.content.replace(/\n$/, "").split("\n")
-        patch = `@@ -0,0 +1,${lines.length} @@\n${lines.map((l) => `+${l}`).join("\n")}`
+      for (const { file, patch } of toolChanges(tool.tool, st.input ?? {}, st.metadata ?? {})) {
+        const name = rel(file)
+        if (!name) continue
+        const rows = parseUnifiedDiff(patch)
+        const add = rows.filter((r) => r.kind === "add").length
+        const del = rows.filter((r) => r.kind === "del").length
+        const prev = byFile.get(name)
+        byFile.set(name, {
+          file: name,
+          additions: (prev?.additions ?? 0) + add,
+          deletions: (prev?.deletions ?? 0) + del,
+          patch: prev ? `${prev.patch}\n${patch}` : patch,
+        })
       }
-      const rows = parseUnifiedDiff(patch)
-      const add = rows.filter((r) => r.kind === "add").length
-      const del = rows.filter((r) => r.kind === "del").length
-      const prev = byFile.get(file)
-      byFile.set(file, {
-        file,
-        additions: (prev?.additions ?? 0) + add,
-        deletions: (prev?.deletions ?? 0) + del,
-        patch: prev ? `${prev.patch}\n${patch}` : patch,
-      })
     }
   return [...byFile.values()]
 }
