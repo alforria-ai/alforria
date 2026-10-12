@@ -1,5 +1,5 @@
-// Session management: rename, archive and delete one session, and the list of
-// archived sessions. Opened from the table row's ⋯ button, F2 on a table or
+// Session management: rename, auto-accept, archive and delete one session,
+// and the list of archived sessions. Opened from the table row's ⋯ button, F2 on a table or
 // session-list row, and the palette. Archive and delete take the subagent
 // sessions under it along; delete asks first, in place.
 import { createResource, createSignal, For, Show } from "solid-js"
@@ -12,6 +12,7 @@ import { age, now, tildify } from "../ui/format"
 import { DialogHead, dialogId, Modal } from "../ui/modal"
 import { server } from "./server"
 import { toast } from "./toast"
+import { autoAccepting, autoAcceptOwn, setAutoAccept } from "./queue/auto"
 
 /** The session and every subagent session under it, deepest first. */
 function family(id: string): string[] {
@@ -49,6 +50,8 @@ export function ManageSession(props: { session: Session; close: () => void }) {
   const [name, setName] = createSignal(props.session.title)
   const [busy, setBusy] = createSignal(false)
   const [confirming, setConfirming] = createSignal(false)
+  const [loosening, setLoosening] = createSignal(false)
+  const parentAccepts = () => !autoAcceptOwn(props.session.id) && autoAccepting(props.session.id)
   const subagents = () => family(props.session.id).length - 1
   const renamed = () => name().trim() && name().trim() !== props.session.title
 
@@ -106,6 +109,54 @@ export function ManageSession(props: { session: Session; close: () => void }) {
           {placeOf(props.session).name} · <bdi>{tildify(props.session.directory, server.home)}</bdi>
         </p>
         <div class="manage-acts">
+          <div>
+            <Show
+              when={autoAcceptOwn(props.session.id)}
+              fallback={
+                <button
+                  class="link-btn"
+                  aria-expanded={loosening()}
+                  disabled={parentAccepts()}
+                  onClick={() => setLoosening(true)}
+                >
+                  Auto-accept…
+                </button>
+              }
+            >
+              {/* Putting the human back in the loop applies at once. */}
+              <button class="link-btn" onClick={() => setAutoAccept(props.session.id, false)}>
+                Ask again
+              </button>
+            </Show>
+            <span>
+              {autoAcceptOwn(props.session.id)
+                ? "Auto-accepting: its permission requests are allowed from this page without asking."
+                : parentAccepts()
+                  ? "Auto-accepting, set on the session it runs under."
+                  : "Its permission requests come to your queue."}
+            </span>
+          </div>
+          <Show when={loosening() && !autoAcceptOwn(props.session.id)}>
+            <div class="confirm-row" role="alert">
+              <span>
+                Allow every permission <b>{displayTitle(props.session)}</b>
+                {subagents() ? " and its subagents" : ""} ask for, without asking, while this page is open? Questions
+                and doom-loop stops still come to you.
+              </span>
+              <button
+                class="link-btn danger"
+                onClick={() => {
+                  setLoosening(false)
+                  setAutoAccept(props.session.id, true)
+                }}
+              >
+                Allow without asking
+              </button>
+              <button class="link-btn" ref={(el) => setTimeout(() => el.focus())} onClick={() => setLoosening(false)}>
+                Cancel
+              </button>
+            </div>
+          </Show>
           <div>
             <button class="link-btn" onClick={archive}>
               Archive

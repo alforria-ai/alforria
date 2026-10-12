@@ -36,6 +36,7 @@ import { OpenFolder } from "./views/open-folder"
 import { Settings } from "./views/settings"
 import { ArchivedSessions, ManageSession } from "./views/manage"
 import { unseenOrder } from "./nav/unseen"
+import { startAutoAccept } from "./views/queue/auto"
 
 const PHONE = "(max-width: 760px)"
 
@@ -99,6 +100,7 @@ export function App() {
     const stopRouting = startRouting()
     void loadServerInfo()
     startPlatform((id) => open(id))
+    startAutoAccept()
     const mq = matchMedia(PHONE)
     const onPhone = () => setPhone(mq.matches)
     mq.addEventListener("change", onPhone)

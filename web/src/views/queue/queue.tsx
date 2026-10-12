@@ -6,6 +6,7 @@ import { counts, displayTitle, interrupts } from "../../fleet/fleet"
 import { Icon } from "../../ui/icons"
 import { act, ledger, selected, setSelected, stamped } from "./act"
 import { Slip, slipKeys, slipSummary } from "./slip"
+import { autoAccepting } from "./auto"
 import { state } from "../../store/store"
 
 const memos = createRoot(() => {
@@ -32,6 +33,9 @@ const memos = createRoot(() => {
   return { queueItems, activeItem, queueIds, itemById }
 })
 export const { queueItems, activeItem, queueIds, itemById } = memos
+
+/** Top-level sessions answering their own permissions from this page. */
+const autoCount = () => Object.values(state.sessions).filter((s) => !s.parentID && autoAccepting(s.id)).length
 
 export function Queue(props: {
   onOpenSession: (id: string) => void
@@ -112,7 +116,10 @@ export function Queue(props: {
     <aside class="queue" id="queue" aria-label="Waiting on you" ref={props.ref} onKeyDown={onKey}>
       <div class="pane-head">
         <h2 id="queueTitle">Waiting on you</h2>
-        <span class="count">{interrupts().length} · oldest first</span>
+        <span class="count">
+          {interrupts().length} · oldest first
+          <Show when={autoCount()}>{(n) => ` · ${n()} auto-accepting`}</Show>
+        </span>
         <span class="spacer" />
         <button class="icon-btn collapse" aria-label="Collapse queue" onClick={props.onCollapse}>
           <Icon name="panel" />

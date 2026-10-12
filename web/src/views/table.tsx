@@ -16,7 +16,7 @@ import { state } from "../store/store"
 import { age, money, now, tildify } from "../ui/format"
 import { Icon } from "../ui/icons"
 import { server } from "./server"
-import { UnseenMark } from "./rail"
+import { AutoTag, UnseenMark } from "./rail"
 
 const STATE_WORD: Record<FleetState, string> = {
   waiting: "Waiting",
@@ -141,6 +141,7 @@ function SessionRow(props: {
           <Show when={props.session.agent && props.session.agent !== "build"}>
             <span class="tag">{props.session.agent}</span>
           </Show>
+          <AutoTag id={id()} />
           <button
             class="row-more"
             aria-label={`Rename, archive or delete ${displayTitle(props.session)}`}

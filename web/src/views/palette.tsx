@@ -117,7 +117,7 @@ export function Palette(props: { initial?: string; actions: PaletteActions }) {
       ...(activeSession() && state.sessions[activeSession()!]
         ? [
             {
-              label: `Rename, archive or delete “${displayTitle(state.sessions[activeSession()!])}”…`,
+              label: `Rename, auto-accept, archive or delete “${displayTitle(state.sessions[activeSession()!])}”…`,
               meta: "F2",
               run: () => props.actions.manage(activeSession()!),
             },

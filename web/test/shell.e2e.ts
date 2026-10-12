@@ -313,6 +313,40 @@ try {
     await p.keyboard.press("Escape")
   }
 
+  console.log("auto-accept")
+  {
+    await p.goto(`${UI}/#/`)
+    const row = p.locator("tr.s-row", { hasText: "Audit secrets" })
+    await row.waitFor()
+    await p.locator(".q-list .slip").first().waitFor()
+    const slips = await p.locator(".q-list .slip").count()
+    await row.hover()
+    await row.locator(".row-more").click()
+    await p.locator(".dialog.manage .link-btn", { hasText: "Auto-accept" }).click()
+    const confirm = p.locator(".dialog.manage .confirm-row[role=alert]")
+    check(
+      ((await confirm.textContent()) ?? "").includes("without asking"),
+      "auto-accept asks first, in place, in a sentence naming its scope",
+    )
+    check((await p.locator(".q-list .slip").count()) === slips, "…and nothing is allowed before the confirm")
+    await confirm.locator(".link-btn.danger").click()
+    await p.keyboard.press("Escape")
+    await p.locator(".q-ledger li", { hasText: "Auto-allowed" }).waitFor({ state: "attached", timeout: 5000 })
+    check(true, "its pending permission is allowed and logged as Auto-allowed")
+    await p.waitForTimeout(1000)
+    check((await p.locator(".q-list .slip").count()) === slips - 1, "…and leaves the queue")
+    check((await row.locator(".auto-tag").count()) === 1, "the table row says auto")
+    check(
+      ((await p.locator(".queue .pane-head .count").textContent()) ?? "").includes("1 auto-accepting"),
+      "so does the queue",
+    )
+    await row.hover()
+    await row.locator(".row-more").click()
+    await p.locator(".dialog.manage .link-btn", { hasText: "Ask again" }).click()
+    check((await row.locator(".auto-tag").count()) === 0, "Ask again applies at once")
+    await p.keyboard.press("Escape")
+  }
+
   console.log("a11y")
   for (const theme of ["dark", "light"]) {
     await p.evaluate((t) => (document.documentElement.dataset.theme = t), theme)

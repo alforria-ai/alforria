@@ -1437,6 +1437,17 @@ kbd {
   flex: none;
   color: var(--ink-3);
 }
+/* Auto-accepting: the human is out of this session's loop, so it reads as a
+   filled ink state, never orange. */
+.auto-tag {
+  flex: none;
+  font: 500 10px/1 var(--f-mono);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 2px 4px;
+  background: var(--ink);
+  color: var(--ground);
+}
 /* Finished (solid) or failed (hollow) while nobody looked; cleared once shown. */
 .unseen-mark {
   flex: none;

@@ -77,10 +77,10 @@ function directoryOf(sessionID: string) {
 export async function act(
   i: Interrupt,
   verdict: Verdict,
-  extra: { answers?: string[][]; message?: string; what?: string } = {},
+  extra: { answers?: string[][]; message?: string; what?: string; auto?: boolean } = {},
 ) {
   if (stamped[i.id]) return
-  const label = verdictLabel(i, verdict)
+  const label = extra.auto ? "Auto-allowed" : verdictLabel(i, verdict)
   const time = clock(Date.now())
   setStamped(i.id, { interrupt: i, verdict, label, time, folding: false, done: false })
   const dir = directoryOf(i.sessionID)

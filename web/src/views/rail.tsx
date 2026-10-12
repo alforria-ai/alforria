@@ -7,6 +7,7 @@ import { createSignal, For, Show } from "solid-js"
 import { activity, counts, displayTitle, fleetState, groups, interrupts } from "../fleet/fleet"
 import { nav } from "../nav/route"
 import { unseen } from "../nav/unseen"
+import { autoAccepting } from "./queue/auto"
 import { state } from "../store/store"
 import { age, now } from "../ui/format"
 import { Icon } from "../ui/icons"
@@ -25,6 +26,17 @@ export function UnseenMark(props: { id: string }) {
           <span class="sr-only">{u().outcome === "fault" ? "New failure: " : "New: "}</span>
         </span>
       )}
+    </Show>
+  )
+}
+
+/** Permissions for this session are allowed without asking (per-session auto-accept). */
+export function AutoTag(props: { id: string }) {
+  return (
+    <Show when={autoAccepting(props.id)}>
+      <span class="auto-tag" title="Auto-accepting permissions from this page">
+        auto
+      </span>
     </Show>
   )
 }
@@ -153,6 +165,7 @@ export function Rail(props: {
                         {displayTitle(r.session)}
                       </span>
                       <span class="badges">
+                        <AutoTag id={id} />
                         <For each={cols()}>
                           {(i) => (
                             <i classList={{ on: i === nav.active }} title={`Column ${i + 1}`}>
