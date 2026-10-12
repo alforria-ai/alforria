@@ -475,19 +475,15 @@ fn render_table(rows: Vec<Vec<String>>, theme: &Theme, width: u16) -> Vec<Line<'
         for (index, cell) in row.iter().enumerate() {
             let width = cell
                 .iter()
-                .map(|span| span.content.chars().count())
+                .map(|span| display_width(&expand_tabs(&span.content, 0)))
                 .sum::<usize>();
             widths[index] = widths[index].max(width);
         }
     }
-    let total: usize = widths.iter().sum::<usize>() + columns * 3 + 1;
-    if let Some(budget) = (width as usize).checked_sub(1) {
-        if total > budget && budget > 0 {
-            // `fitColumnWidthsProportional` — every column keeps a
-            // minimum of one cell.
-            widths = widths.iter().map(|w| (w * budget / total).max(1)).collect();
-        }
-    }
+    // The borders and the cell padding take `3 * columns + 1` cells; the
+    // content shares what is left.
+    let available = (width as usize).saturating_sub(columns * 3 + 1);
+    let widths = fit_column_widths(&widths, available);
     let border = Style::new().fg(theme.border_subtle.to_color());
     let text = Style::new().fg(theme.markdown_text.to_color());
     let rule = |left: char, mid: char, right: char| -> Line<'static> {
@@ -540,7 +536,7 @@ fn render_table(rows: Vec<Vec<String>>, theme: &Theme, width: u16) -> Vec<Line<'
                 let cell_width = widths[column].max(1);
                 let used = cell_spans
                     .iter()
-                    .map(|span| span.content.chars().count())
+                    .map(|span| display_width(&span.content))
                     .sum::<usize>();
                 let pad = cell_width.saturating_sub(used);
                 let (leading, trailing) = match alignments[column] {
@@ -559,6 +555,54 @@ fn render_table(rows: Vec<Vec<String>>, theme: &Theme, width: u16) -> Vec<Line<'
     }
     lines.push(rule('└', '┴', '┘'));
     lines
+}
+
+/// `fitColumnWidthsProportional`: when the natural widths exceed
+/// `available`, scale them down proportionally (every column keeps at
+/// least one cell) and hand the rounding remainder to the widest
+/// columns, so the grid never overflows unless even one cell per column
+/// does not fit.
+fn fit_column_widths(natural: &[usize], available: usize) -> Vec<usize> {
+    let sum: usize = natural.iter().sum();
+    if sum <= available || natural.is_empty() {
+        return natural.to_vec();
+    }
+    let columns = natural.len();
+    if available <= columns {
+        return vec![1; columns];
+    }
+    let mut widths: Vec<usize> = natural
+        .iter()
+        .map(|width| (width * available / sum).max(1))
+        .collect();
+    let mut total: usize = widths.iter().sum();
+    // Trim overshoot (from the `max(1)` floors) off the widest columns.
+    while total > available {
+        let Some((index, _)) = widths
+            .iter()
+            .enumerate()
+            .filter(|(_, width)| **width > 1)
+            .max_by_key(|(_, width)| **width)
+        else {
+            break;
+        };
+        widths[index] -= 1;
+        total -= 1;
+    }
+    // Hand the rounding slack to the columns that lost the most.
+    while total < available {
+        let Some((index, _)) = widths
+            .iter()
+            .enumerate()
+            .filter(|(index, width)| **width < natural[*index])
+            .max_by_key(|(index, width)| natural[*index] - **width)
+        else {
+            break;
+        };
+        widths[index] += 1;
+        total += 1;
+    }
+    widths
 }
 
 // ------------------------------------------------------------- inline
@@ -590,7 +634,7 @@ fn inline_spans(text: &str, theme: &Theme, base: Style) -> Vec<Span<'static>> {
                 Some('*') => (2, "**"),
                 _ => (1, "*"),
             };
-            if let Some(end) = find_marker(&chars[index + marker_len..], marker) {
+            if let Some(end) = emphasis_close(&chars, index, marker_len, marker) {
                 push_plain(&mut spans, &mut plain, base);
                 let content: String = chars[index + marker_len..index + marker_len + end]
                     .iter()
@@ -620,6 +664,58 @@ fn inline_spans(text: &str, theme: &Theme, base: Style) -> Vec<Span<'static>> {
     }
     push_plain(&mut spans, &mut plain, base);
     spans
+}
+
+/// CommonMark punctuation: ASCII punctuation, plus any other symbol
+/// that is neither alphanumeric nor whitespace (`，`, `—`, `“`…).
+fn is_punctuation(char: char) -> bool {
+    char.is_ascii_punctuation()
+        || (!char.is_ascii() && !char.is_alphanumeric() && !char.is_whitespace())
+}
+
+/// A delimiter run at `start..start + len` is left-flanking (it can
+/// open) when the next char is not whitespace and, if punctuation, the
+/// previous one is whitespace, punctuation or the line start.
+fn left_flanking(chars: &[char], start: usize, len: usize) -> bool {
+    let Some(&next) = chars.get(start + len) else {
+        return false;
+    };
+    if next.is_whitespace() {
+        return false;
+    }
+    let prev = start.checked_sub(1).map(|index| chars[index]);
+    !is_punctuation(next) || prev.is_none_or(|prev| prev.is_whitespace() || is_punctuation(prev))
+}
+
+/// The mirror: right-flanking (it can close).
+fn right_flanking(chars: &[char], start: usize, len: usize) -> bool {
+    let Some(prev) = start.checked_sub(1).map(|index| chars[index]) else {
+        return false;
+    };
+    if prev.is_whitespace() {
+        return false;
+    }
+    let next = chars.get(start + len).copied();
+    !is_punctuation(prev) || next.is_none_or(|next| next.is_whitespace() || is_punctuation(next))
+}
+
+/// The offset (from the content start) of the run that closes the `*`
+/// emphasis opened at `index`, honoring the CommonMark flanking rules
+/// (`2 * 3 * 4` stays literal; `**思考**` is strong).
+fn emphasis_close(chars: &[char], index: usize, len: usize, marker: &str) -> Option<usize> {
+    if !left_flanking(chars, index, len) {
+        return None;
+    }
+    let content = index + len;
+    let mut from = 0;
+    while let Some(offset) = find_marker(&chars[content + from..], marker) {
+        let at = content + from + offset;
+        if at > content && right_flanking(chars, at, len) {
+            return Some(at - content);
+        }
+        from += offset + 1;
+    }
+    None
 }
 
 fn find_marker(chars: &[char], marker: &str) -> Option<usize> {
@@ -682,7 +778,7 @@ fn wrap_hanging(
 ) -> Vec<Line<'static>> {
     let prefix = first
         .iter()
-        .map(|span| span.content.chars().count())
+        .map(|span| display_width(&span.content))
         .sum::<usize>();
     let content_width = (width as usize).saturating_sub(prefix).max(1) as u16;
     let wrapped = wrap_spans(spans, content_width);
@@ -704,7 +800,68 @@ fn wrap_hanging(
         .collect()
 }
 
-/// Word-wrap a span list to `width` columns (char-based).
+/// Tab stops every `TAB_WIDTH` cells.
+pub const TAB_WIDTH: usize = 4;
+
+/// The display width of `text` in terminal cells (wide CJK and emoji
+/// glyphs take two).
+pub fn display_width(text: &str) -> usize {
+    use unicode_width::UnicodeWidthChar;
+    text.chars().map(|char| char.width().unwrap_or(0)).sum()
+}
+
+fn char_width(char: char) -> usize {
+    unicode_width::UnicodeWidthChar::width(char).unwrap_or(0)
+}
+
+/// Expand tabs to spaces, `column` being the cell the text starts at.
+/// Borrowed unchanged when there is no tab.
+pub fn expand_tabs(text: &str, column: usize) -> std::borrow::Cow<'_, str> {
+    if !text.contains('\t') {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len() + TAB_WIDTH);
+    let mut column = column;
+    for char in text.chars() {
+        match char {
+            '\t' => {
+                let spaces = TAB_WIDTH - column % TAB_WIDTH;
+                out.extend(std::iter::repeat_n(' ', spaces));
+                column += spaces;
+            }
+            '\n' => {
+                out.push(char);
+                column = 0;
+            }
+            _ => {
+                out.push(char);
+                column += char_width(char);
+            }
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// Expand the tabs of a rendered line in place (spans measured left to
+/// right).
+pub fn expand_line_tabs(line: &mut Line<'static>) {
+    if !line.spans.iter().any(|span| span.content.contains('\t')) {
+        return;
+    }
+    let mut column = 0usize;
+    for span in &mut line.spans {
+        if span.content.contains('\t') {
+            let expanded = expand_tabs(&span.content, column).into_owned();
+            span.content = expanded.into();
+        }
+        column += display_width(&span.content);
+    }
+}
+
+/// Word-wrap a span list to `width` terminal cells: break at the last
+/// space that fits (the space is dropped), hard-break a word longer
+/// than the line. Widths are display cells, so CJK wraps at half the
+/// chars; tabs expand first.
 pub(crate) fn wrap_spans(spans: Vec<Span<'static>>, width: u16) -> Vec<Line<'static>> {
     let width = (width.max(1) as usize).max(1);
     let mut lines = Vec::new();
@@ -713,7 +870,8 @@ pub(crate) fn wrap_spans(spans: Vec<Span<'static>>, width: u16) -> Vec<Line<'sta
 
     for span in spans {
         let style = span.style;
-        let mut remaining: &str = &span.content;
+        let content = expand_tabs(&span.content, used).into_owned();
+        let mut remaining: &str = &content;
         while !remaining.is_empty() {
             let space = width.saturating_sub(used);
             if space == 0 {
@@ -721,34 +879,65 @@ pub(crate) fn wrap_spans(spans: Vec<Span<'static>>, width: u16) -> Vec<Line<'sta
                 used = 0;
                 continue;
             }
-            let count = remaining.chars().count();
-            if count <= space {
+            let total = display_width(remaining);
+            if total <= space {
                 current.push(Span::styled(remaining.to_string(), style));
-                used += count;
+                used += total;
                 break;
             }
+            // The break candidates: a space inside the budget, or the
+            // space right at the overflow column.
             let mut break_at = None;
-            for (position, _) in remaining.char_indices().skip(1) {
-                if position > space {
+            let mut fit_end = 0usize;
+            let mut cells = 0usize;
+            // Leading indentation is never a break point (code keeps it).
+            let mut seen_word = false;
+            for (position, char) in remaining.char_indices() {
+                let char_cells = char_width(char);
+                let breakable = char == ' ' && (seen_word || used > 0);
+                if cells + char_cells > space {
+                    if breakable {
+                        break_at = Some(position);
+                    }
                     break;
                 }
-                if remaining.as_bytes()[position - 1] == b' ' {
+                if breakable {
                     break_at = Some(position);
                 }
+                seen_word |= char != ' ';
+                cells += char_cells;
+                fit_end = position + char.len_utf8();
             }
             match break_at {
                 Some(position) => {
-                    let (head, tail) = remaining.split_at(position - 1);
-                    current.push(Span::styled(head.to_string(), style));
-                    remaining = tail.strip_prefix(' ').unwrap_or(tail);
+                    let head = &remaining[..position];
+                    if !head.is_empty() {
+                        current.push(Span::styled(head.to_string(), style));
+                    }
+                    remaining = &remaining[position + 1..];
+                    lines.push(Line::from(std::mem::take(&mut current)));
+                    used = 0;
+                }
+                None if fit_end == 0 && used > 0 => {
+                    // Nothing fits after the earlier spans: continue on
+                    // a fresh line.
                     lines.push(Line::from(std::mem::take(&mut current)));
                     used = 0;
                 }
                 None => {
-                    let head: String = remaining.chars().take(space).collect();
-                    let head_len = head.len();
-                    current.push(Span::styled(head, style));
-                    remaining = &remaining[head_len..];
+                    // A glyph wider than the whole line still has to be
+                    // consumed or the loop never advances.
+                    let cut = if fit_end == 0 {
+                        remaining
+                            .chars()
+                            .next()
+                            .map(char::len_utf8)
+                            .unwrap_or(remaining.len())
+                    } else {
+                        fit_end
+                    };
+                    current.push(Span::styled(remaining[..cut].to_string(), style));
+                    remaining = &remaining[cut..];
                     lines.push(Line::from(std::mem::take(&mut current)));
                     used = 0;
                 }
@@ -973,6 +1162,67 @@ mod tests {
         // Links render as their text.
         assert_eq!(spans[6].content, "docs");
         assert_eq!(spans[6].style.fg, Some(theme.markdown_link_text.to_color()));
+    }
+
+    #[test]
+    fn cjk_paragraphs_wrap_by_display_width() {
+        // 15 wide glyphs = 30 cells: three rows of five at width 10.
+        let lines = lines_of("你好世界你好世界你好世界你好世", 10);
+        assert_eq!(lines, vec!["你好世界你", "好世界你好", "世界你好世"]);
+        for line in lines_of("中文 mixed 文本 with 一些 English 单词 here", 10) {
+            assert!(display_width(&line) <= 10, "{line:?}");
+        }
+        // A glyph wider than the line is still consumed.
+        assert_eq!(lines_of("你好", 1), vec!["你", "好"]);
+    }
+
+    #[test]
+    fn strong_cjk_and_flanking() {
+        let theme = theme();
+        let lines = render("**思考** done", 80, &theme);
+        assert_eq!(lines[0].spans[0].content, "思考");
+        assert_eq!(
+            lines[0].spans[0].style.fg,
+            Some(theme.markdown_strong.to_color())
+        );
+        // Stars surrounded by spaces are not emphasis (CommonMark
+        // left/right flanking).
+        assert_eq!(lines_of("2 * 3 * 4", 80), vec!["2 * 3 * 4"]);
+        assert_eq!(lines_of("a ** b ** c", 80), vec!["a ** b ** c"]);
+        assert_eq!(lines_of("*em* and **strong**", 80), vec!["em and strong"]);
+    }
+
+    #[test]
+    fn three_column_table_fits_width_40() {
+        let markdown = "| name | description | value |\n|---|---|---|\n\
+            | alpha | a fairly long description of the first row | 1 |\n\
+            | 测试 | 中文描述也需要按显示宽度换行才能对齐 | 22 |";
+        let lines = lines_of(markdown, 40);
+        let widths: Vec<usize> = lines.iter().map(|line| display_width(line)).collect();
+        assert!(widths.iter().all(|width| *width == widths[0]), "{lines:#?}");
+        assert!(widths[0] <= 40, "{lines:#?}");
+        // The fit uses the whole budget.
+        assert_eq!(widths[0], 40, "{lines:#?}");
+    }
+
+    #[test]
+    fn fit_column_widths_never_overflows() {
+        assert_eq!(fit_column_widths(&[3, 4], 10), vec![3, 4]);
+        let fitted = fit_column_widths(&[50, 5, 1], 20);
+        assert_eq!(fitted.iter().sum::<usize>(), 20, "{fitted:?}");
+        assert!(fitted.iter().all(|width| *width >= 1));
+        assert_eq!(fit_column_widths(&[9, 9, 9], 2), vec![1, 1, 1]);
+    }
+
+    #[test]
+    fn tabs_expand_before_measuring() {
+        let lines = lines_of("```\n\tfn x() {\n\t\treturn;\n\t}\n```", 80);
+        assert_eq!(lines, vec!["    fn x() {", "        return;", "    }"]);
+        assert_eq!(expand_tabs("ab\tc", 0), "ab  c");
+        assert_eq!(expand_tabs("\t", 3), " ");
+        // A tab-indented line wraps by its expanded width.
+        let lines = lines_of("```\n\t\taaaa\n```", 10);
+        assert_eq!(lines, vec!["        aa", "aa"]);
     }
 
     #[test]

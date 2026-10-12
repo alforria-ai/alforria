@@ -494,7 +494,10 @@ fn getting_started_lines(app: &App, theme: &Theme) -> Vec<Line<'static>> {
 /// One full-width card row: the copy padded out with the
 /// `backgroundElement` card background.
 fn card_line(theme: &Theme, spans: Vec<Span<'static>>) -> Line<'static> {
-    let width: usize = spans.iter().map(|span| span.content.chars().count()).sum();
+    let width: usize = spans
+        .iter()
+        .map(|span| crate::ui::markdown::display_width(&span.content))
+        .sum();
     let mut spans = spans;
     spans.push(Span::raw(" ".repeat(CARD_WIDTH.saturating_sub(width))));
     Line::from(spans).style(Style::new().bg(theme.background_element.to_color()))
@@ -567,7 +570,11 @@ fn word_wrap(input: &str, width: usize) -> Vec<String> {
     for word in input.split(' ') {
         if current.is_empty() {
             current.push_str(word);
-        } else if current.chars().count() + 1 + word.chars().count() <= width {
+        } else if crate::ui::markdown::display_width(&current)
+            + 1
+            + crate::ui::markdown::display_width(word)
+            <= width
+        {
             current.push(' ');
             current.push_str(word);
         } else {

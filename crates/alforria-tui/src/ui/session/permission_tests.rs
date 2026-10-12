@@ -499,3 +499,35 @@ fn the_prompt_keys_never_fire_from_behind_a_dialog() {
     assert!(app.ui.dialogs.is_empty());
     assert!(visible(&app).is_some(), "still pending");
 }
+
+#[test]
+fn a_long_diff_keeps_the_options_and_hints_on_screen() {
+    // A 12-line edit diff at 24 rows: the body shrinks, the option
+    // buttons and the key hints stay (`permission.tsx` flexShrink).
+    let mut request = request("per_1", "ses_parent", "edit");
+    let mut diff = String::from("Index: a.rs\n====\n--- a.rs\n+++ a.rs\n@@ -1,12 +1,12 @@\n");
+    for index in 0..12 {
+        diff.push_str(&format!("-old {index}\n+new {index}\n"));
+    }
+    request.metadata.insert("filepath".into(), "a.rs".into());
+    request.metadata.insert("diff".into(), diff.into());
+    let mut app = app_with_request("ses_parent", request);
+    app.ui.terminal_width = 80;
+    app.ui.terminal_height = 24;
+    let backend = ratatui::backend::TestBackend::new(80, 24);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| crate::ui::view(&mut app, frame))
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    let screen: Vec<String> = (0..24)
+        .map(|y| (0..80).map(|x| buffer[(x, y)].symbol()).collect())
+        .collect();
+    let text = screen.join("\n");
+    assert!(text.contains("Allow once"), "{text}");
+    assert!(text.contains("enter confirm"), "{text}");
+    assert!(!text.contains("Index:"), "{text}");
+    // The buttons stay clickable at their painted row.
+    let row = app.ui.permission.clicks.first().expect("option row").row;
+    assert!(screen[row as usize].contains("Allow once"), "{text}");
+}

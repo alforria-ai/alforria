@@ -266,7 +266,7 @@ pub fn status_lines(app: &App, theme: &Theme, width: u16) -> Vec<ratatui::text::
                 Some("failed") => error.unwrap_or_default().to_string(),
                 Some("disabled") => "Disabled in configuration".to_string(),
                 Some("needs_auth") => {
-                    format!("Needs authentication (run: opencode mcp auth {name})")
+                    format!("Needs authentication (run: alforria mcp auth {name})")
                 }
                 Some("needs_client_registration") => error.unwrap_or_default().to_string(),
                 other => other.unwrap_or_default().to_string(),

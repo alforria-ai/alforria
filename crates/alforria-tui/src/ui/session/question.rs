@@ -764,7 +764,7 @@ fn tab_spans(line: &Line<'_>, x_start: u16) -> Vec<(u16, u16, usize)> {
     let mut spans = Vec::new();
     let mut x = x_start;
     for span in &line.spans {
-        let width = span.content.chars().count() as u16;
+        let width = crate::ui::markdown::display_width(&span.content) as u16;
         if span.style.bg.is_some() {
             spans.push((x, width, spans.len()));
         }

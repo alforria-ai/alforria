@@ -31,7 +31,11 @@ struct Snapshot {
 pub struct Display {
     pub rows: Vec<Vec<(char, Option<u64>)>>,
     pub cursor_row: usize,
+    /// The cursor's column in display cells.
     pub cursor_col: usize,
+    /// The cursor's char index within its row (what the renderer
+    /// paints; differs from `cursor_col` after wide glyphs).
+    pub cursor_index: usize,
 }
 
 impl Display {
@@ -510,44 +514,15 @@ impl Textarea {
     /// CJK/emoji count as two columns, `unicode_width`) and place the
     /// cursor.
     pub fn display(&self, width: u16) -> Display {
-        let width = (width.max(1) as usize).max(1);
-        let mut rows: Vec<Vec<(char, Option<u64>)>> = vec![Vec::new()];
-        // The display-width budget of the current row.
-        let mut row_widths: Vec<usize> = vec![0];
-        let mut cursor_row = 0;
-        let mut cursor_col = 0;
-        for (offset, char) in self.buffer.chars().enumerate() {
-            if offset == self.cursor {
-                cursor_row = rows.len() - 1;
-                cursor_col = *row_widths.last().unwrap_or(&0);
-            }
-            if char == '\n' {
-                rows.push(Vec::new());
-                row_widths.push(0);
-                continue;
-            }
-            let char_width = unicode_width::UnicodeWidthChar::width(char).unwrap_or(0);
-            if row_widths.last().is_some_and(|w| w + char_width > width) {
-                rows.push(Vec::new());
-                row_widths.push(0);
-            }
+        let chars = self.buffer.chars().enumerate().map(|(offset, char)| {
             let mark = self
                 .extmarks
                 .iter()
                 .find(|mark| offset >= mark.start && offset < mark.end)
                 .map(|mark| mark.id);
-            rows.last_mut().expect("a row").push((char, mark));
-            *row_widths.last_mut().expect("a row") += char_width;
-        }
-        if self.cursor >= self.char_count() {
-            cursor_row = rows.len() - 1;
-            cursor_col = *row_widths.last().unwrap_or(&0);
-        }
-        Display {
-            rows,
-            cursor_row,
-            cursor_col,
-        }
+            (char, mark)
+        });
+        wrap_chars(chars, self.cursor, width)
     }
 
     /// `maxHeight` (`prompt/index.tsx:1345`): `prompt.max_height`
@@ -556,6 +531,92 @@ impl Textarea {
         config
             .unwrap_or_else(|| std::cmp::max(6, terminal_height / 3))
             .max(1)
+    }
+}
+
+/// Soft-wrap plain `text` with the cursor at its end (the seeded
+/// `--prompt` input).
+pub fn wrap_text(text: &str, width: u16) -> Display {
+    wrap_chars(text.chars().map(|char| (char, None)), usize::MAX, width)
+}
+
+/// Soft-wrap `(char, extmark)` cells into `width` display columns; the
+/// cursor sits before the char at offset `cursor` (past the end when
+/// `cursor` is beyond the text).
+fn wrap_chars(
+    chars: impl Iterator<Item = (char, Option<u64>)>,
+    cursor: usize,
+    width: u16,
+) -> Display {
+    let width = (width.max(1) as usize).max(1);
+    let mut rows: Vec<Vec<(char, Option<u64>)>> = vec![Vec::new()];
+    // The display width used by the current row.
+    let mut used = 0usize;
+    let mut placed: Option<(usize, usize, usize)> = None;
+    for (offset, (char, mark)) in chars.enumerate() {
+        if char == '\n' {
+            if offset == cursor {
+                placed = Some((rows.len() - 1, used, rows.last().map_or(0, Vec::len)));
+            }
+            rows.push(Vec::new());
+            used = 0;
+            continue;
+        }
+        let char_width = unicode_width::UnicodeWidthChar::width(char).unwrap_or(0);
+        if used + char_width > width && used > 0 {
+            rows.push(Vec::new());
+            used = 0;
+        }
+        // Placed after the wrap decision: a cursor on a char that wraps
+        // sits at the start of the next row.
+        if offset == cursor {
+            placed = Some((rows.len() - 1, used, rows.last().map_or(0, Vec::len)));
+        }
+        rows.last_mut().expect("a row").push((char, mark));
+        used += char_width;
+    }
+    let (cursor_row, cursor_col, cursor_index) =
+        placed.unwrap_or((rows.len() - 1, used, rows.last().map_or(0, Vec::len)));
+    Display {
+        rows,
+        cursor_row,
+        cursor_col,
+        cursor_index,
+    }
+}
+
+impl Display {
+    /// The visible rows as styled lines, with the block cursor painted
+    /// over the cursor's char (or one cell past the row's end) when
+    /// `cursor` is set — shared by the session and home prompts.
+    pub fn lines(
+        &self,
+        window: std::ops::Range<usize>,
+        text: ratatui::style::Style,
+        cursor: Option<ratatui::style::Style>,
+    ) -> Vec<ratatui::text::Line<'static>> {
+        use ratatui::text::{Line, Span};
+        let mut lines = Vec::new();
+        for (row, cells) in self.rows[window.clone()].iter().enumerate() {
+            let on_cursor_row = window.start + row == self.cursor_row;
+            let mut spans: Vec<Span<'static>> = Vec::with_capacity(cells.len() + 1);
+            for (index, (char, _mark)) in cells.iter().enumerate() {
+                let style = match cursor {
+                    Some(cursor) if on_cursor_row && index == self.cursor_index => cursor,
+                    _ => text,
+                };
+                spans.push(Span::styled(char.to_string(), style));
+            }
+            // The cursor one past the last cell (its usual position
+            // while typing): an explicit block cell.
+            if let Some(cursor) = cursor {
+                if on_cursor_row && self.cursor_index >= cells.len() {
+                    spans.push(Span::styled(" ", cursor));
+                }
+            }
+            lines.push(Line::from(spans));
+        }
+        lines
     }
 }
 
@@ -710,6 +771,64 @@ mod tests {
         let display = textarea.display(4);
         assert_eq!(display.rows.len(), 2);
         assert_eq!(display.rows[0].len(), 4);
+    }
+
+    fn cursor_cells(
+        lines: &[ratatui::text::Line<'_>],
+        cursor: ratatui::style::Style,
+    ) -> Vec<String> {
+        lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .filter(|span| span.style == cursor)
+            .map(|span| span.content.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn the_cursor_lands_on_its_char_after_wide_glyphs() {
+        let mut textarea = Textarea::new();
+        textarea.insert_text("你好ab");
+        textarea.move_to(3, false); // before `b`
+        let display = textarea.display(20);
+        assert_eq!((display.cursor_row, display.cursor_col), (0, 5));
+        assert_eq!(display.cursor_index, 3);
+        let cursor = ratatui::style::Style::new().bg(ratatui::style::Color::Red);
+        let lines = display.lines(0..1, ratatui::style::Style::new(), Some(cursor));
+        assert_eq!(cursor_cells(&lines, cursor), vec!["b"]);
+        // At the end: one block cell past the text, no other.
+        textarea.move_to(4, false);
+        let display = textarea.display(20);
+        let lines = display.lines(0..1, ratatui::style::Style::new(), Some(cursor));
+        assert_eq!(cursor_cells(&lines, cursor), vec![" "]);
+    }
+
+    #[test]
+    fn a_cursor_on_a_wrapping_char_starts_the_next_row() {
+        let mut textarea = Textarea::new();
+        textarea.insert_text("你好世");
+        textarea.move_to(2, false); // before `世`, which wraps at width 4
+        let display = textarea.display(4);
+        assert_eq!(display.rows.len(), 2);
+        assert_eq!(
+            (display.cursor_row, display.cursor_col, display.cursor_index),
+            (1, 0, 0)
+        );
+    }
+
+    #[test]
+    fn a_scrolled_window_paints_one_cursor() {
+        // Empty rows above the cursor used to get a phantom cursor once
+        // the window scrolled (window-relative vs absolute rows).
+        let mut textarea = Textarea::new();
+        textarea.insert_text("\n\n\n\n\nlast");
+        let display = textarea.display(20);
+        let window = display.window(2);
+        assert_eq!(window, 4..6);
+        let cursor = ratatui::style::Style::new().bg(ratatui::style::Color::Red);
+        let lines = display.lines(window, ratatui::style::Style::new(), Some(cursor));
+        assert_eq!(cursor_cells(&lines, cursor), vec![" "]);
+        assert_eq!(wrap_text("ab\n你好", 3).rows.len(), 3);
     }
 
     #[test]

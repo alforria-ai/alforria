@@ -177,10 +177,12 @@ fn info(app: &App, request: &PermissionV1Request) -> (&'static str, String, Vec<
                 };
                 let width = app.ui.terminal_width;
                 let view = crate::ui::diff::view_for(style, width);
+                // The session column pads 2 + 2; the panel's border and
+                // padding take 1 + 1 + 3 more.
                 crate::ui::diff::render(
                     &diff_content,
                     view,
-                    width.saturating_sub(4),
+                    width.saturating_sub(9),
                     crate::ui::diff::WrapMode::Word,
                     &theme,
                 )
@@ -570,12 +572,37 @@ fn option_row(state: &PermissionState, theme: &Theme) -> Line<'static> {
 /// The permission box's rendered rows (the box is the left-bordered
 /// panel; `maxHeight: 15` when not expanded).
 pub fn lines(app: &App) -> Vec<Line<'static>> {
+    layout(app).0
+}
+
+/// The rows fitted into `max_rows`: like the TS body (the only
+/// shrinkable child, `permission.tsx:649-662`), only the body gives up
+/// rows, so the header, the option buttons and the key hints stay.
+/// Also returns the index of the button row (the only clickable row).
+pub fn fitted_lines(app: &App, max_rows: usize) -> (Vec<Line<'static>>, Option<usize>) {
+    let (mut rows, body, mut buttons) = layout(app);
+    let excess = rows.len().saturating_sub(max_rows);
+    let cut = excess.min(body.len());
+    rows.drain(body.end - cut..body.end);
+    if let Some(row) = buttons.as_mut() {
+        if *row >= body.end {
+            *row -= cut;
+        }
+    }
+    (rows, buttons)
+}
+
+/// The rows, the range of the shrinkable body among them and the index
+/// of the button row.
+fn layout(app: &App) -> (Vec<Line<'static>>, std::ops::Range<usize>, Option<usize>) {
     let theme = app_theme(app);
     let Some(request) = visible(app) else {
-        return Vec::new();
+        return (Vec::new(), 0..0, None);
     };
     let state = &app.ui.permission;
     let mut rows: Vec<Line<'static>> = Vec::new();
+    let mut body_range = 0..0;
+    let mut buttons = None;
     match state.stage {
         PermissionStage::Permission => {
             let (icon, title, body) = info(app, &request);
@@ -597,7 +624,9 @@ pub fn lines(app: &App) -> Vec<Line<'static>> {
                 ),
                 Span::styled(title, Style::new().fg(theme.text.to_color())),
             ]));
+            body_range = rows.len()..rows.len() + body.len();
             rows.extend(body);
+            buttons = Some(rows.len());
             rows.push(option_row(state, &theme));
             // The `permission.prompt.fullscreen` shortcut hint
             // (`permission.tsx:698-702`).
@@ -648,6 +677,7 @@ pub fn lines(app: &App) -> Vec<Line<'static>> {
                 // `gap={1}` between the heading and the pattern list
                 // (`permission.tsx:147`).
                 rows.push(Line::raw(""));
+                body_range = rows.len()..rows.len() + request.always.len();
                 for pattern in &request.always {
                     rows.push(Line::styled(
                         format!("  - {pattern}"),
@@ -675,6 +705,7 @@ pub fn lines(app: &App) -> Vec<Line<'static>> {
                         }),
                 ));
             }
+            buttons = Some(rows.len());
             rows.push(Line::from(spans));
         }
         PermissionStage::Reject => {
@@ -701,7 +732,7 @@ pub fn lines(app: &App) -> Vec<Line<'static>> {
             ]));
         }
     }
-    rows
+    (rows, body_range, buttons)
 }
 
 /// `maxHeight: 15` when not expanded (`permission.tsx:638-647`).
@@ -723,7 +754,7 @@ fn button_ranges(line: &Line<'_>) -> Vec<(usize, usize)> {
     let mut ranges = Vec::new();
     let mut x = 0usize;
     for span in &line.spans {
-        let width = span.content.chars().count();
+        let width = crate::ui::markdown::display_width(&span.content);
         if span.style.bg.is_some() {
             ranges.push((x, width));
         }
@@ -734,7 +765,8 @@ fn button_ranges(line: &Line<'_>) -> Vec<(usize, usize)> {
 
 /// Render into the prompt slot.
 pub fn render(app: &mut App, frame: &mut ratatui::Frame, theme: &Theme, area: Rect) {
-    let rows = lines(app);
+    // The block pads one row above and below.
+    let (rows, buttons) = fitted_lines(app, area.height.saturating_sub(2) as usize);
     let border = match app.ui.permission.stage {
         PermissionStage::Reject => theme.error,
         _ => theme.warning,
@@ -742,12 +774,13 @@ pub fn render(app: &mut App, frame: &mut ratatui::Frame, theme: &Theme, area: Re
     // The option buttons are mouse-interactive (`permission.tsx:676-693`)
     // — record their screen geometry for hit-testing. Content starts at
     // `area.x + 2` (left border + padding) / `area.y + 1` (top padding).
+    // Only the button row: diff rows carry backgrounds too.
     let mut clicks = Vec::new();
     for (index, line) in rows.iter().enumerate() {
-        let buttons = button_ranges(line);
-        if buttons.is_empty() {
+        if Some(index) != buttons {
             continue;
         }
+        let buttons = button_ranges(line);
         clicks.push(ClickRow {
             row: area.y + 1 + index as u16,
             buttons: buttons

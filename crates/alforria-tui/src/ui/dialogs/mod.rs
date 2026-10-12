@@ -1913,7 +1913,10 @@ fn content_lines(app: &App, dialog: &DialogFrame, theme: &Theme) -> Vec<Line<'st
             // so nothing behind the dialog shows through.
             let inner = (width as usize).saturating_sub(8).max(4);
             let row = |spans: Vec<(String, Style)>| {
-                let used: usize = spans.iter().map(|(t, _)| t.chars().count()).sum();
+                let used: usize = spans
+                    .iter()
+                    .map(|(t, _)| crate::ui::markdown::display_width(t))
+                    .sum();
                 let mut out = vec![Span::raw("    ")];
                 out.extend(spans.into_iter().map(|(t, style)| Span::styled(t, style)));
                 out.push(Span::raw(

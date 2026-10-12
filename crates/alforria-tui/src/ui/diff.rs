@@ -33,43 +33,63 @@ pub enum DiffRow {
     },
 }
 
-/// Parse a unified diff. `@@` hunks track the line numbers; anything
-/// outside a hunk is rendered as context rows.
+/// Parse a unified diff. Everything before the first `@@` (the
+/// `Index:` / `====` / `---` / `+++` / `diff --git` headers core emits)
+/// is skipped; inside a hunk the header's line counts decide where it
+/// ends, so a removed line that reads `-- x` stays a removal while the
+/// next file's headers are skipped. `\ No newline at end of file`
+/// markers are dropped.
 pub fn parse(diff: &str) -> Vec<DiffRow> {
     let mut rows = Vec::new();
     let mut old_no: u32 = 0;
     let mut new_no: u32 = 0;
+    // The lines left in the current hunk (old side, new side); `None`
+    // outside a hunk. An unparseable header runs to the next `@@`.
+    let mut hunk: Option<(u32, u32)> = None;
     for raw in diff.lines() {
         if raw.starts_with("@@") {
-            let (next_old, next_new) = parse_hunk_header(raw).unwrap_or((old_no, new_no));
-            old_no = next_old;
-            new_no = next_new;
+            match parse_hunk_header(raw) {
+                Some(header) => {
+                    old_no = header.old_start;
+                    new_no = header.new_start;
+                    hunk = Some((header.old_lines, header.new_lines));
+                }
+                None => hunk = Some((u32::MAX, u32::MAX)),
+            }
             rows.push(DiffRow::Hunk {
                 text: raw.to_string(),
             });
             continue;
         }
-        if raw.starts_with("diff --git") || raw.starts_with("--- ") || raw.starts_with("+++ ") {
+        let Some((old_left, new_left)) = hunk.as_mut() else {
+            continue;
+        };
+        if raw.starts_with('\\') {
             continue;
         }
-        let (sign, text) = raw.split_at(1.min(raw.len()));
-        let text = text.to_string();
+        let mut chars = raw.chars();
+        let sign = chars.next();
+        let text = expand_tabs(chars.as_str());
         match sign {
-            "+" => {
+            Some('+') => {
                 rows.push(DiffRow::Added {
                     new_no: Some(new_no),
                     text,
                 });
                 new_no = new_no.saturating_add(1);
+                *new_left = new_left.saturating_sub(1);
             }
-            "-" => {
+            Some('-') => {
                 rows.push(DiffRow::Removed {
                     old_no: Some(old_no),
                     text,
                 });
                 old_no = old_no.saturating_add(1);
+                *old_left = old_left.saturating_sub(1);
             }
-            _ => {
+            // A context line; an empty line is a context line whose
+            // leading space was stripped.
+            Some(' ') | None => {
                 rows.push(DiffRow::Context {
                     old_no: Some(old_no),
                     new_no: Some(new_no),
@@ -77,20 +97,56 @@ pub fn parse(diff: &str) -> Vec<DiffRow> {
                 });
                 old_no = old_no.saturating_add(1);
                 new_no = new_no.saturating_add(1);
+                *old_left = old_left.saturating_sub(1);
+                *new_left = new_left.saturating_sub(1);
             }
+            // Anything else ends the hunk (the next file's headers).
+            Some(_) => {
+                hunk = None;
+                continue;
+            }
+        }
+        if hunk.is_some_and(|(old, new)| old == 0 && new == 0) {
+            hunk = None;
         }
     }
     rows
 }
 
-/// `@@ -3,4 +3,5 @@` → `(4, 4)` — the *first* line numbers of the
-/// hunk. 1-based; a zero start renders as none.
-fn parse_hunk_header(raw: &str) -> Option<(u32, u32)> {
-    let old = raw.split('-').nth(1)?.split(',').next()?;
-    let new = raw.split('+').nth(1)?.split(',').next()?;
-    let old: u32 = old.parse().ok()?;
-    let new: u32 = new.parse().ok()?;
-    Some((old, new))
+/// A parsed `@@ -a,b +c,d @@` header.
+struct HunkHeader {
+    old_start: u32,
+    old_lines: u32,
+    new_start: u32,
+    new_lines: u32,
+}
+
+/// `@@ -3,4 +3,5 @@` → starts `(3, 3)`, counts `(4, 5)`. A missing
+/// count is 1 (`@@ -1 +1 @@`). 1-based; a zero start renders as none.
+fn parse_hunk_header(raw: &str) -> Option<HunkHeader> {
+    let mut fields = raw.strip_prefix("@@")?.split_whitespace();
+    let old = fields.next()?.strip_prefix('-')?;
+    let new = fields.next()?.strip_prefix('+')?;
+    let range = |range: &str| -> Option<(u32, u32)> {
+        match range.split_once(',') {
+            Some((start, count)) => Some((start.parse().ok()?, count.parse().ok()?)),
+            None => Some((range.parse().ok()?, 1)),
+        }
+    };
+    let (old_start, old_lines) = range(old)?;
+    let (new_start, new_lines) = range(new)?;
+    Some(HunkHeader {
+        old_start,
+        old_lines,
+        new_start,
+        new_lines,
+    })
+}
+
+/// Tabs expand to spaces before any width math (the terminal would
+/// otherwise paint them as zero or one cell).
+fn expand_tabs(text: &str) -> String {
+    crate::ui::markdown::expand_tabs(text, 0).into_owned()
 }
 
 /// `DiffStyle` (`config/index.tsx:30-32`).
@@ -438,7 +494,44 @@ fn split_pane_span(side: Option<SplitSide>, pane: usize, theme: &Theme) -> Span<
 pub fn revert_files(diff: &str) -> Vec<RevertFile> {
     let mut files = Vec::new();
     let mut current: Option<RevertFile> = None;
+    // Lines left in the current hunk: `---`/`+++` are file headers only
+    // outside one.
+    let mut hunk: Option<(u32, u32)> = None;
     for raw in diff.lines() {
+        if raw.starts_with("@@") {
+            hunk = Some(
+                parse_hunk_header(raw)
+                    .map(|header| (header.old_lines, header.new_lines))
+                    .unwrap_or((u32::MAX, u32::MAX)),
+            );
+            continue;
+        }
+        if let Some((old_left, new_left)) = hunk.as_mut() {
+            match raw.chars().next() {
+                Some('+') => {
+                    *new_left = new_left.saturating_sub(1);
+                    if let Some(file) = current.as_mut() {
+                        file.additions += 1;
+                    }
+                }
+                Some('-') => {
+                    *old_left = old_left.saturating_sub(1);
+                    if let Some(file) = current.as_mut() {
+                        file.deletions += 1;
+                    }
+                }
+                Some('\\') => {}
+                Some(' ') | None => {
+                    *old_left = old_left.saturating_sub(1);
+                    *new_left = new_left.saturating_sub(1);
+                }
+                Some(_) => hunk = None,
+            }
+            if hunk.is_some_and(|(old, new)| old == 0 && new == 0) {
+                hunk = None;
+            }
+            continue;
+        }
         if raw.starts_with("+++ ") {
             let name = raw.strip_prefix("+++ ").unwrap_or("").trim();
             let name = name.strip_prefix("b/").unwrap_or(name);
@@ -452,15 +545,6 @@ pub fn revert_files(diff: &str) -> Vec<RevertFile> {
                     deletions: 0,
                 });
             }
-            continue;
-        }
-        let Some(file) = current.as_mut() else {
-            continue;
-        };
-        if raw.starts_with('+') {
-            file.additions += 1;
-        } else if raw.starts_with('-') {
-            file.deletions += 1;
         }
     }
     if let Some(file) = current {
@@ -583,6 +667,83 @@ mod tests {
         assert_eq!(files[0].filename, "src/lib.rs");
         assert_eq!(files[0].additions, 2);
         assert_eq!(files[0].deletions, 1);
+    }
+
+    /// `createTwoFilesPatch` as core's edit tool emits it
+    /// (`alforria-core/src/tool/diff.rs`), with a removed line that
+    /// itself reads `-- x` and a no-newline marker.
+    const CORE_DIFF: &str = concat!(
+        "Index: /p/a.rs\n",
+        "===================================================================\n",
+        "--- /p/a.rs\n",
+        "+++ /p/a.rs\n",
+        "@@ -1,3 +1,3 @@\n",
+        " keep\n",
+        "--- x\n",
+        "+\tnew 你好\n",
+        " tail\n",
+        "\\ No newline at end of file\n",
+    );
+
+    #[test]
+    fn core_edit_diff_skips_headers() {
+        let rows = parse(CORE_DIFF);
+        assert_eq!(
+            rows,
+            vec![
+                DiffRow::Hunk {
+                    text: "@@ -1,3 +1,3 @@".into()
+                },
+                DiffRow::Context {
+                    old_no: Some(1),
+                    new_no: Some(1),
+                    text: "keep".into()
+                },
+                DiffRow::Removed {
+                    old_no: Some(2),
+                    text: "-- x".into()
+                },
+                DiffRow::Added {
+                    new_no: Some(2),
+                    text: "    new 你好".into()
+                },
+                DiffRow::Context {
+                    old_no: Some(3),
+                    new_no: Some(3),
+                    text: "tail".into()
+                },
+            ]
+        );
+        let text: Vec<String> = render(CORE_DIFF, "unified", 80, WrapMode::Word, &theme())
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect();
+        assert!(text.iter().all(|row| !row.contains("Index:")
+            && !row.contains("====")
+            && !row.contains("No newline")));
+    }
+
+    #[test]
+    fn multi_file_patches_skip_the_next_headers() {
+        let diff =
+            "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n--- a/y\n+++ b/y\n@@ -0,0 +1,2 @@\n+c\n+d\n";
+        let rows = parse(diff);
+        assert_eq!(rows.len(), 6, "{rows:?}");
+        assert!(matches!(&rows[3], DiffRow::Hunk { .. }), "{rows:?}");
+        assert_eq!(
+            rows[4],
+            DiffRow::Added {
+                new_no: Some(1),
+                text: "c".into()
+            }
+        );
+        let files = revert_files(diff);
+        assert_eq!(files.len(), 2);
+        assert_eq!((files[0].additions, files[0].deletions), (1, 1));
+        assert_eq!((files[1].additions, files[1].deletions), (2, 0));
+        // Core's `Index:` headers don't count either.
+        let files = revert_files(CORE_DIFF);
+        assert_eq!((files[0].additions, files[0].deletions), (1, 1));
     }
 
     #[test]

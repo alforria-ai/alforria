@@ -381,8 +381,14 @@ pub(crate) fn bottom_row(app: &App, theme: &Theme, width: u16) -> Line<'static> 
     } else {
         right.extend(shortcut_spans(app, theme, session_id.as_deref()));
     }
-    let left_width: usize = left.iter().map(|s| s.content.chars().count()).sum();
-    let right_width: usize = right.iter().map(|s| s.content.chars().count()).sum();
+    let left_width: usize = left
+        .iter()
+        .map(|s| crate::ui::markdown::display_width(&s.content))
+        .sum();
+    let right_width: usize = right
+        .iter()
+        .map(|s| crate::ui::markdown::display_width(&s.content))
+        .sum();
     let padding = (width as usize).saturating_sub(left_width + right_width);
     let mut spans = left;
     spans.push(Span::raw(" ".repeat(padding.max(1))));
@@ -456,7 +462,6 @@ pub fn render(app: &App, frame: &mut ratatui::Frame, theme: &Theme, area: Rect) 
     let max_height =
         crate::ui::textarea::Textarea::max_height(app.config.prompt_max_height, area.height.max(1));
     let window = display.window(max_height);
-    let rows: Vec<&Vec<(char, Option<u64>)>> = display.rows[window.clone()].iter().collect();
     let text_empty = app.ui.prompt.is_empty();
     // `cursor.blinking` (config/index.tsx:33-42) — the OpenTUI cursor
     // blinks; the blink phase is driven by the render tick.
@@ -487,29 +492,11 @@ pub fn render(app: &App, frame: &mut ratatui::Frame, theme: &Theme, area: Rect) 
         ));
         lines.push(Line::from(spans));
     } else {
-        for (row, cells) in rows.iter().enumerate() {
-            let mut spans: Vec<Span> = Vec::new();
-            for (column, (char, _mark)) in cells.iter().enumerate() {
-                let mut style = Style::new().fg(theme.text.to_color());
-                if blink && window.start + row == display.cursor_row && column == display.cursor_col
-                {
-                    style = cursor;
-                }
-                spans.push(Span::styled(char.to_string(), style));
-            }
-            // The cursor one-past-the-last cell (its usual position
-            // while typing) — draw an explicit block cell.
-            if blink
-                && window.start + row == display.cursor_row
-                && display.cursor_col >= cells.len()
-            {
-                spans.push(Span::styled(" ", cursor));
-            }
-            if row == display.cursor_row && spans.is_empty() && blink {
-                spans.push(Span::styled(" ", cursor));
-            }
-            lines.push(Line::from(spans));
-        }
+        lines.extend(display.lines(
+            window,
+            Style::new().fg(theme.text.to_color()),
+            blink.then_some(cursor),
+        ));
     }
     // The meta box `paddingTop={1}` — a blank row above the meta row.
     lines.push(Line::raw(""));

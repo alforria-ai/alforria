@@ -861,4 +861,138 @@ mod tests {
         // Messages at/after the revert point are hidden.
         assert!(!text.contains("text msg_1"), "{text}");
     }
+
+    /// Deterministic mixed-width noise: wide glyphs, emoji, combining
+    /// marks, tabs and markdown/diff punctuation.
+    fn noise(seed: &mut u64, len: usize) -> String {
+        const ATOMS: [&str; 22] = [
+            "a",
+            "word ",
+            "你",
+            "好",
+            "😀",
+            "é",
+            "e\u{301}",
+            "\t",
+            "*",
+            "**",
+            "_",
+            "|",
+            "`",
+            " ",
+            "\n",
+            "\n\n",
+            "- ",
+            "# ",
+            "@@ -1 +1 @@\n",
+            "+",
+            "-",
+            "> ",
+        ];
+        let mut out = String::new();
+        for _ in 0..len {
+            *seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            out.push_str(ATOMS[(*seed >> 33) as usize % ATOMS.len()]);
+        }
+        out
+    }
+
+    pub(crate) fn part(value: serde_json::Value) -> V1Part {
+        serde_json::from_value(value).expect("a V1Part")
+    }
+
+    pub(crate) fn mixed_parts(message_id: &str, seed: &mut u64, len: usize) -> Vec<V1Part> {
+        let common = |id: &str| serde_json::json!({ "id": id, "sessionID": "ses_a", "messageID": message_id });
+        let with = |id: &str, extra: serde_json::Value| {
+            let mut value = common(id);
+            for (key, field) in extra.as_object().unwrap() {
+                value[key] = field.clone();
+            }
+            part(value)
+        };
+        let table = format!(
+            "| {} | {} | c |\n|---|:---:|--:|\n| {} | {} | 3 |\n",
+            noise(seed, 3).replace(['\n', '|'], " "),
+            noise(seed, 3).replace(['\n', '|'], " "),
+            noise(seed, 6).replace(['\n', '|'], " "),
+            noise(seed, 2).replace(['\n', '|'], " "),
+        );
+        vec![
+            with(
+                &format!("prt_{message_id}_r"),
+                serde_json::json!({
+                    "type": "reasoning",
+                    "text": format!("**{}**\n\n{}", noise(seed, 3), noise(seed, len)),
+                    "time": { "start": 0, "end": 2000 },
+                }),
+            ),
+            with(
+                &format!("prt_{message_id}_t"),
+                serde_json::json!({ "type": "text", "text": format!("{}\n\n{table}", noise(seed, len)) }),
+            ),
+            with(
+                &format!("prt_{message_id}_e"),
+                serde_json::json!({
+                    "type": "tool",
+                    "callID": "call_e",
+                    "tool": "edit",
+                    "state": {
+                        "status": "completed",
+                        "input": { "filePath": "/repo/a.rs" },
+                        "output": "",
+                        "title": "a.rs",
+                        "metadata": { "diff": format!(
+                            "Index: a.rs\n====\n--- a.rs\n+++ a.rs\n@@ -1,2 +1,2 @@\n {}\n-{}\n+{}\n\\ No newline at end of file\n",
+                            noise(seed, 4).replace('\n', " "),
+                            noise(seed, 4).replace('\n', " "),
+                            noise(seed, 4).replace('\n', " "),
+                        ) },
+                        "time": { "start": 0, "end": 1 },
+                    },
+                }),
+            ),
+            with(
+                &format!("prt_{message_id}_b"),
+                serde_json::json!({
+                    "type": "tool",
+                    "callID": "call_b",
+                    "tool": "bash",
+                    "state": {
+                        "status": "completed",
+                        "input": { "command": "ls" },
+                        "output": "",
+                        "title": "ls",
+                        "metadata": { "output": noise(seed, len) },
+                        "time": { "start": 0, "end": 1 },
+                    },
+                }),
+            ),
+        ]
+    }
+
+    #[test]
+    fn mixed_width_transcripts_never_panic() {
+        let mut seed = 7u64;
+        let mut app = app_with_messages(vec![
+            user_message("msg_1", 1.0),
+            assistant_message("msg_2", Some(2)),
+        ]);
+        for round in 0..12 {
+            let user = part(serde_json::json!({
+                "id": "prt_u", "sessionID": "ses_a", "messageID": "msg_1",
+                "type": "text", "text": noise(&mut seed, 40),
+            }));
+            app.state.sync.part.insert("msg_1".to_string(), vec![user]);
+            app.state
+                .sync
+                .part
+                .insert("msg_2".to_string(), mixed_parts("msg_2", &mut seed, 60));
+            for width in [5u16, 6, 7, 9, 13, 21, 40, 80, 121, 160] {
+                let text = render_lines(&mut app, width, 12 + round);
+                assert!(!text.is_empty());
+            }
+        }
+    }
 }

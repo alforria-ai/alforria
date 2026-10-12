@@ -92,25 +92,17 @@ fn rows(app: &App, area: Rect) -> crate::ui::textarea::Display {
         } if app.ui.prompt.is_empty() => Some(&seed.input),
         _ => None,
     };
-    let Some(seed) = seed else {
-        return app.ui.prompt.textarea.display(inner_width(area));
-    };
-    let mut rows: Vec<Vec<(char, Option<u64>)>> = vec![Vec::new()];
-    for char in seed.chars() {
-        if char == '\n' {
-            rows.push(Vec::new());
-        } else {
-            rows.last_mut()
-                .expect("rows starts with one row")
-                .push((char, None));
-        }
-    }
-    let cursor_row = rows.len() - 1;
-    let cursor_col = rows.last().map(Vec::len).unwrap_or(0);
-    crate::ui::textarea::Display {
-        rows,
-        cursor_row,
-        cursor_col,
+    // The prompt box is `prompt_max_width` wide, centered in the area.
+    let width = inner_width(Rect {
+        width: app
+            .config
+            .prompt_max_width(area.width.saturating_sub(4))
+            .min(area.width),
+        ..area
+    });
+    match seed {
+        Some(seed) => crate::ui::textarea::wrap_text(seed, width),
+        None => app.ui.prompt.textarea.display(width),
     }
 }
 
@@ -264,10 +256,13 @@ fn render_footer(app: &App, frame: &mut ratatui::Frame, theme: &Theme, area: Rec
         spans.push(Span::styled("/status", theme.text_muted.to_color()));
     }
     let version = crate::ui::session::sidebar::INSTALLATION_VERSION;
-    let used: usize = spans.iter().map(|span| span.content.chars().count()).sum();
+    let used: usize = spans
+        .iter()
+        .map(|span| crate::ui::markdown::display_width(&span.content))
+        .sum();
     let remaining = (row.width as usize)
         .saturating_sub(used)
-        .saturating_sub(version.chars().count())
+        .saturating_sub(crate::ui::markdown::display_width(version))
         .saturating_sub(2); // paddingRight=2
     spans.push(Span::raw(" ".repeat(remaining)));
     spans.push(Span::styled(version, theme.text_muted.to_color()));
@@ -408,7 +403,7 @@ fn tips_list(app: &App) -> Vec<String> {
         press(agent_cycle, "to cycle between Build and Plan agents"),
         Some("Use {highlight}/undo{/highlight} to revert the last message and file changes".to_string()),
         Some("Use {highlight}/redo{/highlight} to restore previously undone messages and file changes".to_string()),
-        Some("Run {highlight}/share{/highlight} to create a public opencode.ai link".to_string()),
+        Some("Run {highlight}/share{/highlight} to create a public share link".to_string()),
         Some("Drag and drop images or PDFs into the terminal as context".to_string()),
         press(input_paste, "to paste images from your clipboard into the prompt"),
         Some(format!("Use {} to compose messages in your external editor", command_text("/editor", editor_open))),
@@ -476,24 +471,14 @@ fn tips_list(app: &App) -> Vec<String> {
         Some("Set {highlight}\"formatter\": false{/highlight} to disable inherited formatters".to_string()),
         Some("Define custom formatter commands with file extensions in config".to_string()),
         Some("Set {highlight}\"lsp\": true{/highlight} to enable built-in LSP code analysis".to_string()),
-        Some("Create {highlight}.ts{/highlight} files in {highlight}.opencode/tools/{/highlight} to define new LLM tools".to_string()),
-        Some("Tool definitions can invoke scripts written in Python, Go, etc".to_string()),
-        Some("Add {highlight}.ts{/highlight} files to {highlight}.opencode/plugins/{/highlight} for event hooks".to_string()),
-        Some("Use plugins to send OS notifications when sessions complete".to_string()),
-        Some("Create a plugin to prevent OpenCode from reading sensitive files".to_string()),
-        Some("Use {highlight}opencode run{/highlight} for non-interactive scripting".to_string()),
-        Some("Use {highlight}opencode --continue{/highlight} to resume the last session".to_string()),
-        Some("Use {highlight}opencode run -f file.ts{/highlight} to attach files via CLI".to_string()),
+        Some("Use {highlight}alforria run{/highlight} for non-interactive scripting".to_string()),
+        Some("Use {highlight}alforria --continue{/highlight} to resume the last session".to_string()),
+        Some("Use {highlight}alforria run -f file.ts{/highlight} to attach files via CLI".to_string()),
         Some("Use {highlight}--format json{/highlight} for machine-readable output in scripts".to_string()),
-        Some("Run {highlight}opencode serve{/highlight} for headless API access to OpenCode".to_string()),
-        Some("Use {highlight}opencode run --attach{/highlight} to connect to a running server".to_string()),
-        Some("Run {highlight}opencode upgrade{/highlight} to update to the latest version".to_string()),
-        Some("Run {highlight}opencode auth list{/highlight} to see all configured providers".to_string()),
-        Some("Run {highlight}opencode agent create{/highlight} for guided agent creation".to_string()),
-        Some("Use {highlight}/opencode{/highlight} in GitHub issues/PRs to trigger AI actions".to_string()),
-        Some("Run {highlight}opencode github install{/highlight} to set up the GitHub workflow".to_string()),
-        Some("Comment {highlight}/opencode fix this{/highlight} on issues to auto-create PRs".to_string()),
-        Some("Comment {highlight}/oc{/highlight} on PR code lines for targeted code reviews".to_string()),
+        Some("Run {highlight}alforria serve{/highlight} for headless API access to alforria".to_string()),
+        Some("Use {highlight}alforria run --attach{/highlight} to connect to a running server".to_string()),
+        Some("Run {highlight}alforria auth list{/highlight} to see all configured providers".to_string()),
+        Some("Run {highlight}alforria agent create{/highlight} for guided agent creation".to_string()),
         Some("Use {highlight}\"theme\": \"system\"{/highlight} to match your terminal's colors".to_string()),
         Some("Create JSON theme files in {highlight}.opencode/themes/{/highlight} directory".to_string()),
         Some("Themes support dark/light variants for both modes".to_string()),
@@ -511,7 +496,7 @@ fn tips_list(app: &App) -> Vec<String> {
         Some("Run {highlight}/unshare{/highlight} to remove a session from public access".to_string()),
         Some("Permission {highlight}doom_loop{/highlight} prevents infinite tool call loops".to_string()),
         Some("Permission {highlight}external_directory{/highlight} protects files outside project".to_string()),
-        Some("Run {highlight}opencode debug config{/highlight} to troubleshoot configuration".to_string()),
+        Some("Run {highlight}alforria debug config{/highlight} to troubleshoot configuration".to_string()),
         Some("Use {highlight}--print-logs{/highlight} flag to see detailed logs in stderr".to_string()),
         Some(format!("Use {} to jump to specific messages", command_text("/timeline", session_timeline))),
         press(messages_toggle_conceal, "to toggle code block visibility in messages"),
@@ -524,8 +509,6 @@ fn tips_list(app: &App) -> Vec<String> {
             ),
             true => "Toggle username display in chat via the command palette".to_string(),
         }),
-        Some("Run {highlight}docker run -it --rm ghcr.io/anomalyco/opencode{/highlight} in a container".to_string()),
-        Some("Use {highlight}/connect{/highlight} with OpenCode Zen for curated, tested models".to_string()),
         Some("Commit your project's {highlight}AGENTS.md{/highlight} file to Git for team sharing".to_string()),
         Some("Use {highlight}/review{/highlight} to review uncommitted changes, branches, or PRs".to_string()),
         Some(format!("Use {} to show the help dialog", command_text("/help", help_show))),
@@ -561,7 +544,7 @@ fn tip_lines(app: &App, theme: &Theme, width: u16) -> Vec<Line<'static>> {
                 continue;
             }
             let empty = rows.last().expect("rows starts with one row").is_empty();
-            if !empty && used + 1 + word.chars().count() > width as usize {
+            if !empty && used + 1 + crate::ui::markdown::display_width(word) > width as usize {
                 rows.push(Vec::new());
                 used = TIP_PREFIX_WIDTH;
             }
@@ -571,14 +554,14 @@ fn tip_lines(app: &App, theme: &Theme, width: u16) -> Vec<Line<'static>> {
                 used += 1;
             }
             last.push((word.to_string(), highlighted));
-            used += word.chars().count();
+            used += crate::ui::markdown::display_width(word);
         }
     }
     rows.into_iter()
         .map(|row| {
             let row_width = row
                 .iter()
-                .map(|(text, _)| text.chars().count())
+                .map(|(text, _)| crate::ui::markdown::display_width(text))
                 .sum::<usize>()
                 + TIP_PREFIX_WIDTH;
             let mut spans = vec![Span::raw(
@@ -659,27 +642,11 @@ fn render_prompt(app: &App, frame: &mut ratatui::Frame, theme: &Theme, area: Rec
         ));
         lines.push(Line::from(spans));
     } else {
-        for (row, cells) in display.rows[window.clone()].iter().enumerate() {
-            let mut spans: Vec<Span> = Vec::new();
-            for (column, (char, _mark)) in cells.iter().enumerate() {
-                let mut style = Style::new().fg(theme.text.to_color());
-                if blink && window.start + row == display.cursor_row && column == display.cursor_col
-                {
-                    style = cursor;
-                }
-                spans.push(Span::styled(char.to_string(), style));
-            }
-            if blink
-                && window.start + row == display.cursor_row
-                && display.cursor_col >= cells.len()
-            {
-                spans.push(Span::styled(" ", cursor));
-            }
-            if window.start + row == display.cursor_row && spans.is_empty() && blink {
-                spans.push(Span::styled(" ", cursor));
-            }
-            lines.push(Line::from(spans));
-        }
+        lines.extend(display.lines(
+            window,
+            Style::new().fg(theme.text.to_color()),
+            blink.then_some(cursor),
+        ));
     }
     // The meta box `paddingTop={1}` — a blank row above the meta row.
     lines.push(Line::raw(""));

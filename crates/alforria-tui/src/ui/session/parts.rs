@@ -19,12 +19,18 @@ use crate::ui::theme::Rgba;
 
 /// `PART_MAPPING` — text, tool and reasoning only.
 pub fn render_part(part: &V1Part, ctx: &Ctx) -> Vec<Line<'static>> {
-    match part {
+    let mut lines = match part {
         V1Part::Text { .. } => render_text(part, ctx),
         V1Part::Reasoning { .. } => render_reasoning(part, ctx),
         V1Part::Tool { .. } => render_tool(part, ctx),
         _ => Vec::new(),
+    };
+    // Tool output (shell output, written files) carries raw tabs; the
+    // terminal would paint them as one cell or none.
+    for line in &mut lines {
+        markdown::expand_line_tabs(line);
     }
+    lines
 }
 
 // ------------------------------------------------------------- helpers
@@ -88,39 +94,34 @@ fn render_text(part: &V1Part, ctx: &Ctx) -> Vec<Line<'static>> {
 // ---------------------------------------------------------- reasoning
 
 /// `reasoningSummary` (`context/thinking.ts:12-20`): a leading bolded
-/// title block separates from the body.
-fn reasoning_summary(text: &str) -> (Option<String>, String) {
+/// title block separates from the body —
+/// `/^\*\*([^*\n]+)\*\*(?:\r?\n\r?\n|$)/`.
+pub(crate) fn reasoning_summary(text: &str) -> (Option<String>, String) {
     let content = text.trim();
-    let rest = content.strip_prefix("**").unwrap_or(content);
-    if rest.len() == content.len() {
-        return (None, content.to_string());
-    }
-    let mut end = None;
-    for (index, char) in rest.char_indices() {
-        if char == '*' {
-            if index == 0 || rest[index - 1..index].chars().any(|c| c == '\n') {
-                break;
-            }
-            if rest.as_bytes().get(index + 1) == Some(&b'*') {
-                end = Some(index);
-                break;
-            }
-        }
-    }
-    let Some(end) = end else {
-        return (None, content.to_string());
+    let untitled = || (None, content.to_string());
+    let Some(rest) = content.strip_prefix("**") else {
+        return untitled();
     };
+    // `[^*\n]+` — at least one char, then the closing `**`.
+    let Some(end) = rest.find(['*', '\n']) else {
+        return untitled();
+    };
+    if end == 0 || !rest[end..].starts_with("**") {
+        return untitled();
+    }
     let title = &rest[..end];
     let after = &rest[end + 2..];
-    if title.contains('*') || title.contains('\n') {
-        return (None, content.to_string());
-    }
-    let body = if after.starts_with("\n\n") || after.is_empty() {
-        after.trim_end().to_string()
+    let body = if after.is_empty() {
+        after
+    } else if let Some(body) = ["\r\n\r\n", "\r\n\n", "\n\r\n", "\n\n"]
+        .iter()
+        .find_map(|separator| after.strip_prefix(separator))
+    {
+        body
     } else {
-        return (None, content.to_string());
+        return untitled();
     };
-    (Some(title.trim().to_string()), body)
+    (Some(title.trim().to_string()), body.trim_end().to_string())
 }
 
 /// `ReasoningPart` (`session/index.tsx:1586-1684`).
@@ -185,7 +186,12 @@ fn render_reasoning(part: &V1Part, ctx: &Ctx) -> Vec<Line<'static>> {
         }
         let detail = detail.join(" · ");
         let text = if opaque {
-            format!("Thought{detail}")
+            // `Thought · 2.0s` (`ReasoningHeader`, index.tsx:1665).
+            if duration_text.is_empty() {
+                "Thought".to_string()
+            } else {
+                format!("Thought · {duration_text}")
+            }
         } else {
             let prefix = if in_minimal && !opaque {
                 if open {
@@ -204,10 +210,15 @@ fn render_reasoning(part: &V1Part, ctx: &Ctx) -> Vec<Line<'static>> {
         lines.push(Line::from(span(text, fg)));
     }
 
+    // The body box `paddingLeft={inMinimal ? 2 : 0}` inside the part's
+    // own `paddingLeft={3}` (index.tsx:1631).
     if !opaque && open && !body.is_empty() {
-        let indent: usize = if in_minimal { 5 } else { 3 };
-        let body_lines =
-            markdown::render(&body, ctx.width.saturating_sub(indent as u16), ctx.theme);
+        let indent: usize = if in_minimal { 2 } else { 0 };
+        let body_lines = markdown::render(
+            &body,
+            ctx.width.saturating_sub(3 + indent as u16),
+            ctx.theme,
+        );
         lines.push(blank());
         lines.extend(pad(body_lines, indent));
     }
@@ -1670,6 +1681,74 @@ mod tests {
         // Hide mode renders collapsed (`+ `) with the `Thought: <detail>`
         // header (`session/index.tsx:1664-1667`).
         assert!(text.contains("+ Thought: 1.5s"), "{text}");
+    }
+
+    fn reasoning(text: &str, metadata: Option<serde_json::Map<String, Value>>) -> V1Part {
+        V1Part::Reasoning {
+            id: "prt_r".into(),
+            session_id: "ses_a".into(),
+            message_id: "msg_1".into(),
+            text: text.into(),
+            metadata,
+            time: ReasoningTime {
+                start: 0,
+                end: Some(2_000),
+            },
+        }
+    }
+
+    #[test]
+    fn reasoning_summary_matches_the_ts_regex() {
+        // Non-ASCII titles used to slice through a char boundary.
+        assert_eq!(
+            reasoning_summary("**思考**\n\n正文"),
+            (Some("思考".into()), "正文".into())
+        );
+        assert_eq!(
+            reasoning_summary("**思考**"),
+            (Some("思考".into()), "".into())
+        );
+        assert_eq!(
+            reasoning_summary("**Plan**\r\n\r\nbody  \n"),
+            (Some("Plan".into()), "body".into())
+        );
+        // No blank line after the title, an empty title, a newline or a
+        // star inside: no title.
+        for text in ["**a** b", "****", "**a\nb**", "**a*b**", "**é", "*é*", "**"] {
+            assert_eq!(
+                reasoning_summary(text),
+                (None, text.trim().into()),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn reasoning_body_is_indented_once() {
+        let mut app = app();
+        app.state
+            .kv
+            .set(crate::state::kv::keys::THINKING_MODE, json!("show"));
+        let theme = theme();
+        let ctx = Ctx::new(&app, &theme, "ses_a", 80);
+        let lines = render_part(&reasoning("**思考**\n\nbody text", None), &ctx);
+        let rows: Vec<String> = lines
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect();
+        assert_eq!(rows[1], "   Thought: 思考 · 2.0s");
+        // `paddingLeft={3}` only in show mode (index.tsx:1631).
+        assert_eq!(rows[3], "   body text");
+    }
+
+    #[test]
+    fn opaque_reasoning_reads_thought_dot_duration() {
+        let app = app();
+        let theme = theme();
+        let ctx = Ctx::new(&app, &theme, "ses_a", 80);
+        let metadata = json!({ "encrypted": "x" }).as_object().unwrap().clone();
+        let text = plain(&render_part(&reasoning("[REDACTED]", Some(metadata)), &ctx));
+        assert!(text.contains("Thought · 2.0s"), "{text}");
     }
 
     #[test]
