@@ -74,10 +74,16 @@ const proxy = Object.fromEntries(
   ]),
 )
 
+// The dev server stays on loopback: its proxy presents the server's origin
+// and password, so whoever reaches it gets the agent. ALFORRIA_LAN=1 (the
+// counterpart of `bun run server --lan`) opens it to the LAN for a phone;
+// vite's own --host works too.
+const lan = process.env.ALFORRIA_LAN === "1"
+
 export default defineConfig({
   plugins: [solid()],
   server: {
-    host: "0.0.0.0",
+    host: lan ? "0.0.0.0" : "127.0.0.1",
     port: 4610,
     proxy,
   },

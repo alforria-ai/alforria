@@ -7,7 +7,8 @@
 //
 // All state lives under web/.dev/ (projects/ and server/), wiped on every
 // start unless --keep. --lan binds 0.0.0.0 so a phone on the LAN can reach
-// the server directly; `bun run dev` proxies to 127.0.0.1 either way.
+// the server directly; `bun run dev` proxies to 127.0.0.1 either way and
+// itself stays on loopback unless started with ALFORRIA_LAN=1.
 
 import { existsSync, readFileSync, rmSync } from "node:fs"
 import { networkInterfaces } from "node:os"
