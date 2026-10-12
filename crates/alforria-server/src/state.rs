@@ -297,8 +297,11 @@ pub fn resolve_directory(p: &Path) -> PathBuf {
     } else {
         lexical_normalize(&cwd().join(p))
     };
+    // Windows' canonicalize yields `\\?\`-prefixed verbatim paths; Node's
+    // realpath does not. Strip so directory strings agree between the
+    // instance store, the event publish locations and the SSE filters.
     match std::fs::canonicalize(&resolved) {
-        Ok(real) => real,
+        Ok(real) => alforria_core::filesystem::strip_verbatim(real),
         Err(_) => resolved,
     }
 }

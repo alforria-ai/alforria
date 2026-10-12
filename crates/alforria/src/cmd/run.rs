@@ -213,7 +213,10 @@ pub fn pick_model(value: Option<&str>) -> Option<(String, String)> {
 
 /// `FSUtil.resolve` (core/fs-util.ts:94-99) — realpath, lexical fallback.
 pub fn fs_resolve(path: PathBuf) -> PathBuf {
-    std::fs::canonicalize(&path).unwrap_or(path)
+    // Windows' canonicalize yields `\\?\`-prefixed verbatim paths; strip
+    // them (Node's realpath doesn't produce them) so the `?directory=`
+    // strings on the wire match the server's resolved instances.
+    alforria_core::filesystem::strip_verbatim(std::fs::canonicalize(&path).unwrap_or(path))
 }
 
 fn resolve_root() -> PathBuf {

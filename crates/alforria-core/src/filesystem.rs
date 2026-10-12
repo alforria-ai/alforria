@@ -1,10 +1,25 @@
 //! Ripgrep-backed fuzzy search — port of `core/src/filesystem/search.ts`
 //! (the ripgrep layer; the `#fff` native index is out of scope).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::fuzzysort;
 use crate::tool::ripgrep::{Ripgrep, RipgrepService};
+
+/// Strip the `\\?\` verbatim prefix Windows' `canonicalize` adds, so
+/// resolved paths match what Node's `fs.realpathSync` produces and what
+/// every directory string in the wire protocol expects. No-op elsewhere.
+pub fn strip_verbatim(path: PathBuf) -> PathBuf {
+    if let Some(text) = path.as_os_str().to_str() {
+        if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = text.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
+        }
+    }
+    path
+}
 
 /// The background walk state (`filesystem/search.ts:30-38`): every file the
 /// ripgrep `--files` walk yields plus the derived directory set.
