@@ -517,6 +517,13 @@ mod tests {
                     "--test-threads=1",
                 ])
                 .env(ALONE, "1")
+                // The isolated run must not inherit an ambient server
+                // password (e.g. a developer session inside `alforria
+                // serve` exports OPENCODE_SERVER_PASSWORD): the raw
+                // in-process request below carries no credentials, and the
+                // server would 401 it.
+                .env_remove("OPENCODE_SERVER_PASSWORD")
+                .env_remove("OPENCODE_SERVER_USERNAME")
                 .stdin(std::process::Stdio::null())
                 .status()
                 .expect("re-run the test alone");
