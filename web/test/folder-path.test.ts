@@ -1,5 +1,16 @@
 import { describe, expect, test } from "vitest"
-import { canonical, expand, inputFor, joinPath, matchFolders, parentOf, splitInput } from "../src/views/folder-path"
+import {
+  canonical,
+  expand,
+  folderNames,
+  inputFor,
+  joinPath,
+  listingBase,
+  matchFolders,
+  parentOf,
+  recentFolders,
+  splitInput,
+} from "../src/views/folder-path"
 
 const HOME = "/home/ada"
 
@@ -74,5 +85,45 @@ describe("matchFolders", () => {
   test("dot folders only when asked for", () => {
     expect(matchFolders(names, "co")).toEqual([])
     expect(matchFolders(names, ".")).toEqual([".config"])
+  })
+})
+
+describe("listing", () => {
+  test("anchors at home under it, at the root elsewhere", () => {
+    expect(listingBase(HOME, HOME)).toBe(HOME)
+    expect(listingBase("/home/ada/repos/x", HOME)).toBe(HOME)
+    expect(listingBase("/home/adam", HOME)).toBe("/")
+    expect(listingBase("/srv", HOME)).toBe("/")
+    expect(listingBase("/srv", "")).toBe("/")
+  })
+
+  test("takes folder names from base-relative entries", () => {
+    const entries = [
+      { path: "repos/alpha/", type: "directory" },
+      { path: "repos/notes.md", type: "file" },
+      { path: "repos/.git/", type: "directory" },
+      { path: "top/", type: "directory" },
+    ]
+    expect(folderNames(entries)).toEqual(["alpha", ".git", "top"])
+  })
+})
+
+describe("recentFolders", () => {
+  test("every folder once, newest use first, projects included, never '/'", () => {
+    const at = (updated: number) => ({ updated })
+    const dirs = recentFolders(
+      [
+        { directory: "/a", time: at(5) },
+        { directory: "/b", time: at(9) },
+        { directory: "/a", time: at(7) },
+        { directory: "/", time: at(10) },
+      ],
+      [
+        { worktree: "/", time: { created: 1, updated: 11 } },
+        { worktree: "/p", time: { created: 8 } },
+        { worktree: "/b", time: { created: 1, updated: 2 } },
+      ],
+    )
+    expect(dirs).toEqual(["/b", "/p", "/a"])
   })
 })

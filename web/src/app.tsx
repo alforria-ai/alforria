@@ -3,7 +3,7 @@
 // phone tab bar. All navigation state lives in nav/route.ts.
 import { createMemo, createSignal, Match, onCleanup, onMount, Show, Switch } from "solid-js"
 import { api } from "./api/client"
-import { counts, filter, filteredGroups, fleetState, interrupts, setFilter } from "./fleet/fleet"
+import { counts, filter, filteredGroups, fleetState, groups, interrupts, setFilter } from "./fleet/fleet"
 import { bindKeys } from "./nav/keys"
 import {
   closeColumn,
@@ -178,7 +178,7 @@ export function App() {
               <div class="pane-head ws-head">
                 <h2>Sessions</h2>
                 <span class="count">
-                  {counts().all} · {state.projectOrder.length} projects
+                  {counts().all} · {groups().length} projects
                 </span>
                 <div class="seg" role="group" aria-label="Filter sessions">
                   {(

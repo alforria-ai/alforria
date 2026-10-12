@@ -18,6 +18,7 @@ import {
 import { enqueue, setConn, setState, state, withSnapshot } from "../store/store"
 import type { ModelInfo } from "../store/state"
 import { dropCatalog } from "./catalog"
+import { eachSessionPage } from "./history"
 import { connectEvents } from "./stream"
 
 /** Directories a project's sessions live in: the worktree plus its sandboxes. */
@@ -53,12 +54,10 @@ async function snapshotDir(directory: string, sessions: Session[]): Promise<Proj
  */
 async function globalSessions(start: number) {
   const out: Session[] = []
-  for (let cursor: number | undefined; ;) {
-    const page = await api.allSessions({ start, cursor, limit: 200 })
-    for (const { project: _, ...s } of page.items) if (s.projectID === GLOBAL_PROJECT) out.push(s)
-    if (page.next === undefined) return out
-    cursor = page.next
-  }
+  await eachSessionPage({ start }, (items) => {
+    for (const { project: _, ...s } of items) if (s.projectID === GLOBAL_PROJECT) out.push(s)
+  })
+  return out
 }
 
 /**

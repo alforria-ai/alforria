@@ -231,6 +231,17 @@ export const api = {
       "/file",
       { directory, query: { path } },
     ),
+  /**
+   * A folder's direct children (v2), entries relative to `base`, folders
+   * ending in "/". Every call under one base is served by that base's
+   * instance: listing a git folder doesn't boot it or register a project.
+   */
+  listDir: async (base: string, path: string) =>
+    (
+      await request<{ data: { path: string; type: "file" | "directory" }[] }>("GET", "/api/fs/list", {
+        query: { "location[directory]": base, path },
+      })
+    ).data,
   readFile: (directory: string, path: string) =>
     request<{ type: "text" | "binary"; content: string; encoding?: "base64"; mimeType?: string }>(
       "GET",

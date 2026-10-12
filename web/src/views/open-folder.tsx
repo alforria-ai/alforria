@@ -3,40 +3,40 @@
 // folder left of the last slash is listed, the rest filters it. Enter steps
 // into the highlighted folder (or starts the session on "Start here"),
 // ⌘↵ starts one in whatever the input names.
-import { createEffect, createMemo, createSignal, For, on, Show } from "solid-js"
-import { api } from "../api/client"
-import { places } from "../fleet/fleet"
+//
+// Browsing has no side effects: folders are listed through the v2 file API
+// anchored at one base (the server's home, or "/"), never through a v1 call
+// per folder, which would boot an instance and register every git folder
+// stepped into as a project.
+import { createEffect, createMemo, createSignal, For, on, onCleanup, Show } from "solid-js"
+import { api, type GlobalSession } from "../api/client"
+import { projectName } from "../fleet/fleet"
+import { state } from "../store/store"
+import { eachSessionPage } from "../sync/history"
 import { basename, tildify } from "../ui/format"
 import { Icon } from "../ui/icons"
 import { DialogHead, dialogId, Modal } from "../ui/modal"
-import { expand, inputFor, joinPath, matchFolders, parentOf, splitInput } from "./folder-path"
+import {
+  expand,
+  folderNames,
+  inputFor,
+  joinPath,
+  listingBase,
+  matchFolders,
+  parentOf,
+  recentFolders,
+  splitInput,
+} from "./folder-path"
 import { server } from "./server"
 
 type Row =
   | { kind: "recent"; path: string; name: string }
-  | { kind: "here"; path: string }
+  /** `pending` until the folder's listing lands (Enter then waits for it). */
+  | { kind: "here"; path: string; pending?: boolean }
   | { kind: "up"; path: string }
   | { kind: "folder"; path: string; name: string }
 
 type Listing = { dir: string; names?: string[]; missing?: boolean }
-
-/** Subfolder names per folder, for the life of the page; null when it can't be read. */
-const listings = new Map<string, Promise<string[] | null>>()
-function listFolders(dir: string) {
-  let p = listings.get(dir)
-  if (!p) {
-    p = api
-      .listFiles(dir, "")
-      .then((nodes) => nodes.filter((n) => n.type === "directory").map((n) => n.name))
-      .catch(() => null)
-    listings.set(dir, p)
-    // A failed read may be a folder that doesn't exist yet: try again next time.
-    void p.then((names) => {
-      if (!names) listings.delete(dir)
-    })
-  }
-  return p
-}
 
 const RECENT_MAX = 6
 
@@ -50,6 +50,43 @@ export function OpenFolder(props: { onStart: (directory: string) => Promise<void
   const [listing, setListing] = createSignal<Listing>({ dir: "" })
   const [busy, setBusy] = createSignal(false)
   const [error, setError] = createSignal("")
+  // Once the user steps into a folder, the listing leads, not Recent.
+  const [navigated, setNavigated] = createSignal(false)
+
+  /** Subfolder names per folder while the dialog is open; null when it can't be read. */
+  const listings = new Map<string, Promise<string[] | null>>()
+  const listFolders = (dir: string) => {
+    let p = listings.get(dir)
+    if (!p) {
+      p = api
+        .listDir(listingBase(dir, home()), dir)
+        .then(folderNames)
+        .catch(() => null)
+      listings.set(dir, p)
+      // A failed read may be a folder that doesn't exist yet: try again next time.
+      void p.then((names) => {
+        if (!names) listings.delete(dir)
+      })
+    }
+    return p
+  }
+
+  // Recent: every folder ever used, not just the fleet's window. The fleet's
+  // sessions and the projects show at once; older pages fill in behind.
+  const [history, setHistory] = createSignal<GlobalSession[]>([])
+  let open = true
+  onCleanup(() => (open = false))
+  void eachSessionPage({}, (items) => {
+    if (!open) return false
+    setHistory((h) => [...h, ...items])
+  }).catch(() => undefined)
+  const recentDirs = createMemo(() =>
+    recentFolders([...Object.values(state.sessions), ...history()], Object.values(state.projects)),
+  )
+  const nameOf = (dir: string) => {
+    const p = Object.values(state.projects).find((p) => p.worktree === dir)
+    return p ? projectName(p) : basename(dir)
+  }
 
   const parts = createMemo(() => splitInput(q(), home()))
   const show = (path: string) => tildify(path, home())
@@ -85,21 +122,26 @@ export function OpenFolder(props: { onStart: (directory: string) => Promise<void
   const rows = createMemo<{ group: string; rows: Row[] }[]>(() => {
     const { dir, tail } = parts()
     const out: { group: string; rows: Row[] }[] = []
-    if (dir === expand("~", home())) {
-      const word = tail.toLowerCase()
-      const recent = places()
-        .filter((p) => !word || p.name.toLowerCase().includes(word))
-        .slice(0, RECENT_MAX)
-        .map((p): Row => ({ kind: "recent", path: p.directory, name: p.name }))
-      if (recent.length) out.push({ group: "Recent", rows: recent })
-    }
     const l = listing()
+    const listed = l.dir === dir
     const here: Row[] = []
-    if (!tail && l.names && l.dir === dir) here.push({ kind: "here", path: dir })
+    // "Start here" shows before the listing lands, so Enter right after
+    // stepping in starts here rather than whatever row was first.
+    if (!tail && !(listed && l.missing)) here.push({ kind: "here", path: dir, pending: !(listed && l.names) })
     if (!tail && dir !== "/") here.push({ kind: "up", path: parentOf(dir) })
     const folders = matches().map((name): Row => ({ kind: "folder", path: joinPath(dir, name), name }))
     if (here.length || folders.length)
       out.push({ group: `In ${dir === expand("~", home()) ? "~" : basename(dir) || "/"}`, rows: [...here, ...folders] })
+    if (dir === expand("~", home())) {
+      const word = tail.toLowerCase()
+      const recent = recentDirs()
+        .filter((d) => !word || d.toLowerCase().includes(word))
+        .slice(0, RECENT_MAX)
+        .map((d): Row => ({ kind: "recent", path: d, name: nameOf(d) }))
+      // Recent leads when the dialog opens; once the user has stepped into a
+      // folder, the listing does.
+      if (recent.length) out[navigated() ? "push" : "unshift"]({ group: "Recent", rows: recent })
+    }
     return out
   })
   const flat = createMemo(() => rows().flatMap((g) => g.rows))
@@ -107,6 +149,7 @@ export function OpenFolder(props: { onStart: (directory: string) => Promise<void
   createEffect(() => setSel((v) => Math.min(v, Math.max(0, flat().length - 1))))
 
   const go = (path: string) => {
+    setNavigated(true)
     setQ(inputFor(path, home()))
     setSel(0)
     setError("")
@@ -127,9 +170,16 @@ export function OpenFolder(props: { onStart: (directory: string) => Promise<void
     }
   }
 
+  /** Start in a folder whose listing may still be on its way. */
+  const startListed = async (path: string) => {
+    if (await listFolders(path)) return start(path)
+    setError(`No folder at ${show(path)}`)
+  }
+
   const act = (row: Row | undefined) => {
     if (!row) return void start(target())
-    if (row.kind === "here" || row.kind === "recent") return void start(row.path)
+    if (row.kind === "here") return void (row.pending ? startListed(row.path) : start(row.path))
+    if (row.kind === "recent") return void start(row.path)
     go(row.path)
   }
 
@@ -166,7 +216,7 @@ export function OpenFolder(props: { onStart: (directory: string) => Promise<void
 
   const status = () => {
     const l = listing()
-    if (l.dir !== parts().dir) return `Reading ${show(parts().dir)}…`
+    if (l.dir !== parts().dir || (!l.names && !l.missing)) return `Reading ${show(parts().dir)}…`
     if (l.missing) return `Can't open ${show(parts().dir)}: no such folder, or it can't be read.`
     if (!flat().length) return `No folder matching “${parts().tail}” in ${show(parts().dir)}.`
     return ""

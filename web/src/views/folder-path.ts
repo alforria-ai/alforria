@@ -59,3 +59,37 @@ export function matchFolders(names: readonly string[], tail: string) {
   const contains = shown.filter((n) => !n.toLowerCase().startsWith(q) && n.toLowerCase().includes(q)).sort(byName)
   return [...starts, ...contains]
 }
+
+/**
+ * Where a listing of `path` is anchored: the server's home for anything under
+ * it, else the root. The server lists only inside its base, and one base
+ * means one instance for every folder browsed.
+ */
+export function listingBase(path: string, home: string) {
+  return home && home !== "/" && (path === home || path.startsWith(`${home}/`)) ? home : "/"
+}
+
+/** Subfolder names from a `GET /api/fs/list` answer (paths relative to the base, folders ending in "/"). */
+export function folderNames(entries: readonly { path: string; type: string }[]) {
+  return entries
+    .filter((e) => e.type === "directory")
+    .map((e) => e.path.replace(/\/+$/, "").split("/").pop() ?? "")
+    .filter(Boolean)
+}
+
+/**
+ * Every folder a session ran in, plus every project's worktree, most recently
+ * used first, once each. "/" (the non-git project's worktree) is no place.
+ */
+export function recentFolders(
+  sessions: readonly { directory: string; time: { updated: number } }[],
+  projects: readonly { worktree: string; time: { updated?: number; created: number } }[],
+) {
+  const last = new Map<string, number>()
+  const see = (dir: string, at: number) => {
+    if (dir && dir !== "/" && at > (last.get(dir) ?? -1)) last.set(dir, at)
+  }
+  for (const s of sessions) see(s.directory, s.time.updated)
+  for (const p of projects) see(p.worktree, p.time.updated ?? p.time.created)
+  return [...last.entries()].sort((a, b) => b[1] - a[1]).map(([dir]) => dir)
+}
