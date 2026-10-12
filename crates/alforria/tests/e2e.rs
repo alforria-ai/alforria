@@ -152,11 +152,21 @@ fn run_missing_file_exits_one() {
 // serve: handshake + attach
 // -----------------------------------------------------------------------
 
-#[test]
-fn serve_prints_warning_and_handshake() {
-    let env = env_with_llm("serve", "x");
-    let mut child = env
-        .command(&["serve", "--port", "0"])
+/// Spawn `serve --port 0` with `password` as `OPENCODE_SERVER_PASSWORD`
+/// (`None`: unset) and collect stdout until `after_handshake` lines arrived
+/// after the handshake. Returns the child, the stdout lines and whether
+/// stderr stayed empty. The caller kills and waits on the child.
+#[allow(clippy::zombie_processes)]
+fn spawn_serve(
+    env: &Env,
+    password: Option<&str>,
+    after_handshake: usize,
+) -> (std::process::Child, Vec<String>, bool) {
+    let mut command = env.command(&["serve", "--port", "0"]);
+    if let Some(password) = password {
+        command.env("OPENCODE_SERVER_PASSWORD", password);
+    }
+    let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -171,7 +181,7 @@ fn serve_prints_warning_and_handshake() {
             collected.lock().unwrap().push(line);
         }
     });
-    let err_lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let err_lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let collected = err_lines.clone();
     std::thread::spawn(move || {
         for line in BufReader::new(stderr).lines() {
@@ -181,27 +191,78 @@ fn serve_prints_warning_and_handshake() {
     });
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        let ready = lines
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|line| line.starts_with("alforria server listening on "));
-        if ready {
+        {
             let lines = lines.lock().unwrap();
-            assert!(
-                lines[0].starts_with("Warning: OPENCODE_SERVER_PASSWORD is not set"),
-                "first line: {lines:?}"
-            );
-            assert!(
-                lines[1].starts_with("alforria server listening on http://"),
-                "second line: {lines:?}"
-            );
-            assert!(err_lines.lock().unwrap().is_empty());
-            break;
+            let handshake = lines
+                .iter()
+                .position(|line| line.starts_with("alforria server listening on "));
+            if let Some(index) = handshake {
+                if lines.len() > index + after_handshake {
+                    let quiet = err_lines.lock().unwrap().is_empty();
+                    return (child, lines.clone(), quiet);
+                }
+            }
         }
         assert!(Instant::now() < deadline, "serve handshake timed out");
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// With `OPENCODE_SERVER_PASSWORD` set but empty (the explicit opt-out),
+/// serve keeps the TS warning and runs unsecured.
+#[test]
+fn serve_prints_warning_and_handshake() {
+    let env = env_with_llm("serve", "x");
+    let (mut child, lines, quiet) = spawn_serve(&env, Some(""), 0);
+    assert!(
+        lines[0].starts_with("Warning: OPENCODE_SERVER_PASSWORD is not set"),
+        "first line: {lines:?}"
+    );
+    assert!(
+        lines[1].starts_with("alforria server listening on http://"),
+        "second line: {lines:?}"
+    );
+    assert!(quiet);
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Without `OPENCODE_SERVER_PASSWORD`, serve generates a password, prints
+/// it, and refuses requests that don't carry it.
+#[test]
+fn serve_generates_and_requires_a_password() {
+    let env = env_with_llm("serve-password", "x");
+    let (mut child, lines, quiet) = spawn_serve(&env, None, 2);
+    assert!(quiet);
+    assert!(
+        lines[0].starts_with("alforria server listening on http://"),
+        "{lines:?}"
+    );
+    assert_eq!(lines[1], "  username: alforria", "{lines:?}");
+    let password = lines[2]
+        .strip_prefix("  password: ")
+        .unwrap_or_else(|| panic!("{lines:?}"))
+        .to_string();
+    assert_eq!(password.len(), 32);
+    let url = lines[0]
+        .strip_prefix("alforria server listening on ")
+        .unwrap()
+        .to_string();
+
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let statuses = runtime.block_on(async {
+        let client = reqwest::Client::new();
+        let mut statuses = Vec::new();
+        for credential in [None, Some("nope"), Some(password.as_str())] {
+            let mut request = client.get(format!("{url}/path"));
+            if let Some(credential) = credential {
+                request = request.basic_auth("alforria", Some(credential));
+            }
+            statuses.push(request.send().await.unwrap().status().as_u16());
+        }
+        statuses
+    });
+    assert_eq!(statuses, [401, 401, 200]);
     let _ = child.kill();
     let _ = child.wait();
 }

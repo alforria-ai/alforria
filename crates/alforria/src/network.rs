@@ -86,6 +86,7 @@ impl ResolvedNetworkOptions {
             } else {
                 Vec::new()
             },
+            password: None,
         }
     }
 }

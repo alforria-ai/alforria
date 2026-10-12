@@ -5,6 +5,12 @@ import solid from "vite-plugin-solid"
 // isolated one with a scripted model and prints its URL; point at it with
 // ALFORRIA_URL (default: the dev harness's fixed port).
 const target = process.env.ALFORRIA_URL ?? "http://127.0.0.1:4697"
+// `alforria serve` wants a password; the dev harness uses a fixed one
+// (script/lib/alforria.ts). Against another serve, pass the one it printed
+// in ALFORRIA_PASSWORD (and ALFORRIA_USERNAME if it isn't "alforria").
+const username = process.env.ALFORRIA_USERNAME ?? "alforria"
+const password = process.env.ALFORRIA_PASSWORD ?? "alforria-dev"
+const authorization = `Basic ${Buffer.from(`${username}:${password}`).toString("base64")}`
 const api = [
   "/global",
   "/event",
@@ -37,7 +43,7 @@ const api = [
 // Host header) present the target's origin instead. Anything else keeps its
 // real Origin, so a foreign site can't use this proxy to get past the check.
 type Req = { headers: Record<string, string | string[] | undefined> }
-type ProxyReq = { setHeader(k: string, v: string): void }
+type ProxyReq = { setHeader(k: string, v: string): void; getHeader(k: string): unknown }
 const fromOwnPage = (req: Req) => {
   const origin = req.headers.origin
   const host = req.headers.host
@@ -58,6 +64,8 @@ const proxy = Object.fromEntries(
       configure: (server: { on(event: string, cb: (proxyReq: ProxyReq, req: Req) => void): void }) => {
         const rewrite = (proxyReq: ProxyReq, req: Req) => {
           if (fromOwnPage(req)) proxyReq.setHeader("origin", target)
+          // Present the server's credentials so the browser never prompts.
+          if (!proxyReq.getHeader("authorization")) proxyReq.setHeader("authorization", authorization)
         }
         server.on("proxyReq", rewrite)
         server.on("proxyReqWs", rewrite)

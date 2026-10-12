@@ -52,6 +52,12 @@ impl AuthConfig {
         }
     }
 
+    /// A fresh random password (122 random bits, 32 hex chars) for a
+    /// `serve` started without `OPENCODE_SERVER_PASSWORD`.
+    pub fn generate_password() -> String {
+        uuid::Uuid::new_v4().simple().to_string()
+    }
+
     /// Auth is enforced only when the password is present *and* non-empty
     /// (`auth.ts:24-26`).
     pub fn required(&self) -> bool {

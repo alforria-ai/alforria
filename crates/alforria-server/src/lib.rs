@@ -42,6 +42,8 @@ pub struct ListenOptions {
     /// Extra `Host` names the server answers to besides loopback, the bound
     /// hostname and the `--cors` hosts (the mDNS name).
     pub hosts: Vec<String>,
+    /// Overrides `OPENCODE_SERVER_PASSWORD` (a password `serve` generated).
+    pub password: Option<String>,
 }
 
 impl Default for ListenOptions {
@@ -51,6 +53,7 @@ impl Default for ListenOptions {
             hostname: DEFAULT_HOSTNAME.to_string(),
             cors: Vec::new(),
             hosts: Vec::new(),
+            password: None,
         }
     }
 }
@@ -179,8 +182,12 @@ pub fn production_context(
         runtime.clone(),
         seams,
     );
+    let mut auth = AuthConfig::from_env();
+    if let Some(password) = &opts.password {
+        auth.password = Some(password.clone());
+    }
     let mut ctx = ServerContext::new(
-        AuthConfig::from_env(),
+        auth,
         instances,
         storage,
         bus,

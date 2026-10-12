@@ -15,6 +15,8 @@ import { join } from "node:path"
 import {
   Api,
   DEV,
+  DEV_PASSWORD,
+  DEV_USERNAME,
   EventStream,
   MODEL_REF,
   ensureBinary,
@@ -183,6 +185,7 @@ async function report(items: Seeded[]) {
     }
   }
   console.log(`\nalforria dev server: ${urls.join("  ")}`)
+  console.log(`sign in as:          ${DEV_USERNAME} / ${DEV_PASSWORD}`)
   console.log(`scripted backend:    ${backend.url}`)
   console.log(`libertai stand-in:   ${libertai.url}`)
   console.log(`state:               ${DEV} (log: ${join(STATE, "server.log")})\n`)

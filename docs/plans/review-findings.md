@@ -789,3 +789,10 @@ Deliberate deviations from the pinned TS server:
   `?ticket=` on `…/pty/:id/connect` past auth and validates in the handler;
   here the ticket must be live and issued for that PTY before the request
   passes auth (the handler still consumes it against the full scope).
+- **`alforria serve` has a password by default** (S2b). With
+  `OPENCODE_SERVER_PASSWORD` unset it generates a random one and prints the
+  username and password after the handshake line; TS only warns. Set but
+  empty is the explicit opt-out (TS's warning, no auth), which the e2e and
+  parity harnesses use. `attach --password` / `run --attach` take it as
+  before; `bun run server` and the web e2e use a fixed dev password that the
+  vite proxy presents.

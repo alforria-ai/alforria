@@ -7,6 +7,7 @@ import { chromium, type Page } from "playwright"
 import { join } from "node:path"
 import { mkdtempSync, readFileSync } from "node:fs"
 import { tmpdir } from "node:os"
+import { DEV_AUTH, DEV_PASSWORD, DEV_USERNAME } from "../../script/lib/alforria"
 
 const WEB = join(import.meta.dir, "../..")
 const API_PORT = Number(process.env.E2E_API_PORT ?? 4797)
@@ -15,6 +16,10 @@ const UI_PORT = Number(process.env.E2E_UI_PORT ?? 4711)
 // pack` + `cargo build -p alforria`): real CSP, real SPA fallback, no proxy.
 const EMBEDDED = process.env.E2E_EMBEDDED === "1"
 const UI = EMBEDDED ? `http://127.0.0.1:${API_PORT}` : `http://127.0.0.1:${UI_PORT}`
+// The server wants the dev password; vite preview's proxy injects it, the
+// embedded UI gets it the way a browser does after the Basic-auth prompt.
+const credentials = EMBEDDED ? { httpCredentials: { username: DEV_USERNAME, password: DEV_PASSWORD } } : {}
+const authed = { headers: { authorization: DEV_AUTH } }
 
 let pass = 0
 let fail = 0
@@ -33,7 +38,7 @@ async function waitFor(url: string, ms = 60_000) {
   const end = Date.now() + ms
   while (Date.now() < end) {
     try {
-      if ((await fetch(url)).ok) return
+      if ((await fetch(url, authed)).ok) return
     } catch {
       /* not up yet */
     }
@@ -106,13 +111,16 @@ try {
   {
     // bypassCSP only lets the test inject axe-core; the CSP header itself is
     // asserted separately in embedded mode.
-    const p = await (await browser.newContext({ viewport: { width: 1440, height: 900 }, bypassCSP: true })).newPage()
+    const p = await (
+      await browser.newContext({ viewport: { width: 1440, height: 900 }, bypassCSP: true, ...credentials })
+    ).newPage()
     watch(p, "desktop")
     const res = await p.goto(`${UI}/#/`)
     if (EMBEDDED) {
       const csp = res?.headers()["content-security-policy"] ?? ""
       check(/script-src 'self' 'wasm-unsafe-eval' 'sha256-/.test(csp), "embedded: CSP hashes the theme-preload script")
-      const deep = await fetch(`${UI}/some/deep/link`)
+      check((await fetch(`${UI}/global/health`)).status === 401, "embedded: the server wants the password")
+      const deep = await fetch(`${UI}/some/deep/link`, authed)
       check(deep.ok && (await deep.text()).includes('id="root"'), "embedded: unknown paths fall back to index.html")
     }
     await p.locator("tr.s-row").first().waitFor()
@@ -315,7 +323,12 @@ try {
 
   console.log("phone")
   {
-    const ctx = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true })
+    const ctx = await browser.newContext({
+      viewport: { width: 390, height: 844 },
+      isMobile: true,
+      hasTouch: true,
+      ...credentials,
+    })
     const p = await ctx.newPage()
     watch(p, "phone")
     const shown = () =>

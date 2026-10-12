@@ -15,6 +15,13 @@ export const REPO = resolve(WEB, "..")
 export const DEV = process.env.ALFORRIA_DEV_DIR ?? join(WEB, ".dev")
 export const BIN = join(REPO, "target/debug/alforria")
 
+// `alforria serve` requires a password (it generates one when none is set).
+// The harness uses a fixed one so `bun run dev`'s proxy (vite.config.ts) and
+// the e2e browser can present it; a LAN browser gets the Basic-auth prompt.
+export const DEV_USERNAME = "alforria"
+export const DEV_PASSWORD = "alforria-dev"
+export const DEV_AUTH = `Basic ${btoa(`${DEV_USERNAME}:${DEV_PASSWORD}`)}`
+
 export const PROVIDER = "mock"
 export const MODEL = "mock-model"
 export const MODEL_REF = { providerID: PROVIDER, modelID: MODEL }
@@ -145,7 +152,7 @@ export async function spawnServe(opts: {
   const fd = openSync(opts.log, "w")
   const proc = Bun.spawn([BIN, "serve", "--hostname", opts.hostname, "--port", String(opts.port)], {
     cwd: opts.cwd,
-    env: opts.env,
+    env: { ...opts.env, OPENCODE_SERVER_USERNAME: DEV_USERNAME, OPENCODE_SERVER_PASSWORD: DEV_PASSWORD },
     stdout: "pipe",
     stderr: fd,
   })
@@ -204,7 +211,7 @@ export class Api {
 
   async request(method: string, path: string, body?: unknown): Promise<unknown> {
     const url = new URL(path, this.base)
-    const headers: Record<string, string> = { "content-type": "application/json" }
+    const headers: Record<string, string> = { "content-type": "application/json", authorization: DEV_AUTH }
     if (this.directory) {
       if (method === "GET") url.searchParams.set("directory", this.directory)
       else headers["x-opencode-directory"] = encodeURIComponent(this.directory)
@@ -242,7 +249,10 @@ export class EventStream {
 
   static async open(base: string): Promise<EventStream> {
     const stream = new EventStream()
-    const response = await fetch(new URL("/global/event", base), { signal: stream.abort.signal })
+    const response = await fetch(new URL("/global/event", base), {
+      headers: { authorization: DEV_AUTH },
+      signal: stream.abort.signal,
+    })
     if (!response.ok || !response.body) throw new Error(`/global/event: ${response.status}`)
     const connected = stream.next((frame) => frame.payload.type === "server.connected", 10_000)
     stream.pump(response.body)

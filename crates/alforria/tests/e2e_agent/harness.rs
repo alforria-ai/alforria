@@ -220,8 +220,11 @@ impl Serve {
     // through the struct handle.
     #[allow(clippy::zombie_processes)]
     pub fn spawn(env: &Env) -> Serve {
+        // An empty password is the explicit opt-out of the generated one:
+        // the harness clients (and the TS parity side) talk without auth.
         let mut child = env
             .command(&["serve", "--port", "0"])
+            .env("OPENCODE_SERVER_PASSWORD", "")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
