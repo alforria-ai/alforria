@@ -101,6 +101,9 @@ fn prompt_info_from_parts(
 }
 
 async fn run_inner(input: TuiInput) -> Result<Exit> {
+    // The `system` theme's palette: ask the terminal (OSC 10/11/4) before
+    // anything else reads stdin, so the startup theme mode sees it.
+    ui::theme::probe::probe_and_install(Duration::from_millis(100));
     let _guard = TerminalGuard::enter(input.config.mouse)?;
 
     let http_config = HttpClientConfig {
@@ -1149,6 +1152,14 @@ fn spawn_signals(messages: tokio::sync::mpsc::UnboundedSender<Msg>) {
         tokio::spawn(async move {
             sighup.recv().await;
             let _ = messages.send(Msg::Hangup);
+        });
+    }
+    // SIGUSR2 reloads the custom themes, as in TS.
+    if let Ok(mut sigusr2) = signal(SignalKind::user_defined2()) {
+        tokio::spawn(async move {
+            while sigusr2.recv().await.is_some() {
+                ui::theme::registry::refresh_custom_themes();
+            }
         });
     }
     if let Ok(mut sigterm) = signal(SignalKind::terminate()) {
