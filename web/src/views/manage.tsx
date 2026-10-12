@@ -209,8 +209,8 @@ async function loadArchived(): Promise<Session[]> {
   let cursor: number | undefined
   // The list mixes live and archived sessions; walk a few pages for these.
   for (let page = 0; page < 5; page++) {
-    const { sessions, next } = await api.sessionsAcrossProjects({ archived: true, roots: true, cursor, limit: 200 })
-    out.push(...sessions.filter((s) => s.time.archived))
+    const { items, next } = await api.allSessions({ archived: true, roots: true, cursor, limit: 200 })
+    out.push(...items.filter((s) => s.time.archived))
     if (!next) break
     cursor = next
   }

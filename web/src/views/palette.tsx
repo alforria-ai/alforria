@@ -8,9 +8,11 @@ import { closeOtherColumns, nav, openSettings } from "../nav/route"
 import { state } from "../store/store"
 import { Icon } from "../ui/icons"
 import { DialogHead, dialogId, Modal } from "../ui/modal"
-import { tildify } from "../ui/format"
+import { age, tildify } from "../ui/format"
 import { theme, toggleTheme } from "../ui/theme"
 import { server } from "./server"
+import { searchSessions } from "../sync/history"
+import type { GlobalSession } from "../api/client"
 
 export interface PaletteActions {
   openSession(id: string): void
@@ -26,6 +28,8 @@ export interface PaletteActions {
 }
 
 interface Item {
+  /** A session's id, for session results. */
+  id?: string
   group: string
   label: string
   meta: string
@@ -76,6 +80,27 @@ export function Palette(props: { initial?: string; actions: PaletteActions }) {
   })
   onCleanup(() => clearTimeout(timer))
 
+  // "All sessions": titles matching the query however old, beyond the fleet's
+  // history window. Same rule: only the latest query's answer lands.
+  const [older, setOlder] = createSignal<GlobalSession[]>([])
+  let olderTimer: ReturnType<typeof setTimeout> | undefined
+  let olderAsked = 0
+  createEffect(() => {
+    const query = q().trim()
+    const ask = ++olderAsked
+    clearTimeout(olderTimer)
+    if (query.length < 2) return setOlder([])
+    const land = (list: GlobalSession[]) => ask === olderAsked && setOlder(list)
+    olderTimer = setTimeout(
+      () =>
+        searchSessions(query, 20)
+          .then(land)
+          .catch(() => land([])),
+      200,
+    )
+  })
+  onCleanup(() => clearTimeout(olderTimer))
+
   const items = createMemo<Item[]>(() => {
     const query = q().toLowerCase().trim()
     const out: Item[] = []
@@ -86,6 +111,7 @@ export function Palette(props: { initial?: string; actions: PaletteActions }) {
       const name = placeOf(s).name
       if (query && !matches(query, `${s.title} ${name}`.toLowerCase())) continue
       out.push({
+        id: s.id,
         group: "Sessions",
         label: displayTitle(s),
         meta: `${name} · ${fleetState(state, s.id)}`,
@@ -140,6 +166,17 @@ export function Palette(props: { initial?: string; actions: PaletteActions }) {
     ]
     for (const c of commands)
       if (!query || matches(query, c.label.toLowerCase())) out.push({ group: "Commands", icon: "chev-right", ...c })
+    const listed = new Set(out.filter((i) => i.group === "Sessions").map((i) => i.id))
+    for (const s of older()) {
+      if (listed.has(s.id) || s.time.archived) continue
+      out.push({
+        group: "All sessions",
+        label: displayTitle(s),
+        meta: `${s.project?.name || placeOf(s).name} · ${age(Date.now() - s.time.updated)} ago`,
+        icon: "chev-right",
+        run: () => props.actions.openSession(s.id),
+      })
+    }
     const sid = activeSession() ?? Object.values(state.sessions).find((s) => s.directory === fileDir())?.id
     for (const f of files())
       out.push({
@@ -280,6 +317,15 @@ const GROUPS: [string, [string[], string][]][] = [
     ],
   ],
   [
+    "Composer",
+    [
+      [["⌥", "↵"], "Queue a follow-up while the session works"],
+      [["↑", "↓"], "Prompt history, in an empty composer"],
+      [["!"], "Run a shell command (first character)"],
+      [["⇧", "⌘", "D"], "Cycle the model's reasoning variant"],
+    ],
+  ],
+  [
     "Queue",
     [
       [["A"], "Allow once / continue"],
@@ -307,6 +353,7 @@ const GROUPS: [string, [string[], string][]][] = [
       [["W"], "Open the oldest waiting session"],
       [["[", "]"], "Previous / next column"],
       [["I"], "Write in the active column"],
+      [["⌘", "⌥", "[", "]"], "Previous / next message in the active column"],
     ],
   ],
 ]

@@ -167,7 +167,16 @@ export const api = {
    * the cursor for the following page, absent on the last. No directory, so
    * it boots no instance.
    */
-  allSessions: async (query: { start?: number; cursor?: number; limit?: number; search?: string } = {}) => {
+  allSessions: async (
+    query: {
+      start?: number
+      cursor?: number
+      limit?: number
+      search?: string
+      archived?: boolean
+      roots?: boolean
+    } = {},
+  ) => {
     const { body, headers } = await send<GlobalSession[]>("GET", "/experimental/session", { query })
     const next = headers.get("x-next-cursor")
     return { items: body, next: next ? Number(next) : undefined }
@@ -191,13 +200,6 @@ export const api = {
   /** Force-removes the worktree and deletes its branch. */
   removeWorktree: (directory: string, worktree: string) =>
     request<boolean>("DELETE", "/experimental/worktree", { directory, body: { directory: worktree } }),
-  /** Sessions across every project, newest first; `next` is the cursor for the page after. */
-  sessionsAcrossProjects: async (query: { archived?: boolean; roots?: boolean; cursor?: number; limit?: number }) => {
-    const res = await fetch(apiUrl("/experimental/session", query), { credentials: "same-origin" })
-    if (!res.ok) throw new ApiError(res.status, undefined, `GET /experimental/session → ${res.status}`)
-    const next = Number(res.headers.get("x-next-cursor")) || undefined
-    return { sessions: (await res.json()) as Session[], next }
-  },
   messages: (id: string, opts: { limit?: number; before?: string } = {}) =>
     request<MessageWithParts[]>("GET", `/session/${id}/message`, { query: opts }),
   /** The newest `limit` messages before `before` (oldest first); `next` reads the page before, absent at the start. */

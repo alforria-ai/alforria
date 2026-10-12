@@ -451,7 +451,7 @@ try {
     await m.locator(".col").waitFor()
     await m.waitForTimeout(600)
     await targets("focus")
-    for (const page of ["providers", "permissions", "appearance"]) {
+    for (const page of ["providers", "permissions", "appearance", "mcp"]) {
       await m.goto(`${UI}/#/settings/${page}`)
       await m.waitForTimeout(800)
       await targets(`settings ${page}`)

@@ -2048,8 +2048,8 @@ button.tool-row:hover {
   color: var(--del-mark);
 }
 /* Line numbers on a tinted row: ink-3 falls under 4.5:1 there. */
-.diff .ln.add > span:first-child,
-.diff .ln.del > span:first-child {
+.diff .ln.add > :first-child,
+.diff .ln.del > :first-child {
   color: var(--ink-2);
 }
 .slip .diff {

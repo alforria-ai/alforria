@@ -11,6 +11,8 @@ import { canNotify, enableNotifications, notifyOn } from "../platform"
 import { server } from "./server"
 import { ConnectDialog, type ConnectTarget } from "./connect"
 import { loadModels } from "../sync/sync"
+import { loadCatalog, useCatalog } from "../sync/catalog"
+import { anyDirectory } from "../fleet/fleet"
 import { hm } from "../ui/format"
 import { toast } from "./toast"
 
@@ -23,9 +25,6 @@ const PAGES = [
   ["appearance", "Appearance"],
   ["server", "Server"],
 ] as const
-
-/** Any project directory; catalog endpoints are instance-scoped. */
-const anyDir = () => state.projects[state.projectOrder[0] ?? ""]?.worktree
 
 const SAVE_NOTE = "Saving reloads every project on this server; a session mid-turn may be interrupted."
 
@@ -90,8 +89,10 @@ export function Settings() {
 }
 
 function Providers() {
-  const [catalog, { refetch }] = createResource(() => api.providerCatalog(anyDir()))
-  const [methods] = createResource(() => api.authMethods(anyDir()).catch(() => ({}) as Record<string, AuthMethod[]>))
+  const [catalog, { refetch }] = createResource(() => api.providerCatalog(anyDirectory()))
+  const [methods] = createResource(() =>
+    api.authMethods(anyDirectory()).catch(() => ({}) as Record<string, AuthMethod[]>),
+  )
   const [connecting, setConnecting] = createSignal<ConnectTarget | null>(null)
   // Success shows in place: the row's state flips to Connected, and this
   // announces it.
@@ -185,7 +186,7 @@ function Providers() {
           <ConnectDialog
             provider={target()}
             methods={methods()?.[target().id] ?? []}
-            directory={anyDir()}
+            directory={anyDirectory()}
             onClose={() => setConnecting(null)}
             onConnected={() => {
               setSaid(`${target().name} connected`)
@@ -271,7 +272,7 @@ function Models() {
 }
 
 function Agents() {
-  const [agents] = createResource(() => api.agents(anyDir()))
+  const [agents] = createResource(() => api.agents(anyDirectory()))
   return (
     <>
       <h3>Agents</h3>
@@ -296,11 +297,14 @@ function Agents() {
 }
 
 function Mcp() {
-  const [status, { refetch }] = createResource(() => api.mcpStatus(anyDir()))
+  // The status lives in the directory's catalog (sync/catalog.ts), shared with the rest of the app.
+  useCatalog(anyDirectory)
+  const status = () => state.catalogs[anyDirectory() ?? ""]?.mcp
   const toggle = async (name: string, connected: boolean) => {
+    const dir = anyDirectory()
     try {
-      await (connected ? api.mcpDisconnect(name, anyDir()) : api.mcpConnect(name, anyDir()))
-      void refetch()
+      await (connected ? api.mcpDisconnect(name, dir) : api.mcpConnect(name, dir))
+      if (dir) void loadCatalog(dir, ["mcp"])
     } catch (err) {
       toast(`MCP ${name}: ${err instanceof Error ? err.message : err}`, "error")
     }
@@ -342,7 +346,7 @@ function Permissions() {
   const { config, patch, saved } = useGlobalConfig()
   // What applies today when the global config says nothing: the default
   // agent's resolved ruleset (built-ins + project config), last match wins.
-  const [agents] = createResource(() => api.agents(anyDir()))
+  const [agents] = createResource(() => api.agents(anyDirectory()))
   const effective = (tool: string): Action | undefined => {
     const agent = (agents() ?? []).find((a) => a.name === "build") ?? agents()?.[0]
     let action: Action | undefined
