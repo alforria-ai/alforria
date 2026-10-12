@@ -76,6 +76,11 @@ pub enum MoveSessionError {
 /// `path.relative(from, to)` with `/` separators — empty when equal
 /// (`git.ts:737`, `move-session.ts:109`).
 fn relative_scope(from: &Path, to: &Path) -> String {
+    // Windows verbatim (`\\?\`) prefixes parse as different `Component`s
+    // than plain drive paths, so the common-prefix walk would start at
+    // zero and return the full `to` path. Strip both sides first.
+    let from = crate::filesystem::strip_verbatim(from.to_path_buf());
+    let to = crate::filesystem::strip_verbatim(to.to_path_buf());
     let skip = |c: &std::path::Component<'_>| !matches!(c, std::path::Component::CurDir);
     let from: Vec<_> = from.components().filter(skip).collect();
     let to: Vec<_> = to.components().filter(skip).collect();

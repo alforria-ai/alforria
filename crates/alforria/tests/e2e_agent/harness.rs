@@ -86,9 +86,13 @@ impl Env {
         let project = self.home.join("project");
         // macOS resolves TMPDIR through a symlink (/var/folders ->
         // /private/var/folders): canonicalize so the `?directory=` the
-        // client sends matches the cwd the spawned server reports.
+        // client sends matches the cwd the spawned server reports. On
+        // Windows the verbatim `\\?\` prefix is stripped to match the
+        // resolved directories the engine reports.
         if project.exists() {
-            std::fs::canonicalize(&project).expect("canonicalize project dir")
+            alforria_core::filesystem::strip_verbatim(
+                std::fs::canonicalize(&project).expect("canonicalize project dir"),
+            )
         } else {
             project
         }
@@ -252,9 +256,18 @@ impl Serve {
         });
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
-            let line = rx
-                .recv_timeout(Duration::from_secs(1))
-                .expect("serve handshake line");
+            let line = match rx.recv_timeout(Duration::from_secs(1)) {
+                Ok(line) => line,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    // A slow boot can be silent for seconds; the deadline,
+                    // not the per-line timeout, is the real bound.
+                    assert!(Instant::now() < deadline, "serve handshake timed out");
+                    continue;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("serve stdout closed before the handshake line")
+                }
+            };
             if let Some(rest) = line.strip_prefix("alforria server listening on ") {
                 let port = rest
                     .trim_start_matches("http://")
