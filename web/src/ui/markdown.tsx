@@ -455,7 +455,7 @@ function patch(root: HTMLElement, prev: Shown[], blocks: Block[]): Shown[] {
   return next
 }
 
-async function writeClipboard(text: string): Promise<boolean> {
+export async function writeClipboard(text: string): Promise<boolean> {
   try {
     await navigator.clipboard.writeText(text)
     return true

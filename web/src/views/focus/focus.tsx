@@ -14,7 +14,8 @@ import { slipKind } from "../queue/slip"
 import { CtxCell } from "../table"
 import { toast } from "../toast"
 import { Composer } from "./composer"
-import { Transcript } from "./transcript"
+import { exportName, transcriptMarkdown } from "./export"
+import { stepMessage, Transcript } from "./transcript"
 
 const Changes = lazy(() => import("./changes"))
 const Files = lazy(() => import("./files"))
@@ -144,6 +145,25 @@ function SessionColumn(props: {
       toast(`Could not compact: ${err instanceof Error ? err.message : err}`, "error")
     }
   }
+  // The loaded transcript as a Markdown file.
+  const exportTranscript = () => {
+    const url = URL.createObjectURL(new Blob([transcriptMarkdown(state, id())], { type: "text/markdown" }))
+    const a = document.createElement("a")
+    a.href = url
+    a.download = exportName(displayTitle(s()))
+    a.click()
+    setTimeout(() => URL.revokeObjectURL(url), 1000)
+  }
+  // ⌘⌥[ / ⌘⌥] step through the transcript's messages from anywhere in the
+  // column, as upstream (by key code: ⌥ changes the character on macOS).
+  const onKeyDown = (e: KeyboardEvent) => {
+    if (!(e.metaKey || e.ctrlKey) || !e.altKey || (e.code !== "BracketLeft" && e.code !== "BracketRight")) return
+    const scroller = el.querySelector<HTMLElement>(".transcript")
+    if (!scroller) return
+    e.preventDefault()
+    e.stopPropagation()
+    stepMessage(scroller, e.code === "BracketLeft" ? -1 : 1)
+  }
 
   return (
     <section
@@ -154,6 +174,7 @@ function SessionColumn(props: {
       aria-label={displayTitle(s())}
       onFocusIn={() => setActiveColumn(props.index)}
       onMouseDown={() => setActiveColumn(props.index)}
+      onKeyDown={onKeyDown}
     >
       <Show when={waiting()}>
         {(w) => (
@@ -201,6 +222,9 @@ function SessionColumn(props: {
               onClick={() => void compact()}
             >
               <Icon name="compact" />
+            </button>
+            <button aria-label="Export transcript" title="Export the transcript as Markdown" onClick={exportTranscript}>
+              <Icon name="download" />
             </button>
             <button aria-label="Close column" title="Close column" onClick={props.onClose}>
               <Icon name="close" />

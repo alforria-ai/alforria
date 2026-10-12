@@ -25,6 +25,7 @@ const PATHS = {
   back: `<path d="M13.25 8H2.75M7 3.75 2.75 8 7 12.25"/>`,
   undo: `<path d="M5.5 3 2.5 6l3 3"/><path d="M2.5 6h7.25a3.75 3.75 0 0 1 0 7.5H7"/>`,
   copy: `<rect x="5.25" y="5.25" width="8.5" height="8.5"/><path d="M10.75 5.25V2.25h-8.5v8.5h3"/>`,
+  download: `<path d="M8 2.25v8M4.75 7 8 10.25 11.25 7"/><path d="M2.75 11.25v2.5h10.5v-2.5"/>`,
   rows: `<path d="M1.75 3.5h12.5M1.75 8h12.5M1.75 12.5h12.5"/>`,
   columns: `<rect x="1.75" y="2.75" width="12.5" height="10.5"/><path d="M6 2.75v10.5M10 2.75v10.5"/>`,
   compact: `<path d="M2.75 3.5h10.5M4.75 8h6.5M6.75 12.5h2.5"/>`,

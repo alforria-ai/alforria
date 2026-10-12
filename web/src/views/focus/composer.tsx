@@ -103,6 +103,15 @@ const variantsFor = (dir: string) => {
   return variantCache.get(dir)!
 }
 
+/** Fill a session's composer: a fork carries its prompt over, with the agent and model it used. */
+export function setComposerDraft(
+  sessionID: string,
+  d: { text: string; agent?: string; model?: string; variant?: string },
+) {
+  setDrafts(sessionID, (prev) => ({ ...(prev ?? { files: [] }), ...d }))
+  persist()
+}
+
 /** A draft starting with `!` is a shell command (POST /session/:id/shell), as upstream. */
 const shellMode = (text: string) => text.startsWith("!")
 

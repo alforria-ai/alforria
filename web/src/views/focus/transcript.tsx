@@ -3,14 +3,46 @@
 // right after the tool call that raised it. The view sticks to the bottom
 // while the reader is there, and offers "Latest" when they have scrolled up.
 import { createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js"
+import { api } from "../../api/client"
 import type { AssistantMessage, UserMessage } from "../../api/types"
 import { fleetState, interruptsFor, type Interrupt } from "../../fleet/derive"
 import { state } from "../../store/store"
 import { hm, ktok, money } from "../../ui/format"
 import { Icon } from "../../ui/icons"
+import { writeClipboard } from "../../ui/markdown"
 import { Slip } from "../queue/slip"
+import { toast } from "../toast"
+import { setComposerDraft } from "./composer"
+import { replyMarkdown } from "./export"
 import { PartView } from "./parts"
-import { isReverted, revertBoundary } from "./revert"
+import { canRestoreFiles, isReverted, promptText, revertBoundary, revertTo } from "./revert"
+
+/**
+ * Scroll a transcript to the previous (-1) or next (+1) message and focus
+ * it, so a reader can keep going from the keyboard. From a focused message
+ * it steps by one; otherwise from the first message at the top of the view
+ * (which is itself the first stop when nothing sits above it).
+ */
+export function stepMessage(scroller: HTMLElement, offset: -1 | 1) {
+  const msgs = [...scroller.querySelectorAll<HTMLElement>(".msg")]
+  const focused = msgs.indexOf(document.activeElement as HTMLElement)
+  let target: HTMLElement | undefined
+  if (focused >= 0) target = msgs[focused + offset]
+  else {
+    const top = scroller.getBoundingClientRect().top
+    // 2px slack for rounding; a message within 24px of the top counts as "here".
+    const at = msgs.findIndex((m) => m.getBoundingClientRect().top >= top - 2)
+    // Every message starts above the view: the last one is the one being read.
+    if (at < 0) target = offset < 0 ? msgs[msgs.length - 1] : undefined
+    else {
+      const aligned = msgs[at]!.getBoundingClientRect().top - top < 24
+      target = offset < 0 ? (msgs[at - 1] ?? msgs[at]) : aligned ? msgs[at + 1] : msgs[at]
+    }
+  }
+  if (!target) return
+  target.scrollIntoView({ block: "start" })
+  target.focus({ preventScroll: true })
+}
 
 /** Arrays of ids compare by content so memos only notify on real changes. */
 const sameIds = (a: string[], b: string[]) => a.length === b.length && a.every((x, i) => x === b[i])
@@ -207,13 +239,63 @@ function TurnView(props: {
     return { tokens, cost, ms: first && end ? end - first : 0 }
   })
   const streaming = () => props.last && props.busy
+
+  // Copy reads "Copied" in place for a moment; there is no toast for success.
+  const [copied, setCopied] = createSignal(false)
+  let copiedTimer: ReturnType<typeof setTimeout> | undefined
+  onCleanup(() => clearTimeout(copiedTimer))
+  const copyReply = async () => {
+    if (!(await writeClipboard(replyMarkdown(state, replies())))) return toast("Could not copy the reply", "error")
+    setCopied(true)
+    clearTimeout(copiedTimer)
+    copiedTimer = setTimeout(() => setCopied(false), 1500)
+  }
+  const forkAt = async (messageID: string) => {
+    try {
+      const f = await api.fork(props.sessionID, messageID)
+      const m = state.message[messageID] as UserMessage | undefined
+      setComposerDraft(f.id, {
+        text: promptText(state, messageID),
+        agent: m?.agent,
+        model: m?.model ? `${m.model.providerID}/${m.model.modelID}` : undefined,
+        variant: m?.model?.variant,
+      })
+      props.onOpenSession(f.id, true)
+    } catch (err) {
+      toast(`Could not fork: ${err instanceof Error ? err.message : err}`, "error")
+    }
+  }
+  const revertAt = (messageID: string) =>
+    revertTo(props.sessionID, messageID).catch((err) =>
+      toast(`Could not revert: ${err instanceof Error ? err.message : err}`, "error"),
+    )
   return (
     <>
       <Show when={user()}>
         {(u) => (
-          <div class="msg msg-user" classList={{ reverted: props.reverted }}>
+          <div class="msg msg-user" tabindex="-1" classList={{ reverted: props.reverted }}>
             <div class="msg-label">
               You<span class="mono">{hm(u().time.created)}</span>
+              <span class="msg-acts">
+                <button
+                  class="link-btn"
+                  title="A new session with the conversation before this prompt, the prompt in its composer"
+                  onClick={() => void forkAt(u().id)}
+                >
+                  <Icon name="fork" />
+                  Fork
+                </button>
+                <Show when={canRestoreFiles(state, props.sessionID) && !props.reverted}>
+                  <button
+                    class="link-btn"
+                    title="Roll back this prompt and everything after it, files included (Unrevert undoes it)"
+                    onClick={() => void revertAt(u().id)}
+                  >
+                    <Icon name="undo" />
+                    Revert
+                  </button>
+                </Show>
+              </span>
             </div>
             {/* A shell turn's prompt is only the server's synthetic note: no empty plate. */}
             <div
@@ -245,12 +327,20 @@ function TurnView(props: {
       </Show>
       <Show when={head()}>
         {(h) => (
-          <div class="msg msg-asst" classList={{ reverted: props.reverted }}>
+          <div class="msg msg-asst" tabindex="-1" classList={{ reverted: props.reverted }}>
             <div class="msg-label">
               {h().agent}
               <span class="mono">
                 {h().modelID} · {hm(h().time.created)}
               </span>
+              <Show when={!streaming()}>
+                <span class="msg-acts">
+                  <button class="link-btn" title="Copy this reply as Markdown" onClick={() => void copyReply()}>
+                    <Icon name="copy" />
+                    {copied() ? "Copied" : "Copy"}
+                  </button>
+                </span>
+              </Show>
             </div>
             <div class="parts">
               <For each={replies()}>

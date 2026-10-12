@@ -1714,6 +1714,38 @@ kbd {
   text-transform: none;
   letter-spacing: 0;
 }
+/* Per-message actions (fork, revert, copy): shown on hover or focus, always on touch. */
+.msg-acts {
+  display: flex;
+  gap: 6px;
+  margin-left: auto;
+  opacity: 0;
+}
+.msg:hover .msg-acts,
+.msg:focus-within .msg-acts,
+.msg:focus .msg-acts {
+  opacity: 1;
+}
+.msg:focus:not(:focus-visible) {
+  outline: none;
+}
+.msg:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 4px;
+}
+.msg-acts .link-btn {
+  padding: 3px 6px;
+}
+@media (hover: none) {
+  .msg-acts {
+    opacity: 1;
+  }
+}
+@media (max-width: 760px) {
+  .msg-acts .link-btn {
+    min-height: 40px;
+  }
+}
 .msg-user .body {
   background: var(--plate);
   border: 1px solid var(--rule);
