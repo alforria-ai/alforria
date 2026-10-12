@@ -111,6 +111,10 @@ async fn current_project_is_the_resolved_git_project() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");
     std::fs::create_dir_all(&repo).unwrap();
+    // macOS resolves TMPDIR through a symlink (/var/folders ->
+    // /private/var/folders): canonicalize so the expected worktree matches
+    // what the registry (and git) report.
+    let repo = std::fs::canonicalize(&repo).unwrap();
     init_git_repo(&repo, "https://github.com/acme/widgets.git");
 
     let (status, json) =
@@ -135,6 +139,10 @@ async fn list_and_directories_after_boot() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");
     std::fs::create_dir_all(&repo).unwrap();
+    // macOS resolves TMPDIR through a symlink (/var/folders ->
+    // /private/var/folders): canonicalize so the expected worktree matches
+    // what the registry (and git) report.
+    let repo = std::fs::canonicalize(&repo).unwrap();
     init_git_repo(&repo, "https://github.com/acme/widgets.git");
 
     // Boot the instance first — `list` and `directories` are global views
@@ -168,6 +176,10 @@ async fn update_project_and_not_found() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");
     std::fs::create_dir_all(&repo).unwrap();
+    // macOS resolves TMPDIR through a symlink (/var/folders ->
+    // /private/var/folders): canonicalize so the expected worktree matches
+    // what the registry (and git) report.
+    let repo = std::fs::canonicalize(&repo).unwrap();
     init_git_repo(&repo, "https://github.com/acme/widgets.git");
     let (_, project) =
         request_json(&ctx, "GET", &format!("/project/current{}", q(&repo)), None).await;
