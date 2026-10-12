@@ -198,6 +198,21 @@ async fn dispatch_one(
 
 impl LlmStream for ScriptLlm {
     fn stream(&self, input: StreamInput) -> LlmEventStream {
+        // Background title generation (`fork_title`, loop.rs) shares this
+        // seam and races the scripted prompt runs for the queue — whichever
+        // call arrives first would otherwise eat the next script. Serve the
+        // title call a canned reply instead of popping the queue.
+        let is_title_call = input.small
+            && input.tools.is_empty()
+            && input.messages.iter().any(|message| {
+                message.content.iter().any(|part| {
+                    matches!(part, alforria_llm::schema::messages::ContentPart::Text { text, .. }
+                        if text.starts_with("Generate a title for this conversation"))
+                })
+            });
+        if is_title_call {
+            return futures::stream::iter(text_stream("A title")).boxed();
+        }
         let mut queue = self.scripts.lock().unwrap();
         let script = if queue.is_empty() {
             Vec::new()
@@ -470,12 +485,7 @@ async fn scenario(in_process: bool) {
     std::env::set_var("LIBERTAI_API_KEY", "e2e-dummy-key");
     std::env::set_var("OPENCODE_ENABLE_QUESTION_TOOL", "1");
 
-    let server = spawn_server(vec![
-        text_stream("Warmup"),
-        question_tool_stream(),
-        text_stream("Answer received"),
-    ])
-    .await;
+    let server = spawn_server(vec![question_tool_stream(), text_stream("Answer received")]).await;
 
     let backend: Arc<dyn alforria_tui::transport::backend::Backend> = if in_process {
         Arc::clone(&server.in_process)
