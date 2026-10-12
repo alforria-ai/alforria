@@ -25,6 +25,14 @@ export interface ModelInfo {
   context?: number
 }
 
+/** What one directory's instance offers; each list is absent until read. */
+export interface Catalog {
+  /** `providerID/modelID` → display info. */
+  models?: Record<string, ModelInfo>
+  mcp?: Record<string, { status: string; error?: string }>
+  lsp?: { id: string; name: string; root: string; status: "connected" | "error" }[]
+}
+
 export interface State {
   projects: Record<string, Project>
   /** Project ids in display order. */
@@ -51,6 +59,8 @@ export interface State {
   branches: Record<string, string>
   /** `providerID/modelID` → display info (context window for the ctx meter). */
   models: Record<string, ModelInfo>
+  /** Per-directory catalogs, read on demand (sync/catalog.ts); `models` above is the server-wide default. */
+  catalogs: Record<string, Catalog>
   /** A fleet snapshot has landed since the page loaded. */
   synced: boolean
   conn: { state: ConnState; lastFrame: number; attempt: number; retryAt: number }
@@ -75,6 +85,7 @@ export function emptyState(): State {
     earlier: {},
     branches: {},
     models: {},
+    catalogs: {},
     synced: false,
     conn: { state: "connecting", lastFrame: 0, attempt: 0, retryAt: 0 },
   }

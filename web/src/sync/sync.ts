@@ -17,8 +17,7 @@ import {
   type ProjectSnapshot,
 } from "../store/reduce"
 import { enqueue, setConn, setState, state, withSnapshot } from "../store/store"
-import type { ModelInfo } from "../store/state"
-import { dropCatalog } from "./catalog"
+import { dropCatalog, loadCatalog, modelMap } from "./catalog"
 import { eachSessionPage } from "./history"
 import { connectEvents } from "./stream"
 
@@ -254,11 +253,7 @@ async function loadBranches() {
 /** The model list behind the composer's picker; reload after credentials change. */
 export async function loadModels() {
   const list = await api.providers(anyDirectory()).catch(() => undefined)
-  if (!list) return
-  const models: Record<string, ModelInfo> = {}
-  for (const p of list.providers)
-    for (const m of Object.values(p.models)) models[`${p.id}/${m.id}`] = { name: m.name, context: m.limit?.context }
-  setState("models", models)
+  if (list) setState("models", modelMap(list))
 }
 
 /**
@@ -306,6 +301,10 @@ export function onFrame(frame: Parameters<typeof enqueue>[0]) {
     dropCatalog()
     void resyncWithRetry()
   } else if (ev.type === "server.instance.disposed") void resnapshotDir(ev.properties.directory)
+  // Live status changes for a directory whose catalog a view shows.
+  else if (ev.type === "lsp.updated" && state.catalogs[frame.directory]) void loadCatalog(frame.directory, ["lsp"])
+  else if (ev.type === "mcp.tools.changed" && state.catalogs[frame.directory])
+    void loadCatalog(frame.directory, ["mcp"])
 }
 
 let stop: (() => void) | undefined

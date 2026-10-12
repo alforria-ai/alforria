@@ -222,6 +222,8 @@ export const api = {
     }),
   mcpStatus: (directory?: string) =>
     request<Record<string, { status: string; error?: string }>>("GET", "/mcp", { directory }),
+  lspStatus: (directory?: string) =>
+    request<{ id: string; name: string; root: string; status: "connected" | "error" }[]>("GET", "/lsp", { directory }),
   mcpConnect: (name: string, directory?: string) => request<boolean>("POST", `/mcp/${name}/connect`, { directory }),
   mcpDisconnect: (name: string, directory?: string) =>
     request<boolean>("POST", `/mcp/${name}/disconnect`, { directory }),

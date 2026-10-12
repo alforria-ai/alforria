@@ -23,6 +23,7 @@ const api = [
   "/pty",
   "/vcs",
   "/mcp",
+  "/lsp",
   "/auth",
   "/api",
   "/doc",
