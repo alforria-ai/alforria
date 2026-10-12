@@ -45,6 +45,8 @@ export interface State {
   errors: Record<string, SessionError>
   /** Sessions whose transcript has been fetched and is kept live. */
   loaded: Record<string, boolean>
+  /** Open transcripts with older messages still on the server: the cursor that reads them. */
+  earlier: Record<string, string>
   /** projectID → current VCS branch (from GET /vcs, kept live by vcs.branch.updated). */
   branches: Record<string, string>
   /** `providerID/modelID` → display info (context window for the ctx meter). */
@@ -70,6 +72,7 @@ export function emptyState(): State {
     diffs: {},
     errors: {},
     loaded: {},
+    earlier: {},
     branches: {},
     models: {},
     synced: false,

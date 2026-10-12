@@ -12,7 +12,8 @@ vi.mock("../src/api/client", async (original) => ({
 }))
 
 const { ApiError } = await import("../src/api/client")
-const { onFrame, resync, retainTranscript, releaseTranscript, useTranscript } = await import("../src/sync/sync")
+const { loadEarlier, onFrame, resync, retainTranscript, releaseTranscript, useTranscript } =
+  await import("../src/sync/sync")
 const { flush, setState, state } = await import("../src/store/store")
 const { emptyState } = await import("../src/store/state")
 const { agentsFor } = await import("../src/sync/catalog")
@@ -63,6 +64,7 @@ beforeEach(() => {
     permissions: vi.fn(async () => []),
     questions: vi.fn(async () => []),
     messages: vi.fn(async () => []),
+    messagePage: vi.fn(async () => ({ items: [] })),
     todos: vi.fn(async () => []),
     session: vi.fn(async () => Promise.reject(notFound())),
     providers: vi.fn(async () => ({ providers: [], default: {} })),
@@ -81,7 +83,7 @@ describe("resync", () => {
     expect(state.loaded.ses_a).toBe(true)
     // Offline: the session is deleted; the reconnect snapshot no longer lists it.
     api.sessions!.mockResolvedValue([])
-    api.messages!.mockRejectedValue(notFound())
+    api.messagePage!.mockRejectedValue(notFound())
     await expect(resync()).resolves.toBeUndefined()
     expect(state.sessions.ses_a).toBeUndefined()
     expect(state.loaded.ses_a).toBeUndefined()
@@ -180,20 +182,46 @@ describe("transcripts", () => {
       return dispose
     })
     await settle()
-    expect(api.messages).toHaveBeenCalledTimes(1)
+    expect(api.messagePage).toHaveBeenCalledTimes(1)
     onFrame(frame("session.updated", { sessionID: "ses_a", info: session("ses_a", "/a", { title: "renamed" }) }))
     await settle()
     expect(state.sessions.ses_a?.title).toBe("renamed")
-    expect(api.messages).toHaveBeenCalledTimes(1)
+    expect(api.messagePage).toHaveBeenCalledTimes(1)
     expect(state.loaded.ses_a).toBe(true)
     // Switching sessions does release the old one and load the new one.
     setState("sessions", "ses_b", session("ses_b", "/a"))
     setId("ses_b")
     await settle()
-    expect(api.messages).toHaveBeenCalledTimes(2)
+    expect(api.messagePage).toHaveBeenCalledTimes(2)
     expect(state.loaded.ses_a).toBeUndefined()
     dispose()
     expect(state.loaded.ses_b).toBeUndefined()
+  })
+
+  test("a long transcript loads its latest page, then earlier pages on demand", async () => {
+    const msg = (n: number) => ({
+      info: { id: `msg_${n}`, sessionID: "ses_a", role: "user", time: { created: n } },
+      parts: [{ id: `prt_${n}`, sessionID: "ses_a", messageID: `msg_${n}`, type: "text", text: `${n}` }],
+    })
+    api.messagePage!.mockImplementation(async (_id: string, { before }: { before?: string }) =>
+      before === "c1" ? { items: [msg(1), msg(2)] } : { items: [msg(3), msg(4)], next: "c1" },
+    )
+    setState("sessions", "ses_a", session("ses_a", "/a"))
+    void retainTranscript("ses_a")
+    await settle()
+    expect(state.messages.ses_a).toEqual(["msg_3", "msg_4"])
+    expect(state.earlier.ses_a).toBe("c1")
+    const [a, b] = [loadEarlier("ses_a"), loadEarlier("ses_a")]
+    expect(a).toBe(b)
+    expect(await a).toBe(false)
+    expect(state.messages.ses_a).toEqual(["msg_1", "msg_2", "msg_3", "msg_4"])
+    expect(state.part.prt_1).toBeDefined()
+    expect(await loadEarlier("ses_a")).toBe(false)
+    // A reload after a reconnect asks for as much as the view holds.
+    await resync()
+    expect(api.messagePage!.mock.calls.at(-1)![1]).toEqual({ limit: 100 })
+    releaseTranscript("ses_a")
+    expect(state.earlier.ses_a).toBeUndefined()
   })
 
   test("an unknown session reports missing", async () => {

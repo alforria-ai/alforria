@@ -7,6 +7,7 @@ import type { Project, Session } from "../api/types"
 import { anyDirectory, GLOBAL_PROJECT, HISTORY_WINDOW } from "../fleet/fleet"
 import {
   applyDirSnapshot,
+  applyEarlier,
   applyMessages,
   applySnapshot,
   applyTail,
@@ -105,11 +106,16 @@ function forget(sessionID: string) {
   setState(produce((d) => dropSession(d, sessionID)))
 }
 
+/** Messages per transcript page; older ones load on demand (`loadEarlier`). */
+const PAGE = 100
+
 export async function loadTranscript(sessionID: string) {
+  // A reload (after a reconnect) keeps as much history as the view had.
+  const limit = Math.max(PAGE, state.messages[sessionID]?.length ?? 0)
   try {
     await withSnapshot(
-      () => api.messages(sessionID),
-      (d, list) => applyMessages(d, sessionID, list),
+      () => api.messagePage(sessionID, { limit }),
+      (d, page) => applyMessages(d, sessionID, page.items, page.next),
       // A view may close while the fetch is in flight: don't resurrect it.
       () => (viewers.get(sessionID) ?? 0) > 0,
     )
@@ -117,6 +123,30 @@ export async function loadTranscript(sessionID: string) {
     if (!notFound(err)) throw err
     forget(sessionID)
   }
+}
+
+const earlierLoads = new Map<string, Promise<boolean>>()
+
+/**
+ * Load the page before the oldest message an open transcript holds (the
+ * transcript's "load earlier"). Resolves false once there is nothing earlier.
+ */
+export function loadEarlier(sessionID: string): Promise<boolean> {
+  const before = state.earlier[sessionID]
+  if (!before) return Promise.resolve(false)
+  let load = earlierLoads.get(sessionID)
+  if (!load) {
+    load = withSnapshot(
+      () => api.messagePage(sessionID, { limit: PAGE, before }),
+      (d, page) => applyEarlier(d, sessionID, page.items, page.next),
+      // Still open, and not reloaded from the tail meanwhile.
+      () => !!state.loaded[sessionID] && state.earlier[sessionID] === before,
+    )
+      .then(() => !!state.earlier[sessionID])
+      .finally(() => earlierLoads.delete(sessionID))
+    earlierLoads.set(sessionID, load)
+  }
+  return load
 }
 
 /** A session's row, fetched on its own (one older than the window). False if it doesn't exist. */
@@ -146,6 +176,7 @@ export function releaseTranscript(sessionID: string) {
   setState(
     produce((d) => {
       delete d.loaded[sessionID]
+      delete d.earlier[sessionID]
       trimToTail(d, sessionID)
     }),
   )

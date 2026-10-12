@@ -158,6 +158,11 @@ export const api = {
   deleteSession: (id: string) => request<boolean>("DELETE", `/session/${id}`),
   messages: (id: string, opts: { limit?: number; before?: string } = {}) =>
     request<MessageWithParts[]>("GET", `/session/${id}/message`, { query: opts }),
+  /** The newest `limit` messages before `before` (oldest first); `next` reads the page before, absent at the start. */
+  messagePage: async (id: string, opts: { limit: number; before?: string }) => {
+    const { body, headers } = await send<MessageWithParts[]>("GET", `/session/${id}/message`, { query: opts })
+    return { items: body, next: headers.get("x-next-cursor") ?? undefined }
+  },
   todos: (id: string) => request<Todo[]>("GET", `/session/${id}/todo`),
   /** TS answers [] without a messageID; a turn's diff is its user message's `summary.diffs`. */
   diff: (id: string, messageID?: string) =>

@@ -147,6 +147,7 @@ function dropSessionData(s: State, sessionID: string) {
   delete s.diffs[sessionID]
   delete s.errors[sessionID]
   delete s.loaded[sessionID]
+  delete s.earlier[sessionID]
 }
 
 /** Per-directory REST snapshot taken on (re)connect. */
@@ -238,8 +239,11 @@ function keepStreamed(prev: Part | undefined, part: Part): Part {
   return prev.text.length > part.text.length ? { ...part, text: prev.text } : part
 }
 
-/** Replace one session's transcript with `GET /session/{id}/message`. */
-export function applyMessages(s: State, sessionID: string, list: MessageWithParts[]) {
+/**
+ * Replace one session's transcript with `GET /session/{id}/message`: the
+ * whole of it, or its latest page with `earlier` the cursor for the rest.
+ */
+export function applyMessages(s: State, sessionID: string, list: MessageWithParts[], earlier?: string) {
   const prev = new Map<string, Part>()
   for (const mid of s.messages[sessionID] ?? [])
     for (const pid of s.parts[mid] ?? []) {
@@ -260,6 +264,27 @@ export function applyMessages(s: State, sessionID: string, list: MessageWithPart
   }
   s.messages[sessionID] = ids
   s.loaded[sessionID] = true
+  if (earlier) s.earlier[sessionID] = earlier
+  else delete s.earlier[sessionID]
+}
+
+/** Add an older page in front of an open transcript; `earlier` reads the one before it. */
+export function applyEarlier(s: State, sessionID: string, list: MessageWithParts[], earlier?: string) {
+  if (!s.loaded[sessionID]) return
+  const ids = (s.messages[sessionID] ??= [])
+  for (const { info, parts } of list) {
+    if (s.message[info.id]) continue
+    s.message[info.id] = info
+    insertSorted(ids, info.id)
+    const pids: string[] = []
+    for (const part of parts) {
+      s.part[part.id] = part
+      insertSorted(pids, part.id)
+    }
+    s.parts[info.id] = pids
+  }
+  if (earlier) s.earlier[sessionID] = earlier
+  else delete s.earlier[sessionID]
 }
 
 /**
