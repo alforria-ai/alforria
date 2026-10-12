@@ -1,7 +1,9 @@
 // The session list shown beside focus columns: every session, live, grouped by
 // project. Click swaps the active column; shift-click or "open beside" adds a
-// column. Collapsed, it becomes a strip of status lamps.
-import { For, Show } from "solid-js"
+// column. Collapsed, it becomes a strip of status lamps. The list is one tab
+// stop (roving tabindex): ↑/↓, Home and End move between rows, Enter opens,
+// Shift+Enter opens beside.
+import { createSignal, For, Show } from "solid-js"
 import { activity, counts, displayTitle, fleetState, groups, interrupts } from "../fleet/fleet"
 import { nav } from "../nav/route"
 import { state } from "../store/store"
@@ -17,6 +19,44 @@ export function Rail(props: {
   const oldest = () => interrupts()[0]
   const colsOf = (id: string) =>
     nav.columns.map((c, i) => (c.kind === "session" && c.session === id ? i : -1)).filter((i) => i >= 0)
+  const ids = () => groups().flatMap((g) => g.rows.map((r) => r.session.id))
+  // The row that takes the list's one tab stop: the last one moved to, else
+  // the active column's session, else the first.
+  const [roving, setRoving] = createSignal<string | null>(null)
+  const tabStop = () => {
+    const list = ids()
+    const r = roving()
+    if (r && list.includes(r)) return r
+    const col = nav.columns[nav.active]
+    if (col?.kind === "session" && list.includes(col.session)) return col.session
+    return list[0]
+  }
+  let listEl!: HTMLDivElement
+  const onListKey = (e: KeyboardEvent) => {
+    if (e.metaKey || e.ctrlKey || e.altKey) return
+    const id = (e.target as HTMLElement).closest<HTMLElement>("[data-rail]")?.dataset.rail
+    if (!id) return
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault()
+      return props.onOpen(id, e.shiftKey)
+    }
+    const list = ids()
+    const at = list.indexOf(id)
+    const to =
+      e.key === "ArrowDown"
+        ? list[Math.min(list.length - 1, at + 1)]
+        : e.key === "ArrowUp"
+          ? list[Math.max(0, at - 1)]
+          : e.key === "Home"
+            ? list[0]
+            : e.key === "End"
+              ? list[list.length - 1]
+              : undefined
+    if (!to) return
+    e.preventDefault()
+    setRoving(to)
+    listEl.querySelector<HTMLElement>(`[data-rail="${to}"]`)?.focus()
+  }
   return (
     <aside class="queue rail" id="queue" aria-label="Sessions">
       <div class="pane-head">
@@ -40,7 +80,7 @@ export function Rail(props: {
           </button>
         )}
       </Show>
-      <div class="rail-list" role="listbox" aria-labelledby="railTitle">
+      <div class="rail-list" role="listbox" aria-labelledby="railTitle" ref={listEl} onKeyDown={onListKey}>
         <For each={groups()}>
           {(g) => (
             // A listbox may only hold options and groups: each project is a
@@ -76,9 +116,10 @@ export function Rail(props: {
                       }}
                       role="option"
                       aria-selected={cols().includes(nav.active)}
-                      tabindex="-1"
+                      tabindex={tabStop() === id ? 0 : -1}
                       title={displayTitle(r.session)}
                       data-rail={id}
+                      onFocus={() => setRoving(id)}
                       onMouseDown={(e) => e.shiftKey && e.preventDefault()}
                       onClick={(e) => props.onOpen(id, e.shiftKey)}
                     >
@@ -97,9 +138,11 @@ export function Rail(props: {
                       <span class="now" classList={{ prose: a().prose }}>
                         <b>{nowLabel(st(), a().kind)}</b> {a().text}
                       </span>
-                      <button
+                      {/* An option holds no controls: this is the pointer's
+                          shortcut for Shift+Enter / ⇧ click. */}
+                      <span
                         class="beside"
-                        aria-label={`Open ${displayTitle(r.session)} beside`}
+                        aria-hidden="true"
                         title="Open beside (⇧ click)"
                         onClick={(e) => {
                           e.stopPropagation()
@@ -107,7 +150,7 @@ export function Rail(props: {
                         }}
                       >
                         <Icon name="columns" />
-                      </button>
+                      </span>
                     </div>
                   )
                 }}
@@ -117,7 +160,8 @@ export function Rail(props: {
         </For>
       </div>
       <div class="rail-hint">
-        Click to switch the active column · ⇧ click to open beside · <kbd>Alt</kbd>
+        Click to switch the active column · ⇧ click or <kbd>⇧</kbd>
+        <kbd>↵</kbd> to open beside · <kbd>Alt</kbd>
         <kbd>↑</kbd>
         <kbd>↓</kbd>
       </div>

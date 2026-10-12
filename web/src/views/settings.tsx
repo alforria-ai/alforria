@@ -1,7 +1,7 @@
 // Settings: providers and credentials, default models, agents, MCP servers,
 // permission rules, appearance, and the server itself. Config edits go to the
 // global config (every project; a project's opencode.json still overrides).
-import { createMemo, createResource, createSignal, For, Match, Show, Switch } from "solid-js"
+import { createEffect, createMemo, createResource, createSignal, For, Match, on, Show, Switch } from "solid-js"
 import { api, type AuthMethod } from "../api/client"
 import { leaveSettings, nav, openSettings } from "../nav/route"
 import { state } from "../store/store"
@@ -11,6 +11,7 @@ import { canNotify, enableNotifications, notifyOn } from "../platform"
 import { server } from "./server"
 import { ConnectDialog, type ConnectTarget } from "./connect"
 import { loadModels } from "../sync/sync"
+import { hm } from "../ui/format"
 import { toast } from "./toast"
 
 const PAGES = [
@@ -29,6 +30,17 @@ const anyDir = () => state.projects[state.projectOrder[0] ?? ""]?.worktree
 const SAVE_NOTE = "Saving reloads every project on this server; a session mid-turn may be interrupted."
 
 export function Settings() {
+  let navEl!: HTMLElement
+  // On phones the nav is a sideways strip: keep the current page in view.
+  createEffect(
+    on(
+      () => nav.settingsPage,
+      () =>
+        queueMicrotask(() =>
+          navEl?.querySelector('[aria-current="true"]')?.scrollIntoView({ block: "nearest", inline: "nearest" }),
+        ),
+    ),
+  )
   return (
     <>
       <div class="pane-head ws-head">
@@ -40,7 +52,7 @@ export function Settings() {
       </div>
       <div class="ws-body">
         <div class="settings">
-          <nav aria-label="Settings sections">
+          <nav aria-label="Settings sections" ref={navEl}>
             <For each={PAGES}>
               {([id, label]) => (
                 <button aria-current={nav.settingsPage === id} onClick={() => openSettings(id)}>
@@ -81,6 +93,9 @@ function Providers() {
   const [catalog, { refetch }] = createResource(() => api.providerCatalog(anyDir()))
   const [methods] = createResource(() => api.authMethods(anyDir()).catch(() => ({}) as Record<string, AuthMethod[]>))
   const [connecting, setConnecting] = createSignal<ConnectTarget | null>(null)
+  // Success shows in place: the row's state flips to Connected, and this
+  // announces it.
+  const [said, setSaid] = createSignal("")
   const rows = createMemo(() => {
     const c = catalog()
     if (!c) return []
@@ -97,6 +112,7 @@ function Providers() {
   const remove = async (id: string) => {
     try {
       await api.removeAuth(id)
+      setSaid("")
       refresh()
     } catch (err) {
       toast(`Could not remove: ${err instanceof Error ? err.message : err}`, "error")
@@ -106,6 +122,9 @@ function Providers() {
     <>
       <h3>Providers</h3>
       <p class="lead">Credentials live on the server in auth.json. The browser never stores keys.</p>
+      <p class="sr-only" role="status">
+        {said()}
+      </p>
       <Show when={!catalog.loading} fallback={<p class="lead">Loading…</p>}>
         <div class="spec providers">
           <div class="row head">
@@ -125,7 +144,10 @@ function Providers() {
                   <span class="d cr">
                     {on() ? (p.source === "env" ? `env · ${p.env[0] ?? ""}` : p.source) : "Not configured"}
                   </span>
-                  <span class="d mono r md">{Object.keys(p.models).length}</span>
+                  <span class="d mono r md">
+                    {Object.keys(p.models).length}
+                    <span class="unit">{Object.keys(p.models).length === 1 ? " model" : " models"}</span>
+                  </span>
                   <Show
                     when={on()}
                     fallback={
@@ -165,7 +187,10 @@ function Providers() {
             methods={methods()?.[target().id] ?? []}
             directory={anyDir()}
             onClose={() => setConnecting(null)}
-            onConnected={refresh}
+            onConnected={() => {
+              setSaid(`${target().name} connected`)
+              refresh()
+            }}
           />
         )}
       </Show>
@@ -185,22 +210,32 @@ function unchanged(config: unknown, body: Record<string, unknown>): boolean {
 
 function useGlobalConfig() {
   const [config, { refetch, mutate }] = createResource(() => api.globalConfig())
+  const [saved, setSaved] = createSignal<number | null>(null)
   const patch = async (body: Record<string, unknown>) => {
     // Saving reloads every instance; a click that changes nothing sends nothing.
     if (config() && unchanged(config(), body)) return
     try {
       mutate(await api.patchGlobalConfig(body))
-      toast("Saved")
+      setSaved(Date.now())
     } catch (err) {
       toast(`Could not save: ${err instanceof Error ? err.message : err}`, "error")
       void refetch()
     }
   }
-  return { config, patch }
+  return { config, patch, saved }
+}
+
+/** Where a save is confirmed: beside the page title, never in a toast. */
+function SavedNote(props: { at: number | null }) {
+  return (
+    <p class="saved-note" role="status">
+      <Show when={props.at}>{(at) => `Saved ${hm(at())}`}</Show>
+    </p>
+  )
 }
 
 function Models() {
-  const { config, patch } = useGlobalConfig()
+  const { config, patch, saved } = useGlobalConfig()
   const models = createMemo(() =>
     Object.entries(state.models)
       .map(([id, m]) => ({ id, name: m.name }))
@@ -226,6 +261,7 @@ function Models() {
     <>
       <h3>Models</h3>
       <p class="lead">Defaults for new sessions. {SAVE_NOTE}</p>
+      <SavedNote at={saved()} />
       <div class="spec">
         <Select field="model" label="Default" note="Used by build and plan unless an agent sets its own." />
         <Select field="small_model" label="Small" note="Titles, summaries and other light work." />
@@ -303,7 +339,7 @@ type Action = "allow" | "ask" | "deny"
 const TOOLS = ["bash", "edit", "read", "webfetch", "websearch", "external_directory", "doom_loop", "task"]
 
 function Permissions() {
-  const { config, patch } = useGlobalConfig()
+  const { config, patch, saved } = useGlobalConfig()
   // What applies today when the global config says nothing: the default
   // agent's resolved ruleset (built-ins + project config), last match wins.
   const [agents] = createResource(() => api.agents(anyDir()))
@@ -346,6 +382,7 @@ function Permissions() {
     <>
       <h3>Permissions</h3>
       <p class="lead">Global rules, evaluated last-match-wins. Anything set to Ask lands in your queue. {SAVE_NOTE}</p>
+      <SavedNote at={saved()} />
       <div class="spec numbered">
         <For each={rules()}>
           {(r, i) => (

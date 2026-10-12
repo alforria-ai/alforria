@@ -64,11 +64,10 @@ export function ConnectDialog(props: {
     if (done) return
     done = true
     waiting?.abort()
-    // A key saved after the dialog closed still refreshes the list.
+    // A key saved after the dialog closed still refreshes the list. Success
+    // shows in place, on the provider's row.
     props.onConnected()
-    if (disposed) return
-    toast(`${props.provider.name} connected`)
-    props.onClose()
+    if (!disposed) props.onClose()
   }
   const fail = (method: number, err: unknown) => {
     if (done || disposed) return

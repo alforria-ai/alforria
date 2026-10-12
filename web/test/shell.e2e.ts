@@ -186,24 +186,131 @@ try {
     await p.waitForTimeout(1200)
   }
 
+  console.log("session list")
+  {
+    await p.locator("tr.s-row", { hasText: "Fix flaky config test" }).click()
+    await p.locator(".col").first().waitFor()
+    const stops = await p.locator(".rail-list [tabindex='0']").count()
+    check(stops === 1, "the session list is one tab stop", stops)
+    check(
+      !(await p.locator(".rail-list [role=option] :is(button, a, input, [tabindex])").count()),
+      "no controls inside an option",
+    )
+    await p.locator(".rail-list [tabindex='0']").focus()
+    await p.keyboard.press("Home")
+    const from = await p.evaluate(() => (document.activeElement as HTMLElement).dataset.rail)
+    await p.keyboard.press("ArrowDown")
+    const to = await p.evaluate(() => (document.activeElement as HTMLElement).dataset.rail)
+    check(to && to !== from, "↓ moves to the next session")
+    check(
+      (await p.locator(".rail-list [tabindex='0']").getAttribute("data-rail")) === to,
+      "…and the tab stop follows it",
+    )
+    await p.keyboard.press("Enter")
+    await p.waitForURL(new RegExp(`#/focus/${to}`))
+    check(true, "Enter opens it in the active column")
+    await p.keyboard.press("Escape")
+  }
+
   console.log("a11y")
   for (const theme of ["dark", "light"]) {
     await p.evaluate((t) => (document.documentElement.dataset.theme = t), theme)
     await p.goto(`${UI}/#/`)
     await p.locator("tr.s-row").first().waitFor()
     await p.evaluate((t) => (document.documentElement.dataset.theme = t), theme)
+    // With the keyboard cursor on a row (plate-2).
+    await p.locator("body").click({ position: { x: 700, y: 880 } })
+    await p.keyboard.press("j")
     const v = await a11y(p)
     check(!v.length, `overview, ${theme}: no serious a11y violations`, v)
-    await p.locator("tr.s-row").first().click()
+    await p.keyboard.press("Control+k")
+    await p.locator(".palette").waitFor()
+    const pal = await a11y(p)
+    check(!pal.length, `palette, ${theme}: no serious a11y violations`, pal)
+    await p.keyboard.press("Escape")
+    await p.locator("tr.s-row", { hasText: "Add cursor pagination" }).click()
     await p.locator(".col").first().waitFor()
     await p.waitForTimeout(500)
     const f = await a11y(p)
     check(!f.length, `focus, ${theme}: no serious a11y violations`, f)
+    await p.locator(".col.is-active .tabs button", { hasText: "Changes" }).click()
+    await p.locator(".col.is-active .diff").first().waitFor({ timeout: 10_000 })
+    const c = await a11y(p)
+    check(!c.length, `changes, ${theme}: no serious a11y violations`, c)
+    for (const page of ["providers", "permissions"]) {
+      await p.goto(`${UI}/#/settings/${page}`)
+      await p.waitForTimeout(800)
+      await p.evaluate((t) => (document.documentElement.dataset.theme = t), theme)
+      const s = await a11y(p)
+      check(!s.length, `settings ${page}, ${theme}: no serious a11y violations`, s)
+    }
+  }
+  await ctx.close()
+
+  console.log("phone")
+  {
+    const phone = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true })
+    const m = await phone.newPage()
+    m.on("pageerror", (e) => errors.push(e.message))
+    /** Every visible control under 40px either way. */
+    const small = () =>
+      m.evaluate(() =>
+        Array.from(
+          document.querySelectorAll<HTMLElement>("button, a[href], input, select, textarea, summary, [role=option]"),
+        )
+          .filter((e) => {
+            const r = e.getBoundingClientRect()
+            const visible = r.width > 0 && r.height > 0 && getComputedStyle(e).visibility !== "hidden"
+            return visible && (r.height < 40 || r.width < 40)
+          })
+          .map((e) => `${e.className || e.tagName.toLowerCase()} “${(e.textContent ?? "").trim().slice(0, 20)}”`),
+      )
+    const targets = async (where: string) => {
+      const s = await small()
+      check(!s.length, `phone ${where}: every control is at least 40px`, s)
+    }
+    await m.goto(`${UI}/#/`)
+    await m.locator(".q-list .slip").first().waitFor()
+    await m.waitForTimeout(800)
+    await targets("queue")
+    await m.locator(".mobile-tabs button", { hasText: "Sessions" }).tap()
+    await targets("sessions")
+    await m.locator("tr.s-row").first().tap()
+    await m.locator(".col").waitFor()
+    await m.waitForTimeout(600)
+    await targets("focus")
+    for (const page of ["providers", "permissions", "appearance"]) {
+      await m.goto(`${UI}/#/settings/${page}`)
+      await m.waitForTimeout(800)
+      await targets(`settings ${page}`)
+    }
+    await m.goto(`${UI}/#/settings/server`)
+    await m.waitForTimeout(800)
+    check(
+      await m.evaluate(() => {
+        const r = document.querySelector('.settings nav [aria-current="true"]')!.getBoundingClientRect()
+        return r.left >= 0 && r.right <= innerWidth
+      }),
+      "the settings strip scrolls to the current page",
+    )
+    await phone.close()
+  }
+  console.log("settings")
+  {
+    // Last: a save reloads every instance, which drops pending asks.
+    const p = await (await browser.newContext({ viewport: { width: 1440, height: 900 } })).newPage()
     await p.goto(`${UI}/#/settings/permissions`)
-    await p.waitForTimeout(800)
-    await p.evaluate((t) => (document.documentElement.dataset.theme = t), theme)
-    const s = await a11y(p)
-    check(!s.length, `settings, ${theme}: no serious a11y violations`, s)
+    const row = p.locator(".spec.numbered .row", { has: p.locator(".n", { hasText: /^webfetch$/ }) })
+    const ask = row.locator(".perm-seg button", { hasText: "ask" })
+    await ask.waitFor()
+    let patches = 0
+    p.on("request", (r) => r.method() === "PATCH" && r.url().includes("/global/config") && patches++)
+    await ask.click()
+    await p.locator(".saved-note", { hasText: "Saved" }).waitFor({ timeout: 5000 })
+    check(!(await p.locator(".toast").count()), "a save shows in place, not in a toast")
+    await ask.click()
+    await p.waitForTimeout(600)
+    check(patches === 1, "pressing the current value saves nothing", patches)
   }
 } finally {
   await browser.close()
