@@ -1,0 +1,15 @@
+name: windows-debug
+
+on:
+  workflow_dispatch:
+
+jobs:
+  debug:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Hunt the hanging tui test
+        run: cargo nextest run -p alforria-tui --retries 1 --slow-after 30s
