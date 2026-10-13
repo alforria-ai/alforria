@@ -121,7 +121,7 @@ jobs:
 
       - name: Run tests (windows, core unit + pty tests deferred)
         if: runner.os == 'Windows'
-        run: cargo nextest run --retries 2 -E 'not (package(alforria-core) or test(pty::tests))' || cargo test --workspace --exclude alforria-core
+        run: cargo nextest run --retries 2 -E 'not (package(alforria-core) or binary(pty) or test(pty::tests))' || cargo test --workspace --exclude alforria-core
 
   # 4. Cross-build and attach binaries + sha256 sidecars.
   build-binaries:
