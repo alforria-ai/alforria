@@ -113,8 +113,9 @@ async fn current_project_is_the_resolved_git_project() {
     std::fs::create_dir_all(&repo).unwrap();
     // macOS resolves TMPDIR through a symlink (/var/folders ->
     // /private/var/folders): canonicalize so the expected worktree matches
-    // what the registry (and git) report.
-    let repo = std::fs::canonicalize(&repo).unwrap();
+    // what the registry (and git) report; strip the Windows verbatim
+    // prefix, which the registry's resolved paths never carry.
+    let repo = alforria_core::filesystem::strip_verbatim(std::fs::canonicalize(&repo).unwrap());
     init_git_repo(&repo, "https://github.com/acme/widgets.git");
 
     let (status, json) =
@@ -141,8 +142,9 @@ async fn list_and_directories_after_boot() {
     std::fs::create_dir_all(&repo).unwrap();
     // macOS resolves TMPDIR through a symlink (/var/folders ->
     // /private/var/folders): canonicalize so the expected worktree matches
-    // what the registry (and git) report.
-    let repo = std::fs::canonicalize(&repo).unwrap();
+    // what the registry (and git) report; strip the Windows verbatim
+    // prefix, which the registry's resolved paths never carry.
+    let repo = alforria_core::filesystem::strip_verbatim(std::fs::canonicalize(&repo).unwrap());
     init_git_repo(&repo, "https://github.com/acme/widgets.git");
 
     // Boot the instance first — `list` and `directories` are global views
@@ -178,8 +180,9 @@ async fn update_project_and_not_found() {
     std::fs::create_dir_all(&repo).unwrap();
     // macOS resolves TMPDIR through a symlink (/var/folders ->
     // /private/var/folders): canonicalize so the expected worktree matches
-    // what the registry (and git) report.
-    let repo = std::fs::canonicalize(&repo).unwrap();
+    // what the registry (and git) report; strip the Windows verbatim
+    // prefix, which the registry's resolved paths never carry.
+    let repo = alforria_core::filesystem::strip_verbatim(std::fs::canonicalize(&repo).unwrap());
     init_git_repo(&repo, "https://github.com/acme/widgets.git");
     let (_, project) =
         request_json(&ctx, "GET", &format!("/project/current{}", q(&repo)), None).await;
