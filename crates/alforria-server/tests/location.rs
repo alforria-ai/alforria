@@ -194,6 +194,14 @@ fn create_session(
         .map(|_| ())
 }
 
+/// The expected probe value: the middleware resolves the raw directory
+/// (drive-relative posix literals land on the cwd's drive on Windows).
+fn resolved(raw: &str) -> String {
+    alforria_server::state::resolve_directory(std::path::Path::new(raw))
+        .display()
+        .to_string()
+}
+
 // ---------------------------------------------------------------- v1
 
 #[tokio::test]
@@ -207,11 +215,11 @@ async fn v1_directory_query_header_and_cwd_fallback() {
         "/agent?directory=%2Frepo&x-opencode-directory=ignored",
     )
     .await;
-    assert_eq!(probe["directory"], "/repo");
+    assert_eq!(probe["directory"], resolved("/repo"));
 
     // The header applies when the query param is absent.
     let probe = probe_json_headers(&router, "/agent", &[("x-opencode-directory", "/hdr")]).await;
-    assert_eq!(probe["directory"], "/hdr");
+    assert_eq!(probe["directory"], resolved("/hdr"));
 
     // An empty ?directory= is falsy — the header applies.
     let probe = probe_json_headers(
@@ -220,7 +228,7 @@ async fn v1_directory_query_header_and_cwd_fallback() {
         &[("x-opencode-directory", "/hdr")],
     )
     .await;
-    assert_eq!(probe["directory"], "/hdr");
+    assert_eq!(probe["directory"], resolved("/hdr"));
 
     // cwd fallback.
     let probe = probe_json(&router, "/agent").await;
@@ -236,11 +244,11 @@ async fn v1_percent_decodes_the_resolved_directory() {
     // The instance-context decode is applied after searchParams decoding:
     // %2520 → "%20" → " " (instance-context.ts:15-21).
     let probe = probe_json(&router, "/agent?directory=/a%2520b").await;
-    assert_eq!(probe["directory"], "/a b");
+    assert_eq!(probe["directory"], resolved("/a b"));
 
     // The v1 header is decoded the same way.
     let probe = probe_json_headers(&router, "/agent", &[("x-opencode-directory", "/a%20b")]).await;
-    assert_eq!(probe["directory"], "/a b");
+    assert_eq!(probe["directory"], resolved("/a b"));
 }
 
 #[tokio::test]
