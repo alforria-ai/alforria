@@ -592,11 +592,19 @@ async fn global_event_receives_project_updated_on_boot() {
     let _ = frames.next().await; // server.connected
 
     // Every instance boot emits `project.updated` with directory "global"
-    // (`project.ts:133-140` + `fromDirectory`, `project.ts:305`).
+    // (`project.ts:133-140` + `fromDirectory`, `project.ts:305`). The
+    // worktree is the resolved directory (`/repo` is drive-relative on
+    // Windows).
     ctx.instances.load(Path::new("/repo")).unwrap();
     let frame = frames.next_event().await.unwrap();
+    let worktree = alforria_server::state::resolve_directory(Path::new("/repo"))
+        .display()
+        .to_string();
     assert_eq!(
         normalize(&frame),
-        "data: {\"directory\":\"global\",\"project\":\"prj_test\",\"payload\":{\"type\":\"project.updated\",\"properties\":{\"id\":\"prj_test\",\"sandboxes\":[],\"time\":{\"created\":0,\"updated\":0},\"worktree\":\"/repo\"},\"id\":\"evt_X\"}}\n\n"
+        format!(
+            "data: {{\"directory\":\"global\",\"project\":\"prj_test\",\"payload\":{{\"type\":\"project.updated\",\"properties\":{{\"id\":\"prj_test\",\"sandboxes\":[],\"time\":{{\"created\":0,\"updated\":0}},\"worktree\":{}}},\"id\":\"evt_X\"}}\n\n",
+            serde_json::to_string(&worktree).unwrap()
+        )
     );
 }
