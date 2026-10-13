@@ -15,4 +15,4 @@ jobs:
         run: cargo install cargo-nextest --locked || true
 
       - name: Hunt the hanging tui test
-        run: cargo nextest run -p alforria-tui --retries 1 --no-fail-fast
+        run: cargo nextest run --retries 1 --no-fail-fast -E 'not (package(alforria-core) or binary(pty) or test(pty::tests))'

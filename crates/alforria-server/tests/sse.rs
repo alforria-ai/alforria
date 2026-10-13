@@ -83,6 +83,15 @@ fn fixture() -> Arc<ServerContext> {
 }
 
 /// Publish a `models-dev.refreshed` event with the given location fields.
+/// The resolved form of a test directory — the wire filter compares
+/// directory strings, and production publishes carry the resolved
+/// directory (a raw `/repo` is drive-relative on Windows).
+fn dir(raw: &str) -> String {
+    alforria_server::state::resolve_directory(std::path::Path::new(raw))
+        .display()
+        .to_string()
+}
+
 fn publish(ctx: &ServerContext, directory: Option<&str>, workspace: Option<String>) {
     ctx.bus
         .publish(
@@ -90,7 +99,7 @@ fn publish(ctx: &ServerContext, directory: Option<&str>, workspace: Option<Strin
             serde_json::json!({}),
             PublishOptions {
                 location: directory.map(|directory| LocationRef {
-                    directory: directory.to_string(),
+                    directory: dir(directory),
                     workspace_id: workspace,
                     project: None,
                 }),
@@ -122,13 +131,13 @@ fn create_session(ctx: &ServerContext, id: &str, directory: &str) -> Result<(), 
         .create(
             &SessionContext {
                 project_id: "prj_test".to_string(),
-                directory: PathBuf::from(directory),
-                worktree: PathBuf::from(directory),
+                directory: PathBuf::from(&dir(directory)),
+                worktree: PathBuf::from(&dir(directory)),
                 workspace_id: None,
             },
             &CreateInput {
                 id: Some(id.to_string()),
-                directory: Some(directory.to_string()),
+                directory: Some(dir(directory)),
                 workspace_id: None,
                 ..Default::default()
             },
