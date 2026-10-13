@@ -192,7 +192,8 @@ pub fn which_git() -> bool {
         None => return false,
     };
     for dir in std::env::split_paths(&path) {
-        if dir.join("git").is_file() {
+        // Windows ships git as git.exe; Bun.which finds it either way.
+        if dir.join("git").is_file() || dir.join("git.exe").is_file() {
             return true;
         }
     }
