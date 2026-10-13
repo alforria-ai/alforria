@@ -129,7 +129,7 @@ jobs:
   # 4. Cross-build and attach binaries + sha256 sidecars.
   build-binaries:
     name: Build Release Binaries
-    needs: [verify]
+    needs: [verify, check-version, check-release]
     runs-on: ${{ matrix.os }}
     permissions:
       contents: write
