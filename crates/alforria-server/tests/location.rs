@@ -318,12 +318,12 @@ async fn v1_session_derived_directory() {
 
     // The session's directory wins over query hints.
     let probe = probe_json(&router, "/session/ses_route?directory=/elsewhere").await;
-    assert_eq!(probe["directory"], "/repo/work");
+    assert_eq!(probe["directory"], resolved("/repo/work"));
     assert_eq!(probe["workspaceID"], serde_json::Value::Null);
 
     // A missing session routes like no session at all.
     let probe = probe_json(&router, "/session/ses_missing?directory=/elsewhere").await;
-    assert_eq!(probe["directory"], "/elsewhere");
+    assert_eq!(probe["directory"], resolved("/elsewhere"));
     assert_eq!(probe["workspaceID"], serde_json::Value::Null);
 
     // /session/status never derives from a session.
@@ -338,7 +338,7 @@ async fn v1_session_derived_directory() {
         .await
         .unwrap();
     let probe: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
-    assert_eq!(probe["directory"], "/status-dir");
+    assert_eq!(probe["directory"], resolved("/status-dir"));
 }
 
 #[tokio::test]
@@ -397,7 +397,7 @@ async fn v2_location_query_and_headers() {
     let router = probe_router(&fixture.ctx);
 
     let probe = probe_json(&router, "/api/agent?location[directory]=%2Frepo").await;
-    assert_eq!(probe["directory"], "/repo");
+    assert_eq!(probe["directory"], resolved("/repo"));
 
     let probe = probe_json_headers(
         &router,
@@ -405,12 +405,12 @@ async fn v2_location_query_and_headers() {
         &[("x-opencode-directory", "/header")],
     )
     .await;
-    assert_eq!(probe["directory"], "/query");
+    assert_eq!(probe["directory"], resolved("/query"));
 
     // The header is percent-decoded best-effort (location.ts:41-47).
     let probe =
         probe_json_headers(&router, "/api/agent", &[("x-opencode-directory", "/a%20b")]).await;
-    assert_eq!(probe["directory"], "/a b");
+    assert_eq!(probe["directory"], resolved("/a b"));
 
     // The workspace ref carries through without any registry lookup.
     let probe = probe_json(
@@ -418,7 +418,7 @@ async fn v2_location_query_and_headers() {
         "/api/agent?location[directory]=%2Frepo&location[workspace]=wrk_1",
     )
     .await;
-    assert_eq!(probe["directory"], "/repo");
+    assert_eq!(probe["directory"], resolved("/repo"));
     assert_eq!(probe["workspaceID"], "wrk_1");
 
     let probe = probe_json_headers(
@@ -512,7 +512,7 @@ async fn v2_session_location_matrix() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let probe: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
-    assert_eq!(probe["directory"], "/repo/v2");
+    assert_eq!(probe["directory"], resolved("/repo/v2"));
     assert_eq!(probe["workspaceID"], "wrk_v2");
 }
 
