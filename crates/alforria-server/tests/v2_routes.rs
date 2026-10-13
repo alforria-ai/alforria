@@ -748,11 +748,13 @@ async fn v2_misc_envelopes() {
     assert_eq!(response.status(), StatusCode::OK);
     let location: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
     // The location route reports the resolved directory — macOS resolves
-    // TMPDIR through a symlink, so compare against the canonical form.
-    let resolved = std::fs::canonicalize(&f.worktree)
-        .unwrap_or_else(|_| f.worktree.clone())
-        .to_string_lossy()
-        .to_string();
+    // TMPDIR through a symlink and Windows' canonicalize adds a verbatim
+    // prefix the resolved form never carries.
+    let resolved = alforria_core::filesystem::strip_verbatim(
+        std::fs::canonicalize(&f.worktree).unwrap_or_else(|_| f.worktree.clone()),
+    )
+    .to_string_lossy()
+    .to_string();
     assert_eq!(location["directory"], serde_json::json!(resolved));
     assert!(location["project"]["id"].is_string());
 

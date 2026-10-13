@@ -104,8 +104,12 @@ async fn at_mention_finds_a_file_and_attaches_a_line_range() {
     };
     assert_eq!(mime, "text/plain");
     assert_eq!(filename.as_deref(), Some("src/main.rs#3-5"));
+    // The URL carries the server-resolved directory — with the platform's
+    // separators on Windows.
+    let url_slashes = url.replace('\\', "/");
     assert!(
-        url.starts_with("file://") && url.ends_with("/repo/src/main.rs?start=3&end=5"),
+        url_slashes.starts_with("file://")
+            && url_slashes.ends_with("/repo/src/main.rs?start=3&end=5"),
         "{url}"
     );
     let source = source.as_ref().unwrap();

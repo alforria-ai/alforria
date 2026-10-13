@@ -258,9 +258,12 @@ async fn v1_event_stream_connected_filter_and_dispose() {
     // (handlers/event.ts:42-62).
     ctx.instances.dispose_directory(Path::new("/repo"));
     let frame = frames.next_event().await.unwrap();
+    let repo = serde_json::to_string(&dir("/repo")).unwrap();
     assert_eq!(
         normalize(&frame),
-        "data: {\"id\":\"evt_X\",\"type\":\"server.instance.disposed\",\"properties\":{\"directory\":\"/repo\"}}\n\n"
+        format!(
+            "data: {{\"id\":\"evt_X\",\"type\":\"server.instance.disposed\",\"properties\":{{\"directory\":{repo}}}}}\n\n"
+        )
     );
     assert!(
         frames.next().await.is_none(),
@@ -333,9 +336,12 @@ async fn global_event_stream() {
     ctx.instances.load(Path::new("/repo")).unwrap();
     ctx.instances.dispose_directory(Path::new("/repo"));
     let frame = frames.next_event().await.unwrap();
+    let repo = serde_json::to_string(&dir("/repo")).unwrap();
     assert_eq!(
         normalize(&frame),
-        "data: {\"directory\":\"/repo\",\"payload\":{\"type\":\"server.instance.disposed\",\"properties\":{\"directory\":\"/repo\"},\"id\":\"evt_X\"}}\n\n"
+        format!(
+            "data: {{\"directory\":{repo},\"payload\":{{\"type\":\"server.instance.disposed\",\"properties\":{{\"directory\":{repo}}},\"id\":\"evt_X\"}}}}\n\n"
+        )
     );
     publish(&ctx, Some("/repo"), None);
     let frame = frames.next_event().await.unwrap();
@@ -379,9 +385,12 @@ async fn api_event_stream() {
 
     publish(&ctx, Some("/repo"), None);
     let frame = frames.next_event().await.unwrap();
+    let repo = serde_json::to_string(&dir("/repo")).unwrap();
     assert_eq!(
         normalize(&frame),
-        "data: {\"id\":\"evt_X\",\"type\":\"models-dev.refreshed\",\"location\":{\"directory\":\"/repo\"},\"data\":{}}\n\n"
+        format!(
+            "data: {{\"id\":\"evt_X\",\"type\":\"models-dev.refreshed\",\"location\":{{\"directory\":{repo}}},\"data\":{{}}}}\n\n"
+        )
     );
 
     // Comments keep coming on the interval.
