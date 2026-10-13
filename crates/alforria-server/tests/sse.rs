@@ -603,7 +603,7 @@ async fn global_event_receives_project_updated_on_boot() {
     assert_eq!(
         normalize(&frame),
         format!(
-            "data: {{\"directory\":\"global\",\"project\":\"prj_test\",\"payload\":{{\"type\":\"project.updated\",\"properties\":{{\"id\":\"prj_test\",\"sandboxes\":[],\"time\":{{\"created\":0,\"updated\":0}},\"worktree\":{}}},\"id\":\"evt_X\"}}\n\n",
+            "data: {{\"directory\":\"global\",\"project\":\"prj_test\",\"payload\":{{\"type\":\"project.updated\",\"properties\":{{\"id\":\"prj_test\",\"sandboxes\":[],\"time\":{{\"created\":0,\"updated\":0}},\"worktree\":{}}},\"id\":\"evt_X\"}}}}\n\n",
             serde_json::to_string(&worktree).unwrap()
         )
     );
