@@ -11,5 +11,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Install nextest
+        run: cargo install cargo-nextest --locked || true
+
       - name: Hunt the hanging tui test
         run: cargo nextest run -p alforria-tui --retries 1 --slow-after 30s
