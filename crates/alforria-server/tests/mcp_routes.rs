@@ -2,7 +2,6 @@
 //! the OAuth-unsupported 400 (flat `{"error": ...}`), the
 //! `McpServerNotFoundError` 404 matrix and `GET /experimental/resource`.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use alforria_core::mcp::{McpService, McpServiceInput};
@@ -91,7 +90,10 @@ fn fixture_context() -> Arc<ServerContext> {
         Arc::new(EmptyUiBackend),
     );
     let service = McpService::new(McpServiceInput {
-        directory: PathBuf::from("/tmp"),
+        // A directory that exists on every platform — it is the cwd the
+        // MCP server process is spawned with (`/tmp` is drive-relative
+        // and missing on Windows).
+        directory: std::env::temp_dir(),
         data_dir: std::env::temp_dir(),
         mcp: serde_json::from_value(serde_json::json!({
             "srv": {
