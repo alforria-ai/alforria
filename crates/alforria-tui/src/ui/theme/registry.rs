@@ -224,7 +224,10 @@ mod tests {
         let directories = theme_directories();
         let cwd = std::env::current_dir().unwrap();
         assert!(directories.contains(&cwd.join(".opencode")));
-        assert_eq!(directories.last(), Some(&PathBuf::from("/.opencode")));
+        // The walk climbs to the filesystem root ("/" on unix, the drive
+        // root on Windows).
+        let root = cwd.ancestors().last().expect("root").to_path_buf();
+        assert_eq!(directories.last(), Some(&root.join(".opencode")));
     }
 
     #[test]
