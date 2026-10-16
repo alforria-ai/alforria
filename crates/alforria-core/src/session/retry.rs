@@ -251,6 +251,18 @@ pub fn retryable(error: &AssistantError, provider: &str) -> Option<Retryable> {
                     action: None,
                 });
             }
+            // Native-runtime addition: a model streaming malformed tool-call
+            // JSON surfaces as `ProviderShared.stream: Invalid JSON input for
+            // <route> tool call <name>` (UnknownError on the wire). It is a
+            // sampling glitch, not a permanent failure — retrying re-issues
+            // the request, which otherwise ends the turn and, inside a
+            // subagent, discards all of its work.
+            if lower.contains("invalid json input for ") && lower.contains(" tool call ") {
+                return Some(Retryable {
+                    message,
+                    action: None,
+                });
+            }
             if matches_retryable_message(&message) {
                 return Some(Retryable {
                     message,
@@ -1187,6 +1199,26 @@ mod tests {
     #[test]
     fn reqwest_transport_failures_are_retryable() {
         let message = "RequestExecutor.execute: error sending request for url (https://api.libertai.io/v1/chat/completions)";
+        let error = AssistantError::Unknown {
+            message: message.to_string(),
+            r#ref: None,
+        };
+        assert_eq!(
+            retryable(&error, "libertai"),
+            Some(Retryable {
+                message: message.to_string(),
+                action: None,
+            })
+        );
+    }
+
+    /// A model streaming malformed tool-call JSON surfaces as
+    /// `ProviderShared.stream: Invalid JSON input for <route> tool call
+    /// <name>` (UnknownError) — a sampling glitch that must retry, not
+    /// end the turn.
+    #[test]
+    fn invalid_tool_input_json_is_retryable() {
+        let message = "ProviderShared.stream: Invalid JSON input for openai-chat tool call write";
         let error = AssistantError::Unknown {
             message: message.to_string(),
             r#ref: None,

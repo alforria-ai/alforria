@@ -67,6 +67,17 @@ Response must include:
 
 Any attempt to use tools is a critical violation. Respond with text ONLY.";
 
+/// Native-runtime addition: the user message appended when a step finishes
+/// with reason `length` (the `max_tokens` budget — thinking included — was
+/// exhausted mid-response). Appending it and looping keeps a long task
+/// running instead of silently ending the turn, which previously required
+/// the user to type "continue" by hand.
+pub const OUTPUT_LENGTH_CONTINUE_PROMPT: &str = "You hit the output token limit and your previous response was cut off. Continue exactly where you stopped — do not repeat what you already wrote. If the work is complete, reply with a short summary.";
+
+/// How many consecutive `length` finishes are auto-continued before the loop
+/// gives up and ends the turn (each continue spends a full output budget).
+const MAX_OUTPUT_LENGTH_CONTINUES: u32 = 3;
+
 const STRUCTURED_OUTPUT_DESCRIPTION: &str =
     "Use this tool to return your final response in the requested structured format.
 
@@ -293,6 +304,7 @@ pub async fn run_loop(
 ) -> Result<WithParts, LoopError> {
     let structured: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
     let mut step: u64 = 0;
+    let mut length_continues: u32 = 0;
     let session = deps.sessions.get(session_id)?;
 
     let result: Result<WithParts, LoopError> = loop {
@@ -340,7 +352,19 @@ pub async fn run_loop(
                     && !has_tool_calls
                     && parent_id == last_user_id
                 {
+                    // Native-runtime addition: a `length` finish cut the
+                    // response mid-output (thinking tokens included). Append
+                    // a continuation user message and keep the task running
+                    // instead of silently ending the turn, up to the cap.
+                    if finish == "length" && length_continues < MAX_OUTPUT_LENGTH_CONTINUES {
+                        length_continues += 1;
+                        append_output_length_continue(deps, session_id, &last_user)?;
+                        continue;
+                    }
                     break last_assistant(deps, session_id).await;
+                }
+                if finish != "length" {
+                    length_continues = 0;
                 }
             }
         }
@@ -700,6 +724,57 @@ pub async fn run_loop(
     }
 
     result
+}
+
+/// Append the auto-continue user message after a `length` finish — a
+/// synthetic user message with a single text part, mirroring compaction's
+/// auto-continue message (compaction.ts:958-1004). Native-runtime addition.
+fn append_output_length_continue(
+    deps: &LoopDeps,
+    session_id: &str,
+    last_user: &V1Message,
+) -> Result<(), LoopError> {
+    let (agent_name, model_ref) = match last_user {
+        V1Message::User { agent, model, .. } => (agent.clone(), model.clone()),
+        _ => return Err(LoopError::Unknown("user message required".to_string())),
+    };
+    let continue_msg = V1Message::User {
+        id: crate::session::ids::MessageId::ascending(None)?,
+        session_id: session_id.to_string(),
+        time: alforria_schema::session_v1::UserTime {
+            created: deps.clock.now_ms() as f64,
+        },
+        format: None,
+        summary: None,
+        agent: agent_name,
+        model: model_ref,
+        system: None,
+        tools: None,
+    };
+    deps.sessions.update_message(&continue_msg)?;
+    let now = deps.clock.now_ms();
+    let part = V1Part::Text {
+        id: crate::session::ids::PartId::ascending(None)?,
+        session_id: session_id.to_string(),
+        message_id: crate::session::message::message_id(&continue_msg).to_string(),
+        text: OUTPUT_LENGTH_CONTINUE_PROMPT.to_string(),
+        synthetic: Some(true),
+        ignored: None,
+        time: Some(alforria_schema::session_v1::TextPartTime {
+            start: now,
+            end: Some(now),
+        }),
+        metadata: Some(
+            [(
+                "output_length_continue".to_string(),
+                serde_json::Value::Bool(true),
+            )]
+            .into_iter()
+            .collect(),
+        ),
+    };
+    deps.sessions.update_part(&part)?;
+    Ok(())
 }
 
 // -------------------------------------------------------------------------
@@ -1930,6 +2005,131 @@ mod tests {
         assert!(
             text == MAX_STEPS_PROMPT,
             "MAX_STEPS_PROMPT missing from the model messages"
+        );
+    }
+
+    /// A text stream that finishes with reason `length`.
+    fn length_stream(text: &str) -> Vec<Result<LlmEvent, LlmError>> {
+        vec![
+            Ok(LlmEvent::StepStart { index: 0.0 }),
+            Ok(LlmEvent::TextStart {
+                id: "t1".to_string(),
+                provider_metadata: None,
+            }),
+            Ok(LlmEvent::TextDelta {
+                id: "t1".to_string(),
+                text: text.to_string(),
+                provider_metadata: None,
+            }),
+            Ok(LlmEvent::TextEnd {
+                id: "t1".to_string(),
+                provider_metadata: None,
+            }),
+            Ok(LlmEvent::StepFinish {
+                index: 0.0,
+                reason: alforria_llm::schema::ids::FinishReason::Length,
+                usage: None,
+                provider_metadata: None,
+            }),
+            Ok(LlmEvent::Finish {
+                reason: alforria_llm::schema::ids::FinishReason::Length,
+                usage: None,
+                provider_metadata: None,
+            }),
+        ]
+    }
+
+    /// The synthetic auto-continue user messages a run appended.
+    fn length_continue_count(h: &Harness, session_id: &str) -> usize {
+        h.services
+            .messages
+            .stream(session_id)
+            .unwrap()
+            .into_iter()
+            .filter(|msg| {
+                msg.parts.iter().any(|part| match part {
+                    V1Part::Text {
+                        text,
+                        synthetic: Some(true),
+                        ..
+                    } => text == OUTPUT_LENGTH_CONTINUE_PROMPT,
+                    _ => false,
+                })
+            })
+            .count()
+    }
+
+    #[tokio::test]
+    async fn run_loop_length_finish_auto_continues() {
+        let h = harness(
+            "run-loop-length-continue",
+            vec![length_stream("cut off"), text_stream("all done")],
+        );
+        let session = create_session(&h);
+        h.services
+            .sessions
+            .set_title(&session.id, "Custom")
+            .unwrap();
+        push_user_message(&h, &session.id, "msg_user1");
+
+        let deps = loop_deps(&h);
+        let cancel = CancellationToken::new();
+        let result = run_loop(&deps, &session.id, &cancel).await;
+
+        assert_eq!(h.llm.calls(), 2);
+        match result {
+            Ok(message) => {
+                let V1Message::Assistant { finish, .. } = &message.info else {
+                    panic!("expected an assistant message");
+                };
+                assert_eq!(finish.as_deref(), Some("stop"));
+            }
+            _ => panic!("expected Ok"),
+        }
+        assert_eq!(
+            length_continue_count(&h, &session.id),
+            1,
+            "one auto-continue user message expected"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_loop_length_continue_caps_after_max() {
+        let h = harness(
+            "run-loop-length-cap",
+            vec![
+                length_stream("one"),
+                length_stream("two"),
+                length_stream("three"),
+                length_stream("four"),
+            ],
+        );
+        let session = create_session(&h);
+        h.services
+            .sessions
+            .set_title(&session.id, "Custom")
+            .unwrap();
+        push_user_message(&h, &session.id, "msg_user1");
+
+        let deps = loop_deps(&h);
+        let cancel = CancellationToken::new();
+        let result = run_loop(&deps, &session.id, &cancel).await;
+
+        // MAX_OUTPUT_LENGTH_CONTINUES auto-continues, then the turn ends.
+        assert_eq!(h.llm.calls(), 4);
+        match result {
+            Ok(message) => {
+                let V1Message::Assistant { finish, .. } = &message.info else {
+                    panic!("expected an assistant message");
+                };
+                assert_eq!(finish.as_deref(), Some("length"));
+            }
+            _ => panic!("expected Ok"),
+        }
+        assert_eq!(
+            length_continue_count(&h, &session.id),
+            3,
+            "one auto-continue user message per capped continue"
         );
     }
 
