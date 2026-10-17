@@ -186,8 +186,16 @@ async fn compress_if_eligible(
     // only already-buffered bodies are compressed — stream bodies (SSE,
     // chunked uploads) pass through untouched. A bounded body reports an
     // exact size hint; streaming bodies do not.
-    if http_body::Body::size_hint(&body).exact().is_none() {
-        return Response::from_parts(parts, body);
+    //
+    // A buffered body larger than the collect cap also passes through
+    // uncompressed: TS compresses any Uint8Array regardless of size (zlib
+    // has no cap), so emptying an oversized body would be a porting bug —
+    // and compressing tens of MiB only to re-buffer them would double
+    // memory for a response the client can consume as-is.
+    match http_body::Body::size_hint(&body).exact() {
+        None => return Response::from_parts(parts, body),
+        Some(size) if size > COLLECT_LIMIT as u64 => return Response::from_parts(parts, body),
+        _ => {}
     }
     let path = path_of(full_url);
     // compression.ts:47-49
@@ -210,8 +218,9 @@ async fn compress_if_eligible(
 
     let bytes = match axum::body::to_bytes(body, COLLECT_LIMIT).await {
         Ok(bytes) => bytes,
-        // Errors can only come from an aborted in-flight body; the partial
-        // response is the closest thing to TS's untouched passthrough.
+        // Unreachable for exact-hint bodies under the cap (checked above);
+        // kept as a guard for any body that reports an exact size but
+        // fails mid-collection.
         Err(_) => return Response::from_parts(parts, Body::empty()),
     };
     let bytes = bytes.to_vec();

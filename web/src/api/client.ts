@@ -205,6 +205,9 @@ export const api = {
   /** The newest `limit` messages before `before` (oldest first); `next` reads the page before, absent at the start. */
   messagePage: async (id: string, opts: { limit: number; before?: string }) => {
     const { body, headers } = await send<MessageWithParts[]>("GET", `/session/${id}/message`, { query: opts })
+    // A 200 with a malformed body (empty, wrong shape) must fail loudly here,
+    // not as a TypeError deep in the store's reduce ("Symbol.iterator of undefined").
+    if (!Array.isArray(body)) throw new ApiError(200, body, `GET /session/${id}/message → 200 with a malformed body`)
     return { items: body, next: headers.get("x-next-cursor") ?? undefined }
   },
   todos: (id: string) => request<Todo[]>("GET", `/session/${id}/todo`),

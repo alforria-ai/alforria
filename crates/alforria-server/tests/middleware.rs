@@ -74,6 +74,42 @@ async fn skips_bodies_below_the_threshold() {
 }
 
 #[tokio::test]
+async fn oversized_buffered_body_passes_through_untouched() {
+    // A buffered body above the 16 MiB collect cap must never be emptied:
+    // the client gets it uncompressed. Regression: a transcript page with a
+    // huge embedded diff came back as a 200 with an empty body, which the
+    // web UI turned into "Could not load the transcript".
+    let big = "x".repeat(17 * 1024 * 1024);
+    let expected_len = big.len();
+    let service =
+        compression::CompressionLayer.layer(tower::service_fn(move |_: Request<Body>| {
+            let big = big.clone();
+            async move {
+                let mut response = Response::new(Body::from(big));
+                response.headers_mut().insert(
+                    header::CONTENT_TYPE,
+                    header::HeaderValue::from_static("application/json"),
+                );
+                Ok::<_, std::convert::Infallible>(response)
+            }
+        }));
+    let response = service
+        .oneshot(
+            Request::builder()
+                .header(header::ACCEPT_ENCODING, "gzip")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(bytes.len(), expected_len);
+}
+
+#[tokio::test]
 async fn deflate_used_when_gzip_not_accepted() {
     let service =
         compression::CompressionLayer.layer(tower::service_fn(|_: Request<Body>| async {
