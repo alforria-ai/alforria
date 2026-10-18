@@ -532,7 +532,61 @@ fn lower_messages(request: &LlmRequest) -> Result<Vec<OpenAiChatMessage>, LlmErr
         messages.extend(lower_message(message)?);
     }
     flush_images(&mut messages, &mut pending_images);
+    // Native-runtime addition: DeepSeek V4.1 deployments reject message
+    // text containing the reserved image placeholder token (the serving
+    // layer validates content and reasoning before image parts are
+    // encoded as that token, so a session whose history carries it — e.g.
+    // a tool output quoting tokenizer source — faults on every request
+    // and can never continue). For DeepSeek models, swap the fullwidth
+    // token for its ASCII-pipe lookalike, which the vocab does not
+    // reserve.
+    if request.model.id.contains("deepseek") {
+        for message in &mut messages {
+            neutralize_deepseek_image_placeholder(message);
+        }
+    }
     Ok(messages)
+}
+
+/// `<｜deepseek_image｜>` — DeepSeek V4.1's reserved image placeholder
+/// (fullwidth pipes, U+FF5C).
+const DEEPSEEK_IMAGE_PLACEHOLDER: &str = "<｜deepseek_image｜>";
+
+/// The ASCII-pipe lookalike substituted into outgoing text.
+const DEEPSEEK_IMAGE_PLACEHOLDER_TEXT: &str = "<|deepseek_image|>";
+
+fn neutralize_deepseek_image_placeholder(message: &mut OpenAiChatMessage) {
+    fn text(slot: &mut String) {
+        if slot.contains(DEEPSEEK_IMAGE_PLACEHOLDER) {
+            *slot = slot.replace(DEEPSEEK_IMAGE_PLACEHOLDER, DEEPSEEK_IMAGE_PLACEHOLDER_TEXT);
+        }
+    }
+    match message {
+        OpenAiChatMessage::System { content } => text(content),
+        OpenAiChatMessage::User { content } => match content {
+            OpenAiChatUserContent::Text(string) => text(string),
+            OpenAiChatUserContent::Parts(parts) => {
+                for part in parts.iter_mut() {
+                    if let OpenAiChatUserContentPart::Text { text: slot } = part {
+                        text(slot);
+                    }
+                }
+            }
+        },
+        OpenAiChatMessage::Assistant {
+            content,
+            reasoning_content,
+            ..
+        } => {
+            if let Some(content) = content.as_mut() {
+                text(content);
+            }
+            if let Some(reasoning) = reasoning_content.as_mut() {
+                text(reasoning);
+            }
+        }
+        OpenAiChatMessage::Tool { content, .. } => text(content),
+    }
 }
 
 /// TS `lowerOptions` — resolve `providerOptions.openai` readers, validating
@@ -957,6 +1011,55 @@ mod tests {
         let expected: serde_json::Value = serde_json::from_str(r#"{"model":"gpt-4o-mini","messages":[{"role":"system","content":"You are concise."},{"role":"user","content":"Say hello in one short sentence."}],"stream":true,"stream_options":{"include_usage":true},"max_tokens":20,"temperature":0}"#).unwrap();
         let body = OpenAiChat.lower_body(&request).unwrap();
         assert_json_equal(&expected, &body);
+    }
+
+    #[test]
+    fn deepseek_image_placeholder_is_neutralized_for_deepseek_models_only() {
+        let mut request = request();
+        request.model = crate::schema::messages::ModelRef::new(
+            "deepseek-v4.1-flash-thinking",
+            "libertai",
+            #[allow(clippy::arc_with_non_send_sync)]
+            Arc::new(RouteHandle::empty()),
+        );
+        let placeholder = "<｜deepseek_image｜>";
+        request.messages = vec![
+            Message::user(format!(
+                "This file defines the token: IMAGE_PLACEHOLDER = \"{placeholder}\""
+            )),
+            Message::assistant(vec![
+                ContentPart::reasoning(format!("The token {placeholder} is reserved.")),
+                ContentPart::text("read the tokenizer source"),
+            ]),
+            Message::tool(ToolResultInput {
+                id: "call_read".to_string(),
+                name: "read".to_string(),
+                result: json!({"output": format!("found {placeholder} in text")}),
+                ..ToolResultInput::default()
+            }),
+        ];
+
+        let body = OpenAiChat.lower_body(&request).unwrap();
+        let wire = serde_json::to_string(&body).unwrap();
+        assert!(
+            !wire.contains(placeholder),
+            "the reserved token must not reach the wire for deepseek models"
+        );
+        assert!(wire.contains("<|deepseek_image|>"));
+
+        // A non-DeepSeek model is left byte-identical: separate test below.
+    }
+
+    #[test]
+    fn deepseek_image_placeholder_is_kept_for_other_models() {
+        let placeholder = "<｜deepseek_image｜>";
+        let mut plain = request();
+        plain.messages = vec![Message::user(format!(
+            "This file defines the token: IMAGE_PLACEHOLDER = \"{placeholder}\""
+        ))];
+        let body = OpenAiChat.lower_body(&plain).unwrap();
+        let wire = serde_json::to_string(&body).unwrap();
+        assert!(wire.contains(placeholder));
     }
 
     #[test]
