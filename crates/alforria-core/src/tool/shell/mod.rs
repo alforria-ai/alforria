@@ -908,6 +908,14 @@ async fn run(
         );
     }
 
+    // The model only sees `output`, not the `exit` metadata. Surface a
+    // non-zero status so failures are not silently treated as success.
+    match code {
+        Some(0) => {}
+        Some(code) => output.push_str(&format!("\n\n[exit code: {code}]")),
+        None => output.push_str("\n\n[exit code: signal]"),
+    }
+
     let metadata_output = if last.is_empty() {
         preview(&output)
     } else {
@@ -1536,6 +1544,7 @@ mod tests {
         let tool = shell_tool(spawner, TRUNC_MAX_BYTES, &dir);
         let (result, _, _, _) = execute(&tool, json!({ "command": "exit 7" })).await;
         assert_eq!(result.metadata["exit"], json!(7));
+        assert!(result.output.ends_with("[exit code: 7]"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1552,7 +1561,7 @@ mod tests {
             execute(&tool, json!({ "command": "sleep 100", "timeout": 100 })).await;
         assert_eq!(
             result.output,
-            "partial output\n\n\n<shell_metadata>\nshell tool terminated command after exceeding timeout 100 ms. If this command is expected to take longer and is not waiting for interactive input, retry with a larger timeout value in milliseconds.\n</shell_metadata>"
+            "partial output\n\n\n<shell_metadata>\nshell tool terminated command after exceeding timeout 100 ms. If this command is expected to take longer and is not waiting for interactive input, retry with a larger timeout value in milliseconds.\n</shell_metadata>\n\n[exit code: signal]"
         );
         assert_eq!(result.metadata["exit"], serde_json::Value::Null);
         std::fs::remove_dir_all(&dir).ok();

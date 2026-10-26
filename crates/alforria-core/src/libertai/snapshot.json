@@ -103,7 +103,7 @@
     {
       "id": "deepseek-v4.1-flash",
       "name": "DeepSeek V4.1 Flash",
-      "hf_id": "LibertAIDAI/DeepSeek-V4.1-Flash-REAP-256E",
+      "hf_id": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
       "pricing": {
         "text": {
           "price_per_million_input_tokens": 0.25,
@@ -115,7 +115,7 @@
           "tee": false,
           "vision": true,
           "reasoning": true,
-          "context_window": 262144,
+          "context_window": 1048576,
           "function_calling": true
         }
       }

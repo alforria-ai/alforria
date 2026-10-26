@@ -945,6 +945,35 @@ async fn ask_edit(
         .await
 }
 
+/// True when a completed tool call in this session has read or written
+/// `target`. An empty message history means the tool is being invoked
+/// outside a session (unit tests, one-shot calls); those are exempt.
+pub(crate) fn file_was_observed(ctx: &ToolCtxRef<'_>, target: &Path) -> bool {
+    if ctx.messages.is_empty() {
+        return true;
+    }
+    ctx.messages.iter().any(|message| {
+        message
+            .get("parts")
+            .and_then(Value::as_array)
+            .is_some_and(|parts| {
+                parts.iter().any(|part| {
+                    if part.pointer("/state/status").and_then(Value::as_str) != Some("completed") {
+                        return false;
+                    }
+                    let tool = part.get("tool").and_then(Value::as_str);
+                    if !matches!(tool, Some("read" | "write" | "edit")) {
+                        return false;
+                    }
+                    part.pointer("/state/input/filePath")
+                        .and_then(Value::as_str)
+                        .map(|path| ts_resolve(&ctx.instance.directory, path) == target)
+                        .unwrap_or(false)
+                })
+            })
+    })
+}
+
 fn run(
     params: EditParameters,
     ctx: ToolCtxRef<'_>,
@@ -966,6 +995,15 @@ fn run(
         let file_path = ts_resolve(&instance.directory, &params.file_path);
         let file_str = file_path.to_string_lossy().to_string();
         assert_external_directory(&ctx, Some(&file_str), ExternalOptions::default()).await?;
+
+        if !params.old_string.is_empty()
+            && tokio::fs::metadata(&file_path).await.is_ok()
+            && !file_was_observed(&ctx, &file_path)
+        {
+            return Err(ToolError::Failed(format!(
+                "File {file_str} has not been read in this session. Read it before editing."
+            )));
+        }
 
         let mut diff;
         let content_old;
@@ -1167,6 +1205,23 @@ mod tests {
         let result = (def.execute)(args, c).await;
         let metadata = ask.metadata_calls.lock().unwrap().clone();
         (result, ask.requests(), metadata)
+    }
+
+    async fn call_with_messages(
+        dir: &Path,
+        events: Arc<dyn FileEvents>,
+        args: Value,
+        messages: &[Value],
+    ) -> Result<ExecuteResult, ToolError> {
+        let def = tool(dir, None, events);
+        let ask = RecordingAsk::new();
+        let inst = instance(dir);
+        let extra = Extra::default();
+        let c = ToolCtxRef {
+            messages,
+            ..ctx(&ask, &inst, &extra)
+        };
+        (def.execute)(args, c).await
     }
 
     fn events() -> Arc<RecordingEvents> {
@@ -1395,6 +1450,47 @@ mod tests {
                 format!("updated:{}:change", file.display()),
             ]
         );
+        std::fs::remove_dir_all(temp.path()).ok();
+    }
+
+    #[tokio::test]
+    async fn edit_requires_a_prior_read_in_session() {
+        let temp = crate::storage::test_support::TempDir::new("edit-read-guard");
+        let file = write(temp.path(), "main.txt", "hello\n");
+        let args = json!({
+            "filePath": file.to_string_lossy(),
+            "oldString": "hello",
+            "newString": "goodbye",
+        });
+
+        let unread = vec![json!({
+            "parts": [{
+                "type": "tool",
+                "tool": "bash",
+                "state": { "status": "completed", "input": { "command": "echo hi" } }
+            }]
+        })];
+        let result = call_with_messages(temp.path(), events(), args.clone(), &unread).await;
+        assert!(matches!(
+            result,
+            Err(ToolError::Failed(message)) if message.contains("has not been read")
+        ));
+
+        let read = vec![json!({
+            "parts": [{
+                "type": "tool",
+                "tool": "read",
+                "state": {
+                    "status": "completed",
+                    "input": { "filePath": file.to_string_lossy() }
+                }
+            }]
+        })];
+        let result = call_with_messages(temp.path(), events(), args, &read)
+            .await
+            .unwrap();
+        assert_eq!(result.output, "Edit applied successfully.");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "goodbye\n");
         std::fs::remove_dir_all(temp.path()).ok();
     }
 

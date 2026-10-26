@@ -1,6 +1,7 @@
 //! System prompt — port of `session/system.ts`.
 //!
-//! * `provider` — the per-provider prompt dispatch table (system.ts:28-51).
+//! * `provider` — the per-provider prompt dispatch table (system.ts:28-51),
+//!   extended with a DeepSeek family.
 //! * `environment` — the `<env>` block (system.ts:69-105).
 //! * `skills` — the skill system-prompt block (system.ts:107-119).
 //! * `mcp` — the `<mcp_instructions>` block (system.ts:121-137).
@@ -16,6 +17,7 @@ use std::path::Path;
 const PROMPT_ANTHROPIC: &str = include_str!("prompt/anthropic.txt");
 const PROMPT_DEFAULT: &str = include_str!("prompt/default.txt");
 const PROMPT_BEAST: &str = include_str!("prompt/beast.txt");
+const PROMPT_DEEPSEEK: &str = include_str!("prompt/deepseek.txt");
 const PROMPT_GEMINI: &str = include_str!("prompt/gemini.txt");
 const PROMPT_GPT: &str = include_str!("prompt/gpt.txt");
 const PROMPT_ASTRA: &str = include_str!("prompt/gpt-astra.txt");
@@ -24,10 +26,89 @@ const PROMPT_META: &str = include_str!("prompt/meta.txt");
 const PROMPT_CODEX: &str = include_str!("prompt/codex.txt");
 const PROMPT_TRINITY: &str = include_str!("prompt/trinity.txt");
 
-/// `provider(model)` (system.ts:28-51) — the provider prompt for a model,
-/// dispatched on `model.api.id` (and `model.providerID` for kimi).
-pub fn provider(api_id: &str, provider_id: &str) -> Vec<String> {
+/// The model-family switch behind [`provider`].
+///
+/// The TS reference dispatches directly on `api_id`/`provider_id`; this enum
+/// exposes the same table as a value so prompt variants can be tested and
+/// extended without repeating the string checks at every call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptFamily {
+    Anthropic,
+    Astra,
+    Beast,
+    Codex,
+    DeepSeek,
+    Default,
+    Gemini,
+    Gpt,
+    Kimi,
+    Meta,
+    Trinity,
+}
+
+/// Classify a model into the prompt family used for its system prompt.
+///
+/// DeepSeek is an alforria extension: the TS reference falls through to
+/// `default.txt` for these models.
+pub fn family(api_id: &str, provider_id: &str) -> PromptFamily {
     if api_id.contains("muse") {
+        return PromptFamily::Meta;
+    }
+    if api_id.contains("gpt-4") || api_id.contains("o1") || api_id.contains("o3") {
+        return PromptFamily::Beast;
+    }
+    if api_id.contains("gpt") {
+        if api_id.contains("gpt-6") {
+            return PromptFamily::Astra;
+        }
+        if api_id.contains("codex") {
+            return PromptFamily::Codex;
+        }
+        return PromptFamily::Gpt;
+    }
+    if api_id.contains("gemini-") {
+        return PromptFamily::Gemini;
+    }
+    if api_id.contains("claude") {
+        return PromptFamily::Anthropic;
+    }
+    if api_id.to_lowercase().contains("trinity") {
+        return PromptFamily::Trinity;
+    }
+    if api_id.to_lowercase().contains("kimi")
+        || ["kimi-for-coding", "moonshotai", "moonshotai-cn"].contains(&provider_id)
+    {
+        return PromptFamily::Kimi;
+    }
+    if api_id.to_lowercase().contains("deepseek") || provider_id == "deepseek" {
+        return PromptFamily::DeepSeek;
+    }
+    PromptFamily::Default
+}
+
+/// The prompt variant for a family.
+pub fn prompt_for(family: PromptFamily) -> &'static str {
+    match family {
+        PromptFamily::Anthropic => PROMPT_ANTHROPIC,
+        PromptFamily::Astra => PROMPT_ASTRA,
+        PromptFamily::Beast => PROMPT_BEAST,
+        PromptFamily::Codex => PROMPT_CODEX,
+        PromptFamily::DeepSeek => PROMPT_DEEPSEEK,
+        PromptFamily::Default => PROMPT_DEFAULT,
+        PromptFamily::Gemini => PROMPT_GEMINI,
+        PromptFamily::Gpt => PROMPT_GPT,
+        PromptFamily::Kimi => PROMPT_KIMI,
+        PromptFamily::Meta => PROMPT_META,
+        PromptFamily::Trinity => PROMPT_TRINITY,
+    }
+}
+
+/// `provider(model)` (system.ts:28-51) — the provider prompt for a model,
+/// dispatched on `model.api.id` (and `model.providerID` for kimi), with a
+/// DeepSeek family added.
+pub fn provider(api_id: &str, provider_id: &str) -> Vec<String> {
+    let family = family(api_id, provider_id);
+    if family == PromptFamily::Meta {
         let name = if api_id.contains("muse-glimmer") {
             "Muse Glimmer"
         } else {
@@ -35,33 +116,7 @@ pub fn provider(api_id: &str, provider_id: &str) -> Vec<String> {
         };
         return vec![PROMPT_META.replace("{{MODEL_NAME}}", name)];
     }
-    if api_id.contains("gpt-4") || api_id.contains("o1") || api_id.contains("o3") {
-        return vec![PROMPT_BEAST.to_string()];
-    }
-    if api_id.contains("gpt") {
-        if api_id.contains("gpt-6") {
-            return vec![PROMPT_ASTRA.to_string()];
-        }
-        if api_id.contains("codex") {
-            return vec![PROMPT_CODEX.to_string()];
-        }
-        return vec![PROMPT_GPT.to_string()];
-    }
-    if api_id.contains("gemini-") {
-        return vec![PROMPT_GEMINI.to_string()];
-    }
-    if api_id.contains("claude") {
-        return vec![PROMPT_ANTHROPIC.to_string()];
-    }
-    if api_id.to_lowercase().contains("trinity") {
-        return vec![PROMPT_TRINITY.to_string()];
-    }
-    if api_id.to_lowercase().contains("kimi")
-        || ["kimi-for-coding", "moonshotai", "moonshotai-cn"].contains(&provider_id)
-    {
-        return vec![PROMPT_KIMI.to_string()];
-    }
-    vec![PROMPT_DEFAULT.to_string()]
+    vec![prompt_for(family).to_string()]
 }
 
 /// The model identity lines of `environment` (system.ts:74-104).
@@ -320,7 +375,53 @@ mod tests {
             provider("kimi-k2", "moonshot"),
             vec![PROMPT_KIMI.to_string()]
         );
+        assert_eq!(
+            provider("deepseek-v4.1-flash-thinking", "libertai"),
+            vec![PROMPT_DEEPSEEK.to_string()]
+        );
+        assert_eq!(
+            provider("deepseek-v4-flash", "deepseek"),
+            vec![PROMPT_DEEPSEEK.to_string()]
+        );
         assert_eq!(provider("whatever", "x"), vec![PROMPT_DEFAULT.to_string()]);
+    }
+
+    #[test]
+    fn family_switch() {
+        assert_eq!(
+            family("claude-sonnet-4-5", "anthropic"),
+            PromptFamily::Anthropic
+        );
+        assert_eq!(family("gpt-4o", "openai"), PromptFamily::Beast);
+        assert_eq!(family("o3-mini", "openai"), PromptFamily::Beast);
+        assert_eq!(family("gpt-6", "openai"), PromptFamily::Astra);
+        assert_eq!(family("gpt-5-codex", "openai"), PromptFamily::Codex);
+        assert_eq!(family("gpt-5", "openai"), PromptFamily::Gpt);
+        assert_eq!(family("gemini-2.5-pro", "models"), PromptFamily::Gemini);
+        assert_eq!(family("muse-glimmer", "meta"), PromptFamily::Meta);
+        assert_eq!(family("Trinity", "anthropic"), PromptFamily::Trinity);
+        assert_eq!(family("kimi-k2", "moonshot"), PromptFamily::Kimi);
+        assert_eq!(
+            family("deepseek-v4.1-flash", "libertai"),
+            PromptFamily::DeepSeek
+        );
+        assert_eq!(
+            family("DeepSeek-V4.1-Flash-1017", "custom"),
+            PromptFamily::DeepSeek
+        );
+        assert_eq!(family("some-model", "deepseek"), PromptFamily::DeepSeek);
+        assert_eq!(family("whatever", "x"), PromptFamily::Default);
+    }
+
+    #[test]
+    fn deepseek_prompt_is_a_first_party_variant() {
+        let prompt = prompt_for(PromptFamily::DeepSeek);
+        assert!(prompt.contains("powered by DeepSeek"));
+        assert!(prompt.contains("Use glob"));
+        assert!(prompt.contains("Use these tools directly"));
+        assert!(prompt.contains("priority"));
+        assert!(!prompt.contains("You are opencode"));
+        assert!(!prompt.contains("fewer than 4 lines"));
     }
 
     #[test]

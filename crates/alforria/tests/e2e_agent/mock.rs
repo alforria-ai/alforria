@@ -213,7 +213,7 @@ mod e2e_agent {
         let backend = MockBackend::new(scenarios::A11_SESSION_DIFF);
         scenarios::a11_session_diff(&backend).await;
 
-        assert_eq!(backend.requests().len(), 2, "one model request per step");
+        assert_eq!(backend.requests().len(), 3, "one model request per step");
     }
 
     // -------------------------------------------------------------------

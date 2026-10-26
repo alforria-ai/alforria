@@ -12,7 +12,7 @@ use crate::tool::external_directory::{assert_external_directory, ExternalOptions
 use crate::tool::ripgrep::{ts_dirname, ts_resolve, Ripgrep};
 use crate::tool::truncate::Truncate;
 
-const LIMIT: usize = 100;
+const LIMIT: usize = 250;
 
 #[derive(Debug, Deserialize)]
 pub struct GrepParameters {
@@ -329,7 +329,7 @@ mod tests {
     #[tokio::test]
     async fn ask_metadata_and_truncation_boundaries() {
         let temp = crate::storage::test_support::TempDir::new("grep-limit");
-        for i in 0..101 {
+        for i in 0..251 {
             write(temp.path(), &format!("f{i}.txt"), "match\n");
         }
         let (result, requests) = call(
@@ -343,19 +343,19 @@ mod tests {
             requests[0].metadata,
             json!({ "pattern": "match", "include": "*.txt" })
         );
-        assert_eq!(result.metadata["matches"], json!(100));
+        assert_eq!(result.metadata["matches"], json!(250));
         assert_eq!(result.metadata["truncated"], json!(true));
         assert!(result
             .output
-            .starts_with("Found 100 matches (more matches available)"));
+            .starts_with("Found 250 matches (more matches available)"));
         assert!(result
             .output
             .ends_with("\n\n(Results truncated. Consider using a more specific path or pattern.)"));
         std::fs::remove_dir_all(temp.path()).ok();
 
-        // 99 matches -> no truncation footer.
+        // 249 matches -> no truncation footer.
         let temp = crate::storage::test_support::TempDir::new("grep-limit2");
-        for i in 0..99 {
+        for i in 0..249 {
             write(temp.path(), &format!("f{i}.txt"), "match\n");
         }
         let (result, _) = call(
@@ -365,7 +365,7 @@ mod tests {
         .await;
         let result = result.unwrap();
         assert_eq!(result.metadata["truncated"], json!(false));
-        assert!(result.output.starts_with("Found 99 matches\n"));
+        assert!(result.output.starts_with("Found 249 matches\n"));
         assert!(!result.output.contains("(Results truncated"));
         std::fs::remove_dir_all(temp.path()).ok();
     }

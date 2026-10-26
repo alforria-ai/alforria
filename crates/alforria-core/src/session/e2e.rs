@@ -516,6 +516,11 @@ mod tests {
             vec![
                 tool_call_step(vec![tool_call_event(
                     "cal_1",
+                    "read",
+                    json!({ "filePath": "a.txt" }),
+                )]),
+                tool_call_step(vec![tool_call_event(
+                    "cal_2",
                     "write",
                     json!({ "filePath": "a.txt", "content": "v2\n" }),
                 )]),

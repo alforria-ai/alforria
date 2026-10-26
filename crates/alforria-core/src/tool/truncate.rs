@@ -4,11 +4,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use alforria_schema::permission_v1::PermissionV1Action;
 use ulid::Ulid;
 
 use crate::tool::def::{AgentInfo, BoxFuture};
-use crate::tool::permission::evaluate;
 
 pub const MAX_LINES: usize = 2000;
 pub const MAX_BYTES: usize = 50 * 1024; // 50 KB
@@ -63,15 +61,6 @@ pub trait Truncate: Send + Sync {
         opts: Options,
         agent: Option<&'a AgentInfo>,
     ) -> BoxFuture<'a, TruncResult>;
-}
-
-/// `hasTaskTool` (truncate.ts:27-30): agents whose ruleset does not deny the
-/// `task` tool get the "delegate to explore agent" hint variant.
-fn has_task_tool(agent: Option<&AgentInfo>) -> bool {
-    match agent {
-        None => false,
-        Some(a) => evaluate("task", "*", &[&a.permission]).action != PermissionV1Action::Deny,
-    }
 }
 
 /// Production implementation over the local filesystem. The truncation
@@ -179,7 +168,7 @@ impl Truncate for TruncateService {
         &'a self,
         text: &'a str,
         opts: Options,
-        agent: Option<&'a AgentInfo>,
+        _agent: Option<&'a AgentInfo>,
     ) -> BoxFuture<'a, TruncResult> {
         Box::pin(async move {
             let (resolved_lines, resolved_bytes) = self.limits().await;
@@ -241,15 +230,9 @@ impl Truncate for TruncateService {
             let output_path = self.write(text).await;
             let file = output_path.display();
 
-            let hint = if has_task_tool(agent) {
-                format!(
-                    "The tool call succeeded but the output was truncated. Full output saved to: {file}\nUse the Task tool to have explore agent process this file with Grep and Read (with offset/limit). Do NOT read the full file yourself - delegate to save context."
-                )
-            } else {
-                format!(
-                    "The tool call succeeded but the output was truncated. Full output saved to: {file}\nUse Grep to search the full content or Read with offset/limit to view specific sections."
-                )
-            };
+            let hint = format!(
+                "The tool call succeeded but the output was truncated. Full output saved to: {file}\nUse Grep to search the full content or Read with offset/limit to view specific sections."
+            );
 
             let content = match direction {
                 Direction::Head => {
@@ -272,8 +255,6 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
-    use crate::tool::permission::Ruleset;
-    use alforria_schema::permission_v1::{PermissionV1Action, PermissionV1Rule};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -285,23 +266,6 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         dir
-    }
-
-    fn agent(permission: Ruleset) -> Option<AgentInfo> {
-        Some(AgentInfo {
-            name: "build".to_string(),
-            description: None,
-            mode: crate::tool::def::AgentMode::Primary,
-            permission,
-        })
-    }
-
-    fn deny_rule() -> PermissionV1Rule {
-        PermissionV1Rule {
-            permission: "task".to_string(),
-            pattern: "*".to_string(),
-            action: PermissionV1Action::Deny,
-        }
     }
 
     #[tokio::test]
@@ -394,28 +358,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn output_task_hint_variant() {
+    async fn output_truncation_hint_uses_direct_tools() {
         let dir = temp();
         let svc = TruncateService::new(dir.clone(), 1, 50_000);
-        let a = agent(vec![]);
-        let result = svc.output("a\nb\nc", Options::default(), a.as_ref()).await;
-        match result {
-            TruncResult::Truncated { content, .. } => {
-                assert!(content.contains("Use the Task tool to have explore agent process this file with Grep and Read (with offset/limit). Do NOT read the full file yourself - delegate to save context."));
-            }
-            _ => panic!("expected truncated"),
-        }
-        // Denying task falls back to the plain variant.
-        let result = svc
-            .output(
-                "a\nb\nc",
-                Options::default(),
-                agent(vec![deny_rule()]).as_ref(),
-            )
-            .await;
+        let result = svc.output("a\nb\nc", Options::default(), None).await;
         match result {
             TruncResult::Truncated { content, .. } => {
                 assert!(content.contains("Use Grep to search the full content or Read with offset/limit to view specific sections."));
+                assert!(!content.contains("Use the Task tool"));
             }
             _ => panic!("expected truncated"),
         }

@@ -9,7 +9,7 @@ use crate::format::Formatter;
 use crate::tool::bom;
 use crate::tool::def::{define, Agents, AskRequest, BoxFuture, ExecuteResult, ToolCtxRef, ToolDef};
 use crate::tool::diff::create_two_files_patch;
-use crate::tool::edit::{diagnostic_report, trim_diff, FileEvents, Lsp};
+use crate::tool::edit::{diagnostic_report, file_was_observed, trim_diff, FileEvents, Lsp};
 use crate::tool::error::ToolError;
 use crate::tool::external_directory::{assert_external_directory, ExternalOptions};
 use crate::tool::ripgrep::{ts_relative, ts_resolve};
@@ -80,6 +80,11 @@ fn run(
         assert_external_directory(&ctx, Some(&file_str), ExternalOptions::default()).await?;
 
         let exists = tokio::fs::metadata(&file_path).await.is_ok();
+        if exists && !file_was_observed(&ctx, &file_path) {
+            return Err(ToolError::Failed(format!(
+                "File {file_str} has not been read in this session. Read it before overwriting."
+            )));
+        }
         let source = if exists {
             bom::read_file(&file_path).await?
         } else {
@@ -246,6 +251,23 @@ mod tests {
         (result, ask.requests(), metadata)
     }
 
+    async fn call_with_messages(
+        dir: &Path,
+        events: Arc<dyn FileEvents>,
+        args: Value,
+        messages: &[Value],
+    ) -> Result<ExecuteResult, ToolError> {
+        let def = tool(dir, None, events);
+        let ask = RecordingAsk::new();
+        let inst = instance(dir);
+        let extra = Extra::default();
+        let c = ToolCtxRef {
+            messages,
+            ..ctx(&ask, &inst, &extra)
+        };
+        (def.execute)(args, c).await
+    }
+
     fn events() -> Arc<RecordingEvents> {
         Arc::new(RecordingEvents::default())
     }
@@ -339,6 +361,48 @@ mod tests {
                 format!("updated:{}:change", file.display()),
             ]
         );
+        std::fs::remove_dir_all(temp.path()).ok();
+    }
+
+    #[tokio::test]
+    async fn write_requires_a_prior_read_for_existing_files() {
+        let temp = crate::storage::test_support::TempDir::new("write-read-guard");
+        let file = temp.path().join("file.txt");
+        std::fs::write(&file, "old\n").unwrap();
+        let args = json!({
+            "content": "new\n",
+            "filePath": file.to_string_lossy(),
+        });
+
+        let unread = vec![json!({
+            "parts": [{
+                "type": "tool",
+                "tool": "bash",
+                "state": { "status": "completed", "input": { "command": "echo hi" } }
+            }]
+        })];
+        let result = call_with_messages(temp.path(), events(), args.clone(), &unread).await;
+        assert!(matches!(
+            result,
+            Err(ToolError::Failed(message)) if message.contains("has not been read")
+        ));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "old\n");
+
+        let read = vec![json!({
+            "parts": [{
+                "type": "tool",
+                "tool": "read",
+                "state": {
+                    "status": "completed",
+                    "input": { "filePath": file.to_string_lossy() }
+                }
+            }]
+        })];
+        let result = call_with_messages(temp.path(), events(), args, &read)
+            .await
+            .unwrap();
+        assert_eq!(result.metadata["exists"], json!(true));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\n");
         std::fs::remove_dir_all(temp.path()).ok();
     }
 
