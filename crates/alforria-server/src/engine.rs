@@ -27,19 +27,26 @@ use alforria_core::session::snapshot::Snapshot;
 use alforria_core::session::subtask::{SessionSubtask, SubtaskDeps};
 use alforria_core::session::summary::{SessionSummary, SummaryDeps};
 use alforria_core::session::task_ops::ProductionTaskOps;
+use alforria_core::session::workflow_ops::ProductionWorkflowOps;
 use alforria_core::tool::def::InstanceContext;
 use alforria_core::tool::registry::{RuntimeFlags, ToolRegistry};
 use alforria_core::tool::task::BackgroundMode;
+use alforria_core::tool::workflow::Workflows;
 use alforria_core::{
     BackgroundJobService, Clock, CoreError, SessionError, SessionServices, WithParts,
 };
 use alforria_schema::file_diff::SnapshotFileDiff;
 use alforria_schema::session_v1::V1SessionInfo;
+use alforria_schema::workflow::{
+    WorkflowDefinition, WorkflowRun, WorkflowSaveRequest, WorkflowStartRequest,
+};
 use futures::future::BoxFuture;
 
 use crate::error::ServerError;
 use crate::middleware::location::LocationContext;
 use crate::state::{EngineFactory, SessionEngine, ToolRegistrySource};
+use alforria_core::workflow::service::WorkflowService;
+use alforria_core::workflow::{WorkflowOps, WorkflowSettings};
 
 /// `Config.boolean(name).pipe(Config.withDefault(false))` — Effect accepts
 /// the same truthy strings as the project registry (project/registry.rs).
@@ -227,6 +234,8 @@ pub struct ProductionEngine {
     models: Arc<dyn alforria_core::session::r#loop::ModelSource>,
     defaults: Arc<dyn alforria_core::session::prompt_input::Models>,
     llm: Arc<dyn LlmStream>,
+    /// Saved workflows + run progress (alforria extension).
+    workflows: Arc<WorkflowService>,
 }
 
 /// The [`SessionEngine`] surface (`state.rs`) over the M5 services. The
@@ -308,6 +317,126 @@ impl SessionEngine for ProductionEngine {
                 context,
             )
             .await
+        })
+    }
+
+    fn workflow_list(&self) -> BoxFuture<'static, Result<Vec<WorkflowDefinition>, ServerError>> {
+        let workflows = self.workflows.clone();
+        Box::pin(async move { Ok(workflows.definitions()) })
+    }
+
+    fn workflow_runs(&self) -> BoxFuture<'static, Result<Vec<WorkflowRun>, ServerError>> {
+        let workflows = self.workflows.clone();
+        Box::pin(async move { Ok(workflows.runs()) })
+    }
+
+    fn workflow_start(
+        &self,
+        request: WorkflowStartRequest,
+    ) -> BoxFuture<'static, Result<WorkflowRun, ServerError>> {
+        let workflows = self.workflows.clone();
+        Box::pin(async move { workflows.start(request).map_err(workflow_error) })
+    }
+
+    fn workflow_get(
+        &self,
+        run_id: String,
+    ) -> BoxFuture<'static, Result<Option<WorkflowRun>, ServerError>> {
+        let workflows = self.workflows.clone();
+        Box::pin(async move { Ok(workflows.get(&run_id)) })
+    }
+
+    fn workflow_wait(
+        &self,
+        run_id: String,
+    ) -> BoxFuture<'static, Result<WorkflowRun, ServerError>> {
+        let workflows = self.workflows.clone();
+        Box::pin(async move { workflows.wait(&run_id).await.map_err(workflow_error) })
+    }
+
+    fn workflow_abort(
+        &self,
+        run_id: String,
+    ) -> BoxFuture<'static, Result<WorkflowRun, ServerError>> {
+        let workflows = self.workflows.clone();
+        Box::pin(async move { workflows.abort(&run_id).await.map_err(workflow_error) })
+    }
+
+    fn workflow_save(
+        &self,
+        request: WorkflowSaveRequest,
+    ) -> Result<WorkflowDefinition, ServerError> {
+        self.workflows.save(request).map_err(workflow_error)
+    }
+
+    fn workflow_delete(&self, name: String) -> Result<bool, ServerError> {
+        self.workflows.delete(&name).map_err(workflow_error)
+    }
+}
+
+fn workflow_error(message: String) -> ServerError {
+    ServerError::Core(CoreError::Storage(message))
+}
+
+/// The `Workflows` tool seam over the instance service.
+struct WorkflowSeam(Arc<WorkflowService>);
+
+impl Workflows for WorkflowSeam {
+    fn list<'a>(
+        &'a self,
+    ) -> BoxFuture<'a, Result<Vec<WorkflowDefinition>, alforria_core::tool::error::ToolError>> {
+        Box::pin(async move { Ok(self.0.definitions()) })
+    }
+
+    fn start<'a>(
+        &'a self,
+        session_id: &'a str,
+        mut request: WorkflowStartRequest,
+    ) -> BoxFuture<'a, Result<WorkflowRun, alforria_core::tool::error::ToolError>> {
+        request.session_id = Some(session_id.to_string());
+        let service = self.0.clone();
+        Box::pin(async move {
+            service
+                .start(request)
+                .map_err(alforria_core::tool::error::ToolError::Failed)
+        })
+    }
+
+    fn get<'a>(
+        &'a self,
+        run_id: &'a str,
+    ) -> BoxFuture<'a, Result<Option<WorkflowRun>, alforria_core::tool::error::ToolError>> {
+        Box::pin(async move { Ok(self.0.get(run_id)) })
+    }
+
+    fn latest_for_session<'a>(
+        &'a self,
+        session_id: &'a str,
+    ) -> BoxFuture<'a, Result<Option<WorkflowRun>, alforria_core::tool::error::ToolError>> {
+        Box::pin(async move { Ok(self.0.latest_for_session(session_id)) })
+    }
+
+    fn wait<'a>(
+        &'a self,
+        run_id: &'a str,
+    ) -> BoxFuture<'a, Result<WorkflowRun, alforria_core::tool::error::ToolError>> {
+        Box::pin(async move {
+            self.0
+                .wait(run_id)
+                .await
+                .map_err(alforria_core::tool::error::ToolError::Failed)
+        })
+    }
+
+    fn abort<'a>(
+        &'a self,
+        run_id: &'a str,
+    ) -> BoxFuture<'a, Result<WorkflowRun, alforria_core::tool::error::ToolError>> {
+        Box::pin(async move {
+            self.0
+                .abort(run_id)
+                .await
+                .map_err(alforria_core::tool::error::ToolError::Failed)
         })
     }
 }
@@ -680,6 +809,34 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
         worktree: input.worktree.clone(),
         workspace_id: None,
     };
+    let workflow_ops = ProductionWorkflowOps::new(
+        services.sessions.clone(),
+        context.clone(),
+        services.agents.clone(),
+    );
+    let workflow_config = input.config.workflows.clone().unwrap_or_default();
+    let workflow_settings = WorkflowSettings {
+        directory: input.directory.clone(),
+        worktree: input.worktree.clone(),
+        config: input.paths.config.clone(),
+        home: input.paths.home.clone(),
+        config_dirs: input.config_dirs.clone(),
+        paths: workflow_config.paths.clone().unwrap_or_default(),
+        state: input.paths.state.clone(),
+        enabled: workflow_config.enabled.unwrap_or(true) && !bool_env("OPENCODE_DISABLE_WORKFLOWS"),
+        max_concurrent: std::env::var("OPENCODE_WORKFLOW_MAX_CONCURRENT_AGENTS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .or(workflow_config.max_concurrent.map(|value| value as usize))
+            .unwrap_or(WorkflowSettings::DEFAULT_MAX_CONCURRENT),
+        max_agents: WorkflowSettings::DEFAULT_MAX_AGENTS,
+        claude_compat: workflow_config.claude_compat.unwrap_or(true)
+            && !bool_env("OPENCODE_DISABLE_CLAUDE_CODE"),
+    };
+    let workflows = WorkflowService::new(
+        workflow_ops.clone() as Arc<dyn WorkflowOps>,
+        workflow_settings,
+    );
 
     // Provider-runtime seams — the M7.7 production runtime (models +
     // route sender) unless the e2e tests script a mock LLM here.
@@ -895,6 +1052,11 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
             skill_service.clone(),
             ripgrep.clone(),
         ),
+        alforria_core::tool::workflow::workflow_tool(
+            truncate.clone(),
+            agents.clone(),
+            Arc::new(WorkflowSeam(workflows.clone())),
+        ),
         alforria_core::tool::apply_patch::apply_patch_tool(
             truncate.clone(),
             agents.clone(),
@@ -1026,6 +1188,7 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
     });
 
     ops.bind(prompt.clone());
+    workflow_ops.bind(prompt.clone());
 
     // M7.5: the share network service (share-next.ts) behind its HTTP +
     // account seams, wrapped in the SessionShare gate/auto-share service
@@ -1072,6 +1235,7 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
         models,
         defaults: Arc::new(runtime_models),
         llm,
+        workflows,
     }))
 }
 

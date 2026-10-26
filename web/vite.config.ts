@@ -31,6 +31,7 @@ const api = [
   "/mcp",
   "/lsp",
   "/auth",
+  "/workflow",
   "/api",
   "/experimental",
   "/doc",

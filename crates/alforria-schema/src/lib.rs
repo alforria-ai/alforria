@@ -83,3 +83,6 @@ pub mod session_v1;
 // M1.11 — Envelopes & manifest unions
 pub mod event;
 pub mod event_manifest;
+
+// alforria extension — dynamic workflows (no TS reference)
+pub mod workflow;

@@ -29,6 +29,7 @@ pub mod truncate;
 pub mod truncation_dir;
 pub mod webfetch;
 pub mod websearch;
+pub mod workflow;
 pub mod write;
 
 pub use def::{

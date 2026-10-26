@@ -3,12 +3,13 @@
 //   #/                      overview (queue + session table)
 //   #/focus/<col>,<col>     focus columns; a col is a session id or term:<projectID>
 //   #/settings/<page>       settings
+//   #/workflows             saved workflows + run progress
 // On phones the same state drives three tabs (queue / sessions / focus); the
 // visible view and the highlighted tab can never disagree because both are
 // derived from `nav`.
 import { createStore, produce } from "solid-js/store"
 
-export type View = "overview" | "focus" | "settings"
+export type View = "overview" | "focus" | "settings" | "workflows"
 export type ColumnTab = "transcript" | "changes" | "files"
 
 export type Column =
@@ -44,6 +45,7 @@ export function routeHash(n: Nav = nav) {
   if (n.view === "focus" && n.columns.length)
     return `#/focus/${n.columns.map((c) => (c.kind === "session" ? c.session : `term:${c.project}`)).join(",")}`
   if (n.view === "settings") return `#/settings/${n.settingsPage}`
+  if (n.view === "workflows") return "#/workflows"
   return "#/"
 }
 
@@ -94,6 +96,9 @@ export function applyHash(hash = location.hash) {
         if (n.view !== "settings") n.back = n.view
         n.settingsPage = arg || "providers"
         n.view = "settings"
+      } else if (view === "workflows") {
+        if (n.view === "settings") n.back = "workflows"
+        n.view = "workflows"
       } else {
         n.view = "overview"
       }

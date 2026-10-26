@@ -86,6 +86,15 @@ describe("hash routes", () => {
     expect(nav.view).toBe("focus")
   })
 
+  test("workflows is a first-class hash route", () => {
+    applyHash("#/workflows")
+    expect(nav.view).toBe("workflows")
+    expect(routeHash()).toBe("#/workflows")
+    openSettings("providers")
+    leaveSettings()
+    expect(nav.view).toBe("workflows")
+  })
+
   test("focus with no columns falls back to the overview", () => {
     setView("focus")
     expect(nav.view).toBe("overview")

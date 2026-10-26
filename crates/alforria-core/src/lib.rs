@@ -33,6 +33,7 @@ pub mod skill;
 pub mod storage;
 pub mod tool;
 pub mod vcs;
+pub mod workflow;
 pub mod worktree;
 
 use std::path::PathBuf;

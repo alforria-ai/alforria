@@ -4,10 +4,11 @@ import { Show } from "solid-js"
 import { Icon } from "../ui/icons"
 
 export function MobileTabs(props: {
-  pane: "queue" | "sessions" | "focus" | "settings"
+  pane: "queue" | "sessions" | "focus" | "settings" | "workflows"
   waiting: number
   canFocus: boolean
   onPane: (p: "queue" | "sessions" | "focus") => void
+  onWorkflows: () => void
 }) {
   return (
     <nav class="mobile-tabs" aria-label="Views">
@@ -27,6 +28,10 @@ export function MobileTabs(props: {
       <button aria-current={props.pane === "focus"} disabled={!props.canFocus} onClick={() => props.onPane("focus")}>
         <Icon name="columns" />
         <span>Focus</span>
+      </button>
+      <button aria-current={props.pane === "workflows"} onClick={props.onWorkflows}>
+        <Icon name="workflow" />
+        <span>Workflows</span>
       </button>
     </nav>
   )
