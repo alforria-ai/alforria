@@ -246,6 +246,31 @@ pub struct SkillsInfo {
 }
 
 // ---------------------------------------------------------------------------
+// workflows (alforria extension)
+// ---------------------------------------------------------------------------
+
+/// `workflows` — saved orchestration scripts and the runtime's fan-out limits.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowsInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paths: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(
+        rename = "maxConcurrent",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_concurrent: Option<u64>,
+    #[serde(
+        rename = "claudeCompat",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub claude_compat: Option<bool>,
+}
+
+// ---------------------------------------------------------------------------
 // config/reference.ts
 // ---------------------------------------------------------------------------
 
@@ -1191,6 +1216,8 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skills: Option<SkillsInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflows: Option<WorkflowsInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub references: Option<ReferenceInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reference: Option<ReferenceInfo>,
@@ -1319,6 +1346,7 @@ fn collect_issues(value: &serde_json::Value) -> Vec<crate::SchemaIssue> {
             "server" => check!(issues, key, ServerInfo),
             "command" => check!(issues, key, BTreeMap<String, CommandInfo>),
             "skills" => check!(issues, key, SkillsInfo),
+            "workflows" => check!(issues, key, WorkflowsInfo),
             "references" => check!(issues, key, ReferenceInfo),
             "reference" => check!(issues, key, ReferenceInfo),
             "watcher" => check!(issues, key, WatcherInfo),

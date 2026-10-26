@@ -15,6 +15,8 @@ import type {
   Session,
   SessionStatus,
   Todo,
+  WorkflowDefinition,
+  WorkflowRun,
 } from "./types"
 
 export class ApiError extends Error {
@@ -276,6 +278,26 @@ export const api = {
   mcpConnect: (name: string, directory?: string) => request<boolean>("POST", `/mcp/${name}/connect`, { directory }),
   mcpDisconnect: (name: string, directory?: string) =>
     request<boolean>("POST", `/mcp/${name}/disconnect`, { directory }),
+
+  // Workflows (alforria extension)
+  workflows: (directory: string) => request<WorkflowDefinition[]>("GET", "/workflow", { directory }),
+  saveWorkflow: (
+    directory: string,
+    body: { name: string; description?: string; script: string; scope?: "project" | "global" },
+  ) => request<WorkflowDefinition>("POST", "/workflow", { directory, body }),
+  deleteWorkflow: (directory: string, name: string) =>
+    request<{ deleted: boolean }>("DELETE", `/workflow/${encodeURIComponent(name)}`, { directory }),
+  workflowRuns: (directory: string) => request<WorkflowRun[]>("GET", "/workflow/run", { directory }),
+  startWorkflow: (
+    directory: string,
+    body: { name?: string; script?: string; description?: string; args?: unknown; sessionID?: string },
+  ) => request<WorkflowRun>("POST", "/workflow/run", { directory, body }),
+  workflowRun: (directory: string, runID: string) =>
+    request<WorkflowRun | null>("GET", `/workflow/run/${encodeURIComponent(runID)}`, { directory }),
+  waitWorkflow: (directory: string, runID: string) =>
+    request<WorkflowRun>("POST", `/workflow/run/${encodeURIComponent(runID)}/wait`, { directory }),
+  abortWorkflow: (directory: string, runID: string) =>
+    request<WorkflowRun>("POST", `/workflow/run/${encodeURIComponent(runID)}/abort`, { directory }),
 
   // Catalog
   providers: (directory?: string) => request<ProviderList>("GET", "/config/providers", { directory }),

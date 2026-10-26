@@ -32,7 +32,7 @@ function onTable(el: Element | null) {
   return !el || el === document.body || el.matches("table.reg, tr.s-row")
 }
 
-export function bindKeys(view: () => "overview" | "focus" | "settings", a: KeyActions) {
+export function bindKeys(view: () => "overview" | "focus" | "settings" | "workflows", a: KeyActions) {
   const onKey = (e: KeyboardEvent) => {
     // An open dialog owns the keyboard; the app behind it is inert.
     if (e.defaultPrevented || modalOpen()) return

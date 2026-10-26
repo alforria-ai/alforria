@@ -6,6 +6,7 @@ pub mod doc;
 pub mod ui;
 pub mod v1;
 pub mod v2;
+pub mod workflow;
 
 use std::sync::Arc;
 
@@ -28,6 +29,9 @@ pub fn build_router(ctx: Arc<ServerContext>) -> Router {
     router = router
         .route("/doc", get(doc::doc))
         .route("/openapi.json", get(doc::openapi_json));
+    // alforria extension — dynamic workflows. Kept outside the frozen
+    // v1/v2 tables so the TS OpenAPI surface stays byte-identical.
+    router = workflow::register(router);
 
     let router = router
         .fallback(ui::serve_ui_handler)

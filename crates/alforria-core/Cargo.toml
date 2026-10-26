@@ -41,6 +41,7 @@ ulid = { workspace = true }
 regex = { workspace = true }
 rust_decimal = { workspace = true }
 tracing = { workspace = true }
+rquickjs = { workspace = true }
 
 [dev-dependencies]
 # `start_paused` for the M5.8 retry tests (deterministic clocks, no sleeps)
