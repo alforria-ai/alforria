@@ -1,0 +1,110 @@
+name: Bug report
+description: Report something that does not work as documented
+title: 'bug: '
+labels: ['bug']
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Please search existing issues first, and
+        remove secrets, API keys, and transcript contents from anything you
+        paste here.
+
+        For security vulnerabilities, do not use this form. Follow
+        [SECURITY.md](https://github.com/alforria-ai/alforria/blob/main/SECURITY.md).
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and did not find a duplicate.
+          required: true
+        - label: I am running a current release or a recent build from main.
+          required: true
+  - type: input
+    id: version
+    attributes:
+      label: alforria version
+      description: Output of `alforria --version`.
+      placeholder: alforria 0.2.0
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Linux
+        - macOS
+        - Windows
+        - WSL
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: Install method
+      options:
+        - install.sh
+        - Prebuilt release binary
+        - Built from source (cargo install / cargo build)
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Surface
+      options:
+        - Terminal UI
+        - CLI (run, sessions, stats, export/import)
+        - Local server (serve, API, SSE, PTY)
+        - Web client
+        - Provider or model setup
+        - Build or packaging
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: A clear description of the actual behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+      description: What should have happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Include the command, config, and a minimal project if possible.
+      placeholder: |
+        1. Run `alforria ...`
+        2. ...
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Relevant configuration
+      description: Paste the relevant parts of opencode.json, tui.json, or agent files. Redact credentials.
+      render: json
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Run with `--print-logs --log-level DEBUG` and paste the relevant lines. Redact secrets.
+      render: shell
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Provider/model, terminal, reverse proxy setup, or anything else that might matter.
