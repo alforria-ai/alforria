@@ -31,7 +31,7 @@ dependencies = [
 
 [[package]]
 name = "alforria"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "alforria-core",
  "alforria-llm",
@@ -59,7 +59,7 @@ dependencies = [
 
 [[package]]
 name = "alforria-core"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "alforria-llm",
  "alforria-schema",
@@ -102,7 +102,7 @@ dependencies = [
 
 [[package]]
 name = "alforria-llm"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "alforria-schema",
  "eventsource-stream",
@@ -120,7 +120,7 @@ dependencies = [
 
 [[package]]
 name = "alforria-schema"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "serde",
@@ -130,7 +130,7 @@ dependencies = [
 
 [[package]]
 name = "alforria-server"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "alforria-core",
  "alforria-llm",
@@ -163,7 +163,7 @@ dependencies = [
 
 [[package]]
 name = "alforria-tui"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "alforria-core",
  "alforria-llm",
@@ -196,7 +196,7 @@ dependencies = [
 
 [[package]]
 name = "alforria-ui"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "tar",
  "tracing",
