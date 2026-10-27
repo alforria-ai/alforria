@@ -19,15 +19,15 @@
   "dependencies": {
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/xterm": "^6.0.0",
-    "marked": "^18.0.14",
+    "marked": "^18.1.1",
     "shiki": "^4.5.0",
     "solid-js": "^1.9"
   },
   "devDependencies": {
-    "@types/bun": "^1.4.2",
+    "@types/bun": "^1.4.4",
     "axe-core": "4",
     "openapi-typescript": "^7",
-    "playwright": "1.59.1",
+    "playwright": "1.64.1",
     "prettier": "^3",
     "typescript": "^5.9",
     "vite": "^7",
