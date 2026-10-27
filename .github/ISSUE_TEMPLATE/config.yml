@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation
+    url: https://alforria.ai/docs/
+    about: Installation, configuration, CLI reference, server API, and troubleshooting.
+  - name: Report a security vulnerability
+    url: https://github.com/alforria-ai/alforria/security/advisories/new
+    about: Report vulnerabilities privately. Do not open a public issue.
+  - name: Releases
+    url: https://github.com/alforria-ai/alforria/releases
+    about: Download binaries and read release notes.
