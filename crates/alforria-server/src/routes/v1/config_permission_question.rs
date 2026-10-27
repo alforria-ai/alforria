@@ -108,17 +108,35 @@ pub async fn permission_list(
 
 /// `reply` (`handlers/permission.ts:20-43`).
 pub async fn permission_reply(
+    State(ctx): State<Arc<ServerContext>>,
     axum::Extension(location): axum::Extension<LocationContext>,
     PathParam(request_id): PathParam<String>,
     body: Bytes,
 ) -> Result<Response, ServerError> {
     require_param("per", &request_id)?;
     let payload: PermissionReplyPayload = parse_payload(&body)?;
-    match location.services.permission.reply(PermissionV1ReplyInput {
+    let input = PermissionV1ReplyInput {
         request_id: request_id.clone(),
         reply: payload.reply,
         message: payload.message,
-    }) {
+    };
+    let mut result = location.services.permission.reply(input.clone());
+    if matches!(result, Err(alforria_core::PermissionError::NotFound { .. })) {
+        // Pending requests live in their directory's instance. A client can
+        // lose that directory (a dropped `?directory=`, a stale session row,
+        // or a prompt shown from another project's instance), so answer by
+        // request id from any other loaded instance before giving up.
+        for services in ctx.instances.cached() {
+            if Arc::ptr_eq(&services, &location.services) {
+                continue;
+            }
+            if services.permission.reply(input.clone()).is_ok() {
+                result = Ok(());
+                break;
+            }
+        }
+    }
+    match result {
         Ok(()) => Ok(json_ok(true)),
         Err(alforria_core::PermissionError::NotFound { request_id }) => {
             Err(ApiError::PermissionNotFound {
@@ -149,17 +167,34 @@ pub async fn question_list(
 
 /// `reply` (`handlers/question.ts:19-44`).
 pub async fn question_reply(
+    State(ctx): State<Arc<ServerContext>>,
     axum::Extension(location): axum::Extension<LocationContext>,
     PathParam(request_id): PathParam<String>,
     body: Bytes,
 ) -> Result<Response, ServerError> {
     require_param("que", &request_id)?;
     let payload: QuestionReplyPayload = parse_payload(&body)?;
-    match location
+    let mut result = location
         .services
         .question
-        .reply(&request_id, payload.answers)
-    {
+        .reply(&request_id, payload.answers.clone());
+    if matches!(result, Err(alforria_core::QuestionError::NotFound { .. })) {
+        // Same id-across-instances fallback as `permission_reply`.
+        for services in ctx.instances.cached() {
+            if Arc::ptr_eq(&services, &location.services) {
+                continue;
+            }
+            if services
+                .question
+                .reply(&request_id, payload.answers.clone())
+                .is_ok()
+            {
+                result = Ok(());
+                break;
+            }
+        }
+    }
+    match result {
         Ok(()) => Ok(json_ok(true)),
         Err(alforria_core::QuestionError::NotFound { request_id }) => {
             Err(ApiError::QuestionNotFound {
@@ -174,11 +209,24 @@ pub async fn question_reply(
 
 /// `reject` (`handlers/question.ts:46-62`).
 pub async fn question_reject(
+    State(ctx): State<Arc<ServerContext>>,
     axum::Extension(location): axum::Extension<LocationContext>,
     PathParam(request_id): PathParam<String>,
 ) -> Result<Response, ServerError> {
     require_param("que", &request_id)?;
-    match location.services.question.reject(&request_id) {
+    let mut result = location.services.question.reject(&request_id);
+    if matches!(result, Err(alforria_core::QuestionError::NotFound { .. })) {
+        for services in ctx.instances.cached() {
+            if Arc::ptr_eq(&services, &location.services) {
+                continue;
+            }
+            if services.question.reject(&request_id).is_ok() {
+                result = Ok(());
+                break;
+            }
+        }
+    }
+    match result {
         Ok(()) => Ok(json_ok(true)),
         Err(alforria_core::QuestionError::NotFound { request_id }) => {
             Err(ApiError::QuestionNotFound {
