@@ -84,6 +84,8 @@ pub struct QuestionService {
 
 /// Removes the pending entry when the ask future is dropped
 /// (question/index.ts:106-112 — `Effect.ensuring(pending.delete(id))`).
+/// An entry still waiting here was abandoned by its turn, so a
+/// `question.rejected` event is published to clear clients showing it.
 struct PendingCleanup<'a> {
     service: &'a QuestionService,
     id: String,
@@ -91,9 +93,25 @@ struct PendingCleanup<'a> {
 
 impl Drop for PendingCleanup<'_> {
     fn drop(&mut self) {
-        self.service
-            .lock_pending()
-            .retain(|entry| entry.info.id != self.id);
+        // A reply/reject removes the entry first, so a hit here means the ask
+        // was abandoned (turn aborted, request dropped) with the prompt still
+        // listed. Publish the rejection clients need to clear it.
+        let removed = {
+            let mut pending = self.service.lock_pending();
+            pending
+                .iter()
+                .position(|entry| entry.info.id == self.id)
+                .map(|position| pending.remove(position))
+        };
+        if let Some(entry) = removed {
+            let data = serde_json::to_value(QuestionRejectedData {
+                session_id: entry.info.session_id.clone(),
+                request_id: entry.info.id.clone(),
+            });
+            if let Ok(data) = data {
+                let _ = self.service.publish(&QUESTION_REJECTED, data);
+            }
+        }
     }
 }
 
@@ -152,6 +170,10 @@ impl QuestionService {
                 done,
             });
         }
+        let guard = PendingCleanup {
+            service: self,
+            id: info.id.clone(),
+        };
         let data = serde_json::to_value(QuestionAskedData {
             id: info.id.clone(),
             session_id: info.session_id.clone(),
@@ -161,10 +183,6 @@ impl QuestionService {
         .map_err(|err| QuestionError::Publish(err.to_string()))?;
         self.publish(&QUESTION_ASKED, data)?;
 
-        let guard = PendingCleanup {
-            service: self,
-            id: info.id.clone(),
-        };
         let result = match rx.await {
             Ok(result) => result,
             // The service went away with the ask still pending — the TS
@@ -334,6 +352,27 @@ mod tests {
         let error = handle.await.unwrap().unwrap_err();
         assert_eq!(error, QuestionError::Rejected);
         assert_eq!(error.to_string(), "The user dismissed this question");
+    }
+
+    #[tokio::test]
+    async fn dropped_ask_publishes_rejected_and_clears_pending() {
+        let events = bus();
+        let service = Arc::new(QuestionService::new(Arc::clone(&events)));
+        let mut asked = events.subscribe("question.asked");
+        let mut rejected = events.subscribe("question.rejected");
+        let handle = {
+            let service = Arc::clone(&service);
+            let input = ask_input();
+            tokio::spawn(async move { service.ask(input).await })
+        };
+        recv(&mut asked, "question.asked").await;
+        let request_id = service.list()[0].id.clone();
+
+        handle.abort();
+        assert!(handle.await.unwrap_err().is_cancelled());
+        assert!(service.list().is_empty());
+        let event = recv(&mut rejected, "question.rejected").await;
+        assert_eq!(event.data["requestID"], serde_json::json!(request_id));
     }
 
     #[tokio::test]

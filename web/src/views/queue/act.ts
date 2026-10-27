@@ -6,11 +6,11 @@
 // slow event stream can't bring it back for a second reply.
 import { createEffect, createRoot, createSignal } from "solid-js"
 import { createStore, produce } from "solid-js/store"
-import { api } from "../../api/client"
+import { api, ApiError } from "../../api/client"
 import type { PermissionReply } from "../../api/types"
 import type { Interrupt } from "../../fleet/derive"
 import { interrupts } from "../../fleet/fleet"
-import { state } from "../../store/store"
+import { setState, state } from "../../store/store"
 import { clock } from "../../ui/format"
 import { toast } from "../toast"
 
@@ -90,6 +90,24 @@ export async function act(
     else await api.replyQuestion(i.id, extra.answers ?? [], dir)
   } catch (err) {
     setStamped(produce((s) => delete s[i.id]))
+    // The server has no such request: it was answered in another client, or
+    // the turn that asked it was stopped. Drop the dead prompt here too rather
+    // than leaving a card whose every verdict 404s. A 404 without the tagged
+    // error (an older server missing the route) leaves the prompt alone.
+    const tag =
+      err instanceof ApiError && err.status === 404 && typeof err.body === "object" && err.body
+        ? (err.body as { _tag?: string })._tag
+        : undefined
+    if (tag === "PermissionNotFoundError" || tag === "QuestionNotFoundError") {
+      setState(
+        produce((d) => {
+          delete d.permissions[i.id]
+          delete d.questions[i.id]
+        }),
+      )
+      toast("That request is no longer pending: it was answered elsewhere or its turn ended.", "error")
+      return
+    }
     toast(`Could not send “${label}”: ${err instanceof Error ? err.message : String(err)}`, "error")
     return
   }

@@ -120,6 +120,10 @@ pub struct PermissionService {
 
 /// Removes the pending entry when the ask future is dropped
 /// (permission/index.ts:101-108 — `Effect.ensuring(pending.delete(id))`).
+/// Unlike the TS finalizer, an entry still waiting here was abandoned by its
+/// turn (stream error, task abort), so a `permission.replied` rejection is
+/// published too: otherwise clients keep showing a prompt the server can no
+/// longer answer.
 struct PendingCleanup<'a> {
     service: &'a PermissionService,
     id: String,
@@ -127,7 +131,17 @@ struct PendingCleanup<'a> {
 
 impl Drop for PendingCleanup<'_> {
     fn drop(&mut self) {
-        self.service.remove_pending(&self.id);
+        // A reply removes the entry first, so a hit here means the ask was
+        // abandoned (stream error, task abort) with the prompt still listed.
+        // Publish the rejection clients need to clear it: otherwise the
+        // prompt lingers and its reply is a 404 forever.
+        if let Some(request) = self.service.take_pending(&self.id) {
+            let _ = self.service.publish_replied(
+                &request.session_id,
+                &request.id,
+                PermissionV1Reply::Reject,
+            );
+        }
     }
 }
 
@@ -147,11 +161,12 @@ impl PermissionService {
 
     /// `Effect.ensuring(pending.delete(id))` (permission/index.ts:101-108) —
     /// the ask future may be dropped (tool abort, cancellation) while parked;
-    /// remove the pending entry then too.
-    fn remove_pending(&self, id: &str) {
-        self.lock_state()
-            .pending
-            .retain(|entry| entry.info.id != id);
+    /// remove the pending entry then too, returning it when it was still
+    /// waiting (a reply removes the entry first).
+    fn take_pending(&self, id: &str) -> Option<PermissionV1Request> {
+        let mut state = self.lock_state();
+        let position = state.pending.iter().position(|entry| entry.info.id == id)?;
+        Some(state.pending.remove(position).info)
     }
 
     fn publish_asked(&self, request: &PermissionV1Request) -> Result<(), PermissionError> {
@@ -251,11 +266,11 @@ impl PermissionService {
                 done,
             });
         }
-        self.publish_asked(&request)?;
         let guard = PendingCleanup {
             service: self,
             id: request.id.clone(),
         };
+        self.publish_asked(&request)?;
         let result = match rx.await {
             Ok(result) => result,
             // The service went away with the ask still pending — the TS
@@ -639,6 +654,34 @@ mod tests {
         service.reply(reply_once("per_t1")).unwrap();
         handle.await.unwrap().unwrap();
         assert!(service.list().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dropped_ask_publishes_reject_and_clears_pending() {
+        let events = bus();
+        let service = Arc::new(PermissionService::new(Arc::clone(&events)));
+        let mut asked = events.subscribe("permission.asked");
+        let mut replied = events.subscribe("permission.replied");
+        let handle = {
+            let service = Arc::clone(&service);
+            let input = ask_input(Some("per_drop"));
+            tokio::spawn(async move { service.ask(input).await })
+        };
+
+        recv(&mut asked, "permission.asked").await;
+        assert_eq!(service.list().len(), 1);
+        handle.abort();
+        assert!(handle.await.unwrap_err().is_cancelled());
+        assert!(service.list().is_empty());
+        let event = recv(&mut replied, "permission.replied").await;
+        assert_eq!(
+            event.data,
+            serde_json::json!({
+                "sessionID": "ses_test",
+                "requestID": "per_drop",
+                "reply": "reject"
+            })
+        );
     }
 
     #[tokio::test]

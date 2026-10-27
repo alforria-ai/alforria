@@ -51,15 +51,16 @@ fn fixture() -> Fixture {
         tmp_dir: dir.path().to_path_buf(),
         home: dir.path().to_path_buf(),
     };
-    let services = Arc::new(SessionServices::new(
-        storage.clone(),
-        Arc::new(NoJobs),
-        Arc::new(FixedClock),
-        &agent_input,
-    ));
-    let services_for_factory = services.clone();
-    let instances =
-        InstanceStore::new(Arc::new(move |_directory| Ok(services_for_factory.clone())));
+    let services_for_factory = agent_input.clone();
+    let storage_for_factory = storage.clone();
+    let instances = InstanceStore::new(Arc::new(move |_directory| {
+        Ok(Arc::new(SessionServices::new(
+            storage_for_factory.clone(),
+            Arc::new(NoJobs),
+            Arc::new(FixedClock),
+            &services_for_factory,
+        )))
+    }));
     let ctx = ServerContext::new(
         AuthConfig::new("alforria", None),
         instances,
@@ -268,6 +269,50 @@ async fn permission_list_and_reply() {
         body_string(response).await,
         r#"{"_tag":"PermissionNotFoundError","requestID":"per_000","message":"Permission request not found: per_000"}"#
     );
+}
+
+#[tokio::test]
+async fn permission_reply_finds_the_request_in_another_instance() {
+    let f = fixture();
+    let other = f.worktree.parent().unwrap().join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    let router = routes::build_router(f.ctx.clone());
+
+    // The ask belongs to `other`; the reply names the worktree directory (a
+    // client that lost the request's directory), so the location instance
+    // does not know the id and the route must find it in the other one.
+    let other_services = f.ctx.instances.load(&other).unwrap();
+    let mut asked = other_services.events.subscribe("permission.asked");
+    let ask = {
+        let services = other_services.clone();
+        tokio::spawn(async move {
+            services
+                .permission
+                .ask(alforria_schema::permission_v1::PermissionV1AskInput {
+                    id: Some("per_fb".to_string()),
+                    session_id: "ses_fb".to_string(),
+                    permission: "bash".to_string(),
+                    patterns: vec!["ls".to_string()],
+                    metadata: Default::default(),
+                    always: Vec::new(),
+                    ruleset: Vec::new(),
+                    tool: None,
+                })
+                .await
+        })
+    };
+    asked.recv().await.unwrap();
+
+    let response = send(
+        &router,
+        "POST",
+        &instance_uri(&f.worktree, "permission/per_fb/reply"),
+        r#"{"reply":"once"}"#,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_string(response).await, "true");
+    assert!(ask.await.unwrap().is_ok());
 }
 
 // -----------------------------------------------------------------------
