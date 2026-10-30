@@ -190,6 +190,11 @@ function firstLine(text: string) {
 }
 
 /** The one-line target of a tool call: the command, path, pattern or URL. */
+/** Why a session's last turn failed, without the error's class name. */
+export function lastError(s: State, sessionID: string) {
+  return errorOf(lastAssistant(s, sessionID))?.message ?? ""
+}
+
 export function toolTarget(part: ToolPart): string {
   const state = part.state as { input?: Record<string, unknown>; title?: string }
   const input = state.input ?? {}

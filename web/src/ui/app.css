@@ -2262,6 +2262,81 @@ button.tool-row:hover {
   color: var(--ink-2);
   font-size: 12.5px;
 }
+.subtask.failed {
+  border-color: var(--rule-2);
+}
+.subtask.failed .res {
+  color: var(--ink);
+}
+.subtask .recovered {
+  color: var(--ink-3);
+}
+.tool-row .meta.fail {
+  color: var(--ink);
+}
+.sys-note {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 12px 0;
+  color: var(--ink-3);
+  font-size: 12.5px;
+}
+.sys-note.fault {
+  color: var(--ink);
+}
+.sys-note svg {
+  flex: none;
+  width: 13px;
+  height: 13px;
+}
+.sys-note .lamp {
+  flex: none;
+}
+.work-status {
+  flex: none;
+  border-top: 1px solid var(--rule);
+  padding: 6px 12px 6px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 12.5px;
+}
+.work-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 24px;
+  min-width: 0;
+}
+.work-row .lamp,
+.work-row .link-btn,
+.work-row .n {
+  flex: none;
+}
+.work-row .n {
+  font: 400 11px/1 var(--f-mono);
+  color: var(--ink-3);
+}
+.work-row .what {
+  flex: none;
+  max-width: 45%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 500;
+}
+.work-row .detail {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ink-3);
+}
+.work-row .detail.fault {
+  color: var(--ink);
+}
 .link-btn {
   display: inline-flex;
   align-items: center;

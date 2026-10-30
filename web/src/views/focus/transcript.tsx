@@ -16,6 +16,8 @@ import { toast } from "../toast"
 import { setComposerDraft } from "./composer"
 import { replyMarkdown } from "./export"
 import { PartView } from "./parts"
+import { noteOf, type Note } from "./subagent-notes"
+import { NoteView } from "./subagents"
 import { canRestoreFiles, isReverted, promptText, revertBoundary, revertTo } from "./revert"
 
 /**
@@ -305,9 +307,22 @@ function TurnView(props: {
     revertTo(props.sessionID, messageID).catch((err) =>
       toast(`Could not revert: ${err instanceof Error ? err.message : err}`, "error"),
     )
+  // A prompt that is only the system's note about a subagent has no person behind it.
+  const notes = () => {
+    const u = user()
+    if (!u) return []
+    const found: Note[] = []
+    for (const pid of state.parts[u.id] ?? []) {
+      const p = state.part[pid] as { type?: string; synthetic?: boolean; text?: string } | undefined
+      const note = p?.type === "text" && p.synthetic ? noteOf(p.text ?? "") : undefined
+      if (note) found.push(note)
+    }
+    return found
+  }
   return (
     <>
-      <Show when={user()}>
+      <For each={notes()}>{(note) => <NoteView note={note} onOpen={props.onOpenSession} />}</For>
+      <Show when={!notes().length && user()}>
         {(u) => (
           <div class="msg msg-user" tabindex="-1" classList={{ reverted: props.reverted }}>
             <div class="msg-label">

@@ -3,12 +3,13 @@
 // chosen per tool (output, diff, todo list, subagent link).
 import { createMemo, createSignal, For, Match, Show, Switch } from "solid-js"
 import type { Part, ToolPart } from "../../api/types"
-import { fleetState, toolTarget, type Interrupt } from "../../fleet/derive"
+import { activity, fleetState, lastError, toolTarget, type Interrupt } from "../../fleet/derive"
 import { state } from "../../store/store"
 import { Diff, diffStats, parseUnifiedDiff } from "../../ui/diff"
 import { Markdown } from "../../ui/markdown"
 import { Icon } from "../../ui/icons"
 import { Slip } from "../queue/slip"
+import { failureLine, shortTitle, toolErrorText } from "./subagent-notes"
 
 type State = {
   status: string
@@ -175,6 +176,7 @@ function ToolView(props: {
   const kind = () => {
     if (props.part.tool === "todowrite") return "todos"
     if (props.part.tool === "task") return "task"
+    if (props.part.tool === "subagents") return "subagents"
     if (props.part.tool === "question") return "question"
     if (diff()) return "diff"
     if (props.part.tool === "bash") return "output"
@@ -193,6 +195,9 @@ function ToolView(props: {
       </Match>
       <Match when={kind() === "task"}>
         <TaskRow part={props.part} child={childSession()} onOpen={props.onOpenSession} />
+      </Match>
+      <Match when={kind() === "subagents"}>
+        <SubagentsRow part={props.part} child={childSession()} onOpen={props.onOpenSession} />
       </Match>
       <Match when={true}>
         <div class="tool" classList={{ open: isOpen() && hasBody() }} data-tool={props.part.id}>
@@ -213,7 +218,7 @@ function ToolView(props: {
             <div class="tool-body">
               <Switch>
                 <Match when={status() === "error"}>
-                  <div class="out fail-out">{st().error}</div>
+                  <div class="out fail-out">{toolErrorText(st().error ?? "")}</div>
                 </Match>
                 <Match when={kind() === "diff"}>
                   <Diff rows={diff()!} />
@@ -324,10 +329,51 @@ export function TodoPlate(props: { todos: { content: string; status: string }[] 
   )
 }
 
+const STATE_WORDS: Record<string, string> = { error: "failed", not_started: "not started" }
+
+/** The `subagents` tool: what was asked and where the subagent stands. The output itself is for the model. */
+function SubagentsRow(props: { part: ToolPart; child?: string; onOpen: (id: string, beside: boolean) => void }) {
+  const st = () => props.part.state as State
+  const action = () => String(st().input?.action ?? "")
+  const subject = () => shortTitle(st().title ?? String(st().input?.task_id ?? ""))
+  const word = () => {
+    const value = String(st().metadata?.state ?? "")
+    return STATE_WORDS[value] ?? value
+  }
+  const text = () => {
+    if (st().status === "error") return failureLine(st().error ?? "")
+    if (action() === "list") return st().metadata?.count === undefined ? "" : `${st().metadata!.count} subagents`
+    if (action() === "wait" && st().status !== "completed") return `waiting for ${subject()}`
+    return subject()
+  }
+  return (
+    <div class="tool" data-tool={props.part.id}>
+      <div class="tool-row">
+        <span class={`mark ${st().status}`} />
+        <span class="name">{action() === "list" ? "subagents" : `subagent ${action()}`}</span>
+        <span class="target">{text()}</span>
+        <span class="meta" classList={{ fail: word() === "failed" }}>
+          {word()}
+        </span>
+        <Show when={props.child}>
+          {(id) => (
+            <button class="link-btn" onClick={() => props.onOpen(id(), true)}>
+              Open
+            </button>
+          )}
+        </Show>
+      </div>
+    </div>
+  )
+}
+
 function TaskRow(props: { part: ToolPart; child?: string; onOpen: (id: string, beside: boolean) => void }) {
   const st = () => props.part.state as State
   const input = () => st().input ?? {}
   const child = () => (props.child ? state.sessions[props.child] : undefined)
+  const lamp = () => (props.child ? fleetState(state, props.child) : "idle")
+  const failed = () => st().status === "error"
+  const recovered = () => /<summary>Recovered from errors/.test(st().output ?? "")
   const result = () => {
     if (st().status === "completed") {
       // Output is `<task id=… state=…><task_result>…</task_result></task>`.
@@ -340,11 +386,15 @@ function TaskRow(props: { part: ToolPart; child?: string; onOpen: (id: string, b
           .find((l) => l.trim()) ?? ""
       )
     }
-    if (st().status === "error") return st().error ?? ""
-    return ""
+    if (failed()) return failureLine(st().error ?? "")
+    if (!props.child) return ""
+    // Between automatic resumes the child sits on its error, the task call still running.
+    if (lamp() === "fault") return `Stopped on an error, resuming: ${failureLine(lastError(state, props.child))}`
+    const now = activity(state, props.child)
+    return [now.kind, now.text].join(" ").trim()
   }
   return (
-    <div class="subtask">
+    <div class="subtask" classList={{ failed: failed() }}>
       <span class="name">Task</span>
       <span class="t">
         <span class="mono">{String(input().subagent_type ?? "")}</span>
@@ -353,12 +403,17 @@ function TaskRow(props: { part: ToolPart; child?: string; onOpen: (id: string, b
       <Show when={props.child}>
         {(id) => (
           <button class="link-btn" onClick={() => props.onOpen(id(), true)}>
-            <span class={`lamp ${fleetState(state, id())}`} />
+            <span class={`lamp ${lamp()}`} />
             Open
           </button>
         )}
       </Show>
-      <span class="res">{result() || (child() ? child()!.title : st().status === "running" ? "running…" : "")}</span>
+      <span class="res">
+        {result() || (child() ? child()!.title : st().status === "running" ? "running…" : "")}
+        <Show when={recovered()}>
+          <span class="recovered"> · recovered from errors</span>
+        </Show>
+      </span>
     </div>
   )
 }

@@ -15,6 +15,7 @@ import { CtxCell } from "../table"
 import { toast } from "../toast"
 import { Composer } from "./composer"
 import { exportName, transcriptMarkdown } from "./export"
+import { WorkStatus } from "./subagents"
 import { stepMessage, Transcript } from "./transcript"
 
 const Changes = lazy(() => import("./changes"))
@@ -286,6 +287,7 @@ function SessionColumn(props: {
         </Match>
         <Match when={true}>
           <Transcript sessionID={id()} onOpenSession={props.onOpen} />
+          <WorkStatus sessionID={id()} onOpen={props.onOpen} />
           <Composer sessionID={id()} />
         </Match>
       </Switch>
