@@ -49,6 +49,7 @@ use alforria_schema::question_v1::{QuestionV1Answer, QuestionV1Request};
 use alforria_schema::session_status::SessionStatusInfo;
 use alforria_schema::session_todo::TodoInfo;
 use alforria_schema::session_v1::{V1Message, V1Part, V1SessionInfo};
+use alforria_schema::workflow::{WorkflowDefinition, WorkflowRun};
 
 /// `encodeURIComponent` unreserved set: everything else is percent-encoded.
 pub fn percent_encode(input: &str) -> String {
@@ -270,6 +271,25 @@ pub trait ServerApi: Send + Sync {
         limit: Option<u64>,
     ) -> Result<Vec<MessageWithParts>>;
     async fn session_todo(&self, loc: &Location, session_id: &str) -> Result<Vec<TodoInfo>>;
+    // alforria extension: dynamic workflows. Test doubles keep the defaults.
+    async fn workflow_list(&self, _loc: &Location) -> Result<Vec<WorkflowDefinition>> {
+        Err(anyhow!("workflows are not available"))
+    }
+    async fn workflow_runs(&self, _loc: &Location) -> Result<Vec<WorkflowRun>> {
+        Err(anyhow!("workflows are not available"))
+    }
+    async fn workflow_start(&self, _loc: &Location, _body: Value) -> Result<WorkflowRun> {
+        Err(anyhow!("workflows are not available"))
+    }
+    async fn workflow_abort(&self, _loc: &Location, _run_id: &str) -> Result<WorkflowRun> {
+        Err(anyhow!("workflows are not available"))
+    }
+    async fn workflow_save(&self, _loc: &Location, _body: Value) -> Result<WorkflowDefinition> {
+        Err(anyhow!("workflows are not available"))
+    }
+    async fn workflow_delete(&self, _loc: &Location, _name: &str) -> Result<()> {
+        Err(anyhow!("workflows are not available"))
+    }
     async fn session_diff(
         &self,
         loc: &Location,
@@ -706,6 +726,40 @@ impl ServerApi for HttpServerApi {
             None,
         )
         .await
+    }
+
+    async fn workflow_list(&self, loc: &Location) -> Result<Vec<WorkflowDefinition>> {
+        self.get("/workflow", loc).await
+    }
+
+    async fn workflow_runs(&self, loc: &Location) -> Result<Vec<WorkflowRun>> {
+        self.get("/workflow/run", loc).await
+    }
+
+    async fn workflow_start(&self, loc: &Location, body: Value) -> Result<WorkflowRun> {
+        self.post("/workflow/run", loc, Some(body)).await
+    }
+
+    async fn workflow_abort(&self, loc: &Location, run_id: &str) -> Result<WorkflowRun> {
+        self.post(&format!("/workflow/run/{}/abort", seg(run_id)), loc, None)
+            .await
+    }
+
+    async fn workflow_save(&self, loc: &Location, body: Value) -> Result<WorkflowDefinition> {
+        self.post("/workflow", loc, Some(body)).await
+    }
+
+    async fn workflow_delete(&self, loc: &Location, name: &str) -> Result<()> {
+        let _: Value = self
+            .json(
+                Method::DELETE,
+                &format!("/workflow/{}", seg(name)),
+                loc,
+                &[],
+                None,
+            )
+            .await?;
+        Ok(())
     }
 
     async fn session_todo(&self, loc: &Location, session_id: &str) -> Result<Vec<TodoInfo>> {

@@ -527,6 +527,7 @@ fn assistant_message_lines(
                 id,
                 start,
                 end: lines.len(),
+                workflow_run: parts::workflow_run_of(part),
             });
         }
     }

@@ -198,6 +198,23 @@ pub enum PendingDialog {
     UpdateAvailable {
         version: String,
     },
+    /// A workflow's arguments, before it starts. `name` is the saved workflow,
+    /// or the name for `script` when running one that is no longer saved.
+    WorkflowRun {
+        name: Option<String>,
+        script: Option<String>,
+        title: Option<String>,
+        args: String,
+    },
+    /// A new workflow's name; the editor opens next.
+    WorkflowNew,
+    WorkflowStop {
+        run_id: String,
+        name: String,
+    },
+    WorkflowDelete {
+        name: String,
+    },
     CommandPalette,
     SessionList,
     Model,
@@ -298,6 +315,8 @@ pub struct ClickTarget {
     pub start: usize,
     /// Exclusive end line.
     pub end: usize,
+    /// A `workflow` part opens its run on the workflows screen.
+    pub workflow_run: Option<String>,
 }
 
 impl SessionScroll {
@@ -344,20 +363,25 @@ impl SessionScroll {
 /// (`session/index.tsx:1822,1900,1609`): toggle the expansion of the
 /// part whose rendered lines contain the clicked screen row. The
 /// non-applicable set toggle is a rendering no-op.
-fn transcript_click(app: &mut App, row: u16) {
+fn transcript_click(app: &mut App, row: u16, effects: &mut Vec<Effect>) {
     let scroll = &app.ui.session_scroll;
     if (row as usize) < scroll.area_y as usize {
         return;
     }
     let line = (row - scroll.area_y) as usize + scroll.effective_y();
-    let Some(id) = scroll
+    let Some(target) = scroll
         .clicks
         .iter()
         .find(|target| target.start <= line && line < target.end)
-        .map(|target| target.id.clone())
+        .cloned()
     else {
         return;
     };
+    if let Some(run) = target.workflow_run {
+        effects.extend(crate::ui::workflows::open(app, Some(&run)));
+        return;
+    }
+    let id = target.id;
     toggle_set(&mut app.ui.expanded, &id);
     toggle_set(&mut app.ui.expanded_errors, &id);
 }
@@ -421,6 +445,7 @@ pub struct UiState {
     /// visible (`question.tsx:128-131`).
     pub question_mode_token: Option<u64>,
     /// The permission prompt state machine (M8.7).
+    pub workflows: crate::ui::workflows::WorkflowsState,
     pub permission: crate::ui::session::permission::PermissionState,
     /// The question prompt state machine (M8.7).
     pub question: crate::ui::session::question::QuestionState,
@@ -576,7 +601,9 @@ pub enum Msg {
 #[derive(Debug, PartialEq)]
 pub enum Effect {
     /// `bootstrap()` (`sync.tsx:451`) — `server.instance.disposed`.
-    Bootstrap { fatal: bool },
+    Bootstrap {
+        fatal: bool,
+    },
     /// List the pending permissions and questions (`GET /permission`,
     /// `GET /question`) — at startup and on every stream (re)connect — and
     /// reconcile them with the live events
@@ -590,16 +617,25 @@ pub enum Effect {
         metadata: EventMetadata,
     },
     /// `lsp.updated` refetches `lsp.status` (`sync.tsx:433-437`).
-    LspStatusRefetch { workspace: Option<String> },
+    LspStatusRefetch {
+        workspace: Option<String>,
+    },
     /// `session.fork` + navigate on success (`app.tsx:512-519`).
-    SessionFork { session_id: String, navigate: bool },
+    SessionFork {
+        session_id: String,
+        navigate: bool,
+    },
     /// `terminal.suspend` — leave raw mode, `SIGTSTP`, resume on
     /// `SIGCONT` (`app.tsx:870-879`).
     SuspendTerminal,
     /// `session.share` (`session/index.tsx:488-512`).
-    SessionShare { session_id: String },
+    SessionShare {
+        session_id: String,
+    },
     /// `session.unshare` (`session/index.tsx:559-585`).
-    SessionUnshare { session_id: String },
+    SessionUnshare {
+        session_id: String,
+    },
     /// `session.summarize` (`session/index.tsx:561-572`).
     SessionSummarize {
         session_id: String,
@@ -607,18 +643,24 @@ pub enum Effect {
         model_id: String,
     },
     /// `session.abort` (undo + interrupt paths).
-    SessionAbort { session_id: String },
+    SessionAbort {
+        session_id: String,
+    },
     /// `session.revert` (`session/index.tsx:610-644`).
     SessionRevert {
         session_id: String,
         message_id: String,
     },
     /// `session.unrevert` (`session/index.tsx:646-671`).
-    SessionUnrevert { session_id: String },
+    SessionUnrevert {
+        session_id: String,
+    },
     /// `sync.session.refresh()` — re-list sessions (`local.tsx`).
     SessionRefresh,
     /// `experimental.session.background` (`session/index.tsx:1024-1030`).
-    SessionBackground { session_id: String },
+    SessionBackground {
+        session_id: String,
+    },
     /// `session.copy` — clipboard write of `formatTranscript(...)`
     /// (TODO(M8.8): the transcript formatter).
     SessionCopyTranscript {
@@ -633,18 +675,46 @@ pub enum Effect {
         failure: Option<Toast>,
     },
     /// §6 N6: `docs.open` prints the URL instead of opening a browser.
-    OpenUrl { url: String },
+    OpenUrl {
+        url: String,
+    },
     /// `session.get` on mount + 404 toast/home + workspace re-bootstrap
     /// + hydrate + snap-to-bottom (`session/index.tsx:286-324`).
     SessionMount {
         session_id: String,
         previous_workspace: Option<String>,
     },
+    /// Read the workflow runs, and the saved workflows if asked.
+    WorkflowsRefresh {
+        definitions: bool,
+    },
+    WorkflowStart {
+        name: Option<String>,
+        script: Option<String>,
+        args: serde_json::Value,
+    },
+    WorkflowAbort {
+        run_id: String,
+    },
+    WorkflowDelete {
+        name: String,
+    },
+    /// Open `$EDITOR` on a script and save what comes back.
+    WorkflowEdit {
+        name: String,
+        original: String,
+        scope: String,
+        overwrite: bool,
+    },
     /// `sync.session.sync(sessionID)` — the `task` tool hydrates its
     /// child session on mount (`session/index.tsx:2221-2224`).
-    SessionHydrate { session_id: String },
+    SessionHydrate {
+        session_id: String,
+    },
     /// The session list's server search (`GET /session?search=…`).
-    SessionSearch { query: String },
+    SessionSearch {
+        query: String,
+    },
     /// `GET /api/fs/find?query=…&limit=20` for the `@` popup.
     FindFiles {
         query: String,
@@ -654,14 +724,18 @@ pub enum Effect {
     SessionStatusRefresh,
     /// After an SSE reconnect: hydrate the session again, even if it was
     /// fully synced (the events in between are lost).
-    SessionResync { session_id: String },
+    SessionResync {
+        session_id: String,
+    },
     /// `prompt.paste` — read the clipboard, run the paste pipeline
     /// (`prompt/index.tsx:374-391`).
     PromptPaste,
     /// `prompt.editor` — suspend the terminal, open `$EDITOR` seeded
     /// with `value`, apply the edited content
     /// (`prompt/index.tsx:424-514`).
-    OpenPromptEditor { value: String },
+    OpenPromptEditor {
+        value: String,
+    },
     /// The submit pipeline dispatch (`prompt/index.tsx:947-1147`).
     PromptSubmit {
         payload: Box<crate::state::prompt::SubmitPayload>,
@@ -678,15 +752,25 @@ pub enum Effect {
         answers: Vec<alforria_schema::question_v1::QuestionV1Answer>,
     },
     /// `question.reject` (`question.tsx:57-62`).
-    QuestionReject { request_id: String },
+    QuestionReject {
+        request_id: String,
+    },
     /// `session.update` title (`DialogSessionRename`).
-    SessionRename { session_id: String, title: String },
+    SessionRename {
+        session_id: String,
+        title: String,
+    },
     /// `auth.set` (`dialog-provider.tsx:405-412`) — store the entered API
     /// key for the provider, then re-bootstrap.
-    AuthSet { provider_id: String, key: String },
+    AuthSet {
+        provider_id: String,
+        key: String,
+    },
     /// `auth.remove` — sign out of / drop the auth.json credential (the
     /// server also revokes a LibertAI session), then re-bootstrap.
-    AuthRemove { provider_id: String },
+    AuthRemove {
+        provider_id: String,
+    },
     /// `provider.oauth.authorize` (`dialog-provider.tsx:184-205`), then
     /// for `method: "auto"` the no-code `provider.oauth.callback` wait
     /// (`AutoMethod` onMount, `dialog-provider.tsx:263-282`).
@@ -704,12 +788,18 @@ pub enum Effect {
         code: String,
     },
     /// `session.delete` (`dialog-session-list.tsx:248-262`).
-    SessionDelete { session_id: String },
+    SessionDelete {
+        session_id: String,
+    },
     /// `local.mcp.toggle(name)` + `mcp.status` refresh
     /// (`dialog-mcp.tsx:49-66`).
-    McpToggle { name: String },
+    McpToggle {
+        name: String,
+    },
     /// `global.upgrade` (`app.tsx:1051`).
-    GlobalUpgrade { target: String },
+    GlobalUpgrade {
+        target: String,
+    },
     /// `experimental.moveSession` (`component/prompt/move.tsx`).
     SessionMove {
         session_id: String,
@@ -717,7 +807,9 @@ pub enum Effect {
     },
     /// `project.directories` fetch for the move-session dialog
     /// (`dialog-move-session.tsx:60-78`).
-    ProjectDirectories { project_id: String },
+    ProjectDirectories {
+        project_id: String,
+    },
     /// `session.fork` (+ optional `messageID`) with a prompt seeded
     /// from the forked message parts (`dialog-fork-from-timeline.tsx`).
     SessionForkFromMessage {
@@ -837,6 +929,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                 effects.extend(sync::apply_event(&mut app.state, event.clone()));
                 effects.extend(crate::app::on_bus_event(app, event.clone()));
                 effects.extend(crate::attention::on_bus_event(app, &event.event));
+                crate::ui::workflows::on_bus_event(app, &event.event);
             }
         }
         // Only presses act. A release (reported where the terminal sends
@@ -853,6 +946,8 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             } else if let Some(handled) = crate::ui::session::permission::handle_key(app, &key) {
                 effects.extend(handled);
             } else if let Some(handled) = crate::ui::session::question::handle_key(app, &key) {
+                effects.extend(handled);
+            } else if let Some(handled) = crate::ui::workflows::handle_key(app, &key) {
                 effects.extend(handled);
             } else {
                 // Keys a pending permission/question does not own reach
@@ -898,6 +993,10 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                     // (`permission.tsx:451-460`, `question.tsx:225-233`):
                     // `<leader>q` rejects instead of quitting.
                     if *name == "app.exit" {
+                        if crate::ui::workflows::hold_exit(app) {
+                            handled = true;
+                            continue;
+                        }
                         if let Some(reply) = crate::ui::session::permission::app_exit(app)
                             .or_else(|| crate::ui::session::question::app_exit(app))
                         {
@@ -919,6 +1018,8 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             }
         }
         Msg::Mouse(mouse) if selection_mouse(app, &mouse, &mut effects) => {}
+        Msg::Mouse(mouse)
+            if app.ui.dialogs.is_empty() && crate::ui::workflows::handle_mouse(app, &mouse) => {}
         Msg::Mouse(mouse) => match mouse.kind {
             // TODO(M8.5), hover handling; the transcript wheel uses the
             // config `scroll_speed`. Dialogs get the wheel first —
@@ -1006,7 +1107,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                 {
                     effects.append(&mut question);
                 } else {
-                    transcript_click(app, mouse.row);
+                    transcript_click(app, mouse.row, &mut effects);
                 }
             }
             _ => {}
@@ -1028,6 +1129,8 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             } else if paste_into_bottom_bar(app, &normalized) {
                 // The permission reject message or the question's "Other"
                 // answer has the focus.
+            } else if crate::ui::session::prompt_replaced(app) {
+                // No prompt on screen to paste into.
             } else if normalized.trim().is_empty() {
                 effects.extend(crate::command::run(app, "prompt.paste"));
             } else {
@@ -1045,6 +1148,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                     app.ui.toast_deadline_ms = None;
                 }
             }
+            effects.extend(crate::ui::workflows::on_tick(app, now_ms));
             app.ui.startup_loading.poll(now_ms);
             if app.state.sync.status == Some(crate::state::sync::SyncStatus::Complete) {
                 app.ui.startup_ready = true;
@@ -1247,6 +1351,7 @@ pub fn animating(app: &App) -> bool {
     !app.ui.startup_ready
         || app.ui.startup_loading.visible()
         || app.ui.prompt.submitting
+        || crate::ui::workflows::animating(app)
         || app.state.sync.session_status.values().any(|status| {
             matches!(
                 status,
@@ -1271,6 +1376,7 @@ pub fn next_tick_in(app: &App, now_ms: u64) -> Option<u64> {
         app.ui.startup_loading.deadline(),
         app.keymap.pending_deadline(),
         app.ui.session_search.due_at,
+        crate::ui::workflows::next_poll_at(app, now_ms),
     ];
     if app.ui.prompt_focused && app.config.cursor_blinks() {
         deadlines.push(Some((now_ms / BLINK_MS + 1) * BLINK_MS));
@@ -1564,6 +1670,7 @@ mod tests {
             id: "prt_1".to_string(),
             start: 2,
             end: 5,
+            workflow_run: None,
         }];
         let up = || {
             Msg::Mouse(crossterm::event::MouseEvent {

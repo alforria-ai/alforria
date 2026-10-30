@@ -452,7 +452,8 @@ async fn scenario(in_process: bool) {
             alforria_tui::state::route::Route::Home { .. } => {
                 panic!("route should have moved to the session")
             }
-            alforria_tui::state::route::Route::Plugin { .. } => {
+            alforria_tui::state::route::Route::Plugin { .. }
+            | alforria_tui::state::route::Route::Workflows { .. } => {
                 panic!("route should have moved to the session")
             }
         };

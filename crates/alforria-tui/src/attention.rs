@@ -204,7 +204,7 @@ fn session_error_message(error: &alforria_schema::session_v1::AssistantError) ->
 }
 
 /// `notifications.ts:14-22` — one attention effect per surface.
-fn ask_effect(app: &App, session_id: Option<&str>, message: &str) -> Effect {
+pub(crate) fn ask_effect(app: &App, session_id: Option<&str>, message: &str) -> Effect {
     let session = session_id.and_then(|id| app.state.sync.session(id));
     let is_subagent = session
         .map(|session| session.parent_id.is_some())

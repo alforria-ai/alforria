@@ -50,6 +50,9 @@ pub struct ClickRow {
     pub buttons: Vec<(u16, u16)>,
 }
 
+/// How much of a script a workflow approval shows.
+const WORKFLOW_PREVIEW_LINES: usize = 10;
+
 const OPTIONS: [(&str, &str); 3] = [
     ("once", "Allow once"),
     ("always", "Allow always"),
@@ -268,6 +271,26 @@ fn info(app: &App, request: &PermissionV1Request) -> (&'static str, String, Vec<
                     vec![body_line(format!("  ◉ {description}"))]
                 },
             )
+        }
+        "workflow" => {
+            // What is about to run, not what the model asked for: a saved
+            // workflow's script only exists in the request's metadata.
+            let meta = Value::Object(request.metadata.clone());
+            let name = string_of(&meta, "name");
+            let script = string_of(&meta, "script");
+            let lines: Vec<&str> = script.lines().collect();
+            let mut body: Vec<Line<'static>> = lines
+                .iter()
+                .take(WORKFLOW_PREVIEW_LINES)
+                .map(|line| body_line(format!("  {line}")))
+                .collect();
+            if lines.len() > WORKFLOW_PREVIEW_LINES {
+                body.push(muted_line(format!(
+                    "  … {} more lines",
+                    lines.len() - WORKFLOW_PREVIEW_LINES
+                )));
+            }
+            ("#", format!("Workflow {name}"), body)
         }
         "webfetch" => {
             let url = string_of(&data, "url");
@@ -661,7 +684,12 @@ fn layout(app: &App) -> (Vec<Line<'static>>, std::ops::Range<usize>, Option<usiz
                     Style::new().fg(theme.text.to_color()),
                 ),
             ]));
-            if request.always.len() == 1 && request.always[0] == "*" {
+            if request.always.is_empty() {
+                rows.push(Line::styled(
+                    "  Nothing to remember: this request is approved once.",
+                    Style::new().fg(theme.text_muted.to_color()),
+                ));
+            } else if request.always.len() == 1 && request.always[0] == "*" {
                 rows.push(Line::styled(
                     format!(
                         "  This will allow {} until Alforria is restarted.",

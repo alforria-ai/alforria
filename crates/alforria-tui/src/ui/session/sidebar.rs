@@ -129,6 +129,7 @@ pub fn section_lines(app: &App, theme: &Theme, session_id: &str) -> Vec<Line<'st
         context_lines(app, theme, session_id),
         mcp_lines(app, theme),
         lsp_lines(app, theme),
+        crate::ui::workflows::sidebar_lines(app, theme, session_id),
         todo_lines(app, theme, session_id),
         files_lines(app, theme, session_id),
     ];

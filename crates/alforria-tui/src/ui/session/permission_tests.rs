@@ -531,3 +531,33 @@ fn a_long_diff_keeps_the_options_and_hints_on_screen() {
     let row = app.ui.permission.clicks.first().expect("option row").row;
     assert!(screen[row as usize].contains("Allow once"), "{text}");
 }
+
+#[test]
+fn a_workflow_approval_shows_the_script_about_to_run() {
+    let mut workflow = request("per_1", "ses_parent", "workflow");
+    workflow.metadata = serde_json::json!({
+        "name": "audit",
+        "script": "phase('Plan')\nreturn await agent('look around')",
+    })
+    .as_object()
+    .cloned()
+    .unwrap();
+    let mut app = app_with_request("ses_parent", workflow);
+    app.ui.terminal_width = 100;
+    app.ui.terminal_height = 30;
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+    terminal
+        .draw(|frame| crate::ui::view(&mut app, frame))
+        .unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    let screen: String = (0..30)
+        .map(|y| {
+            (0..100)
+                .map(|x| buffer[(x, y)].symbol().to_string())
+                .collect::<String>()
+                + "\n"
+        })
+        .collect();
+    assert!(screen.contains("Workflow audit"), "{screen}");
+    assert!(screen.contains("agent('look around')"), "{screen}");
+}

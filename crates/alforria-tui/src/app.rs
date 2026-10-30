@@ -388,6 +388,7 @@ pub fn terminal_title(app: &App, env_disabled: bool) -> Option<String> {
     }
     match &app.state.route.data {
         Route::Home { .. } => Some("Alforria".to_string()),
+        Route::Workflows { .. } => Some("Alforria | Workflows".to_string()),
         Route::Session { session_id, .. } => {
             let session = app.state.sync.session(session_id);
             let Some(session) = session else {

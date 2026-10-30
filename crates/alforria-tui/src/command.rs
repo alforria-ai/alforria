@@ -417,6 +417,11 @@ pub fn registry(app: &App) -> Vec<CommandInfo> {
         command
     });
     commands.push({
+        let mut command = CommandInfo::new("workflows.open", "Workflows", "Session");
+        command.slash_name = Some("workflows");
+        command
+    });
+    commands.push({
         let mut command = CommandInfo::new("session.list", "Switch session", "Session");
         command.suggested = !app.state.sync.session.is_empty();
         command.slash_name = Some("sessions");
@@ -1001,6 +1006,10 @@ pub fn run(app: &mut App, name: &str) -> Vec<Effect> {
     match name {
         // ---- app commands
         "command.palette.show" => show_dialog(app, PendingDialog::CommandPalette),
+        "workflows.open" => {
+            clear_dialog(app);
+            return crate::ui::workflows::toggle(app);
+        }
         "session.list" => show_dialog(app, PendingDialog::SessionList),
         "session.new" => {
             app.state.route.navigate(Route::Home { prompt: None });

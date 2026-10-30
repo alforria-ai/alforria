@@ -153,8 +153,13 @@ pub fn route_session_id(app: &App) -> Option<&str> {
 /// A pending permission or question shows in place of the prompt
 /// (`session/index.tsx:240-241,1297-1330`).
 pub fn prompt_replaced(app: &App) -> bool {
-    permission::visible(app).is_some() || question::visible(app).is_some()
+    permission::visible(app).is_some()
+        || question::visible(app).is_some()
+        || matches!(app.state.route.data, Route::Workflows { .. })
 }
+
+/// What is docked above the prompt gives way below this much transcript.
+const MIN_TRANSCRIPT_ROWS: u16 = 6;
 
 /// `render(app, frame, theme, area)` — the session layout
 /// (`session/index.tsx:1157-1361`): a row of [transcript column,
@@ -218,18 +223,37 @@ pub fn render(app: &mut App, frame: &mut ratatui::Frame, theme: &Theme, area: Re
         bottom_height += subagent_footer::HEIGHT;
     }
     let footer_height = 1;
+    // Without the sidebar a running workflow would have no sign in the session
+    // once its tool row scrolls away.
+    let docked = if sidebar_visible || is_child {
+        Vec::new()
+    } else {
+        crate::ui::workflows::docked_lines(app, theme, &session_id)
+    };
+    let docked_height = docked.len() as u16;
+    let docked_height = if column.height
+        >= bottom_height + footer_height + 1 + docked_height + MIN_TRANSCRIPT_ROWS
+    {
+        docked_height
+    } else {
+        0
+    };
     let vertical = ratatui::layout::Layout::vertical([
         ratatui::layout::Constraint::Fill(1),
         // The `gap={1}` between the transcript scrollbox and the
         // bottom stack (`session/index.tsx:1178`).
         ratatui::layout::Constraint::Length(1),
+        ratatui::layout::Constraint::Length(docked_height),
         ratatui::layout::Constraint::Length(bottom_height),
         ratatui::layout::Constraint::Length(footer_height),
     ])
     .split(column);
 
     transcript::render(app, frame, theme, vertical[0], &session_id, content_width);
-    let mut row = vertical[2];
+    if docked_height > 0 {
+        frame.render_widget(ratatui::widgets::Paragraph::new(docked), vertical[2]);
+    }
+    let mut row = vertical[3];
     if is_child {
         let footer = Rect {
             height: subagent_footer::HEIGHT,
@@ -249,7 +273,7 @@ pub fn render(app: &mut App, frame: &mut ratatui::Frame, theme: &Theme, area: Re
     } else if prompt_visible {
         prompt::render(app, frame, theme, row);
     }
-    footer::render(app, frame, theme, vertical[3], &session_id);
+    footer::render(app, frame, theme, vertical[4], &session_id);
 
     if sidebar_visible && !sidebar_area.is_empty() {
         if !wide {

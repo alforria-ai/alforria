@@ -9,6 +9,7 @@ pub mod markdown;
 pub mod session;
 pub mod textarea;
 pub mod theme;
+pub mod workflows;
 
 pub use logo::{LOGO, SPINNER_FRAMES};
 
@@ -40,6 +41,7 @@ pub fn view(app: &mut App, frame: &mut ratatui::Frame) {
         Route::Home { .. } => home::render(app, frame, &theme, area),
         Route::Session { .. } => session::render(app, frame, &theme, area),
         Route::Plugin { id, .. } => render_plugin_missing(frame, &theme, area, id),
+        Route::Workflows { .. } => workflows::render(app, frame, &theme, area),
     }
     // The dialog stack overlays the route (`ui/dialog.tsx`); toasts
     // stay on top (their container is rendered after the dialog root).

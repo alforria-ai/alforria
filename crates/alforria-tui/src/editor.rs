@@ -28,6 +28,16 @@ pub fn normalize_prompt_content(content: &str) -> String {
 /// `editor` is the command string (split on spaces) — a parameter so
 /// tests can drive a fake editor.
 pub fn open_editor_with(value: &str, editor: &str, cwd: Option<&Path>) -> Option<String> {
+    open_file_with(value, editor, cwd, "md")
+}
+
+/// [`open_editor_with`] for a file of a given kind, so the editor highlights it.
+pub fn open_file_with(
+    value: &str,
+    editor: &str,
+    cwd: Option<&Path>,
+    extension: &str,
+) -> Option<String> {
     if editor.trim().is_empty() {
         return None;
     }
@@ -37,7 +47,11 @@ pub fn open_editor_with(value: &str, editor: &str, cwd: Option<&Path>) -> Option
     // keep the pid in the name or two editor tests starting within the
     // same millisecond would clobber each other's file.
     let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let file = directory.join(format!("{}-{}-{unique}.md", millis(), std::process::id()));
+    let file = directory.join(format!(
+        "{}-{}-{unique}.{extension}",
+        millis(),
+        std::process::id()
+    ));
     std::fs::write(&file, value).ok()?;
     let result = run_editor(editor, &file, cwd);
     let content = std::fs::read_to_string(&file).ok();
@@ -46,6 +60,14 @@ pub fn open_editor_with(value: &str, editor: &str, cwd: Option<&Path>) -> Option
         Ok(()) => content.filter(|content| !content.is_empty()).or(None),
         Err(_) => None,
     }
+}
+
+/// `$VISUAL || $EDITOR`, when one is set.
+pub fn configured_editor() -> Option<String> {
+    std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .ok()
+        .filter(|editor| !editor.trim().is_empty())
 }
 
 /// The production entry: `$VISUAL || $EDITOR`.

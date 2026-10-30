@@ -104,6 +104,7 @@ static APP_KEYBINDS: &[&str] = &[
 
 /// `appGlobalBindingCommands` (`app.tsx:92-104`).
 static APP_GLOBAL_KEYBINDS: &[&str] = &[
+    "workflow_list",
     "session_list",
     "session_new",
     "session_quick_switch_1",
@@ -318,6 +319,55 @@ pub struct Keymap {
 }
 
 impl Keymap {
+    /// `formatKeySequence` (`keymap.tsx:250-258`): the first binding of a
+    /// command id (`session.child.first`) or keybind (`leader`), formatted
+    /// for display; empty when it has none.
+    pub fn shortcut(&self, name: &str) -> String {
+        let value = self.bindings.get(name).or_else(|| {
+            self.bindings
+                .iter()
+                .find(|(keybind, _)| command_of(keybind) == Some(name))
+                .map(|(_, value)| value)
+        });
+        let Some(BindingValue::Alternatives(alternatives)) = value else {
+            return String::new();
+        };
+        let Some(sequence) = alternatives.first() else {
+            return String::new();
+        };
+        sequence
+            .iter()
+            .map(|stroke| {
+                let mut parts: Vec<String> = Vec::new();
+                if stroke.ctrl {
+                    parts.push("ctrl".to_string());
+                }
+                if stroke.meta {
+                    parts.push("meta".to_string());
+                }
+                if stroke.super_key {
+                    parts.push("super".to_string());
+                }
+                if stroke.hyper {
+                    parts.push("hyper".to_string());
+                }
+                let single = stroke.key.chars().count() == 1;
+                if stroke.shift {
+                    if single && stroke.key.chars().all(|c| c.is_ascii_lowercase()) {
+                        parts.push(stroke.key.to_ascii_uppercase());
+                        return parts.join("+");
+                    }
+                    parts.push("shift".to_string());
+                }
+                parts.push(stroke.key.clone());
+                parts.join("+")
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// `resolve()` (`config/index.tsx:95-127`): overrides, the
+    /// terminal-suspend rewrite, the leader and its timeout.
     /// `resolve()` (`config/index.tsx:95-127`): overrides, the
     /// terminal-suspend rewrite, the leader and its timeout.
     pub fn resolve(config: &TuiConfig) -> Keymap {

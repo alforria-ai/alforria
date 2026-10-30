@@ -34,6 +34,10 @@ pub enum Route {
         id: String,
         data: Option<Map<String, Value>>,
     },
+    /// The workflows screen (an alforria extension), and where to go back to.
+    Workflows {
+        back: Box<Route>,
+    },
 }
 
 impl Route {
