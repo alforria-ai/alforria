@@ -208,11 +208,31 @@ impl MessageStore {
         limit: usize,
         before: Option<&str>,
     ) -> Result<MessagePage, SessionError> {
+        self.page_of(ALL_COLUMNS, session_id, limit, before)
+    }
+
+    /// [`Self::page`] with every `summary.diffs` empty.
+    pub fn page_without_diffs(
+        &self,
+        session_id: &str,
+        limit: usize,
+        before: Option<&str>,
+    ) -> Result<MessagePage, SessionError> {
+        self.page_of(COLUMNS_WITHOUT_DIFFS, session_id, limit, before)
+    }
+
+    fn page_of(
+        &self,
+        columns: &str,
+        session_id: &str,
+        limit: usize,
+        before: Option<&str>,
+    ) -> Result<MessagePage, SessionError> {
         let before = match before {
             Some(encoded) => Some(cursor::decode(encoded)?),
             None => None,
         };
-        let mut rows = self.query_page(session_id, limit + 1, before.as_ref())?;
+        let mut rows = self.query_page(columns, session_id, limit + 1, before.as_ref())?;
         if rows.is_empty() {
             let exists = self.storage.with_connection(|conn| {
                 conn.query_row("SELECT id FROM session WHERE id = ?1", [session_id], |_| {
@@ -257,14 +277,15 @@ impl MessageStore {
     /// (== && id < row.id)`.
     fn query_page(
         &self,
+        columns: &str,
         session_id: &str,
         limit: usize,
         before: Option<&Cursor>,
     ) -> Result<Vec<Message>, CoreError> {
         let sql = if before.is_some() {
-            "SELECT * FROM message WHERE session_id = ?1 AND (time_created < ?2 OR (time_created = ?2 AND id < ?3)) ORDER BY time_created DESC, id DESC LIMIT ?4"
+            format!("SELECT {columns} FROM message WHERE session_id = ?1 AND (time_created < ?2 OR (time_created = ?2 AND id < ?3)) ORDER BY time_created DESC, id DESC LIMIT ?4")
         } else {
-            "SELECT * FROM message WHERE session_id = ?1 ORDER BY time_created DESC, id DESC LIMIT ?4"
+            format!("SELECT {columns} FROM message WHERE session_id = ?1 ORDER BY time_created DESC, id DESC LIMIT ?4")
         };
         let empty = String::new();
         let (time, id) = match before {
@@ -274,7 +295,7 @@ impl MessageStore {
         self.storage.with_connection(|conn| {
             query_messages(
                 conn,
-                sql,
+                &sql,
                 rusqlite::params![session_id, time, id, limit as i64],
             )
         })
@@ -320,11 +341,22 @@ impl MessageStore {
     /// `MessageV2.stream` (message-v2.ts:469-490): page-until-exhausted in
     /// batches of 50, newest-first. A missing session resolves to `[]`.
     pub fn stream(&self, session_id: &str) -> Result<Vec<WithParts>, SessionError> {
+        self.stream_of(ALL_COLUMNS, session_id)
+    }
+
+    /// [`Self::stream`] with every `summary.diffs` empty, for code that reads
+    /// a session's history on each step and has no use for its file diffs.
+    /// Never write a message from this back to the store: that wipes them.
+    pub fn stream_without_diffs(&self, session_id: &str) -> Result<Vec<WithParts>, SessionError> {
+        self.stream_of(COLUMNS_WITHOUT_DIFFS, session_id)
+    }
+
+    fn stream_of(&self, columns: &str, session_id: &str) -> Result<Vec<WithParts>, SessionError> {
         let size = 50usize;
         let mut result = Vec::new();
         let mut before: Option<String> = None;
         loop {
-            let page = match self.page(session_id, size, before.as_deref()) {
+            let page = match self.page_of(columns, session_id, size, before.as_deref()) {
                 Ok(page) => page,
                 // TS: catchIf(NotFoundError, () => empty page)
                 Err(SessionError::NotFound(_)) => return Ok(Vec::new()),
@@ -333,9 +365,7 @@ impl MessageStore {
             if page.items.is_empty() {
                 break;
             }
-            for item in page.items.iter().rev() {
-                result.push(item.clone());
-            }
+            result.extend(page.items.into_iter().rev());
             if !page.more || page.cursor.is_none() {
                 break;
             }
@@ -383,6 +413,15 @@ impl MessageStore {
         })
     }
 }
+
+/// Every column of a message row.
+const ALL_COLUMNS: &str = "*";
+
+/// A message row with `summary.diffs` emptied by SQLite, so the patches are
+/// never copied out of the database.
+const COLUMNS_WITHOUT_DIFFS: &str = "id, session_id, time_created, time_updated, \
+     CASE WHEN json_type(data, '$.summary.diffs') IS NULL THEN data \
+     ELSE json_set(data, '$.summary.diffs', json('[]')) END AS data";
 
 fn query_messages(
     conn: &Connection,

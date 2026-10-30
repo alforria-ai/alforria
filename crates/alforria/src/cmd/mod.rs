@@ -824,6 +824,18 @@ fn db() -> Command {
                 .default_value("tsv"),
         )
         .subcommand(Command::new("path").about("print the database path"))
+        .subcommand(
+            Command::new("trim-diffs")
+                .about("shrink stored turn diffs; safe while alforria is running")
+                .arg(
+                    Arg::new("vacuum")
+                        .long("vacuum")
+                        .action(clap::ArgAction::SetTrue)
+                        .help(
+                            "then shrink the file; stop alforria first, and have free disk the size of the database",
+                        ),
+                ),
+        )
 }
 
 fn show(ui: &Ui, out: &str) {

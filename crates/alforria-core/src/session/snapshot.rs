@@ -111,6 +111,15 @@ const PRUNE: &str = "7.days";
 /// `limit` — 2 MiB (`snapshot/index.ts:24`).
 const LIMIT: u64 = 2 * 1024 * 1024;
 
+/// How much patch text one `diffFull` keeps. Patches carry whole files, and
+/// this runs after every step, so an unignored `node_modules` would otherwise
+/// put hundreds of MB on the user message each time. Files past the budget
+/// keep their counts and lose `patch`, which the wire schema allows.
+pub const MAX_DIFF_PATCH_BYTES: usize = 4 * 1024 * 1024;
+
+/// How much file content one `diffFull` reads before it stops making patches.
+const MAX_DIFF_LOAD_BYTES: usize = 32 * 1024 * 1024;
+
 /// The `-c` flag sets (`snapshot/index.ts:25-27`).
 const CORE: [&str; 4] = ["-c", "core.longpaths=true", "-c", "core.symlinks=true"];
 const CFG: [&str; 6] = [
@@ -1030,38 +1039,58 @@ impl GitSnapshot {
             rows.retain(|row| !ignored.contains(&row.file));
         }
 
-        let step = 100;
-        let mut result: Vec<FileDiff> = Vec::new();
-        for run in rows.chunks(step) {
-            let text = self.load(run, from, to);
-            for row in run {
-                let (before, after) = if row.binary {
-                    (String::new(), String::new())
-                } else if let Some(text) = text.as_ref() {
+        // The smallest changes get their patches first, so a turn's real
+        // edits survive next to a mass of vendored or generated files.
+        let mut order: Vec<usize> = (0..rows.len()).collect();
+        order.sort_by(|a, b| {
+            let size = |row: &Row| row.additions + row.deletions;
+            size(&rows[*a]).total_cmp(&size(&rows[*b]))
+        });
+
+        let step = 25;
+        let mut patches: Vec<Option<String>> = vec![None; rows.len()];
+        let mut patched = 0usize;
+        let mut loaded = 0usize;
+        for run in order.chunks(step) {
+            if loaded >= MAX_DIFF_LOAD_BYTES {
+                break;
+            }
+            let selected: Vec<Row> = run.iter().map(|index| rows[*index].clone()).collect();
+            let text = self.load(&selected, from, to);
+            for (index, row) in run.iter().zip(&selected) {
+                if row.binary {
+                    patches[*index] = Some(String::new());
+                    continue;
+                }
+                let (before, after) = if let Some(text) = text.as_ref() {
                     let hit = text.get(&row.file).cloned().unwrap_or_default();
                     (hit.before, hit.after)
                 } else {
                     self.show(row, from, to)
                 };
-                result.push(FileDiff {
-                    file: Some(row.file.clone()),
-                    patch: Some(if row.binary {
-                        String::new()
-                    } else {
-                        crate::tool::diff::format_patch(
-                            &row.file,
-                            &before,
-                            &after,
-                            crate::tool::diff::MAX_SAFE_INTEGER,
-                        )
-                    }),
-                    additions: row.additions,
-                    deletions: row.deletions,
-                    status: Some(row.status),
-                });
+                loaded += before.len() + after.len();
+                let patch = crate::tool::diff::format_patch(
+                    &row.file,
+                    &before,
+                    &after,
+                    crate::tool::diff::MAX_SAFE_INTEGER,
+                );
+                if patched + patch.len() <= MAX_DIFF_PATCH_BYTES {
+                    patched += patch.len();
+                    patches[*index] = Some(patch);
+                }
             }
         }
-        result
+        rows.into_iter()
+            .zip(patches)
+            .map(|(row, patch)| FileDiff {
+                patch: patch.or(row.binary.then(String::new)),
+                file: Some(row.file),
+                additions: row.additions,
+                deletions: row.deletions,
+                status: Some(row.status),
+            })
+            .collect()
     }
 
     /// `show` (`snapshot/index.ts:563-586`) — the per-file `git show`
@@ -1232,6 +1261,7 @@ impl Snapshot for GitSnapshot {
 }
 
 /// A `diffFull` row (`snapshot/index.ts:549-555`).
+#[derive(Clone)]
 struct Row {
     file: String,
     status: FileDiffStatus,
@@ -1887,6 +1917,44 @@ mod git_tests {
         let diff = snap.diff(&base).await.unwrap();
         assert!(diff.starts_with("diff --git a/a.txt b/a.txt\n"));
         assert!(diff.ends_with("@@ -1,2 +1,2 @@\n one\n-two\n+TWO"));
+    }
+
+    #[tokio::test]
+    async fn diff_full_keeps_counts_for_every_file_and_patches_within_budget() {
+        let dir = TempDir::new("snap-diff-budget");
+        init_repo(dir.path());
+        let line = "x".repeat(1023);
+        let big = format!("{line}\n").repeat(1024);
+        for index in 0..8 {
+            std::fs::write(dir.path().join(format!("big{index}.js")), &big).unwrap();
+        }
+        std::fs::write(dir.path().join("real.rs"), "one\n").unwrap();
+        commit_all(dir.path());
+
+        let (snap, _data) = snapshot(dir.path());
+        let before = snap.track().await.unwrap();
+        for index in 0..8 {
+            let mut changed = big.clone();
+            changed.push_str("one\ntwo\n");
+            std::fs::write(dir.path().join(format!("big{index}.js")), changed).unwrap();
+        }
+        std::fs::write(dir.path().join("real.rs"), "one\ntwo\n").unwrap();
+        let after = snap.track().await.unwrap();
+
+        let diffs = snap.diff_full(&before, &after).await.unwrap();
+        assert_eq!(diffs.len(), 9);
+        assert!(diffs.iter().all(|diff| diff.additions > 0.0));
+        let kept: usize = diffs
+            .iter()
+            .filter_map(|diff| diff.patch.as_ref().map(String::len))
+            .sum();
+        assert!(kept <= MAX_DIFF_PATCH_BYTES, "kept {kept}");
+        let real = diffs
+            .iter()
+            .find(|diff| diff.file.as_deref() == Some("real.rs"))
+            .unwrap();
+        assert!(real.patch.as_ref().unwrap().contains("+two"));
+        assert!(diffs.iter().any(|diff| diff.patch.is_none()));
     }
 
     #[tokio::test]

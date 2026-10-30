@@ -556,7 +556,7 @@ impl SessionCompaction {
         }
         tracing::info!("pruning");
 
-        let msgs = match self.deps.sessions.messages(session_id, None) {
+        let msgs = match self.deps.sessions.messages_without_diffs(session_id) {
             Ok(msgs) => msgs,
             // catchIf(NotFoundError, () => undefined)
             Err(SessionError::NotFound(_)) => return Ok(()),

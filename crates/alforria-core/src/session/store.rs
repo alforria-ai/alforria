@@ -1020,9 +1020,7 @@ impl SessionStore {
             if page.items.is_empty() {
                 break;
             }
-            for item in page.items.iter().rev() {
-                result.push(item.clone());
-            }
+            result.extend(page.items.into_iter().rev());
             if !page.more || page.cursor.is_none() {
                 break;
             }
@@ -1030,6 +1028,38 @@ impl SessionStore {
         }
         result.reverse();
         Ok(result)
+    }
+
+    /// [`Self::messages`] with every `summary.diffs` empty. Never write a
+    /// message from this back to the store: that wipes them.
+    pub fn messages_without_diffs(&self, session_id: &str) -> Result<Vec<WithParts>, SessionError> {
+        const SIZE: usize = 50;
+        let mut result: Vec<WithParts> = Vec::new();
+        let mut before: Option<String> = None;
+        loop {
+            let page = self
+                .messages
+                .page_without_diffs(session_id, SIZE, before.as_deref())?;
+            if page.items.is_empty() {
+                break;
+            }
+            result.extend(page.items.into_iter().rev());
+            if !page.more || page.cursor.is_none() {
+                break;
+            }
+            before = page.cursor;
+        }
+        result.reverse();
+        Ok(result)
+    }
+
+    /// One message with its parts (`MessageV2.get`, message-v2.ts:506-519).
+    pub fn get_message(
+        &self,
+        session_id: &str,
+        message_id: &str,
+    ) -> Result<WithParts, SessionError> {
+        self.messages.get(session_id, message_id)
     }
 
     /// `updateMessage` (session.ts:629-638).

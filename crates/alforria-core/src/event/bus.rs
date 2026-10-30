@@ -481,7 +481,8 @@ impl EventBus {
                         .map(|stored| {
                             stored.id == event.id
                                 && stored.r#type == stored_type
-                                && stored.data == event.data
+                                && sql::log_form(definition.r#type, &stored.data)
+                                    == sql::log_form(definition.r#type, &event.data)
                         })
                         .unwrap_or(false);
                     if !equal {
@@ -570,7 +571,7 @@ impl EventBus {
                     aggregate_id: aggregate_id.to_string(),
                     seq,
                     r#type: stored_type,
-                    data: event.data.clone(),
+                    data: sql::log_form(definition.r#type, &event.data),
                 },
             )?;
             tx.commit()?;
@@ -1192,6 +1193,23 @@ mod tests {
         diverged.data = serde_json::json!({"sessionID": "ses_1", "changed": true});
         let err = bus.replay(diverged, ReplayOpts::default()).unwrap_err();
         assert!(err.to_string().contains("Replay diverged"), "{err}");
+    }
+
+    #[test]
+    fn log_form_drops_patches_only_from_message_updated() {
+        let data = serde_json::json!({ "info": { "summary": { "diffs": [
+            { "file": "a", "patch": "p", "additions": 1, "deletions": 0 }
+        ] } } });
+        let logged = sql::log_form("message.updated", &data);
+        assert_eq!(
+            logged,
+            serde_json::json!({ "info": { "summary": { "diffs": [
+                { "file": "a", "additions": 1, "deletions": 0 }
+            ] } } })
+        );
+        // A replay of the full event still matches its logged form.
+        assert_eq!(sql::log_form("message.updated", &logged), logged);
+        assert_eq!(sql::log_form("message.part.updated", &data), data);
     }
 
     #[test]

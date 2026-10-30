@@ -423,7 +423,10 @@ impl ProductionTaskOps {
 
     fn state_of(&self, session: V1SessionInfo) -> SubagentState {
         // `stream` is newest-first; each turn's outcome replaces the last one's.
-        let messages = self.messages.stream(&session.id).unwrap_or_default();
+        let messages = self
+            .messages
+            .stream_without_diffs(&session.id)
+            .unwrap_or_default();
         let mut error = None;
         let mut last_text = None;
         let mut tool_calls = 0;

@@ -261,6 +261,11 @@ export default function Changes(props: { sessionID: string }) {
         }
       >
         <div class="change-diff">
+          <Show when={!current()?.patch && (current()?.additions ?? 0) + (current()?.deletions ?? 0) > 0}>
+            <div class="q-empty">
+              <p>This turn changed too much to keep every diff, so only this file's line counts are stored.</p>
+            </div>
+          </Show>
           <Diff rows={rows()} onLine={(r) => setEditing(lineKey(r))} after={lineExtras} marked={marked} />
         </div>
       </Show>

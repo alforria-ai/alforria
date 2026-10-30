@@ -96,6 +96,9 @@ fn cell_to_string(value: &Value) -> String {
 /// `db [query]` (db.ts:8-43) — query execution or the `sqlite3` shell.
 pub fn run(matches: &ArgMatches, ui: &mut Ui) -> Result<(), TypedError> {
     let paths = alforria_core::GlobalPaths::from_env();
+    if let Some(trim) = matches.subcommand_matches("trim-diffs") {
+        return trim_diffs(&paths, trim.get_flag("vacuum"), ui);
+    }
     if matches.subcommand_name().is_some() {
         let path = database_path(&paths);
         ui.write_stdout(&format!("{}\n", path.display()));
@@ -127,6 +130,62 @@ pub fn run(matches: &ArgMatches, ui: &mut Ui) -> Result<(), TypedError> {
         if !tsv.is_empty() {
             ui.write_stdout(&format!("{tsv}\n"));
         }
+    }
+    Ok(())
+}
+
+/// `db trim-diffs`: rewrite oversized stored diffs, then optionally `VACUUM`.
+fn trim_diffs(
+    paths: &alforria_core::GlobalPaths,
+    vacuum: bool,
+    ui: &mut Ui,
+) -> Result<(), TypedError> {
+    let cli_error = |err: String| TypedError::Cli(CliError::new(err));
+    let path = database_path(paths);
+    if vacuum {
+        // `VACUUM` builds its copy in the temp dir, which can be RAM-backed.
+        if let Some(parent) = path.parent() {
+            std::env::set_var("SQLITE_TMPDIR", parent);
+        }
+    }
+    let storage = alforria_core::Storage::open_default(&paths.data)
+        .map_err(|err| cli_error(err.to_string()))?;
+    let mut shown = std::time::Instant::now();
+    let report = alforria_core::session::trim_diffs::trim_stored_diffs(&storage, |report| {
+        if shown.elapsed().as_secs() >= 10 {
+            shown = std::time::Instant::now();
+            eprintln!(
+                "{} messages and {} events trimmed so far, {} MB freed",
+                report.messages,
+                report.events,
+                report.bytes_freed / (1024 * 1024)
+            );
+        }
+    })
+    .map_err(|err| cli_error(err.to_string()))?;
+    ui.write_stdout(&format!(
+        "Trimmed {} messages and {} events, {} MB freed inside the database.\n",
+        report.messages,
+        report.events,
+        report.bytes_freed / (1024 * 1024)
+    ));
+    if vacuum {
+        storage
+            .with_connection(|conn| conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;"))
+            .map_err(|err| {
+                cli_error(format!(
+                    "Vacuum failed, so the file keeps its size: {err}. Is alforria still running?"
+                ))
+            })?;
+        let size = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+        ui.write_stdout(&format!(
+            "The database file is now {} MB.\n",
+            size / (1024 * 1024)
+        ));
+    } else {
+        ui.write_stdout(
+            "The file keeps its size and reuses that space. Stop alforria and add --vacuum to shrink it.\n",
+        );
     }
     Ok(())
 }

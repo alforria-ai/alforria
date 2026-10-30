@@ -110,6 +110,36 @@ pub fn update_owner(
     Ok(())
 }
 
+/// `data` as the event log keeps it. A `message.updated` for a user message
+/// loses its patches: the message row already has them, and the log would
+/// otherwise grow by a turn's whole diff after every step. A replay sees the
+/// files and their counts, which is all the wire schema requires.
+pub fn log_form(r#type: &str, data: &Value) -> Value {
+    let mut data = data.clone();
+    if r#type == "message.updated" {
+        strip_patches(&mut data);
+    }
+    data
+}
+
+/// Drop `patch` from a `message.updated` payload's `info.summary.diffs`.
+/// Returns whether anything changed.
+pub fn strip_patches(data: &mut Value) -> bool {
+    let Some(diffs) = data
+        .pointer_mut("/info/summary/diffs")
+        .and_then(Value::as_array_mut)
+    else {
+        return false;
+    };
+    let mut changed = false;
+    for diff in diffs {
+        if let Some(diff) = diff.as_object_mut() {
+            changed |= diff.remove("patch").is_some();
+        }
+    }
+    changed
+}
+
 /// Insert an `event` row.
 pub fn insert_event(conn: &Connection, row: &EventRow) -> Result<(), CoreError> {
     conn.execute(

@@ -16,6 +16,15 @@ pre-1.0, so minor releases may include breaking changes.
   subagents it started.
 - The TUI and the web client show working subagents and the current todo above
   the prompt, and show resuming, recovered and failed states on task rows.
+- `alforria db trim-diffs [--vacuum]` shrinks a database that already holds
+  oversized diffs.
+
+### Fixed
+
+- A turn whose snapshots include a large unignored directory, such as
+  `node_modules`, no longer costs tens of GB of memory and disk. Each turn keeps
+  at most 4 MB of patches, with line counts for every file, the event log no
+  longer stores patches, and agent steps no longer reload them.
 
 ### Changed
 

@@ -170,7 +170,10 @@ impl ProductionWorkflowOps {
     /// has none, and its agents use the default model.
     fn session_model(&self, session_id: &str) -> (Option<ModelRef>, Option<String>) {
         // `stream` is newest-first.
-        let messages = self.messages.stream(session_id).unwrap_or_default();
+        let messages = self
+            .messages
+            .stream_without_diffs(session_id)
+            .unwrap_or_default();
         match messages.first().map(|message| &message.info) {
             Some(V1Message::Assistant {
                 model_id,

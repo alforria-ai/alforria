@@ -320,7 +320,7 @@ pub async fn run_loop(
             alforria_schema::session_status::SessionStatusInfo::Busy,
         )?;
 
-        let msgs = filter_compacted(deps.messages.stream(session_id)?);
+        let msgs = filter_compacted(deps.messages.stream_without_diffs(session_id)?);
         let latest = latest(&msgs);
         let last_user = latest.user.clone().ok_or_else(|| {
             LoopError::Unknown(

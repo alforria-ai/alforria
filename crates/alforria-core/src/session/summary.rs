@@ -203,7 +203,7 @@ impl SessionSummary {
         if self.deps.config.snapshot == Some(false) {
             return Ok(());
         }
-        let all = self.deps.sessions.messages(session_id, None)?;
+        let all = self.deps.sessions.messages_without_diffs(session_id)?;
         if all.is_empty() {
             return Ok(());
         }
@@ -228,6 +228,17 @@ impl SessionSummary {
         }
         let owned: Vec<WithParts> = messages.iter().map(|msg| (*msg).clone()).collect();
         let msg_diffs = self.compute_diff(&owned).await?;
+        // A step that changed no files leaves the turn's diffs as they were,
+        // and rewriting them would only add to the event log.
+        if let V1Message::User {
+            summary: Some(existing),
+            ..
+        } = &self.deps.sessions.get_message(session_id, message_id)?.info
+        {
+            if existing.diffs == msg_diffs {
+                return Ok(());
+            }
+        }
         let mut info = target.info.clone();
         if let V1Message::User { summary, .. } = &mut info {
             let (title, body) = match summary {
@@ -605,6 +616,131 @@ mod tests {
             }
             _ => panic!("expected user summary with diffs"),
         }
+    }
+
+    /// The user message plus an assistant whose step snapshots span the
+    /// worktree's change, ready for `summarize`.
+    fn turn(h: &crate::session::test_support::Harness, session_id: &str, from: &str, to: &str) {
+        h.services
+            .sessions
+            .update_message(&user_message(session_id, "msg_u", 1.0))
+            .unwrap();
+        h.services
+            .sessions
+            .update_message(&crate::session::test_support::assistant_message(
+                session_id, "msg_a", "msg_u", 2, None, None,
+            ))
+            .unwrap();
+        for part in [
+            step_start(session_id, "msg_a", "prt_s", from),
+            step_finish(session_id, "msg_a", "prt_f", to),
+        ] {
+            h.services.sessions.update_part(&part).unwrap();
+        }
+    }
+
+    fn message_updated_count(h: &crate::session::test_support::Harness) -> i64 {
+        h.services.storage.with_connection(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM event WHERE type = 'message.updated.1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        })
+    }
+
+    #[tokio::test]
+    async fn a_step_that_changes_nothing_writes_no_event() {
+        let h = harness("summary-unchanged", vec![]);
+        let session = create_session(&h.services.sessions, &h.worktree);
+        std::fs::write(h.worktree.join("a.txt"), "one\n").unwrap();
+        let from = h.snapshot.track().await.unwrap();
+        std::fs::write(h.worktree.join("a.txt"), "one\ntwo\n").unwrap();
+        let to = h.snapshot.track().await.unwrap();
+        turn(&h, &session.id, &from, &to);
+        let summary = summary_service(&h);
+
+        summary.summarize(&session.id, "msg_u").await.unwrap();
+        let written = message_updated_count(&h);
+        summary.summarize(&session.id, "msg_u").await.unwrap();
+        assert_eq!(message_updated_count(&h), written);
+    }
+
+    #[tokio::test]
+    async fn the_row_keeps_patches_the_event_log_does_not() {
+        let h = harness("summary-event-log", vec![]);
+        let session = create_session(&h.services.sessions, &h.worktree);
+        std::fs::write(h.worktree.join("a.txt"), "one\n").unwrap();
+        let from = h.snapshot.track().await.unwrap();
+        std::fs::write(h.worktree.join("a.txt"), "one\ntwo\n").unwrap();
+        let to = h.snapshot.track().await.unwrap();
+        turn(&h, &session.id, &from, &to);
+        summary_service(&h)
+            .summarize(&session.id, "msg_u")
+            .await
+            .unwrap();
+
+        let user = h
+            .services
+            .sessions
+            .get_message(&session.id, "msg_u")
+            .unwrap();
+        let V1Message::User {
+            summary: Some(summary),
+            ..
+        } = &user.info
+        else {
+            panic!("expected a summary");
+        };
+        assert!(summary.diffs[0].patch.as_ref().unwrap().contains("+two"));
+
+        let logged: String = h.services.storage.with_connection(|conn| {
+            conn.query_row(
+                "SELECT data FROM event WHERE type = 'message.updated.1' ORDER BY rowid DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        });
+        let logged: serde_json::Value = serde_json::from_str(&logged).unwrap();
+        let entry = &logged["info"]["summary"]["diffs"][0];
+        assert_eq!(entry["file"], "a.txt");
+        assert!(entry.get("patch").is_none(), "{entry}");
+    }
+
+    #[tokio::test]
+    async fn history_without_diffs_leaves_the_row_intact_through_another_summarize() {
+        let h = harness("summary-slim-history", vec![]);
+        let session = create_session(&h.services.sessions, &h.worktree);
+        std::fs::write(h.worktree.join("a.txt"), "one\n").unwrap();
+        let from = h.snapshot.track().await.unwrap();
+        std::fs::write(h.worktree.join("a.txt"), "one\ntwo\n").unwrap();
+        let to = h.snapshot.track().await.unwrap();
+        turn(&h, &session.id, &from, &to);
+        let summary = summary_service(&h);
+        summary.summarize(&session.id, "msg_u").await.unwrap();
+
+        // The slim reads see no diffs, in either store.
+        let slim = h
+            .services
+            .sessions
+            .messages_without_diffs(&session.id)
+            .unwrap();
+        let V1Message::User {
+            summary: Some(listed),
+            ..
+        } = &slim[0].info
+        else {
+            panic!("expected a summary");
+        };
+        assert!(listed.diffs.is_empty());
+
+        // The row still has them, and a later step doesn't lose them.
+        summary.summarize(&session.id, "msg_u").await.unwrap();
+        let diffs = summary.diff(&session.id, Some("msg_u")).unwrap();
+        assert_eq!(diffs.len(), 1);
+        assert!(diffs[0].patch.is_some());
     }
 
     #[tokio::test]
