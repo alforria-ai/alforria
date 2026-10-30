@@ -102,6 +102,11 @@ pub trait WorkflowOps: Send + Sync {
     /// Cancel a running agent session.
     fn cancel_agent<'a>(&'a self, session_id: &'a str) -> BoxFuture<'a, ()>;
 
+    /// How many cancels the session has been asked for.
+    fn cancel_count(&self, _session_id: &str) -> u64 {
+        0
+    }
+
     /// Whether a session is a workflow agent or runs under one. Those hold a
     /// concurrency slot, so a run they started and waited for could never get
     /// one.

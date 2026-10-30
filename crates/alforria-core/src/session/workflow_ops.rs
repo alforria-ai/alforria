@@ -357,6 +357,11 @@ impl WorkflowOps for ProductionWorkflowOps {
         })
     }
 
+    fn cancel_count(&self, session_id: &str) -> u64 {
+        self.facade()
+            .map_or(0, |facade| facade.cancel_count(session_id))
+    }
+
     fn is_workflow_agent(&self, session_id: &str) -> bool {
         let mut current = self.sessions.get(session_id).ok();
         while let Some(session) = current {

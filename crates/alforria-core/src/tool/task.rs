@@ -8,7 +8,7 @@ use std::sync::Arc;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::session::retry::{resume_note, AUTO_RESUME_DELAYS};
+use crate::session::retry::{resume_note, untrusted_output, wait_to_resume, AUTO_RESUME_DELAYS};
 use crate::tool::def::{define, Agents, AskRequest, BoxFuture, ExecuteResult, ToolCtxRef, ToolDef};
 use crate::tool::error::ToolError;
 use crate::tool::truncate::Truncate;
@@ -191,6 +191,10 @@ pub trait TaskOps: Send + Sync {
     }
     /// Cancel a running subagent.
     fn cancel<'a>(&'a self, session_id: &'a str) -> BoxFuture<'a, ()>;
+    /// How many cancels the session has been asked for.
+    fn cancel_count(&self, _session_id: &str) -> u64 {
+        0
+    }
     /// Where one session stands; `None` when it does not exist.
     fn inspect<'a>(&'a self, _session_id: &'a str) -> BoxFuture<'a, Option<SubagentState>> {
         Box::pin(async { None })
@@ -282,18 +286,27 @@ async fn prompt_recovering(
     variant: Option<&str>,
     prompt: &str,
 ) -> Result<(PromptOutcome, usize), ToolError> {
+    let mut cancels = ops.cancel_count(session_id);
     let mut outcome = ops
         .prompt(session_id, agent, model, variant, prompt)
         .await?;
     let mut resumes = 0;
     for delay in AUTO_RESUME_DELAYS {
-        let Some(error) = outcome.error.as_deref().filter(|_| outcome.recoverable) else {
+        let Some(error) = outcome.error.clone().filter(|_| outcome.recoverable) else {
             break;
         };
-        let resume = resume_note(error);
-        tokio::time::sleep(delay).await;
+        // The session is idle now, so a stop has nothing to interrupt: it only
+        // shows here.
+        if !wait_to_resume(delay, || ops.cancel_count(session_id) != cancels).await {
+            outcome.error = Some(format!(
+                "Stopped while waiting to resume after an error: {error}"
+            ));
+            outcome.recoverable = false;
+            break;
+        }
+        cancels = ops.cancel_count(session_id);
         outcome = ops
-            .resume(session_id, agent, model, variant, &resume)
+            .resume(session_id, agent, model, variant, &resume_note(&error))
             .await?;
         resumes += 1;
     }
@@ -654,7 +667,7 @@ async fn run(
                             session_id: &session_id,
                             state,
                             summary: Some(&summary),
-                            text: &text,
+                            text: &untrusted_output(&text),
                         }),
                     )
                     .await;
@@ -889,6 +902,8 @@ mod tests {
         outcomes: std::sync::Mutex<Vec<PromptOutcome>>,
         prompts: std::sync::Mutex<Vec<String>>,
         last_text: Option<String>,
+        /// Whether a stop arrives once the first prompt has ended.
+        stopped_after_first_prompt: bool,
     }
 
     impl FakeOps {
@@ -910,6 +925,7 @@ mod tests {
                 outcomes: Default::default(),
                 prompts: Default::default(),
                 last_text: None,
+                stopped_after_first_prompt: false,
             }
         }
 
@@ -996,6 +1012,9 @@ mod tests {
         }
         fn cancel<'a>(&'a self, _session_id: &'a str) -> BoxFuture<'a, ()> {
             Box::pin(async {})
+        }
+        fn cancel_count(&self, _session_id: &str) -> u64 {
+            u64::from(self.stopped_after_first_prompt && !self.prompts.lock().unwrap().is_empty())
         }
         fn inspect<'a>(&'a self, session_id: &'a str) -> BoxFuture<'a, Option<SubagentState>> {
             let state = SubagentState {
@@ -1243,6 +1262,17 @@ mod tests {
         assert!(text.contains("resumed automatically 2 times"), "{text}");
         assert!(text.contains("found half of it"), "{text}");
         assert!(text.contains("task_id \"ses_child\""), "{text}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_during_the_resume_wait_is_honoured() {
+        let ops = Arc::new(FakeOps {
+            stopped_after_first_prompt: true,
+            ..FakeOps::failing(&[("boom", true)])
+        });
+        let text = failure_text(call(ops.clone(), 1, job()).await.0.unwrap_err());
+        assert_eq!(ops.prompts.lock().unwrap().len(), 1, "not resumed");
+        assert!(text.contains("Stopped while waiting to resume"), "{text}");
     }
 
     #[tokio::test(start_paused = true)]

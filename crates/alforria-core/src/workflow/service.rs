@@ -27,7 +27,7 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
-use crate::session::retry::{resume_note, AUTO_RESUME_DELAYS};
+use crate::session::retry::{resume_note, wait_to_resume, AUTO_RESUME_DELAYS};
 use crate::tool::def::BoxFuture;
 
 use super::definition::{self, parse_meta, rewrite_meta, valid_name};
@@ -760,19 +760,28 @@ impl WorkflowService {
         schema: Option<&Value>,
     ) -> Result<super::WorkflowAgentOutcome, String> {
         let agent = &request.agent;
+        let mut cancels = self.ops.cancel_count(session_id);
         let mut outcome = self
             .ops
             .prompt_agent(session_id, agent, &request.prompt, schema)
             .await?;
         for delay in AUTO_RESUME_DELAYS {
-            let Some(error) = outcome.error.as_deref().filter(|_| outcome.recoverable) else {
+            let Some(error) = outcome.error.clone().filter(|_| outcome.recoverable) else {
                 break;
             };
-            let note = resume_note(error);
-            tokio::time::sleep(delay).await;
+            // The session is idle now, so a stop has nothing to interrupt: it
+            // only shows here.
+            if !wait_to_resume(delay, || self.ops.cancel_count(session_id) != cancels).await {
+                outcome.error = Some(format!(
+                    "Stopped while waiting to resume after an error: {error}"
+                ));
+                outcome.recoverable = false;
+                break;
+            }
+            cancels = self.ops.cancel_count(session_id);
             outcome = self
                 .ops
-                .resume_agent(session_id, agent, &note, schema)
+                .resume_agent(session_id, agent, &resume_note(&error), schema)
                 .await?;
         }
         Ok(outcome)
@@ -1238,6 +1247,8 @@ mod tests {
     struct FlakyOps {
         errors: Mutex<Vec<(&'static str, bool)>>,
         prompts: Mutex<Vec<String>>,
+        /// Whether a stop arrives once the first prompt has ended.
+        stopped: bool,
     }
 
     impl WorkflowOps for FlakyOps {
@@ -1283,6 +1294,29 @@ mod tests {
         fn cancel_agent<'a>(&'a self, _session_id: &'a str) -> BoxFuture<'a, ()> {
             Box::pin(async {})
         }
+
+        fn cancel_count(&self, _session_id: &str) -> u64 {
+            u64::from(self.stopped && !self.prompts.lock().unwrap().is_empty())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stop_during_an_agents_resume_wait_is_honoured() {
+        let temp = crate::storage::test_support::TempDir::new("workflow-stop-resume");
+        let ops = Arc::new(FlakyOps {
+            errors: Mutex::new(vec![("boom", true)]),
+            prompts: Mutex::new(Vec::new()),
+            stopped: true,
+        });
+        let service = WorkflowService::new(ops.clone(), settings(temp.path()));
+        let run = service.start(inline("return await agent('job')")).unwrap();
+        let done = tokio::time::timeout(Duration::from_secs(1), service.wait(&run.id))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(done.state, WorkflowState::Failed);
+        assert_eq!(ops.prompts.lock().unwrap().len(), 1, "not resumed");
+        std::fs::remove_dir_all(temp.path()).ok();
     }
 
     #[tokio::test]
@@ -1291,6 +1325,7 @@ mod tests {
         let ops = Arc::new(FlakyOps {
             errors: Mutex::new(vec![("boom", true)]),
             prompts: Mutex::new(Vec::new()),
+            stopped: false,
         });
         let service = WorkflowService::new(ops.clone(), settings(temp.path()));
         let run = service.start(inline("return await agent('job')")).unwrap();
@@ -1313,6 +1348,7 @@ mod tests {
         let ops = Arc::new(FlakyOps {
             errors: Mutex::new(vec![("bad credentials", false)]),
             prompts: Mutex::new(Vec::new()),
+            stopped: false,
         });
         let service = WorkflowService::new(ops.clone(), settings(temp.path()));
         let run = service.start(inline("return await agent('job')")).unwrap();

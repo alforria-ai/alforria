@@ -584,6 +584,8 @@ pub struct SessionRunState {
     background: Arc<dyn BackgroundJobs>,
     status: Arc<SessionStatusService>,
     runners: Mutex<HashMap<String, Arc<Runner<WithParts, SessionError>>>>,
+    /// Cancels asked for, per session, even with nothing running to stop.
+    cancels: Mutex<HashMap<String, u64>>,
 }
 
 impl SessionRunState {
@@ -595,6 +597,7 @@ impl SessionRunState {
             background,
             status,
             runners: Mutex::new(HashMap::new()),
+            cancels: Mutex::new(HashMap::new()),
         })
     }
 
@@ -662,7 +665,25 @@ impl SessionRunState {
     }
 
     /// `cancel` (run-state.ts:60-70).
+    /// How many cancels a session has been asked for. A session waiting to be
+    /// resumed is idle, so a stop has nothing to interrupt; this is how whoever
+    /// is about to resume it finds out.
+    pub fn cancel_count(&self, session_id: &str) -> u64 {
+        self.cancels
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(session_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
     pub async fn cancel(self: &Arc<Self>, session_id: &str) -> Result<(), CoreError> {
+        *self
+            .cancels
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(session_id.to_string())
+            .or_default() += 1;
         cancel_background_jobs(self.background.as_ref(), session_id)?;
         let existing = self.lock_runners().get(session_id).cloned();
         match existing {

@@ -16,6 +16,7 @@ use futures::future::BoxFuture;
 
 use crate::session::error::SessionError;
 use crate::session::message::MessageStore;
+use crate::session::retry::{neutralize_tags, untrusted_output};
 use crate::session::status::SessionStatusService;
 use crate::session::store::{CreateInput, SessionContext, SessionStore};
 use crate::tool::error::ToolError;
@@ -32,6 +33,10 @@ use crate::tool::task::{ModelRef, ParentMessage, PromptOutcome, Rule, SubagentIn
 pub trait PromptFacade: Send + Sync {
     /// `cancel` (prompt.ts:152-155): `state.cancel(sessionID)`.
     fn cancel<'a>(&'a self, session_id: &'a str) -> BoxFuture<'a, Result<(), SessionError>>;
+    /// How many cancels the session has been asked for.
+    fn cancel_count(&self, _session_id: &str) -> u64 {
+        0
+    }
     /// `resolvePromptParts` (prompt.ts:157-191).
     fn resolve_prompt_parts<'a>(
         &'a self,
@@ -286,6 +291,11 @@ impl TaskOps for ProductionTaskOps {
         })
     }
 
+    fn cancel_count(&self, session_id: &str) -> u64 {
+        self.facade()
+            .map_or(0, |facade| facade.cancel_count(session_id))
+    }
+
     fn inspect<'a>(&'a self, session_id: &'a str) -> BoxFuture<'a, Option<SubagentState>> {
         Box::pin(async move {
             let session = self.sessions.get(session_id).ok()?;
@@ -532,7 +542,11 @@ impl ProductionTaskOps {
             SubagentStatus::Failed => ("error", state.error.unwrap_or_default()),
             _ => return,
         };
-        let summary = format!("The user continued this subagent directly: {}", state.title);
+        let text = untrusted_output(&text);
+        let summary = neutralize_tags(&format!(
+            "The user continued this subagent directly: {}",
+            state.title
+        ));
         self.inject_background_result(
             &parent_id,
             None,

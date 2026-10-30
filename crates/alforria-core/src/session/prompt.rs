@@ -523,6 +523,10 @@ impl crate::session::task_ops::PromptFacade for SessionPrompt {
         Box::pin(async move { SessionPrompt::cancel(self, session_id).await })
     }
 
+    fn cancel_count(&self, session_id: &str) -> u64 {
+        self.deps.services.run_state.cancel_count(session_id)
+    }
+
     fn resolve_prompt_parts<'a>(
         &'a self,
         template: &'a str,
