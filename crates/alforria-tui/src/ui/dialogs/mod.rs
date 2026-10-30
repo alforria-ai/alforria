@@ -190,6 +190,13 @@ pub fn open(app: &mut App, kind: PendingDialog) -> Vec<Effect> {
                 frame.input = session.title.clone();
             }
         }
+        PendingDialog::WorkflowRun { args, .. } => {
+            frame.input = args.clone();
+        }
+        // Not the kind of thing to do by leaning on Enter.
+        PendingDialog::WorkflowStop { .. } | PendingDialog::WorkflowDelete { .. } => {
+            frame.active = 0;
+        }
         PendingDialog::ExportOptions => {
             // `session-${sessionData.id.slice(0, 8)}.md`
             // (`routes/session/index.tsx:959`).
@@ -422,6 +429,8 @@ pub fn handle_key(app: &mut App, key: &crossterm::event::KeyEvent) -> Vec<Effect
     }
     match &kind {
         PendingDialog::SessionRename { .. }
+        | PendingDialog::WorkflowRun { .. }
+        | PendingDialog::WorkflowNew
         | PendingDialog::ProviderCustomId
         | PendingDialog::ProviderApiKey { .. } => prompt_key(app, key),
         PendingDialog::ProviderOauth { .. } => oauth_key(app, key),
@@ -439,6 +448,8 @@ pub fn handle_key(app: &mut App, key: &crossterm::event::KeyEvent) -> Vec<Effect
         | PendingDialog::ShareConsent { .. }
         | PendingDialog::WorkspaceUnavailable
         | PendingDialog::SessionDeleteFailed { .. }
+        | PendingDialog::WorkflowStop { .. }
+        | PendingDialog::WorkflowDelete { .. }
         | PendingDialog::RetryAction { .. } => confirm_key(app, key),
         PendingDialog::Status | PendingDialog::ConsoleOrg | PendingDialog::Tag => {
             if key.code == crossterm::event::KeyCode::Esc || is_ctrl_c(key) {
@@ -622,6 +633,8 @@ pub fn paste(app: &mut App, text: &str) -> bool {
     let line = text.chars().filter(|char| *char != '\n');
     match kind {
         PendingDialog::SessionRename { .. }
+        | PendingDialog::WorkflowRun { .. }
+        | PendingDialog::WorkflowNew
         | PendingDialog::ProviderCustomId
         | PendingDialog::ProviderApiKey { .. }
         | PendingDialog::ProviderOauth { .. } => {
@@ -658,6 +671,31 @@ fn prompt_confirm(app: &mut App, kind: PendingDialog, input: String) -> Vec<Effe
                 session_id,
                 title: input,
             }]
+        }
+        PendingDialog::WorkflowRun { name, script, .. } => {
+            vec![Effect::WorkflowStart {
+                name,
+                script,
+                args: crate::ui::workflows::parse_args(&input),
+            }]
+        }
+        PendingDialog::WorkflowNew => {
+            let name = input.trim();
+            if is_valid_workflow_name(name) {
+                return vec![Effect::WorkflowEdit {
+                    name: name.to_string(),
+                    original: crate::ui::workflows::new_script(name),
+                    scope: "project".to_string(),
+                    overwrite: false,
+                }];
+            }
+            app.show_toast(Toast {
+                title: None,
+                variant: ToastVariant::Error,
+                message: "Use letters, digits, '-', '_' or '.', not starting with '.'".to_string(),
+                duration_ms: 5000,
+            });
+            open(app, PendingDialog::WorkflowNew)
         }
         PendingDialog::ProviderCustomId => {
             let provider_id = input
@@ -700,6 +738,16 @@ fn prompt_confirm(app: &mut App, kind: PendingDialog, input: String) -> Vec<Effe
         }
         _ => Vec::new(),
     }
+}
+
+/// The server's rule for a workflow name (`workflow/definition.rs`).
+fn is_valid_workflow_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 80
+        && !name.starts_with('.')
+        && name
+            .chars()
+            .all(|char| char.is_ascii_alphanumeric() || matches!(char, '-' | '_' | '.'))
 }
 
 /// `normalizeCustomProviderID` (`dialog-provider.tsx:61-65`):
@@ -836,6 +884,20 @@ fn confirm_key(app: &mut App, key: &crossterm::event::KeyEvent) -> Vec<Effect> {
             } else {
                 open(app, PendingDialog::WorkspaceSet)
             }
+        }
+        PendingDialog::WorkflowStop { run_id, .. } => {
+            app.ui.dialogs.stack.pop();
+            if active == 1 {
+                return vec![Effect::WorkflowAbort { run_id }];
+            }
+            Vec::new()
+        }
+        PendingDialog::WorkflowDelete { name } => {
+            app.ui.dialogs.stack.pop();
+            if active == 1 {
+                return vec![Effect::WorkflowDelete { name }];
+            }
+            Vec::new()
         }
         PendingDialog::RetryAction { link, kv_key, .. } => {
             app.ui.dialogs.stack.pop();
@@ -1055,6 +1117,10 @@ fn is_select_kind(kind: &PendingDialog) -> bool {
             | PendingDialog::Debug
             | PendingDialog::Alert { .. }
             | PendingDialog::SessionRename { .. }
+            | PendingDialog::WorkflowRun { .. }
+            | PendingDialog::WorkflowNew
+            | PendingDialog::WorkflowStop { .. }
+            | PendingDialog::WorkflowDelete { .. }
             | PendingDialog::ProviderCustomId
             | PendingDialog::ProviderApiKey { .. }
             | PendingDialog::ProviderOauth { .. }
@@ -1852,11 +1918,27 @@ fn content_lines(app: &App, dialog: &DialogFrame, theme: &Theme) -> Vec<Line<'st
             lines
         }
         PendingDialog::SessionRename { .. }
+        | PendingDialog::WorkflowRun { .. }
+        | PendingDialog::WorkflowNew
         | PendingDialog::ProviderCustomId
         | PendingDialog::ProviderApiKey { .. } => {
             // `DialogPrompt` (`dialog-prompt.tsx:96-140`): the header, the
             // description, the 3-row textarea, the submit hint.
-            let (title, placeholder, description) = match dialog.kind {
+            let run_title;
+            let (title, placeholder, description) = match &dialog.kind {
+                PendingDialog::WorkflowRun { name, title, .. } => {
+                    run_title = format!("Run {}", name.as_deref().unwrap_or("workflow"));
+                    (
+                        run_title.as_str(),
+                        "JSON, or plain text",
+                        title.as_deref().or(Some("Passed to the script as `args`.")),
+                    )
+                }
+                PendingDialog::WorkflowNew => (
+                    "New workflow",
+                    "Name",
+                    Some("Saved in .opencode/workflows. Your editor opens next."),
+                ),
                 PendingDialog::SessionRename { .. } => ("Rename Session", "Enter text", None),
                 PendingDialog::ProviderApiKey { .. } => ("API key", "API key", None),
                 _ => (
@@ -1984,6 +2066,44 @@ fn content_lines(app: &App, dialog: &DialogFrame, theme: &Theme) -> Vec<Line<'st
                 theme,
                 width,
                 &["Skip", "Confirm"],
+                dialog.active,
+                1,
+                0,
+                false,
+            ));
+            lines
+        }
+        PendingDialog::WorkflowStop { name, .. } => {
+            let mut lines = message_lines(
+                theme,
+                "Stop workflow",
+                "esc",
+                &format!("Stop {name} and cancel its running agents?"),
+                width,
+            );
+            lines.push(buttons(
+                theme,
+                width,
+                &["Cancel", "Stop"],
+                dialog.active,
+                1,
+                0,
+                false,
+            ));
+            lines
+        }
+        PendingDialog::WorkflowDelete { name } => {
+            let mut lines = message_lines(
+                theme,
+                "Delete workflow",
+                "esc",
+                &format!("Delete the saved workflow {name}? Its file is removed."),
+                width,
+            );
+            lines.push(buttons(
+                theme,
+                width,
+                &["Cancel", "Delete"],
                 dialog.active,
                 1,
                 0,

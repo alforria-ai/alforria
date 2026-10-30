@@ -56,7 +56,7 @@ export function anyDirectory(): string | undefined {
  * suffix only truncates the task text.
  */
 export function displayTitle(s: Pick<Session, "title"> | undefined) {
-  const t = s?.title?.replace(/\s*\(@[\w-]+ subagent\)\s*$/, "") ?? ""
+  const t = s?.title?.replace(/\s*\(@[\w-]+ (?:subagent|workflow agent)\)\s*$/, "") ?? ""
   return t || "Untitled session"
 }
 

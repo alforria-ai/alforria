@@ -382,6 +382,7 @@ fn clicking_a_task_row_opens_its_child_session() {
         start: 0,
         end: 3,
         child_session: child,
+        workflow_run: None,
     }];
     update(
         &mut app,

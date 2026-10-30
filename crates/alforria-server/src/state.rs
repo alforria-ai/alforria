@@ -19,6 +19,9 @@ use alforria_core::{
 };
 use alforria_schema::file_diff::SnapshotFileDiff;
 use alforria_schema::session_v1::V1SessionInfo;
+use alforria_schema::workflow::{
+    WorkflowDefinition, WorkflowRun, WorkflowSaveRequest, WorkflowStartRequest,
+};
 use futures::future::BoxFuture;
 
 use crate::error::ServerError;
@@ -146,6 +149,54 @@ pub trait SessionEngine: Send + Sync {
     fn generate_copy_name<'a>(&'a self, _context: &'a str) -> BoxFuture<'a, String> {
         Box::pin(async { alforria_core::session::agents::slug_create() })
     }
+
+    // alforria extension — dynamic workflows. Test engines keep the defaults;
+    // the production engine overrides them.
+    fn workflow_list(&self) -> BoxFuture<'static, Result<Vec<WorkflowDefinition>, ServerError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+    fn workflow_runs(&self) -> BoxFuture<'static, Result<Vec<WorkflowRun>, ServerError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+    fn workflow_start(
+        &self,
+        _request: WorkflowStartRequest,
+    ) -> BoxFuture<'static, Result<WorkflowRun, ServerError>> {
+        Box::pin(async { Err(workflows_unavailable()) })
+    }
+    fn workflow_get(
+        &self,
+        _run_id: String,
+    ) -> BoxFuture<'static, Result<Option<WorkflowRun>, ServerError>> {
+        Box::pin(async { Ok(None) })
+    }
+    fn workflow_wait(
+        &self,
+        _run_id: String,
+    ) -> BoxFuture<'static, Result<WorkflowRun, ServerError>> {
+        Box::pin(async { Err(workflows_unavailable()) })
+    }
+    fn workflow_abort(
+        &self,
+        _run_id: String,
+    ) -> BoxFuture<'static, Result<WorkflowRun, ServerError>> {
+        Box::pin(async { Err(workflows_unavailable()) })
+    }
+    fn workflow_save(
+        &self,
+        _request: WorkflowSaveRequest,
+    ) -> Result<WorkflowDefinition, ServerError> {
+        Err(workflows_unavailable())
+    }
+    fn workflow_delete(&self, _name: String) -> Result<bool, ServerError> {
+        Err(workflows_unavailable())
+    }
+}
+
+fn workflows_unavailable() -> ServerError {
+    ServerError::Core(CoreError::Storage(
+        "workflows are not available on this engine".to_string(),
+    ))
 }
 
 /// Resolves the per-directory [`SessionEngine`]. The default (unwired)

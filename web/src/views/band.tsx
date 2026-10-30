@@ -53,6 +53,10 @@ export function Band(props: {
           </Show>
           <kbd>F</kbd>
         </button>
+        <button aria-current={nav.view === "workflows"} onClick={() => setView("workflows")}>
+          <Icon name="workflow" />
+          Workflows
+        </button>
       </nav>
       <button class="designation" title="Server" onClick={props.onSettings}>
         <Icon name="server" />

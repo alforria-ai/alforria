@@ -392,6 +392,7 @@ async fn experimental_tool_lists_production_registry() {
             "webfetch",
             "todowrite",
             "skill",
+            "workflow",
         ]
     );
 }

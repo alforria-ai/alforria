@@ -371,6 +371,7 @@ fn user_message_lines(
             start,
             end: lines.len(),
             child_session: child,
+            workflow_run: None,
         });
     }
 
@@ -545,6 +546,7 @@ fn assistant_message_lines(
                 start,
                 end: lines.len(),
                 child_session: parts::task_child_session(part),
+                workflow_run: parts::workflow_run_of(part),
             });
         }
     }

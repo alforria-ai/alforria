@@ -32,6 +32,7 @@ pub mod system;
 pub mod task_ops;
 pub mod tools;
 pub mod usage;
+pub mod workflow_ops;
 
 #[cfg(test)]
 pub(crate) mod e2e;

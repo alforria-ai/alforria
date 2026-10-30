@@ -29,7 +29,8 @@ fn label(title: &str) -> String {
             .chars()
             .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
             .collect();
-        if !word.is_empty() && rest[word.len()..].starts_with(" subagent") {
+        let after = &rest[word.len()..];
+        if !word.is_empty() && (after.starts_with(" subagent") || after.starts_with(" workflow")) {
             return crate::ui::locale::titlecase(&word);
         }
     }
@@ -159,6 +160,20 @@ pub fn line(app: &App, theme: &Theme, session_id: &str) -> Line<'static> {
         ));
     }
     let mut right: Vec<Span> = Vec::new();
+    // A workflow's agent: the way back to the run it belongs to.
+    let in_workflow = app.state.sync.session(session_id).is_some_and(|session| {
+        session
+            .metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.contains_key("workflowAgent"))
+    });
+    if in_workflow {
+        right.push(Span::styled("Workflow ", theme.text.to_color()));
+        right.push(Span::styled(
+            app.keymap.shortcut("workflows.open"),
+            theme.text_muted.to_color(),
+        ));
+    }
     for (label, keybind) in [
         ("Parent", "session_parent"),
         ("Prev", "session_child_cycle_reverse"),
@@ -221,6 +236,7 @@ mod tests {
         // `\w` excludes `-`, so the hyphenated title falls back (TS parity).
         assert_eq!(label("@web-fetch subagent"), "Subagent");
         assert_eq!(label("@build subagent"), "Build");
+        assert_eq!(label("sessions (@general workflow agent)"), "General");
         assert_eq!(label("Plain title"), "Subagent");
     }
 

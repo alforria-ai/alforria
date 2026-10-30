@@ -38,6 +38,7 @@ import { ArchivedSessions, ManageSession } from "./views/manage"
 import { unseenOrder } from "./nav/unseen"
 import { startAutoAccept } from "./views/queue/auto"
 import { Worktrees } from "./views/worktrees"
+import { Workflows } from "./views/workflows"
 
 const PHONE = "(max-width: 760px)"
 
@@ -111,7 +112,12 @@ export function App() {
     const stopKeys = bindKeys(() => nav.view, {
       palette: () => setPalette(""),
       keys: () => setKeysOpen(true),
-      back: () => (nav.view === "settings" ? leaveSettings() : nav.view === "focus" ? setView("overview") : undefined),
+      back: () =>
+        nav.view === "settings"
+          ? leaveSettings()
+          : nav.view === "focus" || nav.view === "workflows"
+            ? setView("overview")
+            : undefined,
       focusView: () => setView("focus"),
       queue: goQueue,
       nextWaiting: openNextWaiting,
@@ -153,7 +159,14 @@ export function App() {
     })
   })
 
-  const phonePane = () => (nav.view === "focus" ? "focus" : nav.view === "settings" ? "settings" : nav.phonePane)
+  const phonePane = () =>
+    nav.view === "focus"
+      ? "focus"
+      : nav.view === "settings"
+        ? "settings"
+        : nav.view === "workflows"
+          ? "workflows"
+          : nav.phonePane
 
   return (
     <div
@@ -170,21 +183,19 @@ export function App() {
         onSettings={() => openSettings()}
       />
       <main class="main">
-        <Show
-          when={nav.view === "focus" && !phone()}
-          fallback={
-            <Queue
-              ref={(el) => (queueEl = el)}
-              onOpenSession={(id) => open(id)}
-              onCollapse={() => setPanelOpen((v) => !v)}
-            />
-          }
-        >
+        <Show when={nav.view === "focus" && !phone()}>
           <Rail
             onOpen={open}
             onNextWaiting={openNextWaiting}
             onCollapse={() => setPanelOpen((v) => !v)}
             onManage={setManaging}
+          />
+        </Show>
+        <Show when={nav.view === "overview"}>
+          <Queue
+            ref={(el) => (queueEl = el)}
+            onOpenSession={(id) => open(id)}
+            onCollapse={() => setPanelOpen((v) => !v)}
           />
         </Show>
         <section class="workspace" id="workspace" aria-label="Workspace" ref={workspaceEl}>
@@ -200,6 +211,9 @@ export function App() {
             </Match>
             <Match when={nav.view === "settings"}>
               <Settings />
+            </Match>
+            <Match when={nav.view === "workflows"}>
+              <Workflows onOpen={(session) => open(session)} />
             </Match>
             <Match when={nav.view === "overview"}>
               <div class="pane-head ws-head">
@@ -272,6 +286,7 @@ export function App() {
           setNav("phonePane", p)
           setView("overview")
         }}
+        onWorkflows={() => setView("workflows")}
       />
       <Toasts />
       <Show when={palette() !== null}>

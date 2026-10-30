@@ -104,6 +104,7 @@ static APP_KEYBINDS: &[&str] = &[
 
 /// `appGlobalBindingCommands` (`app.tsx:92-104`).
 static APP_GLOBAL_KEYBINDS: &[&str] = &[
+    "workflow_list",
     "session_list",
     "session_new",
     "session_quick_switch_1",
@@ -365,6 +366,8 @@ impl Keymap {
             .join(" ")
     }
 
+    /// `resolve()` (`config/index.tsx:95-127`): overrides, the
+    /// terminal-suspend rewrite, the leader and its timeout.
     /// `resolve()` (`config/index.tsx:95-127`): overrides, the
     /// terminal-suspend rewrite, the leader and its timeout.
     pub fn resolve(config: &TuiConfig) -> Keymap {

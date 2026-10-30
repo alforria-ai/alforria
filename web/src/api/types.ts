@@ -54,3 +54,60 @@ export interface MessageWithParts {
   info: Message
   parts: Part[]
 }
+
+// alforria extension — dynamic workflows (hand-written; no upstream schema).
+export type WorkflowSource = "project" | "global" | "external" | "builtin"
+export type WorkflowState = "queued" | "running" | "completed" | "failed" | "cancelled"
+
+export interface WorkflowDefinition {
+  name: string
+  description?: string
+  path: string
+  source: WorkflowSource
+  phases?: string[]
+  script: string
+}
+
+export interface WorkflowPhase {
+  title: string
+  state: WorkflowState
+  started: number
+  finished?: number
+}
+
+export interface WorkflowAgent {
+  id: string
+  sessionID?: string
+  phase: string
+  label: string
+  agent: string
+  prompt: string
+  state: WorkflowState
+  result?: string
+  error?: string
+  started: number
+  finished?: number
+}
+
+export interface WorkflowLog {
+  time: number
+  message: string
+}
+
+export interface WorkflowRun {
+  id: string
+  name: string
+  description?: string
+  directory: string
+  sessionID?: string
+  state: WorkflowState
+  args?: unknown
+  script: string
+  phases: WorkflowPhase[]
+  agents: WorkflowAgent[]
+  logs: WorkflowLog[]
+  result?: unknown
+  error?: string
+  started: number
+  finished?: number
+}

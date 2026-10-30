@@ -1,8 +1,9 @@
 // Renderers for message parts. Tool calls are datasheet "spec rows": a mark,
 // the tool name in condensed caps, its target in mono, and a preview body
 // chosen per tool (output, diff, todo list, subagent link).
-import { createMemo, createSignal, For, Match, Show, Switch } from "solid-js"
-import type { Part, ToolPart } from "../../api/types"
+import { createEffect, createMemo, createSignal, For, Match, onCleanup, Show, Switch } from "solid-js"
+import { api } from "../../api/client"
+import type { Part, ToolPart, WorkflowRun } from "../../api/types"
 import { activity, fleetState, lastError, toolTarget, type Interrupt } from "../../fleet/derive"
 import { state } from "../../store/store"
 import { Diff, diffStats, parseUnifiedDiff } from "../../ui/diff"
@@ -177,6 +178,7 @@ function ToolView(props: {
     if (props.part.tool === "todowrite") return "todos"
     if (props.part.tool === "task") return "task"
     if (props.part.tool === "subagents") return "subagents"
+    if (props.part.tool === "workflow") return "workflow"
     if (props.part.tool === "question") return "question"
     if (diff()) return "diff"
     if (props.part.tool === "bash") return "output"
@@ -198,6 +200,9 @@ function ToolView(props: {
       </Match>
       <Match when={kind() === "subagents"}>
         <SubagentsRow part={props.part} child={childSession()} onOpen={props.onOpenSession} />
+      </Match>
+      <Match when={kind() === "workflow"}>
+        <WorkflowRow part={props.part} />
       </Match>
       <Match when={true}>
         <div class="tool" classList={{ open: isOpen() && hasBody() }} data-tool={props.part.id}>
@@ -363,6 +368,72 @@ function SubagentsRow(props: { part: ToolPart; child?: string; onOpen: (id: stri
           )}
         </Show>
       </div>
+    </div>
+  )
+}
+
+/** How often a row in the transcript re-reads a run that is still going. */
+const WORKFLOW_ROW_POLL_MS = 2500
+
+/** The `workflow` tool: which run and how it stands, live. The output itself is for the model. */
+function WorkflowRow(props: { part: ToolPart }) {
+  const st = () => props.part.state as State
+  const action = () => String(st().input?.action ?? "")
+  const name = () => (st().title ?? "").replace(/^Workflow: /, "") || String(st().input?.name ?? "inline")
+  const runID = () => st().metadata?.runID as string | undefined
+  const directory = () => state.sessions[(props.part as { sessionID?: string }).sessionID ?? ""]?.directory
+  const [run, setRun] = createSignal<WorkflowRun | null>(null)
+  const settled = () => {
+    const current = run()?.state
+    return current === "completed" || current === "failed" || current === "cancelled"
+  }
+  createEffect(() => {
+    const id = runID()
+    const dir = directory()
+    if (!id || !dir) return
+    const read = () => {
+      if (settled()) return
+      api
+        .workflowRun(dir, id)
+        .then((next) => setRun(next))
+        .catch(() => {
+          // A transient failure keeps the last answer.
+        })
+    }
+    read()
+    const timer = setInterval(read, WORKFLOW_ROW_POLL_MS)
+    onCleanup(() => clearInterval(timer))
+  })
+  const word = () => {
+    if (st().status === "error") return "failed"
+    const current = run()?.state ?? String(st().metadata?.state ?? "")
+    return current === "cancelled" ? "stopped" : current
+  }
+  const progress = () => {
+    const agents = run()?.agents
+    if (!agents?.length) return ""
+    const done = agents.filter((a) => a.state === "completed" || a.state === "failed" || a.state === "cancelled").length
+    return `${done}/${agents.length} agents · `
+  }
+  return (
+    <div class="tool" data-tool={props.part.id}>
+      <div class="tool-row">
+        <span class={`mark ${st().status}`} />
+        <span class="name">workflow</span>
+        <span class="target">{action() === "list" ? "saved workflows" : name()}</span>
+        <span class="meta" classList={{ fail: word() === "failed" }}>
+          {progress()}
+          {word()}
+        </span>
+        <Show when={action() !== "list"}>
+          <a class="link-btn" href="#/workflows">
+            Progress
+          </a>
+        </Show>
+      </div>
+      <Show when={st().status === "error"}>
+        <div class="tool-summary">{failureLine(st().error ?? "")}</div>
+      </Show>
     </div>
   )
 }

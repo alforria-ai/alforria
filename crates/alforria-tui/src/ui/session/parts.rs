@@ -229,7 +229,7 @@ fn render_reasoning(part: &V1Part, ctx: &Ctx) -> Vec<Line<'static>> {
 
 /// `toolDisplay` (`session/index.tsx:2626-2644`).
 fn tool_display(tool: &str) -> &'static str {
-    const TOOLS: [&str; 15] = [
+    const TOOLS: [&str; 16] = [
         "bash",
         "glob",
         "read",
@@ -240,6 +240,7 @@ fn tool_display(tool: &str) -> &'static str {
         "edit",
         "task",
         "subagents",
+        "workflow",
         "apply_patch",
         "todowrite",
         "question",
@@ -335,6 +336,7 @@ fn render_tool(part: &V1Part, ctx: &Ctx) -> Vec<Line<'static>> {
         "edit" => edit(&tool, ctx),
         "task" => task(&tool, ctx),
         "subagents" => subagents(&tool, ctx),
+        "workflow" => workflow(&tool, ctx),
         "execute" => execute(&tool, ctx),
         "apply_patch" => apply_patch(&tool, ctx),
         "todowrite" => todowrite(&tool, ctx),
@@ -1027,6 +1029,63 @@ fn subagents(tool: &ToolParts, ctx: &Ctx) -> Vec<Line<'static>> {
         running,
         text.trim_end_matches(": "),
     )
+}
+
+/// The `workflow` tool (an alforria extension): which run and how it stands,
+/// live. The output itself is for the model.
+fn workflow(tool: &ToolParts, ctx: &Ctx) -> Vec<Line<'static>> {
+    let action = string_value(tool.input.get("action")).unwrap_or_default();
+    let title = match tool.state {
+        V1ToolState::Completed { title, .. } => title.as_str(),
+        _ => "",
+    };
+    let name = title
+        .strip_prefix("Workflow: ")
+        .or_else(|| string_value(tool.input.get("name")))
+        .unwrap_or("inline");
+    let run = string_value(tool.metadata.get("runID"))
+        .and_then(|id| ctx.app.ui.workflows.runs.iter().find(|run| run.id == id));
+    let state = run
+        .map(|run| run.state.as_str())
+        .or_else(|| string_value(tool.metadata.get("state")))
+        .unwrap_or_default();
+    let running = matches!(
+        tool.state,
+        V1ToolState::Running { .. } | V1ToolState::Pending { .. }
+    ) || run.is_some_and(|run| !run.state.is_terminal());
+    let mut text = match action {
+        "list" => "Workflows".to_string(),
+        "abort" => format!("Stop workflow {name}"),
+        _ if state.is_empty() => format!("Workflow {name}"),
+        _ => format!("Workflow {name}: {state}"),
+    };
+    if let Some(progress) = run
+        .map(crate::ui::workflows::progress)
+        .filter(|progress| !progress.is_empty())
+    {
+        text.push_str(&format!(" · {progress}"));
+    }
+    inline_tool(
+        ctx,
+        tool,
+        "◆",
+        None,
+        (state == "failed").then_some(ctx.theme.error),
+        !action.is_empty(),
+        "Starting workflow…",
+        None,
+        running,
+        &text,
+    )
+}
+
+/// The run a `workflow` part is about (`metadata.runID`).
+pub(crate) fn workflow_run_of(part: &V1Part) -> Option<String> {
+    if !matches!(part, V1Part::Tool { tool, .. } if tool == "workflow") {
+        return None;
+    }
+    let tool = tool_parts(part)?;
+    string_value(tool.metadata.get("runID")).map(str::to_string)
 }
 
 fn message_id_of(message: &alforria_schema::session_v1::V1Message) -> &str {

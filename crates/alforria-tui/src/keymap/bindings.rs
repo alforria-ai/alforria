@@ -224,6 +224,11 @@ pub static DEFINITIONS: &[Definition] = &[
         description: "Create a new session",
     }),
     (Definition {
+        name: "workflow_list",
+        default: "<leader>w",
+        description: "Show workflows and their progress",
+    }),
+    (Definition {
         name: "session_list",
         default: "<leader>l",
         description: "List all sessions",
@@ -994,6 +999,7 @@ pub fn command_of(keybind: &str) -> Option<&'static str> {
         "session_copy" => "session.copy",
         "session_move" => "session.move",
         "session_new" => "session.new",
+        "workflow_list" => "workflows.open",
         "session_list" => "session.list",
         "session_timeline" => "session.timeline",
         "session_fork" => "session.fork",

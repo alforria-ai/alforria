@@ -154,7 +154,10 @@ pub fn route_session_id(app: &App) -> Option<&str> {
 /// A pending permission or question shows in place of the prompt
 /// (`session/index.tsx:240-241,1297-1330`).
 pub fn prompt_replaced(app: &App) -> bool {
-    permission::visible(app).is_some() || question::visible(app).is_some() || on_child_session(app)
+    permission::visible(app).is_some()
+        || question::visible(app).is_some()
+        || on_child_session(app)
+        || matches!(app.state.route.data, Route::Workflows { .. })
 }
 
 /// A child session has the subagent footer instead of a prompt
@@ -165,7 +168,7 @@ fn on_child_session(app: &App) -> bool {
         .is_some_and(|session| session.parent_id.is_some())
 }
 
-/// The docked todo list gives way below this much transcript.
+/// What is docked above the prompt gives way below this much transcript.
 const MIN_TRANSCRIPT_ROWS: u16 = 6;
 
 /// `render(app, frame, theme, area)` — the session layout
@@ -234,7 +237,8 @@ pub fn render(app: &mut App, frame: &mut ratatui::Frame, theme: &Theme, area: Re
     let docked_todos = if sidebar_visible || is_child {
         Vec::new()
     } else {
-        let mut lines = subagents::docked_lines(app, theme, &session_id);
+        let mut lines = crate::ui::workflows::docked_lines(app, theme, &session_id);
+        lines.extend(subagents::docked_lines(app, theme, &session_id));
         lines.extend(sidebar::docked_todo_lines(app, theme, &session_id));
         lines
     };

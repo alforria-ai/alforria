@@ -474,6 +474,29 @@ async fn edit_suspended(text: String, cwd: Option<PathBuf>) -> Option<String> {
     .flatten()
 }
 
+/// Where to read workflow runs from: the worktree, so a project's runs show
+/// whichever subdirectory they were started in.
+fn workflow_runs_location(app: &App) -> Location {
+    let project = &app.state.project.instance_path;
+    Location {
+        directory: project
+            .worktree
+            .clone()
+            .filter(|worktree| worktree != "/")
+            .or_else(|| project.directory.clone()),
+        workspace: None,
+    }
+}
+
+fn workflow_error_toast(app: &mut App, error: impl std::fmt::Display) {
+    app.show_toast(Toast {
+        title: None,
+        variant: ToastVariant::Error,
+        message: error.to_string(),
+        duration_ms: 5000,
+    });
+}
+
 /// Execute one effect against the server seam. Effects that can block
 /// on a user reply (the submit pipeline) release the app lock across
 /// their awaits; the rest hold it for the duration.
@@ -1035,6 +1058,98 @@ pub async fn execute_effect(
         Effect::SessionResync { session_id } => {
             app.lock().await.state.sync.full_synced.remove(&session_id);
             let _ = state::sync::session_sync_shared(&**app, api.as_ref(), &session_id).await;
+        }
+        Effect::WorkflowsRefresh { definitions } => {
+            let location = workflow_runs_location(&*app.lock().await);
+            let runs = api
+                .workflow_runs(&location)
+                .await
+                .map_err(|error| error.to_string());
+            let saved = if definitions {
+                api.workflow_list(&Location::default()).await.ok()
+            } else {
+                None
+            };
+            let attention = ui::workflows::apply(&mut *app.lock().await, runs, saved);
+            for effect in attention {
+                Box::pin(execute_effect(app, Arc::clone(&api), effect)).await;
+            }
+        }
+        Effect::WorkflowStart { name, script, args } => {
+            let body = serde_json::json!({ "name": name, "script": script, "args": args });
+            match api.workflow_start(&Location::default(), body).await {
+                Ok(run) => {
+                    {
+                        let mut app = app.lock().await;
+                        ui::workflows::open(&mut app, Some(&run.id));
+                    }
+                    let refresh = Effect::WorkflowsRefresh { definitions: false };
+                    Box::pin(execute_effect(app, api, refresh)).await;
+                }
+                Err(error) => workflow_error_toast(&mut *app.lock().await, error),
+            }
+        }
+        Effect::WorkflowAbort { run_id } => {
+            if let Err(error) = api.workflow_abort(&Location::default(), &run_id).await {
+                workflow_error_toast(&mut *app.lock().await, error);
+            }
+            let refresh = Effect::WorkflowsRefresh { definitions: false };
+            Box::pin(execute_effect(app, api, refresh)).await;
+        }
+        Effect::WorkflowDelete { name } => {
+            if let Err(error) = api.workflow_delete(&Location::default(), &name).await {
+                workflow_error_toast(&mut *app.lock().await, error);
+            }
+            let refresh = Effect::WorkflowsRefresh { definitions: true };
+            Box::pin(execute_effect(app, api, refresh)).await;
+        }
+        Effect::WorkflowEdit {
+            name,
+            original,
+            scope,
+            overwrite,
+        } => {
+            let Some(editor) = editor::configured_editor() else {
+                workflow_error_toast(&mut *app.lock().await, "Set $EDITOR to edit workflows");
+                return;
+            };
+            let cwd = {
+                let app = app.lock().await;
+                app.state
+                    .project
+                    .instance_path
+                    .worktree
+                    .clone()
+                    .or_else(|| app.state.project.instance_path.directory.clone())
+            };
+            let seed = original.clone();
+            let edited = tokio::task::spawn_blocking(move || {
+                term::suspend(|| {
+                    editor::open_file_with(&seed, &editor, cwd.map(PathBuf::from).as_deref(), "js")
+                })
+            })
+            .await
+            .ok()
+            .flatten();
+            let Some(script) = edited.filter(|script| *script != original) else {
+                return;
+            };
+            let body = serde_json::json!({
+                "name": name,
+                "script": script,
+                "scope": scope,
+                "overwrite": overwrite,
+            });
+            match api.workflow_save(&Location::default(), body).await {
+                Ok(saved) => {
+                    let mut app = app.lock().await;
+                    app.ui.workflows.selected = Some(ui::workflows::Selected::Saved(saved.name));
+                    app.ui.workflows.focus = ui::workflows::Focus::List;
+                }
+                Err(error) => workflow_error_toast(&mut *app.lock().await, error),
+            }
+            let refresh = Effect::WorkflowsRefresh { definitions: true };
+            Box::pin(execute_effect(app, api, refresh)).await;
         }
         Effect::SessionHydrate { session_id } => {
             let _ = state::sync::session_sync_shared(&**app, api.as_ref(), &session_id).await;

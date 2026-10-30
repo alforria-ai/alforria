@@ -211,6 +211,7 @@ fn cacheable(part: &V1Part, ctx: &Ctx) -> bool {
         V1Part::Reasoning { time, .. } => time.end.is_some() || ctx.message_done,
         V1Part::Tool { tool, state, .. } => {
             tool != "task"
+                && tool != "workflow"
                 && matches!(
                     state,
                     V1ToolState::Completed { .. } | V1ToolState::Error { .. }
