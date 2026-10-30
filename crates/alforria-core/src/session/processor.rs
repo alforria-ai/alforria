@@ -16,7 +16,7 @@
 //! resizer ships with M5); plugin hooks (`experimental.text.complete`,
 //! `chat.params`, `chat.headers`) are no-op seams (spec §2.6).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -35,7 +35,7 @@ use alforria_schema::session_v1::{
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::schema::Config;
+use crate::config::schema::{Config, TimeoutSetting};
 use crate::event::bus::PublishOptions;
 use crate::Clock;
 
@@ -251,6 +251,38 @@ struct Inner {
 #[derive(Clone)]
 pub struct Handle {
     inner: Arc<Inner>,
+}
+
+/// `chunkTimeout`'s default (openapi `ProviderOptions.chunkTimeout`).
+const DEFAULT_CHUNK_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// How long a provider may go silent before the attempt fails: the provider's
+/// `chunkTimeout`, where `false` turns the limit off.
+fn stall_timeout(config: &Config, provider_id: &str) -> Option<Duration> {
+    let setting = config
+        .provider
+        .as_ref()
+        .and_then(|providers| providers.get(provider_id))
+        .and_then(|provider| provider.options.as_ref())
+        .and_then(|options| options.chunk_timeout.as_ref());
+    match setting {
+        None => Some(DEFAULT_CHUNK_TIMEOUT),
+        Some(TimeoutSetting::Millis(millis)) => Some(Duration::from_millis(millis.get())),
+        Some(TimeoutSetting::Disabled(_)) => None,
+    }
+}
+
+/// A retryable failure, so a hung provider goes through the same retries as a
+/// dropped connection instead of holding the session forever.
+fn stall_error() -> SourceError {
+    SourceError::ApiCall(Box::new(ApiCallError {
+        message: "SSE read timed out".to_string(),
+        status_code: None,
+        is_retryable: true,
+        response_headers: None,
+        response_body: None,
+        url: None,
+    }))
 }
 
 /// Outcome of one attempt driving the stream.
@@ -906,11 +938,20 @@ impl Handle {
         {
             return RunOutcome::Failed(storage_failure(error));
         }
+        let stall = stall_timeout(&inner.deps.config, &stream_input.model.provider_id);
         let mut stream = inner
             .deps
             .llm
             .stream_with_cancel(stream_input, cancel.clone());
+        // Tools run inside the stream, which is silent until they settle.
+        let mut running_tools: HashSet<String> = HashSet::new();
         loop {
+            let stalled = async {
+                match stall.filter(|_| running_tools.is_empty()) {
+                    Some(limit) => tokio::time::sleep(limit).await,
+                    None => std::future::pending().await,
+                }
+            };
             let item = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => {
@@ -961,10 +1002,20 @@ impl Handle {
                     return RunOutcome::Cancelled;
                 }
                 item = stream.next() => item,
+                _ = stalled => return RunOutcome::Failed(stall_error()),
             };
             match item {
                 None => return RunOutcome::Done,
                 Some(Ok(event)) => {
+                    match &event {
+                        LlmEvent::ToolCall { id, .. } => {
+                            running_tools.insert(id.clone());
+                        }
+                        LlmEvent::ToolResult { id, .. } | LlmEvent::ToolError { id, .. } => {
+                            running_tools.remove(id);
+                        }
+                        _ => {}
+                    }
                     if let Err(error) = self.handle_event(event).await {
                         return RunOutcome::Failed(error);
                     }
