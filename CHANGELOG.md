@@ -7,6 +7,8 @@ pre-1.0, so minor releases may include breaking changes.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-27
+
 ### Added
 
 - A DeepSeek prompt family in the core prompt catalog.
@@ -18,6 +20,8 @@ pre-1.0, so minor releases may include breaking changes.
   being sent to the provider as content.
 - An oversized buffered server response is no longer emptied before it is
   returned to the client.
+- Abandoned permission and question requests are cleared from clients, and
+  replies resolve across loaded instances.
 
 ## [0.2.1] - 2026-10-16
 
