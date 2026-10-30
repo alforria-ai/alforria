@@ -461,6 +461,7 @@ fn tool_registry(
         instance.services.messages.clone(),
         instance.services.agents.clone(),
         context.clone(),
+        instance.services.status.clone(),
     );
     let task = alforria_core::tool::task::task_tool(
         truncate.clone(),

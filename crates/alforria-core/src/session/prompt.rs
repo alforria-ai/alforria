@@ -127,8 +127,13 @@ impl SessionPrompt {
     }
 
     /// `prompt` (prompt.ts:1052-1071).
-    pub async fn prompt(&self, input: PromptInput) -> Result<WithParts, PromptError> {
+    pub async fn prompt(&self, mut input: PromptInput) -> Result<WithParts, PromptError> {
         let session = self.deps.services.sessions.get(&input.session_id)?;
+        // A subagent stays the agent it was started as unless told otherwise;
+        // the default agent is for sessions a person started.
+        if input.agent.is_none() && session.parent_id.is_some() {
+            input.agent = session.agent.clone();
+        }
         self.deps.revert.cleanup(&session)?;
         let message = create_user_message(&self.prompt_deps(), &input).await?;
         self.deps.services.sessions.touch(&input.session_id)?;

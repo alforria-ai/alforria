@@ -299,6 +299,54 @@ async fn production_prompt_e2e() {
     );
 }
 
+/// A direct prompt to a child session reaches its parent, which starts a turn
+/// on it without anyone carrying the result over.
+#[tokio::test]
+async fn a_direct_prompt_to_a_child_reports_to_its_parent() {
+    let f = fixture("Hello from the mock");
+    let parent = create_session(&f).await;
+    let parent_id = parent["id"].as_str().unwrap().to_string();
+    let directory = urlencode(&f.directory.display().to_string());
+    let prompt = r#"{"parts": [{"type": "text", "text": "hi"}]}"#;
+    let path = format!("/session/{parent_id}/message?directory={directory}");
+    let response = send(&f.router, "POST", &path, prompt).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = send(
+        &f.router,
+        "POST",
+        &format!("/session?directory={directory}"),
+        &format!(r#"{{"parentID": "{parent_id}"}}"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let child: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+    let child_id = child["id"].as_str().unwrap();
+    let response = send(
+        &f.router,
+        "POST",
+        &format!("/session/{child_id}/message?directory={directory}"),
+        prompt,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let started = std::time::Instant::now();
+    loop {
+        let response = send(&f.router, "GET", &path, "").await;
+        let messages = body_string(response).await;
+        if messages.contains("continued this subagent directly") {
+            assert!(messages.contains(child_id), "{messages}");
+            break;
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the parent never heard: {messages}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
 /// Tool listing from `/experimental/tool` once the registry is wired
 /// (M7.2 acceptance check 4).
 #[tokio::test]
@@ -340,6 +388,7 @@ async fn experimental_tool_lists_production_registry() {
             "edit",
             "write",
             "task",
+            "subagents",
             "webfetch",
             "todowrite",
             "skill",

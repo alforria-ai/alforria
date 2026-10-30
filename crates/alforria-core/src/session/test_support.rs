@@ -394,6 +394,8 @@ pub(crate) struct DispatchLlm {
     script: Mutex<VecDeque<Vec<Result<LlmEvent, LlmError>>>>,
     inputs: Mutex<Vec<StreamInput>>,
     hang: std::sync::atomic::AtomicBool,
+    /// The stream to leave silent instead of ending, by the order they open.
+    hang_at: std::sync::atomic::AtomicUsize,
 }
 
 impl DispatchLlm {
@@ -402,10 +404,17 @@ impl DispatchLlm {
             script: Mutex::new(script.into_iter().collect()),
             inputs: Mutex::new(Vec::new()),
             hang: std::sync::atomic::AtomicBool::new(false),
+            hang_at: std::sync::atomic::AtomicUsize::new(usize::MAX),
         })
     }
 
     // M5.8 (mock-LLM full-loop E2E) exercises the abort path.
+    /// Leave the stream at this position silent instead of ending it.
+    pub(crate) fn hang_stream(&self, index: usize) {
+        self.hang_at
+            .store(index, std::sync::atomic::Ordering::SeqCst);
+    }
+
     #[allow(dead_code)]
     pub(crate) fn lock_hang(&self) {
         self.hang.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -555,7 +564,9 @@ impl LlmStream for DispatchLlm {
     fn stream(&self, input: StreamInput) -> LlmEventStream {
         self.inputs.lock().unwrap().push(input.clone());
         let events = self.script.lock().unwrap().pop_front().unwrap_or_default();
-        let hang = self.hang.load(std::sync::atomic::Ordering::SeqCst);
+        let index = self.inputs.lock().unwrap().len() - 1;
+        let hang_once = self.hang_at.load(std::sync::atomic::Ordering::SeqCst) == index;
+        let hang = hang_once || self.hang.load(std::sync::atomic::Ordering::SeqCst);
         dispatch_stream(events.into(), input.tools, hang)
     }
 }
@@ -729,6 +740,7 @@ fn engine_build_with(
         services.messages.clone(),
         services.agents.clone(),
         context,
+        services.status.clone(),
     );
     let truncate = Arc::new(crate::tool::truncate::TruncateService::default_limits(
         temp.path().to_path_buf(),
@@ -747,9 +759,11 @@ fn engine_build_with(
         EngineDefs::Real => crate::tool::read::read_tool(truncate.clone(), agents.clone(), None),
         EngineDefs::HangingRead => hanging_def("read"),
     };
+    let subagents =
+        crate::tool::subagents::subagents_tool(truncate.clone(), agents.clone(), ops.clone());
     let write = crate::tool::write::write_tool(truncate.clone(), agents, None, None, None);
     let registry = crate::tool::registry::ToolRegistry::new(
-        vec![task, read, write],
+        vec![task, subagents, read, write],
         Vec::new(),
         crate::tool::registry::RuntimeFlags::default(),
         Arc::new(RegistryStubAgents),

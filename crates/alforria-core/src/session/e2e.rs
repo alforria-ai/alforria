@@ -25,8 +25,8 @@ use crate::event::definition::Payload;
 use crate::session::message::WithParts;
 use crate::session::prompt_input::{PromptInput, PromptPartInput};
 use crate::session::test_support::{
-    create_engine_session, engine, engine_hanging_read, engine_with_compaction_script, text_stream,
-    Engine,
+    create_engine_session, engine, engine_hanging_read, engine_with_compaction_script,
+    engine_with_config, text_stream, Engine,
 };
 
 const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -218,8 +218,10 @@ fn assert_golden(name: &str, e: &Engine, events: &[(String, Value)], comment: &s
 mod tests {
     use super::*;
     use crate::session::test_support::PermissionAnswerer;
+    use crate::tool::task::{SubagentStatus, TaskOps};
     use alforria_llm::schema::errors::{HttpRequestDetails, HttpResponseDetails};
     use alforria_schema::permission_v1::PermissionV1Reply;
+    use alforria_schema::session_v1::AssistantError;
 
     // ------------------------------------------------------------------
     // 1. Plain text turn — golden event sequence
@@ -566,6 +568,428 @@ mod tests {
     // ------------------------------------------------------------------
     // 6. Subagent — the task tool spawns a child session
     // ------------------------------------------------------------------
+
+    fn task_call() -> Vec<Result<LlmEvent, LlmError>> {
+        vec![Ok(tool_call_event(
+            "cal_1",
+            "task",
+            json!({
+                "description": "Research",
+                "prompt": "do the research",
+                "subagent_type": "general",
+            }),
+        ))]
+        .into_iter()
+        .chain(tool_calls_finish())
+        .collect()
+    }
+
+    /// A provider rejection the session loop does not retry by itself.
+    fn rejected() -> Vec<Result<LlmEvent, LlmError>> {
+        vec![Err(LlmError {
+            module: "ProviderShared".to_string(),
+            method: "request".to_string(),
+            reason: LlmErrorReason::InvalidRequest {
+                message: "boom from provider".to_string(),
+                parameter: None,
+                classification: None,
+                provider_metadata: None,
+                http: None,
+            },
+        })]
+    }
+
+    fn child_of(e: &Engine, parent: &str) -> String {
+        e.services.sessions.children(parent).unwrap()[0].id.clone()
+    }
+
+    fn text_of(message: &WithParts) -> String {
+        message
+            .parts
+            .iter()
+            .filter_map(|part| match part {
+                V1Part::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_failing_subagent_is_resumed_and_its_parent_gets_the_answer() {
+        let e = engine(
+            "e2e-subagent-resume",
+            vec![
+                task_call(),
+                rejected(),
+                text_stream("answer after the resume"),
+                text_stream("parent continues"),
+            ],
+        );
+        let session = create_engine_session(&e);
+
+        run_prompt(&e, prompt_input(&session.id, "spawn a subagent")).await;
+        assert_eq!(e.llm.calls(), 4);
+
+        let task_part = e
+            .services
+            .messages
+            .stream(&session.id)
+            .unwrap()
+            .into_iter()
+            .flat_map(|message| message.parts)
+            .find(|part| matches!(part, V1Part::Tool { tool, .. } if tool == "task"))
+            .expect("task tool part");
+        let V1Part::Tool {
+            state: V1ToolState::Completed { output, .. },
+            ..
+        } = task_part
+        else {
+            panic!("expected a completed task part, got {task_part:?}")
+        };
+        assert!(output.contains("answer after the resume"), "got {output}");
+        assert!(output.contains("Recovered from errors"), "got {output}");
+
+        // The resume went into the same session, which saw why it stopped.
+        let child = child_of(&e, &session.id);
+        let messages = e.services.messages.stream(&child).unwrap();
+        let resume = messages
+            .iter()
+            .find(|message| matches!(message.info, V1Message::User { .. }))
+            .expect("the resume prompt");
+        assert!(text_of(resume).contains("boom from provider"));
+        // A note from the system, not something the user said.
+        assert!(resume.parts.iter().any(|part| matches!(
+            part,
+            V1Part::Text {
+                synthetic: Some(true),
+                ..
+            }
+        )));
+        let state = e.ops.inspect(&child).await.unwrap();
+        assert_eq!(state.status, SubagentStatus::Completed);
+        assert_eq!(state.last_text.as_deref(), Some("answer after the resume"));
+    }
+
+    #[tokio::test]
+    async fn the_parent_hears_when_the_user_continues_a_subagent_directly() {
+        let e = engine(
+            "e2e-subagent-report",
+            vec![
+                task_call(),
+                text_stream("first answer"),
+                text_stream("parent continues"),
+                // The user's direct prompt to the child.
+                text_stream("answer after the nudge"),
+                // The parent's turn on hearing about it.
+                text_stream("parent saw the update"),
+                // The same again, with the child failing this time.
+                rejected(),
+                text_stream("parent saw the failure"),
+            ],
+        );
+        let session = create_engine_session(&e);
+        // Generated ids, so that later prompts sort after this one.
+        let spawn = PromptInput {
+            message_id: None,
+            ..prompt_input(&session.id, "spawn a subagent")
+        };
+        run_prompt(&e, spawn).await;
+        let child = child_of(&e, &session.id);
+
+        let user_prompt = || PromptInput {
+            message_id: None,
+            agent: Some("general".to_string()),
+            ..prompt_input(&child, "continue")
+        };
+        run_prompt(&e, user_prompt()).await;
+        e.ops.report_to_parent(&child).await;
+        assert_eq!(e.llm.calls(), 5);
+        let parent = e.services.messages.stream(&session.id).unwrap();
+        let reported = parent
+            .iter()
+            .find(|message| matches!(message.info, V1Message::User { .. }))
+            .map(text_of)
+            .unwrap_or_default();
+        assert!(
+            reported.contains("continued this subagent directly"),
+            "got {reported}"
+        );
+        assert!(
+            reported.contains("answer after the nudge"),
+            "got {reported}"
+        );
+        assert!(reported.contains(&format!("<task id=\"{child}\" state=\"completed\">")));
+        assert_eq!(text_of(&parent[0]), "parent saw the update");
+
+        run_prompt(&e, user_prompt()).await;
+        assert_eq!(
+            e.ops.inspect(&child).await.unwrap().status,
+            SubagentStatus::Failed
+        );
+        e.ops.report_to_parent(&child).await;
+        let parent = e.services.messages.stream(&session.id).unwrap();
+        let reported = parent
+            .iter()
+            .find(|message| matches!(message.info, V1Message::User { .. }))
+            .map(text_of)
+            .unwrap_or_default();
+        assert!(reported.contains("state=\"error\""), "got {reported}");
+        assert!(reported.contains("boom from provider"), "got {reported}");
+    }
+
+    fn chunk_timeout_config(millis: u64) -> Value {
+        json!({ "provider": { "anthropic": { "options": { "chunkTimeout": millis } } } })
+    }
+
+    #[tokio::test]
+    async fn a_silent_provider_is_timed_out_and_retried() {
+        let e = engine_with_config(
+            "e2e-stall",
+            vec![Vec::new(), text_stream("answer after the stall")],
+            chunk_timeout_config(50),
+        );
+        e.llm.hang_stream(0);
+        let session = create_engine_session(&e);
+        let done = run_prompt(&e, prompt_input(&session.id, "hello")).await;
+        assert_eq!(e.llm.calls(), 2);
+        assert_eq!(text_of(&done), "answer after the stall");
+    }
+
+    #[tokio::test]
+    async fn a_running_tool_does_not_count_as_a_silent_provider() {
+        // The parent's stream says nothing while its task call runs, here for
+        // the two seconds of the child's automatic resume.
+        let e = engine_with_config(
+            "e2e-stall-tool",
+            vec![
+                task_call(),
+                rejected(),
+                text_stream("answer after the resume"),
+                text_stream("parent continues"),
+            ],
+            chunk_timeout_config(200),
+        );
+        let session = create_engine_session(&e);
+        let done = run_prompt(&e, prompt_input(&session.id, "spawn a subagent")).await;
+        assert_eq!(e.llm.calls(), 4);
+        assert_eq!(text_of(&done), "parent continues");
+    }
+
+    #[tokio::test]
+    async fn a_parent_manages_its_subagents_with_the_tool() {
+        let call = |id: &str, args: Value| -> Vec<Result<LlmEvent, LlmError>> {
+            vec![Ok(tool_call_event(id, "subagents", args))]
+                .into_iter()
+                .chain(tool_calls_finish())
+                .collect()
+        };
+        let e = engine(
+            "e2e-subagents-tool",
+            vec![
+                task_call(),
+                text_stream("the child's answer"),
+                call("cal_2", json!({ "action": "list" })),
+                call(
+                    "cal_3",
+                    json!({ "action": "status", "task_id": "ses_not_mine" }),
+                ),
+                text_stream("parent continues"),
+            ],
+        );
+        let session = create_engine_session(&e);
+        run_prompt(&e, prompt_input(&session.id, "spawn a subagent")).await;
+        let child = child_of(&e, &session.id);
+
+        let parts: Vec<V1Part> = e
+            .services
+            .messages
+            .stream(&session.id)
+            .unwrap()
+            .into_iter()
+            .rev()
+            .flat_map(|message| message.parts)
+            .filter(|part| matches!(part, V1Part::Tool { tool, .. } if tool == "subagents"))
+            .collect();
+        let V1Part::Tool {
+            state: V1ToolState::Completed { output, .. },
+            ..
+        } = &parts[0]
+        else {
+            panic!("expected a completed list, got {:?}", parts[0])
+        };
+        assert!(
+            output.contains(&format!("- {child} [completed]")),
+            "got {output}"
+        );
+        let V1Part::Tool {
+            state: V1ToolState::Error { error, .. },
+            ..
+        } = &parts[1]
+        else {
+            panic!("expected a refused status, got {:?}", parts[1])
+        };
+        assert!(
+            error.contains("not a subagent of this session"),
+            "got {error}"
+        );
+
+        let state = e.ops.inspect(&child).await.unwrap();
+        assert_eq!(state.last_text.as_deref(), Some("the child's answer"));
+    }
+
+    #[tokio::test]
+    async fn a_prompt_naming_no_agent_keeps_a_subagent_its_agent() {
+        let e = engine(
+            "e2e-subagent-agent",
+            vec![
+                task_call(),
+                text_stream("first answer"),
+                text_stream("parent continues"),
+                text_stream("second answer"),
+            ],
+        );
+        let session = create_engine_session(&e);
+        run_prompt(&e, prompt_input(&session.id, "spawn a subagent")).await;
+        let child = child_of(&e, &session.id);
+        let done = run_prompt(
+            &e,
+            PromptInput {
+                message_id: None,
+                agent: None,
+                ..prompt_input(&child, "one more thing")
+            },
+        )
+        .await;
+        let V1Message::Assistant { agent, .. } = &done.info else {
+            panic!("expected an assistant message, got {:?}", done.info)
+        };
+        assert_eq!(agent, "general");
+    }
+
+    #[tokio::test]
+    async fn a_nudge_during_a_task_call_adds_no_parent_turn() {
+        // The child goes silent, is timed out and retried, which leaves two
+        // seconds for the user's prompt to join it; both end together.
+        let e = engine_with_config(
+            "e2e-subagent-noduplicate",
+            vec![
+                task_call(),
+                Vec::new(),
+                text_stream("the child's answer"),
+                text_stream("parent continues"),
+            ],
+            chunk_timeout_config(50),
+        );
+        // The child's stream: the parent's opens first.
+        e.llm.hang_stream(1);
+        let session = create_engine_session(&e);
+        let parent_turn = {
+            let prompt = e.prompt.clone();
+            let input = PromptInput {
+                message_id: None,
+                ..prompt_input(&session.id, "spawn a subagent")
+            };
+            tokio::spawn(async move { prompt.prompt(input).await })
+        };
+        tokio::time::timeout(TIMEOUT, async {
+            loop {
+                let children = e.services.sessions.children(&session.id).unwrap();
+                if children
+                    .first()
+                    .is_some_and(|child| e.ops.is_awaited(&child.id))
+                {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the task call starts");
+        let child = child_of(&e, &session.id);
+        let nudge = PromptInput {
+            message_id: None,
+            agent: Some("general".to_string()),
+            ..prompt_input(&child, "also this")
+        };
+        tokio::time::timeout(TIMEOUT, e.ops.prompt_reporting(&e.prompt, nudge))
+            .await
+            .expect("the nudge ends")
+            .expect("the nudge succeeds");
+        tokio::time::timeout(TIMEOUT, parent_turn)
+            .await
+            .expect("the parent's turn ends")
+            .unwrap()
+            .expect("the parent's turn succeeds");
+        // Time for a report to have landed, if one was on its way.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let users = e
+            .services
+            .messages
+            .stream(&session.id)
+            .unwrap()
+            .iter()
+            .filter(|message| matches!(message.info, V1Message::User { .. }))
+            .count();
+        assert_eq!(users, 1, "the task call was the parent's only update");
+    }
+
+    #[tokio::test]
+    async fn a_nudge_after_the_task_call_reports_through_the_same_path() {
+        let e = engine(
+            "e2e-subagent-report-path",
+            vec![
+                task_call(),
+                text_stream("first answer"),
+                text_stream("parent continues"),
+                text_stream("answer after the nudge"),
+                text_stream("parent saw the update"),
+            ],
+        );
+        let session = create_engine_session(&e);
+        let spawn = PromptInput {
+            message_id: None,
+            ..prompt_input(&session.id, "spawn a subagent")
+        };
+        run_prompt(&e, spawn).await;
+        let child = child_of(&e, &session.id);
+        let nudge = PromptInput {
+            message_id: None,
+            ..prompt_input(&child, "continue")
+        };
+        e.ops.prompt_reporting(&e.prompt, nudge).await.unwrap();
+        tokio::time::timeout(TIMEOUT, async {
+            while e.llm.calls() < 5 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the parent starts a turn on the report");
+    }
+
+    #[tokio::test]
+    async fn a_provider_that_never_finishes_ends_the_turn_instead_of_spinning() {
+        // Nothing scripted: every stream is empty, however often it is opened.
+        let e = engine("e2e-unfinished", Vec::new());
+        let session = create_engine_session(&e);
+        let done = run_prompt(&e, prompt_input(&session.id, "hello")).await;
+        assert_eq!(e.llm.calls(), 3);
+        let V1Message::Assistant { error, .. } = &done.info else {
+            panic!("expected an assistant message, got {:?}", done.info)
+        };
+        let Some(AssistantError::Unknown { message, .. }) = error else {
+            panic!("expected the turn to fail, got {error:?}")
+        };
+        assert!(message.contains("without finishing"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_top_level_session_has_nobody_to_report_to() {
+        let e = engine("e2e-subagent-noreport", vec![text_stream("hello")]);
+        let session = create_engine_session(&e);
+        run_prompt(&e, prompt_input(&session.id, "hi")).await;
+        e.ops.report_to_parent(&session.id).await;
+        assert_eq!(e.llm.calls(), 1);
+    }
 
     #[tokio::test]
     async fn subagent_task_tool_spawns_child_session() {

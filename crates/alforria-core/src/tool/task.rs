@@ -8,6 +8,7 @@ use std::sync::Arc;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::session::retry::{resume_note, AUTO_RESUME_DELAYS};
 use crate::tool::def::{define, Agents, AskRequest, BoxFuture, ExecuteResult, ToolCtxRef, ToolDef};
 use crate::tool::error::ToolError;
 use crate::tool::truncate::Truncate;
@@ -17,6 +18,9 @@ pub const BACKGROUND_DESCRIPTION: &str = "Background mode: background=true launc
 pub const BACKGROUND_STARTED: &str = "The task is working in the background. You will be notified automatically when it finishes.\nDO NOT sleep, poll for progress, ask the task for status, or duplicate this task's work — avoid working with the same files or topics it is using.\nWork on non-overlapping tasks, or briefly tell the user what you launched and end your response.";
 
 pub const BACKGROUND_UPDATED: &str = "Additional context sent to the running background task.\nThe task is still working in the background. You will be notified automatically when it finishes.\nDO NOT sleep, poll for progress, ask the task for status, or duplicate this task's work — avoid working with the same files or topics it is using.\nWork on non-overlapping tasks, or briefly tell the user what you sent and end your response.";
+
+/// How much of a failed subagent's last output its parent gets.
+const FAILURE_OUTPUT_CHARS: usize = 2000;
 
 /// `renderOutput` (task.ts:55-66): the exact XML wrapper.
 pub fn render_output(input: RenderOutput<'_>) -> String {
@@ -61,6 +65,55 @@ pub struct PromptOutcome {
     pub text: String,
     /// `result.info.error.message` / failing tool error.
     pub error: Option<String>,
+    /// Whether prompting again may get past the error: true for a provider or
+    /// call failure, false for a rejected tool, bad credentials or an abort.
+    pub recoverable: bool,
+}
+
+/// Where a subagent stands, from its session and its latest messages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubagentStatus {
+    NotStarted,
+    Running,
+    Retrying { attempt: u64, message: String },
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl SubagentStatus {
+    /// The `state` attribute of [`render_output`].
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SubagentStatus::NotStarted => "not_started",
+            SubagentStatus::Running => "running",
+            SubagentStatus::Retrying { .. } => "retrying",
+            SubagentStatus::Completed => "completed",
+            SubagentStatus::Failed => "error",
+            SubagentStatus::Cancelled => "cancelled",
+        }
+    }
+
+    pub fn is_active(&self) -> bool {
+        matches!(
+            self,
+            SubagentStatus::Running | SubagentStatus::Retrying { .. }
+        )
+    }
+}
+
+/// One subagent as its parent sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubagentState {
+    pub session_id: String,
+    pub parent_id: Option<String>,
+    pub title: String,
+    pub agent: Option<String>,
+    pub status: SubagentStatus,
+    pub error: Option<String>,
+    /// Its latest text, from any turn: a failed turn often has none.
+    pub last_text: Option<String>,
+    pub tool_calls: usize,
 }
 
 /// A resolvable agent (subset of `Agent.Info` the tool needs).
@@ -124,8 +177,28 @@ pub trait TaskOps: Send + Sync {
         variant: Option<&'a str>,
         prompt: &'a str,
     ) -> BoxFuture<'a, Result<PromptOutcome, ToolError>>;
+    /// [`Self::prompt`] with a note from the system rather than from a person:
+    /// the model reads it, and clients show it as what it is.
+    fn resume<'a>(
+        &'a self,
+        session_id: &'a str,
+        agent: &'a str,
+        model: &'a ModelRef,
+        variant: Option<&'a str>,
+        note: &'a str,
+    ) -> BoxFuture<'a, Result<PromptOutcome, ToolError>> {
+        self.prompt(session_id, agent, model, variant, note)
+    }
     /// Cancel a running subagent.
     fn cancel<'a>(&'a self, session_id: &'a str) -> BoxFuture<'a, ()>;
+    /// Where one session stands; `None` when it does not exist.
+    fn inspect<'a>(&'a self, _session_id: &'a str) -> BoxFuture<'a, Option<SubagentState>> {
+        Box::pin(async { None })
+    }
+    /// The direct children of a session, oldest first.
+    fn children<'a>(&'a self, _session_id: &'a str) -> BoxFuture<'a, Vec<SubagentState>> {
+        Box::pin(async { Vec::new() })
+    }
     /// `injectBackgroundResult` (task.ts:236-252) — a synthetic text prompt
     /// into the parent session (parent's agent, captured variant),
     /// fire-and-forget (`Effect.ignore`).
@@ -170,6 +243,12 @@ pub fn derive_subagent_session_permission(
             pattern: "*".to_string(),
             action: "deny",
         });
+        // Nothing to manage without the means to start subagents.
+        result.push(Rule {
+            permission: crate::tool::subagents::TOOL_ID.to_string(),
+            pattern: "*".to_string(),
+            action: "deny",
+        });
     }
     let primary_tools: Vec<Rule> = primary_tools
         .iter()
@@ -190,6 +269,73 @@ pub fn derive_subagent_session_permission(
         }
     }
     result
+}
+
+/// [`TaskOps::prompt`], resuming the subagent while it stops on recoverable
+/// errors, so neither the user nor the parent has to nudge it. Returns how
+/// many resumes it took.
+async fn prompt_recovering(
+    ops: &Arc<dyn TaskOps>,
+    session_id: &str,
+    agent: &str,
+    model: &ModelRef,
+    variant: Option<&str>,
+    prompt: &str,
+) -> Result<(PromptOutcome, usize), ToolError> {
+    let mut outcome = ops
+        .prompt(session_id, agent, model, variant, prompt)
+        .await?;
+    let mut resumes = 0;
+    for delay in AUTO_RESUME_DELAYS {
+        let Some(error) = outcome.error.as_deref().filter(|_| outcome.recoverable) else {
+            break;
+        };
+        let resume = resume_note(error);
+        tokio::time::sleep(delay).await;
+        outcome = ops
+            .resume(session_id, agent, model, variant, &resume)
+            .await?;
+        resumes += 1;
+    }
+    Ok((outcome, resumes))
+}
+
+/// What the parent needs to act on a failure itself: what went wrong, what the
+/// subagent got done, and how to carry on. The first line is `task.ts`'s.
+async fn failure_message(
+    ops: &Arc<dyn TaskOps>,
+    session_id: &str,
+    error: &str,
+    resumes: usize,
+) -> String {
+    let mut message = format!("Subagent failed (task_id: {session_id}): {error}");
+    if resumes > 0 {
+        message.push_str(&format!(
+            "\n\nIt was resumed automatically {} and kept failing.",
+            if resumes == 1 {
+                "once".to_string()
+            } else {
+                format!("{resumes} times")
+            }
+        ));
+    }
+    let state = ops.inspect(session_id).await;
+    if let Some(text) = state.as_ref().and_then(|state| state.last_text.as_deref()) {
+        let skip = text.chars().count().saturating_sub(FAILURE_OUTPUT_CHARS);
+        let tail: String = text.chars().skip(skip).collect();
+        message.push_str(&format!("\n\nIts last output:\n{tail}"));
+    }
+    message.push_str(&format!(
+        "\n\nIts session is intact. To continue it, call task again with task_id \"{session_id}\" and a prompt saying how to proceed. Do not start over unless its work is lost or wrong."
+    ));
+    message
+}
+
+fn recovery_summary(resumes: usize) -> Option<String> {
+    (resumes > 0).then(|| {
+        let plural = if resumes == 1 { "" } else { "s" };
+        format!("Recovered from errors after {resumes} automatic resume{plural}")
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -419,15 +565,21 @@ async fn run(
             let variant = variant.clone();
             let prompt = params.prompt.clone();
             Box::pin(async move {
-                let outcome = match ops
-                    .prompt(&session_id, &agent, &model, variant.as_deref(), &prompt)
-                    .await
+                let (outcome, resumes) = match prompt_recovering(
+                    &ops,
+                    &session_id,
+                    &agent,
+                    &model,
+                    variant.as_deref(),
+                    &prompt,
+                )
+                .await
                 {
                     Ok(outcome) => outcome,
                     Err(error) => return Err(error.to_string()),
                 };
                 if let Some(error) = outcome.error {
-                    return Err(format!("Subagent failed (task_id: {session_id}): {error}"));
+                    return Err(failure_message(&ops, &session_id, &error, resumes).await);
                 }
                 Ok(outcome.text)
             }) as crate::session::background::JobFuture
@@ -683,8 +835,9 @@ async fn run(
     // `Effect.acquireUseRelease` + the abort listener (task.ts:320-358):
     // an aborted parent turn cancels the subagent instead of waiting it
     // out.
-    let outcome = tokio::select! {
-        outcome = ops.prompt(
+    let (outcome, resumes) = tokio::select! {
+        outcome = prompt_recovering(
+            &ops,
             &session_id,
             &next.name,
             &model,
@@ -702,18 +855,19 @@ async fn run(
     };
 
     if let Some(error) = outcome.error {
-        return Err(ToolError::Failed(format!(
-            "Subagent failed (task_id: {session_id}): {error}"
-        )));
+        return Err(ToolError::Failed(
+            failure_message(&ops, &session_id, &error, resumes).await,
+        ));
     }
 
+    let summary = recovery_summary(resumes);
     Ok(ExecuteResult {
         title: params.description.clone(),
         metadata,
         output: render_output(RenderOutput {
             session_id: &session_id,
             state: "completed",
-            summary: None,
+            summary: summary.as_deref(),
             text: &outcome.text,
         }),
         attachments: None,
@@ -731,6 +885,10 @@ mod tests {
     struct FakeOps {
         depth: usize,
         agent: Option<SubagentInfo>,
+        /// Served in order; then the default success.
+        outcomes: std::sync::Mutex<Vec<PromptOutcome>>,
+        prompts: std::sync::Mutex<Vec<String>>,
+        last_text: Option<String>,
     }
 
     impl FakeOps {
@@ -749,6 +907,25 @@ mod tests {
                         action: "allow",
                     }],
                 }),
+                outcomes: Default::default(),
+                prompts: Default::default(),
+                last_text: None,
+            }
+        }
+
+        fn failing(errors: &[(&str, bool)]) -> Self {
+            let outcomes = errors
+                .iter()
+                .rev()
+                .map(|(error, recoverable)| PromptOutcome {
+                    text: String::new(),
+                    error: Some(error.to_string()),
+                    recoverable: *recoverable,
+                })
+                .collect();
+            FakeOps {
+                outcomes: std::sync::Mutex::new(outcomes),
+                ..FakeOps::new()
             }
         }
     }
@@ -805,17 +982,33 @@ mod tests {
             _agent: &'a str,
             _model: &'a ModelRef,
             _variant: Option<&'a str>,
-            _prompt: &'a str,
+            prompt: &'a str,
         ) -> BoxFuture<'a, Result<PromptOutcome, ToolError>> {
-            Box::pin(async {
-                Ok(PromptOutcome {
+            self.prompts.lock().unwrap().push(prompt.to_string());
+            let next = self.outcomes.lock().unwrap().pop();
+            Box::pin(async move {
+                Ok(next.unwrap_or_else(|| PromptOutcome {
+                    recoverable: false,
                     text: "did the thing".to_string(),
                     error: None,
-                })
+                }))
             })
         }
         fn cancel<'a>(&'a self, _session_id: &'a str) -> BoxFuture<'a, ()> {
             Box::pin(async {})
+        }
+        fn inspect<'a>(&'a self, session_id: &'a str) -> BoxFuture<'a, Option<SubagentState>> {
+            let state = SubagentState {
+                session_id: session_id.to_string(),
+                parent_id: None,
+                title: "t".to_string(),
+                agent: None,
+                status: SubagentStatus::Failed,
+                error: None,
+                last_text: self.last_text.clone(),
+                tool_calls: 0,
+            };
+            Box::pin(async move { Some(state) })
         }
     }
 
@@ -969,6 +1162,11 @@ mod tests {
                     pattern: "*".to_string(),
                     action: "deny",
                 },
+                Rule {
+                    permission: "subagents".to_string(),
+                    pattern: "*".to_string(),
+                    action: "deny",
+                },
             ]
         );
         // Explicit permits → no default denies.
@@ -985,6 +1183,75 @@ mod tests {
             .len()
                 == 1
         );
+    }
+
+    fn job() -> Value {
+        json!({ "description": "d", "prompt": "the job", "subagent_type": "research" })
+    }
+
+    fn failure_text(error: ToolError) -> String {
+        match error {
+            ToolError::Failed(text) => text,
+            other => panic!("expected a failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_recoverable_error_is_resumed_without_anyone_asking() {
+        let ops = Arc::new(FakeOps::failing(&[("boom", true)]));
+        let result = call(ops.clone(), 1, job()).await.0.unwrap();
+        assert!(
+            result.output.contains("state=\"completed\""),
+            "{}",
+            result.output
+        );
+        assert!(result.output.contains("did the thing"), "{}", result.output);
+        assert!(
+            result.output.contains("Recovered from errors after 1"),
+            "{}",
+            result.output
+        );
+        let prompts = ops.prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 2);
+        assert_eq!(prompts[0], "the job");
+        assert!(
+            prompts[1].contains("boom") && prompts[1].contains("Continue"),
+            "{prompts:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resumes_are_capped_and_the_parent_gets_the_means_to_continue() {
+        let ops = Arc::new(FakeOps {
+            last_text: Some("found half of it".to_string()),
+            ..FakeOps::failing(&[
+                ("boom", true),
+                ("boom", true),
+                ("boom again", true),
+                ("x", true),
+            ])
+        });
+        let text = failure_text(call(ops.clone(), 1, job()).await.0.unwrap_err());
+        assert_eq!(
+            ops.prompts.lock().unwrap().len(),
+            AUTO_RESUME_DELAYS.len() + 1
+        );
+        assert!(
+            text.starts_with("Subagent failed (task_id: ses_child): boom again"),
+            "{text}"
+        );
+        assert!(text.contains("resumed automatically 2 times"), "{text}");
+        assert!(text.contains("found half of it"), "{text}");
+        assert!(text.contains("task_id \"ses_child\""), "{text}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unrecoverable_error_is_not_resumed() {
+        let ops = Arc::new(FakeOps::failing(&[("bad credentials", false)]));
+        let text = failure_text(call(ops.clone(), 1, job()).await.0.unwrap_err());
+        assert_eq!(ops.prompts.lock().unwrap().len(), 1);
+        assert!(!text.contains("resumed automatically"), "{text}");
+        assert!(text.contains("task_id \"ses_child\""), "{text}");
     }
 
     #[tokio::test]
@@ -1035,6 +1302,7 @@ mod tests {
             Arc::new(FakeOps {
                 depth: 1,
                 agent: None,
+                ..FakeOps::new()
             }),
             1,
             json!({
@@ -1056,6 +1324,7 @@ mod tests {
             Arc::new(FakeOps {
                 depth: 0,
                 agent: None,
+                ..FakeOps::new()
             }),
             1,
             json!({

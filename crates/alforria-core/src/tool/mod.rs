@@ -23,6 +23,7 @@ pub mod registry;
 pub mod ripgrep;
 pub mod shell;
 pub mod skill;
+pub mod subagents;
 pub mod task;
 pub mod todo;
 pub mod truncate;

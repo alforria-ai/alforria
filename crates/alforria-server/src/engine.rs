@@ -211,6 +211,7 @@ impl alforria_core::session::instruction::RemoteInstructions for HttpRemoteInstr
 /// The per-instance engine: prompt facade + revert/summary services built
 /// over the M5 graph, plus the background-job service for `sessionBackground`.
 pub struct ProductionEngine {
+    task_ops: Arc<ProductionTaskOps>,
     prompt: Arc<alforria_core::session::prompt::SessionPrompt>,
     revert: Arc<SessionRevert>,
     summary: Arc<SessionSummary>,
@@ -234,7 +235,8 @@ pub struct ProductionEngine {
 impl SessionEngine for ProductionEngine {
     fn prompt(&self, input: PromptInput) -> BoxFuture<'static, Result<WithParts, PromptError>> {
         let prompt = self.prompt.clone();
-        Box::pin(async move { prompt.prompt(input).await })
+        let task_ops = self.task_ops.clone();
+        Box::pin(async move { task_ops.prompt_reporting(&prompt, input).await })
     }
 
     fn loop_(
@@ -751,6 +753,7 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
         services.messages.clone(),
         services.agents.clone(),
         context,
+        services.status.clone(),
     );
     let truncate = Arc::new(
         alforria_core::tool::truncate::TruncateService::default_limits(
@@ -882,6 +885,11 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
             Some(file_events.clone()),
         ),
         task,
+        alforria_core::tool::subagents::subagents_tool(
+            truncate.clone(),
+            agents.clone(),
+            ops.clone(),
+        ),
         alforria_core::tool::webfetch::webfetch_tool(
             truncate.clone(),
             agents.clone(),
@@ -1061,6 +1069,7 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
     ));
 
     Ok(Arc::new(ProductionEngine {
+        task_ops: ops.clone(),
         prompt: prompt.clone(),
         revert: revert.clone(),
         summary: summary.clone(),

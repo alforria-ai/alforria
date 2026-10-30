@@ -22,6 +22,41 @@ pub const RETRY_MAX_DELAY_NO_HEADERS: f64 = 30_000.0;
 pub const RETRY_MAX_DELAY: f64 = 2_147_483_647.0;
 pub const RETRY_MAX_RETRIES: u64 = 5;
 
+/// The wait before each automatic resume of a subagent that stopped on a
+/// recoverable error (an alforria extension). The session loop has already
+/// retried what it could, so these are few, and only then is anyone told.
+pub const AUTO_RESUME_DELAYS: [std::time::Duration; 2] = [
+    std::time::Duration::from_secs(2),
+    std::time::Duration::from_secs(10),
+];
+
+/// Whether prompting a session again may get past this error. Bad credentials,
+/// an empty balance, a missing model, a filter and a user's abort will all be
+/// the same next time.
+pub fn resumable(error: &AssistantError) -> bool {
+    match error {
+        AssistantError::Unknown { .. } | AssistantError::OutputLength {} => true,
+        AssistantError::Api {
+            status_code,
+            is_retryable,
+            ..
+        } => *is_retryable || !matches!(status_code, Some(401..=404)),
+        AssistantError::Auth { .. }
+        | AssistantError::Aborted { .. }
+        | AssistantError::StructuredOutput { .. }
+        | AssistantError::ContextOverflow { .. }
+        | AssistantError::ContentFilter { .. } => false,
+    }
+}
+
+/// The system's note that resumes a stopped subagent: the model reads it, and
+/// clients recognize the tag to show it as what it is.
+pub fn resume_note(error: &str) -> String {
+    format!(
+        "<auto_resume>\nYour previous attempt stopped with an error: {error}\n\nContinue the task from where you left off. Do not redo work you have already finished.\n</auto_resume>"
+    )
+}
+
 /// The 7 retryable-message regexes (retry.ts:33-41), verbatim, plus a Rust
 /// addition: the native runtime's HTTP client (reqwest) words transport
 /// failures "error sending request for url (…)" where the TS runtime's fetch
@@ -457,6 +492,29 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+
+    fn rejected(status: u64) -> AssistantError {
+        AssistantError::Api {
+            message: "no".to_string(),
+            status_code: Some(status),
+            is_retryable: false,
+            response_headers: None,
+            response_body: None,
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn only_errors_that_can_pass_are_resumable() {
+        assert!(resumable(&rejected(400)));
+        assert!(resumable(&rejected(500)));
+        for status in [401, 402, 403, 404] {
+            assert!(!resumable(&rejected(status)), "{status}");
+        }
+        assert!(!resumable(&AssistantError::Aborted {
+            message: "stopped".to_string()
+        }));
+    }
 
     fn api_error(
         message: &str,
