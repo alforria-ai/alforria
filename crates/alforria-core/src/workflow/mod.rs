@@ -16,8 +16,31 @@ pub mod service;
 use std::path::PathBuf;
 
 use alforria_schema::workflow::WorkflowDefinition;
+use serde_json::Value;
 
 use crate::tool::def::BoxFuture;
+
+/// Why a workflow request failed, so callers can answer with the right status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkflowError {
+    Disabled,
+    Invalid(String),
+    NotFound(String),
+    Conflict(String),
+    Failed(String),
+}
+
+impl std::fmt::Display for WorkflowError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WorkflowError::Disabled => f.write_str("workflows are disabled"),
+            WorkflowError::Invalid(message)
+            | WorkflowError::NotFound(message)
+            | WorkflowError::Conflict(message)
+            | WorkflowError::Failed(message) => f.write_str(message),
+        }
+    }
+}
 
 /// What one `agent()` call needs from the session engine.
 #[derive(Debug, Clone)]
@@ -34,6 +57,8 @@ pub struct WorkflowAgentRequest {
 pub struct WorkflowAgentOutcome {
     pub text: String,
     pub error: Option<String>,
+    /// Whether prompting again may get past `error`.
+    pub recoverable: bool,
 }
 
 /// The session-engine seam behind the workflow runtime.
@@ -52,16 +77,37 @@ pub trait WorkflowOps: Send + Sync {
         request: &'a WorkflowAgentRequest,
     ) -> BoxFuture<'a, Result<String, String>>;
 
-    /// Prompt an agent session to completion.
+    /// Prompt an agent session to completion. With a `schema` the outcome's
+    /// text is the model's structured output, encoded as JSON.
     fn prompt_agent<'a>(
         &'a self,
         session_id: &'a str,
         agent: &'a str,
         prompt: &'a str,
+        schema: Option<&'a Value>,
     ) -> BoxFuture<'a, Result<WorkflowAgentOutcome, String>>;
+
+    /// [`Self::prompt_agent`] with a note from the system rather than from a
+    /// person: the model reads it, and clients show it as what it is.
+    fn resume_agent<'a>(
+        &'a self,
+        session_id: &'a str,
+        agent: &'a str,
+        note: &'a str,
+        schema: Option<&'a Value>,
+    ) -> BoxFuture<'a, Result<WorkflowAgentOutcome, String>> {
+        self.prompt_agent(session_id, agent, note, schema)
+    }
 
     /// Cancel a running agent session.
     fn cancel_agent<'a>(&'a self, session_id: &'a str) -> BoxFuture<'a, ()>;
+
+    /// Whether a session is a workflow agent or runs under one. Those hold a
+    /// concurrency slot, so a run they started and waited for could never get
+    /// one.
+    fn is_workflow_agent(&self, _session_id: &str) -> bool {
+        false
+    }
 }
 
 /// Where to discover workflows and how the runtime behaves.
@@ -83,6 +129,8 @@ pub struct WorkflowSettings {
     pub max_agents: usize,
     /// Read `.claude/workflows` directories too (Claude Code compatibility).
     pub claude_compat: bool,
+    /// False under `OPENCODE_DISABLE_PROJECT_CONFIG`: skip project directories.
+    pub project_config: bool,
 }
 
 impl WorkflowSettings {

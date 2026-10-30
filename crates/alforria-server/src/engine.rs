@@ -42,11 +42,11 @@ use alforria_schema::workflow::{
 };
 use futures::future::BoxFuture;
 
-use crate::error::ServerError;
+use crate::error::{ApiError, ServerError};
 use crate::middleware::location::LocationContext;
 use crate::state::{EngineFactory, SessionEngine, ToolRegistrySource};
 use alforria_core::workflow::service::WorkflowService;
-use alforria_core::workflow::{WorkflowOps, WorkflowSettings};
+use alforria_core::workflow::{WorkflowError, WorkflowOps, WorkflowSettings};
 
 /// `Config.boolean(name).pipe(Config.withDefault(false))` — Effect accepts
 /// the same truthy strings as the project registry (project/registry.rs).
@@ -374,8 +374,26 @@ impl SessionEngine for ProductionEngine {
     }
 }
 
-fn workflow_error(message: String) -> ServerError {
-    ServerError::Core(CoreError::Storage(message))
+fn workflow_error(error: WorkflowError) -> ServerError {
+    let message = error.to_string();
+    match error {
+        WorkflowError::Disabled => ServerError::Api(ApiError::Forbidden { message }),
+        WorkflowError::Invalid(_) => ServerError::Api(ApiError::InvalidRequest {
+            message,
+            kind: None,
+            field: None,
+        }),
+        WorkflowError::NotFound(_) => ServerError::Api(ApiError::not_found(message)),
+        WorkflowError::Conflict(_) => ServerError::Api(ApiError::Conflict {
+            message,
+            resource: Some("workflow".to_string()),
+        }),
+        WorkflowError::Failed(_) => ServerError::Core(CoreError::Storage(message)),
+    }
+}
+
+fn tool_error(error: WorkflowError) -> alforria_core::tool::error::ToolError {
+    alforria_core::tool::error::ToolError::Failed(error.to_string())
 }
 
 /// The `Workflows` tool seam over the instance service.
@@ -395,11 +413,7 @@ impl Workflows for WorkflowSeam {
     ) -> BoxFuture<'a, Result<WorkflowRun, alforria_core::tool::error::ToolError>> {
         request.session_id = Some(session_id.to_string());
         let service = self.0.clone();
-        Box::pin(async move {
-            service
-                .start(request)
-                .map_err(alforria_core::tool::error::ToolError::Failed)
-        })
+        Box::pin(async move { service.start(request).map_err(tool_error) })
     }
 
     fn get<'a>(
@@ -420,24 +434,14 @@ impl Workflows for WorkflowSeam {
         &'a self,
         run_id: &'a str,
     ) -> BoxFuture<'a, Result<WorkflowRun, alforria_core::tool::error::ToolError>> {
-        Box::pin(async move {
-            self.0
-                .wait(run_id)
-                .await
-                .map_err(alforria_core::tool::error::ToolError::Failed)
-        })
+        Box::pin(async move { self.0.wait(run_id).await.map_err(tool_error) })
     }
 
     fn abort<'a>(
         &'a self,
         run_id: &'a str,
     ) -> BoxFuture<'a, Result<WorkflowRun, alforria_core::tool::error::ToolError>> {
-        Box::pin(async move {
-            self.0
-                .abort(run_id)
-                .await
-                .map_err(alforria_core::tool::error::ToolError::Failed)
-        })
+        Box::pin(async move { self.0.abort(run_id).await.map_err(tool_error) })
     }
 }
 
@@ -811,8 +815,15 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
     };
     let workflow_ops = ProductionWorkflowOps::new(
         services.sessions.clone(),
+        services.messages.clone(),
         context.clone(),
         services.agents.clone(),
+        input
+            .config
+            .experimental
+            .as_ref()
+            .and_then(|experimental| experimental.primary_tools.clone())
+            .unwrap_or_default(),
     );
     let workflow_config = input.config.workflows.clone().unwrap_or_default();
     let workflow_settings = WorkflowSettings {
@@ -832,6 +843,7 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
         max_agents: WorkflowSettings::DEFAULT_MAX_AGENTS,
         claude_compat: workflow_config.claude_compat.unwrap_or(true)
             && !bool_env("OPENCODE_DISABLE_CLAUDE_CODE"),
+        project_config: !bool_env("OPENCODE_DISABLE_PROJECT_CONFIG"),
     };
     let workflows = WorkflowService::new(
         workflow_ops.clone() as Arc<dyn WorkflowOps>,
@@ -1071,6 +1083,9 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
         || bool_env("OPENCODE_ENABLE_QUESTION_TOOL");
     if !question_enabled {
         builtin.remove(1);
+    }
+    if !workflows.enabled() {
+        builtin.retain(|tool| tool.id != "workflow");
     }
     let registry = Arc::new(
         ToolRegistry::new(

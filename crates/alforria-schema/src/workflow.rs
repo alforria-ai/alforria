@@ -81,7 +81,13 @@ pub struct WorkflowPhase {
 #[serde(rename_all = "camelCase")]
 pub struct WorkflowAgent {
     pub id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Runs persisted before the field had its wire name used `sessionId`.
+    #[serde(
+        rename = "sessionID",
+        alias = "sessionId",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub session_id: Option<String>,
     pub phase: String,
     pub label: String,
@@ -174,4 +180,35 @@ pub struct WorkflowSaveRequest {
     /// `project` (default) or `global`.
     #[serde(default)]
     pub scope: Option<String>,
+    /// Replace the saved workflow of this name instead of refusing.
+    #[serde(default)]
+    pub overwrite: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_session_id_has_its_wire_name_and_reads_old_runs() {
+        let agent = WorkflowAgent {
+            id: "a".into(),
+            session_id: Some("ses_1".into()),
+            phase: "P".into(),
+            label: "l".into(),
+            agent: "general".into(),
+            prompt: "p".into(),
+            state: WorkflowState::Running,
+            result: None,
+            error: None,
+            started: 1.0,
+            finished: None,
+        };
+        let mut value = serde_json::to_value(&agent).unwrap();
+        assert_eq!(value["sessionID"], "ses_1");
+        let session = value.as_object_mut().unwrap().remove("sessionID").unwrap();
+        value["sessionId"] = session;
+        let old: WorkflowAgent = serde_json::from_value(value).unwrap();
+        assert_eq!(old.session_id.as_deref(), Some("ses_1"));
+    }
 }

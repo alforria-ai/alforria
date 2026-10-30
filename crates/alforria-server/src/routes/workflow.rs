@@ -33,7 +33,7 @@ use crate::state::{resolve_directory, ServerContext, SessionEngine};
 pub fn register(router: Router<Arc<ServerContext>>) -> Router<Arc<ServerContext>> {
     router
         .route("/workflow", get(list).post(save))
-        .route("/workflow/run", get(runs).post(start))
+        .route("/workflow/run", get(runs).post(start).delete(remove_run))
         .route("/workflow/run/{runID}", get(run))
         .route("/workflow/run/{runID}/wait", post(wait))
         .route("/workflow/run/{runID}/abort", post(abort))
@@ -78,6 +78,18 @@ async fn remove(
 ) -> Result<Json<Value>, ServerError> {
     let engine = engine(&ctx, &uri)?;
     Ok(Json(json!({ "deleted": engine.workflow_delete(name)? })))
+}
+
+/// `DELETE /workflow/{name}` for a workflow named `run`: the literal
+/// `/workflow/run` route wins over the parameter one.
+async fn remove_run(
+    State(ctx): State<Arc<ServerContext>>,
+    uri: Uri,
+) -> Result<Json<Value>, ServerError> {
+    let engine = engine(&ctx, &uri)?;
+    Ok(Json(
+        json!({ "deleted": engine.workflow_delete("run".to_string())? }),
+    ))
 }
 
 async fn runs(

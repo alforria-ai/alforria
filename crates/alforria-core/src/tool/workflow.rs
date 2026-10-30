@@ -55,9 +55,11 @@ Saved workflows live in `.opencode/workflows` (project), the user config directo
 
 Actions:
 - `list`: show saved workflows.
-- `run`: start `name` (a saved workflow) or `script` (inline JavaScript). Runs in the background by default; set `wait: true` to wait for the result. `args` is passed to the script.
+- `run`: start `name` (a saved workflow) or `script` (inline JavaScript), not both. Runs in the background by default; set `wait: true` to wait for the result. `args` is passed to the script.
 - `status`: read a run by `runID` (omit `runID` for the most recent run in this session).
 - `abort`: stop a run by `runID`.
+
+A script may use up to 256 MB of memory and is stopped if it runs for 10 minutes without calling `agent()`; time spent waiting for agents does not count. Workflow agents cannot start workflows themselves.
 
 After launching, tell the user what is running and end the turn. Do not poll in a loop; use `status` only when the user asks for progress or you need the result to continue."#;
 
@@ -148,19 +150,42 @@ fn run(
                 })
             }
             "run" => {
-                if params.name.is_none() && params.script.is_none() {
-                    return Err(ToolError::InvalidArguments {
-                        tool: "workflow".to_string(),
-                        detail: "run needs a saved workflow name or an inline script".to_string(),
-                    });
-                }
-                let pattern = params.name.clone().unwrap_or_else(|| "inline".to_string());
+                // Approval is per name, so a name must never smuggle in a script.
+                let (pattern, always, script) = match (&params.name, &params.script) {
+                    (Some(_), Some(_)) => {
+                        return Err(ToolError::InvalidArguments {
+                            tool: "workflow".to_string(),
+                            detail: "run takes a saved workflow name or an inline script, not both"
+                                .to_string(),
+                        });
+                    }
+                    (None, None) => {
+                        return Err(ToolError::InvalidArguments {
+                            tool: "workflow".to_string(),
+                            detail: "run needs a saved workflow name or an inline script"
+                                .to_string(),
+                        });
+                    }
+                    (Some(name), None) => {
+                        let found = workflows
+                            .list()
+                            .await?
+                            .into_iter()
+                            .find(|workflow| &workflow.name == name)
+                            .ok_or_else(|| {
+                                ToolError::Failed(format!("workflow not found: {name}"))
+                            })?;
+                        (name.clone(), vec![name.clone()], found.script)
+                    }
+                    // Each inline script is new code: one approval never covers the next.
+                    (None, Some(script)) => ("inline".to_string(), Vec::new(), script.clone()),
+                };
                 ctx.ask
                     .ask(AskRequest {
                         permission: "workflow".to_string(),
                         patterns: vec![pattern.clone()],
-                        always: vec![pattern.clone()],
-                        metadata: json!({ "name": pattern }),
+                        always,
+                        metadata: json!({ "name": pattern, "script": script }),
                     })
                     .await?;
                 let request = WorkflowStartRequest {
@@ -173,7 +198,13 @@ fn run(
                 let mut run = workflows.start(ctx.session_id, request).await?;
                 let waited = params.wait.unwrap_or(false);
                 if waited {
-                    run = workflows.wait(&run.id).await?;
+                    run = tokio::select! {
+                        finished = workflows.wait(&run.id) => finished?,
+                        _ = ctx.abort.cancelled() => {
+                            let _ = workflows.abort(&run.id).await;
+                            return Err(ToolError::Aborted);
+                        }
+                    };
                 }
                 Ok(ExecuteResult {
                     title: format!("Workflow: {}", run.name),
@@ -218,6 +249,21 @@ fn run(
                         detail: "abort needs a runID".to_string(),
                     });
                 };
+                // A session stops its own runs freely; anyone else's needs approval.
+                let own = workflows
+                    .get(run_id)
+                    .await?
+                    .is_some_and(|run| run.session_id.as_deref() == Some(ctx.session_id));
+                if !own {
+                    ctx.ask
+                        .ask(AskRequest {
+                            permission: "workflow".to_string(),
+                            patterns: vec!["abort".to_string()],
+                            always: Vec::new(),
+                            metadata: json!({ "name": "abort", "runID": run_id }),
+                        })
+                        .await?;
+                }
                 let run = workflows.abort(run_id).await?;
                 Ok(ExecuteResult {
                     title: format!("Workflow: {}", run.name),

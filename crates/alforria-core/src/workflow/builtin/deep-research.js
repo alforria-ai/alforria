@@ -51,9 +51,12 @@ const verified = await parallel(
   ),
 )
 
+const notes = verified.filter(Boolean)
+if (!notes.length) throw new Error('every research agent failed, so there is nothing to report')
+
 phase('Report')
 const report = await agent(
-  `Write one cited report answering: ${question}\n\nUse only these verified research notes. Merge duplicates, rank findings by importance, and keep source URLs next to the claims they support. Put unverified claims in a short final section.\n\n${verified.filter(Boolean).join('\n\n---\n\n')}`,
+  `Write one cited report answering: ${question}\n\nUse only these verified research notes. Merge duplicates, rank findings by importance, and keep source URLs next to the claims they support. Put unverified claims in a short final section.\n\n${notes.join('\n\n---\n\n')}`,
   { label: 'report' },
 )
 

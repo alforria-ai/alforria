@@ -78,6 +78,12 @@ pub const OUTPUT_LENGTH_CONTINUE_PROMPT: &str = "You hit the output token limit 
 /// gives up and ends the turn (each continue spends a full output budget).
 const MAX_OUTPUT_LENGTH_CONTINUES: u32 = 3;
 
+/// Responses in a row that may end with no finish and no tool call. Such a
+/// response leaves nothing to wait for and no reason to stop, so the loop asks
+/// again at once: unchecked, a provider answering with an empty 200 is called
+/// many times a second, forever.
+const MAX_UNFINISHED_RESPONSES: u32 = 3;
+
 const STRUCTURED_OUTPUT_DESCRIPTION: &str =
     "Use this tool to return your final response in the requested structured format.
 
@@ -305,6 +311,7 @@ pub async fn run_loop(
     let structured: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
     let mut step: u64 = 0;
     let mut length_continues: u32 = 0;
+    let mut unfinished_responses: u32 = 0;
     let session = deps.sessions.get(session_id)?;
 
     let result: Result<WithParts, LoopError> = loop {
@@ -701,7 +708,26 @@ pub async fn run_loop(
                         }
                         ProcessResult::Continue => {
                             deps.instruction.clear(&assistant_id);
-                            Outcome::Continue
+                            let called_tools = deps
+                                .messages
+                                .parts(&assistant_id)?
+                                .iter()
+                                .any(|part| matches!(part, V1Part::Tool { .. }));
+                            let finished = !matches!(
+                                assistant_finish(&message).as_deref(),
+                                None | Some("unknown")
+                            );
+                            if called_tools || finished {
+                                unfinished_responses = 0;
+                            } else {
+                                unfinished_responses += 1;
+                            }
+                            if unfinished_responses >= MAX_UNFINISHED_RESPONSES {
+                                fail_unfinished(deps, session_id, message)?;
+                                Outcome::Break
+                            } else {
+                                Outcome::Continue
+                            }
                         }
                     },
                 }
@@ -976,6 +1002,32 @@ fn empty_tokens() -> V1StepTokens {
 /// `NamedError.Unknown.toObject()` published as
 /// `{ sessionID, error: { name: "Unknown", data: { message } } }` —
 /// the same payload shape as `prompt_input.rs`.
+/// End the turn on a provider that keeps not finishing its responses.
+fn fail_unfinished(
+    deps: &LoopDeps,
+    session_id: &str,
+    mut message: V1Message,
+) -> Result<(), LoopError> {
+    let error = AssistantError::Unknown {
+        message: format!(
+            "The provider ended {MAX_UNFINISHED_RESPONSES} responses in a row without finishing them"
+        ),
+        r#ref: None,
+    };
+    if let V1Message::Assistant { error: slot, .. } = &mut message {
+        *slot = Some(error.clone());
+    }
+    deps.sessions.update_message(&message)?;
+    deps.events
+        .publish(
+            &SESSION_ERROR,
+            serde_json::json!({ "sessionID": session_id, "error": error }),
+            PublishOptions::default(),
+        )
+        .map_err(SessionError::from)?;
+    Ok(())
+}
+
 fn publish_unknown_error(
     events: &EventBus,
     session_id: &str,

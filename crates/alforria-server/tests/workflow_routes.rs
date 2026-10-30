@@ -370,6 +370,22 @@ async fn workflow_routes_list_save_start_get_and_abort() {
     assert_eq!(deleted["deleted"], true);
 }
 
+#[tokio::test]
+async fn a_workflow_named_run_can_be_deleted() {
+    let (ctx, dir) = fixture();
+    let directory = urlencode(&dir.path().join("repo").to_string_lossy());
+    let response = send(
+        &ctx,
+        "DELETE",
+        &format!("/workflow/run?directory={directory}"),
+        "",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+    assert_eq!(body["deleted"], true);
+}
+
 fn urlencode(value: &str) -> String {
     value
         .bytes()

@@ -5,12 +5,13 @@
 //! happens in agents. `agent()` returns the last assistant text (or parsed
 //! JSON when `options.schema` is set) and throws when the agent fails.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use alforria_schema::workflow::WorkflowState;
 use rquickjs::function::Async;
-use rquickjs::{AsyncContext, AsyncRuntime, Ctx, Function, Promise};
+use rquickjs::{AsyncContext, AsyncRuntime, CatchResultExt, CaughtError, Ctx, Function, Promise};
 use serde_json::Value;
 
 use crate::tool::def::BoxFuture;
@@ -29,6 +30,12 @@ pub trait WorkflowHost: Send + Sync {
     fn state(&self) -> WorkflowState;
 }
 
+/// How much memory one script may use.
+const MEMORY_LIMIT: usize = 256 * 1024 * 1024;
+/// How long a script may run without calling `agent()`. Time waiting for
+/// agents does not count, so this stops spinning scripts and not long runs.
+const MAX_BUSY: Duration = Duration::from_secs(10 * 60);
+
 const PRELUDE: &str = r#"
 const args = JSON.parse(__workflow_args_json);
 function phase(title) { __workflow_phase(String(title)); return title; }
@@ -40,21 +47,21 @@ async function agent(prompt, options = {}) {
   try { reply = JSON.parse(payload); } catch (e) { reply = { ok: false, error: 'invalid workflow runtime reply' }; }
   if (!reply || reply.ok !== true) throw new Error((reply && reply.error) || 'agent failed');
   if (options.schema) {
-    try { return JSON.parse(reply.output); } catch (e) { return reply.output; }
+    try { return JSON.parse(reply.output); } catch (e) { throw new Error('agent did not return valid JSON: ' + e.message); }
   }
   return reply.output;
 }
 async function parallel(tasks) {
   if (!Array.isArray(tasks)) throw new Error('parallel() expects an array');
   if (tasks.length > 4096) throw new Error('parallel() accepts at most 4096 tasks');
-  const settled = await Promise.allSettled(tasks.map((task) => typeof task === 'function' ? task() : task));
+  const settled = await Promise.allSettled(tasks.map(async (task) => typeof task === 'function' ? task() : task));
   return settled.map((item) => item.status === 'fulfilled' ? item.value : null);
 }
 async function pipeline(items, fn) {
   if (typeof fn !== 'function') throw new Error('pipeline() expects a function');
   if (!Array.isArray(items)) throw new Error('pipeline() expects an array');
   if (items.length > 4096) throw new Error('pipeline() accepts at most 4096 items');
-  const settled = await Promise.allSettled(items.map((item, index) => fn(item, index)));
+  const settled = await Promise.allSettled(items.map(async (item, index) => fn(item, index)));
   return settled.map((item) => item.status === 'fulfilled' ? item.value : null);
 }
 Date.now = () => { throw new Error('Date.now() is not available in workflows; pass timestamps through args'); };
@@ -71,26 +78,39 @@ pub async fn execute(
         return Err("workflow cancelled".to_string());
     }
     let runtime = AsyncRuntime::new().map_err(|err| err.to_string())?;
+    runtime.set_memory_limit(MEMORY_LIMIT).await;
     // A tight JS loop never awaits, so the abort token can only reach it
     // through QuickJS's interrupt handler.
     let guard = host.clone();
-    let started = Instant::now();
+    let last_agent = Arc::new(Mutex::new(Instant::now()));
+    let timed_out = Arc::new(AtomicBool::new(false));
+    let busy_since = last_agent.clone();
+    let out_of_time = timed_out.clone();
     runtime
         .set_interrupt_handler(Some(Box::new(move || {
-            guard.state() == WorkflowState::Cancelled
-                || started.elapsed() > Duration::from_secs(60 * 60)
+            let elapsed = busy_since
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .elapsed();
+            if elapsed > MAX_BUSY {
+                out_of_time.store(true, Ordering::Relaxed);
+            }
+            guard.state() == WorkflowState::Cancelled || elapsed > MAX_BUSY
         })))
         .await;
     let context = AsyncContext::full(&runtime)
         .await
         .map_err(|err| err.to_string())?;
-    let body = strip_export(script);
-    let program = format!(
-        r#"{prelude}
+    let header = format!(
+        r#"{PRELUDE}
 (async () => {{
   try {{
     const __result = await (async () => {{
-{body}
+"#
+    );
+    let body_line = header.matches('\n').count();
+    let program = format!(
+        r#"{header}{body}
     }})();
     return JSON.stringify({{ ok: true, value: __result === undefined ? null : __result }});
   }} catch (error) {{
@@ -99,8 +119,7 @@ pub async fn execute(
   }}
 }})()
 "#,
-        prelude = PRELUDE,
-        body = body
+        body = strip_export(script),
     );
     let args_json = serde_json::to_string(&args).unwrap_or_else(|_| "null".to_string());
 
@@ -130,9 +149,18 @@ pub async fn execute(
                 ctx.clone(),
                 Async(move |_ctx: Ctx<'_>, prompt: String, options: String| {
                     let host = host_agent.clone();
+                    let last_agent = last_agent.clone();
                     async move {
                         let options: Value = serde_json::from_str(&options).unwrap_or(Value::Null);
-                        let reply = match host.agent(prompt, options).await {
+                        let touch = || {
+                            *last_agent
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Instant::now();
+                        };
+                        touch();
+                        let result = host.agent(prompt, options).await;
+                        touch();
+                        let reply = match result {
                             Ok(output) => serde_json::json!({ "ok": true, "output": output }),
                             Err(error) => serde_json::json!({ "ok": false, "error": error }),
                         };
@@ -145,8 +173,15 @@ pub async fn execute(
                 .set("__workflow_agent", agent)
                 .map_err(|err| err.to_string())?;
 
-            let promise: Promise = ctx.eval(program).map_err(|err| err.to_string())?;
-            let raw: String = promise.into_future().await.map_err(|err| err.to_string())?;
+            let promise: Promise = ctx
+                .eval(program)
+                .catch(&ctx)
+                .map_err(|error| describe(error, body_line))?;
+            let raw: String = promise
+                .into_future::<String>()
+                .await
+                .catch(&ctx)
+                .map_err(|error| describe(error, body_line))?;
             let reply: Value = serde_json::from_str(&raw)
                 .map_err(|err| format!("invalid workflow runtime reply: {err}"))?;
             if reply.get("ok").and_then(Value::as_bool) == Some(true) {
@@ -160,8 +195,38 @@ pub async fn execute(
             }
         })
         .await
-        .map_err(|err| err.to_string())?;
+        .map_err(|err: String| {
+            if timed_out.load(Ordering::Relaxed) {
+                format!(
+                    "the workflow script ran for {} minutes without calling agent()",
+                    MAX_BUSY.as_secs() / 60
+                )
+            } else {
+                err
+            }
+        })?;
     Ok(outcome)
+}
+
+/// The script's own message and line for an error the script's `try` could
+/// not catch: a syntax error, or an uncatchable stop. `body_line` is how many
+/// lines of wrapper precede the script.
+fn describe(error: CaughtError<'_>, body_line: usize) -> String {
+    let CaughtError::Exception(exception) = &error else {
+        return error.to_string();
+    };
+    let message = exception
+        .message()
+        .unwrap_or_else(|| "workflow script failed".to_string());
+    let line = exception.stack().and_then(|stack| {
+        let (_, rest) = stack.split_once(':')?;
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse::<usize>().ok()?.checked_sub(body_line)
+    });
+    match line {
+        Some(line) if line > 0 => format!("{message} (script line {line})"),
+        _ => message,
+    }
 }
 
 /// Remove `export` from top-level declarations so the body can run inside an
@@ -185,7 +250,6 @@ fn strip_export(script: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
 
     use serde_json::json;
 
@@ -281,6 +345,73 @@ return out
             .await
             .unwrap_err();
         assert!(error.contains("agent exploded"));
+    }
+
+    #[tokio::test]
+    async fn syntax_errors_name_the_problem_and_line() {
+        let error = execute(FakeHost::new(), "const a = 1\nconst b = ;\n", json!(null))
+            .await
+            .unwrap_err();
+        assert!(!error.contains("Exception generated by QuickJS"), "{error}");
+        assert!(error.contains("line 2"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_script_cannot_exhaust_memory() {
+        let error = execute(
+            FakeHost::new(),
+            "return 'x'.repeat(2 ** 30).length",
+            json!(null),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.contains("memory") || error.contains("length"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn synchronous_throws_become_null_in_parallel_and_pipeline() {
+        let result = execute(
+            FakeHost::new(),
+            r#"
+const a = await parallel([() => { throw new Error('no') }, () => 1])
+const b = await pipeline([1, 2], (item) => { if (item === 1) throw new Error('no'); return item })
+return { a, b }
+"#,
+            json!(null),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, json!({ "a": [null, 1], "b": [null, 2] }));
+    }
+
+    #[tokio::test]
+    async fn schema_rejects_output_that_is_not_json() {
+        struct TextHost;
+        impl WorkflowHost for TextHost {
+            fn phase(&self, _title: String) {}
+            fn log(&self, _message: String) {}
+            fn agent(
+                &self,
+                _prompt: String,
+                _options: Value,
+            ) -> BoxFuture<'static, Result<String, String>> {
+                Box::pin(async { Ok("not json".to_string()) })
+            }
+            fn state(&self) -> WorkflowState {
+                WorkflowState::Running
+            }
+        }
+        let error = execute(
+            Arc::new(TextHost),
+            "return await agent('x', { schema: { type: 'object' } })",
+            json!(null),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("valid JSON"), "{error}");
     }
 
     #[tokio::test]
