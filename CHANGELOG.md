@@ -7,6 +7,37 @@ pre-1.0, so minor releases may include breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- Dynamic workflows: saved JavaScript orchestrations that fan work out to many
+  agents, a `workflow` tool, and progress views in the web client and the TUI
+  (`ctrl+x w` or `/workflows`).
+- A `subagents` tool, so an agent can list, inspect, wait on and cancel the
+  subagents it started.
+- The TUI and the web client show working subagents and the current todo above
+  the prompt, and show resuming, recovered and failed states on task rows.
+
+### Changed
+
+- A subagent that stops on a recoverable provider error resumes automatically,
+  up to twice. If it still fails, its parent gets the partial output and how to
+  continue it.
+- A subagent the user prompts directly reports its result to its parent, which
+  starts a turn on it.
+- Quitting the TUI while a workflow runs asks for a second press.
+
+### Fixed
+
+- A provider answering with an empty response no longer makes a session call it
+  in a tight loop forever: the turn fails after three such responses.
+- A provider that goes silent is timed out after `chunkTimeout` (default 5
+  minutes) and retried, instead of holding the session indefinitely.
+- Pasted line breaks no longer submit the prompt on terminals without bracketed
+  paste.
+- A prompt naming no agent no longer switches a subagent to the default agent.
+- TUI: the `view subagents` hint names its key, and up in a child session no
+  longer recalls the prompt history.
+
 ## [0.3.0] - 2026-10-27
 
 ### Added
