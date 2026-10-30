@@ -791,6 +791,10 @@ kbd {
   overflow-x: auto;
   white-space: pre;
 }
+.plate.wf-approval {
+  max-height: 240px;
+  overflow-y: auto;
+}
 .plate.cmdline::before {
   content: "$ ";
   color: var(--ink-3);

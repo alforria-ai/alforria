@@ -1,6 +1,7 @@
 // Workflows: saved agent orchestrations and live run progress. A run fans
 // out child sessions; open any agent to read its transcript.
 import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js"
+import { createStore, reconcile } from "solid-js/store"
 import { api } from "../api/client"
 import type { WorkflowDefinition, WorkflowRun, WorkflowState } from "../api/types"
 import { state } from "../store/store"
@@ -15,7 +16,7 @@ const NEW_SCRIPT = `export const meta = {
 }
 
 phase('Plan')
-const plan = await agent('Describe the plan for: ' + args, { label: 'plan' })
+const plan = await agent('Describe the plan for: ' + JSON.stringify(args), { label: 'plan' })
 
 phase('Work')
 const results = await parallel([
@@ -25,6 +26,11 @@ const results = await parallel([
 
 return { plan, results }
 `
+
+// Between polls of the run list: quick while something runs, slow otherwise,
+// so a run started from a session still shows up.
+const ACTIVE_POLL_MS = 2500
+const IDLE_POLL_MS = 15000
 
 const TONES: Record<WorkflowState, string> = {
   queued: "queued",
@@ -45,7 +51,11 @@ export function Workflows(props: { onOpen: (session: string) => void }) {
     (typeof localStorage !== "undefined" && localStorage.getItem("alforria.workflow.directory")) || "",
   )
   const [defs, setDefs] = createSignal<WorkflowDefinition[]>([])
-  const [runs, setRuns] = createSignal<WorkflowRun[]>([])
+  // Reconciled by id, so a poll updates the rows in place: an open panel stays
+  // open and a focused button keeps its focus.
+  const [runStore, setRunStore] = createStore<{ list: WorkflowRun[] }>({ list: [] })
+  const runs = () => runStore.list
+  const setRuns = (list: WorkflowRun[]) => setRunStore("list", reconcile(list, { key: "id" }))
   const [loading, setLoading] = createSignal(false)
   const [selectedRun, setSelectedRun] = createSignal<string | null>(null)
   const [selectedWorkflow, setSelectedWorkflow] = createSignal<string | null>(null)
@@ -69,10 +79,13 @@ export function Workflows(props: { onOpen: (session: string) => void }) {
   })
 
   onMount(() => {
+    let last = 0
     const timer = setInterval(() => {
       const dir = directory()
-      if (dir) void refreshRuns(dir)
-    }, 2500)
+      if (!dir || Date.now() - last < (active() ? ACTIVE_POLL_MS : IDLE_POLL_MS)) return
+      last = Date.now()
+      void refreshRuns(dir)
+    }, ACTIVE_POLL_MS)
     onCleanup(() => clearInterval(timer))
   })
 
@@ -80,12 +93,14 @@ export function Workflows(props: { onOpen: (session: string) => void }) {
     setLoading(true)
     try {
       const [workflows, list] = await Promise.all([api.workflows(dir), api.workflowRuns(dir)])
+      // The user may have switched project while this was in flight.
+      if (dir !== directory()) return
       setDefs(workflows)
       setRuns(list)
       if (selectedRun() && !list.some((run) => run.id === selectedRun())) setSelectedRun(null)
       if (!selectedRun() && list.length && !selectedWorkflow()) setSelectedRun(list[0]!.id)
     } catch (error) {
-      toast(errorText(error), "error")
+      if (dir === directory()) toast(errorText(error), "error")
     } finally {
       setLoading(false)
     }
@@ -93,7 +108,8 @@ export function Workflows(props: { onOpen: (session: string) => void }) {
 
   async function refreshRuns(dir: string) {
     try {
-      setRuns(await api.workflowRuns(dir))
+      const list = await api.workflowRuns(dir)
+      if (dir === directory()) setRuns(list)
     } catch {
       // A transient poll failure keeps the last snapshot.
     }
@@ -125,7 +141,7 @@ export function Workflows(props: { onOpen: (session: string) => void }) {
   async function abort(run: WorkflowRun) {
     try {
       const next = await api.abortWorkflow(directory(), run.id)
-      setRuns((list) => list.map((item) => (item.id === next.id ? next : item)))
+      setRuns(runs().map((item) => (item.id === next.id ? next : item)))
     } catch (error) {
       toast(errorText(error), "error")
     }
@@ -543,7 +559,11 @@ function EditorDialog(props: {
           </label>
           <label>
             <span>Save to</span>
-            <select value={scope()} onChange={(event) => setScope(event.currentTarget.value as "project" | "global")}>
+            <select
+              value={scope()}
+              disabled={!!existing}
+              onChange={(event) => setScope(event.currentTarget.value as "project" | "global")}
+            >
               <option value="project">Project (.opencode/workflows)</option>
               <option value="global">User config</option>
             </select>
@@ -576,9 +596,11 @@ function EditorDialog(props: {
             try {
               const saved = await api.saveWorkflow(props.directory, {
                 name: name().trim(),
-                description: description().trim() || undefined,
+                // Empty clears an existing description; a new script keeps its own.
+                description: description().trim() || (existing ? "" : undefined),
                 script: script(),
                 scope: scope(),
+                overwrite: !!existing,
               })
               props.onSaved(saved)
             } catch (error) {

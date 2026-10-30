@@ -159,7 +159,14 @@ export function App() {
     })
   })
 
-  const phonePane = () => (nav.view === "focus" ? "focus" : nav.view === "settings" ? "settings" : nav.phonePane)
+  const phonePane = () =>
+    nav.view === "focus"
+      ? "focus"
+      : nav.view === "settings"
+        ? "settings"
+        : nav.view === "workflows"
+          ? "workflows"
+          : nav.phonePane
 
   return (
     <div
@@ -271,7 +278,7 @@ export function App() {
       </main>
       <StatusLine onKeys={() => setKeysOpen(true)} />
       <MobileTabs
-        pane={nav.view === "workflows" ? "workflows" : phonePane()}
+        pane={phonePane()}
         waiting={interrupts().length}
         canFocus={nav.columns.length > 0}
         onPane={(p) => {

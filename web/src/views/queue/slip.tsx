@@ -152,6 +152,10 @@ function PermissionBody(props: { interrupt: Extract<Interrupt, { kind: "permissi
     <>
       <div class="slip-body">
         <Switch fallback={<div class="plate">{p().patterns.join("\n")}</div>}>
+          <Match when={p().permission === "workflow" && typeof meta().script === "string"}>
+            <p>Runs the workflow {String(meta().name ?? "inline")}:</p>
+            <div class="plate wf-approval">{meta().script as string}</div>
+          </Match>
           <Match when={doom()}>
             <p>The agent called {String(meta().tool ?? "a tool")} with identical input 3 times in a row.</p>
             <div class="plate">{doomTarget(meta())}</div>
@@ -202,9 +206,11 @@ function PermissionBody(props: { interrupt: Extract<Interrupt, { kind: "permissi
           <kbd>A</kbd>
           {doom() ? "Continue" : "Allow once"}
         </button>
-        <button class="stamp" data-verdict="always" onClick={() => send("always")}>
-          <kbd>S</kbd>Always
-        </button>
+        <Show when={p().always.length}>
+          <button class="stamp" data-verdict="always" onClick={() => send("always")}>
+            <kbd>S</kbd>Always
+          </button>
+        </Show>
         <button
           class="stamp"
           data-verdict="reject"

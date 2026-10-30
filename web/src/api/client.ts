@@ -283,7 +283,7 @@ export const api = {
   workflows: (directory: string) => request<WorkflowDefinition[]>("GET", "/workflow", { directory }),
   saveWorkflow: (
     directory: string,
-    body: { name: string; description?: string; script: string; scope?: "project" | "global" },
+    body: { name: string; description?: string; script: string; scope?: "project" | "global"; overwrite?: boolean },
   ) => request<WorkflowDefinition>("POST", "/workflow", { directory, body }),
   deleteWorkflow: (directory: string, name: string) =>
     request<{ deleted: boolean }>("DELETE", `/workflow/${encodeURIComponent(name)}`, { directory }),
