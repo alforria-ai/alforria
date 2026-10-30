@@ -50,14 +50,16 @@ pub fn note_of(text: &str) -> Option<Note> {
     if text.starts_with("<auto_resume>") {
         let error = between(text, "stopped with an error: ", "\n\n")?;
         return Some(Note::Resume {
-            error: first_line(error),
+            error: first_line(&error.replace("&lt;", "<")),
         });
     }
     if text.starts_with("<task id=\"") {
         return Some(Note::Update {
             session_id: between(text, "<task id=\"", "\"")?.to_string(),
             state: between(text, " state=\"", "\"")?.to_string(),
-            summary: update_summary(between(text, "<summary>", "</summary>")?),
+            summary: update_summary(
+                &between(text, "<summary>", "</summary>")?.replace("&lt;", "<"),
+            ),
         });
     }
     None
@@ -401,6 +403,14 @@ mod tests {
             })
         );
         assert_eq!(note_of("The following tool was executed"), None);
+        // Outside text arrives escaped; a person should read it as it was.
+        let note = "<auto_resume>\nYour previous attempt stopped with an error: &lt;html> bad gateway\n\nContinue.\n</auto_resume>";
+        assert_eq!(
+            note_of(note),
+            Some(Note::Resume {
+                error: "<html> bad gateway".to_string()
+            })
+        );
     }
 
     #[test]

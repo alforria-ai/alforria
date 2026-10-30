@@ -23,6 +23,14 @@ describe("subagent notes", () => {
     })
   })
 
+  test("reads escaped outside text as it was", () => {
+    expect(
+      noteOf(
+        "<auto_resume>\nYour previous attempt stopped with an error: &lt;html> bad gateway\n\nContinue.\n</auto_resume>",
+      ),
+    ).toEqual({ kind: "resume", error: "<html> bad gateway" })
+  })
+
   test("leaves other synthetic text alone", () => {
     expect(noteOf("The following tool was executed by the user")).toBeUndefined()
   })

@@ -16,14 +16,18 @@ function updateSummary(summary: string) {
   return shortTitle(summary)
 }
 
+/** Outside text arrives with every `<` escaped; a person should read it as it was. */
+const unescape = (text: string) => text.replaceAll("&lt;", "<")
+
 /** Recognize a synthetic text part as one of the notes. */
 export function noteOf(text: string): Note | undefined {
   if (text.startsWith("<auto_resume>")) {
     const error = /stopped with an error: ([\s\S]*?)\n\n/.exec(text)?.[1]
-    return error === undefined ? undefined : { kind: "resume", error: firstLine(error) }
+    return error === undefined ? undefined : { kind: "resume", error: firstLine(unescape(error)) }
   }
   const update = /^<task id="([^"]+)" state="([^"]+)">\s*<summary>([\s\S]*?)<\/summary>/.exec(text)
-  if (update) return { kind: "update", session: update[1]!, state: update[2]!, summary: updateSummary(update[3]!) }
+  if (update)
+    return { kind: "update", session: update[1]!, state: update[2]!, summary: updateSummary(unescape(update[3]!)) }
   return undefined
 }
 
