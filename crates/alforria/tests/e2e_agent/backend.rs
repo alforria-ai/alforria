@@ -169,7 +169,7 @@ pub enum LiveModel {
 impl LiveModel {
     fn id(self) -> &'static str {
         match self {
-            LiveModel::Cheap => "qwen3.5-4b",
+            LiveModel::Cheap => "qwen3.8-27b",
             LiveModel::QualityGlm => "glm-5.3",
             LiveModel::QualityDeepseek => "deepseek-v4.1-flash",
         }

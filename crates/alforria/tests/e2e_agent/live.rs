@@ -34,7 +34,7 @@ mod e2e_agent {
         }
 
         // -------------------------------------------------------------------
-        // Cheap tier — qwen3.5-4b, all live scenarios
+        // Cheap tier — qwen3.8-27b, all live scenarios
         // -------------------------------------------------------------------
 
         #[tokio::test]
