@@ -278,3 +278,122 @@ fn ctrl_y_copies_a_kept_selection() {
     );
     assert!(!app.ui.selection.active());
 }
+
+/// A child session on screen, its parent known.
+fn app_on_child() -> App {
+    let mut app = app();
+    let child = V1SessionInfo {
+        parent_id: Some("ses_parent".into()),
+        ..session("ses_child")
+    };
+    app.state.sync.session = vec![child, session("ses_parent")];
+    app.state.route.navigate(Route::Session {
+        session_id: "ses_child".into(),
+        prompt: None,
+    });
+    crate::app::post_update(&mut app);
+    app
+}
+
+#[test]
+fn a_child_session_has_no_prompt_to_type_or_paste_into() {
+    let mut app = app_on_child();
+    assert!(!app.ui.prompt_focused);
+    key(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+    update(&mut app, Msg::Paste("pasted".into()));
+    assert_eq!(app.ui.prompt.input(), "");
+}
+
+#[test]
+fn up_leaves_a_child_session_without_recalling_the_prompt_history() {
+    let mut app = app_on_child();
+    let commands = app.keymap.dispatch(
+        &crate::keymap::DispatchContext {
+            route_is_session: true,
+            prompt_focused: app.ui.prompt_focused,
+            foreground_tasks: false,
+            prompt_mounted: !crate::ui::session::prompt_replaced(&app),
+        },
+        &KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+        0,
+    );
+    assert!(commands.contains(&"session.parent"), "{commands:?}");
+    assert!(
+        !commands
+            .iter()
+            .any(|command| command.starts_with("input.") || command.starts_with("prompt.")),
+        "{commands:?}"
+    );
+    key(&mut app, KeyCode::Up, KeyModifiers::NONE);
+    assert!(matches!(
+        &app.state.route.data,
+        Route::Session { session_id, .. } if session_id == "ses_parent"
+    ));
+    assert_eq!(app.ui.prompt.input(), "");
+}
+
+#[test]
+fn the_subagent_hint_names_its_key() {
+    let app = app();
+    assert_eq!(app.keymap.shortcut("session.child.first"), "ctrl+x down");
+    assert_eq!(app.keymap.shortcut("session_child_first"), "ctrl+x down");
+    assert_eq!(app.keymap.shortcut("no.such.command"), "");
+}
+
+fn task_part(metadata: serde_json::Value) -> alforria_schema::session_v1::V1Part {
+    serde_json::from_value(serde_json::json!({
+        "id": "prt_task",
+        "sessionID": "ses_parent",
+        "messageID": "msg_1",
+        "type": "tool",
+        "callID": "call_1",
+        "tool": "task",
+        "state": {
+            "status": "completed",
+            "input": {},
+            "output": "",
+            "title": "",
+            "metadata": metadata,
+            "time": { "start": 1, "end": 2 },
+        },
+    }))
+    .expect("a task part")
+}
+
+#[test]
+fn clicking_a_task_row_opens_its_child_session() {
+    let part = task_part(serde_json::json!({ "sessionId": "ses_child" }));
+    let child = crate::ui::session::parts::task_child_session(&part);
+    assert_eq!(child.as_deref(), Some("ses_child"));
+    assert_eq!(
+        crate::ui::session::parts::task_child_session(&task_part(serde_json::json!({}))),
+        None
+    );
+
+    let mut app = app();
+    app.state.sync.session = vec![session("ses_parent")];
+    app.state.route.navigate(Route::Session {
+        session_id: "ses_parent".into(),
+        prompt: None,
+    });
+    app.ui.session_scroll.sticky = false;
+    app.ui.session_scroll.clicks = vec![crate::state::ClickTarget {
+        id: "prt_task".into(),
+        start: 0,
+        end: 3,
+        child_session: child,
+    }];
+    update(
+        &mut app,
+        Msg::Mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            column: 0,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        }),
+    );
+    assert!(matches!(
+        &app.state.route.data,
+        Route::Session { session_id, .. } if session_id == "ses_child"
+    ));
+}

@@ -68,6 +68,9 @@ pub struct RouteStore {
     pub data: Route,
 }
 
+/// The session id the `--continue` route starts on (`app.tsx:287-293`).
+pub const CONTINUE_PLACEHOLDER: &str = "dummy";
+
 impl RouteStore {
     /// `props.initialRoute ?? initialRoute(startup.initialRoute) ??
     /// {type:"home"}` — with the provider's own `initialRoute` prop set
@@ -75,7 +78,7 @@ impl RouteStore {
     pub fn new(args: &Args, startup: Option<Route>) -> RouteStore {
         let data = if args.continue_ {
             Route::Session {
-                session_id: "dummy".to_string(),
+                session_id: CONTINUE_PLACEHOLDER.to_string(),
                 prompt: None,
             }
         } else {

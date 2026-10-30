@@ -121,7 +121,11 @@ pub fn post_update(app: &mut App) -> Vec<Effect> {
     // per route sessionID — `session.get`, 404 → toast + home, workspace
     // mismatch → non-fatal re-bootstrap, then the session hydrate.
     if let Route::Session { session_id, .. } = &app.state.route.data {
-        if app.ui.session_mounted.as_deref() != Some(session_id.as_str()) {
+        // The `--continue` placeholder is no session to fetch: the route moves
+        // on to the real one once the list is in.
+        if session_id != crate::state::route::CONTINUE_PLACEHOLDER
+            && app.ui.session_mounted.as_deref() != Some(session_id.as_str())
+        {
             let previous_workspace = app.state.project.workspace.current.clone();
             app.ui.session_mounted = Some(session_id.clone());
             effects.push(Effect::SessionMount {
@@ -232,10 +236,19 @@ pub fn on_bus_event(app: &mut App, bus_event: BusEvent) -> Vec<Effect> {
             ) {
                 return Vec::new();
             }
+            // A subagent's failure shows on its task row, and it may yet be resumed.
+            let from_subagent = evt
+                .session_id
+                .as_deref()
+                .and_then(|id| app.state.sync.session(id))
+                .is_some_and(|session| session.parent_id.is_some());
+            if from_subagent {
+                return Vec::new();
+            }
             app.show_toast(Toast {
                 title: None,
                 variant: ToastVariant::Error,
-                message: assistant_error_message(&evt.error),
+                message: crate::ui::session::parts::assistant_error_message(&evt.error),
                 duration_ms: 5000,
             });
         }
@@ -301,18 +314,6 @@ fn plan_switch(app: &mut App, evt: &alforria_schema::session_v1::MessagePartUpda
     }
     app.state.sync = sync;
     app.ui.plan_switch_part = Some(id.clone());
-}
-
-/// `errorMessage` (`app.tsx:154-167`): `error.data.message`, falling back
-/// to JS `String(error)`.
-fn assistant_error_message(error: &alforria_schema::session_v1::AssistantError) -> String {
-    use alforria_schema::session_v1::AssistantError;
-    match error {
-        AssistantError::Auth { message, .. } | AssistantError::Unknown { message, .. } => {
-            message.clone()
-        }
-        _ => "[object Object]".to_string(),
-    }
 }
 
 /// `isVersionGreater` (`app.tsx:169-184`).
@@ -696,9 +697,9 @@ mod tests {
         app.state.sync.status = Some(SyncStatus::Partial);
         app.state.sync.session = vec![session("ses_a", "A", 10, None)];
         let effects = post_update(&mut app);
-        // The fork effect, plus the mount effect for the `--continue`
-        // dummy session the route sits on.
-        assert_eq!(effects.len(), 2);
+        // Just the fork: the `--continue` dummy session the route sits on
+        // is not fetched.
+        assert_eq!(effects.len(), 1);
         assert!(matches!(
             effects[0],
             Effect::SessionFork { session_id: ref s, navigate: true } if s == "ses_a"

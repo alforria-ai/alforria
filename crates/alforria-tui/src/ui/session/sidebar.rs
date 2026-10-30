@@ -129,6 +129,7 @@ pub fn section_lines(app: &App, theme: &Theme, session_id: &str) -> Vec<Line<'st
         context_lines(app, theme, session_id),
         mcp_lines(app, theme),
         lsp_lines(app, theme),
+        super::subagents::sidebar_lines(app, theme, session_id),
         todo_lines(app, theme, session_id),
         files_lines(app, theme, session_id),
     ];
@@ -320,6 +321,64 @@ fn todo_lines(app: &App, theme: &Theme, session_id: &str) -> Vec<Line<'static>> 
             theme.warning
         } else {
             theme.text_muted
+        };
+        rows.push(Line::styled(
+            format!("{mark}{}", todo.content),
+            color.to_color(),
+        ));
+    }
+    rows
+}
+
+/// The most items the docked list shows.
+const DOCKED_TODOS: usize = 4;
+
+/// The todo list above the prompt, for when the sidebar is hidden: the
+/// progress, then the current item and what comes next. Empty once nothing
+/// is left to do.
+pub fn docked_todo_lines(app: &App, theme: &Theme, session_id: &str) -> Vec<Line<'static>> {
+    let Some(list) = app.state.sync.todo.get(session_id) else {
+        return Vec::new();
+    };
+    let open = |todo: &&alforria_schema::session_todo::TodoInfo| {
+        todo.status != "completed" && todo.status != "cancelled"
+    };
+    let (current, next): (Vec<_>, Vec<_>) = list
+        .iter()
+        .filter(open)
+        .partition(|todo| todo.status == "in_progress");
+    let remaining = current.len() + next.len();
+    if remaining == 0 {
+        return Vec::new();
+    }
+    let done = list
+        .iter()
+        .filter(|todo| todo.status == "completed")
+        .count();
+    let mut header = vec![
+        Span::styled(
+            "Todo",
+            Style::new()
+                .fg(theme.text.to_color())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" {done}/{}", list.len()),
+            theme.text_muted.to_color(),
+        ),
+    ];
+    if remaining > DOCKED_TODOS {
+        header.push(Span::styled(
+            format!(" · +{} more", remaining - DOCKED_TODOS),
+            theme.text_muted.to_color(),
+        ));
+    }
+    let mut rows = vec![Line::from(header)];
+    for todo in current.iter().chain(next.iter()).take(DOCKED_TODOS) {
+        let (mark, color) = if todo.status == "in_progress" {
+            ("[•] ", theme.warning)
+        } else {
+            ("[ ] ", theme.text_muted)
         };
         rows.push(Line::styled(
             format!("{mark}{}", todo.content),
@@ -778,6 +837,58 @@ mod tests {
             !rows.iter().any(|row| text(row).contains("Getting started")),
             "{rows:?}"
         );
+    }
+
+    fn todo(status: &str, content: &str) -> alforria_schema::session_todo::TodoInfo {
+        alforria_schema::session_todo::TodoInfo {
+            content: content.into(),
+            status: status.into(),
+            priority: "high".into(),
+        }
+    }
+
+    #[test]
+    fn docked_todos_lead_with_the_current_item_and_cap_the_rest() {
+        let mut app = app();
+        let theme = crate::ui::session::test_theme();
+        assert!(docked_todo_lines(&app, &theme, "ses_1").is_empty());
+        app.state.sync.todo.insert(
+            "ses_1".into(),
+            vec![
+                todo("completed", "done"),
+                todo("pending", "one"),
+                todo("in_progress", "now"),
+                todo("pending", "two"),
+                todo("pending", "three"),
+                todo("pending", "four"),
+                todo("cancelled", "dropped"),
+            ],
+        );
+        let rows: Vec<String> = docked_todo_lines(&app, &theme, "ses_1")
+            .iter()
+            .map(text)
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                "Todo 1/7 · +1 more",
+                "[•] now",
+                "[ ] one",
+                "[ ] two",
+                "[ ] three"
+            ]
+        );
+    }
+
+    #[test]
+    fn docked_todos_leave_once_nothing_is_open() {
+        let mut app = app();
+        let theme = crate::ui::session::test_theme();
+        app.state.sync.todo.insert(
+            "ses_1".into(),
+            vec![todo("completed", "done"), todo("cancelled", "dropped")],
+        );
+        assert!(docked_todo_lines(&app, &theme, "ses_1").is_empty());
     }
 
     #[test]

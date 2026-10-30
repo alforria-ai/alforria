@@ -1133,6 +1133,28 @@ pub async fn session_sync_shared<S: StateCell>(
     .await
 }
 
+/// The child sessions of `session_id`'s `task` parts that have no messages
+/// here yet — a resumed session never saw their live events.
+pub fn unsynced_task_children(sync: &SyncState, session_id: &str) -> Vec<String> {
+    let mut children: Vec<String> = sync
+        .message
+        .get(session_id)
+        .into_iter()
+        .flatten()
+        .flat_map(|message| {
+            sync.part
+                .get(message_id(message))
+                .map(Vec::as_slice)
+                .unwrap_or(&[])
+        })
+        .filter_map(crate::ui::session::parts::task_child_session)
+        .filter(|child| sync.message.get(child).is_none_or(Vec::is_empty))
+        .collect();
+    children.sort();
+    children.dedup();
+    children
+}
+
 struct Hydrated {
     session: V1SessionInfo,
     messages: Vec<crate::transport::api::MessageWithParts>,

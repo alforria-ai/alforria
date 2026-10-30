@@ -1435,7 +1435,7 @@ fn move_child(app: &mut App, direction: i32) {
 
 /// `enterChild` (`session/index.tsx:418-424`): navigate, then the
 /// retry-status alert.
-fn enter_child(app: &mut App, session_id: &str) {
+pub(crate) fn enter_child(app: &mut App, session_id: &str) {
     app.state.route.navigate(Route::Session {
         session_id: session_id.to_string(),
         prompt: None,

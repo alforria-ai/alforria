@@ -298,6 +298,8 @@ pub struct ClickTarget {
     pub start: usize,
     /// Exclusive end line.
     pub end: usize,
+    /// A `task` part opens its child session (`session/index.tsx:2215-2328`).
+    pub child_session: Option<String>,
 }
 
 impl SessionScroll {
@@ -350,14 +352,19 @@ fn transcript_click(app: &mut App, row: u16) {
         return;
     }
     let line = (row - scroll.area_y) as usize + scroll.effective_y();
-    let Some(id) = scroll
+    let Some(target) = scroll
         .clicks
         .iter()
         .find(|target| target.start <= line && line < target.end)
-        .map(|target| target.id.clone())
+        .cloned()
     else {
         return;
     };
+    if let Some(child) = target.child_session {
+        crate::command::enter_child(app, &child);
+        return;
+    }
+    let id = target.id;
     toggle_set(&mut app.ui.expanded, &id);
     toggle_set(&mut app.ui.expanded_errors, &id);
 }
@@ -1028,6 +1035,8 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             } else if paste_into_bottom_bar(app, &normalized) {
                 // The permission reject message or the question's "Other"
                 // answer has the focus.
+            } else if crate::ui::session::prompt_replaced(app) {
+                // No prompt on screen to paste into.
             } else if normalized.trim().is_empty() {
                 effects.extend(crate::command::run(app, "prompt.paste"));
             } else {
@@ -1564,6 +1573,7 @@ mod tests {
             id: "prt_1".to_string(),
             start: 2,
             end: 5,
+            child_session: None,
         }];
         let up = || {
             Msg::Mouse(crossterm::event::MouseEvent {

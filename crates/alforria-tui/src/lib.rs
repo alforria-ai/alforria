@@ -19,6 +19,7 @@ pub mod config;
 pub mod editor;
 pub mod keymap;
 pub mod log;
+pub mod paste_burst;
 pub mod state;
 pub mod transcript;
 pub mod transport;
@@ -956,6 +957,15 @@ pub async fn execute_effect(
                         state::sync::session_sync_shared(&**app, api.as_ref(), &session_id).await;
                     // `scroll.scrollBy(100_000)` — snap to bottom.
                     app.lock().await.ui.session_scroll.snap_to_bottom();
+                    // `Task`'s `onMount` sync (`session/index.tsx:2215-2328`).
+                    let children = state::sync::unsynced_task_children(
+                        &app.lock().await.state.sync,
+                        &session_id,
+                    );
+                    futures::future::join_all(children.iter().map(|child| {
+                        state::sync::session_sync_shared(&**app, api.as_ref(), child)
+                    }))
+                    .await;
                 }
                 Err(_) => {
                     let mut app = app.lock().await;
@@ -1181,34 +1191,84 @@ fn spawn_sse(source: Arc<dyn EventSource>, messages: tokio::sync::mpsc::Unbounde
 /// park while a child process (`$EDITOR`, a shell after ctrl+z) owns the
 /// terminal: otherwise it would steal the child's keystrokes.
 fn spawn_input_pump(messages: tokio::sync::mpsc::UnboundedSender<Msg>) {
-    std::thread::spawn(move || loop {
-        if messages.is_closed() {
-            return;
-        }
-        if term::park_if_paused() {
-            continue;
-        }
-        match crossterm::event::poll(Duration::from_millis(50)) {
-            Ok(true) => {}
-            Ok(false) => continue,
-            Err(_) => return,
-        }
-        if term::paused() {
-            continue;
-        }
-        let msg = match crossterm::event::read() {
-            Ok(crossterm::event::Event::Key(key)) => Msg::Key(key),
-            Ok(crossterm::event::Event::Mouse(mouse)) => Msg::Mouse(mouse),
-            Ok(crossterm::event::Event::Resize(columns, rows)) => Msg::Resize(columns, rows),
-            // Bracketed paste (`prompt/index.tsx:1396-1420`).
-            Ok(crossterm::event::Event::Paste(text)) => Msg::Paste(text),
-            Ok(_) => continue,
-            Err(_) => return,
-        };
-        if messages.send(msg).is_err() {
-            return;
+    std::thread::spawn(move || {
+        let mut pending = None;
+        let mut long_burst_end = None;
+        loop {
+            if messages.is_closed() {
+                return;
+            }
+            if term::park_if_paused() {
+                continue;
+            }
+            let event = match pending.take() {
+                Some(event) => event,
+                None => {
+                    match crossterm::event::poll(Duration::from_millis(50)) {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(_) => return,
+                    }
+                    if term::paused() {
+                        continue;
+                    }
+                    match crossterm::event::read() {
+                        Ok(event) => event,
+                        Err(_) => return,
+                    }
+                }
+            };
+            let msgs = match event {
+                crossterm::event::Event::Key(key) if paste_burst::is_text(&key) => {
+                    let Ok((burst, next)) = gather_burst(key) else {
+                        return;
+                    };
+                    pending = next;
+                    let continuing = long_burst_end
+                        .is_some_and(|end: Instant| end.elapsed() < paste_burst::CONTINUATION);
+                    long_burst_end = paste_burst::is_long(burst.len())
+                        .then(Instant::now)
+                        .or(long_burst_end.filter(|_| continuing));
+                    match paste_burst::resolve(burst, continuing) {
+                        paste_burst::Burst::Keys(keys) => keys.into_iter().map(Msg::Key).collect(),
+                        paste_burst::Burst::Paste(text) => vec![Msg::Paste(text)],
+                        paste_burst::Burst::Ignore => Vec::new(),
+                    }
+                }
+                crossterm::event::Event::Key(key) => vec![Msg::Key(key)],
+                crossterm::event::Event::Mouse(mouse) => vec![Msg::Mouse(mouse)],
+                crossterm::event::Event::Resize(columns, rows) => vec![Msg::Resize(columns, rows)],
+                // Bracketed paste (`prompt/index.tsx:1396-1420`).
+                crossterm::event::Event::Paste(text) => vec![Msg::Paste(text)],
+                _ => continue,
+            };
+            for msg in msgs {
+                if messages.send(msg).is_err() {
+                    return;
+                }
+            }
         }
     });
+}
+
+/// The text keys following `first` within [`paste_burst::GAP`] of each
+/// other, plus the event that ended the burst if it was not a text key.
+fn gather_burst(
+    first: crossterm::event::KeyEvent,
+) -> io::Result<(
+    Vec<crossterm::event::KeyEvent>,
+    Option<crossterm::event::Event>,
+)> {
+    let mut burst = vec![first];
+    while crossterm::event::poll(paste_burst::GAP)? {
+        match crossterm::event::read()? {
+            crossterm::event::Event::Key(key) if paste_burst::is_text(&key) => burst.push(key),
+            crossterm::event::Event::Key(key)
+                if key.kind == crossterm::event::KeyEventKind::Release => {}
+            event => return Ok((burst, Some(event))),
+        }
+    }
+    Ok((burst, None))
 }
 
 /// SIGHUP: the terminal is gone — exit (`app.tsx:231-235`), whatever is on

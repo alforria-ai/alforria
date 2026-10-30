@@ -15,6 +15,7 @@ mod question_tests;
 pub mod render_cache;
 pub mod sidebar;
 pub mod subagent_footer;
+pub mod subagents;
 pub mod transcript;
 
 use ratatui::layout::Rect;
@@ -153,8 +154,19 @@ pub fn route_session_id(app: &App) -> Option<&str> {
 /// A pending permission or question shows in place of the prompt
 /// (`session/index.tsx:240-241,1297-1330`).
 pub fn prompt_replaced(app: &App) -> bool {
-    permission::visible(app).is_some() || question::visible(app).is_some()
+    permission::visible(app).is_some() || question::visible(app).is_some() || on_child_session(app)
 }
+
+/// A child session has the subagent footer instead of a prompt
+/// (`session/index.tsx:1296-1313`).
+fn on_child_session(app: &App) -> bool {
+    route_session_id(app)
+        .and_then(|session_id| app.state.sync.session(session_id))
+        .is_some_and(|session| session.parent_id.is_some())
+}
+
+/// The docked todo list gives way below this much transcript.
+const MIN_TRANSCRIPT_ROWS: u16 = 6;
 
 /// `render(app, frame, theme, area)` — the session layout
 /// (`session/index.tsx:1157-1361`): a row of [transcript column,
@@ -218,18 +230,37 @@ pub fn render(app: &mut App, frame: &mut ratatui::Frame, theme: &Theme, area: Re
         bottom_height += subagent_footer::HEIGHT;
     }
     let footer_height = 1;
+    // Without the sidebar the list would scroll away with the transcript.
+    let docked_todos = if sidebar_visible || is_child {
+        Vec::new()
+    } else {
+        let mut lines = subagents::docked_lines(app, theme, &session_id);
+        lines.extend(sidebar::docked_todo_lines(app, theme, &session_id));
+        lines
+    };
+    let todo_height = docked_todos.len() as u16;
+    let todo_height =
+        if column.height >= bottom_height + footer_height + 1 + todo_height + MIN_TRANSCRIPT_ROWS {
+            todo_height
+        } else {
+            0
+        };
     let vertical = ratatui::layout::Layout::vertical([
         ratatui::layout::Constraint::Fill(1),
         // The `gap={1}` between the transcript scrollbox and the
         // bottom stack (`session/index.tsx:1178`).
         ratatui::layout::Constraint::Length(1),
+        ratatui::layout::Constraint::Length(todo_height),
         ratatui::layout::Constraint::Length(bottom_height),
         ratatui::layout::Constraint::Length(footer_height),
     ])
     .split(column);
 
     transcript::render(app, frame, theme, vertical[0], &session_id, content_width);
-    let mut row = vertical[2];
+    if todo_height > 0 {
+        frame.render_widget(ratatui::widgets::Paragraph::new(docked_todos), vertical[2]);
+    }
+    let mut row = vertical[3];
     if is_child {
         let footer = Rect {
             height: subagent_footer::HEIGHT,
@@ -249,7 +280,7 @@ pub fn render(app: &mut App, frame: &mut ratatui::Frame, theme: &Theme, area: Re
     } else if prompt_visible {
         prompt::render(app, frame, theme, row);
     }
-    footer::render(app, frame, theme, vertical[3], &session_id);
+    footer::render(app, frame, theme, vertical[4], &session_id);
 
     if sidebar_visible && !sidebar_area.is_empty() {
         if !wide {

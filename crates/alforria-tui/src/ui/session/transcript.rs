@@ -78,42 +78,7 @@ fn model_name(app: &App, provider_id: &str, model_id: &str) -> String {
 /// the OpenTUI keymap registry; the port formats the resolved binding
 /// directly (documented divergence — shape only).
 fn command_shortcut(app: &App, command: &str) -> String {
-    use crate::keymap::bindings::BindingValue;
-    let Some(BindingValue::Alternatives(alternatives)) = app.keymap.bindings.get(command) else {
-        return String::new();
-    };
-    let Some(sequence) = alternatives.first() else {
-        return String::new();
-    };
-    sequence
-        .iter()
-        .map(|stroke| {
-            let mut parts: Vec<String> = Vec::new();
-            if stroke.ctrl {
-                parts.push("ctrl".to_string());
-            }
-            if stroke.meta {
-                parts.push("meta".to_string());
-            }
-            if stroke.super_key {
-                parts.push("super".to_string());
-            }
-            if stroke.hyper {
-                parts.push("hyper".to_string());
-            }
-            let single = stroke.key.chars().count() == 1;
-            if stroke.shift {
-                if single && stroke.key.chars().all(|c| c.is_ascii_lowercase()) {
-                    parts.push(stroke.key.to_ascii_uppercase());
-                    return parts.join("+");
-                }
-                parts.push("shift".to_string());
-            }
-            parts.push(stroke.key.clone());
-            parts.join("+")
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+    app.keymap.shortcut(command)
 }
 
 /// The transcript entry point — the `<scrollbox>` contents
@@ -237,6 +202,7 @@ fn build_lines(
                     content_width,
                     &mut lines,
                     &mut children,
+                    clicks,
                 );
             }
             V1Message::Assistant { .. } => {
@@ -332,6 +298,7 @@ fn user_message_lines(
     content_width: u16,
     lines: &mut Segmented,
     children: &mut Vec<(String, usize)>,
+    clicks: &mut Vec<crate::state::ClickTarget>,
 ) {
     let V1Message::User {
         id, agent, time, ..
@@ -356,6 +323,56 @@ fn user_message_lines(
         .iter()
         .filter(|part| matches!(part, V1Part::File { .. }))
         .collect();
+
+    for part in parts {
+        let V1Part::Text {
+            id,
+            text,
+            synthetic: Some(true),
+            ..
+        } = part
+        else {
+            continue;
+        };
+        let Some(note) = super::subagents::note_of(text) else {
+            continue;
+        };
+        if index != 0 {
+            lines.push(blank());
+        }
+        let start = lines.len();
+        let (row, child) = match note {
+            super::subagents::Note::Resume { error } => (
+                Line::from(styled(
+                    format!("   ↻ Resumed automatically after an error: {error}"),
+                    theme.warning,
+                )),
+                None,
+            ),
+            super::subagents::Note::Update {
+                session_id,
+                state,
+                summary,
+            } => (
+                Line::from(styled(
+                    format!("   ◆ {summary}"),
+                    if state == "error" {
+                        theme.error
+                    } else {
+                        theme.text_muted
+                    },
+                )),
+                Some(session_id),
+            ),
+        };
+        lines.push(row);
+        clicks.push(crate::state::ClickTarget {
+            id: id.clone(),
+            start,
+            end: lines.len(),
+            child_session: child,
+        });
+    }
 
     if !text.is_empty() {
         if index != 0 {
@@ -527,6 +544,7 @@ fn assistant_message_lines(
                 id,
                 start,
                 end: lines.len(),
+                child_session: parts::task_child_session(part),
             });
         }
     }

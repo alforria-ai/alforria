@@ -303,42 +303,7 @@ fn parse_tip(tip: &str) -> Vec<(String, bool)> {
 /// `formatKeySequence` (`keymap.tsx:250-258`) — the transcript twin;
 /// the first registered binding of a command, formatted for display.
 fn command_shortcut(app: &App, command: &str) -> String {
-    use crate::keymap::bindings::BindingValue;
-    let Some(BindingValue::Alternatives(alternatives)) = app.keymap.bindings.get(command) else {
-        return String::new();
-    };
-    let Some(sequence) = alternatives.first() else {
-        return String::new();
-    };
-    sequence
-        .iter()
-        .map(|stroke| {
-            let mut parts: Vec<String> = Vec::new();
-            if stroke.ctrl {
-                parts.push("ctrl".to_string());
-            }
-            if stroke.meta {
-                parts.push("meta".to_string());
-            }
-            if stroke.super_key {
-                parts.push("super".to_string());
-            }
-            if stroke.hyper {
-                parts.push("hyper".to_string());
-            }
-            let single = stroke.key.chars().count() == 1;
-            if stroke.shift {
-                if single && stroke.key.chars().all(|c| c.is_ascii_lowercase()) {
-                    parts.push(stroke.key.to_ascii_uppercase());
-                    return parts.join("+");
-                }
-                parts.push("shift".to_string());
-            }
-            parts.push(stroke.key.clone());
-            parts.join("+")
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+    app.keymap.shortcut(command)
 }
 
 /// The `TIPS` array (`feature-plugins/home/tips-view.tsx:64-164`) plus

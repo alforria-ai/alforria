@@ -229,7 +229,7 @@ fn render_reasoning(part: &V1Part, ctx: &Ctx) -> Vec<Line<'static>> {
 
 /// `toolDisplay` (`session/index.tsx:2626-2644`).
 fn tool_display(tool: &str) -> &'static str {
-    const TOOLS: [&str; 14] = [
+    const TOOLS: [&str; 15] = [
         "bash",
         "glob",
         "read",
@@ -239,6 +239,7 @@ fn tool_display(tool: &str) -> &'static str {
         "write",
         "edit",
         "task",
+        "subagents",
         "apply_patch",
         "todowrite",
         "question",
@@ -299,7 +300,7 @@ fn tool_parts<'a>(part: &'a V1Part) -> Option<ToolParts<'a>> {
             metadata.clone().unwrap_or_default(),
             input.clone(),
             None,
-            Some(error.clone()),
+            Some(super::subagents::tool_error_text(error)),
         ),
     };
     Some(ToolParts {
@@ -333,6 +334,7 @@ fn render_tool(part: &V1Part, ctx: &Ctx) -> Vec<Line<'static>> {
         "write" => write(&tool, ctx),
         "edit" => edit(&tool, ctx),
         "task" => task(&tool, ctx),
+        "subagents" => subagents(&tool, ctx),
         "execute" => execute(&tool, ctx),
         "apply_patch" => apply_patch(&tool, ctx),
         "todowrite" => todowrite(&tool, ctx),
@@ -814,6 +816,16 @@ fn websearch(tool: &ToolParts, ctx: &Ctx) -> Vec<Line<'static>> {
     )
 }
 
+/// The child session a `task` or `subagents` part is about
+/// (`metadata.sessionId`).
+pub(crate) fn task_child_session(part: &V1Part) -> Option<String> {
+    if !matches!(part, V1Part::Tool { tool, .. } if tool == "task" || tool == "subagents") {
+        return None;
+    }
+    let tool = tool_parts(part)?;
+    string_value(tool.metadata.get("sessionId")).map(str::to_string)
+}
+
 /// `Task` (`session/index.tsx:2215-2328`).
 fn task(tool: &ToolParts, ctx: &Ctx) -> Vec<Line<'static>> {
     let description = string_value(tool.input.get("description")).unwrap_or_default();
@@ -873,6 +885,16 @@ fn task(tool: &ToolParts, ctx: &Ctx) -> Vec<Line<'static>> {
         Some(status) if background && !matches!(status, SessionStatusInfo::Idle) => true,
         _ => matches!(tool.state, V1ToolState::Running { .. }),
     };
+    // Between automatic resumes the child is idle on its error, with the task
+    // call still running.
+    let child_busy = matches!(status, Some(SessionStatusInfo::Busy));
+    let stopped_on = child_id.as_deref().and_then(|id| {
+        let messages = ctx.app.state.sync.message.get(id)?;
+        messages.iter().rev().find_map(|message| match message {
+            alforria_schema::session_v1::V1Message::Assistant { error, .. } => Some(error.clone()),
+            _ => None,
+        })?
+    });
 
     let mut content = vec![format!(
         "{} Task{} — {description}",
@@ -890,6 +912,20 @@ fn task(tool: &ToolParts, ctx: &Ctx) -> Vec<Line<'static>> {
                 "↳ Retrying (attempt {attempt}) · {}",
                 locale::truncate(message, 80)
             ));
+        } else if let Some(error) = stopped_on.as_ref().filter(|error| {
+            !child_busy
+                && !matches!(
+                    error,
+                    alforria_schema::session_v1::AssistantError::Aborted { .. }
+                )
+        }) {
+            content.push(format!(
+                "↳ Stopped on an error, resuming · {}",
+                locale::truncate(
+                    &super::subagents::failure_line(&assistant_error_message(error)),
+                    80
+                )
+            ));
         } else if !tools.is_empty() {
             match current {
                 Some((tool, title)) => {
@@ -906,19 +942,30 @@ fn task(tool: &ToolParts, ctx: &Ctx) -> Vec<Line<'static>> {
         }
     }
     if !is_running && matches!(tool.state, V1ToolState::Completed { .. }) {
+        let recovered = tool
+            .output
+            .as_deref()
+            .filter(|output| output.contains("<summary>Recovered from errors"))
+            .map_or("", |_| " · recovered from errors");
         content.push(format!(
-            "↳ {}",
+            "↳ {}{recovered}",
             format_completed_subagent_detail(tools.len(), &locale::duration(duration))
+        ));
+    }
+    if let (false, Some(error)) = (is_running, tool.error.as_deref()) {
+        content.push(format!(
+            "↳ Failed · {}",
+            locale::truncate(&super::subagents::failure_line(error), 80)
         ));
     }
 
     inline_tool(
         ctx,
         tool,
-        if matches!(tool.state, V1ToolState::Completed { .. }) {
-            "✓"
-        } else {
-            "│"
+        match tool.state {
+            V1ToolState::Completed { .. } => "✓",
+            V1ToolState::Error { .. } => "✗",
+            _ => "│",
         },
         None,
         retry.map(|_| ctx.theme.error),
@@ -927,6 +974,58 @@ fn task(tool: &ToolParts, ctx: &Ctx) -> Vec<Line<'static>> {
         None,
         is_running,
         &content.join("\n"),
+    )
+}
+
+/// The `subagents` tool (an alforria extension): what was asked and where the
+/// subagent stands. The output itself is for the model.
+fn subagents(tool: &ToolParts, ctx: &Ctx) -> Vec<Line<'static>> {
+    let action = string_value(tool.input.get("action")).unwrap_or_default();
+    let title = match tool.state {
+        V1ToolState::Completed { title, .. } => Some(title.as_str()),
+        _ => None,
+    };
+    let subject = title
+        .map(|title| super::subagents::short_title(title).to_string())
+        .or_else(|| string_value(tool.input.get("task_id")).map(str::to_string))
+        .unwrap_or_default();
+    let state = match string_value(tool.metadata.get("state")).unwrap_or_default() {
+        "error" => "failed",
+        "not_started" => "not started",
+        state => state,
+    };
+    let text = match action {
+        "list" => match tool.metadata.get("count").and_then(Value::as_u64) {
+            Some(count) => format!("Subagents ({count})"),
+            None => "Subagents".to_string(),
+        },
+        "wait"
+            if matches!(
+                tool.state,
+                V1ToolState::Running { .. } | V1ToolState::Pending { .. }
+            ) =>
+        {
+            format!("Waiting for {subject}")
+        }
+        "wait" => format!("Waited for {subject}: {state}"),
+        "cancel" => format!("Cancel {subject}: {state}"),
+        _ => format!("Subagent {subject}: {state}"),
+    };
+    let running = matches!(
+        tool.state,
+        V1ToolState::Running { .. } | V1ToolState::Pending { .. }
+    );
+    inline_tool(
+        ctx,
+        tool,
+        "◆",
+        None,
+        (state == "failed").then_some(ctx.theme.error),
+        !action.is_empty(),
+        "Checking subagents…",
+        None,
+        running,
+        text.trim_end_matches(": "),
     )
 }
 
