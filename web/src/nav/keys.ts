@@ -20,6 +20,10 @@ export interface KeyActions {
   manage(): void
   /** U: open the oldest session that finished or failed unseen. */
   nextUnseen(): void
+  /** H: every session, by folder, however old. */
+  history(): void
+  /** →/←: show or hide the cursor row's subagents (← on a subagent steps to its parent). */
+  fold(show: boolean): void
 }
 
 export function isTyping(el: Element | null) {
@@ -61,6 +65,7 @@ export function bindKeys(view: () => "overview" | "focus" | "settings" | "workfl
     if (k === "?") return go(a.keys)
     if (k === "F2") return go(a.manage)
     if (lower === "u" && view() !== "settings") return go(a.nextUnseen)
+    if (lower === "h" && view() !== "settings") return go(a.history)
     if (k === "/") return go(a.palette)
     if (lower === "q") return go(a.queue)
     if (lower === "n") return go(a.newSession)
@@ -68,6 +73,7 @@ export function bindKeys(view: () => "overview" | "focus" | "settings" | "workfl
     if (view() === "overview") {
       if (lower === "j" || k === "ArrowDown") return go(() => a.cursor(1))
       if (lower === "k" || k === "ArrowUp") return go(() => a.cursor(-1))
+      if (k === "ArrowRight" || k === "ArrowLeft") return go(() => a.fold(k === "ArrowRight"))
       // Enter opens the cursor row only from the table (or nothing focused);
       // on a focused button it presses that button.
       if (k === "Enter" && onTable(document.activeElement)) return go(() => a.openCursor(e.shiftKey))

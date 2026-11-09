@@ -561,8 +561,9 @@ kbd {
   white-space: nowrap;
   font-weight: 500;
 }
+/* Subagents indent one step per level (--depth, set from 2). */
 .rail-row.sub {
-  padding-left: 30px;
+  padding-left: calc(16px + 14px * var(--depth, 1));
 }
 .rail-row.sub .t {
   font-weight: 400;
@@ -1389,6 +1390,10 @@ kbd {
   width: 12px;
   height: 12px;
 }
+/* Only the first action takes the free space; the rest sit beside it. */
+.proj .add + .add {
+  margin-left: 0;
+}
 
 .s-row {
   cursor: pointer;
@@ -1441,6 +1446,37 @@ kbd {
   color: var(--ink-3);
   border: 1px solid var(--rule-2);
   padding: 2px 4px;
+}
+/* A parent's subagents, shown or hidden. Collapsed, it reads as a count and
+   what they are doing; waiting ones take the accent. */
+.fold {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  height: 18px;
+  padding: 0 5px 0 2px;
+  font: 400 11px/1 var(--f-mono);
+  color: var(--ink-3);
+  border: 1px solid var(--rule-2);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.fold .i {
+  width: 11px;
+  height: 11px;
+}
+.fold:hover {
+  color: var(--ink);
+  border-color: var(--ink-3);
+}
+.fold.folded {
+  color: var(--ink-2);
+  background: var(--plate);
+}
+.fold.waiting {
+  color: var(--accent-text);
+  border-color: currentColor;
 }
 .title-cell .open-mark {
   flex: none;
@@ -1495,13 +1531,13 @@ kbd {
   color: var(--ground);
 }
 .s-row.sub .title-cell {
-  padding-left: 20px;
+  padding-left: calc(20px * var(--depth, 1));
   position: relative;
 }
 .s-row.sub .title-cell::before {
   content: "";
   position: absolute;
-  left: 4px;
+  left: calc(4px + 20px * (var(--depth, 1) - 1));
   top: -18px;
   width: 10px;
   height: 26px;
@@ -3613,6 +3649,15 @@ button.tool-row:hover {
   .ws-head .seg[aria-label="View"] {
     display: none;
   }
+  /* The tab bar already says Sessions; the room goes to History and Open folder. */
+  .ws-head h2 {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+  }
   .ws-head .seg button {
     padding: 0 7px;
   }
@@ -4419,8 +4464,65 @@ button.tool-row:hover {
   color: var(--ink);
   background: var(--plate);
 }
+.ws-folder + .ws-folder {
+  margin-left: 0;
+}
 .q-empty .link-btn {
   margin-top: 12px;
+}
+.q-empty-acts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+/* ───────────── session history ───────────── */
+
+/* The open-folder frame (input, headed results, foot) with a folder picker
+   beside the search, and session titles that take the row. */
+.history {
+  /* A flex item of the scrim: long folder paths must not widen it. */
+  min-width: 0;
+}
+.history .palette-input .history-folder {
+  /* An explicit width: a select is otherwise as wide as its longest option. */
+  flex: 0 1 260px;
+  width: 260px;
+  min-width: 0;
+  max-width: 45%;
+  text-overflow: ellipsis;
+}
+.history .res .t {
+  flex: 1 1 auto;
+  max-width: none;
+  min-width: 0;
+}
+.history .res .m {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 50%;
+}
+.history .res .i {
+  flex: none;
+  color: var(--ink-3);
+}
+.history .folder-foot {
+  min-height: 57px;
+}
+.history .folder-foot .p {
+  font: 400 12px/1 var(--f-mono);
+  color: var(--ink-2);
+}
+.history-keys {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font: 400 11.5px/1 var(--f-label);
+  color: var(--ink-3);
+}
+.history-keys kbd:last-of-type {
+  margin-left: 6px;
 }
 @media (max-width: 760px) {
   .folder {
@@ -4442,6 +4544,21 @@ button.tool-row:hover {
   }
   .ws-folder span {
     display: none;
+  }
+  .history-keys {
+    display: none;
+  }
+  /* The fold chip keeps its size; its touch target reaches 40px. */
+  .fold {
+    position: relative;
+  }
+  .fold::after {
+    content: "";
+    position: absolute;
+    inset: -11px -6px;
+  }
+  .history .folder-foot .link-btn {
+    min-height: 44px;
   }
 }
 

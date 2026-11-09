@@ -10,9 +10,11 @@ import {
   fleetState,
   GLOBAL_PROJECT,
   sessionCost,
+  subagentSummary,
   todoProgress,
 } from "../fleet/fleet"
 import type { FleetState } from "../fleet/derive"
+import { subagentsCollapsed } from "../nav/collapse"
 import { state } from "../store/store"
 import { age, money, now, tildify } from "../ui/format"
 import { Icon } from "../ui/icons"
@@ -114,12 +116,46 @@ export function CtxCell(props: { id: string }) {
   )
 }
 
+/**
+ * Shows or hides a parent's subagents. Collapsed, it says what they are
+ * doing, so a waiting or working subagent is never out of sight.
+ */
+export function FoldToggle(props: {
+  id: string
+  subagents: string[]
+  compact?: boolean
+  onFold: (id: string) => void
+}) {
+  const folded = () => subagentsCollapsed(props.id)
+  const sum = () => subagentSummary(props.subagents)
+  const label = () => `${folded() ? "Show" : "Hide"} ${sum().count} subagent${sum().count === 1 ? "" : "s"}`
+  return (
+    <button
+      class="fold"
+      classList={{ folded: folded(), waiting: folded() && sum().waiting > 0 }}
+      aria-expanded={!folded()}
+      aria-label={label()}
+      title={`${label()} (${folded() ? "→" : "←"})${folded() ? `: ${sum().text}` : ""}`}
+      onMouseDown={(e) => e.preventDefault()}
+      onClick={(e) => {
+        e.stopPropagation()
+        props.onFold(props.id)
+      }}
+    >
+      <Icon name={folded() ? "chev-right" : "chev-down"} />
+      <span>{props.compact || !folded() ? sum().count : sum().text}</span>
+    </button>
+  )
+}
+
 function SessionRow(props: {
   session: Session
   depth: number
+  subagents: string[]
   cursor: boolean
   onOpen: (id: string, beside: boolean) => void
   onManage: (id: string) => void
+  onFold: (id: string) => void
 }) {
   const id = () => props.session.id
   const st = () => fleetState(state, id())
@@ -128,6 +164,7 @@ function SessionRow(props: {
       class="s-row"
       classList={{ sub: props.depth > 0, "is-waiting": st() === "waiting", "is-cursor": props.cursor }}
       data-sid={id()}
+      style={props.depth > 1 ? { "--depth": props.depth } : undefined}
       tabindex="-1"
       onMouseDown={(e) => e.shiftKey && e.preventDefault()}
       onClick={(e) => props.onOpen(id(), e.shiftKey)}
@@ -141,6 +178,9 @@ function SessionRow(props: {
           <span class="t">{displayTitle(props.session)}</span>
           <Show when={props.session.agent && props.session.agent !== "build"}>
             <span class="tag">{props.session.agent}</span>
+          </Show>
+          <Show when={props.subagents.length}>
+            <FoldToggle id={id()} subagents={props.subagents} onFold={props.onFold} />
           </Show>
           <AutoTag id={id()} />
           <button
@@ -181,6 +221,10 @@ export function SessionTable(props: {
   onManage: (id: string) => void
   onWorktrees: (projectID: string) => void
   onNewSession: (directory: string) => void
+  /** This folder's full session history, however old. */
+  onHistory: (folder: { key: string; name: string; directory: string }) => void
+  /** Show or hide a parent's subagents. */
+  onFold: (id: string) => void
 }) {
   return (
     <table class="reg" aria-label="Sessions by project">
@@ -224,8 +268,8 @@ export function SessionTable(props: {
                       )}
                     </Show>
                     <span class="tally">
-                      {g.rows.length} sessions
-                      <Show when={g.rows.filter((r) => fleetState(state, r.session.id) === "waiting").length}>
+                      {g.all.length} sessions
+                      <Show when={g.all.filter((r) => fleetState(state, r.session.id) === "waiting").length}>
                         {(w) => (
                           <>
                             {" "}
@@ -234,6 +278,14 @@ export function SessionTable(props: {
                         )}
                       </Show>
                     </span>
+                    <button
+                      class="add hist"
+                      aria-label={`Session history in ${g.name}`}
+                      title="History: every session in this folder, however old"
+                      onClick={() => props.onHistory({ key: g.key, name: g.name, directory: g.directory })}
+                    >
+                      <Icon name="history" />
+                    </button>
                     <Show when={g.project.id !== GLOBAL_PROJECT && g.project.vcs === "git"}>
                       <button
                         class="add wt"
@@ -260,9 +312,11 @@ export function SessionTable(props: {
                   <SessionRow
                     session={r.session}
                     depth={r.depth}
+                    subagents={r.subagents}
                     cursor={props.cursor === r.session.id}
                     onOpen={props.onOpen}
                     onManage={props.onManage}
+                    onFold={props.onFold}
                   />
                 )}
               </For>

@@ -3,7 +3,18 @@
 // phone tab bar. All navigation state lives in nav/route.ts.
 import { createMemo, createSignal, Match, onCleanup, onMount, Show, Switch } from "solid-js"
 import { api } from "./api/client"
-import { counts, filter, filteredGroups, fleetState, groups, interrupts, setFilter } from "./fleet/fleet"
+import {
+  counts,
+  filter,
+  filteredGroups,
+  fleetState,
+  groups,
+  HISTORY_WINDOW,
+  interrupts,
+  setFilter,
+} from "./fleet/fleet"
+import type { Folder } from "./fleet/history"
+import { setAllSubagentsCollapsed, setSubagentsCollapsed, subagentsCollapsed, toggleSubagents } from "./nav/collapse"
 import { bindKeys } from "./nav/keys"
 import {
   closeColumn,
@@ -39,6 +50,7 @@ import { unseenOrder } from "./nav/unseen"
 import { startAutoAccept } from "./views/queue/auto"
 import { Worktrees } from "./views/worktrees"
 import { Workflows } from "./views/workflows"
+import { SessionHistory } from "./views/history"
 
 const PHONE = "(max-width: 760px)"
 
@@ -53,6 +65,9 @@ export function App() {
   const [managing, setManaging] = createSignal<string | null>(null)
   const [archivedOpen, setArchivedOpen] = createSignal(false)
   const [worktreesOf, setWorktreesOf] = createSignal<string | null>(null)
+  /** The session history, open on one folder or (`{}`) on every folder. */
+  const [historyOf, setHistoryOf] = createSignal<{ folder?: Folder } | null>(null)
+  const openHistory = (folder?: Folder) => setHistoryOf({ folder })
   /** F2's target: a focused session-list row, the table's cursor row, or the active column. */
   const manageTarget = () => {
     const rail = (document.activeElement as HTMLElement | null)?.closest<HTMLElement>("[data-rail]")
@@ -67,6 +82,20 @@ export function App() {
   const maxColumns = () => (phone() ? 1 : Math.max(1, Math.min(3, Math.floor(workspaceWidth() / 400))))
   // Keyboard row navigation follows what the table shows.
   const rows = createMemo(() => filteredGroups().flatMap((g) => g.rows.map((r) => r.session.id)))
+
+  /**
+   * Show or hide a parent's subagents (toggle when `collapsed` is unset). A
+   * cursor on a subagent that just went out of sight moves up to the parent.
+   */
+  const fold = (id: string, collapsed?: boolean) => {
+    if (collapsed === undefined) toggleSubagents(id)
+    else setSubagentsCollapsed(id, collapsed)
+    const at = cursor()
+    if (at && at !== id && !rows().includes(at) && groups().some((g) => g.all.some((r) => r.session.id === at))) {
+      for (let p = state.sessions[at]?.parentID; p; p = state.sessions[p]?.parentID)
+        if (rows().includes(p)) return setCursor(p)
+    }
+  }
 
   const open = (id: string, beside = false) => {
     setCursor(id)
@@ -149,6 +178,21 @@ export function App() {
         if (!id) return toast("No session has news")
         open(id)
       },
+      history: () => openHistory(),
+      fold: (show) => {
+        const id = cursor()
+        if (!id) return
+        const row = groups()
+          .flatMap((g) => g.all)
+          .find((r) => r.session.id === id)
+        if (row?.subagents.length && subagentsCollapsed(id) === show) return fold(id, !show)
+        // From a subagent, ← steps up to its parent.
+        const parent = state.sessions[id]?.parentID
+        if (!show && parent && rows().includes(parent)) {
+          setCursor(parent)
+          document.querySelector(`tr[data-sid="${parent}"]`)?.scrollIntoView({ block: "nearest" })
+        }
+      },
     })
     onCleanup(() => {
       stopSync()
@@ -189,6 +233,8 @@ export function App() {
             onNextWaiting={openNextWaiting}
             onCollapse={() => setPanelOpen((v) => !v)}
             onManage={setManaging}
+            onHistory={() => openHistory()}
+            onFold={fold}
           />
         </Show>
         <Show when={nav.view === "overview"}>
@@ -236,6 +282,14 @@ export function App() {
                     </button>
                   ))}
                 </div>
+                <button
+                  class="ws-folder"
+                  title="Session history: every session, by folder, however old (H)"
+                  onClick={() => openHistory()}
+                >
+                  <Icon name="history" />
+                  <span>History</span>
+                </button>
                 <button class="ws-folder" title="Start a session in any folder" onClick={() => setFolderOpen(true)}>
                   <Icon name="folder" />
                   <span>Open folder</span>
@@ -246,13 +300,22 @@ export function App() {
                   when={counts().all > 0}
                   fallback={
                     <div class="q-empty">
-                      <h3>{state.conn.state === "live" ? "No sessions yet" : "Connecting…"}</h3>
-                      <p>Sessions from every project on this server appear here as they start.</p>
+                      <h3>{state.conn.state === "live" ? "No recent sessions" : "Connecting…"}</h3>
+                      <p>
+                        Sessions from every project on this server appear here as they start, and stay for{" "}
+                        {HISTORY_WINDOW / 86_400_000} days. Older ones are in the session history.
+                      </p>
                       <Show when={state.conn.state === "live"}>
-                        <button class="link-btn" onClick={() => setFolderOpen(true)}>
-                          <Icon name="folder" />
-                          Open a folder
-                        </button>
+                        <div class="q-empty-acts">
+                          <button class="link-btn" onClick={() => setFolderOpen(true)}>
+                            <Icon name="folder" />
+                            Open a folder
+                          </button>
+                          <button class="link-btn" onClick={() => openHistory()}>
+                            <Icon name="history" />
+                            Session history
+                          </button>
+                        </div>
                       </Show>
                       <Show when={state.conn.state === "live" && !Object.keys(state.models).length}>
                         <p>No model is connected yet. Sign in with LibertAI or add an API key first.</p>
@@ -269,6 +332,8 @@ export function App() {
                     onNewSession={newSession}
                     onManage={setManaging}
                     onWorktrees={setWorktreesOf}
+                    onHistory={openHistory}
+                    onFold={(id) => fold(id)}
                   />
                 </Show>
               </div>
@@ -304,6 +369,8 @@ export function App() {
             showKeys: () => setKeysOpen(true),
             manage: setManaging,
             archived: () => setArchivedOpen(true),
+            history: () => openHistory(),
+            subagents: setAllSubagentsCollapsed,
             worktrees: setWorktreesOf,
             close: () => setPalette(null),
           }}
@@ -317,6 +384,9 @@ export function App() {
       </Show>
       <Show when={state.projects[worktreesOf() ?? ""]}>
         {(p) => <Worktrees project={p()} onStart={startSession} close={() => setWorktreesOf(null)} />}
+      </Show>
+      <Show when={historyOf()}>
+        {(h) => <SessionHistory folder={h().folder} onOpen={open} close={() => setHistoryOf(null)} />}
       </Show>
       <Show when={archivedOpen()}>
         <ArchivedSessions onOpen={(id) => open(id)} close={() => setArchivedOpen(false)} />

@@ -18,6 +18,14 @@ pre-1.0, so minor releases may include breaking changes.
   the prompt, and show resuming, recovered and failed states on task rows.
 - `alforria db trim-diffs [--vacuum]` shrinks a database that already holds
   oversized diffs.
+- Session history in the web client (`H`, the History buttons, or ⌘K): every
+  session the server keeps, however old, filtered by folder and title. This
+  includes folders that have dropped off the overview. An opened session
+  rejoins the session list, and stays once it is used again.
+- The web client's session lists fold a parent's subagents away: the toggle
+  beside its title, `←`/`→` on a row, or "Hide all subagents" in ⌘K. Folded,
+  the toggle says how many subagents are working or waiting. Nested subagents
+  indent one step per level.
 
 ### Fixed
 
@@ -34,6 +42,7 @@ pre-1.0, so minor releases may include breaking changes.
 - A subagent the user prompts directly reports its result to its parent, which
   starts a turn on it.
 - Quitting the TUI while a workflow runs asks for a second press.
+- The web client's overview keeps sessions for 7 days instead of 3.
 
 ### Fixed
 

@@ -2,9 +2,10 @@
 // project. Click swaps the active column; shift-click or "open beside" adds a
 // column. Collapsed, it becomes a strip of status lamps. The list is one tab
 // stop (roving tabindex): ↑/↓, Home and End move between rows, Enter opens,
-// Shift+Enter opens beside.
+// Shift+Enter opens beside, ← and → hide and show a parent's subagents.
 import { createSignal, For, Show } from "solid-js"
-import { activity, counts, displayTitle, fleetState, groups, interrupts } from "../fleet/fleet"
+import { activity, counts, displayTitle, fleetState, interrupts, listedGroups, subagentSummary } from "../fleet/fleet"
+import { subagentsCollapsed } from "../nav/collapse"
 import { nav } from "../nav/route"
 import { unseen } from "../nav/unseen"
 import { autoAccepting } from "./queue/auto"
@@ -41,17 +42,50 @@ export function AutoTag(props: { id: string }) {
   )
 }
 
+/**
+ * A parent's subagents, shown or hidden. An option holds no controls: this is
+ * the pointer's shortcut for → and ←, which the list announces itself.
+ */
+function RailFold(props: { id: string; subagents: string[]; onFold: (id: string) => void }) {
+  const folded = () => subagentsCollapsed(props.id)
+  const sum = () => subagentSummary(props.subagents)
+  return (
+    <span
+      class="fold"
+      classList={{ folded: folded(), waiting: folded() && sum().waiting > 0 }}
+      aria-hidden="true"
+      title={`${folded() ? "Show" : "Hide"} subagents (${folded() ? "→" : "←"}): ${sum().text}`}
+      onMouseDown={(e) => e.preventDefault()}
+      onClick={(e) => {
+        e.stopPropagation()
+        props.onFold(props.id)
+      }}
+    >
+      <Icon name={folded() ? "chev-right" : "chev-down"} />
+      <span>{sum().count}</span>
+    </span>
+  )
+}
+
 export function Rail(props: {
   onOpen: (id: string, beside: boolean) => void
   onNextWaiting: () => void
   onCollapse: () => void
   /** Rename, archive or delete (a row's context menu, or F2 on it). */
   onManage: (id: string) => void
+  /** Every session, however old. */
+  onHistory: () => void
+  /** Show or hide a parent's subagents. */
+  onFold: (id: string, collapsed?: boolean) => void
 }) {
   const oldest = () => interrupts()[0]
   const colsOf = (id: string) =>
     nav.columns.map((c, i) => (c.kind === "session" && c.session === id ? i : -1)).filter((i) => i >= 0)
-  const ids = () => groups().flatMap((g) => g.rows.map((r) => r.session.id))
+  const ids = () => listedGroups().flatMap((g) => g.rows.map((r) => r.session.id))
+  const rowOf = (id: string) =>
+    listedGroups()
+      .flatMap((g) => g.rows)
+      .find((r) => r.session.id === id)
   // The row that takes the list's one tab stop: the last one moved to, else
   // the active column's session, else the first.
   const [roving, setRoving] = createSignal<string | null>(null)
@@ -71,6 +105,21 @@ export function Rail(props: {
     if (e.key === "Enter" || e.key === " ") {
       e.preventDefault()
       return props.onOpen(id, e.shiftKey)
+    }
+    // A tree's keys: → shows a parent's subagents, ← hides them, and from a
+    // subagent ← steps up to its parent.
+    if (e.key === "ArrowRight" || e.key === "ArrowLeft") {
+      const show = e.key === "ArrowRight"
+      const row = rowOf(id)
+      if (row?.subagents.length && subagentsCollapsed(id) === show) {
+        e.preventDefault()
+        return props.onFold(id, !show)
+      }
+      const parent = state.sessions[id]?.parentID
+      if (show || !parent || !rowOf(parent)) return
+      e.preventDefault()
+      setRoving(parent)
+      return listEl.querySelector<HTMLElement>(`[data-rail="${parent}"]`)?.focus()
     }
     const list = ids()
     const at = list.indexOf(id)
@@ -97,6 +146,14 @@ export function Rail(props: {
           {counts().working} working · {counts().all} total
         </span>
         <span class="spacer" />
+        <button
+          class="icon-btn"
+          aria-label="Session history"
+          title="Session history: every session, however old (H)"
+          onClick={props.onHistory}
+        >
+          <Icon name="history" />
+        </button>
         <button class="icon-btn collapse" aria-label="Collapse session list" onClick={props.onCollapse}>
           <Icon name="panel" />
         </button>
@@ -113,7 +170,7 @@ export function Rail(props: {
         )}
       </Show>
       <div class="rail-list" role="listbox" aria-labelledby="railTitle" ref={listEl} onKeyDown={onListKey}>
-        <For each={groups()}>
+        <For each={listedGroups()}>
           {(g) => (
             // A listbox may only hold options and groups: each project is a
             // labelled group, its header presentational.
@@ -121,8 +178,8 @@ export function Rail(props: {
               <div class="rail-proj" role="presentation">
                 <h3 role="presentation">{g.name}</h3>
                 <span class="tally">
-                  {g.rows.length}
-                  <Show when={g.rows.filter((r) => fleetState(state, r.session.id) === "waiting").length}>
+                  {g.all.length}
+                  <Show when={g.all.filter((r) => fleetState(state, r.session.id) === "waiting").length}>
                     {(w) => (
                       <>
                         {" "}
@@ -150,6 +207,7 @@ export function Rail(props: {
                       aria-selected={cols().includes(nav.active)}
                       tabindex={tabStop() === id ? 0 : -1}
                       title={displayTitle(r.session)}
+                      style={r.depth > 1 ? { "--depth": r.depth } : undefined}
                       data-rail={id}
                       onFocus={() => setRoving(id)}
                       onContextMenu={(e) => {
@@ -163,8 +221,16 @@ export function Rail(props: {
                       <span class="t">
                         <UnseenMark id={id} />
                         {displayTitle(r.session)}
+                        <Show when={r.subagents.length}>
+                          <span class="sr-only">
+                            , {subagentSummary(r.subagents).text}, {subagentsCollapsed(id) ? "hidden" : "shown"}
+                          </span>
+                        </Show>
                       </span>
                       <span class="badges">
+                        <Show when={r.subagents.length}>
+                          <RailFold id={id} subagents={r.subagents} onFold={props.onFold} />
+                        </Show>
                         <AutoTag id={id} />
                         <For each={cols()}>
                           {(i) => (
@@ -209,7 +275,7 @@ export function Rail(props: {
         <button class="icon-btn" aria-label="Expand session list" onClick={props.onCollapse}>
           <Icon name="panel" />
         </button>
-        <For each={groups().flatMap((g) => g.rows)}>
+        <For each={listedGroups().flatMap((g) => g.rows)}>
           {(r) => (
             <button
               class="mini"

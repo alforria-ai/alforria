@@ -14,6 +14,7 @@ const PATHS = {
   diff: `<rect x="2.75" y="1.75" width="10.5" height="12.5"/><path d="M8 4.25v4M6 6.25h4M6 11h4"/>`,
   file: `<path d="M3.25 1.75h6l3.5 3.5v9H3.25z"/><path d="M9.25 1.75v3.5h3.5"/>`,
   folder: `<path d="M1.75 3.25h4.5l1.5 1.5h6.5v8.5H1.75z"/>`,
+  history: `<path d="M2.25 8A5.75 5.75 0 1 0 4 3.9L2.25 5.75"/><path d="M2.25 2.5v3.25H5.5"/><path d="M8 4.75V8l2.25 1.5"/>`,
   sliders: `<path d="M1.75 4h12.5M1.75 8h12.5M1.75 12h12.5"/><rect x="9.25" y="2.5" width="2.5" height="3" fill="currentColor" stroke="none"/><rect x="3.75" y="6.5" width="2.5" height="3" fill="currentColor" stroke="none"/><rect x="7.25" y="10.5" width="2.5" height="3" fill="currentColor" stroke="none"/>`,
   contrast: `<circle cx="8" cy="8" r="5.75"/><path d="M8 2.25a5.75 5.75 0 0 1 0 11.5z" fill="currentColor" stroke="none"/>`,
   fork: `<circle cx="4.5" cy="3.5" r="1.5"/><circle cx="4.5" cy="12.5" r="1.5"/><circle cx="11.5" cy="4.5" r="1.5"/><path d="M4.5 5v6M11.5 6v1.25c0 2-2 2.5-7 3.25"/>`,

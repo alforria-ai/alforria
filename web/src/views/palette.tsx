@@ -23,6 +23,9 @@ export interface PaletteActions {
   showKeys(): void
   manage(sessionID: string): void
   archived(): void
+  history(): void
+  /** Hide (true) or show every parent's subagents, now and from now on. */
+  subagents(collapsed: boolean): void
   worktrees(projectID: string): void
   close(): void
 }
@@ -158,6 +161,9 @@ export function Palette(props: { initial?: string; actions: PaletteActions }) {
             },
           ]
         : []),
+      { label: "Session history…", meta: "H", run: props.actions.history },
+      { label: "Hide all subagents", meta: "", run: () => props.actions.subagents(true) },
+      { label: "Show all subagents", meta: "", run: () => props.actions.subagents(false) },
       { label: "Archived sessions…", meta: "", run: props.actions.archived },
       { label: `Switch to ${theme() === "dark" ? "light" : "dark"} theme`, meta: "", run: toggleTheme },
       { label: "Open settings", meta: "", run: () => openSettings() },
@@ -311,6 +317,7 @@ const GROUPS: [string, [string[], string][]][] = [
       [["Q"], "Go to the queue"],
       [["N"], "New session"],
       [["U"], "Open the oldest session that finished or failed while you were away"],
+      [["H"], "Session history: every session, by folder, however old"],
       [["Esc"], "Back (focus → overview, settings → where you were)"],
       [["F2"], "Rename, archive or delete the cursor row's or active column's session"],
       [["?"], "This sheet"],
@@ -343,6 +350,7 @@ const GROUPS: [string, [string[], string][]][] = [
       [["J", "K"], "Move through rows"],
       [["↵"], "Open in focus"],
       [["⇧", "↵"], "Open beside the current column"],
+      [["←", "→"], "Hide / show a row's subagents (also in the focus session list)"],
       [["F"], "Back to focus"],
     ],
   ],

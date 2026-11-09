@@ -247,6 +247,45 @@ try {
     await p.locator(".scrim").click({ position: { x: 8, y: 8 } })
     check((await p.locator(".palette").count()) === 0, "a press outside closes the palette")
 
+    // A parent's subagents fold away and back; the overview's count keeps them.
+    const rowCount = () => p.locator("tr.s-row").count()
+    const unfolded = await rowCount()
+    const tokens = p.locator("tr.s-row", { hasText: "Consolidate color tokens" })
+    await tokens.locator(".fold").click()
+    check(
+      (await rowCount()) === unfolded - 1 && (await tokens.locator(".fold").getAttribute("aria-expanded")) === "false",
+      "a parent's fold toggle hides its subagent",
+    )
+    check(p.url().endsWith("#/"), "the fold toggle doesn't open the session")
+    await tokens.locator(".fold").click()
+    check((await rowCount()) === unfolded, "the fold toggle shows it again")
+
+    // Session history: every session however old, by folder and title. A
+    // folder row's button opens it on that folder; H opens it on every one.
+    await p.locator(".proj", { hasText: "ferrite-cli" }).locator(".add.hist").click()
+    await p.locator(".history .res").first().waitFor()
+    await p.waitForTimeout(300)
+    check((await p.locator(".history .res").count()) === 3, "a folder's history lists its 3 sessions")
+    const historyA11y = await a11y(p)
+    check(!historyA11y.length, `session history has no serious a11y violations ${historyA11y.join(" ")}`)
+    await p.keyboard.press("Escape")
+    await p.keyboard.press("h")
+    await p.locator(".history .res").first().waitFor()
+    await p.waitForTimeout(300)
+    check(
+      (await p.locator(".history .res").count()) === (await p.locator("tr.s-row:not(.sub)").count()),
+      "H opens the history on every folder, subagents left out",
+    )
+    await p.locator(".history input").fill("trailing slash")
+    await p.keyboard.press("Enter")
+    await p.locator(".col.is-active .msg-user").first().waitFor()
+    check(
+      (await p.locator(".col.is-active .col-head h2").textContent())?.includes("Trailing slash") ?? false,
+      "a history row opens its session",
+    )
+    await p.keyboard.press("Escape")
+    await p.waitForTimeout(300)
+
     // The model picker works from the keyboard.
     await p.locator("tr.s-row", { hasText: "Apply pending migrations" }).click()
     await p.locator(".col.is-active .model-btn").click()
