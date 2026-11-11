@@ -489,6 +489,10 @@ pub struct TriggerTurn {
     /// The trigger's creator was restricted: the run is that caller's,
     /// replayed. It happens in a restricted session or not at all.
     pub restricted: bool,
+    /// The trigger was written by a session that had seen outside content
+    /// (`StoredSpec::outside_content`): the run's session carries that
+    /// mark — provenance only, no ceiling.
+    pub outside_content: bool,
     /// The prompt was written by the operator (the config, or an `admin`
     /// request), not by a model or a restricted caller. Only then are the
     /// `@file` and `@agent` mentions in it resolved: resolving one attaches
@@ -534,6 +538,9 @@ pub struct Creator {
     /// The creator is restricted (`session::caller`): a credential below
     /// `admin`, or a tool call in a restricted session.
     pub restricted: bool,
+    /// The creating session had seen outside content
+    /// (`SessionMark::OutsideContent`).
+    pub outside_content: bool,
 }
 
 /// The session-engine seam behind the scheduler.

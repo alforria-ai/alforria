@@ -15,6 +15,7 @@ pub mod invalid;
 pub mod lsp;
 pub mod mcp_websearch;
 pub mod memory;
+pub mod outside;
 pub mod patch_parser;
 pub mod permission;
 pub mod plan;

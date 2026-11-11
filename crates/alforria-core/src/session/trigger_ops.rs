@@ -121,7 +121,7 @@ impl ProductionTriggerOps {
                     // word for things, such as the memory flush before a
                     // compaction; and what puts the ceiling on it.
                     marks: crate::session::store::SessionMarks {
-                        outside_content: turn.untrusted,
+                        outside_content: turn.untrusted || turn.outside_content,
                         outside_start: turn.untrusted,
                     },
                     ..Default::default()
@@ -190,6 +190,16 @@ impl ProductionTriggerOps {
                                 .mark(
                                     &session.id,
                                     crate::session::store::SessionMark::OutsideStart,
+                                )
+                                .map_err(|error| error.to_string())?;
+                        }
+                        // Provenance alone: the trigger's prompt was
+                        // written after outside content was seen.
+                        if turn.outside_content {
+                            self.sessions
+                                .mark(
+                                    &session.id,
+                                    crate::session::store::SessionMark::OutsideContent,
                                 )
                                 .map_err(|error| error.to_string())?;
                         }
@@ -390,6 +400,7 @@ mod tests {
             }],
             untrusted: false,
             restricted: false,
+            outside_content: false,
             operator_authored: true,
             prompt: "Write the morning brief".to_string(),
             payload: None,

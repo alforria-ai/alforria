@@ -413,6 +413,26 @@ mod tests {
         }
     }
 
+    /// Every upstream built-in, with every flag on, is classified
+    /// (`tool::outside`). The server's own registry is walked in its tests.
+    #[test]
+    fn every_builtin_is_classified_as_returning_outside_content_or_not() {
+        let flags = RuntimeFlags {
+            client: "cli".to_string(),
+            enable_question_tool: true,
+            experimental_code_mode: true,
+            experimental_lsp_tool: true,
+            experimental_plan_mode: true,
+            ..RuntimeFlags::default()
+        };
+        for id in builtin_ids(&flags) {
+            assert!(
+                crate::tool::outside::builtin(id).is_some(),
+                "classify `{id}` in tool::outside::BUILTIN"
+            );
+        }
+    }
+
     #[test]
     fn question_slot_follows_flags() {
         let ids = builtin_ids(&RuntimeFlags {

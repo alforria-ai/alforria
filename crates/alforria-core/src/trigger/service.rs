@@ -92,6 +92,8 @@ struct Entry {
     origin_session_id: Option<String>,
     /// Its creator was restricted (`StoredSpec::restricted`).
     restricted: bool,
+    /// `StoredSpec::outside_content`.
+    outside_content: bool,
     schedule: Result<Schedule, String>,
     state: TriggerState,
     time_created: u64,
@@ -272,6 +274,7 @@ impl TriggerService {
                     None,
                     None,
                     false,
+                    false,
                     now,
                     now,
                     now,
@@ -297,6 +300,7 @@ impl TriggerService {
                 stored.stored.inherited,
                 stored.origin_session_id,
                 stored.stored.restricted,
+                stored.stored.outside_content,
                 stored.time_created,
                 stored.time_updated,
                 now,
@@ -331,6 +335,7 @@ impl TriggerService {
         inherited: Option<PermissionV1Ruleset>,
         origin_session_id: Option<String>,
         restricted: bool,
+        outside_content: bool,
         time_created: u64,
         time_updated: u64,
         now: u64,
@@ -358,6 +363,7 @@ impl TriggerService {
             inherited,
             origin_session_id,
             restricted,
+            outside_content,
             schedule,
             state,
             time_created: if source == TriggerSource::Config {
@@ -453,6 +459,7 @@ impl TriggerService {
                 origin_session_id,
                 inherited,
                 restricted: false,
+                outside_content: false,
             },
         )
     }
@@ -497,6 +504,35 @@ impl TriggerService {
         }
     }
 
+    /// Record that a session which had seen outside content changed a
+    /// stored trigger (`StoredSpec::outside_content`): from now on its
+    /// runs' sessions carry that mark. Never cleared.
+    pub fn mark_outside_content(&self, id: &str) -> Result<(), TriggerError> {
+        let mut entries = self.lock();
+        let Some(entry) = entries.get_mut(id) else {
+            return Err(TriggerError::NotFound(format!("trigger not found: {id}")));
+        };
+        if entry.outside_content || entry.source != TriggerSource::Runtime {
+            return Ok(());
+        }
+        self.store
+            .put(&StoredTrigger {
+                id: id.to_string(),
+                stored: StoredSpec {
+                    spec: entry.spec.clone(),
+                    inherited: entry.inherited.clone(),
+                    restricted: entry.restricted,
+                    outside_content: true,
+                },
+                origin_session_id: entry.origin_session_id.clone(),
+                time_created: entry.time_created,
+                time_updated: entry.time_updated,
+            })
+            .map_err(|error| TriggerError::Failed(error.to_string()))?;
+        entry.outside_content = true;
+        Ok(())
+    }
+
     /// Create a stored trigger for `creator`. What the creator was is
     /// recorded with it and binds every run (`StoredSpec::restricted`).
     pub fn create_as(
@@ -509,6 +545,7 @@ impl TriggerService {
             origin_session_id,
             inherited,
             restricted,
+            outside_content,
         } = creator;
         self.require_enabled()?;
         let schedule = spec.schedule().map_err(TriggerError::Invalid)?;
@@ -566,6 +603,7 @@ impl TriggerService {
                         spec: spec.clone(),
                         inherited: inherited.clone(),
                         restricted,
+                        outside_content,
                     },
                     origin_session_id: origin_session_id.clone(),
                     time_created: now,
@@ -580,6 +618,7 @@ impl TriggerService {
                 inherited,
                 origin_session_id,
                 restricted,
+                outside_content,
                 schedule: Ok(schedule),
                 state,
                 time_created: now,
@@ -698,6 +737,7 @@ impl TriggerService {
                             spec: entry.spec.clone(),
                             inherited: entry.inherited.clone(),
                             restricted: entry.restricted,
+                            outside_content: entry.outside_content,
                         },
                         origin_session_id: entry.origin_session_id.clone(),
                         time_created: entry.time_created,
@@ -1154,6 +1194,7 @@ impl TriggerService {
                         .unwrap_or_default(),
                     untrusted,
                     restricted: entry.restricted,
+                    outside_content: entry.outside_content,
                     operator_authored: entry.origin_session_id.is_none() && !entry.restricted,
                     prompt: entry.spec.prompt.clone(),
                     payload,

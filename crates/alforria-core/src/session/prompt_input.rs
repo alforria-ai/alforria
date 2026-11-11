@@ -680,6 +680,20 @@ pub async fn create_user_message(
         .may_act_on(session_restricted)
         .map_err(|message| PromptError::Forbidden { message })?;
     let bounds = input.caller.bounds(session_restricted);
+    // alforria extension: a file a caller below `admin` sends with a prompt
+    // is outside content (`SessionMark::OutsideContent`): the operator did
+    // not pick it. Marked before the message exists.
+    if matches!(input.caller, Caller::Restricted)
+        && input
+            .parts
+            .iter()
+            .any(|part| matches!(part, PromptPartInput::File { .. }))
+    {
+        deps.sessions.mark(
+            &input.session_id,
+            crate::session::store::SessionMark::OutsideContent,
+        )?;
+    }
     let assigned;
     let input = if bounds.restricted && bounds.from_request {
         assigned = without_caller_ids(input);

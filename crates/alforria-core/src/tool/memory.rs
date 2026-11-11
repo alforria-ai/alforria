@@ -89,6 +89,17 @@ fn failed(tool: &str, error: MemoryError) -> ToolError {
     }
 }
 
+/// `metadata`, saying so when the result holds content nobody vouches for
+/// (`tool::outside`): the session that reads it has seen outside content.
+fn flagged(mut metadata: Value, outside: bool) -> Value {
+    if outside {
+        if let Some(object) = metadata.as_object_mut() {
+            object.insert(crate::tool::outside::FLAG.to_string(), json!(true));
+        }
+    }
+    metadata
+}
+
 fn render_record(record: &MemoryRecord, text: &str) -> String {
     format!(
         "<record id=\"{}\" kind=\"{}\" updated=\"{}\"{}{}>{}</record>",
@@ -136,8 +147,10 @@ fn fenced(records: &[&MemoryRecord], empty: &str) -> String {
     out.join("\n")
 }
 
-/// Whether a session carries text from outside
-/// ([`crate::trigger::session_untrusted`]).
+/// A fact about a session, looked up by id: whether it has seen outside
+/// content, whether outside input started it, whether it is restricted
+/// (`SessionStore::seen_outside_content`, `started_by_outside_input`,
+/// `is_restricted`).
 pub type Untrusted = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 pub fn memory_tool(
@@ -146,6 +159,7 @@ pub fn memory_tool(
     memory: Arc<MemoryService>,
     untrusted: Untrusted,
     restricted: Untrusted,
+    ceiling: Untrusted,
 ) -> ToolDef {
     define(
         MEMORY_TOOL,
@@ -161,6 +175,7 @@ pub fn memory_tool(
                 Arc::clone(&memory),
                 Arc::clone(&untrusted),
                 Arc::clone(&restricted),
+                Arc::clone(&ceiling),
             )
         },
     )
@@ -183,21 +198,25 @@ fn run_memory(
     memory: Arc<MemoryService>,
     untrusted: Untrusted,
     restricted: Untrusted,
+    ceiling: Untrusted,
 ) -> BoxFuture<'_, Result<ExecuteResult, ToolError>> {
     Box::pin(async move {
         let fail = |error| failed(MEMORY_TOOL, error);
-        // Who is writing: this session, and whether it carries text from
-        // outside. The service records it with whatever it changes.
+        // Who is writing: this session, and whether it has seen content
+        // from outside (provenance: what it saves is unverified). The
+        // service records it with whatever it changes.
         // Whether the session is restricted (`session::caller`) goes with
         // it too: what such a session saves is shown to its own kind only.
         let by = Provenance::tool(ctx.session_id, untrusted(ctx.session_id))
-            .restricted(restricted(ctx.session_id));
-        // Refused before anyone is asked: such a session may add records
-        // (when its trigger lets it), never touch existing ones.
+            .restricted(restricted(ctx.session_id))
+            .add_only(ceiling(ctx.session_id));
+        // Refused before anyone is asked: a run outside input started may
+        // add records (when its trigger lets it), never touch existing
+        // ones. The ceiling's effect; provenance alone refuses nothing.
         let outsiders_only_add = |what: &str| -> Result<(), ToolError> {
-            if by.untrusted {
+            if by.add_only {
                 return Err(ToolError::Failed(format!(
-                    "this session carries text from outside, so it may not {what} an existing \
+                    "this session was started by outside input, so it may not {what} an existing \
                      memory. It can only add new ones."
                 )));
             }
@@ -252,7 +271,10 @@ fn run_memory(
                     .map_err(fail)?;
                 Ok(ExecuteResult {
                     title: format!("Memory search: {} found", hits.len()),
-                    metadata: json!({ "count": hits.len() }),
+                    metadata: flagged(
+                        json!({ "count": hits.len() }),
+                        hits.iter().any(|hit| !hit.record.verified),
+                    ),
                     output: fenced(
                         &hits.iter().map(|hit| &hit.record).collect::<Vec<_>>(),
                         "No memory matches.",
@@ -272,7 +294,10 @@ fn run_memory(
                     .map_err(fail)?;
                 Ok(ExecuteResult {
                     title: format!("Memories: {}", records.len()),
-                    metadata: json!({ "count": records.len() }),
+                    metadata: flagged(
+                        json!({ "count": records.len() }),
+                        records.iter().any(|record| !record.verified),
+                    ),
                     output: fenced(
                         &records.iter().collect::<Vec<_>>(),
                         "Nothing is remembered yet.",
@@ -442,7 +467,10 @@ pub fn session_search_tool(
                 }
                 Ok(ExecuteResult {
                     title: format!("Session search: {} found", hits.len()),
-                    metadata: json!({ "count": hits.len(), "indexing": building }),
+                    metadata: flagged(
+                        json!({ "count": hits.len(), "indexing": building }),
+                        hits.iter().any(|hit| hit.untrusted),
+                    ),
                     output: lines.join("\n"),
                     attachments: None,
                 })
@@ -483,6 +511,7 @@ mod tests {
             memory.clone(),
             Arc::new(move |_session_id| outside),
             Arc::new(|_: &str| false),
+            Arc::new(move |_session_id| outside),
         );
         Setup { dir, memory, def }
     }
@@ -644,7 +673,7 @@ mod tests {
         ] {
             let error = call(&s, &ask, args.clone()).await.unwrap_err();
             assert!(
-                error.to_string().contains("text from outside"),
+                error.to_string().contains("started by outside input"),
                 "{args}: {error}"
             );
         }
@@ -879,8 +908,12 @@ mod tests {
             Arc::new(TruncateService::default_limits(e.temp.path().to_path_buf())),
             fixed_agents(),
             memory.clone(),
-            Arc::new(move |id: &str| lookup.seen_outside_content(id)),
+            Arc::new({
+                let lookup = lookup.clone();
+                move |id: &str| lookup.seen_outside_content(id)
+            }),
             Arc::new(|_: &str| false),
+            Arc::new(move |id: &str| lookup.started_by_outside_input(id)),
         );
         let ask = RecordingAsk::new();
         let inst = instance(e.temp.path());
@@ -912,7 +945,7 @@ mod tests {
         .await
         .unwrap_err();
         assert!(
-            refused.to_string().contains("text from outside"),
+            refused.to_string().contains("started by outside input"),
             "{refused}"
         );
 

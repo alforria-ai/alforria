@@ -789,6 +789,18 @@ impl Handle {
         };
         let (input, start) = (input.clone(), time.start);
         let now = self.now_ms();
+        // alforria extension: every tool result is appended here, so this
+        // is where a result that brings outside content marks the session
+        // (`tool::outside`) — before it is stored.
+        inner.deps.sessions.note_tool_result(
+            &call.session_id,
+            &crate::tool::outside::ToolResult {
+                tool: tool_name(&part),
+                input: &Value::Object(input.clone()),
+                metadata: Some(&output.metadata),
+                output: &output.output,
+            },
+        )?;
         inner.deps.sessions.update_part(&V1Part::Tool {
             id: call.part_id.clone(),
             session_id: call.session_id.clone(),
@@ -1835,6 +1847,24 @@ impl Handle {
             return Ok(false);
         };
         let (input, start, state_metadata) = (input.clone(), time.start, state_metadata(state));
+        // A failure's message is a result too: an MCP server's error text
+        // was written elsewhere. A rejection is the permission system's
+        // own words.
+        if let FailError::Error { message } = &error {
+            inner
+                .deps
+                .sessions
+                .note_tool_result(
+                    &call.session_id,
+                    &crate::tool::outside::ToolResult {
+                        tool: tool_name(&part),
+                        input: &Value::Object(input.clone()),
+                        metadata: None,
+                        output: message,
+                    },
+                )
+                .map_err(storage_failure)?;
+        }
         inner
             .deps
             .sessions

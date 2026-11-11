@@ -22,6 +22,7 @@ fn turn(untrusted: bool) -> TriggerTurn {
         own: Vec::new(),
         untrusted,
         restricted: false,
+        outside_content: false,
         operator_authored: true,
         prompt: "Handle it".to_string(),
         payload: untrusted.then(|| TriggerPayload {
@@ -120,4 +121,46 @@ async fn a_marked_reuse_session_keeps_its_ceiling_when_the_kind_changes() {
         has_ceiling(&after),
         "the read-only ceiling was lifted from a session whose history holds a webhook body"
     );
+}
+
+/// H6: a trigger written by a session that had seen outside content marks
+/// its runs' sessions with that provenance — new or reused — and with
+/// nothing else: no ceiling, no outside-start mark.
+#[tokio::test]
+async fn a_run_of_a_trigger_written_after_outside_content_carries_provenance_only() {
+    let e = engine(
+        "trig-provenance-only",
+        vec![text_stream("one"), text_stream("two"), text_stream("three")],
+    );
+    let context = e.services.instance_context(&e.worktree, None).unwrap();
+    let ops = ProductionTriggerOps::new(
+        e.services.sessions.clone(),
+        e.services.agents.clone(),
+        context,
+    );
+    ops.bind(e.prompt.clone());
+    let sessions = &e.services.sessions;
+
+    // A clean trigger's session, kept by a reuse trigger.
+    let first = ops.run_turn(&turn(false)).await.unwrap();
+    assert!(!sessions.seen_outside_content(&first.session_id));
+
+    // The trigger is rewritten by a session that had seen outside content.
+    let mut carried = turn(false);
+    carried.outside_content = true;
+    carried.session_id = Some(first.session_id.clone());
+    let out = ops.run_turn(&carried).await.unwrap();
+    assert_eq!(out.session_id, first.session_id);
+    assert!(sessions.seen_outside_content(&out.session_id));
+    assert!(!sessions.started_by_outside_input(&out.session_id));
+    assert!(!has_ceiling(&sessions.get(&out.session_id).unwrap()));
+
+    // And a fresh session for such a trigger starts with it.
+    let mut fresh = turn(false);
+    fresh.outside_content = true;
+    fresh.mode = SessionMode::New;
+    let out = ops.run_turn(&fresh).await.unwrap();
+    assert!(sessions.seen_outside_content(&out.session_id));
+    assert!(!sessions.started_by_outside_input(&out.session_id));
+    assert!(!has_ceiling(&sessions.get(&out.session_id).unwrap()));
 }

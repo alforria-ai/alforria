@@ -167,6 +167,8 @@ async fn create(
             id,
             spec,
             alforria_core::trigger::Creator {
+                // The request is its caller's own words.
+                outside_content: false,
                 origin_session_id: None,
                 inherited: None,
                 restricted,

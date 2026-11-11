@@ -38,7 +38,7 @@ page, `server.resume` and `storage` (retention, `synchronous`) are host keys:
 they decide what a restart does in every project and how durable the shared
 database is.
 
-alforria's own tables (`session_restriction`, `outbox`, and the trigger and
+alforria's own tables (`session_restriction`, `session_mark`, `outbox`, and the trigger and
 memory tables) are created by one set of migrations
 (`crates/alforria-core/src/storage/alforria_migration.rs`), beside the
 upstream schema and journal, which stay byte-compatible.
@@ -570,29 +570,43 @@ set it up and the session it lands in.
 | --- | --- | --- |
 | A trigger the operator wrote (config, an `admin` request, the `schedule` tool in an unrestricted session) | `Caller::Session` | The session it lands in: unrestricted in a session of its own, restricted if it names a restricted session. |
 | A trigger a restricted caller created (a `chat`/`connector` request, or the `schedule` tool in a restricted session) | `Caller::Restricted` — that caller's request, replayed | Recorded on the trigger when it is created and never changed. Its runs happen in restricted sessions only: the sessions it creates are created restricted, a session it names must be this directory's and restricted, and the engine refuses the turn if the session's restriction has been lifted since. Its prompt is text: `@file` and `@agent` mentions are resolved only in a prompt the operator wrote. |
-| A webhook call (`POST /trigger/{id}/hook`) | The trigger's caller, above | What it delivers is outside text: the run's session carries the untrusted-input mark, and its rules are the read-only ceiling **plus whatever the trigger's own `permission` block grants** — a webhook trigger whose block allows `bash` runs `bash` on a body its caller wrote, so who may call it matters. A `hook` credential calls the one trigger it is bound to; the body is capped at 256 KiB before it is read, and a trigger accepts one delivery per `triggers.webhook_min_interval` (default 1 s; sooner is a 429 with `Retry-After`), whoever sends it. |
+| A webhook call (`POST /trigger/{id}/hook`) | The trigger's caller, above | What it delivers is outside text: the run's session carries the outside-start mark (and with it outside-content), and its rules are the read-only ceiling **plus whatever the trigger's own `permission` block grants** — a webhook trigger whose block allows `bash` runs `bash` on a body its caller wrote, so who may call it matters. A `hook` credential calls the one trigger it is bound to; the body is capped at 256 KiB before it is read, and a trigger accepts one delivery per `triggers.webhook_min_interval` (default 1 s; sooner is a 429 with `Retry-After`), whoever sends it. |
 | A restart follow-up (`server.resume: notify` / `continue`) | `Caller::Session` | The interrupted session's own restriction and rules. A trigger's interrupted turn is resumed like any other, once; its run is closed as interrupted and its tick is not fired again. |
-| The memory flush before a compaction | No turn: one model request with one tool | The session's own `memory` permission (an `ask` is a refusal), its untrusted-input mark and its restriction, all recorded on what it writes. |
+| The memory flush before a compaction | No turn: one model request with one tool | The session's own `memory` permission (an `ask` is a refusal), its outside-content mark and its restriction, all recorded on what it writes. |
 | A `/goal` round, a subagent's run, a subagent's result, an auto-resume | `Caller::Session` | The session, as before. |
 
-Two marks can sit on a session, and they are independent:
+Three things can be recorded about a session. They are independent, each
+has one cause and one effect, and all three live in tables only the server
+writes (`session_restriction`, `session_mark`) — not in session metadata,
+which a client can write:
 
-- **restricted** — who may drive it (this page; the `session_restriction`
-  table);
-- **untrusted input** — its context holds text from outside
-  (`metadata.untrustedInput`, [assistant.md](assistant.md)).
+| Mark | Cause | Effect |
+| --- | --- | --- |
+| **restricted** | A caller below `admin` created the session (this page). | Who may drive it, and what its turns may do. |
+| **outside start** | A `webhook` or `watch` trigger started a run in it, or a trigger run delivered a payload. | The read-only ceiling: the rules the run was given are a ceiling nothing widens. The project's standing `always` approvals do not apply, an `ask` is a deny at once, and `permission.unattended` never answers for it — `on_timeout: "allow"` included. It cannot change existing memory records or write loader files. A fork keeps its rules along with its text. |
+| **outside content** | A tool that returns somebody else's content answered in the session (`webfetch`, `websearch`, any MCP tool, a read from the upload area, an unverified memory record, an excerpt of a marked session, a marked subagent's result), a caller below `admin` attached a file to a prompt, or the run belongs to a trigger a marked session wrote. Always set together with *outside start*. | Provenance only: memory it writes is unverified and not injected into later sessions, triggers it schedules carry the mark, its transcript excerpts are fenced. **No permission changes**: an operator's interactive session keeps working as before after a web search. |
 
-Both are inherited by children and forks at any depth, neither is cleared
-below `admin` (lifting a restriction is `DELETE /session/{id}/restriction`;
-the untrusted mark is never removed), and a turn may do only what both
-allow. For a session that carries untrusted input the rules it was given
-are a ceiling nothing widens: the project's standing `always` approvals do
-not apply to it, an `ask` is a deny at once, and `permission.unattended`
-never answers for it — `on_timeout: "allow"` included. A fork of such a
-session keeps its rules along with its text.
+The full list of causes, and the test that keeps the tool list complete, is
+in [assistant.md](assistant.md#two-session-marks-what-causes-each-and-what-each-does).
 
-A lookup that fails never reads as the permissive answer: a session that
-cannot be read counts as carrying untrusted input, a restriction that cannot
+All three are inherited by children and forks at any depth, and none is
+cleared below `admin` (lifting a restriction is
+`DELETE /session/{id}/restriction`; the other two are never removed by the
+engine). `GET /session/{id}/restriction` reports all three. A client cannot
+set them: `untrustedInput` and `triggerID` are stripped from metadata a
+client supplies on session create and update.
+
+What the outside-content mark does **not** claim: that a session without it
+has read nothing hostile. `bash` output and ordinary project files are not
+tracked (see assistant.md for why), so a prompt injection that arrives
+through `curl` in a shell, or through a file in a cloned repository, can
+still be saved as verified memory by a session that is allowed to write
+memory. The mark closes the paths an outsider reaches *without* the
+operator's shell: the web tools, MCP servers, uploads, webhook bodies and
+what earlier marked sessions left behind.
+
+A lookup that fails never reads as the permissive answer: a session whose
+marks cannot be read counts as carrying both, a restriction that cannot
 be read is an error or counts as one, and a session a trigger cannot verify
 as its own does not exist for it.
 

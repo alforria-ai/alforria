@@ -545,6 +545,10 @@ pub struct SessionStore {
     background: Arc<dyn BackgroundJobs>,
     clock: Arc<dyn crate::Clock>,
     messages: MessageStore,
+    /// The upload area (`server.upload.directories`), shared by every
+    /// clone: files there were put by a client, and a tool that reads one
+    /// brings outside content into the session (`tool::outside`).
+    uploads: Arc<std::sync::RwLock<Vec<String>>>,
 }
 
 impl SessionStore {
@@ -561,7 +565,67 @@ impl SessionStore {
             background,
             clock,
             messages,
+            uploads: Default::default(),
         }
+    }
+
+    /// Tell the store where the upload area is (the server does, from its
+    /// policy). Unset: there is none.
+    pub fn set_upload_directories(&self, directories: Vec<String>) {
+        *self
+            .uploads
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = directories;
+    }
+
+    /// **The one place a tool's result marks its session** (alforria
+    /// extension): called by the processor for every result it is about to
+    /// append, before it appends it. A result that brings outside content
+    /// ([`crate::tool::outside`]) sets [`SessionMark::OutsideContent`], for
+    /// life. An error here is an error for the result: content is not
+    /// appended to a session that could not be marked for it.
+    pub fn note_tool_result(
+        &self,
+        session_id: &str,
+        result: &crate::tool::outside::ToolResult<'_>,
+    ) -> Result<(), SessionError> {
+        use crate::tool::outside::{carries_outside_content, classify, Outside, SessionFacts};
+        if classify(result.tool) == Outside::Never {
+            return Ok(());
+        }
+        let uploads = self
+            .uploads
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let directory = match classify(result.tool) {
+            Outside::ReadsPath(_) | Outside::ListsFiles if !uploads.is_empty() => {
+                PathBuf::from(self.get(session_id)?.directory)
+            }
+            _ => PathBuf::new(),
+        };
+        let child_marked = || {
+            let sql = format!(
+                "SELECT EXISTS(SELECT 1 FROM session child WHERE child.parent_id = ?1 AND {})",
+                SessionMark::OutsideContent.sql("child.id")
+            );
+            // A child whose marks cannot be read counts as marked.
+            self.storage
+                .with_connection(|conn| {
+                    conn.query_row(&sql, [session_id], |row| row.get::<_, bool>(0))
+                        .map_err(CoreError::from)
+                })
+                .unwrap_or(true)
+        };
+        let facts = SessionFacts {
+            directory: &directory,
+            uploads: &uploads,
+            child_marked: &child_marked,
+        };
+        if carries_outside_content(result, &facts) {
+            self.mark(session_id, SessionMark::OutsideContent)?;
+        }
+        Ok(())
     }
 
     fn now(&self) -> u64 {

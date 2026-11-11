@@ -566,6 +566,62 @@ async fn no_registered_tool_acts_on_an_untrusted_run_without_a_grant() {
 }
 
 /// Cloning a repository must not be enough to schedule turns in it.
+/// H6: every tool the server registers is classified as returning outside
+/// content or not (`alforria_core::tool::outside::BUILTIN`). A tool added to
+/// the registry without a line in that table fails here: whether its
+/// results mark a session is a decision, not a default. Anything that is not
+/// a built-in — every MCP tool — is always outside content.
+#[tokio::test]
+async fn every_registered_tool_is_classified_as_returning_outside_content_or_not() {
+    use alforria_core::tool::outside::{builtin, classify, Outside, BUILTIN};
+    let f = fixture(
+        "ok",
+        json!({
+            "triggers": { "concurrency": 2 },
+            "memory": { "enabled": true },
+            "workflows": { "enabled": true },
+        }),
+    );
+    let (status, ids) = call(&f, "GET", "/experimental/tool/ids", "").await;
+    assert_eq!(status, StatusCode::OK);
+    let ids: Vec<String> = serde_json::from_value(ids).unwrap();
+    // The assistant tools are registered in this fixture.
+    for expected in [
+        "schedule",
+        "memory",
+        "session_search",
+        "webfetch",
+        "websearch",
+        "task",
+    ] {
+        assert!(ids.iter().any(|id| id == expected), "{expected} in {ids:?}");
+    }
+    let unclassified: Vec<&String> = ids.iter().filter(|id| builtin(id).is_none()).collect();
+    assert!(
+        unclassified.is_empty(),
+        "classify these in alforria_core::tool::outside::BUILTIN: {unclassified:?}"
+    );
+    // No name is listed twice with two answers.
+    for (index, (id, _)) in BUILTIN.iter().enumerate() {
+        assert!(
+            BUILTIN[..index].iter().all(|(other, _)| other != id),
+            "{id} is classified twice"
+        );
+    }
+    // The decisions the finding was about.
+    for id in ["webfetch", "websearch"] {
+        assert_eq!(classify(id), Outside::Always, "{id}");
+    }
+    for id in ["memory", "session_search"] {
+        assert_eq!(classify(id), Outside::Flagged, "{id}");
+    }
+    assert_eq!(classify("read"), Outside::ReadsPath("filePath"));
+    // An MCP tool is keyed `<server>_<tool>`: never in the table.
+    for id in ["github_create_issue", "linear_search", "anything_new"] {
+        assert_eq!(classify(id), Outside::Always, "{id}");
+    }
+}
+
 #[tokio::test]
 async fn a_projects_own_config_cannot_declare_triggers() {
     let f = fixture("ok", json!({}));

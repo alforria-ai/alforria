@@ -228,6 +228,11 @@ The agent manages its own triggers with the built-in `schedule` tool:
 optionally `id`, `title`, `session` (`new`, `reuse`, or `current` for this
 conversation), `report` and `quiet_token`.
 
+A trigger created or changed by a session that has seen outside content
+carries that fact (`outsideContent` in what is stored): the sessions of its
+runs start with the outside-content mark, so what they save to memory is
+unverified. It is provenance only — such a run is not read-only.
+
 A trigger created by the tool runs as the agent that created it. Its sessions
 carry a copy of the rules that governed the creating session at that moment
 (the agent's rules, then the session's own), applied again on every run after
@@ -329,12 +334,10 @@ the `memory` table, which every query can filter on):
   conversations; it is not put into the system context of the operator's
   sessions (it is still listed and searched there, and
   `memory.inject.unverified` opts in to injecting it).
-- `untrusted` is true when the writing session carried text from outside. A
-  session carries it when a webhook or watch trigger started it, or when it
-  was created as a child or a fork of a session that does, at any depth. This
-  is stored once, as `metadata.untrustedInput` on the session when it is
-  created, and never removed; everything that needs to know reads that one
-  value. A session that cannot be read counts as carrying it.
+- `untrusted` is true when the writing session had seen content from
+  outside: the session's **outside-content** mark, described under
+  [Two session marks](#two-session-marks-what-causes-each-and-what-each-does)
+  below. A session that cannot be read counts as marked.
 - A record is `verified` unless its source is `flush`, it is `untrusted`, or
   its origin is missing or unreadable. Unverified records are never injected
   unless `memory.inject.unverified` is set: they would otherwise be a way for
@@ -350,12 +353,42 @@ the `memory` table, which every query can filter on):
   rewriting an unverified record leaves it unverified; only the operator
   vouches for one. `history` keeps the last 10
   changes (who, when, which fields).
-- A session that carried outside text may add records, if its trigger's
-  `permission` block grants `memory`, and those are unverified. It may not
-  update, archive or forget an existing record: the tool and the service both
-  refuse.
-- `session_search` excerpts from sessions that carried outside text are
+- A session that has seen outside content writes unverified records, and a
+  record it rewrites becomes unverified. Nothing else changes for it: it
+  updates, archives and forgets as its `memory` permission allows.
+- A run that outside input *started* (a webhook or watch trigger; the
+  outside-start mark) may add records, if its trigger's `permission` block
+  grants `memory`, and those are unverified. It may not update, archive or
+  forget an existing record: the tool and the service both refuse.
+- `session_search` excerpts from sessions that have seen outside content are
   marked `trust="untrusted"`, with a warning, like unverified records.
+
+### Two session marks: what causes each, and what each does
+
+The server keeps two marks per session, in its own `session_mark` table.
+They are not session metadata: nothing a client sends sets or clears one,
+the keys `untrustedInput` and `triggerID` are dropped from metadata a client
+supplies, and Rust and SQL read the marks through one definition
+(`SessionMark::sql`). Both are inherited by children and forks at any depth,
+neither is removed below `admin`, and a mark that cannot be read counts as
+set. `GET /session/{id}/restriction` (admin) reports them as `outsideContent`
+and `outsideStart`.
+
+| | **Outside content** (provenance) | **Outside start** (ceiling) |
+| --- | --- | --- |
+| Means | The session has seen content somebody else wrote. | A run in the session was started by outside input. |
+| Set when | A tool that returns outside content answers in it — `webfetch`, `websearch`, every MCP or plugin tool, code mode (`execute`); `memory` when it returns an unverified record; `session_search` when a hit comes from a marked session; `read` of a file in the upload area (`server.upload.directories`) and `grep` output that lists one; `task`, `subagents` and `workflow` when a child session is marked. Also: a prompt from a caller below `admin` that brings a file part; a run of a trigger that a marked session created or changed. And always together with the other mark. | A `webhook` or `watch` trigger starts a run in it, or any trigger run delivers a payload. |
+| Where it is set | At the one place a tool's result is appended to the session (the processor), from a table that classifies every built-in tool (`tool::outside::BUILTIN`); a tool that is not in the table is treated as returning outside content. A test walks the server's registry and fails on an unclassified tool. | Where a trigger's run gets its session (`session::trigger_ops`). |
+| Effect | Memory the session writes — with the `memory` tool or by the flush before a compaction — is recorded `untrusted`, is unverified and is not injected. A trigger it creates or changes with `schedule` carries the mark into its runs' sessions. Its `session_search` excerpts are fenced and labelled `trust="untrusted"`. | The read-only ceiling of [Declaring triggers](#declaring-triggers): the stricter of the run's rules and read-only, standing `always` approvals ignored, an `ask` denied at once, `permission.unattended` never answering. Existing memory records cannot be changed. Loader files cannot be written. |
+| Does not | Change any permission. An interactive session works exactly as before after its first web search: asks are asked, approvals apply, tools are offered. | — |
+
+What is *not* a cause, on purpose: `bash` (a shell can fetch anything, and
+marking it would mark every coding session and leave memory unusable), and
+`read`/`grep`/`glob` over ordinary project files (a cloned repository's
+README is somebody else's text too). A session that only ever used those
+writes verified memory. Deployments that need more can deny `memory` to the
+agents that browse, or set `memory.inject.unverified: false` (the default)
+and review what `/memory` lists as unverified.
 
 Records written by an earlier build of this branch are classified by the
 `memory_0002_provenance` migration; any whose origin cannot be told become

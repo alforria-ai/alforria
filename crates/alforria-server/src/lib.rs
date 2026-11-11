@@ -458,6 +458,9 @@ pub fn production_context(
                 .permission
                 .set_unattended(policy.unattended_permission);
             services.question.set_unattended(policy.unattended_question);
+            services
+                .sessions
+                .set_upload_directories(policy.upload_directories.clone());
             outbox.attach(&services.events);
         }
     });

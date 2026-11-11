@@ -29,6 +29,16 @@ pub struct StoredSpec {
     /// are bound by it for as long as it exists.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub restricted: bool,
+    /// The session that created or last changed it had seen outside
+    /// content (`SessionMark::OutsideContent`): its prompt may hold what an
+    /// outsider wrote, so the sessions of its runs carry that mark too —
+    /// provenance, not the read-only ceiling. Set, never cleared.
+    #[serde(
+        rename = "outsideContent",
+        default,
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub outside_content: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
