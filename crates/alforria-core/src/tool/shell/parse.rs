@@ -58,10 +58,6 @@ pub struct Redirect {
     pub writes: bool,
     /// Text of the enclosing statement, redirection included.
     pub source: String,
-    /// True when no command in the statement would carry this redirection in
-    /// its own permission pattern: either the statement has no command at all
-    /// (`> file`), or its body is a single command the scan may drop (`cd`).
-    pub standalone: bool,
 }
 
 /// Node kinds accepted as command parts. TS also accepts
@@ -203,11 +199,6 @@ fn collect_redirects(out: &mut Vec<Redirect>, node: tree_sitter::Node<'_>, src: 
             Some(parent) => parent,
             None => node,
         };
-        let body = statement.child_by_field_name("body");
-        let standalone = match body {
-            Some(body) => body.kind() == "command",
-            None => statement.kind() != "command",
-        };
         let mut destinations = node.walk();
         for destination in node.children_by_field_name("destination", &mut destinations) {
             let target = src[destination.byte_range()].to_string();
@@ -221,7 +212,6 @@ fn collect_redirects(out: &mut Vec<Redirect>, node: tree_sitter::Node<'_>, src: 
                 target,
                 writes: operator.contains('>'),
                 source: src[statement.byte_range()].trim().to_string(),
-                standalone,
             });
         }
     }
