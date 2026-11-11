@@ -150,9 +150,20 @@ pre-1.0, so minor releases may include breaking changes.
   HMAC-SHA256 or Ed25519 signature over timestamp and body, and bounded
   retention. Deliveries survive a restart. The payload carries ids, the
   session and its title, never message content.
-- `shell_env` (global config) controls what the agent's shells inherit from
-  the server's environment: `inherit` (`"all"`, `"none"` or a list), `allow`,
-  `set` and `deny`.
+- `shell_env` (global config) controls what the agent's shells and helper
+  processes inherit from the server's environment: `inherit` (`"all"`,
+  `"none"` or a list), `allow`, `set` and `deny` (matched without regard to
+  case). A server that is unattended or reachable from another machine —
+  bearer auth, a non-loopback bind, `permission.unattended` /
+  `question.unattended`, `hook.webhook`, a `webhook` or `watch` trigger, or
+  `server.trust.project: "restricted"` — runs them in a restricted posture:
+  an allowlist (`PATH`, `HOME`, `LANG`, `LC_*`, `TERM`, `TZ`, `USER`,
+  `LOGNAME`, `SHELL`, `TMPDIR`, plus `allow`) with credential-looking names
+  (`*_TOKEN`, `*_KEY`, `*_SECRET`, `AWS_*`, …) denied, for shells, MCP stdio
+  servers, language servers and git alike. The posture is logged at startup,
+  tightens (never relaxes) when such a trigger or listener appears while the
+  server runs, and is shown by `GET /server/posture` (admin). A run that a
+  webhook or watch trigger started always gets the restricted environment.
 - `compaction.default_context`: the context window, in tokens, assumed for a
   model that declares none (128,000 when unset).
 - A restart repairs the sessions the last process died in the middle of.
@@ -386,13 +397,29 @@ pre-1.0, so minor releases may include breaking changes.
 - On SIGTERM the trigger schedulers stop firing and the transcript indexers
   end before the running turns are settled, and a turn that ended inside the
   process leaves no restart marker.
-- The agent's shells no longer inherit the server's secrets. The `bash` tool,
-  the session `shell` command, command-template `` !`cmd` `` substitutions,
-  terminals, worktree start scripts, MCP stdio servers and language servers
-  start without the server password and auth variables and without provider
-  API keys (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `LIBERTAI_API_KEY`, …; the
-  list is in `docs/unattended-server.md`). To pass one through, name it in
-  `shell_env.allow`, or in an MCP server's own `environment`.
+- The agent's processes no longer inherit alforria's own secrets and provider
+  API keys; everything else in the environment is passed as before on a
+  standalone install (`GITHUB_TOKEN`, `AWS_*`, `NPM_TOKEN`, `PGPASSWORD` and
+  the like still reach `gh`, `aws`, `npm` and `psql`). The `bash` tool, the
+  session `shell` command, command-template `` !`cmd` `` substitutions,
+  terminals, worktree start scripts, MCP stdio servers, language servers and
+  the server's `git` calls start without: the server password and auth
+  variables (`OPENCODE_SERVER_PASSWORD`, `OPENCODE_AUTH_CONTENT`,
+  `OPENCODE_CONFIG_CONTENT`, `ALFORRIA_*_SECRET` / `_TOKEN` / `_KEY` /
+  `_PASSWORD`); the built-in provider key variables (`ANTHROPIC_API_KEY`,
+  `OPENAI_API_KEY`, `LIBERTAI_API_KEY`, …); any variable named `*_API_KEY`
+  or `*_API_TOKEN`; every `provider.*.env` name of the model catalog and of
+  a loaded config; and every variable a config file reads through
+  `{env:NAME}` — in any letter case. A name learned from a config or the
+  catalog stays withheld until the server restarts. To pass one through,
+  name it in `shell_env.allow`, or in an MCP server's own `environment`.
+- A standalone user who uses one of these gets the restricted shell
+  environment (an allowlist; see `shell_env` under Added) and will find
+  `GITHUB_TOKEN`, `AWS_*` and similar missing from the agent's shell until
+  `shell_env.allow` names them: `alforria serve --hostname` with an address
+  other than loopback (`0.0.0.0`, a LAN address), or a `webhook` / `watch`
+  trigger (in the config, or created by the `schedule` tool — from the
+  moment it is created, until the server restarts without it).
 - A global config file that does not parse now stops `alforria serve` and
   `alforria web` from listening, instead of serving with the defaults: the
   host config carries the server's access policy.
