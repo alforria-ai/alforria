@@ -1389,6 +1389,14 @@ asked the model for:
   and after a restart. `admin` and the operator are held to `max_bytes`
   only, and their uploads are likewise noticed at the next count.
 
+While bearer tokens are configured, no language server is started on a
+file inside an upload directory — reading or editing `uploads/x.ts` gives
+no diagnostics — and the formatter seam (`format::Excluding`) skips such
+files, so a `package.json`, `node_modules/` or `prettier.config.js` that
+reached the upload area some other way is still never a tool's config. A
+server without bearer tokens treats a project's `uploads/` as any other
+directory.
+
 A `file.edited` event is published for the written file.
 
 ```jsonc

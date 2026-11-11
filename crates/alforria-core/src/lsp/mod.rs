@@ -50,6 +50,32 @@ pub struct LspService {
     /// The in-flight spawn dedup (`spawning`, lsp.ts:116) — concurrent
     /// callers share one spawn section.
     spawn_lock: tokio::sync::Mutex<()>,
+    /// alforria extension: directories no server is started on or
+    /// configured from ([`LspService::exclude`]).
+    excluded: std::sync::RwLock<Option<Excluded>>,
+}
+
+/// The directories, as of now, in which files are not a language
+/// server's or a formatter's business (alforria extension): the upload
+/// area of a server whose tokens below `admin` can upload. A file there
+/// was put by somebody the operator gave no right to configure a tool, and
+/// a tool started on it would take its config — `package.json`,
+/// `node_modules/.bin`, an `eslint.config.js` — from beside it.
+pub type Excluded = Arc<dyn Fn() -> Vec<PathBuf> + Send + Sync>;
+
+/// Whether `file` is in one of `excluded`, where the kernel lands both.
+pub fn is_excluded(excluded: &Option<Excluded>, file: &str) -> bool {
+    let Some(excluded) = excluded else {
+        return false;
+    };
+    let directories = excluded();
+    if directories.is_empty() {
+        return false;
+    }
+    let file = crate::protect::resolve(std::path::Path::new(file));
+    directories
+        .iter()
+        .any(|directory| crate::protect::within(&file, &crate::protect::resolve(directory)))
 }
 
 fn now_ms() -> u64 {
@@ -228,12 +254,34 @@ impl LspService {
                 broken: HashSet::new(),
             }),
             spawn_lock: tokio::sync::Mutex::new(()),
+            excluded: std::sync::RwLock::new(None),
         })
+    }
+
+    /// Name the directories no server is started on ([`Excluded`]); asked
+    /// at every use, so it follows the server's policy.
+    pub fn exclude(&self, excluded: Excluded) {
+        *self
+            .excluded
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(excluded);
+    }
+
+    fn excludes(&self, file: &str) -> bool {
+        let excluded = self
+            .excluded
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        is_excluded(&excluded, file)
     }
 
     /// `getClients` (lsp.ts:208-297).
     async fn get_clients(&self, file: &str) -> Vec<Arc<LspClient>> {
         if !contains_path(file, &self.input.directory, &self.input.worktree) {
+            return Vec::new();
+        }
+        if self.excludes(file) {
             return Vec::new();
         }
         let extension = file_extension(file);
@@ -341,6 +389,9 @@ impl LspService {
 
     /// `hasClients` (lsp.ts:328-342).
     pub async fn has_clients(&self, file: &str) -> bool {
+        if self.excludes(file) {
+            return false;
+        }
         let extension = file_extension(file);
         for server in &self.servers {
             if !server.extensions.is_empty() && !server.extensions.contains(&extension) {

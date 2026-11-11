@@ -1140,6 +1140,18 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
         events: Some(services.events.clone()),
         flags: alforria_core::lsp::server::Flags::from_env(),
     });
+    // No language server on, or configured from, the upload area while
+    // tokens below `admin` can upload into it.
+    lsp.exclude({
+        let (sessions, directory) = (services.sessions.clone(), input.directory.clone());
+        Arc::new(move || {
+            sessions
+                .untooled_upload_directories()
+                .iter()
+                .map(|upload| directory.join(upload))
+                .collect()
+        })
+    });
     let edit_lsp: Arc<dyn alforria_core::tool::edit::Lsp> = lsp.clone();
     // `FileSystem.Event.Edited` / `Watcher.Event.Updated` from the
     // edit/write/apply_patch tools (edit.ts:115,159, write.ts:68,

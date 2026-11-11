@@ -478,6 +478,9 @@ pub fn production_context(
             services
                 .sessions
                 .set_upload_directories(policy.upload_directories.clone());
+            services
+                .sessions
+                .set_uploads_from_below_admin(policy.bearer.is_some());
             outbox.attach(&services.events);
         }
     });

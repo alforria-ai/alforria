@@ -459,6 +459,35 @@ async fn status_list_shape() {
     drop(dir);
 }
 
+/// alforria extension: no server is started on a file in an excluded
+/// directory (the upload area of a server with tokens below `admin`), so
+/// none takes its config from beside one; elsewhere nothing changes.
+#[tokio::test]
+async fn no_server_is_started_on_a_file_in_an_excluded_directory() {
+    let (dir, a_rs) = temp();
+    let log = dir.path().join("double.log");
+    let service = service(dir.path(), &log, &[]);
+    let uploads = dir.path().join("uploads");
+    std::fs::create_dir_all(&uploads).unwrap();
+    std::fs::write(uploads.join("b.rs"), "fn main() {}\n").unwrap();
+    std::fs::write(uploads.join("Cargo.toml"), "[package]\n").unwrap();
+    let uploaded = uploads.join("b.rs").to_string_lossy().into_owned();
+    let a_rs = a_rs.to_string_lossy().into_owned();
+
+    // Not excluded yet: a standalone project's `uploads/` is like any other.
+    assert!(service.has_clients(&uploaded).await);
+
+    let excluded = uploads.clone();
+    service.exclude(Arc::new(move || vec![excluded.clone()]));
+    assert!(!service.has_clients(&uploaded).await);
+    service.touch_file(&uploaded, None).await;
+    assert!(!log.exists(), "no server was started for the uploaded file");
+
+    assert!(service.has_clients(&a_rs).await);
+    service.touch_file(&a_rs, None).await;
+    assert!(!read_log(&log).is_empty(), "the project's own file has one");
+}
+
 #[tokio::test]
 async fn has_clients_extension_filter() {
     let (dir, a_rs) = temp();

@@ -584,6 +584,9 @@ pub struct SessionStore {
     /// clone: files there were put by a client, and a tool that reads one
     /// brings outside content into the session (`tool::outside`).
     uploads: Arc<std::sync::RwLock<Vec<String>>>,
+    /// Whether callers below `admin` can upload there
+    /// ([`SessionStore::set_uploads_from_below_admin`]).
+    uploads_from_below_admin: Arc<std::sync::atomic::AtomicBool>,
     /// What a file tool reported for a call, by `(session, call)`, from
     /// the moment the tool finishes to the moment its result is appended
     /// ([`SessionStore::report_returned_paths`]). In memory only.
@@ -618,6 +621,7 @@ impl SessionStore {
             clock,
             messages,
             uploads: Default::default(),
+            uploads_from_below_admin: Default::default(),
             returned_paths: Default::default(),
         }
     }
@@ -629,6 +633,31 @@ impl SessionStore {
             .uploads
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = directories;
+    }
+
+    /// Tell the store whether credentials below `admin` exist that can
+    /// upload into the upload area (the server does: bearer tokens are
+    /// configured).
+    pub fn set_uploads_from_below_admin(&self, possible: bool) {
+        self.uploads_from_below_admin
+            .store(possible, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The upload directories a language server or a formatter must stay
+    /// out of (`lsp::Excluded`): all of them while callers below `admin`
+    /// can upload, none otherwise — a standalone project's own `uploads/`
+    /// is an ordinary directory.
+    pub fn untooled_upload_directories(&self) -> Vec<String> {
+        if !self
+            .uploads_from_below_admin
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Vec::new();
+        }
+        self.uploads
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// A tool's own report of what it opened and returned, for the call

@@ -158,7 +158,9 @@ pre-1.0, so minor releases may include breaking changes.
   at most 8 levels deep — answered `413` `UploadQuotaError` before
   anything is written, from a running count that is re-read at most every
   5 minutes. The write guard also protects the files a `formatter` or
-  `lsp` entry's `command` names.
+  `lsp` entry's `command` names, and while bearer tokens are configured no
+  language server is started on a file in an upload directory (nor would a
+  formatter be run on one), so nothing uploaded is read as a tool's config.
 - `permission.unattended` and `question.unattended` (global config) bound how
   long a permission ask or a question waits for a person: after `timeout`, an
   ask is denied or allowed once and a question is dismissed, the model is
