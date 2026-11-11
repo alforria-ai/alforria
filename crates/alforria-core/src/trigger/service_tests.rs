@@ -142,6 +142,7 @@ impl Fixture {
             max_watched: 1000,
             ignore: Vec::new(),
             config: serde_json::from_value(config).unwrap(),
+            webhook_min_interval_ms: 0,
         }
     }
 

@@ -79,6 +79,12 @@ pub struct Principal {
     /// The JWT `sub`, or a static token's `name`.
     pub subject: Option<String>,
     pub via: Via,
+    /// The one trigger this credential delivers to: the JWT `trg` claim or
+    /// a static token's `trigger`. A `hook` credential must have one — it
+    /// is handed to a third party to call one webhook, and without the
+    /// binding it fired every webhook trigger of the directory. On a wider
+    /// credential it narrows the webhook route the same way.
+    pub trigger: Option<String>,
 }
 
 /// How a request authenticated.
@@ -100,6 +106,17 @@ impl Principal {
             scope: Scope::Admin,
             subject: None,
             via,
+            trigger: None,
+        }
+    }
+
+    /// Whether this credential may deliver to webhook trigger `id`: a
+    /// `hook` credential only to the trigger it is bound to, any other
+    /// only to its binding when it has one.
+    pub fn may_deliver_to(&self, id: &str) -> bool {
+        match &self.trigger {
+            Some(bound) => bound == id,
+            None => self.scope != Scope::Hook,
         }
     }
 
@@ -174,6 +191,7 @@ struct StaticToken {
     digest: [u8; 32],
     scope: Scope,
     name: Option<String>,
+    trigger: Option<String>,
 }
 
 /// The resolved `server.auth.bearer`.
@@ -309,22 +327,25 @@ impl BearerAuth {
                     digest: parse_digest(digest).map_err(at)?,
                     scope: Scope::Admin,
                     name: None,
+                    trigger: None,
                 },
                 BearerTokenInfo::Scoped {
                     sha256,
                     scope,
                     name,
+                    trigger,
                 } => StaticToken {
                     digest: parse_digest(sha256).map_err(at)?,
                     scope: match scope {
                         None => Scope::Admin,
                         Some(names) => Scope::widest(names).ok_or_else(|| {
                             at(format!(
-                                "unknown scope {names:?} (expected chat, connector or admin)"
+                                "unknown scope {names:?} (expected hook, chat, connector or admin)"
                             ))
                         })?,
                     },
                     name: name.clone(),
+                    trigger: trigger.clone().filter(|id| !id.is_empty()),
                 },
             });
         }
@@ -362,6 +383,7 @@ impl BearerAuth {
                 scope: matched.scope,
                 subject: matched.name.clone(),
                 via: Via::StaticToken,
+                trigger: matched.trigger.clone(),
             });
         }
         if self.keys.is_empty() || token.split('.').count() != 3 {
@@ -466,6 +488,13 @@ impl BearerAuth {
                 .and_then(|sub| sub.as_str())
                 .map(str::to_string),
             via: Via::Jwt,
+            // A claim that is present and is not a non-empty string is a
+            // malformed token, not an unbound one.
+            trigger: match claims.get("trg") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(serde_json::Value::String(id)) if !id.is_empty() => Some(id.clone()),
+                Some(_) => return Err(BearerError::Malformed("trg is not a trigger id")),
+            },
         })
     }
 }
@@ -754,6 +783,7 @@ mod tests {
     #[test]
     fn the_hook_scope_stands_apart() {
         let holder = |scope| Principal {
+            trigger: None,
             scope,
             subject: None,
             via: Via::Jwt,

@@ -68,6 +68,10 @@ pub enum TriggerError {
     /// The caller may not do this to this trigger.
     Forbidden(String),
     Failed(String),
+    /// A webhook delivery arrived sooner than the trigger takes another.
+    TooSoon {
+        retry_after_ms: u64,
+    },
 }
 
 impl std::fmt::Display for TriggerError {
@@ -79,6 +83,10 @@ impl std::fmt::Display for TriggerError {
             | TriggerError::Conflict(message)
             | TriggerError::Forbidden(message)
             | TriggerError::Failed(message) => f.write_str(message),
+            TriggerError::TooSoon { retry_after_ms } => write!(
+                f,
+                "this trigger was delivered to a moment ago: try again in {retry_after_ms} ms"
+            ),
         }
     }
 }

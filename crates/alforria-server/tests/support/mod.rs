@@ -373,6 +373,17 @@ impl Signer {
         format!("{signed}.{}", b64url(signature.as_ref()))
     }
 
+    /// A `hook` token for `audience`, bound to `trigger` (the `trg` claim).
+    pub fn hook_token(&self, audience: &str, trigger: &str) -> String {
+        self.sign(json!({
+            "aud": audience,
+            "scope": "hook",
+            "trg": trigger,
+            "exp": now_secs() + 300,
+            "sub": "test-hook",
+        }))
+    }
+
     /// A token for `audience` with `scope`, valid for five minutes.
     pub fn token(&self, audience: &str, scope: &str) -> String {
         self.sign(json!({

@@ -41,9 +41,9 @@
 
 use std::sync::Arc;
 
-use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::Uri;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
@@ -104,6 +104,11 @@ fn trigger_error(error: TriggerError) -> ServerError {
         }),
         TriggerError::Forbidden(_) => ServerError::Api(ApiError::Forbidden { message }),
         TriggerError::Failed(_) => ServerError::Core(CoreError::Storage(message)),
+        // Only the webhook entry produces it, and answers it itself (429).
+        TriggerError::TooSoon { .. } => ServerError::Api(ApiError::Conflict {
+            message,
+            resource: Some("trigger".to_string()),
+        }),
     }
 }
 
@@ -227,16 +232,76 @@ async fn run(
     service.run_now(&id).map(Json).map_err(trigger_error)
 }
 
+/// The webhook entry.
+///
+/// * The credential: a `hook` token reaches only the trigger it is bound to
+///   (the auth layer, `Principal::may_deliver_to`).
+/// * No oracle for such a caller: a trigger that does not exist, is not a
+///   webhook trigger, or is paused answers the same 404.
+/// * The body is capped before it is read (`MAX_PAYLOAD_BYTES`), and a
+///   trigger takes one delivery per `triggers.webhook_min_interval`.
 async fn hook(
     State(ctx): State<Arc<ServerContext>>,
     axum::Extension(directory): axum::Extension<RequestDirectory>,
+    principal: Option<axum::Extension<Principal>>,
     Path(id): Path<String>,
-    body: Bytes,
-) -> Result<Json<TriggerRun>, ServerError> {
-    triggers(&ctx, &directory)?
-        .hook(&id, &body)
-        .map(Json)
-        .map_err(trigger_error)
+    request: axum::extract::Request,
+) -> Result<Response, ServerError> {
+    use alforria_core::trigger::MAX_PAYLOAD_BYTES;
+    let hook_only = principal
+        .as_ref()
+        .is_some_and(|principal| principal.0.scope == crate::bearer::Scope::Hook);
+    let too_large = || {
+        Response::builder()
+            .status(axum::http::StatusCode::PAYLOAD_TOO_LARGE)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(
+                json!({
+                    "_tag": "PayloadTooLargeError",
+                    "message": format!("the webhook body is larger than {MAX_PAYLOAD_BYTES} bytes"),
+                })
+                .to_string(),
+            ))
+            .expect("static response parts are valid")
+    };
+    // Refused on the declared length, and the read itself stops at the cap.
+    let declared = request
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok());
+    if declared.is_some_and(|length| length > MAX_PAYLOAD_BYTES) {
+        return Ok(too_large());
+    }
+    let Ok(body) = axum::body::to_bytes(request.into_body(), MAX_PAYLOAD_BYTES).await else {
+        return Ok(too_large());
+    };
+    match triggers(&ctx, &directory)?.hook(&id, &body) {
+        Ok(run) => Ok(Json(run).into_response()),
+        Err(TriggerError::TooSoon { retry_after_ms }) => Ok(Response::builder()
+            .status(axum::http::StatusCode::TOO_MANY_REQUESTS)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .header(
+                axum::http::header::RETRY_AFTER,
+                retry_after_ms.div_ceil(1000).max(1).to_string(),
+            )
+            .body(axum::body::Body::from(
+                json!({
+                    "_tag": "TooManyRequestsError",
+                    "message": TriggerError::TooSoon { retry_after_ms }.to_string(),
+                })
+                .to_string(),
+            ))
+            .expect("static response parts are valid")),
+        Err(TriggerError::NotFound(_) | TriggerError::Conflict(_) | TriggerError::Disabled)
+            if hook_only =>
+        {
+            Err(ServerError::Api(ApiError::not_found(
+                "no such webhook trigger".to_string(),
+            )))
+        }
+        Err(error) => Err(trigger_error(error)),
+    }
 }
 
 async fn runs(

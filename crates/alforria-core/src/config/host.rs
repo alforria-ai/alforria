@@ -132,13 +132,17 @@ pub enum BearerTokenInfo {
     Digest(String),
     Scoped {
         sha256: String,
-        /// Space-separated scopes (`chat`, `connector`, `admin`); `admin`
-        /// when absent.
+        /// Space-separated scopes (`hook`, `chat`, `connector`, `admin`);
+        /// `admin` when absent.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         scope: Option<String>,
         /// A label for logs.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
+        /// The one webhook trigger the token delivers to. Required for a
+        /// `hook` token: without it the token is refused.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trigger: Option<String>,
     },
 }
 

@@ -1057,6 +1057,12 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
                 input.paths.cache.clone(),
             ],
             config: input.config.trigger.clone().unwrap_or_default(),
+            webhook_min_interval_ms: trigger_config
+                .webhook_min_interval
+                .map(|interval| interval.get().as_millis() as u64)
+                .unwrap_or(
+                    alforria_core::trigger::TriggerSettings::DEFAULT_WEBHOOK_MIN_INTERVAL_MS,
+                ),
         },
     );
 

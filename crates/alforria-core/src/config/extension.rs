@@ -21,6 +21,11 @@ pub struct TriggersInfo {
     /// The most files and directories one `watch` may cover (default 10000).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_watched: Option<u64>,
+    /// The least time between two deliveries one webhook trigger accepts
+    /// (default `"1s"`; `"0s"` is no limit). A delivery that comes sooner
+    /// is answered 429.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_min_interval: Option<crate::config::host::DurationSetting>,
 }
 
 /// `memory.scope` — whose records an instance reads and writes.

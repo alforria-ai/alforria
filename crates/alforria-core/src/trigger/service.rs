@@ -45,11 +45,16 @@ pub struct TriggerSettings {
     pub ignore: Vec<PathBuf>,
     /// The `trigger` map from the config.
     pub config: BTreeMap<String, TriggerSpec>,
+    /// The least time between two accepted deliveries to one webhook
+    /// trigger (`triggers.webhook_min_interval`); 0 is no limit.
+    pub webhook_min_interval_ms: u64,
 }
 
 impl TriggerSettings {
     pub const DEFAULT_CONCURRENCY: usize = 1;
     pub const DEFAULT_MAX_WATCHED: usize = 10_000;
+    /// One delivery a second per webhook trigger unless configured.
+    pub const DEFAULT_WEBHOOK_MIN_INTERVAL_MS: u64 = 1_000;
 }
 
 /// The longest the loop sleeps without looking at the clock again, so a
@@ -232,6 +237,8 @@ pub struct TriggerService {
     started: AtomicBool,
     /// Set by [`TriggerService::stop`]: nothing fires any more.
     stopped: AtomicBool,
+    /// When each webhook trigger last accepted a delivery.
+    hook_times: Mutex<BTreeMap<String, u64>>,
 }
 
 impl TriggerService {
@@ -309,6 +316,7 @@ impl TriggerService {
             slots,
             wake: tokio::sync::Notify::new(),
             settled: tokio::sync::Notify::new(),
+            hook_times: Mutex::new(BTreeMap::new()),
             started: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
         })
@@ -1032,6 +1040,22 @@ impl TriggerService {
             return Err(TriggerError::Invalid(format!(
                 "the webhook body is larger than {MAX_PAYLOAD_BYTES} bytes"
             )));
+        }
+        // Per trigger, not per caller: whoever holds the credential, one
+        // receiver is not started faster than this.
+        let min = self.settings.webhook_min_interval_ms;
+        if min > 0 {
+            let now = self.clock.now_ms();
+            let mut times = self.hook_times.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(last) = times.get(id) {
+                let since = now.saturating_sub(*last);
+                if since < min {
+                    return Err(TriggerError::TooSoon {
+                        retry_after_ms: min - since,
+                    });
+                }
+            }
+            times.insert(id.to_string(), now);
         }
         let text = String::from_utf8_lossy(body).trim().to_string();
         let payload = (!text.is_empty()).then(|| TriggerPayload {

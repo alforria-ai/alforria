@@ -637,6 +637,7 @@ mod tests {
                     "nightly": { "on": { "cron": "@daily" }, "prompt": "Nightly work" }
                 }))
                 .unwrap(),
+                webhook_min_interval_ms: 0,
             },
         );
         let rules = Arc::new(FakeSessions);

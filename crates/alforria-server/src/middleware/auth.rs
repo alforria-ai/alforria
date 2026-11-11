@@ -380,6 +380,24 @@ fn check_bearer(
             principal.scope.as_str()
         )));
     }
+    // A webhook credential is bound to one trigger: checked here, before
+    // the request reaches anything that would tell an existing trigger
+    // from a missing one.
+    if let Some(id) = scope::hook_trigger_id(method.as_str(), uri.path()) {
+        if !principal.may_deliver_to(&url_decode(id)) {
+            return Err(Rejection::Forbidden(
+                "this token may not deliver to this trigger: a hook credential is bound to one \
+                 trigger (the `trg` claim, or `trigger` on a static token)"
+                    .to_string(),
+            ));
+        }
+    } else if principal.scope == crate::bearer::Scope::Hook {
+        // (Unreachable while `hook` reaches only the webhook route: kept so
+        // that widening the table cannot widen an unbound token.)
+        return Err(Rejection::Forbidden(
+            "a hook credential delivers to its trigger and nothing else".to_string(),
+        ));
+    }
     if principal.restricted() {
         check_directories(directories, uri, headers)?;
     }

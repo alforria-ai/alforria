@@ -181,6 +181,16 @@ pub fn required(method: &str, path: &str) -> Scope {
         .unwrap_or(Scope::Admin)
 }
 
+/// The trigger id of a request to the webhook entry
+/// (`POST /trigger/{id}/hook`), still percent-encoded.
+pub fn hook_trigger_id<'a>(method: &str, path: &'a str) -> Option<&'a str> {
+    if method != "POST" {
+        return None;
+    }
+    let id = path.strip_prefix("/trigger/")?.strip_suffix("/hook")?;
+    (!id.is_empty() && !id.contains('/')).then_some(id)
+}
+
 /// Whether the route resolves a missing `?directory=` to the server's
 /// working directory on its own (see [`CWD_ROUTES`]).
 pub fn defaults_to_cwd(path: &str) -> bool {

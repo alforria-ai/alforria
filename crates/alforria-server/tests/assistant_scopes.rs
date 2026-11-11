@@ -25,6 +25,8 @@ fn host_config(signer: &Signer, extra: Value) -> impl FnOnce(&Dirs) -> Value + '
                 "directories": [dirs.repo.display().to_string()]
             },
             "memory": { "enabled": true },
+            // The tests deliver to one trigger several times in a row.
+            "triggers": { "webhook_min_interval": "0s" },
             "trigger": {
                 "nightly": { "on": { "cron": "0 3 * * *" }, "prompt": "Tidy up" },
                 "inbox": { "on": { "webhook": true }, "prompt": "Triage the delivery" }
@@ -348,7 +350,11 @@ async fn the_webhook_entry_takes_a_hook_token_and_a_hook_token_takes_nothing_els
     let signer = Signer::new();
     let f = fixture_with(host_config(&signer, json!({})), Some(PASSWORD), Vec::new());
     let dir = dir_query(&f.dirs.repo);
-    let token = |scope: &str| bearer(&signer.token(AUDIENCE, scope));
+    // A hook token is bound to the trigger it delivers to.
+    let token = |scope: &str| match scope {
+        "hook" => bearer(&signer.hook_token(AUDIENCE, "inbox")),
+        scope => bearer(&signer.token(AUDIENCE, scope)),
+    };
     let hook = format!("/trigger/inbox/hook?{dir}");
 
     assert_eq!(
@@ -405,13 +411,37 @@ async fn the_webhook_entry_takes_a_hook_token_and_a_hook_token_takes_nothing_els
         StatusCode::FORBIDDEN,
         "outside server.directories"
     );
-    // A trigger that is not a webhook trigger is not fired through it.
+    // A trigger that is not a webhook trigger is not fired through it:
+    // refused to a token bound elsewhere, one 404 to a token bound to it,
+    // and the informative conflict to the sidecar.
     assert_eq!(
         send(
             &f,
             "POST",
             &format!("/trigger/nightly/hook?{dir}"),
             &token("hook"),
+            None,
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        send(
+            &f,
+            "POST",
+            &format!("/trigger/nightly/hook?{dir}"),
+            &bearer(&signer.hook_token(AUDIENCE, "nightly")),
+            None,
+        )
+        .await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        send(
+            &f,
+            "POST",
+            &format!("/trigger/nightly/hook?{dir}"),
+            &token("connector"),
             None,
         )
         .await,
@@ -813,7 +843,7 @@ async fn a_session_can_be_restricted_and_untrusted_and_both_marks_hold() {
         ],
     );
     let chat = bearer(&signer.token(AUDIENCE, "chat"));
-    let hook = bearer(&signer.token(AUDIENCE, "hook"));
+    let hook = bearer(&signer.hook_token(AUDIENCE, "deliveries"));
     let dir = dir_query(&f.dirs.repo);
     let marker = f.dirs.repo.join("ran-marker");
 

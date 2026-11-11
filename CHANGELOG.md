@@ -318,6 +318,11 @@ pre-1.0, so minor releases may include breaking changes.
 
 ### Changed
 
+- A `hook` bearer credential must be bound to one trigger (`trg` claim, or
+  `trigger` on a static token) and delivers only to it; an unbound `hook`
+  token is refused. A webhook trigger accepts one delivery per
+  `triggers.webhook_min_interval` (default `"1s"`).
+
 - `alforria serve` / `web` refuse to listen on a host config that does not
   parse **or cannot be read** (an unreadable file in the global config
   directory, `~/.opencode` or the managed directory used to count as empty,
