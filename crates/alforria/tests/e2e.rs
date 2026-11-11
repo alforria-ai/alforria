@@ -295,6 +295,107 @@ fn run_attach_against_running_serve() {
     );
 }
 
+/// `/goal` over the wire: the command is offered, sets a goal, the reviewer
+/// loop runs to completion and the goal route reports it.
+#[test]
+fn goal_command_over_http() {
+    // The mock model answers every request the same way, so its one reply
+    // serves as the working turn's text and as the reviewer's verdict.
+    let env = env_with_llm(
+        "goal",
+        r#"{\"verdict\":\"done\",\"reason\":\"the output shows it\"}"#,
+    );
+    let project = env.project_dir();
+    std::fs::create_dir_all(&project).expect("create project");
+    let serve = harness::Serve::spawn(&env);
+    let base = format!("http://127.0.0.1:{}", serve.port);
+    let directory = project.to_string_lossy().to_string();
+
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let client = reqwest::Client::new();
+        let query = [("directory", directory.as_str())];
+
+        let commands: serde_json::Value = client
+            .get(format!("{base}/command"))
+            .query(&query)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(
+            commands
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|command| command["name"] == "goal"),
+            "{commands}"
+        );
+
+        let session: serde_json::Value = client
+            .post(format!("{base}/session"))
+            .query(&query)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let id = session["id"].as_str().expect("session id").to_string();
+        let goal_url = format!("{base}/session/{id}/goal");
+
+        let none: serde_json::Value = client
+            .get(&goal_url)
+            .query(&query)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(none.is_null(), "{none}");
+
+        let started = client
+            .post(format!("{base}/session/{id}/command"))
+            .query(&query)
+            .json(&serde_json::json!({
+                "command": "goal",
+                "arguments": "print the answer",
+                "model": "mock/mock-model",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert!(started.status().is_success(), "{}", started.status());
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let goal = loop {
+            let goal: serde_json::Value = client
+                .get(&goal_url)
+                .query(&query)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            if goal["status"] != "active" {
+                break goal;
+            }
+            assert!(Instant::now() < deadline, "the goal never settled: {goal}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert_eq!(goal["status"], "complete", "{goal}");
+        assert_eq!(goal["objective"], "print the answer");
+        assert_eq!(goal["reason"], "the output shows it");
+        assert_eq!(goal["maxRounds"], 50);
+    });
+    drop(serve);
+}
+
 // -----------------------------------------------------------------------
 // models / agent / session list
 // -----------------------------------------------------------------------
