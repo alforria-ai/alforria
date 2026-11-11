@@ -14,8 +14,13 @@ import type {
 } from "../api/types"
 import { insertSorted, removeId, type State } from "./state"
 
-/** Apply one `/global/event` frame. Unknown and `sync` frames are ignored. */
-export function reduce(s: State, frame: GlobalEvent) {
+/**
+ * Apply one `/global/event` frame. Unknown and `sync` frames are ignored.
+ * `replayed` marks a frame re-applied on top of a snapshot it raced: the part
+ * it carries is as old as the frame, so it must not shorten text that has
+ * streamed in since.
+ */
+export function reduce(s: State, frame: GlobalEvent, replayed = false) {
   const ev = frame.payload
   s.conn.lastFrame = Date.now()
   switch (ev.type) {
@@ -63,7 +68,7 @@ export function reduce(s: State, frame: GlobalEvent) {
       const part = ev.properties.part
       // A part for a message we trimmed (or never saw) of an unread session.
       if (!s.loaded[part.sessionID] && !s.message[part.messageID]) return
-      upsertPart(s, part)
+      upsertPart(s, replayed ? keepStreamed(s.part[part.id], part) : part)
       return
     }
     case "message.part.delta": {

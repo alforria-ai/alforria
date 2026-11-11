@@ -83,8 +83,10 @@ export default function Changes(props: { sessionID: string }) {
   const files = createMemo<Change[]>(() => {
     const src = source()
     if (src === "edits") return edits()
+    // `latest`: only the first load suspends; a refresh keeps the view (and
+    // the reader's place in it) until the new diff is in.
     if (src === "tree")
-      return (tree() ?? []).map((d) => ({
+      return (tree.latest ?? []).map((d) => ({
         file: d.file,
         patch: d.patch ?? "",
         additions: d.additions,

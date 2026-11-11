@@ -36,9 +36,10 @@ export async function enableNotifications(on: boolean) {
   return on
 }
 
-function notify(title: string, body: string, onClick: () => void) {
+/** `tag` names what a newer notification replaces: the same kind for the same session, never a namesake's. */
+function notify(tag: string, title: string, body: string, onClick: () => void) {
   if (!notifyOn() || !canNotify() || Notification.permission !== "granted") return
-  const n = new Notification(title, { body, tag: title, silent: false })
+  const n = new Notification(title, { body, tag, silent: false })
   n.onclick = () => {
     window.focus()
     onClick()
@@ -71,7 +72,7 @@ export function startPlatform(open: (sessionID: string) => void) {
               i.kind === "question"
                 ? (i.request.questions[0]?.question ?? "has a question")
                 : `wants to run ${i.request.permission}`
-            notify(`${title} is waiting on you`, what, () => open(i.sessionID))
+            notify(`${i.sessionID}:waiting`, `${title} is waiting on you`, what, () => open(i.sessionID))
           }
         known = ids
       }),
@@ -82,7 +83,12 @@ export function startPlatform(open: (sessionID: string) => void) {
     const title = displayTitle(state.sessions[id])
     const err = state.errors[id]
     if (outcome === "fault")
-      notify(`${title} failed`, err ? `${err.name}: ${err.message}` : "The turn ended in an error", () => open(id))
-    else notify(`${title} finished`, "Its turn is done", () => open(id))
+      notify(
+        `${id}:failed`,
+        `${title} failed`,
+        err ? `${err.name}: ${err.message}` : "The turn ended in an error",
+        () => open(id),
+      )
+    else notify(`${id}:finished`, `${title} finished`, "Its turn is done", () => open(id))
   })
 }

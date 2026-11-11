@@ -35,7 +35,8 @@ export function flush() {
  * Apply a snapshot without losing events that raced it: frames that arrive
  * between the fetch and the apply are re-applied on top. Deltas are skipped
  * on replay (they are not idempotent, and snapshots never carry part text
- * mid-stream anyway; the next `message.part.updated` settles it).
+ * mid-stream anyway; the next `message.part.updated` settles it), and a
+ * replayed part never shortens text that is still streaming.
  */
 export async function withSnapshot<T>(
   fetch: () => Promise<T>,
@@ -52,7 +53,7 @@ export async function withSnapshot<T>(
     setState(
       produce((d) => {
         apply(d, data)
-        for (const f of own) if (f.payload.type !== "message.part.delta") reduce(d, f)
+        for (const f of own) if (f.payload.type !== "message.part.delta") reduce(d, f, true)
       }),
     )
   } finally {

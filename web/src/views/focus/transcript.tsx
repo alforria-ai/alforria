@@ -82,12 +82,24 @@ function turnIds(sessionID: string, key: string): { user?: string; replies: stri
   return out
 }
 
+/**
+ * Where the reader was in each open transcript. The Changes and Files tabs
+ * take the transcript's place in its column, so it is rebuilt on the way
+ * back: this puts the reader where they were. Forgotten with the column.
+ */
+const places = new Map<string, { top: number; stuck: boolean; shown: number }>()
+export const forgetPlace = (sessionID: string) => void places.delete(sessionID)
+
 export function Transcript(props: { sessionID: string; onOpenSession: (id: string, beside: boolean) => void }) {
   let scroller!: HTMLDivElement
   let content!: HTMLDivElement
-  const [stuck, setStuck] = createSignal(true)
+  const place = places.get(props.sessionID)
+  const [stuck, setStuck] = createSignal(place?.stuck ?? true)
   // Long sessions render their most recent turns; older ones on request.
-  const [shown, setShown] = createSignal(40)
+  const [shown, setShown] = createSignal(place?.shown ?? 40)
+  // Kept from the last scroll event: by cleanup the scroller may be detached.
+  let top = place?.top ?? 0
+  onCleanup(() => places.set(props.sessionID, { top, stuck: stuck(), shown: shown() }))
   const turns = createMemo(() => turnKeys(props.sessionID), [], { equals: sameIds })
   const pending = createMemo(() => interruptsFor(state, props.sessionID))
   const pendingById = createMemo(() => new Map(pending().map((i) => [i.id, i])))
@@ -153,7 +165,8 @@ export function Transcript(props: { sessionID: string; onOpenSession: (id: strin
   const atBottom = () => scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 32
   const toBottom = () => (scroller.scrollTop = scroller.scrollHeight)
   onMount(() => {
-    toBottom()
+    if (stuck()) toBottom()
+    else scroller.scrollTop = top
     // Content growth (streaming) and scroller shrink (the composer growing,
     // a phone keyboard opening) both keep a reader at the bottom there.
     const ro = new ResizeObserver(() => stuck() && toBottom())
@@ -163,7 +176,16 @@ export function Transcript(props: { sessionID: string; onOpenSession: (id: strin
   })
 
   return (
-    <div class="transcript" ref={scroller} tabindex="0" aria-label="Transcript" onScroll={() => setStuck(atBottom())}>
+    <div
+      class="transcript"
+      ref={scroller}
+      tabindex="0"
+      aria-label="Transcript"
+      onScroll={() => {
+        top = scroller.scrollTop
+        setStuck(atBottom())
+      }}
+    >
       <div ref={content}>
         <Show when={state.loaded[props.sessionID]} fallback={<div class="transcript-loading">Loading transcript…</div>}>
           <Show

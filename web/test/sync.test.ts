@@ -14,8 +14,9 @@ vi.mock("../src/api/client", async (original) => ({
 const { ApiError } = await import("../src/api/client")
 const { loadEarlier, onFrame, resync, retainTranscript, releaseTranscript, useTranscript } =
   await import("../src/sync/sync")
-const { flush, setState, state } = await import("../src/store/store")
+const { flush, setState, state, withSnapshot } = await import("../src/store/store")
 const { emptyState } = await import("../src/store/state")
+const { applyMessages } = await import("../src/store/reduce")
 const { agentsFor } = await import("../src/sync/catalog")
 const { HISTORY_WINDOW } = await import("../src/fleet/fleet")
 
@@ -170,6 +171,74 @@ describe("resync", () => {
     release()
     await settle()
     expect(state.part.prt_1).toMatchObject({ text: "Hello" })
+  })
+})
+
+describe("snapshot replay", () => {
+  test("a text-start frame that raced a snapshot doesn't wipe what has streamed", async () => {
+    const info = {
+      id: "msg_1",
+      sessionID: "ses_a",
+      role: "assistant",
+      time: { created: 1 },
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      cost: 0,
+    }
+    // Each copy is its own object, as off the wire.
+    const part = (text: string, end?: number) => ({
+      id: "prt_1",
+      sessionID: "ses_a",
+      messageID: "msg_1",
+      type: "text",
+      text,
+      time: { start: 1, ...(end ? { end } : {}) },
+    })
+    const delta = (text: string) =>
+      frame("message.part.delta", {
+        sessionID: "ses_a",
+        messageID: "msg_1",
+        partID: "prt_1",
+        field: "text",
+        delta: text,
+      })
+    setState("sessions", "ses_a", session("ses_a", "/a"))
+    const snapshot = () => {
+      let release!: () => void
+      const done = withSnapshot(
+        () => new Promise<never[]>((r) => (release = () => r([{ info, parts: [part("")] }] as never[]))),
+        (d, list) => applyMessages(d, "ses_a", list),
+      )
+      return { release, done }
+    }
+    // Two snapshots overlap (a resync and a transcript load): the first to
+    // land replaces the part the text-start frame put in the store, so the
+    // slower one replays that frame with only what had streamed until then.
+    const slow = snapshot()
+    onFrame(frame("message.updated", { sessionID: "ses_a", info }))
+    onFrame(frame("message.part.updated", { sessionID: "ses_a", part: part(""), time: 1 }))
+    onFrame(delta("Hel"))
+    flush()
+    const fast = snapshot()
+    fast.release()
+    await fast.done
+    onFrame(delta("lo"))
+    flush()
+    expect(state.part.prt_1).toMatchObject({ text: "Hello" })
+    slow.release()
+    await slow.done
+    expect(state.part.prt_1).toMatchObject({ text: "Hello" })
+    // Still streaming afterwards.
+    onFrame(delta(" world"))
+    flush()
+    expect(state.part.prt_1).toMatchObject({ text: "Hello world" })
+
+    // A part that ended during the fetch is replayed as it is, even if shorter.
+    const again = snapshot()
+    onFrame(frame("message.part.updated", { sessionID: "ses_a", part: part("Hello", 2), time: 2 }))
+    flush()
+    again.release()
+    await again.done
+    expect(state.part.prt_1).toMatchObject({ text: "Hello", time: { end: 2 } })
   })
 })
 

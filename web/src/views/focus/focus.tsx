@@ -1,7 +1,7 @@
 // Focus: up to three columns, each a session (transcript / changes / files) or
 // a terminal. Columns are keyed components over the shared store, so nothing
 // reloads when you switch, split or close.
-import { createEffect, For, lazy, Match, Show, Suspense, Switch } from "solid-js"
+import { createEffect, For, lazy, Match, on, onCleanup, Show, Suspense, Switch } from "solid-js"
 import { api } from "../../api/client"
 import { fleetState, interruptsFor, lastAssistant, sessionCost, turnDiffs } from "../../fleet/derive"
 import { displayTitle, GLOBAL_PROJECT, placeOf, projectName } from "../../fleet/fleet"
@@ -16,7 +16,7 @@ import { toast } from "../toast"
 import { Composer } from "./composer"
 import { exportName, transcriptMarkdown } from "./export"
 import { WorkStatus } from "./subagents"
-import { stepMessage, Transcript } from "./transcript"
+import { forgetPlace, stepMessage, Transcript } from "./transcript"
 
 const Changes = lazy(() => import("./changes"))
 const Files = lazy(() => import("./files"))
@@ -100,6 +100,8 @@ function SessionColumn(props: {
     },
     error: (err) => toast(`Could not load the transcript: ${err.message}`, "error"),
   })
+  // The reading position survives the Changes and Files tabs, not the column.
+  createEffect(on(id, (sid) => onCleanup(() => forgetPlace(sid))))
   // Deleted elsewhere (a `session.deleted` event): close rather than show a husk.
   let seen = false
   createEffect(() => {
