@@ -497,7 +497,9 @@ pub async fn agent_list(
                     alforria_core::AgentMode::Subagent => "subagent",
                     alforria_core::AgentMode::All => "all",
                 },
-                "permission": agent.permission,
+                // The wire form is a flat rendering of the policy, never
+                // more permissive than it (`Policy::render`).
+                "permission": agent.permission.render(),
                 "options": agent.options,
             });
             if let Some(native) = agent.native {

@@ -1163,7 +1163,7 @@ mod tests {
                     name: "build".to_string(),
                     description: None,
                     mode: crate::tool::def::AgentMode::Primary,
-                    permission: Ruleset::new(),
+                    permission: Ruleset::new().into(),
                 })
             })
         }

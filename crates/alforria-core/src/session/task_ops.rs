@@ -123,8 +123,10 @@ impl TaskOps for ProductionTaskOps {
                     model_id: model.model_id.clone(),
                     provider_id: model.provider_id.clone(),
                 }),
+                // A flat rendering, never more permissive than the policy.
                 permission: found
                     .permission
+                    .render()
                     .iter()
                     .map(|rule| Rule {
                         permission: rule.permission.clone(),

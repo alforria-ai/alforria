@@ -49,7 +49,8 @@ impl ScheduleSessions for SessionTree {
         let mut rules = self
             .agents
             .get(agent)
-            .map(|agent| agent.permission.clone())
+            // The flat rendering: never more permissive than the policy.
+            .map(|agent| agent.permission.render())
             .unwrap_or_default();
         if let Ok(session) = self.sessions.get(session_id) {
             rules.extend(session.permission.unwrap_or_default());

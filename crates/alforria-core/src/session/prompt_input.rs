@@ -35,7 +35,6 @@ use crate::session::store::SessionStore;
 use crate::tool::def::{Ask, AskRequest, ExecuteResult, Extra, MetadataSink, ToolCtxRef, ToolDef};
 use crate::tool::error::ToolError;
 pub use crate::tool::lsp::LspServer;
-use crate::tool::permission::evaluate;
 use crate::CoreError;
 
 use crate::session::event_definitions::SESSION_ERROR;
@@ -1440,7 +1439,7 @@ fn resolve_agent_part(
     let PromptPartInput::Agent { id, name, source } = part else {
         unreachable!("checked by caller");
     };
-    let perm = evaluate("task", name, &[&ag.permission]);
+    let perm = ag.permission.evaluate("task", name);
     let hint = if perm.action == alforria_schema::permission_v1::PermissionV1Action::Deny {
         " . Invoked by user; guaranteed to exist."
     } else {
@@ -1652,7 +1651,7 @@ mod tests {
                     name: "build".to_string(),
                     description: None,
                     mode: crate::tool::def::AgentMode::Primary,
-                    permission: Vec::new(),
+                    permission: Vec::new().into(),
                 })
             })
         }

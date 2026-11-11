@@ -12,7 +12,7 @@ use alforria_schema::permission_v1::PermissionV1Action;
 
 use crate::tool::def::{AgentInfo, AgentMode, Agents, BoxFuture, ToolDef};
 use crate::tool::error::ToolError;
-use crate::tool::permission::{evaluate, Ruleset};
+use crate::tool::permission::Ruleset;
 
 /// Runtime flags the registry consumes (runtime-flags.ts; `client` defaults
 /// to `"cli"`).
@@ -176,8 +176,7 @@ impl ToolRegistry {
         let mut filtered: Vec<AgentInfo> = items
             .into_iter()
             .filter(|item| {
-                evaluate("task", &item.name, &[&agent.permission]).action
-                    != PermissionV1Action::Deny
+                agent.permission.evaluate("task", &item.name).action != PermissionV1Action::Deny
             })
             .collect();
         filtered.sort_by(|a, b| a.name.cmp(&b.name));
@@ -294,7 +293,7 @@ mod tests {
                     name: "build".to_string(),
                     description: None,
                     mode: AgentMode::Primary,
-                    permission: Ruleset::new(),
+                    permission: Ruleset::new().into(),
                 })
             })
         }
@@ -309,7 +308,7 @@ mod tests {
             name: name.to_string(),
             description: None,
             mode: AgentMode::Primary,
-            permission: Ruleset::new(),
+            permission: Ruleset::new().into(),
         }
     }
 
@@ -318,7 +317,7 @@ mod tests {
             name: name.to_string(),
             description: None,
             mode: AgentMode::Subagent,
-            permission: Ruleset::new(),
+            permission: Ruleset::new().into(),
         }
     }
 
@@ -697,7 +696,8 @@ mod tests {
             permission: "task".to_string(),
             pattern: "hidden".to_string(),
             action: PermissionV1Action::Deny,
-        }];
+        }]
+        .into();
         let tools = reg
             .tools(ToolModel {
                 provider_id: "anthropic",

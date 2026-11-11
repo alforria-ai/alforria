@@ -2825,7 +2825,7 @@ mod tests {
         let build = registry.get("build").unwrap();
         for (permission, pattern) in [("bash", "rm -rf /"), ("edit", "opencode.json")] {
             assert_eq!(
-                crate::tool::permission::evaluate(permission, pattern, &[&build.permission]).action,
+                build.permission.evaluate(permission, pattern).action,
                 alforria_schema::permission_v1::PermissionV1Action::Deny,
                 "{permission}"
             );

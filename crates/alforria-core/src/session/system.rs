@@ -7,7 +7,6 @@
 //! * `mcp` — the `<mcp_instructions>` block (system.ts:121-137).
 
 use crate::session::agents::AgentInfo;
-use crate::tool::permission::{disabled, merge};
 use crate::tool::skill::SkillInfo;
 
 use alforria_schema::permission_v1::PermissionV1Ruleset;
@@ -423,7 +422,7 @@ fn escape_html(value: &str) -> String {
 /// `skills(agent)` (system.ts:107-119): `None` when the `skill` permission
 /// is disabled for the agent.
 pub fn skills(agent: &AgentInfo, available: &[SkillInfo]) -> Option<String> {
-    if disabled(&["skill"], &agent.permission).contains("skill") {
+    if agent.permission.disabled(&["skill"]).contains("skill") {
         return None;
     }
     Some(
@@ -451,7 +450,7 @@ pub fn mcp(
     items: &[McpInstruction],
 ) -> Option<String> {
     let empty = PermissionV1Ruleset::new();
-    let ruleset = merge(&[&agent.permission, permission.unwrap_or(&empty)]);
+    let policy = agent.permission.extended(permission.unwrap_or(&empty));
     let instructions: Vec<&McpInstruction> = items
         .iter()
         .filter(|item| {
@@ -459,7 +458,7 @@ pub fn mcp(
                 return true;
             }
             let tools: Vec<&str> = item.tools.iter().map(|t| t.as_str()).collect();
-            disabled(&tools, &ruleset).len() < item.tools.len()
+            policy.disabled(&tools).len() < item.tools.len()
         })
         .collect();
     if instructions.is_empty() {
@@ -499,7 +498,7 @@ mod tests {
             top_p: None,
             temperature: None,
             color: None,
-            permission,
+            permission: permission.into(),
             model: None,
             variant: None,
             prompt: None,

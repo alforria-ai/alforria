@@ -112,7 +112,7 @@ async fn agent_list(
             hidden: agent.hidden.unwrap_or(false),
             color: agent.color.clone(),
             steps: agent.steps.map(|steps| steps as u64),
-            permissions: super::util::relabel_ruleset(&agent.permission),
+            permissions: super::util::relabel_ruleset(&agent.permission.render()),
         })
         .collect::<Vec<_>>();
     envelope(&location, agents)

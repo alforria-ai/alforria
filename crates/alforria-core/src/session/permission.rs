@@ -391,8 +391,21 @@ impl PermissionService {
             .collect()
     }
 
-    /// `ask` (permission/index.ts:67-107 — binding).
+    /// `ask` (permission/index.ts:67-107 — binding), judged by the plain
+    /// ruleset the input carries: the wire form, which has no ceiling.
     pub async fn ask(&self, input: PermissionV1AskInput) -> Result<(), PermissionError> {
+        let policy = crate::tool::permission::Policy::plain(input.ruleset.clone());
+        self.ask_policy(input, &policy).await
+    }
+
+    /// [`PermissionService::ask`] judged by `policy` — the agent's, with
+    /// its ceilings, extended by the session's rules. `input.ruleset` is
+    /// only what a denial reports.
+    pub async fn ask_policy(
+        &self,
+        input: PermissionV1AskInput,
+        policy: &crate::tool::permission::Policy,
+    ) -> Result<(), PermissionError> {
         let mut needs_ask = false;
         let untrusted = self.carries_untrusted_input(&input.session_id);
         let denied = |input: &PermissionV1AskInput| PermissionError::Denied {
@@ -409,15 +422,13 @@ impl PermissionService {
             // alforria extension: see `set_untrusted_lookup`.
             let approved = if untrusted { &none } else { &state.approved };
             for pattern in &input.patterns {
-                let rule = evaluate(&input.permission, pattern, &[&input.ruleset, approved]);
+                // A standing approval counts in every reading of the policy.
+                let rule = policy
+                    .extended(approved)
+                    .evaluate(&input.permission, pattern);
                 match rule.action {
                     PermissionV1Action::Deny => {
-                        let ruleset = input
-                            .ruleset
-                            .iter()
-                            .filter(|rule| wildcard_match(&input.permission, &rule.permission))
-                            .cloned()
-                            .collect();
+                        let ruleset = policy.rules_for(&input.permission);
                         return Err(PermissionError::Denied { ruleset });
                     }
                     PermissionV1Action::Allow => continue,
@@ -598,7 +609,7 @@ pub struct SessionAsk {
     session_id: String,
     message_id: String,
     call_id: String,
-    ruleset: PermissionV1Ruleset,
+    ruleset: crate::tool::permission::Policy,
 }
 
 impl SessionAsk {
@@ -607,14 +618,14 @@ impl SessionAsk {
         session_id: impl Into<String>,
         message_id: impl Into<String>,
         call_id: impl Into<String>,
-        ruleset: PermissionV1Ruleset,
+        ruleset: impl Into<crate::tool::permission::Policy>,
     ) -> SessionAsk {
         SessionAsk {
             service,
             session_id: session_id.into(),
             message_id: message_id.into(),
             call_id: call_id.into(),
-            ruleset,
+            ruleset: ruleset.into(),
         }
     }
 }
@@ -645,19 +656,22 @@ impl crate::tool::def::Ask for SessionAsk {
     fn ask<'a>(&'a self, request: AskRequest) -> BoxFuture<'a, Result<(), ToolError>> {
         Box::pin(async move {
             self.service
-                .ask(PermissionV1AskInput {
-                    id: None,
-                    session_id: self.session_id.clone(),
-                    permission: request.permission,
-                    patterns: request.patterns,
-                    metadata: json_map(&request.metadata),
-                    always: request.always,
-                    tool: Some(PermissionV1Tool {
-                        message_id: self.message_id.clone(),
-                        call_id: self.call_id.clone(),
-                    }),
-                    ruleset: self.ruleset.clone(),
-                })
+                .ask_policy(
+                    PermissionV1AskInput {
+                        id: None,
+                        session_id: self.session_id.clone(),
+                        permission: request.permission,
+                        patterns: request.patterns,
+                        metadata: json_map(&request.metadata),
+                        always: request.always,
+                        tool: Some(PermissionV1Tool {
+                            message_id: self.message_id.clone(),
+                            call_id: self.call_id.clone(),
+                        }),
+                        ruleset: self.ruleset.render(),
+                    },
+                    &self.ruleset,
+                )
                 .await
                 .map_err(ask_tool_error)
         })
@@ -685,14 +699,19 @@ impl AskPermission for PermissionService {
                     message_id: request.tool.message_id,
                     call_id: request.tool.call_id,
                 }),
-                ruleset: request.ruleset,
+                ruleset: request.ruleset.render(),
             };
-            self.ask(input).await.map_err(|error| match error {
-                PermissionError::Rejected => {
-                    crate::session::processor::PermissionAskError::Rejected(error.to_string())
-                }
-                other => crate::session::processor::PermissionAskError::Other(other.to_string()),
-            })
+            let policy = request.ruleset;
+            self.ask_policy(input, &policy)
+                .await
+                .map_err(|error| match error {
+                    PermissionError::Rejected => {
+                        crate::session::processor::PermissionAskError::Rejected(error.to_string())
+                    }
+                    other => {
+                        crate::session::processor::PermissionAskError::Other(other.to_string())
+                    }
+                })
         })
     }
 }
@@ -1433,7 +1452,7 @@ mod tests {
                 patterns: vec!["rm".to_string()],
                 always: vec![],
                 metadata: serde_json::json!({}),
-                ruleset: vec![rule("bash", "*", PermissionV1Action::Deny)],
+                ruleset: vec![rule("bash", "*", PermissionV1Action::Deny)].into(),
                 tool: crate::session::processor::PermissionAskTool {
                     message_id: "msg_1".to_string(),
                     call_id: "call_1".to_string(),
@@ -1465,7 +1484,7 @@ mod tests {
                         patterns: vec!["rm".to_string()],
                         always: vec![],
                         metadata: serde_json::json!({}),
-                        ruleset: vec![],
+                        ruleset: crate::tool::permission::Policy::default(),
                         tool: crate::session::processor::PermissionAskTool {
                             message_id: "msg_1".to_string(),
                             call_id: "call_1".to_string(),

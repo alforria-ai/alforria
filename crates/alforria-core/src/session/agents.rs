@@ -31,7 +31,10 @@ pub struct AgentInfo {
     pub top_p: Option<f64>,
     pub temperature: Option<f64>,
     pub color: Option<String>,
-    pub permission: PermissionV1Ruleset,
+    /// What the agent may do. Decisions go through
+    /// [`Policy::evaluate`](crate::tool::permission::Policy::evaluate); a wire
+    /// format gets `permission.render()`.
+    pub permission: crate::tool::permission::Policy,
     pub model: Option<AgentModel>,
     pub variant: Option<String>,
     pub prompt: Option<String>,
@@ -87,7 +90,7 @@ pub struct AgentRegistryInput {
     /// (`ConfigLoader::load_trusted`): every agent's rules are capped by
     /// what this config gives it, so a project's or a remote config can
     /// narrow a permission and never widen one
-    /// (`tool::permission::with_ceiling`). `None`: no cap — `config` is
+    /// (`tool::permission::Policy`). `None`: no cap — `config` is
     /// all there is.
     pub host_config: Option<Config>,
 }
@@ -249,15 +252,12 @@ impl AgentRegistry {
         });
         for (name, agent) in registry.agents.iter_mut() {
             let ceiling = match trusted.agents.get(name) {
-                Some(trusted) => trusted.permission.clone(),
+                Some(trusted) => trusted.permission.written().clone(),
                 // The host's config has no such agent (it disabled it):
                 // nothing is allowed.
                 None => rules(&[("*", vec![("*", PermissionV1Action::Deny)])]),
             };
-            agent.permission = crate::tool::permission::with_ceiling(
-                std::mem::take(&mut agent.permission),
-                ceiling,
-            );
+            agent.permission = std::mem::take(&mut agent.permission).with_ceiling("host", ceiling);
         }
         registry
     }
@@ -329,7 +329,8 @@ impl AgentRegistry {
                         ("plan_enter", vec![("*", PermissionV1Action::Allow)]),
                     ]),
                     &user,
-                ]),
+                ])
+                .into(),
                 model: None,
                 variant: None,
                 prompt: None,
@@ -381,7 +382,8 @@ impl AgentRegistry {
                         ),
                     ]),
                     &user,
-                ]),
+                ])
+                .into(),
                 model: None,
                 variant: None,
                 prompt: None,
@@ -407,7 +409,7 @@ impl AgentRegistry {
                     &defaults,
                     &rules(&[("todowrite", vec![("*", PermissionV1Action::Deny)])]),
                     &user,
-                ]),
+                ]).into(),
                 model: None,
                 variant: None,
                 prompt: None,
@@ -449,7 +451,7 @@ impl AgentRegistry {
                             .collect(),
                     )]),
                     &user,
-                ]),
+                ]).into(),
                 model: None,
                 variant: None,
                 prompt: Some(PROMPT_EXPLORE.to_string()),
@@ -469,7 +471,7 @@ impl AgentRegistry {
                 top_p: None,
                 temperature: None,
                 color: None,
-                permission: merge(&[&defaults, &deny_all, &user]),
+                permission: merge(&[&defaults, &deny_all, &user]).into(),
                 model: None,
                 variant: None,
                 prompt: Some(PROMPT_COMPACTION.to_string()),
@@ -489,7 +491,7 @@ impl AgentRegistry {
                 top_p: None,
                 temperature: Some(0.5),
                 color: None,
-                permission: merge(&[&defaults, &deny_all, &user]),
+                permission: merge(&[&defaults, &deny_all, &user]).into(),
                 model: None,
                 variant: None,
                 prompt: Some(PROMPT_TITLE.to_string()),
@@ -509,7 +511,7 @@ impl AgentRegistry {
                 top_p: None,
                 temperature: None,
                 color: None,
-                permission: merge(&[&defaults, &deny_all, &user]),
+                permission: merge(&[&defaults, &deny_all, &user]).into(),
                 model: None,
                 variant: None,
                 prompt: Some(PROMPT_SUMMARY.to_string()),
@@ -528,7 +530,7 @@ impl AgentRegistry {
                 let item = agents.entry(key.clone()).or_insert_with(|| AgentInfo {
                     name: key.clone(),
                     mode: AgentMode::All,
-                    permission: merge(&[&defaults, &user]),
+                    permission: merge(&[&defaults, &user]).into(),
                     options: BTreeMap::new(),
                     native: Some(false),
                     model: None,
@@ -580,10 +582,8 @@ impl AgentRegistry {
                     &serde_json::to_value(&value.options).unwrap_or_default(),
                 );
                 item.options = serde_json::from_value(options).unwrap_or_default();
-                item.permission = merge(&[
-                    &item.permission,
-                    &from_config(&value.permission, &input.home),
-                ]);
+                item.permission
+                    .push_written(from_config(&value.permission, &input.home));
             }
         }
 
@@ -596,6 +596,7 @@ impl AgentRegistry {
                 .get(&name)
                 .expect("agent exists")
                 .permission
+                .written()
                 .iter()
                 .any(|r| {
                     r.permission == "external_directory"
@@ -606,10 +607,11 @@ impl AgentRegistry {
                 continue;
             }
             let item = agents.get_mut(&name).expect("agent exists");
-            item.permission = merge(&[
-                &item.permission,
-                &vec![rule("external_directory", &glob, PermissionV1Action::Allow)],
-            ]);
+            item.permission.push_written([rule(
+                "external_directory",
+                &glob,
+                PermissionV1Action::Allow,
+            )]);
         }
 
         AgentRegistry {
@@ -672,7 +674,6 @@ impl AgentRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool::permission::evaluate;
 
     fn test_input(config: &Config) -> AgentRegistryInput {
         AgentRegistryInput {
@@ -721,35 +722,35 @@ mod tests {
         let build = registry.get("build").unwrap();
         assert_eq!(build.mode, AgentMode::Primary);
         assert_eq!(
-            evaluate("bash", "anything", &[&build.permission]).action,
+            build.permission.evaluate("bash", "anything").action,
             PermissionV1Action::Allow
         );
         assert_eq!(
-            evaluate("doom_loop", "*", &[&build.permission]).action,
+            build.permission.evaluate("doom_loop", "*").action,
             PermissionV1Action::Ask
         );
         assert_eq!(
-            evaluate("question", "*", &[&build.permission]).action,
+            build.permission.evaluate("question", "*").action,
             PermissionV1Action::Allow
         );
         assert_eq!(
-            evaluate("plan_enter", "*", &[&build.permission]).action,
+            build.permission.evaluate("plan_enter", "*").action,
             PermissionV1Action::Allow
         );
         assert_eq!(
-            evaluate("plan_exit", "*", &[&build.permission]).action,
+            build.permission.evaluate("plan_exit", "*").action,
             PermissionV1Action::Deny
         );
         assert_eq!(
-            evaluate("read", ".env", &[&build.permission]).action,
+            build.permission.evaluate("read", ".env").action,
             PermissionV1Action::Ask
         );
         assert_eq!(
-            evaluate("read", "a.b.env", &[&build.permission]).action,
+            build.permission.evaluate("read", "a.b.env").action,
             PermissionV1Action::Ask
         );
         assert_eq!(
-            evaluate("read", "a.env.example", &[&build.permission]).action,
+            build.permission.evaluate("read", "a.env.example").action,
             PermissionV1Action::Allow
         );
     }
@@ -760,18 +761,16 @@ mod tests {
         let build = registry.get("build").unwrap();
         // unknown dirs ask
         assert_eq!(
-            evaluate(
-                "external_directory",
-                "/some/random/dir",
-                &[&build.permission]
-            )
-            .action,
+            build
+                .permission
+                .evaluate("external_directory", "/some/random/dir")
+                .action,
             PermissionV1Action::Ask
         );
         // tmp + truncate glob allow
         for dir in ["/tmp/x/y", "/data/tool-output/spill"] {
             assert_eq!(
-                evaluate("external_directory", dir, &[&build.permission]).action,
+                build.permission.evaluate("external_directory", dir).action,
                 PermissionV1Action::Allow,
                 "{dir}"
             );
@@ -792,25 +791,24 @@ mod tests {
         });
         let build = registry.get("build").unwrap();
         assert_eq!(
-            evaluate(
-                "external_directory",
-                "/skills/my-skill/x",
-                &[&build.permission]
-            )
-            .action,
+            build
+                .permission
+                .evaluate("external_directory", "/skills/my-skill/x")
+                .action,
             PermissionV1Action::Allow
         );
         assert_eq!(
-            evaluate("external_directory", "/refs/main/x", &[&build.permission]).action,
+            build
+                .permission
+                .evaluate("external_directory", "/refs/main/x")
+                .action,
             PermissionV1Action::Allow
         );
         assert_eq!(
-            evaluate(
-                "external_directory",
-                "/skills/other/x",
-                &[&build.permission]
-            )
-            .action,
+            build
+                .permission
+                .evaluate("external_directory", "/skills/other/x")
+                .action,
             PermissionV1Action::Ask
         );
     }
@@ -820,29 +818,35 @@ mod tests {
         let registry = AgentRegistry::new(&test_input(&empty_config()));
         let plan = registry.get("plan").unwrap();
         assert_eq!(
-            evaluate("edit", "src/lib.ts", &[&plan.permission]).action,
+            plan.permission.evaluate("edit", "src/lib.ts").action,
             PermissionV1Action::Deny
         );
         assert_eq!(
-            evaluate("edit", ".opencode/plans/plan.md", &[&plan.permission]).action,
+            plan.permission
+                .evaluate("edit", ".opencode/plans/plan.md")
+                .action,
             PermissionV1Action::Allow
         );
         assert_eq!(
-            evaluate("task", "general", &[&plan.permission]).action,
+            plan.permission.evaluate("task", "general").action,
             PermissionV1Action::Deny
         );
         assert_eq!(
-            evaluate("plan_exit", "*", &[&plan.permission]).action,
+            plan.permission.evaluate("plan_exit", "*").action,
             PermissionV1Action::Allow
         );
         // <data>/plans/* allow
         assert_eq!(
-            evaluate("external_directory", "/data/plans/x", &[&plan.permission]).action,
+            plan.permission
+                .evaluate("external_directory", "/data/plans/x")
+                .action,
             PermissionV1Action::Allow
         );
         // relative path from worktree to <data>/plans/*.md allow
         assert_eq!(
-            evaluate("edit", "../data/plans/a.md", &[&plan.permission]).action,
+            plan.permission
+                .evaluate("edit", "../data/plans/a.md")
+                .action,
             PermissionV1Action::Allow
         );
     }
@@ -853,7 +857,7 @@ mod tests {
         let general = registry.get("general").unwrap();
         assert_eq!(general.mode, AgentMode::Subagent);
         assert_eq!(
-            evaluate("todowrite", "*", &[&general.permission]).action,
+            general.permission.evaluate("todowrite", "*").action,
             PermissionV1Action::Deny
         );
     }
@@ -863,7 +867,7 @@ mod tests {
         let registry = AgentRegistry::new(&test_input(&empty_config()));
         let explore = registry.get("explore").unwrap();
         assert_eq!(
-            evaluate("*", "anything", &[&explore.permission]).action,
+            explore.permission.evaluate("*", "anything").action,
             PermissionV1Action::Deny
         );
         for tool in [
@@ -876,18 +880,24 @@ mod tests {
             "read",
         ] {
             assert_eq!(
-                evaluate(tool, "*", &[&explore.permission]).action,
+                explore.permission.evaluate(tool, "*").action,
                 PermissionV1Action::Allow,
                 "{tool}"
             );
         }
         // readonly external_directory: ask for unknown, allow whitelisted
         assert_eq!(
-            evaluate("external_directory", "/elsewhere", &[&explore.permission]).action,
+            explore
+                .permission
+                .evaluate("external_directory", "/elsewhere")
+                .action,
             PermissionV1Action::Ask
         );
         assert_eq!(
-            evaluate("external_directory", "/tmp/x", &[&explore.permission]).action,
+            explore
+                .permission
+                .evaluate("external_directory", "/tmp/x")
+                .action,
             PermissionV1Action::Allow
         );
         assert_eq!(explore.mode, AgentMode::Subagent);
@@ -911,7 +921,7 @@ mod tests {
         for name in ["compaction", "title", "summary"] {
             let agent = registry.get(name).unwrap();
             assert_eq!(
-                evaluate("*", "anything", &[&agent.permission]).action,
+                agent.permission.evaluate("*", "anything").action,
                 PermissionV1Action::Deny
             );
         }
@@ -938,7 +948,12 @@ mod tests {
         }))
         .unwrap();
         let action = |registry: &AgentRegistry, agent: &str, permission: &str| {
-            evaluate(permission, "x", &[&registry.get(agent).unwrap().permission]).action
+            registry
+                .get(agent)
+                .unwrap()
+                .permission
+                .evaluate(permission, "x")
+                .action
         };
         // Upstream's reading (no host config given): the project wins.
         let uncapped = AgentRegistry::new(&AgentRegistryInput {
@@ -977,7 +992,7 @@ mod tests {
         )));
         let build = registry.get("build").unwrap();
         assert_eq!(
-            evaluate("bash", "ls", &[&build.permission]).action,
+            build.permission.evaluate("bash", "ls").action,
             PermissionV1Action::Deny
         );
     }
@@ -1018,7 +1033,7 @@ mod tests {
         assert_eq!(reviewer.description.as_deref(), Some("Reviews code"));
         // defaults + user merged in
         assert_eq!(
-            evaluate("read", "src/lib.ts", &[&reviewer.permission]).action,
+            reviewer.permission.evaluate("read", "src/lib.ts").action,
             PermissionV1Action::Allow
         );
     }
@@ -1080,7 +1095,10 @@ mod tests {
         let registry = AgentRegistry::new(&test_input(&empty_config()));
         let build = registry.get("build").unwrap();
         assert_eq!(
-            evaluate("external_directory", &glob, &[&build.permission]).action,
+            build
+                .permission
+                .evaluate("external_directory", &glob)
+                .action,
             PermissionV1Action::Allow
         );
 
@@ -1096,7 +1114,10 @@ mod tests {
         let registry = AgentRegistry::new(&test_input(&config));
         let build = registry.get("build").unwrap();
         assert_eq!(
-            evaluate("external_directory", &glob, &[&build.permission]).action,
+            build
+                .permission
+                .evaluate("external_directory", &glob)
+                .action,
             PermissionV1Action::Deny
         );
     }

@@ -92,7 +92,12 @@ impl ProductionTriggerOps {
             .agent
             .clone()
             .or_else(|| self.agents.default_agent().ok())
-            .and_then(|name| self.agents.get(&name).map(|agent| agent.permission.clone()))
+            // The flat rendering: never more permissive than the policy.
+            .and_then(|name| {
+                self.agents
+                    .get(&name)
+                    .map(|agent| agent.permission.render())
+            })
             .unwrap_or_default();
         turn.session_rules(&agent)
     }

@@ -26,7 +26,6 @@ use alforria_llm::schema::errors::{LlmError, LlmErrorReason, ProviderFailureClas
 use alforria_llm::schema::events::{LlmEvent, Usage};
 use alforria_llm::schema::ids::FinishReason;
 use alforria_llm::schema::messages::ToolResultValue;
-use alforria_schema::permission_v1::PermissionV1Ruleset;
 use alforria_schema::session_status::SessionStatusInfo;
 use alforria_schema::session_v1::{
     AssistantError, ReasoningTime, TextPartTime, ToolStateCompletedTime, ToolStateErrorTime,
@@ -102,7 +101,8 @@ pub struct PermissionAsk {
     pub patterns: Vec<String>,
     pub always: Vec<String>,
     pub metadata: Value,
-    pub ruleset: PermissionV1Ruleset,
+    /// The policy the ask is judged by (`tool::permission::Policy`).
+    pub ruleset: crate::tool::permission::Policy,
     pub tool: PermissionAskTool,
 }
 

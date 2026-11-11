@@ -204,6 +204,36 @@ fn empty_tokens() -> SessionTokens {
 // `{action, resource, effect}`)
 // ---------------------------------------------------------------------------
 
+/// A V2 wire rule as the core rule it is: the inverse of
+/// [`relabel_ruleset`], so the V2 surface evaluates through the one
+/// evaluation in core (`tool::permission::Policy`).
+pub fn core_rule(rule: &PermissionRule) -> alforria_schema::permission_v1::PermissionV1Rule {
+    alforria_schema::permission_v1::PermissionV1Rule {
+        permission: rule.action.clone(),
+        pattern: rule.resource.clone(),
+        action: match rule.effect {
+            PermissionEffect::Allow => PermissionV1Action::Allow,
+            PermissionEffect::Deny => PermissionV1Action::Deny,
+            PermissionEffect::Ask => PermissionV1Action::Ask,
+        },
+    }
+}
+
+/// The V2 decision for one action and resource: `policy`'s — the agent's
+/// rules under their ceilings — relabelled. The only V2 evaluation of an
+/// agent's rules.
+pub fn evaluate_policy(
+    action: &str,
+    resource: &str,
+    policy: &alforria_core::tool::permission::Policy,
+) -> PermissionEffect {
+    match policy.evaluate(action, resource).action {
+        PermissionV1Action::Allow => PermissionEffect::Allow,
+        PermissionV1Action::Deny => PermissionEffect::Deny,
+        PermissionV1Action::Ask => PermissionEffect::Ask,
+    }
+}
+
 /// Relabel a V1 agent ruleset onto the V2 wire shape. The M5 registry
 /// stores agent permissions in the V1 layout; V2 evaluates the same rules
 /// with renamed fields (M6.7 adapter).
@@ -222,8 +252,12 @@ pub fn relabel_ruleset(ruleset: &PermissionV1Ruleset) -> Vec<PermissionRule> {
         .collect()
 }
 
-/// `Permission.evaluate` (`core/src/permission.ts`) — the last matching
-/// rule wins, an unmatched action/resource pair defaults to `ask`.
+/// `Permission.evaluate` (`core/src/permission.ts`) over one plain V2 rule
+/// list — the last matching rule wins, an unmatched action/resource pair
+/// defaults to `ask`. A decision about an agent goes through
+/// [`evaluate_policy`]; this reads a wire list (and the differential test
+/// holds the two together).
+#[cfg(test)]
 pub fn evaluate_permission(
     action: &str,
     resource: &str,
@@ -449,6 +483,44 @@ mod tests {
         assert!(decode_sessions_cursor(&bad).is_err(), "non-ses id");
         let bad = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{}"#);
         assert!(decode_sessions_cursor(&bad).is_err(), "missing anchor");
+    }
+
+    /// The V2 surface decides through the core policy: for generated
+    /// policies its answer is the policy's, and the flat wire rendering a
+    /// V2 client reads is never more permissive.
+    #[test]
+    fn v2_evaluation_agrees_with_the_core_policy() {
+        use alforria_core::tool::permission::{differential, strictness};
+        let effect = |action: PermissionV1Action| match action {
+            PermissionV1Action::Allow => PermissionEffect::Allow,
+            PermissionV1Action::Deny => PermissionEffect::Deny,
+            PermissionV1Action::Ask => PermissionEffect::Ask,
+        };
+        let rank = |effect: PermissionEffect| match effect {
+            PermissionEffect::Allow => 0,
+            PermissionEffect::Ask => 1,
+            PermissionEffect::Deny => 2,
+        };
+        for (policy, queries) in differential::cases() {
+            let wire = relabel_ruleset(&policy.render());
+            // The relabelling round-trips.
+            let back: Vec<_> = wire.iter().map(core_rule).collect();
+            assert_eq!(back, policy.render());
+            for (action, resource) in &queries {
+                let decided = policy.evaluate(action, resource).action;
+                assert_eq!(evaluate_policy(action, resource, &policy), effect(decided));
+                assert_eq!(
+                    decided,
+                    differential::floor(&policy, action, resource),
+                    "{action} {resource}"
+                );
+                let rendered = evaluate_permission(action, resource, &wire).effect;
+                assert!(
+                    rank(rendered) >= strictness(decided),
+                    "{action} {resource}: wire {rendered:?} < {decided:?}"
+                );
+            }
+        }
     }
 
     #[test]

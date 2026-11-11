@@ -34,7 +34,6 @@ use serde_json::Value;
 use crate::session::agents::AgentInfo;
 use crate::session::store::INSTALLATION_VERSION;
 use crate::tool::def::BoxFuture;
-use crate::tool::permission::{disabled as permission_disabled, merge as merge_rulesets};
 
 /// A provider event stream (TS `Stream.Stream<LLMEvent, unknown>`).
 pub type LlmEventStream = futures::stream::BoxStream<'static, Result<LlmEvent, LlmError>>;
@@ -299,13 +298,12 @@ pub struct PrepareInput<'a> {
 /// `resolveTools` (request.ts:208-214): drop tools denied by the merged
 /// ruleset and tools the user message turned off.
 pub fn resolve_tools(input: &PrepareInput<'_>) -> Vec<LlmTool> {
-    let mut rulesets = vec![input.agent.permission.as_ref()];
-    if let Some(permission) = input.permission {
-        rulesets.push(permission);
-    }
-    let merged = merge_rulesets(&rulesets);
+    let policy = match input.permission {
+        Some(permission) => input.agent.permission.extended(permission),
+        None => input.agent.permission.clone(),
+    };
     let names: Vec<&str> = input.tools.iter().map(|tool| tool.name.as_str()).collect();
-    let disabled = permission_disabled(&names, &merged);
+    let disabled = policy.disabled(&names);
     input
         .tools
         .iter()

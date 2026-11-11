@@ -633,10 +633,9 @@ pub fn debug_agent(ui: &mut Ui, instance: &Instance, name: &str) -> Result<(), T
             },
             permission: None,
         }));
-    let disabled = alforria_core::tool::permission::disabled(
-        &tools.iter().map(|tool| tool.id).collect::<Vec<&str>>(),
-        &agent.permission,
-    );
+    let disabled = agent
+        .permission
+        .disabled(&tools.iter().map(|tool| tool.id).collect::<Vec<&str>>());
     let mut resolved = serde_json::Map::new();
     for tool in &tools {
         resolved.insert(

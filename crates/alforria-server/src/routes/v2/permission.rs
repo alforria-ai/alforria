@@ -34,8 +34,7 @@ use crate::middleware::location::LocationContext;
 use crate::state::ServerContext;
 
 use super::util::{
-    defect, envelope, evaluate_permission, no_content, parse_payload, payload_error,
-    relabel_ruleset,
+    core_rule, defect, envelope, evaluate_policy, no_content, parse_payload, payload_error,
 };
 
 // ---------------------------------------------------------------------------
@@ -260,19 +259,22 @@ struct AskPayload {
 }
 
 /// `configured` (`core/src/permission.ts:130-136`) — the resolved agent's
-/// rules (the default agent when unset), deny-all when the agent has none.
+/// policy (the default agent when unset), deny-all when there is none. A
+/// [`Policy`](alforria_core::tool::permission::Policy), not a rule list:
+/// the agent's ceilings come with it.
 fn configured(
     location: &LocationContext,
     session_id: &str,
     agent_id: Option<&str>,
-) -> Result<Vec<PermissionRule>, ServerError> {
+) -> Result<alforria_core::tool::permission::Policy, ServerError> {
+    use alforria_core::tool::permission::Policy;
     let session = location.services.sessions.get(session_id).map_err(defect)?;
     let missing = || {
-        vec![PermissionRule {
+        Policy::plain(vec![core_rule(&PermissionRule {
             action: "*".to_string(),
             resource: "*".to_string(),
             effect: PermissionEffect::Deny,
-        }]
+        })])
     };
     // `agents.resolve(agentID ?? session.agent)` — a missing id resolves
     // the *default* agent (`agent.ts:90-93`), deny-all only applies when
@@ -287,14 +289,25 @@ fn configured(
     let Some(info) = location.services.agents.get(&agent) else {
         return Ok(missing());
     };
-    Ok(relabel_ruleset(&info.permission))
+    Ok(info.permission.clone())
 }
 
-fn evaluate_input(input: &AskPayload, rules: &[PermissionRule]) -> PermissionEffect {
+/// `policy` followed by the project's saved (always-allow) rules.
+fn with_saved(
+    policy: &alforria_core::tool::permission::Policy,
+    saved: &[PermissionRule],
+) -> alforria_core::tool::permission::Policy {
+    policy.extended(&saved.iter().map(core_rule).collect())
+}
+
+fn evaluate_input(
+    input: &AskPayload,
+    policy: &alforria_core::tool::permission::Policy,
+) -> PermissionEffect {
     let effects: Vec<PermissionEffect> = input
         .resources
         .iter()
-        .map(|resource| evaluate_permission(&input.action, resource, rules).effect)
+        .map(|resource| evaluate_policy(&input.action, resource, policy))
         .collect();
     if effects.contains(&PermissionEffect::Deny) {
         PermissionEffect::Deny
@@ -305,10 +318,11 @@ fn evaluate_input(input: &AskPayload, rules: &[PermissionRule]) -> PermissionEff
     }
 }
 
-fn denied(input: &AskPayload, rules: &[PermissionRule]) -> bool {
-    input.resources.iter().any(|resource| {
-        evaluate_permission(&input.action, resource, rules).effect == PermissionEffect::Deny
-    })
+fn denied(input: &AskPayload, policy: &alforria_core::tool::permission::Policy) -> bool {
+    input
+        .resources
+        .iter()
+        .any(|resource| evaluate_policy(&input.action, resource, policy) == PermissionEffect::Deny)
 }
 
 /// `session.permission.create` (`handlers/permission.ts:40-67`).
@@ -344,8 +358,7 @@ async fn permission_ask(
         .id;
     let rules = configured(&location, &session_id, payload.agent.as_deref())?;
     let saved = saved_rules(&ctx, &project_id)?;
-    let all_rules: Vec<PermissionRule> = rules.iter().chain(saved.iter()).cloned().collect();
-    let effect = evaluate_input(&payload, &all_rules);
+    let effect = evaluate_input(&payload, &with_saved(&rules, &saved));
 
     let id = payload.id.clone().unwrap_or_else(PermissionId::generate);
     if effect == PermissionEffect::Ask {
@@ -537,9 +550,9 @@ async fn permission_reply(
         if denied(&ask, &rules) {
             continue;
         }
-        let all: Vec<PermissionRule> = rules.iter().chain(remembered.iter()).cloned().collect();
+        let all = with_saved(&rules, &remembered);
         let allowed = ask.resources.iter().all(|resource| {
-            evaluate_permission(&ask.action, resource, &all).effect == PermissionEffect::Allow
+            evaluate_policy(&ask.action, resource, &all) == PermissionEffect::Allow
         });
         if !allowed {
             continue;

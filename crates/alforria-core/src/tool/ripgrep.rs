@@ -399,7 +399,7 @@ pub(crate) mod test_support {
                     name: "build".to_string(),
                     description: None,
                     mode: AgentMode::Primary,
-                    permission: Ruleset::new(),
+                    permission: Ruleset::new().into(),
                 })
             })
         }

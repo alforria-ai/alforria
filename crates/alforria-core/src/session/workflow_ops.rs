@@ -18,7 +18,6 @@ use crate::session::prompt_input::{ModelRef, PromptInput, PromptPartInput};
 use crate::session::store::{CreateInput, SessionContext, SessionStore};
 use crate::session::task_ops::PromptFacade;
 use crate::tool::def::BoxFuture;
-use crate::tool::permission::evaluate;
 use crate::tool::task::{derive_subagent_session_permission, Rule};
 use crate::workflow::{WorkflowAgentOutcome, WorkflowAgentRequest, WorkflowOps};
 
@@ -270,12 +269,11 @@ impl WorkflowOps for ProductionWorkflowOps {
                 .as_ref()
                 .and_then(|session| session.agent.as_deref())
                 .and_then(|name| self.agents.get(name));
-            let no_rules = Vec::new();
-            let rulesets = [
-                parent_agent.map_or(&no_rules, |agent| &agent.permission),
-                &parent_permission,
-            ];
-            if evaluate("task", &request.agent, &rulesets).action == PermissionV1Action::Deny {
+            let policy = parent_agent
+                .map(|agent| agent.permission.clone())
+                .unwrap_or_default()
+                .extended(&parent_permission);
+            if policy.evaluate("task", &request.agent).action == PermissionV1Action::Deny {
                 return Err(format!(
                     "permission denied: agent {} may not be run as a subagent here",
                     request.agent
@@ -283,7 +281,7 @@ impl WorkflowOps for ProductionWorkflowOps {
             }
             let mut permission = derive_subagent_session_permission(
                 &rules_of(&parent_permission),
-                &rules_of(&agent.permission),
+                &rules_of(&agent.permission.render()),
                 &self.primary_tools,
             );
             permission.push(Rule {

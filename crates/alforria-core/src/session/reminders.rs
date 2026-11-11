@@ -282,7 +282,7 @@ mod tests {
             top_p: None,
             temperature: None,
             color: None,
-            permission: Vec::new(),
+            permission: Vec::new().into(),
             model: None,
             variant: None,
             prompt: None,

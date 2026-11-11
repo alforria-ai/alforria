@@ -16,7 +16,6 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::tool::error::ToolError;
-use crate::tool::permission::Ruleset;
 use crate::tool::truncate::{Options, Truncate};
 
 /// Future alias — `futures::future::BoxFuture` without the `futures` dep
@@ -158,7 +157,7 @@ pub struct AgentInfo {
     pub name: String,
     pub description: Option<String>,
     pub mode: AgentMode,
-    pub permission: Ruleset,
+    pub permission: crate::tool::permission::Policy,
 }
 
 /// The `Agent.Service` seam (`agents.get` / `agents.list`).
@@ -321,7 +320,7 @@ mod tests {
                     name: "build".to_string(),
                     description: None,
                     mode: AgentMode::Primary,
-                    permission: Ruleset::new(),
+                    permission: Ruleset::new().into(),
                 })
             })
         }

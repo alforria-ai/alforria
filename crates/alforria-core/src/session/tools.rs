@@ -12,7 +12,6 @@
 
 use std::sync::Arc;
 
-use alforria_schema::permission_v1::PermissionV1Ruleset;
 use alforria_schema::session_v1::{V1Part, V1SessionInfo, V1ToolState};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -123,12 +122,9 @@ pub async fn resolve(
         | alforria_schema::session_v1::V1Message::Assistant { id, .. } => id,
     }
     .to_string();
-    let ruleset = {
-        let mut merged = vec![input.agent.permission.as_ref()];
-        if let Some(permission) = input.session.permission.as_ref() {
-            merged.push(permission);
-        }
-        crate::tool::permission::merge(&merged)
+    let ruleset = match input.session.permission.as_ref() {
+        Some(permission) => input.agent.permission.extended(permission),
+        None => input.agent.permission.clone(),
     };
     // Shared by every tool's closure: one copy of the history, not one per
     // tool.
@@ -525,7 +521,7 @@ struct PermissionAdapter {
     session_id: String,
     message_id: String,
     call_id: String,
-    ruleset: PermissionV1Ruleset,
+    ruleset: crate::tool::permission::Policy,
 }
 
 impl Ask for PermissionAdapter {

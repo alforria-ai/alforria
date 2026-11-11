@@ -30,7 +30,6 @@ use crate::session::agents::AgentInfo;
 use crate::session::llm::{LlmStream, LlmTool, LlmToolOutput, StreamInput, ToolFailure};
 use crate::session::r#loop::ResolvedModel;
 use crate::tool::def::BoxFuture;
-use crate::tool::permission::evaluate;
 
 /// How many records one flush may write.
 pub const MAX_FLUSH_RECORDS: usize = 8;
@@ -160,12 +159,11 @@ impl MemoryFlush {
             return false;
         };
         let own = session.permission.unwrap_or_default();
-        evaluate(
-            crate::tool::memory::MEMORY_TOOL,
-            "remember",
-            &[&agent.permission, &own],
-        )
-        .action
+        agent
+            .permission
+            .extended(&own)
+            .evaluate(crate::tool::memory::MEMORY_TOOL, "remember")
+            .action
             == PermissionV1Action::Allow
     }
 

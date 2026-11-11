@@ -118,7 +118,7 @@ fn writer(
         return Ok((memory, project_id, Provenance::api()));
     }
     let allowed = services.agents.default_info().is_ok_and(|agent| {
-        alforria_core::tool::permission::evaluate(permission, pattern, &[&agent.permission]).action
+        agent.permission.evaluate(permission, pattern).action
             == alforria_schema::permission_v1::PermissionV1Action::Allow
     });
     if !allowed {

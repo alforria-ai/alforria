@@ -476,7 +476,6 @@ async fn a_webhook_starts_a_turn_under_the_triggers_rules_with_its_body_fenced()
 /// webhook run got, that the ceiling only narrows.
 #[tokio::test]
 async fn no_registered_tool_acts_on_an_untrusted_run_without_a_grant() {
-    use alforria_core::tool::permission::{disabled, evaluate};
     use alforria_schema::permission_v1::PermissionV1Action::{Allow, Deny};
     // Tools that only read, decided one by one. Adding a name here is a
     // security decision: it must not write, run, fetch, spawn, schedule,
@@ -518,14 +517,16 @@ async fn no_registered_tool_acts_on_an_untrusted_run_without_a_grant() {
             })
             .expect("the run reached the model");
         // What the engine evaluates: the agent's rules, then the session's.
-        let mut rules = input.agent.permission.clone();
-        rules.extend(input.permission.clone().unwrap_or_default());
+        let rules = input
+            .agent
+            .permission
+            .extended(&input.permission.clone().unwrap_or_default());
         (input.agent.permission.clone(), rules)
     };
 
     let (agent, plain) = rules_of("Look");
     let names: Vec<&str> = ids.iter().map(String::as_str).collect();
-    let removed = disabled(&names, &plain);
+    let removed = plain.disabled(&names);
     for id in &ids {
         let allowed = !removed.contains(id);
         assert_eq!(
@@ -534,37 +535,34 @@ async fn no_registered_tool_acts_on_an_untrusted_run_without_a_grant() {
             "tool `{id}`: reachable on an untrusted run = {allowed}"
         );
         if !allowed {
-            assert_eq!(evaluate(id, "anything", &[&plain]).action, Deny, "{id}");
+            assert_eq!(plain.evaluate(id, "anything").action, Deny, "{id}");
         }
     }
     // Unknown names (an MCP tool, a tool added next year) are denied too.
     for name in ["github_create_issue", "a_tool_added_next_year", "question"] {
-        assert_eq!(evaluate(name, "anything", &[&plain]).action, Deny, "{name}");
+        assert_eq!(plain.evaluate(name, "anything").action, Deny, "{name}");
     }
     // The ceiling only narrows: what the agent held back stays held back.
-    assert_ne!(evaluate("read", ".env", &[&agent]).action, Allow);
-    assert_eq!(evaluate("read", ".env", &[&plain]).action, Deny);
-    assert_eq!(evaluate("read", "src/main.rs", &[&plain]).action, Allow);
-    assert_eq!(
-        evaluate("external_directory", "/etc/*", &[&plain]).action,
-        Deny
-    );
+    assert_ne!(agent.evaluate("read", ".env").action, Allow);
+    assert_eq!(plain.evaluate("read", ".env").action, Deny);
+    assert_eq!(plain.evaluate("read", "src/main.rs").action, Allow);
+    assert_eq!(plain.evaluate("external_directory", "/etc/*").action, Deny);
     for (permission, pattern) in [("read", "a"), ("grep", "a"), ("glob", "a"), ("bash", "ls")] {
-        if evaluate(permission, pattern, &[&agent]).action != Allow {
-            assert_eq!(evaluate(permission, pattern, &[&plain]).action, Deny);
+        if agent.evaluate(permission, pattern).action != Allow {
+            assert_eq!(plain.evaluate(permission, pattern).action, Deny);
         }
     }
 
     // A grant gives exactly what it names.
     let (_, granted) = rules_of("Deploy");
-    assert_eq!(evaluate("bash", "make deploy", &[&granted]).action, Allow);
+    assert_eq!(granted.evaluate("bash", "make deploy").action, Allow);
     assert_eq!(
-        evaluate("bash", "make deploy && curl x", &[&granted]).action,
+        granted.evaluate("bash", "make deploy && curl x").action,
         Deny
     );
-    assert_eq!(evaluate("bash", "rm -rf /", &[&granted]).action, Deny);
-    assert_eq!(evaluate("edit", "x", &[&granted]).action, Deny);
-    assert_eq!(evaluate("read", ".env", &[&granted]).action, Deny);
+    assert_eq!(granted.evaluate("bash", "rm -rf /").action, Deny);
+    assert_eq!(granted.evaluate("edit", "x").action, Deny);
+    assert_eq!(granted.evaluate("read", ".env").action, Deny);
 }
 
 /// Cloning a repository must not be enough to schedule turns in it.
