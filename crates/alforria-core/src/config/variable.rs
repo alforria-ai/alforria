@@ -226,15 +226,16 @@ fn resolve_file_path(config_dir: &Path, file_path: &str) -> PathBuf {
 /// `${VAR}` expansion in a provider base URL (provider.ts:1734-1741) — the
 /// one implementation, for the loader and the provider runtime.
 ///
-/// `allowed` is the same decision `{env:NAME}` is under for the source the
-/// text came from: a name it refuses expands to nothing (and is logged), so
-/// a URL never carries a variable its author was not entitled to read. An
-/// allowed name that is unset is left as written, as upstream does.
+/// One pass over the text as written: a substituted value is never scanned
+/// again. `allowed` is the decision `{env:NAME}` is under for the source the
+/// text came from; a name it refuses is an `Err` carrying that name — the
+/// caller turns it into an error, never into a URL. An allowed name that is
+/// unset is left as written, as upstream does.
 pub fn interpolate_dollar(
     text: &str,
     allowed: &dyn Fn(&str) -> bool,
     lookup: &dyn Fn(&str) -> Option<String>,
-) -> String {
+) -> Result<String, String> {
     let mut out = String::new();
     let mut rest = text;
     while let Some(start) = rest.find("${") {
@@ -245,16 +246,30 @@ pub fn interpolate_dollar(
         };
         let key = &rest[2..end];
         if !allowed(key) {
-            tracing::warn!("not expanding ${{{key}}} in a base URL: its source may not read it");
-        } else if let Some(value) = lookup(key) {
-            out.push_str(&value);
-        } else {
-            out.push_str(&rest[..end + 1]);
+            return Err(key.to_string());
+        }
+        match lookup(key) {
+            Some(value) => out.push_str(&value),
+            None => out.push_str(&rest[..end + 1]),
         }
         rest = &rest[end + 1..];
     }
     out.push_str(rest);
-    out
+    Ok(out)
+}
+
+/// [`interpolate_dollar`] for a source that is not the host's, made final:
+/// whatever `${` the result still holds — an unset reference, a value that
+/// itself contains one, a `$${X}` whose expansion forms one — is written
+/// `%24{`, the same URL text with nothing left that a later expansion (the
+/// provider runtime's, which knows the host's rule only) would act on. The
+/// expansion of such a URL happens here, once, under its source's rule.
+pub fn interpolate_dollar_final(
+    text: &str,
+    allowed: &dyn Fn(&str) -> bool,
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> Result<String, String> {
+    interpolate_dollar(text, allowed, lookup).map(|expanded| expanded.replace("${", "%24{"))
 }
 
 /// Read a confined `{file:path}`: the path must be relative and is opened
@@ -447,6 +462,48 @@ mod tests {
         // A remote config: no root, no files.
         let err = confined("{file:inside.txt}", &file, None, &any).unwrap_err();
         assert!(err.to_string().contains("remote config"), "{err}");
+    }
+
+    #[test]
+    fn dollar_expansion_is_one_pass_and_a_refusal_is_an_error() {
+        let lookup = |name: &str| match name {
+            "REGION" => Some("eu".to_string()),
+            "NESTED" => Some("${SECRET}".to_string()),
+            "BRACE" => Some("{SECRET}".to_string()),
+            "SECRET" => Some("hunter2".to_string()),
+            _ => None,
+        };
+        let open = |name: &str| name != "SECRET";
+        let expand = |text: &str| interpolate_dollar(text, &open, &lookup);
+        assert_eq!(
+            expand("https://${REGION}.x/${UNSET}").unwrap(),
+            "https://eu.x/${UNSET}"
+        );
+        // Refused: an error naming the variable, not a URL.
+        assert_eq!(expand("https://x/${SECRET}"), Err("SECRET".to_string()));
+        // A value is not scanned again…
+        assert_eq!(
+            expand("https://x/${NESTED}").unwrap(),
+            "https://x/${SECRET}"
+        );
+        assert_eq!(
+            expand("https://x/$${BRACE}").unwrap(),
+            "https://x/${SECRET}"
+        );
+        // …and the final form leaves nothing for a later pass to expand.
+        let last = |text: &str| interpolate_dollar_final(text, &open, &lookup).unwrap();
+        for text in [
+            "https://x/${NESTED}",
+            "https://x/$${BRACE}",
+            "https://x/${UNSET}",
+        ] {
+            let once = last(text);
+            assert!(!once.contains("${"), "{once}");
+            let again = interpolate_dollar(&once, &|_| true, &lookup).unwrap();
+            assert_eq!(again, once);
+            assert!(!again.contains("hunter2"));
+        }
+        assert_eq!(last("https://x/${NESTED}"), "https://x/%24{SECRET}");
     }
 
     #[test]

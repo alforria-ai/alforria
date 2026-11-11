@@ -1351,8 +1351,18 @@ impl ConfigLoader {
         // expanded here, by this source's rule, so nothing is left for the
         // provider runtime to expand without knowing where the URL came
         // from.
+        // The expansion is final (`interpolate_dollar_final`), and a name
+        // the source may not read is a config error.
         if confinement.is_some() {
-            expand_base_urls(&mut value, &env_allowed, env);
+            expand_base_urls(&mut value, &env_allowed, env).map_err(|(key, name)| {
+                CoreError::invalid(
+                    &source_path,
+                    format!(
+                        "`{key}` refers to ${{{name}}}: a project's or a remote config may not \
+                         read that variable (see `server.trust.project_env`)"
+                    ),
+                )
+            })?;
         }
         // `ConfigV2Compat.lower(normalizeLoadedConfig(input))` before the
         // V1 schema (config.ts:189) — V2 keys lower onto V1, V2 permissions
@@ -1403,39 +1413,42 @@ impl ConfigLoader {
 
 /// The config strings the provider runtime treats as a base URL and expands
 /// `${VAR}` in: `provider.*.api`, `provider.*.options.baseURL` and
-/// `provider.*.models.*.provider.api`.
+/// `provider.*.models.*.provider.api`. `Err` is the key and the variable it
+/// may not read.
 fn expand_base_urls(
     config: &mut Value,
     allowed: &dyn Fn(&str) -> bool,
     env: &HashMap<String, String>,
-) {
+) -> Result<(), (String, String)> {
     let lookup = |name: &str| env.get(name).cloned().or_else(|| std::env::var(name).ok());
-    let expand = |value: &mut Value| {
-        if let Value::String(text) = value {
-            *text = super::variable::interpolate_dollar(text, allowed, &lookup);
+    let expand = |value: Option<&mut Value>, key: String| -> Result<(), (String, String)> {
+        if let Some(Value::String(text)) = value {
+            *text = super::variable::interpolate_dollar_final(text, allowed, &lookup)
+                .map_err(|name| (key, name))?;
         }
+        Ok(())
     };
     let Some(Value::Object(providers)) = config.get_mut("provider") else {
-        return;
+        return Ok(());
     };
-    for provider in providers.values_mut() {
-        if let Some(api) = provider.get_mut("api") {
-            expand(api);
-        }
-        if let Some(url) = provider
-            .get_mut("options")
-            .and_then(|o| o.get_mut("baseURL"))
-        {
-            expand(url);
-        }
+    for (id, provider) in providers.iter_mut() {
+        expand(provider.get_mut("api"), format!("provider.{id}.api"))?;
+        expand(
+            provider
+                .get_mut("options")
+                .and_then(|o| o.get_mut("baseURL")),
+            format!("provider.{id}.options.baseURL"),
+        )?;
         if let Some(Value::Object(models)) = provider.get_mut("models") {
-            for model in models.values_mut() {
-                if let Some(api) = model.get_mut("provider").and_then(|p| p.get_mut("api")) {
-                    expand(api);
-                }
+            for (model_id, model) in models.iter_mut() {
+                expand(
+                    model.get_mut("provider").and_then(|p| p.get_mut("api")),
+                    format!("provider.{id}.models.{model_id}.provider.api"),
+                )?;
             }
         }
     }
+    Ok(())
 }
 
 /// `globalConfigFile()` — first existing of `opencode.jsonc`,
@@ -2399,46 +2412,81 @@ mod tests {
     }
 
     /// `${VAR}` in a base URL from a project config is the same read as
-    /// `{env:VAR}`, under the same rule, and is settled at load: a name the
-    /// source may not read is gone, and nothing is left for the provider
-    /// runtime to expand.
+    /// `{env:VAR}`, under the same rule, and it is settled at load, once: a
+    /// name the source may not read is a config error naming the file and
+    /// the variable, and what the result holds is final — the provider
+    /// runtime finds nothing left to expand under its own, wider rule.
     #[test]
-    fn a_project_base_url_expands_only_what_its_source_may_read() {
+    fn a_project_base_url_is_expanded_once_under_its_sources_rule() {
         let f = Fixture::new();
         let work = f.root.join("work");
         std::env::set_var("ALFORRIA_URLTEST_SECRET", "hunter2");
         std::env::set_var("ALFORRIA_URLTEST_REGION", "eu");
-        let project = json!({ "provider": { "acme": {
-            "api": "https://${ALFORRIA_URLTEST_REGION}.a.example/${ALFORRIA_URLTEST_SECRET}",
-            "options": { "baseURL": "https://b.example/${ALFORRIA_URLTEST_SECRET}/${ALFORRIA_URLTEST_REGION}" },
-            "models": { "m": { "provider": { "api": "https://c.example/${ALFORRIA_URLTEST_SECRET}" } } },
-        } } })
-        .to_string();
-        write(&work.join("opencode.json"), &project);
+        // An allowed variable whose value is itself a reference.
+        std::env::set_var("ALFORRIA_URLTEST_NESTED", "${ALFORRIA_URLTEST_SECRET}");
+        let provider = |api: &str, base: &str, model: &str| {
+            json!({ "provider": { "acme": {
+                "api": api,
+                "options": { "baseURL": base },
+                "models": { "m": { "provider": { "api": model } } },
+            } } })
+            .to_string()
+        };
         let urls = |f: &Fixture| {
             let (config, _) = f.load().unwrap();
             let acme = serde_json::to_value(&config.provider.unwrap()["acme"]).unwrap();
+            let text = |value: &Value| value.as_str().unwrap_or_default().to_string();
             (
-                acme["api"].as_str().unwrap_or_default().to_string(),
-                acme["options"]["baseURL"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_string(),
-                acme["models"]["m"]["provider"]["api"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_string(),
+                text(&acme["api"]),
+                text(&acme["options"]["baseURL"]),
+                text(&acme["models"]["m"]["provider"]["api"]),
             )
         };
-        // Full trust: an ordinary variable expands, a withheld one does not.
-        assert_eq!(
-            urls(&f),
+
+        // Refused, in each of the three places: an error, no URL.
+        let secret = "https://x.example/${ALFORRIA_URLTEST_SECRET}";
+        let plain = "https://x.example";
+        for (config, key) in [
+            (provider(secret, plain, plain), "provider.acme.api"),
             (
-                "https://eu.a.example/".to_string(),
-                "https://b.example//eu".to_string(),
-                "https://c.example/".to_string()
-            )
+                provider(plain, secret, plain),
+                "provider.acme.options.baseURL",
+            ),
+            (
+                provider(plain, plain, secret),
+                "provider.acme.models.m.provider.api",
+            ),
+        ] {
+            write(&work.join("opencode.json"), &config);
+            let error = f.load().unwrap_err().to_string();
+            assert!(error.contains(key), "{error}");
+            assert!(error.contains("ALFORRIA_URLTEST_SECRET"), "{error}");
+            assert!(error.contains("opencode.json"), "{error}");
+            assert!(!error.contains("hunter2"), "{error}");
+        }
+
+        // Allowed: expanded; a value holding a reference, an unset name and
+        // a `$${…}` construction are literal text afterwards.
+        write(
+            &work.join("opencode.json"),
+            &provider(
+                "https://${ALFORRIA_URLTEST_REGION}.a.example/${ALFORRIA_URLTEST_NESTED}",
+                "https://b.example/${ALFORRIA_URLTEST_UNSET}",
+                "https://c.example/$${ALFORRIA_URLTEST_REGION}",
+            ),
         );
+        let (api, base, model) = urls(&f);
+        assert_eq!(api, "https://eu.a.example/%24{ALFORRIA_URLTEST_SECRET}");
+        assert_eq!(base, "https://b.example/%24{ALFORRIA_URLTEST_UNSET}");
+        assert_eq!(model, "https://c.example/$eu");
+        // A second expansion — the runtime's, under any rule — changes
+        // nothing and reveals nothing.
+        for url in [&api, &base, &model] {
+            let lookup = |name: &str| std::env::var(name).ok();
+            let again = super::super::variable::interpolate_dollar(url, &|_| true, &lookup);
+            assert_eq!(again.as_ref(), Ok(url));
+        }
+
         // Restricted, with the provider keys handed back: only the names
         // on `project_env` — the ordinary variable is refused as well.
         write(
@@ -2449,20 +2497,25 @@ mod tests {
             } } })
             .to_string(),
         );
-        assert_eq!(
-            urls(&f),
-            (
-                "https://.a.example/".to_string(),
-                "https://b.example//".to_string(),
-                "https://c.example/".to_string()
-            )
+        write(
+            &work.join("opencode.json"),
+            &provider("https://${ALFORRIA_URLTEST_REGION}.a.example", plain, plain),
         );
-        // The user's own config keeps the reference for the runtime.
+        let error = f.load().unwrap_err().to_string();
+        assert!(error.contains("ALFORRIA_URLTEST_REGION"), "{error}");
+
+        // The user's own config keeps today's behaviour: the reference is
+        // left for the runtime, which expands it under the host's rule.
         fs::remove_file(work.join("opencode.json")).unwrap();
-        write(&f.root.join("config").join("opencode.json"), &project);
-        assert!(urls(&f).0.contains("${ALFORRIA_URLTEST_REGION}"));
-        std::env::remove_var("ALFORRIA_URLTEST_SECRET");
-        std::env::remove_var("ALFORRIA_URLTEST_REGION");
+        let own = "https://${ALFORRIA_URLTEST_REGION}.a.example/${ALFORRIA_URLTEST_SECRET}";
+        write(
+            &f.root.join("config").join("opencode.json"),
+            &provider(own, plain, plain),
+        );
+        assert_eq!(urls(&f).0, own);
+        for name in ["SECRET", "REGION", "NESTED"] {
+            std::env::remove_var(format!("ALFORRIA_URLTEST_{name}"));
+        }
     }
 
     /// `server.trust.host: "managed"` (in the managed directory): the

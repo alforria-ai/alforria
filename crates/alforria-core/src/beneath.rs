@@ -8,8 +8,12 @@
 //! `RESOLVE_BENEATH` (links inside the root are followed, nothing —
 //! `..`, an absolute link, a magic link — leaves it); where that is not
 //! available, a component-by-component `openat` with `O_NOFOLLOW`, which
-//! refuses every symlink on the way. The caller reads from the descriptor
-//! it gets back; there is no second lookup of the name.
+//! refuses every symlink on the way (every other Unix, and a Linux kernel
+//! without `openat2`: `ENOSYS`, or `EPERM`/`EINVAL` from a filter — never a
+//! check of the name). On Windows the file is opened and the decision is
+//! made from the opened handles' final paths (`GetFinalPathNameByHandleW`);
+//! a platform with neither refuses. The caller reads from the descriptor it
+//! gets back; there is no second lookup of the name.
 //!
 //! Every "path must stay inside root" read goes through here.
 
@@ -193,26 +197,102 @@ mod imp {
     }
 }
 
-#[cfg(not(unix))]
+/// The decision for a platform without `openat`: made from the *opened
+/// handles'* final paths, never from a name. `None` — the platform could
+/// not say where a handle points — is a refusal.
+#[cfg(any(windows, test))]
+fn decide_from_final_paths(root: Option<&Path>, file: Option<&Path>) -> io::Result<()> {
+    let (Some(root), Some(file)) = (root, file) else {
+        return Err(refused(
+            "cannot tell where the opened file is: refusing rather than trusting its name",
+        ));
+    };
+    if file != root && file.starts_with(root) {
+        Ok(())
+    } else {
+        Err(refused("the path leads outside its root"))
+    }
+}
+
+#[cfg(windows)]
+mod imp {
+    use super::decide_from_final_paths;
+    use std::fs::File;
+    use std::io;
+    use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use std::path::{Path, PathBuf};
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    /// `FILE_NAME_NORMALIZED | VOLUME_NAME_DOS`.
+    const FINAL_PATH_FLAGS: u32 = 0;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetFinalPathNameByHandleW(
+            file: *mut core::ffi::c_void,
+            path: *mut u16,
+            len: u32,
+            flags: u32,
+        ) -> u32;
+    }
+
+    /// Where an open handle points, links and all resolved — asked of the
+    /// handle, so it is the file that was opened whatever its name does
+    /// afterwards.
+    fn final_path(file: &File) -> Option<PathBuf> {
+        let mut buffer = vec![0u16; 1024];
+        loop {
+            // SAFETY: the handle is open and the buffer has the length
+            // passed; the result is checked.
+            let len = unsafe {
+                GetFinalPathNameByHandleW(
+                    file.as_raw_handle() as *mut core::ffi::c_void,
+                    buffer.as_mut_ptr(),
+                    buffer.len() as u32,
+                    FINAL_PATH_FLAGS,
+                )
+            } as usize;
+            if len == 0 {
+                return None;
+            }
+            if len > buffer.len() {
+                buffer.resize(len, 0);
+                continue;
+            }
+            return Some(PathBuf::from(std::ffi::OsString::from_wide(&buffer[..len])));
+        }
+    }
+
+    pub fn open(root: &Path, relative: &Path) -> io::Result<File> {
+        // A directory handle needs backup semantics.
+        let root_handle = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(root)?;
+        let file = File::open(root.join(relative))?;
+        decide_from_final_paths(
+            final_path(&root_handle).as_deref(),
+            final_path(&file).as_deref(),
+        )?;
+        Ok(file)
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 mod imp {
     use super::refused;
     use std::fs::File;
     use std::io;
     use std::path::Path;
 
-    /// No `openat` here: open, then judge the file that was opened by the
-    /// real path of its handle's target, refusing when either end does not
-    /// resolve.
-    pub fn open(root: &Path, relative: &Path) -> io::Result<File> {
-        let real_root = std::fs::canonicalize(root)?;
-        let path = real_root.join(relative);
-        let file = File::open(&path)?;
-        let real = std::fs::canonicalize(&path)?;
-        if real.starts_with(&real_root) {
-            Ok(file)
-        } else {
-            Err(refused("the path leads outside its root"))
-        }
+    /// No way here to open beneath a directory or to ask a handle where it
+    /// points: refuse, rather than check a name.
+    pub fn open(_root: &Path, _relative: &Path) -> io::Result<File> {
+        Err(refused(
+            "confined file access is not supported on this platform",
+        ))
     }
 }
 
@@ -227,6 +307,27 @@ mod tests {
         std::fs::write(root.join("sub/inside.txt"), "inside").unwrap();
         std::fs::write(dir.path().join("secret.txt"), "secret").unwrap();
         (dir, root)
+    }
+
+    /// The handle-based decision (Windows): inside only when both final
+    /// paths are known and the file's is below the root's. The swap shape —
+    /// a name inside the root whose handle resolved outside — is refused,
+    /// and so is a platform that cannot say.
+    #[test]
+    fn the_final_path_decision_fails_closed() {
+        let root = Path::new("/srv/root");
+        let decide = |root: Option<&Path>, file: Option<&str>| {
+            decide_from_final_paths(root, file.map(Path::new)).map_err(|error| error.kind())
+        };
+        assert_eq!(decide(Some(root), Some("/srv/root/sub/a.txt")), Ok(()));
+        let denied = Err(io::ErrorKind::PermissionDenied);
+        // Opened through a link that pointed out.
+        assert_eq!(decide(Some(root), Some("/srv/secret.txt")), denied);
+        assert_eq!(decide(Some(root), Some("/srv/root-other/a.txt")), denied);
+        assert_eq!(decide(Some(root), Some("/srv/root")), denied);
+        // No answer from the platform, for either handle.
+        assert_eq!(decide(Some(root), None), denied);
+        assert_eq!(decide(None, Some("/srv/root/a.txt")), denied);
     }
 
     #[test]

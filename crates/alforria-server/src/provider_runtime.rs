@@ -999,17 +999,36 @@ impl LlmRequestSender for RouteLlmSender {
 /// `${VAR}` interpolation over the env (provider.ts:1734-1741), through the
 /// one implementation (`alforria_core::config::interpolate_dollar`).
 ///
-/// What reaches here is the host's: a base URL from the user's own config or
-/// the model catalog. A project's or a remote config had its `${VAR}`
-/// expanded at load, under the rule of its origin
-/// (`config::precedence::expand_base_urls`), and none is left in it. Even
-/// for the host's own a URL never carries a variable the shell environment
-/// policy withholds from the agent's processes.
+/// What reaches here with a `${…}` in it is the host's: a base URL from the
+/// user's own config or the model catalog. A project's or a remote config
+/// had its URLs expanded at load, once, under the rule of its origin, and
+/// in a form that holds no `${` any more
+/// (`config::interpolate_dollar_final`): for those this pass finds nothing
+/// to do, so no URL is expanded twice or under a rule that is not its
+/// source's. Even the host's own URL never carries a variable the shell
+/// environment policy withholds from the agent's processes: such a
+/// reference is left as written (a URL that will not resolve) and logged.
 fn interpolate_env(url: &str) -> String {
     let policy = alforria_core::shell_env::current();
-    alforria_core::config::interpolate_dollar(url, &|key| !policy.denied(key), &|key| {
+    interpolate_env_with(url, &|key| !policy.denied(key), &|key| {
         std::env::var(key).ok()
     })
+}
+
+fn interpolate_env_with(
+    url: &str,
+    allowed: &dyn Fn(&str) -> bool,
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> String {
+    match alforria_core::config::interpolate_dollar(url, allowed, lookup) {
+        Ok(expanded) => expanded,
+        Err(name) => {
+            tracing::warn!(
+                "not expanding the base URL {url}: ${{{name}}} is withheld from URLs (shell_env)"
+            );
+            url.to_string()
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1089,17 +1108,42 @@ mod tests {
     }
 
     /// A base URL never carries a variable the shell environment policy
-    /// withholds: `https://attacker.example/${OPENCODE_SERVER_PASSWORD}`.
+    /// withholds, a substituted value is not expanded again, and a URL a
+    /// project config already settled is left alone.
     #[test]
-    fn interpolate_env_never_substitutes_a_withheld_secret() {
-        std::env::set_var("OPENCODE_API_KEY", "sk-runtime-secret");
-        std::env::set_var("ALFORRIA_RUNTIME_TEST_REGION", "eu");
-        let url = interpolate_env(
-            "https://${ALFORRIA_RUNTIME_TEST_REGION}.x.example/${OPENCODE_API_KEY}",
+    fn interpolate_env_is_one_pass_and_never_substitutes_a_withheld_secret() {
+        let lookup = |key: &str| match key {
+            "SERVER_SECRET" => Some("hunter2".to_string()),
+            "REGION" => Some("eu".to_string()),
+            "NESTED" => Some("${SERVER_SECRET}".to_string()),
+            _ => None,
+        };
+        let allowed = |key: &str| key != "SERVER_SECRET";
+        let expand = |url: &str| interpolate_env_with(url, &allowed, &lookup);
+        // The host's own URL: today's behaviour.
+        assert_eq!(
+            expand("https://${REGION}.x.example/v1"),
+            "https://eu.x.example/v1"
         );
-        std::env::remove_var("OPENCODE_API_KEY");
-        std::env::remove_var("ALFORRIA_RUNTIME_TEST_REGION");
-        assert_eq!(url, "https://eu.x.example/");
+        assert_eq!(
+            expand("https://x.example/${UNSET}"),
+            "https://x.example/${UNSET}"
+        );
+        // Withheld: nothing of the URL is expanded.
+        assert_eq!(
+            expand("https://${REGION}.x.example/${SERVER_SECRET}"),
+            "https://${REGION}.x.example/${SERVER_SECRET}"
+        );
+        // A value holding a reference stays that text.
+        assert_eq!(
+            expand("https://x.example/${NESTED}"),
+            "https://x.example/${SERVER_SECRET}"
+        );
+        // What the loader settled for a project config has no reference.
+        assert_eq!(
+            expand("https://x.example/%24{SERVER_SECRET}"),
+            "https://x.example/%24{SERVER_SECRET}"
+        );
     }
 
     #[test]
