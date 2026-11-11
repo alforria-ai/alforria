@@ -7,6 +7,7 @@ pub mod compaction;
 pub mod error;
 pub mod event_definitions;
 pub mod from_error;
+pub mod goal;
 pub mod ids;
 pub mod instruction;
 pub mod llm;

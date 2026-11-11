@@ -1065,6 +1065,357 @@ mod tests {
         );
     }
 
+    // ------------------------------------------------------------------
+    // /goal — the reviewer loop
+    // ------------------------------------------------------------------
+
+    fn goal_command(session_id: &str, arguments: &str) -> crate::session::prompt::CommandInput {
+        crate::session::prompt::CommandInput {
+            session_id: session_id.to_string(),
+            message_id: None,
+            agent: Some("build".to_string()),
+            model: None,
+            variant: None,
+            arguments: arguments.to_string(),
+            command: "goal".to_string(),
+            parts: Vec::new(),
+        }
+    }
+
+    fn verdict(json: &str) -> Vec<Result<LlmEvent, LlmError>> {
+        text_stream(json)
+    }
+
+    /// Wait for the goal loop, which runs detached, to leave `active`.
+    async fn goal_settles(e: &Engine, session_id: &str) -> crate::session::goal::GoalState {
+        tokio::time::timeout(TIMEOUT, async {
+            loop {
+                let goal = e.prompt.goals().read(session_id).expect("a goal is set");
+                if goal.status != crate::session::goal::GoalStatus::Active {
+                    return goal;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the goal settles")
+    }
+
+    /// The user messages of a session, oldest first.
+    fn user_texts(e: &Engine, session_id: &str) -> Vec<String> {
+        e.services
+            .messages
+            .stream(session_id)
+            .unwrap()
+            .into_iter()
+            .rev()
+            .filter(|message| matches!(message.info, V1Message::User { .. }))
+            .map(|message| {
+                message
+                    .parts
+                    .iter()
+                    .filter_map(|part| match part {
+                        V1Part::Text { text, .. } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_goal_keeps_the_session_working_until_the_reviewer_is_satisfied() {
+        use crate::session::goal::GoalStatus;
+        let e = engine(
+            "e2e-goal-loop",
+            vec![
+                text_stream("I think it is done."),
+                verdict(
+                    r#"{"verdict":"continue","reason":"no test output shown","next_step":"run the tests"}"#,
+                ),
+                text_stream("Ran the tests: 12 passed."),
+                verdict(r#"{"verdict":"done","reason":"the test run shows 12 passed"}"#),
+            ],
+        );
+        let session = create_engine_session(&e);
+        let rx = e.services.events.all();
+
+        tokio::time::timeout(
+            TIMEOUT,
+            e.prompt
+                .command(goal_command(&session.id, "\"make <the> tests pass\"")),
+        )
+        .await
+        .expect("the kickoff turn ends")
+        .expect("the kickoff turn succeeds");
+
+        let goal = goal_settles(&e, &session.id).await;
+        assert_eq!(goal.status, GoalStatus::Complete);
+        assert_eq!(goal.objective, "make <the> tests pass");
+        assert_eq!(goal.reason.as_deref(), Some("the test run shows 12 passed"));
+        assert_eq!(goal.rounds, 1);
+        assert_eq!(e.llm.calls(), 4, "two turns, each followed by a review");
+
+        let users = user_texts(&e, &session.id);
+        assert_eq!(
+            users.len(),
+            2,
+            "the kickoff and one continuation: {users:?}"
+        );
+        // The user sees their objective; the model gets it fenced as data.
+        assert!(
+            users[0].starts_with("Goal: make <the> tests pass\n"),
+            "{}",
+            users[0]
+        );
+        assert!(
+            users[0].contains("make &lt;the&gt; tests pass"),
+            "{}",
+            users[0]
+        );
+        assert!(users[1].starts_with("Continue working toward the active goal."));
+        assert!(users[1].contains("no test output shown\nNext step: run the tests"));
+
+        // The reviewer reads the conversation with no tools to act with.
+        assert!(e.llm.input(1).tools.is_empty() && e.llm.input(3).tools.is_empty());
+        assert!(
+            !e.llm.input(0).tools.is_empty(),
+            "the working turn keeps its tools"
+        );
+
+        let changes: Vec<Value> = drain(rx)
+            .into_iter()
+            .filter(|(kind, _)| kind == "goal.changed")
+            .map(|(_, data)| data["goal"]["status"].clone())
+            .collect();
+        assert_eq!(
+            changes,
+            vec![json!("active"), json!("active"), json!("complete")],
+            "set, one continuation, done"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_goal_pauses_when_the_reviewer_says_the_user_is_needed() {
+        use crate::session::goal::GoalStatus;
+        let e = engine(
+            "e2e-goal-blocked",
+            vec![
+                text_stream("I need the deploy key."),
+                verdict(r#"{"verdict":"blocked","reason":"the assistant needs a deploy key"}"#),
+            ],
+        );
+        let session = create_engine_session(&e);
+        e.prompt
+            .command(goal_command(&session.id, "deploy the site"))
+            .await
+            .unwrap();
+        let goal = goal_settles(&e, &session.id).await;
+        assert_eq!(goal.status, GoalStatus::Paused);
+        assert_eq!(
+            goal.reason.as_deref(),
+            Some("the assistant needs a deploy key")
+        );
+        assert_eq!(e.llm.calls(), 2);
+        assert_eq!(
+            user_texts(&e, &session.id).len(),
+            1,
+            "no continuation was sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_goal_going_nowhere_is_paused() {
+        use crate::session::goal::{GoalStatus, MAX_STALLS};
+        let same = r#"{"verdict":"continue","reason":"nothing was changed"}"#;
+        let mut script = Vec::new();
+        for _ in 0..MAX_STALLS {
+            script.push(text_stream("Thinking about it."));
+            script.push(verdict(same));
+        }
+        // Would be used if the loop kept going.
+        script.push(text_stream("Still thinking."));
+        let e = engine("e2e-goal-stall", script);
+        let session = create_engine_session(&e);
+        e.prompt
+            .command(goal_command(&session.id, "refactor the parser"))
+            .await
+            .unwrap();
+        let goal = goal_settles(&e, &session.id).await;
+        assert_eq!(goal.status, GoalStatus::Paused);
+        assert_eq!(
+            goal.reason.as_deref(),
+            Some("Not making progress: nothing was changed")
+        );
+        assert_eq!(e.llm.calls(), (MAX_STALLS * 2) as usize);
+    }
+
+    #[tokio::test]
+    async fn stopping_between_rounds_pauses_the_goal() {
+        use crate::session::goal::GoalStatus;
+        let e = engine(
+            "e2e-goal-stop",
+            vec![
+                text_stream("Working."),
+                verdict(r#"{"verdict":"continue","reason":"not finished"}"#),
+                text_stream("must never run"),
+            ],
+        );
+        // The review hangs, as a slow model would, while the user hits stop.
+        e.llm.hang_stream(1);
+        let session = create_engine_session(&e);
+        e.prompt
+            .command(goal_command(&session.id, "write the docs"))
+            .await
+            .unwrap();
+        tokio::time::timeout(TIMEOUT, async {
+            while e.llm.calls() < 2 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the review starts");
+        e.prompt.cancel(&session.id).await.unwrap();
+        let goal = goal_settles(&e, &session.id).await;
+        assert_eq!(goal.status, GoalStatus::Paused);
+        assert_eq!(goal.reason.as_deref(), Some("Stopped by the user"));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(e.llm.calls(), 2, "no continuation after a stop");
+    }
+
+    #[tokio::test]
+    async fn goal_controls_and_their_refusals() {
+        use crate::session::goal::GoalStatus;
+        let e = engine(
+            "e2e-goal-controls",
+            vec![
+                text_stream("Working."),
+                verdict(r#"{"verdict":"blocked","reason":"needs a decision"}"#),
+                text_stream("Resumed work."),
+                verdict(r#"{"verdict":"done","reason":"shown in the output"}"#),
+            ],
+        );
+        let session = create_engine_session(&e);
+        let error = |result: Result<WithParts, crate::session::prompt_input::PromptError>| {
+            result.unwrap_err().to_string()
+        };
+        let run = |arguments: &'static str| e.prompt.command(goal_command(&session.id, arguments));
+
+        assert!(error(run("").await).contains("Usage: /goal"));
+        assert!(error(run("pause").await).contains("No active goal to pause."));
+        assert!(error(run("clear").await).contains("No goal is set."));
+        let long = "x".repeat(crate::session::goal::MAX_OBJECTIVE + 1);
+        assert!(
+            error(e.prompt.command(goal_command(&session.id, &long)).await)
+                .contains("limited to 4000 characters")
+        );
+        assert!(e.prompt.goals().read(&session.id).is_none());
+
+        run("ship it").await.unwrap();
+        assert_eq!(
+            goal_settles(&e, &session.id).await.status,
+            GoalStatus::Paused
+        );
+        // With no argument the command reports where the goal stands.
+        let status = error(run("").await);
+        assert!(
+            status.starts_with("Goal paused: ship it\nneeds a decision"),
+            "{status}"
+        );
+
+        run("resume").await.unwrap();
+        let goal = goal_settles(&e, &session.id).await;
+        assert_eq!(goal.status, GoalStatus::Complete);
+        assert!(user_texts(&e, &session.id)[1].contains("The user resumed the goal."));
+
+        run("clear").await.unwrap();
+        assert!(e.prompt.goals().read(&session.id).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_goal_left_active_by_another_process_comes_back_paused() {
+        use crate::session::goal::{GoalState, GoalStatus};
+        let e = engine("e2e-goal-restart", vec![text_stream("must never run")]);
+        let session = create_engine_session(&e);
+        let dir = e.temp.path().join("goal");
+        std::fs::create_dir_all(&dir).unwrap();
+        let stale = GoalState {
+            id: "g1".to_string(),
+            objective: "finish the migration".to_string(),
+            status: GoalStatus::Active,
+            reason: None,
+            rounds: 3,
+            max_rounds: 50,
+            stalls: None,
+            boot: "an-earlier-process".to_string(),
+            updated_at: 1,
+        };
+        std::fs::write(
+            dir.join(format!("{}.json", session.id)),
+            serde_json::to_vec(&stale).unwrap(),
+        )
+        .unwrap();
+        let goal = e.prompt.goals().read(&session.id).unwrap();
+        assert_eq!(goal.status, GoalStatus::Paused);
+        assert_eq!(
+            goal.reason.as_deref(),
+            Some("The server restarted while the goal was active")
+        );
+        // An ordinary prompt does not wake it.
+        run_prompt(&e, prompt_input(&session.id, "hello")).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(e.llm.calls(), 1);
+        // A path-shaped session id reads nothing rather than escaping.
+        assert!(e.prompt.goals().read("../goal/x").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_fork_is_told_it_is_a_fork() {
+        let e = engine(
+            "e2e-fork-notice",
+            vec![text_stream("original answer"), text_stream("fork answer")],
+        );
+        let session = create_engine_session(&e);
+        run_prompt(&e, prompt_input(&session.id, "start the build")).await;
+
+        let context = crate::session::store::SessionContext {
+            project_id: "global".to_string(),
+            directory: e.worktree.clone(),
+            worktree: e.worktree.clone(),
+            workspace_id: None,
+        };
+        let fork = e
+            .services
+            .sessions
+            .fork(&context, &session.id, None)
+            .unwrap();
+        e.prompt.fork_notice(&fork.id).await.unwrap();
+        assert_eq!(e.llm.calls(), 1, "the notice starts no turn");
+        let users = user_texts(&e, &fork.id);
+        assert_eq!(users.len(), 2, "{users:?}");
+        assert!(users[1].starts_with("<fork-notice>") && users[1].ends_with("</fork-notice>"));
+        // The original is untouched.
+        assert_eq!(user_texts(&e, &session.id).len(), 1);
+
+        // The next turn in the fork carries the notice to the model.
+        run_prompt(
+            &e,
+            PromptInput {
+                message_id: None,
+                ..prompt_input(&fork.id, "what is running?")
+            },
+        )
+        .await;
+        let sent = serde_json::to_string(&e.llm.input(1).messages).unwrap();
+        assert!(sent.contains("is a fork of another conversation"), "{sent}");
+
+        // A fork of nothing has nothing to be warned about.
+        let empty = create_engine_session(&e);
+        e.prompt.fork_notice(&empty.id).await.unwrap();
+        assert!(user_texts(&e, &empty.id).is_empty());
+    }
+
     #[tokio::test]
     async fn a_top_level_session_has_nobody_to_report_to() {
         let e = engine("e2e-subagent-noreport", vec![text_stream("hello")]);

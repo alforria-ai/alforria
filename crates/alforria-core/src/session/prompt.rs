@@ -85,7 +85,7 @@ pub struct SessionPromptDeps {
 /// The `SessionPrompt.Service` facade (prompt.ts:105-135).
 #[derive(Clone)]
 pub struct SessionPrompt {
-    deps: Arc<SessionPromptDeps>,
+    pub(crate) deps: Arc<SessionPromptDeps>,
 }
 
 impl From<RunnerError<SessionError>> for PromptError {
@@ -101,6 +101,14 @@ impl From<RunnerError<SessionError>> for PromptError {
 
 impl SessionPrompt {
     pub fn new(deps: SessionPromptDeps) -> Arc<SessionPrompt> {
+        // A session between goal rounds is idle, so a stop has nothing to
+        // interrupt; the goal has to hear of it directly.
+        let goals =
+            crate::session::goal::GoalStore::new(&deps.data_dir, deps.services.events.clone());
+        let clock = deps.clock.clone();
+        deps.services.run_state.on_cancel(move |session_id| {
+            goals.pause_active(session_id, "Stopped by the user", clock.now_ms());
+        });
         Arc::new(SessionPrompt {
             deps: Arc::new(deps),
         })
@@ -165,7 +173,55 @@ impl SessionPrompt {
                 parts: message.parts,
             });
         }
-        Ok(self.loop_(&input.session_id).await?)
+        let cancels = self.deps.services.run_state.cancel_count(&input.session_id);
+        let result = self.loop_(&input.session_id).await;
+        if session.parent_id.is_none() {
+            self.goal_after_turn(&input.session_id, &result, cancels);
+        }
+        Ok(result?)
+    }
+
+    /// Tell a freshly forked session what it is (upstream `fork-notice.ts`).
+    ///
+    /// A fork inherits a transcript full of promises that are not its own:
+    /// subagents it cannot continue, shells whose output lands elsewhere,
+    /// uncommitted work the original is still changing. Without the notice
+    /// the model waits for results that never arrive or redoes the work.
+    /// The note is for the model only and starts no turn.
+    pub async fn fork_notice(&self, session_id: &str) -> Result<(), PromptError> {
+        let has_history = !self
+            .deps
+            .services
+            .messages
+            .stream_without_diffs(session_id)?
+            .is_empty();
+        if !has_history {
+            return Ok(());
+        }
+        let agent = self.deps.services.sessions.get(session_id)?.agent.clone();
+        self.prompt(PromptInput {
+            session_id: session_id.to_string(),
+            message_id: None,
+            model: None,
+            agent,
+            no_reply: Some(true),
+            tools: None,
+            format: None,
+            system: None,
+            variant: None,
+            parts: vec![PromptPartInput::Text {
+                id: None,
+                text: include_str!("prompt/fork-notice.txt")
+                    .trim_end()
+                    .to_string(),
+                synthetic: Some(true),
+                ignored: None,
+                time: None,
+                metadata: None,
+            }],
+        })
+        .await
+        .map(|_| ())
     }
 
     /// `loop` (prompt.ts:1350-1354): runLoop through the run state.
@@ -222,6 +278,27 @@ impl SessionPrompt {
     /// `command` (prompt.ts:1361-1481).
     pub async fn command(&self, input: CommandInput) -> Result<WithParts, PromptError> {
         let deps = &self.deps;
+        if input.command == "goal" {
+            return match self.goal_command(&input.session_id, &input.arguments).await {
+                Ok(Some(turn)) => turn,
+                // Nothing was said to the model: hand back where the
+                // conversation stands.
+                Ok(None) => deps
+                    .services
+                    .messages
+                    .stream_without_diffs(&input.session_id)?
+                    // Newest first.
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| PromptError::Unknown {
+                        message: "The session has no messages.".to_string(),
+                    }),
+                Err(message) => {
+                    publish_error(deps, &input.session_id, &message)?;
+                    Err(PromptError::Unknown { message })
+                }
+            };
+        }
         let Some(cmd) = deps
             .config
             .command

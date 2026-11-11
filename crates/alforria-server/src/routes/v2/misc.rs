@@ -542,6 +542,17 @@ async fn command_list(
             model: None,
             subtask: Some(true),
         },
+        // alforria extension, handled by the session engine itself.
+        alforria_schema::command::CommandInfo {
+            name: "goal".to_string(),
+            template: String::new(),
+            description: Some(
+                "keep working until an objective is met [pause|resume|clear]".to_string(),
+            ),
+            agent: None,
+            model: None,
+            subtask: None,
+        },
     ];
     let params = alforria_core::LoadParams::new(location.directory.clone())
         .paths(alforria_core::GlobalPaths::from_env());

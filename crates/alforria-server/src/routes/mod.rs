@@ -3,6 +3,7 @@
 //! stack (`httpapi/server.ts:276-297`).
 
 pub mod doc;
+pub mod goal;
 pub mod ui;
 pub mod v1;
 pub mod v2;
@@ -32,6 +33,7 @@ pub fn build_router(ctx: Arc<ServerContext>) -> Router {
     // alforria extension — dynamic workflows. Kept outside the frozen
     // v1/v2 tables so the TS OpenAPI surface stays byte-identical.
     router = workflow::register(router);
+    router = goal::register(router);
 
     let router = router
         .fallback(ui::serve_ui_handler)

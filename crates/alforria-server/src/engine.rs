@@ -266,6 +266,19 @@ impl SessionEngine for ProductionEngine {
         Box::pin(async move { prompt.shell(input).await })
     }
 
+    fn fork_notice(&self, session_id: String) -> BoxFuture<'static, ()> {
+        let prompt = self.prompt.clone();
+        Box::pin(async move {
+            if let Err(error) = prompt.fork_notice(&session_id).await {
+                tracing::warn!("failed to add the fork notice to {session_id}: {error}");
+            }
+        })
+    }
+
+    fn goal(&self, session_id: &str) -> Option<alforria_core::session::goal::GoalState> {
+        self.prompt.goals().read(session_id)
+    }
+
     fn revert(
         &self,
         input: RevertInput,

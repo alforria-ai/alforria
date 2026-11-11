@@ -821,6 +821,7 @@ pub async fn update(
 
 /// `forkRaw` (`handlers/session.ts:206-230`).
 pub async fn fork(
+    State(ctx): State<Arc<ServerContext>>,
     axum::Extension(location): axum::Extension<LocationContext>,
     Path(session_id): Path<String>,
     body: Bytes,
@@ -842,12 +843,16 @@ pub async fn fork(
             return Ok(bad_request_empty());
         }
     }
-    let ctx = session_ctx(&location)?;
+    let session = session_ctx(&location)?;
     let info = location
         .services
         .sessions
-        .fork(&ctx, &session_id, payload.message_id.as_deref())
+        .fork(&session, &session_id, payload.message_id.as_deref())
         .map_err(session_error)?;
+    // Best effort: the fork exists either way.
+    if let Ok(engine) = engine(&ctx, &location) {
+        engine.fork_notice(info.id.clone()).await;
+    }
     Ok(json_ok(info))
 }
 

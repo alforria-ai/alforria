@@ -586,7 +586,11 @@ pub struct SessionRunState {
     runners: Mutex<HashMap<String, Arc<Runner<WithParts, SessionError>>>>,
     /// Cancels asked for, per session, even with nothing running to stop.
     cancels: Mutex<HashMap<String, u64>>,
+    /// Told of every cancel, whichever route it came through.
+    cancel_listeners: Mutex<Vec<CancelListener>>,
 }
+
+type CancelListener = Arc<dyn Fn(&str) + Send + Sync>;
 
 impl SessionRunState {
     pub fn new(
@@ -598,6 +602,7 @@ impl SessionRunState {
             status,
             runners: Mutex::new(HashMap::new()),
             cancels: Mutex::new(HashMap::new()),
+            cancel_listeners: Mutex::new(Vec::new()),
         })
     }
 
@@ -677,6 +682,27 @@ impl SessionRunState {
             .unwrap_or(0)
     }
 
+    /// Run `listener` with the session id on every cancel. A session can be
+    /// idle and still have something that must hear the user's stop (a goal
+    /// between rounds), which no runner interrupt would reach.
+    pub fn on_cancel(&self, listener: impl Fn(&str) + Send + Sync + 'static) {
+        self.cancel_listeners
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(Arc::new(listener));
+    }
+
+    /// Whether a background job started by this session is still running
+    /// (its result will start a turn here when it lands).
+    pub fn has_running_background(&self, session_id: &str) -> bool {
+        self.background.list().is_ok_and(|jobs| {
+            jobs.iter().any(|job| {
+                job.status == BackgroundJobStatus::Running
+                    && job.metadata_session_id("parentSessionId") == Some(session_id)
+            })
+        })
+    }
+
     pub async fn cancel(self: &Arc<Self>, session_id: &str) -> Result<(), CoreError> {
         *self
             .cancels
@@ -684,6 +710,14 @@ impl SessionRunState {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .entry(session_id.to_string())
             .or_default() += 1;
+        let listeners = self
+            .cancel_listeners
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        for listener in listeners {
+            listener(session_id);
+        }
         cancel_background_jobs(self.background.as_ref(), session_id)?;
         let existing = self.lock_runners().get(session_id).cloned();
         match existing {

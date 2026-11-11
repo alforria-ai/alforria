@@ -115,6 +115,14 @@ pub trait SessionEngine: Send + Sync {
     fn command(&self, input: CommandInput) -> BoxFuture<'static, Result<WithParts, PromptError>>;
     /// `SessionPrompt.shell` (prompt.ts:452-459).
     fn shell(&self, input: ShellInput) -> BoxFuture<'static, Result<WithParts, SessionError>>;
+    /// Tell a forked session that it is a fork (alforria extension).
+    fn fork_notice(&self, _session_id: String) -> BoxFuture<'static, ()> {
+        Box::pin(async {})
+    }
+    /// The session's `/goal`, if it has one (alforria extension).
+    fn goal(&self, _session_id: &str) -> Option<alforria_core::session::goal::GoalState> {
+        None
+    }
     /// `SessionRevert.revert` / `unrevert` (revert.ts:38-89, 96-99).
     fn revert(&self, input: RevertInput)
         -> BoxFuture<'static, Result<V1SessionInfo, SessionError>>;

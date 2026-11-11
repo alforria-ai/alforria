@@ -428,6 +428,14 @@ pub async fn command_list(
             "subtask": true,
             "hints": ["$ARGUMENTS"],
         }),
+        // alforria extension, handled by the session engine itself.
+        json!({
+            "name": "goal",
+            "description": "keep working until an objective is met [pause|resume|clear]",
+            "source": "command",
+            "template": {},
+            "hints": ["$ARGUMENTS"],
+        }),
     ];
     for (name, command) in config.command.iter().flatten() {
         commands.push(json!({
