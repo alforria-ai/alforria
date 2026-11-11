@@ -32,6 +32,7 @@ pub mod summary;
 pub mod system;
 pub mod task_ops;
 pub mod tools;
+pub mod trigger_ops;
 pub mod trim_diffs;
 pub mod usage;
 pub mod workflow_ops;

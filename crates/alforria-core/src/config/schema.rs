@@ -1277,6 +1277,13 @@ pub struct Config {
     pub compaction: Option<CompactionInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub experimental: Option<ExperimentalInfo>,
+
+    // -- alforria extensions (`config/extension.rs`) ------------------------
+    /// Scheduled and event-started turns, by id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<BTreeMap<String, crate::trigger::TriggerSpec>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub triggers: Option<crate::config::extension::TriggersInfo>,
 }
 
 /// Decode + validate a raw config value against the full wire schema.
@@ -1377,6 +1384,8 @@ fn collect_issues(value: &serde_json::Value) -> Vec<crate::SchemaIssue> {
             "tool_output" => check!(issues, key, ToolOutputInfo),
             "compaction" => check!(issues, key, CompactionInfo),
             "experimental" => check!(issues, key, ExperimentalInfo),
+            "trigger" => check!(issues, key, BTreeMap<String, crate::trigger::TriggerSpec>),
+            "triggers" => check!(issues, key, crate::config::extension::TriggersInfo),
             _ => {}
         }
     }

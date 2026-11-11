@@ -4,6 +4,7 @@
 
 pub mod doc;
 pub mod goal;
+pub mod trigger;
 pub mod ui;
 pub mod v1;
 pub mod v2;
@@ -34,6 +35,7 @@ pub fn build_router(ctx: Arc<ServerContext>) -> Router {
     // v1/v2 tables so the TS OpenAPI surface stays byte-identical.
     router = workflow::register(router);
     router = goal::register(router);
+    router = trigger::register(router);
 
     let router = router
         .fallback(ui::serve_ui_handler)

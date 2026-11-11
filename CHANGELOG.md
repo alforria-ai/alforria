@@ -38,6 +38,22 @@ pre-1.0, so minor releases may include breaking changes.
   it.
 - A forked session starts with a note telling the model it is a fork, so it
   does not wait on or redo background work that belongs to the original.
+- Triggers: turns that start on a schedule or an event instead of a person.
+  A `trigger` map in the config (or `POST /trigger`) pairs a prompt with a
+  5-field cron expression in a real timezone, an interval, a one-shot time, a
+  watched path, or a webhook. Each run is an ordinary session under the
+  trigger's own permission rules, with the prompt marked
+  `metadata.trigger = { id, run }`. A tick that finds the last run still going
+  is skipped and recorded, missed ticks are not replayed (`catch_up` runs the
+  latest one), and `quiet_token` lets a check that found nothing stay silent.
+  Runs are announced by `trigger.fired`, `trigger.completed`, `trigger.failed`
+  and `trigger.skipped`. Triggers are read from your own config, never from a
+  project's, and a webhook run cannot act unless its trigger allows it. See
+  `docs/assistant.md`.
+- A `schedule` tool, so an agent can create, list, change, pause and delete
+  its own triggers and one-shot reminders, gated by a `schedule` permission.
+  It only changes triggers its own conversation scheduled, and what it
+  schedules runs under the rules its creator had.
 - `alforria migrate` moves an install from the `opencode` directories to
   alforria's own (see Changed). `--copy` copies the data instead of moving it,
   `--fresh` starts a new database and keeps the saved logins, `--dry-run`

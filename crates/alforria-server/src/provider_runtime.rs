@@ -1125,6 +1125,7 @@ mod tests {
             runtime: EngineRuntime {
                 catalog: Arc::new(move || Ok(catalog.clone())),
                 auth: auth.clone(),
+                schedule: false,
             },
             seams: EngineSeams::default(),
         })

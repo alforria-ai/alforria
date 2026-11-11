@@ -199,6 +199,10 @@ pub trait SessionEngine: Send + Sync {
     fn workflow_delete(&self, _name: String) -> Result<bool, ServerError> {
         Err(workflows_unavailable())
     }
+    /// The instance's triggers (alforria extension), when the engine has them.
+    fn triggers(&self) -> Option<Arc<alforria_core::trigger::TriggerService>> {
+        None
+    }
 }
 
 fn workflows_unavailable() -> ServerError {

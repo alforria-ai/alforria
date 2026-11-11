@@ -987,15 +987,17 @@ mod tests {
         let actual = storage
             .with_connection(|conn| -> rusqlite::Result<Vec<String>> {
                 let mut stmt = conn.prepare(
-                    "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL AND name != 'migration'",
+                    "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL AND name != 'migration'
+                     ORDER BY rowid",
                 )?;
                 let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()
             })
             .unwrap();
         // `sqlite_master` rows appear in creation order, so this also pins
-        // the statement order.
-        assert_eq!(actual, SCHEMA_SQL.to_vec());
+        // the statement order. alforria's own tables (`storage::extension`)
+        // are created after the upstream schema.
+        assert_eq!(actual[..SCHEMA_SQL.len()], SCHEMA_SQL.to_vec());
     }
 
     /// Regression (battle test): the row mappers bind columns by NAME

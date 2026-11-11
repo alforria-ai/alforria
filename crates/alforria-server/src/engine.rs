@@ -237,6 +237,8 @@ pub struct ProductionEngine {
     llm: Arc<dyn LlmStream>,
     /// Saved workflows + run progress (alforria extension).
     workflows: Arc<WorkflowService>,
+    /// Scheduled and event-started turns (alforria extension).
+    triggers: Arc<alforria_core::trigger::TriggerService>,
 }
 
 /// The [`SessionEngine`] surface (`state.rs`) over the M5 services. The
@@ -386,6 +388,10 @@ impl SessionEngine for ProductionEngine {
 
     fn workflow_delete(&self, name: String) -> Result<bool, ServerError> {
         self.workflows.delete(&name).map_err(workflow_error)
+    }
+
+    fn triggers(&self) -> Option<Arc<alforria_core::trigger::TriggerService>> {
+        Some(self.triggers.clone())
     }
 }
 
@@ -769,6 +775,9 @@ pub struct EngineInput {
 pub struct EngineRuntime {
     pub catalog: crate::state::CatalogSource,
     pub auth: Arc<dyn crate::state::AuthStore>,
+    /// Whether this process runs the trigger scheduler
+    /// ([`crate::ListenOptions::schedule`]).
+    pub schedule: bool,
 }
 
 /// Provider-runtime + share seams: `None` falls back to the unwired M7.7
@@ -863,6 +872,41 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
     let workflows = WorkflowService::new(
         workflow_ops.clone() as Arc<dyn WorkflowOps>,
         workflow_settings,
+    );
+    // Triggers (alforria extension): the config's plus the stored ones.
+    let trigger_ops = alforria_core::session::trigger_ops::ProductionTriggerOps::new(
+        services.sessions.clone(),
+        services.agents.clone(),
+        context.clone(),
+    );
+    let trigger_config = input.config.triggers.clone().unwrap_or_default();
+    let triggers = alforria_core::trigger::TriggerService::new(
+        trigger_ops.clone(),
+        services.events.clone(),
+        services.storage.clone(),
+        clock.clone(),
+        alforria_core::trigger::TriggerSettings {
+            directory: input.directory.clone(),
+            project_id: context.project_id.clone(),
+            home: input.paths.home.clone(),
+            enabled: trigger_config.enabled.unwrap_or(true)
+                && !bool_env("OPENCODE_DISABLE_TRIGGERS"),
+            concurrency: trigger_config
+                .concurrency
+                .map(|value| value.max(1) as usize)
+                .unwrap_or(alforria_core::trigger::TriggerSettings::DEFAULT_CONCURRENCY),
+            max_watched: trigger_config
+                .max_watched
+                .map(|value| value as usize)
+                .unwrap_or(alforria_core::trigger::TriggerSettings::DEFAULT_MAX_WATCHED),
+            // A turn writes here; a watch that saw it would fire itself.
+            ignore: vec![
+                input.paths.data.clone(),
+                input.paths.state.clone(),
+                input.paths.cache.clone(),
+            ],
+            config: input.config.trigger.clone().unwrap_or_default(),
+        },
     );
 
     // Provider-runtime seams — the M7.7 production runtime (models +
@@ -1108,6 +1152,20 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
     if !workflows.enabled() {
         builtin.retain(|tool| tool.id != "workflow");
     }
+    // -- always-on assistant tools (alforria extension): keep this block
+    //    contiguous, after the upstream tools ---------------------------------
+    if triggers.enabled() {
+        builtin.push(alforria_core::tool::schedule::schedule_tool(
+            truncate.clone(),
+            agents.clone(),
+            triggers.clone(),
+            Arc::new(alforria_core::tool::schedule::SessionTree {
+                sessions: services.sessions.clone(),
+                agents: services.agents.clone(),
+            }),
+        ));
+    }
+    // -- end of the always-on assistant tools ---------------------------------
     let registry = Arc::new(
         ToolRegistry::new(
             builtin,
@@ -1225,6 +1283,10 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
 
     ops.bind(prompt.clone());
     workflow_ops.bind(prompt.clone());
+    trigger_ops.bind(prompt.clone());
+    if input.runtime.schedule {
+        triggers.start();
+    }
 
     // M7.5: the share network service (share-next.ts) behind its HTTP +
     // account seams, wrapped in the SessionShare gate/auto-share service
@@ -1273,6 +1335,7 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
         defaults: Arc::new(runtime_models),
         llm,
         workflows,
+        triggers,
     }))
 }
 

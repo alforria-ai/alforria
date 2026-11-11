@@ -21,6 +21,7 @@ pub mod question;
 pub mod read;
 pub mod registry;
 pub mod ripgrep;
+pub mod schedule;
 pub mod shell;
 pub mod skill;
 pub mod subagents;

@@ -32,6 +32,7 @@ pub mod share;
 pub mod skill;
 pub mod storage;
 pub mod tool;
+pub mod trigger;
 pub mod vcs;
 pub mod workflow;
 pub mod worktree;

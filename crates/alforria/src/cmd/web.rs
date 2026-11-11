@@ -142,7 +142,10 @@ pub fn run(matches: &ArgMatches, ui: &mut Ui, raw: &[OsString]) -> Result<(), Ty
     let opts = network::resolve(&args, raw, &config);
     let runtime = super::runtime()?;
     let listener = runtime
-        .block_on(alforria_server::listen(&opts.listen_options()))
+        .block_on(alforria_server::listen(&alforria_server::ListenOptions {
+            schedule: true,
+            ..opts.listen_options()
+        }))
         .map_err(|err| TypedError::Unknown {
             raw: err.to_string(),
         })?;

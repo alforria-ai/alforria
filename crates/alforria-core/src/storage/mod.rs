@@ -1,6 +1,7 @@
 //! SQLite storage: connection handling, migrations, schema.
 
 pub mod connection;
+pub mod extension;
 pub mod migration;
 pub mod schema;
 

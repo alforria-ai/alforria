@@ -6,7 +6,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use rusqlite::Connection;
 
-use crate::storage::migration;
+use crate::storage::{extension, migration};
 use crate::CoreError;
 
 /// PRAGMAs run on every open (`database.ts:27-32`).
@@ -39,6 +39,7 @@ impl Storage {
         Self::configure(&conn)?;
         refuse_foreign_schema(&conn, path)?;
         migration::apply(&mut conn)?;
+        extension::apply(&mut conn)?;
         Ok(Storage {
             conn: Mutex::new(conn),
         })
@@ -50,6 +51,7 @@ impl Storage {
         let mut conn = Connection::open_in_memory()?;
         Self::configure(&conn)?;
         migration::apply(&mut conn)?;
+        extension::apply(&mut conn)?;
         Ok(Storage {
             conn: Mutex::new(conn),
         })
