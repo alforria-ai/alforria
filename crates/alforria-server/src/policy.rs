@@ -84,8 +84,14 @@ impl Default for DirectoryAllowlist {
     }
 }
 
+/// `server.upload.directories` when unset.
+pub const DEFAULT_UPLOAD_DIRECTORY: &str = "uploads";
+
+/// `server.upload.max_bytes` when unset: 32 MiB.
+pub const DEFAULT_UPLOAD_MAX_BYTES: u64 = 32 * 1024 * 1024;
+
 /// Everything the server resolved from the host config.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ServerPolicy {
     pub shutdown: ShutdownOptions,
     /// `server.auth.bearer`, when it configures anything.
@@ -95,12 +101,33 @@ pub struct ServerPolicy {
     /// `server.auth.bearer.reply_always`: whether a credential below
     /// `admin` may answer a permission request `always`.
     pub reply_always: bool,
+    /// `server.upload.max_bytes`: the largest body `PUT /file/content`
+    /// takes.
+    pub upload_max_bytes: u64,
+    /// `server.upload.directories`: where, inside the project, a
+    /// credential below `admin` may upload.
+    pub upload_directories: Vec<String>,
     /// What the agent's shells see of the server's environment.
     pub shell_env: alforria_core::shell_env::ShellEnvPolicy,
     /// Why the host config could not be used, if it could not. A listener
     /// refuses to bind with this set ([`crate::listen_with`]): the policy
     /// in force would not be the one written down.
     pub config_error: Option<String>,
+}
+
+impl Default for ServerPolicy {
+    fn default() -> Self {
+        ServerPolicy {
+            shutdown: ShutdownOptions::default(),
+            bearer: None,
+            directories: DirectoryAllowlist::default(),
+            reply_always: false,
+            upload_max_bytes: DEFAULT_UPLOAD_MAX_BYTES,
+            upload_directories: vec![DEFAULT_UPLOAD_DIRECTORY.to_string()],
+            shell_env: alforria_core::shell_env::ShellEnvPolicy::default(),
+            config_error: None,
+        }
+    }
 }
 
 impl ServerPolicy {
@@ -143,6 +170,14 @@ impl ServerPolicy {
                 .and_then(|auth| auth.bearer.as_ref())
                 .and_then(|bearer| bearer.reply_always)
                 .unwrap_or(false),
+            upload_max_bytes: server
+                .and_then(|server| server.upload.as_ref())
+                .and_then(|upload| upload.max_bytes)
+                .unwrap_or(DEFAULT_UPLOAD_MAX_BYTES),
+            upload_directories: server
+                .and_then(|server| server.upload.as_ref())
+                .and_then(|upload| upload.directories.clone())
+                .unwrap_or_else(|| vec![DEFAULT_UPLOAD_DIRECTORY.to_string()]),
             shell_env: alforria_core::shell_env::ShellEnvPolicy::from_config(
                 config.shell_env.as_ref(),
             ),

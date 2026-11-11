@@ -1505,6 +1505,8 @@ pub struct ServerContext {
     /// The unattended-server settings from the host config (alforria
     /// extension, `policy.rs`). Defaults everywhere outside production.
     pub policy: Arc<crate::policy::ServerPolicy>,
+    /// Read tickets for single files (alforria extension, `ticket.rs`).
+    pub file_tickets: crate::ticket::FileTickets,
 }
 
 impl ServerContext {
@@ -1589,6 +1591,7 @@ impl ServerContext {
             websockets: WebSocketTracker::default(),
             projects,
             policy: Arc::new(crate::policy::ServerPolicy::default()),
+            file_tickets: crate::ticket::FileTickets::default(),
         }
     }
 

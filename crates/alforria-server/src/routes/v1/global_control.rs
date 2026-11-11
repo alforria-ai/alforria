@@ -742,7 +742,9 @@ impl CombinedIgnore {
 
 /// `content` (`handlers/file.ts:95-135`).
 pub async fn file_content(
+    State(ctx): State<Arc<ServerContext>>,
     axum::Extension(location): axum::Extension<LocationContext>,
+    principal: Option<axum::Extension<crate::bearer::Principal>>,
     uri: Uri,
 ) -> Result<Response, ServerError> {
     let path = match query_param(uri.query(), "path") {
@@ -753,6 +755,17 @@ pub async fn file_content(
     let file = directory.join(&path);
     if !path_contains(directory, &file) {
         return Err(defect("Path escapes the location"));
+    }
+    // alforria extension: a request admitted on a file ticket reads that
+    // ticket's file only (`routes::file_ext`).
+    if let Err(refusal) = crate::routes::file_ext::check_ticket(
+        &ctx,
+        &principal,
+        &uri,
+        &location,
+        &crate::confine::resolve_for_access(&file),
+    ) {
+        return Ok(axum::response::IntoResponse::into_response(refusal));
     }
     if !file.exists() {
         return Ok(json_ok(json!({"type": "text", "content": ""})));

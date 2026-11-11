@@ -57,13 +57,24 @@ pre-1.0, so minor releases may include breaking changes.
   messages, events, permission and question replies, project files),
   `connector` (chat plus local automation) or `admin` (everything). Routes
   not listed for a scope need `admin`. `server.directories` lists the project
-  directories a token narrower than `admin` may open; by default that is the
-  server's working directory. With bearer authentication configured and no
+  directories (matched exactly) a token narrower than `admin` may open; by
+  default that is the server's working directory. With bearer authentication configured and no
   password set, `alforria serve` generates none. A token below `admin` cannot
-  run shell directly, set permission rules, switch tools on, pick hidden
-  agents or answer a permission request `always`
-  (`server.auth.bearer.reply_always` opts in); the threat model is in
-  `docs/unattended-server.md`.
+  run shell directly or a command with inline shell, set permission rules,
+  switch tools on, pick hidden agents, attach files from outside the project
+  or answer a permission request `always`
+  (`server.auth.bearer.reply_always` opts in). These limits are enforced in
+  the engine on the values it resolves, not on the request as written; the
+  threat model is in `docs/unattended-server.md`.
+- Files for browser clients: `POST /file/ticket` mints a short-lived read
+  ticket for one project file, usable as `?ticket=` on the new
+  `GET /file/raw` (the file's bytes, with ranges, served sandboxed) and on
+  `GET /file/content`; `PUT /file/content?path=` uploads a file into the
+  project, up to `server.upload.max_bytes` (default 32 MiB). Paths are
+  confined to the project, symlinks and `..` included; a token below `admin`
+  uploads only into `server.upload.directories` (default `uploads/`) and
+  never to a config, instruction, agent, command, skill, workflow or git
+  file.
 - `shell_env` (global config) controls what the agent's shells inherit from
   the server's environment: `inherit` (`"all"`, `"none"` or a list), `allow`,
   `set` and `deny`.

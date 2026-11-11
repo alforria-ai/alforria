@@ -175,6 +175,18 @@ pub struct ServerAuthInfo {
     pub bearer: Option<BearerAuthInfo>,
 }
 
+/// `server.upload` — limits on `PUT /file/content`.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct UploadInfo {
+    /// The largest upload accepted, in bytes (default 32 MiB).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u64>,
+    /// The directories, relative to the project, a token below `admin` may
+    /// upload into (default `["uploads"]`). `"."` is the whole project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directories: Option<Vec<String>>,
+}
+
 // ---------------------------------------------------------------------------
 // shell_env
 // ---------------------------------------------------------------------------

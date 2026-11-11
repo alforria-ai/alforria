@@ -515,6 +515,15 @@ impl<S> LocationService<S> {
 }
 
 /// `defaultDirectory` (`workspace-routing.ts:86-88`).
+/// The directory a request names, resolved the way the v1 location
+/// resolves it when no session routes the request: `?directory=`, else the
+/// `x-opencode-directory` header, else the working directory. alforria's own
+/// routes outside the frozen tables resolve their project through this.
+pub(crate) fn request_directory(query: Option<&str>, headers: &HeaderMap) -> PathBuf {
+    let directory = decode_best_effort(&default_directory(query, headers));
+    crate::state::resolve_directory(Path::new(&directory))
+}
+
 fn default_directory(query: Option<&str>, headers: &HeaderMap) -> String {
     non_empty(query_param(query, "directory"))
         .or_else(|| header_value(headers, "x-opencode-directory"))

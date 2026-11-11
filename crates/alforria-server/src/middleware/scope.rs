@@ -72,6 +72,9 @@ pub const ROUTES: &[(&str, &str, Scope)] = &[
     ("GET", "/find", Chat),
     ("GET", "/find/file", Chat),
     ("GET", "/find/symbol", Chat),
+    ("POST", "/file/ticket", Chat),
+    ("GET", "/file/raw", Chat),
+    ("PUT", "/file/content", Chat),
     // What a chat client needs to draw itself.
     ("GET", "/agent", Chat),
     ("GET", "/command", Chat),
@@ -114,6 +117,9 @@ const CWD_ROUTES: &[&str] = &[
     "/workflow/run/{runID}/wait",
     "/workflow/run/{runID}/abort",
     "/session/{sessionID}/goal",
+    "/file/ticket",
+    "/file/raw",
+    "/file/content",
 ];
 
 fn lookup_method(method: &str) -> &str {
@@ -258,6 +264,9 @@ mod tests {
             ("POST", "/workflow/run/{runID}/wait"),
             ("POST", "/workflow/run/{runID}/abort"),
             ("GET", "/session/{sessionID}/goal"),
+            ("POST", "/file/ticket"),
+            ("GET", "/file/raw"),
+            ("PUT", "/file/content"),
         ];
         for (method, route, _) in ROUTES {
             let known = v1::ROUTES

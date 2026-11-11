@@ -26,6 +26,7 @@ pub mod paths;
 pub mod process_group;
 pub mod project;
 pub mod project_copy;
+pub mod project_files;
 pub mod provider;
 pub mod repository;
 pub mod session;

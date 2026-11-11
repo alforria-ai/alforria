@@ -218,6 +218,8 @@ pub struct ServerInfo {
     /// The project directories a token without the `admin` scope may open.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub directories: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upload: Option<super::host::UploadInfo>,
 }
 
 // ---------------------------------------------------------------------------

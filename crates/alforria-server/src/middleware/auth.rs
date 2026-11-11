@@ -33,6 +33,7 @@ use crate::policy::DirectoryAllowlist;
 use crate::pty::ticket::TicketCache;
 use crate::routes::{ui, v1, v2};
 use crate::state::AuthConfig;
+use crate::ticket::{FileScope, FileTickets};
 
 /// `WWW_AUTHENTICATE` (v1 authorization.ts:14, v2 authorization.ts:10).
 pub const WWW_AUTHENTICATE: &str = "Basic realm=\"Secure Area\"";
@@ -380,9 +381,43 @@ fn check_bearer(
     Ok(principal)
 }
 
+/// The routes a file ticket opens (`routes::file_ext`): reads only.
+fn is_file_read(method: &Method, path: &str) -> bool {
+    (method == Method::GET || method == Method::HEAD)
+        && (path == "/file/raw" || path == "/file/content")
+}
+
+/// Whether the request carries a live file ticket issued for exactly the
+/// file and project it asks for. The handler checks again against the file
+/// it opens.
+fn file_ticketed(file_tickets: &FileTickets, uri: &Uri, headers: &HeaderMap) -> bool {
+    let Some(ticket) = query_param(uri.query(), "ticket").filter(|ticket| !ticket.is_empty())
+    else {
+        return false;
+    };
+    let Some(path) = query_param(uri.query(), "path").filter(|path| !path.is_empty()) else {
+        return false;
+    };
+    let directory = crate::middleware::location::request_directory(uri.query(), headers);
+    let file = if std::path::Path::new(&path).is_absolute() {
+        std::path::PathBuf::from(&path)
+    } else {
+        directory.join(&path)
+    };
+    file_tickets.admits(
+        &ticket,
+        &FileScope {
+            file: crate::confine::resolve_for_access(&file),
+            directory,
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn check(
     auth: &AuthConfig,
     tickets: &TicketCache,
+    file_tickets: &FileTickets,
     directories: &DirectoryAllowlist,
     method: &Method,
     uri: &Uri,
@@ -394,6 +429,9 @@ fn check(
     }
     if is_public_ui_path(method, path) {
         return Ok(None);
+    }
+    if is_file_read(method, path) && file_ticketed(file_tickets, uri, headers) {
+        return Ok(Some(Principal::operator(Via::Ticket)));
     }
     let surface = surface(method, path);
     if surface != Surface::Raw {
@@ -498,6 +536,7 @@ fn unauthorized_v2(challenge: &'static str) -> Response<Body> {
 pub struct AuthLayer {
     auth: AuthConfig,
     tickets: TicketCache,
+    file_tickets: FileTickets,
     directories: DirectoryAllowlist,
 }
 
@@ -506,8 +545,15 @@ impl AuthLayer {
         AuthLayer {
             auth,
             tickets,
+            file_tickets: FileTickets::default(),
             directories: DirectoryAllowlist::default(),
         }
+    }
+
+    /// The cache `POST /file/ticket` issues from.
+    pub fn with_file_tickets(mut self, file_tickets: FileTickets) -> AuthLayer {
+        self.file_tickets = file_tickets;
+        self
     }
 
     /// The directories a credential narrower than `admin` may open.
@@ -525,6 +571,7 @@ impl<S> tower::Layer<S> for AuthLayer {
             inner,
             auth: self.auth.clone(),
             tickets: self.tickets.clone(),
+            file_tickets: self.file_tickets.clone(),
             directories: self.directories.clone(),
         }
     }
@@ -535,6 +582,7 @@ pub struct AuthService<S> {
     inner: S,
     auth: AuthConfig,
     tickets: TicketCache,
+    file_tickets: FileTickets,
     directories: DirectoryAllowlist,
 }
 
@@ -559,6 +607,7 @@ where
         let result = check(
             &self.auth,
             &self.tickets,
+            &self.file_tickets,
             &self.directories,
             req.method(),
             req.uri(),

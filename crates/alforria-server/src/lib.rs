@@ -16,6 +16,7 @@ pub mod routes;
 pub mod shutdown;
 pub mod sse;
 pub mod state;
+pub mod ticket;
 pub mod workspace;
 
 use std::io;

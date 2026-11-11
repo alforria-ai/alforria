@@ -32,6 +32,7 @@ pub fn apply_stack(router: Router, ctx: &Arc<ServerContext>) -> Router {
         // authorizationLayer — TS bakes it into route handlers.
         .layer(
             auth::AuthLayer::new(ctx.auth.clone(), ctx.pty_tickets.clone())
+                .with_file_tickets(ctx.file_tickets.clone())
                 .with_directories(ctx.policy.directories.clone()),
         )
         // cors — short-circuits every OPTIONS request.

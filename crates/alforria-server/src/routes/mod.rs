@@ -3,6 +3,7 @@
 //! stack (`httpapi/server.ts:276-297`).
 
 pub mod doc;
+pub mod file_ext;
 pub mod goal;
 pub mod ui;
 pub mod v1;
@@ -34,6 +35,7 @@ pub fn build_router(ctx: Arc<ServerContext>) -> Router {
     // v1/v2 tables so the TS OpenAPI surface stays byte-identical.
     router = workflow::register(router);
     router = goal::register(router);
+    router = file_ext::register(router);
 
     let router = router
         .fallback(ui::serve_ui_handler)
