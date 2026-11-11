@@ -887,9 +887,17 @@ mod tests {
         let sent = serde_json::to_string(&e.llm.input(0).messages).unwrap();
         assert!(sent.contains("The earlier modules were read"), "{sent}");
         assert!(!sent.contains("Request 0:"), "{sent}");
-        // Let the forked diff summary and prune finish reading.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        e.services.storage.message_rows_read() - before
+        // The diff summary and prune are forked: wait until they have
+        // stopped reading.
+        let mut read = e.services.storage.message_rows_read();
+        let mut quiet = 0;
+        while quiet < 5 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let now = e.services.storage.message_rows_read();
+            quiet = if now == read { quiet + 1 } else { 0 };
+            read = now;
+        }
+        read - before
     }
 
     #[tokio::test]
@@ -897,7 +905,10 @@ mod tests {
         let short = rows_read_by_a_turn("rows-short", 300).await;
         let long = rows_read_by_a_turn("rows-long", 3_000).await;
         eprintln!("rows read by a three-step turn: {short} with 300 messages of history, {long} with 3,000");
-        assert_eq!(short, long);
+        // The diff summary is forked and reads the turn as it stands at
+        // that moment, so the count can differ by a message or two between
+        // runs. The histories differ by 2,700.
+        assert!(short.abs_diff(long) <= 8, "{short} vs {long}");
         // Four passes over a window of about a dozen messages, read a page
         // at a time, plus the turn's own bookkeeping: nowhere near the
         // history.

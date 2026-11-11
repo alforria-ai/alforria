@@ -47,6 +47,23 @@ pre-1.0, so minor releases may include breaking changes.
 - ACP clients are told when a turn is waiting on a provider retry.
 - `compaction.default_context`: the context window, in tokens, assumed for a
   model that declares none (128,000 when unset).
+- A restart repairs the sessions the last process died in the middle of.
+  Every running turn leaves a marker on disk; at startup, before the first
+  request, a turn whose process is gone has its running tool calls closed as
+  errors ("interrupted by a server restart"), its assistant message
+  completed and its status set idle, so the history is valid for the next
+  prompt and no client sees a session stuck busy. A `session.interrupted`
+  event is published for each.
+- `server.resume` says what happens next: `"none"` (the default) leaves it
+  there, `"notify"` adds a note the model reads with the next prompt, and
+  `"continue"` prompts the model to carry on. A turn is resumed once: if the
+  server dies again while resuming, the turn is left with a note. Subagents
+  and `!shell` commands are repaired but never resumed, and `/goal` still
+  comes back paused.
+- `storage.synchronous`: `"full"` puts every commit on disk before it
+  returns, for machines that are stopped by being killed; `"normal"`, the
+  default and upstream's setting, never corrupts the database but can lose
+  the last few seconds on a power cut.
 - `storage.retention.events` bounds the event log, which until now only
   shrank when a session was deleted: `max_age` (`"30d"`, `"12h"`, …) drops
   older events, `keep_last` keeps each session's newest N whatever their age
@@ -62,6 +79,8 @@ pre-1.0, so minor releases may include breaking changes.
 
 ### Fixed
 
+- A goal armed before a reboot could stay "active" with nothing driving it
+  when the new server got the process id the old one had.
 - A session whose history no provider had counted (imported, or long and
   never compacted) was sent whole on the next prompt, however large. The
   request is now sized before it is sent, from the provider's own token

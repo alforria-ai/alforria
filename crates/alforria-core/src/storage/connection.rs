@@ -60,6 +60,20 @@ impl Storage {
         })
     }
 
+    /// `PRAGMA synchronous`: `full` puts every commit on disk before it
+    /// returns, `normal` (the default at open) leaves the write-ahead log
+    /// to the operating system between checkpoints.
+    pub fn set_synchronous(&self, full: bool) -> Result<(), CoreError> {
+        self.with_connection(|conn| {
+            conn.execute_batch(if full {
+                "PRAGMA synchronous = FULL"
+            } else {
+                "PRAGMA synchronous = NORMAL"
+            })?;
+            Ok(())
+        })
+    }
+
     /// How many message rows have been read back with their parts: what a
     /// step costs in history, for tests and diagnostics.
     pub fn message_rows_read(&self) -> u64 {

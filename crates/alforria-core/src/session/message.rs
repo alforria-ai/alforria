@@ -202,6 +202,15 @@ pub struct Window {
     pub complete: bool,
 }
 
+/// A [`MessageStore::dangling`] result.
+#[derive(Debug, Clone, Default)]
+pub struct Dangling {
+    /// Ids of assistant messages with no completion time, oldest first.
+    pub assistants: Vec<String>,
+    /// Tool parts still pending or running.
+    pub tools: Vec<V1Part>,
+}
+
 /// A [`MessageStore::last_compaction`] result.
 #[derive(Debug, Clone)]
 pub struct Compacted {
@@ -501,6 +510,44 @@ impl MessageStore {
             }
         }
         Ok(result)
+    }
+
+    /// What a process that died mid-turn left unfinished in a session:
+    /// assistant messages never completed, and tool calls still pending or
+    /// running.
+    pub fn dangling(&self, session_id: &str) -> Result<Dangling, SessionError> {
+        let (assistants, tools) = self.storage.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id FROM message
+                 WHERE session_id = ?1
+                   AND json_extract(data, '$.role') = 'assistant'
+                   AND json_extract(data, '$.time.completed') IS NULL
+                 ORDER BY time_created, id",
+            )?;
+            let assistants = stmt
+                .query_map([session_id], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut stmt = conn.prepare(
+                "SELECT * FROM part
+                 WHERE session_id = ?1
+                   AND json_extract(data, '$.type') = 'tool'
+                   AND json_extract(data, '$.state.status') IN ('pending', 'running')
+                 ORDER BY message_id, id",
+            )?;
+            let mut rows = stmt.query([session_id])?;
+            let mut tools = Vec::new();
+            while let Some(row) = rows.next()? {
+                tools.push(part_from_row(row)?);
+            }
+            Ok::<_, CoreError>((assistants, tools))
+        })?;
+        Ok(Dangling {
+            assistants,
+            tools: tools
+                .iter()
+                .map(part_from_row_data)
+                .collect::<Result<Vec<_>, CoreError>>()?,
+        })
     }
 
     /// The stored size of these messages' parts.

@@ -24,8 +24,10 @@ use alforria_schema::session_status::SessionStatusInfo;
 
 use crate::session::error::{BusyError, SessionError};
 use crate::session::message::WithParts;
+use crate::session::recovery::RunMarkers;
 use crate::session::status::SessionStatusService;
 use crate::CoreError;
+use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
 
 use crate::tool::def::BoxFuture;
@@ -588,6 +590,9 @@ pub struct SessionRunState {
     cancels: Mutex<HashMap<String, u64>>,
     /// Told of every cancel, whichever route it came through.
     cancel_listeners: Mutex<Vec<CancelListener>>,
+    /// Where running turns are recorded for the next process to find, and
+    /// the instance directory they run in.
+    markers: Mutex<Option<(RunMarkers, PathBuf)>>,
 }
 
 type CancelListener = Arc<dyn Fn(&str) + Send + Sync>;
@@ -603,6 +608,54 @@ impl SessionRunState {
             runners: Mutex::new(HashMap::new()),
             cancels: Mutex::new(HashMap::new()),
             cancel_listeners: Mutex::new(Vec::new()),
+            markers: Mutex::new(None),
+        })
+    }
+
+    /// Record every turn this instance runs under `markers`, so a process
+    /// that dies mid-turn leaves word of it
+    /// ([`crate::session::recovery`]). Off until called.
+    pub fn track_runs(&self, markers: RunMarkers, directory: PathBuf) {
+        *self
+            .markers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((markers, directory));
+    }
+
+    /// `work`, bracketed by the session's run marker. The marker spans the
+    /// work itself, not the call: a caller joining a run already under way
+    /// starts nothing.
+    fn marked(
+        &self,
+        session_id: &str,
+        work: Work<WithParts, SessionError>,
+    ) -> Work<WithParts, SessionError> {
+        let Some((markers, directory)) = self
+            .markers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        else {
+            return work;
+        };
+        let session_id = session_id.to_string();
+        Arc::new(move || {
+            let (markers, directory, session_id, work) = (
+                markers.clone(),
+                directory.clone(),
+                session_id.clone(),
+                work.clone(),
+            );
+            Box::pin(async move {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_millis() as u64)
+                    .unwrap_or(0);
+                markers.begin(&session_id, &directory, now);
+                let result = (work)().await;
+                markers.end(&session_id);
+                result
+            })
         })
     }
 
@@ -741,6 +794,7 @@ impl SessionRunState {
         work: Work<WithParts, SessionError>,
     ) -> Result<WithParts, RunnerError<SessionError>> {
         let runner = self.runner(session_id, on_interrupt);
+        let work = self.marked(session_id, work);
         runner.ensure_running(cancel, work).await
     }
 
@@ -754,6 +808,7 @@ impl SessionRunState {
         ready: Option<Latch>,
     ) -> Result<WithParts, SessionError> {
         let runner = self.runner(session_id, on_interrupt);
+        let work = self.marked(session_id, work);
         runner
             .start_shell(work, ready)
             .await

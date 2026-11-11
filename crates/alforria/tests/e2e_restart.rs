@@ -1,0 +1,554 @@
+//! Restart recovery, end to end: a real `alforria serve` is killed with
+//! SIGKILL in the middle of a turn (mid-stream and mid-tool) and started
+//! again over the same data directory, against a scripted model.
+//!
+//! `Child::kill` is SIGKILL on Unix, so nothing in the server gets to clean
+//! up: this is the stop an always-on host gives it.
+
+#![cfg(unix)]
+
+#[path = "e2e_agent/harness.rs"]
+#[allow(dead_code)]
+mod harness;
+
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use axum::body::Body;
+use axum::routing::post;
+use axum::Router;
+use serde_json::{json, Value};
+
+use harness::{Env, MockServer, Serve};
+
+/// How the scripted model answers a request that is not the first.
+#[derive(Clone, Copy, PartialEq)]
+enum Later {
+    /// A short answer.
+    Answer,
+    /// Like the first: start answering, then never finish.
+    Hang,
+}
+
+/// What the scripted model does with the first turn request.
+#[derive(Clone, Copy, PartialEq)]
+enum First {
+    /// Stream some text and stop sending, without ever finishing.
+    HangMidStream,
+    /// Call the shell tool with a command that outlives the test.
+    SlowTool,
+}
+
+#[derive(Default)]
+struct Seen {
+    /// Bodies of the turn requests (title requests are not turns).
+    turns: Vec<Value>,
+}
+
+fn sse(frames: &[Value]) -> String {
+    let mut body = String::new();
+    for frame in frames {
+        body.push_str(&format!("data: {frame}\n\n"));
+    }
+    body.push_str("data: [DONE]\n\n");
+    body
+}
+
+fn text_reply(text: &str) -> String {
+    sse(&[
+        json!({ "choices": [{ "delta": { "content": text } }] }),
+        json!({
+            "choices": [{ "delta": {}, "finish_reason": "stop" }],
+            "usage": { "prompt_tokens": 10, "completion_tokens": 6 },
+        }),
+    ])
+}
+
+/// A body that sends `head` and then stays open, silent.
+fn hanging(head: String) -> Body {
+    let stream = futures::stream::unfold(Some(head), |head| async move {
+        match head {
+            Some(head) => Some((Ok::<_, std::io::Error>(head), None)),
+            None => std::future::pending().await,
+        }
+    });
+    Body::from_stream(stream)
+}
+
+fn model(first: First, later: Later) -> (MockServer, String, Arc<Mutex<Seen>>) {
+    let seen = Arc::new(Mutex::new(Seen::default()));
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post({
+            let seen = seen.clone();
+            move |axum::Json(body): axum::Json<Value>| {
+                let seen = seen.clone();
+                async move {
+                    let reply = |body: Body| {
+                        axum::response::Response::builder()
+                            .header("content-type", "text/event-stream")
+                            .body(body)
+                            .expect("response")
+                    };
+                    if body
+                        .to_string()
+                        .contains("Generate a title for this conversation")
+                    {
+                        return reply(Body::from(text_reply("A title")));
+                    }
+                    let index = {
+                        let mut seen = seen.lock().unwrap();
+                        seen.turns.push(body.clone());
+                        seen.turns.len() - 1
+                    };
+                    let partial = format!(
+                        "data: {}\n\n",
+                        json!({ "choices": [{ "delta": { "content": "Working on " } }] })
+                    );
+                    if index > 0 {
+                        return match later {
+                            Later::Answer => reply(Body::from(text_reply("recovered"))),
+                            Later::Hang => reply(hanging(partial)),
+                        };
+                    }
+                    match first {
+                        First::HangMidStream => reply(hanging(partial)),
+                        First::SlowTool => {
+                            let shell = body["tools"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|tool| tool["function"]["name"].as_str())
+                                .find(|name| *name == "bash" || *name == "shell")
+                                .unwrap_or("bash")
+                                .to_string();
+                            reply(Body::from(sse(&[
+                                json!({ "choices": [{ "delta": { "tool_calls": [{
+                                    "index": 0,
+                                    "id": "call_slow",
+                                    "type": "function",
+                                    "function": {
+                                        "name": shell,
+                                        "arguments": json!({
+                                            "command": "sleep 300",
+                                            "description": "wait",
+                                        }).to_string(),
+                                    },
+                                }] } }] }),
+                                json!({
+                                    "choices": [{ "delta": {}, "finish_reason": "tool_calls" }],
+                                    "usage": { "prompt_tokens": 10, "completion_tokens": 6 },
+                                }),
+                            ])))
+                        }
+                    }
+                }
+            }
+        }),
+    );
+    let server = MockServer::new(app);
+    let url = format!("http://127.0.0.1:{}/v1", server.port);
+    (server, url, seen)
+}
+
+struct World {
+    env: Env,
+    seen: Arc<Mutex<Seen>>,
+    directory: String,
+    runtime: tokio::runtime::Runtime,
+    client: reqwest::Client,
+    _model: MockServer,
+}
+
+impl World {
+    /// An environment whose global config sets `server.resume` (`None`
+    /// leaves the default) and whose shell tool needs no approval.
+    fn new(tag: &str, first: First, later: Later, resume: Option<&str>) -> World {
+        let (server, url, seen) = model(first, later);
+        let env = Env::new(tag);
+        env.write_project_config(&url, tag);
+        let config_dir = env.home.join(".config").join("alforria");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let mut config = json!({ "permission": { "bash": "allow" } });
+        if let Some(resume) = resume {
+            config["server"] = json!({ "resume": resume });
+        }
+        std::fs::write(config_dir.join("opencode.json"), config.to_string()).unwrap();
+        let directory = env.project_dir().to_string_lossy().to_string();
+        World {
+            env,
+            seen,
+            directory,
+            runtime: tokio::runtime::Runtime::new().unwrap(),
+            client: reqwest::Client::new(),
+            _model: server,
+        }
+    }
+
+    fn get(&self, serve: &Serve, path: &str) -> Value {
+        self.runtime.block_on(async {
+            self.client
+                .get(format!("http://127.0.0.1:{}{path}", serve.port))
+                .query(&[("directory", self.directory.as_str())])
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap()
+        })
+    }
+
+    fn post(&self, serve: &Serve, path: &str, body: Value) -> reqwest::StatusCode {
+        self.runtime.block_on(async {
+            self.client
+                .post(format!("http://127.0.0.1:{}{path}", serve.port))
+                .query(&[("directory", self.directory.as_str())])
+                .json(&body)
+                .send()
+                .await
+                .unwrap()
+                .status()
+        })
+    }
+
+    /// Create a session and start a turn in it without waiting for it.
+    fn start_turn(&self, serve: &Serve) -> String {
+        let session: Value = self.runtime.block_on(async {
+            self.client
+                .post(format!("http://127.0.0.1:{}/session", serve.port))
+                .query(&[("directory", self.directory.as_str())])
+                .json(&json!({}))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap()
+        });
+        let id = session["id"].as_str().expect("session id").to_string();
+        let status = self.post(
+            serve,
+            &format!("/session/{id}/prompt_async"),
+            json!({
+                "parts": [{ "type": "text", "text": "do the long job" }],
+                "model": { "providerID": "mock", "modelID": "mock-model" },
+            }),
+        );
+        assert!(status.is_success(), "{status}");
+        id
+    }
+
+    fn messages(&self, serve: &Serve, session: &str) -> Vec<Value> {
+        self.get(serve, &format!("/session/{session}/message"))
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Poll the session's messages until `done` says so.
+    fn wait_for(
+        &self,
+        serve: &Serve,
+        session: &str,
+        what: &str,
+        done: impl Fn(&[Value]) -> bool,
+    ) -> Vec<Value> {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let messages = self.messages(serve, session);
+            if done(&messages) {
+                return messages;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {what}: {}",
+                serde_json::to_string_pretty(&messages).unwrap()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn marker(&self, session: &str) -> std::path::PathBuf {
+        self.env
+            .home
+            .join(".local/share/alforria/running")
+            .join(format!("{session}.json"))
+    }
+
+    fn turns(&self) -> usize {
+        self.seen.lock().unwrap().turns.len()
+    }
+}
+
+fn parts<'a>(messages: &'a [Value], kind: &str) -> Vec<&'a Value> {
+    messages
+        .iter()
+        .flat_map(|message| message["parts"].as_array().into_iter().flatten())
+        .filter(|part| part["type"] == kind)
+        .collect()
+}
+
+fn assistants(messages: &[Value]) -> Vec<&Value> {
+    messages
+        .iter()
+        .filter(|message| message["info"]["role"] == "assistant")
+        .collect()
+}
+
+/// Whether the newest assistant message has begun its answer. The text
+/// itself is stored when it ends; while it streams there is the part.
+fn streaming(messages: &[Value]) -> bool {
+    assistants(messages).last().is_some_and(|message| {
+        message["parts"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|part| part["type"] == "text")
+    })
+}
+
+fn tool_running(messages: &[Value]) -> bool {
+    parts(messages, "tool")
+        .iter()
+        .any(|part| part["state"]["status"] == "running")
+}
+
+/// Text parts the system wrote about the restart, by `restart.kind`.
+fn restart_parts<'a>(messages: &'a [Value], kind: &str) -> Vec<&'a Value> {
+    parts(messages, "text")
+        .into_iter()
+        .filter(|part| part["metadata"]["restart"]["kind"] == kind)
+        .collect()
+}
+
+/// Killed while the model's answer was still streaming, default policy:
+/// the session comes back idle with the half-written message closed, and
+/// the next prompt works.
+#[test]
+fn a_turn_killed_mid_stream_is_repaired_at_the_next_start() {
+    let world = World::new("restart-stream", First::HangMidStream, Later::Answer, None);
+    let serve = Serve::spawn(&world.env);
+    let session = world.start_turn(&serve);
+    world.wait_for(&serve, &session, "streamed text", streaming);
+    assert!(world.marker(&session).exists(), "a running turn is marked");
+    drop(serve); // SIGKILL
+
+    let serve = Serve::spawn(&world.env);
+    // Repaired before the first request is served.
+    let messages = world.messages(&serve, &session);
+    let reply = assistants(&messages);
+    assert_eq!(reply.len(), 1, "{messages:?}");
+    assert_eq!(reply[0]["info"]["error"]["name"], "MessageAbortedError");
+    assert_eq!(
+        reply[0]["info"]["error"]["data"]["message"],
+        "Interrupted by a server restart"
+    );
+    assert!(reply[0]["info"]["time"]["completed"].is_number());
+    let text = parts(&messages, "text");
+    assert!(
+        text.iter()
+            .all(|part| part["time"].is_null() || part["time"]["end"].is_number()),
+        "{text:?}"
+    );
+    let status = world.get(&serve, "/session/status");
+    assert!(
+        status.get(&session).is_none(),
+        "idle sessions are not listed: {status}"
+    );
+    assert!(!world.marker(&session).exists(), "the marker is consumed");
+    // `none`: nothing was added, nothing was sent.
+    assert!(restart_parts(&messages, "note").is_empty());
+    assert!(restart_parts(&messages, "resume").is_empty());
+    assert_eq!(world.turns(), 1);
+
+    // The session takes the next prompt as usual.
+    let status = world.post(
+        &serve,
+        &format!("/session/{session}/prompt_async"),
+        json!({
+            "parts": [{ "type": "text", "text": "are you there?" }],
+            "model": { "providerID": "mock", "modelID": "mock-model" },
+        }),
+    );
+    assert!(status.is_success());
+    world.wait_for(&serve, &session, "the next answer", |messages| {
+        parts(messages, "text")
+            .iter()
+            .any(|part| part["text"] == "recovered")
+    });
+    // What the model was sent has no dangling tool call or empty turn in it.
+    let sent = world.seen.lock().unwrap().turns[1].clone();
+    assert!(
+        sent["messages"].to_string().contains("are you there?"),
+        "{sent}"
+    );
+}
+
+/// Killed while a tool was running, `notify`: the tool call is closed as
+/// interrupted and a note is left for the model, without starting a turn.
+#[test]
+fn a_turn_killed_mid_tool_is_repaired_and_noted() {
+    let world = World::new(
+        "restart-tool",
+        First::SlowTool,
+        Later::Answer,
+        Some("notify"),
+    );
+    let serve = Serve::spawn(&world.env);
+    let session = world.start_turn(&serve);
+    world.wait_for(&serve, &session, "a running tool", tool_running);
+    drop(serve); // SIGKILL
+
+    let serve = Serve::spawn(&world.env);
+    let messages = world.wait_for(&serve, &session, "the restart note", |messages| {
+        !restart_parts(messages, "note").is_empty()
+    });
+    let tools = parts(&messages, "tool");
+    assert_eq!(tools.len(), 1, "{tools:?}");
+    assert_eq!(tools[0]["state"]["status"], "error");
+    assert!(
+        tools[0]["state"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("interrupted by a server restart"),
+        "{}",
+        tools[0]
+    );
+    assert_eq!(tools[0]["state"]["metadata"]["interrupted"], true);
+    let reply = assistants(&messages);
+    assert!(
+        reply[0]["info"]["time"]["completed"].is_number(),
+        "{reply:?}"
+    );
+    let notes = restart_parts(&messages, "note");
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0]["synthetic"], true);
+    assert!(notes[0]["text"]
+        .as_str()
+        .unwrap()
+        .starts_with("<restart_note>"));
+    // A note starts no turn.
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(world.turns(), 1);
+    assert!(!world.marker(&session).exists());
+
+    // The model reads the note, and the interrupted call's result, with the
+    // next prompt.
+    let status = world.post(
+        &serve,
+        &format!("/session/{session}/prompt_async"),
+        json!({
+            "parts": [{ "type": "text", "text": "what happened?" }],
+            "model": { "providerID": "mock", "modelID": "mock-model" },
+        }),
+    );
+    assert!(status.is_success());
+    world.wait_for(&serve, &session, "the next answer", |messages| {
+        parts(messages, "text")
+            .iter()
+            .any(|part| part["text"] == "recovered")
+    });
+    let sent = world.seen.lock().unwrap().turns[1]["messages"].to_string();
+    assert!(sent.contains("restart_note"), "{sent}");
+    assert!(sent.contains("call_slow"), "{sent}");
+    assert!(sent.contains("interrupted by a server restart"), "{sent}");
+
+    // A third start has nothing to do.
+    drop(serve);
+    let serve = Serve::spawn(&world.env);
+    let messages = world.messages(&serve, &session);
+    assert_eq!(restart_parts(&messages, "note").len(), 1);
+}
+
+/// `continue`: the turn is picked up again without anyone asking.
+#[test]
+fn an_interrupted_turn_is_resumed_under_continue() {
+    let world = World::new(
+        "restart-continue",
+        First::SlowTool,
+        Later::Answer,
+        Some("continue"),
+    );
+    let serve = Serve::spawn(&world.env);
+    let session = world.start_turn(&serve);
+    world.wait_for(&serve, &session, "a running tool", tool_running);
+    drop(serve); // SIGKILL
+
+    let serve = Serve::spawn(&world.env);
+    let messages = world.wait_for(&serve, &session, "the resumed answer", |messages| {
+        parts(messages, "text")
+            .iter()
+            .any(|part| part["text"] == "recovered")
+    });
+    let resumes = restart_parts(&messages, "resume");
+    assert_eq!(resumes.len(), 1);
+    assert!(resumes[0]["text"]
+        .as_str()
+        .unwrap()
+        .starts_with("<auto_resume>"));
+    assert_eq!(world.turns(), 2);
+    let sent = world.seen.lock().unwrap().turns[1]["messages"].to_string();
+    assert!(sent.contains("auto_resume"), "{sent}");
+    assert!(sent.contains("do the long job"), "{sent}");
+    // The resumed turn ran to its end and cleared its own marker.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while world.marker(&session).exists() {
+        assert!(Instant::now() < deadline, "the marker outlived the turn");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Starting again changes nothing: the turn finished.
+    drop(serve);
+    let serve = Serve::spawn(&world.env);
+    std::thread::sleep(Duration::from_millis(500));
+    let messages = world.messages(&serve, &session);
+    assert_eq!(restart_parts(&messages, "resume").len(), 1);
+    assert_eq!(world.turns(), 2);
+}
+
+/// A server that dies every time it resumes must not resume forever: the
+/// second time, the turn is left with a note.
+#[test]
+fn a_resumed_turn_that_is_killed_again_is_not_resumed_twice() {
+    let world = World::new(
+        "restart-loop",
+        First::HangMidStream,
+        Later::Hang,
+        Some("continue"),
+    );
+    let serve = Serve::spawn(&world.env);
+    let session = world.start_turn(&serve);
+    world.wait_for(&serve, &session, "streamed text", streaming);
+    drop(serve); // SIGKILL, first time
+
+    // The restart resumes the turn, and the model hangs again.
+    let serve = Serve::spawn(&world.env);
+    world.wait_for(&serve, &session, "the resumed turn streaming", |messages| {
+        restart_parts(messages, "resume").len() == 1
+            && assistants(messages).len() == 2
+            && streaming(messages)
+    });
+    assert_eq!(world.turns(), 2);
+    drop(serve); // SIGKILL, mid-resume
+
+    let serve = Serve::spawn(&world.env);
+    let messages = world.wait_for(&serve, &session, "the note", |messages| {
+        !restart_parts(messages, "note").is_empty()
+    });
+    assert_eq!(restart_parts(&messages, "resume").len(), 1, "resumed once");
+    assert!(assistants(&messages)
+        .iter()
+        .all(|message| message["info"]["time"]["completed"].is_number()));
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(world.turns(), 2, "no third request");
+
+    // And however often it starts after that.
+    drop(serve);
+    let serve = Serve::spawn(&world.env);
+    std::thread::sleep(Duration::from_millis(500));
+    let messages = world.messages(&serve, &session);
+    assert_eq!(restart_parts(&messages, "resume").len(), 1);
+    assert_eq!(restart_parts(&messages, "note").len(), 1);
+    assert_eq!(world.turns(), 2);
+}

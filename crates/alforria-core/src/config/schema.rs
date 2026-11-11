@@ -210,6 +210,24 @@ pub struct ServerInfo {
     pub mdns_domain: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cors: Option<Vec<String>>,
+    /// alforria extension: what to do, at startup, with a turn the last
+    /// process died in the middle of.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume: Option<ResumeMode>,
+}
+
+/// `server.resume`. Whatever it says, the interrupted turn's history is
+/// repaired first: its running tool calls are marked interrupted and its
+/// assistant message is completed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResumeMode {
+    /// Repair and leave it (the default).
+    None,
+    /// Repair, and leave a note the model reads with the next prompt.
+    Notify,
+    /// Repair, and prompt the model to carry on. A turn is resumed once.
+    Continue,
 }
 
 // ---------------------------------------------------------------------------
@@ -350,11 +368,26 @@ pub struct RetentionInfo {
     pub events: Option<EventRetentionInfo>,
 }
 
+/// `storage.synchronous` — how hard SQLite pushes a commit to disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SynchronousMode {
+    /// Upstream's setting, and the default. A crash never corrupts the
+    /// database, but a machine that loses power (or is killed by its host)
+    /// can lose the last few seconds of commits.
+    Normal,
+    /// Every commit is on disk before it returns: nothing acknowledged is
+    /// lost, for one `fsync` per commit.
+    Full,
+}
+
 /// `storage` — how the database is kept.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct StorageInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retention: Option<RetentionInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synchronous: Option<SynchronousMode>,
 }
 
 // ---------------------------------------------------------------------------

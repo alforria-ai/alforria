@@ -109,6 +109,9 @@ impl GoalState {
             return false;
         }
         match self.pid {
+            // After a reboot the new server often has the id the old one
+            // had: another boot's goal under this process's id is nobody's.
+            Some(pid) if pid == std::process::id() => true,
             Some(pid) => !process_alive(pid),
             // Written before owners were recorded.
             None => true,

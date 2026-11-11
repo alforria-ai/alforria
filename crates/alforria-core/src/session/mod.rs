@@ -19,6 +19,7 @@ pub mod processor;
 pub mod prompt;
 pub mod prompt_input;
 pub mod question;
+pub mod recovery;
 pub mod reminders;
 pub mod render;
 pub mod retry;
