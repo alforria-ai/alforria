@@ -224,6 +224,10 @@ pub struct ServerInfo {
     /// process died in the middle of.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume: Option<ResumeMode>,
+    /// alforria extension: how far project config and which host files are
+    /// trusted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust: Option<super::host::TrustInfo>,
 }
 
 /// `server.resume`. Whatever it says, the interrupted turn's history is

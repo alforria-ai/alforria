@@ -997,7 +997,22 @@ impl LlmRequestSender for RouteLlmSender {
 }
 
 /// `${VAR}` interpolation over the env (provider.ts:1734-1741).
+///
+/// A base URL is where requests go, and it can come from a config the
+/// agent is able to write: a variable the shell environment policy
+/// withholds from the agent's own processes (the server's password, a
+/// provider key) is not put into one. Such a reference is left as written.
 fn interpolate_env(url: &str) -> String {
+    interpolate_env_with(url, &alforria_core::shell_env::current(), |key| {
+        std::env::var(key).ok()
+    })
+}
+
+fn interpolate_env_with(
+    url: &str,
+    policy: &alforria_core::shell_env::ShellEnvPolicy,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> String {
     let mut out = String::new();
     let mut rest = url;
     while let Some(start) = rest.find("${") {
@@ -1005,9 +1020,15 @@ fn interpolate_env(url: &str) -> String {
         rest = &rest[start..];
         if let Some(end) = rest.find('}') {
             let key = &rest[2..end];
-            match std::env::var(key) {
-                Ok(value) => out.push_str(&value),
-                Err(_) => out.push_str(&rest[..end + 1]),
+            let value = if policy.denied(key) {
+                tracing::warn!("not substituting ${{{key}}} into a base URL: it is a secret");
+                None
+            } else {
+                lookup(key)
+            };
+            match value {
+                Some(value) => out.push_str(&value),
+                None => out.push_str(&rest[..end + 1]),
             }
             rest = &rest[end + 1..];
         } else {
@@ -1093,6 +1114,35 @@ mod tests {
             1_735_689_600_000.0
         );
         assert_eq!(parse_release_date("bogus"), None);
+    }
+
+    /// A base URL never carries a variable the shell environment policy
+    /// withholds: `https://attacker.example/${OPENCODE_SERVER_PASSWORD}`.
+    #[test]
+    fn interpolate_env_never_substitutes_a_withheld_secret() {
+        let policy = alforria_core::shell_env::ShellEnvPolicy::default();
+        let lookup = |key: &str| match key {
+            "OPENCODE_SERVER_PASSWORD" => Some("hunter2".to_string()),
+            "ANTHROPIC_API_KEY" => Some("sk-ant".to_string()),
+            "AZURE_RESOURCE_NAME" => Some("my-resource".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            interpolate_env_with(
+                "https://x.example/${OPENCODE_SERVER_PASSWORD}/${ANTHROPIC_API_KEY}",
+                &policy,
+                lookup
+            ),
+            "https://x.example/${OPENCODE_SERVER_PASSWORD}/${ANTHROPIC_API_KEY}"
+        );
+        assert_eq!(
+            interpolate_env_with(
+                "https://${AZURE_RESOURCE_NAME}.openai.azure.com",
+                &policy,
+                lookup
+            ),
+            "https://my-resource.openai.azure.com"
+        );
     }
 
     #[test]

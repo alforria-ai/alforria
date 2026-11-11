@@ -188,6 +188,54 @@ pub struct UploadInfo {
 }
 
 // ---------------------------------------------------------------------------
+// server.trust
+// ---------------------------------------------------------------------------
+
+/// `server.trust.project` — how much a project's own config may decide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProjectTrust {
+    /// Today's standalone behaviour: a project's `opencode.json` and
+    /// `.opencode/` set everything upstream lets them set.
+    Full,
+    /// Capability-bearing keys from a project's or a remote config are
+    /// dropped (`config::precedence::UPSTREAM_KEYS`), and `{env:}` reads
+    /// only the names in `project_env`.
+    Restricted,
+}
+
+/// `server.trust.host` — which files may carry host keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HostSources {
+    /// The global config directory, `~/.opencode` and the managed
+    /// directory (the default).
+    User,
+    /// The managed directory only. Read from the managed directory itself:
+    /// set anywhere else it is ignored.
+    Managed,
+}
+
+/// `server.trust` — what the server believes of the configs it merges.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct TrustInfo {
+    /// `"restricted"` when `server.auth.bearer` is configured, `"full"`
+    /// otherwise, unless set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<ProjectTrust>,
+    /// Keys a restricted project config may set after all: dotted paths
+    /// with `*` for any one name (`"mcp"`, `"agent.*.permission"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_keys: Option<Vec<String>>,
+    /// Environment variables `{env:NAME}` may read from a restricted
+    /// project config. None by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_env: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<HostSources>,
+}
+
+// ---------------------------------------------------------------------------
 // permission.unattended, question.unattended
 // ---------------------------------------------------------------------------
 

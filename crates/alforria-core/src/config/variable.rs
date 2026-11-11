@@ -48,6 +48,28 @@ pub enum Missing {
 static ENV_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\{env:([^}]+)\}").unwrap());
 static FILE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\{file:[^}]+\}").unwrap());
 
+/// What a config that is *not the user's own* may substitute.
+///
+/// `{env:NAME}` and `{file:path}` are upstream features written for the
+/// user's config. A project's `opencode.json` — a file that arrives with a
+/// clone and that the agent can write — and a remote config got them too,
+/// and so could read the server's password, a provider key or `auth.json`
+/// into a system prompt, an MCP server's environment or a base URL. For
+/// such a source:
+///
+/// * `{env:NAME}` substitutes only when `env_allowed(NAME)`; a refused name
+///   substitutes the empty string (as an unset variable does) and is logged;
+/// * `{file:path}` must be a relative path that, with symlinks resolved,
+///   stays inside `root`; an absolute path, `~`, a `..` or a link that
+///   leaves it is a bad file reference. With no `root` (a remote config)
+///   every `{file:}` is one.
+pub struct Confinement<'a> {
+    /// The project directory `{file:}` may read inside.
+    pub root: Option<PathBuf>,
+    /// Whether this source may read environment variable `NAME`.
+    pub env_allowed: &'a dyn Fn(&str) -> bool,
+}
+
 /// Apply `{env:VAR}` and `{file:path}` substitutions to config text.
 ///
 /// * `{env:VAR}` → the injected map's value for `VAR` falling back to the
@@ -61,14 +83,39 @@ static FILE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\{file:[^}]+\}")
 ///
 /// A `{file:...}` failure raises `CoreError::ConfigInvalid`
 /// (`bad file reference: "{token}" ...`) unless `missing` is `Empty`.
+///
+/// This is the form for the user's own config: nothing is refused. A
+/// project's or a remote config goes through [`substitute_confined`].
 pub fn substitute(
     text: &str,
     source: &Source,
     env: &HashMap<String, String>,
     missing: Missing,
 ) -> Result<String, CoreError> {
+    substitute_confined(text, source, env, missing, None)
+}
+
+/// [`substitute`], with what the source may read limited by `confinement`
+/// (`None`: the user's own config, unlimited).
+pub fn substitute_confined(
+    text: &str,
+    source: &Source,
+    env: &HashMap<String, String>,
+    missing: Missing,
+    confinement: Option<&Confinement<'_>>,
+) -> Result<String, CoreError> {
     let text = ENV_RE.replace_all(text, |captures: &regex::Captures| {
         let var = captures.get(1).unwrap().as_str();
+        if let Some(confinement) = confinement {
+            if !(confinement.env_allowed)(var) {
+                tracing::warn!(
+                    "ignoring {{env:{var}}} in {}: a project's or a remote config may not read \
+                     that variable (see `server.trust.project_env` and `shell_env`)",
+                    source.name().display()
+                );
+                return String::new();
+            }
+        }
         env.get(var)
             .cloned()
             .or_else(|| env::var(var).ok())
@@ -97,7 +144,22 @@ pub fn substitute(
         }
 
         let file_path = &token["{file:".len()..token.len() - 1];
-        let resolved = resolve_file_path(&config_dir, file_path);
+        let resolved = match confinement {
+            None => resolve_file_path(&config_dir, file_path),
+            Some(confinement) => {
+                match confined_file_path(&config_dir, file_path, confinement.root.as_deref()) {
+                    Ok(resolved) => resolved,
+                    // Refused whatever `missing` says: this is not a file
+                    // that happens to be absent.
+                    Err(reason) => {
+                        return Err(CoreError::invalid(
+                            source.name(),
+                            format!("bad file reference: \"{token}\" {reason}"),
+                        ));
+                    }
+                }
+            }
+        };
 
         match fs::read_to_string(&resolved) {
             Ok(content) => {
@@ -150,6 +212,43 @@ fn resolve_file_path(config_dir: &Path, file_path: &str) -> PathBuf {
                 .unwrap_or_else(|_| config_dir.to_path_buf())
         };
         normalize(&dir.join(joined))
+    }
+}
+
+/// The file a confined `{file:path}` denotes, or why it is refused: the path
+/// must be relative, and — with every symlink resolved — inside `root`.
+fn confined_file_path(
+    config_dir: &Path,
+    file_path: &str,
+    root: Option<&Path>,
+) -> Result<PathBuf, String> {
+    let Some(root) = root else {
+        return Err("is not allowed in a remote config".to_string());
+    };
+    let outside = || {
+        format!(
+            "is outside the project: a project config reads files inside {} only",
+            root.display()
+        )
+    };
+    let path = Path::new(file_path);
+    if file_path.starts_with('~') || path.is_absolute() || path.has_root() {
+        return Err(outside());
+    }
+    let resolved = resolve_file_path(config_dir, file_path);
+    // Both ends real: `..` is already folded, and a link that points out of
+    // the project resolves to where it points. A file that does not exist
+    // has nothing to resolve; its lexical path must be inside, and reading
+    // it fails as a missing file.
+    let real_root = fs::canonicalize(root).unwrap_or_else(|_| normalize(root));
+    let inside = match fs::canonicalize(&resolved) {
+        Ok(real) => real.starts_with(&real_root),
+        Err(_) => resolved.starts_with(&real_root) || resolved.starts_with(normalize(root)),
+    };
+    if inside {
+        Ok(resolved)
+    } else {
+        Err(outside())
     }
 }
 
@@ -209,6 +308,102 @@ mod tests {
         ));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn confined(
+        text: &str,
+        file: &Path,
+        root: Option<&Path>,
+        env_allowed: &dyn Fn(&str) -> bool,
+    ) -> Result<String, CoreError> {
+        substitute_confined(
+            text,
+            &Source::Path(file.to_path_buf()),
+            &env_map(&[("FROM_MAP", "map-secret"), ("OK_NAME", "fine")]),
+            Missing::Error,
+            Some(&Confinement {
+                root: root.map(Path::to_path_buf),
+                env_allowed,
+            }),
+        )
+    }
+
+    /// A project config cannot read a variable it is not allowed, from the
+    /// injected map or from the process; an allowed one still substitutes.
+    #[test]
+    fn a_confined_source_reads_only_allowed_variables() {
+        let root = temp_dir();
+        let file = root.join("opencode.json");
+        let allowed = |name: &str| name == "OK_NAME";
+        let out = confined(
+            "a={env:FROM_MAP} b={env:PATH} c={env:OK_NAME}",
+            &file,
+            Some(&root),
+            &allowed,
+        )
+        .unwrap();
+        assert_eq!(out, "a= b= c=fine");
+    }
+
+    /// `{file:}` from a project config stays inside the project: no absolute
+    /// path, no `~`, no `..`, no symlink out; a remote config has no files.
+    #[test]
+    fn a_confined_source_reads_files_inside_its_root_only() {
+        let base = temp_dir();
+        let root = base.join("project");
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::write(root.join("inside.txt"), "inside").unwrap();
+        fs::write(base.join("secret.txt"), "sk-secret").unwrap();
+        let file = root.join("sub").join("opencode.json");
+        let any = |_: &str| true;
+
+        let ok = confined("{file:../inside.txt}", &file, Some(&root), &any).unwrap();
+        assert_eq!(ok, "inside");
+
+        let secret = base.join("secret.txt");
+        for reference in [
+            format!("{{file:{}}}", secret.display()),
+            "{file:../../secret.txt}".to_string(),
+            "{file:~/.config/alforria/opencode.json}".to_string(),
+            "{file:~}".to_string(),
+            // Absolute, even though it is inside.
+            format!("{{file:{}}}", root.join("inside.txt").display()),
+        ] {
+            let err = confined(&reference, &file, Some(&root), &any).unwrap_err();
+            assert!(
+                err.to_string().contains("bad file reference"),
+                "{reference}: {err}"
+            );
+            assert!(!err.to_string().contains("sk-secret"));
+        }
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&secret, root.join("link.txt")).unwrap();
+            std::os::unix::fs::symlink(&base, root.join("up")).unwrap();
+            for reference in ["{file:../link.txt}", "{file:../up/secret.txt}"] {
+                let err = confined(reference, &file, Some(&root), &any).unwrap_err();
+                assert!(err.to_string().contains("outside the project"), "{err}");
+            }
+        }
+
+        // `missing: Empty` does not turn a refusal into an empty string.
+        let err = substitute_confined(
+            "{file:../../secret.txt}",
+            &Source::Path(file.clone()),
+            &HashMap::new(),
+            Missing::Empty,
+            Some(&Confinement {
+                root: Some(root.clone()),
+                env_allowed: &any,
+            }),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("outside the project"), "{err}");
+
+        // A remote config: no root, no files.
+        let err = confined("{file:inside.txt}", &file, None, &any).unwrap_err();
+        assert!(err.to_string().contains("remote config"), "{err}");
     }
 
     #[test]

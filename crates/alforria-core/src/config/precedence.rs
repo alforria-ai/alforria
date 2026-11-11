@@ -36,7 +36,7 @@ use crate::paths::GlobalPaths;
 use crate::{parse_jsonc, CoreError};
 
 use super::schema::{decode_config, Config, SCHEMA_REF};
-use super::variable::{substitute, Missing, Source};
+use super::variable::{substitute_confined, Confinement, Missing, Source};
 
 /// Content written to `.opencode/.gitignore` (`ensureGitignore`).
 pub const GITIGNORE_CONTENTS: &str =
@@ -250,7 +250,10 @@ pub enum KeyTrust {
 /// Where a config being merged came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigOrigin {
-    /// The global config directory, `~/.opencode`, the managed directory.
+    /// The managed directory (`/etc/opencode`): the administrator's.
+    Managed,
+    /// The global config directory and `~/.opencode`: the user's host
+    /// config.
     Host,
     /// `OPENCODE_CONFIG`, `OPENCODE_CONFIG_DIR`, `OPENCODE_CONFIG_CONTENT`:
     /// the user's, but not part of the host config.
@@ -266,7 +269,7 @@ impl KeyTrust {
     /// `{ "enabled": false }` through.)
     pub fn admits(self, origin: ConfigOrigin) -> bool {
         match (self, origin) {
-            (KeyTrust::Project, _) | (_, ConfigOrigin::Host) => true,
+            (KeyTrust::Project, _) | (_, ConfigOrigin::Host | ConfigOrigin::Managed) => true,
             (KeyTrust::Host, _) => false,
             (_, ConfigOrigin::Own) => true,
             (_, ConfigOrigin::Outside) => false,
@@ -304,6 +307,9 @@ pub const EXTENSION_KEYS: &[(&str, KeyTrust)] = &[
     // Whether a turn the last process died in is prompted again, unasked,
     // in whatever project it ran in.
     ("server.resume", KeyTrust::Host),
+    // How far a project's config is believed, and which files are the host
+    // config at all.
+    ("server.trust", KeyTrust::Host),
     // What the agent's shells inherit from the server's environment.
     ("shell_env", KeyTrust::Host),
     // What an ask nobody answers resolves to: `allow` grants.
@@ -403,9 +409,155 @@ pub fn apply_key_trust(mut config: Value, source: &str, origin: ConfigOrigin) ->
     config
 }
 
+/// What the host config says about the other configs: read first, from
+/// the host sources alone, and applied to every source merged after.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HostMode {
+    /// `server.trust.project`: a project's or a remote config sets only
+    /// what cannot carry a capability. The default when
+    /// `server.auth.bearer` is configured — an unattended server, where
+    /// nobody is at a terminal to notice what a clone brought with it.
+    pub restricted: bool,
+    /// `server.trust.project_keys`.
+    pub project_keys: Vec<String>,
+    /// `server.trust.project_env`.
+    pub project_env: Vec<String>,
+    /// `server.trust.host: "managed"` (from the managed directory): host
+    /// keys are read from the managed directory only.
+    pub managed_only: bool,
+}
+
+impl HostMode {
+    /// Whether a config from `origin` may read environment variable `name`
+    /// through `{env:NAME}`. `own` are names the source is entitled to
+    /// whatever else holds (a remote config's own token).
+    fn env_allowed(&self, origin: ConfigOrigin, name: &str, credentials: &[&str]) -> bool {
+        match origin {
+            ConfigOrigin::Managed | ConfigOrigin::Host | ConfigOrigin::Own => true,
+            ConfigOrigin::Outside if self.restricted => {
+                self.project_env.iter().any(|allowed| allowed == name)
+            }
+            // The shell environment policy says which of the server's
+            // variables its children may see; a config the agent can write
+            // gets no more. Provider credentials from `auth.json` are
+            // never a project's to read either.
+            // unless the host config names the variable for them
+            // (`server.trust.project_env`).
+            ConfigOrigin::Outside => {
+                self.project_env.iter().any(|allowed| allowed == name)
+                    || (!crate::shell_env::current().denied(name) && !credentials.contains(&name))
+            }
+        }
+    }
+}
+
+/// How one source is loaded: where it came from and what that entitles it
+/// to substitute.
+struct SourceRules<'a> {
+    origin: ConfigOrigin,
+    mode: &'a HostMode,
+    /// The directory `{file:}` may read inside (`None`: nowhere).
+    root: Option<&'a Path>,
+    /// Names `{env:}` resolves from `auth.json`, withheld from a project.
+    credentials: &'a [&'a str],
+    /// A name this source may read whatever else holds.
+    own_env: Option<String>,
+}
+
 impl ConfigLoader {
     pub fn new() -> Self {
         ConfigLoader
+    }
+
+    /// Read [`HostMode`] from the host sources. A host source that does not
+    /// load leaves the mode restricted: what the operator wanted is
+    /// unknown, so nothing from a project is taken on trust.
+    pub fn host_mode(&self, params: &LoadParams) -> HostMode {
+        let env: HashMap<String, String> = params
+            .auth
+            .all()
+            .iter()
+            .map(|p| (p.key.clone(), p.token.clone()))
+            .collect();
+        let mode = HostMode::default();
+        let rules = |origin| SourceRules {
+            origin,
+            mode: &mode,
+            root: None,
+            credentials: &[],
+            own_env: None,
+        };
+        let mut failed = false;
+        let mut load = |path: PathBuf, origin| match self.load_file(&path, &env, &rules(origin)) {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(
+                    "{}: {error}; project config is treated as untrusted until it loads",
+                    path.display()
+                );
+                failed = true;
+                Value::Object(Map::new())
+            }
+        };
+        let mut managed = Value::Object(Map::new());
+        let managed_dir = managed_config_dir(params);
+        if managed_dir.exists() {
+            for name in ["opencode.json", "opencode.jsonc"] {
+                let next = load(managed_dir.join(name), ConfigOrigin::Managed);
+                merge_config_concat_arrays(&mut managed, &next);
+            }
+        }
+        let trust = |config: &Value, key: &str| config["server"]["trust"][key].clone();
+        let managed_only = trust(&managed, "host") == "managed";
+        let mut merged = Value::Object(Map::new());
+        if !managed_only {
+            for name in crate::project_files::CONFIG_DIR_FILES {
+                let next = load(params.paths.config.join(name), ConfigOrigin::Host);
+                merge_config_concat_arrays(&mut merged, &next);
+            }
+            for dir in up(
+                &[crate::project_files::CONFIG_DIR],
+                &params.paths.home,
+                Some(params.paths.home.as_path()),
+            ) {
+                for name in ["opencode.json", "opencode.jsonc"] {
+                    let next = load(dir.join(name), ConfigOrigin::Host);
+                    merge_config_concat_arrays(&mut merged, &next);
+                }
+            }
+            if trust(&merged, "host") == "managed" {
+                tracing::warn!(
+                    "ignoring `server.trust.host` outside the managed directory: it is read \
+                     from {} only",
+                    managed_dir.display()
+                );
+            }
+        }
+        merge_config_concat_arrays(&mut merged, &managed);
+        let bearer = &merged["server"]["auth"]["bearer"];
+        let configured = |key: &str| bearer[key].as_array().is_some_and(|list| !list.is_empty());
+        let bearer = configured("keys") || configured("tokens_sha256");
+        let names = |key: &str| -> Vec<String> {
+            trust(&merged, key)
+                .as_array()
+                .map(|list| {
+                    list.iter()
+                        .filter_map(|name| name.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let restricted = match trust(&merged, "project").as_str() {
+            Some("restricted") => true,
+            Some("full") => failed,
+            _ => bearer || failed,
+        };
+        HostMode {
+            restricted,
+            project_keys: names("project_keys"),
+            project_env: names("project_env"),
+            managed_only,
+        }
     }
 
     /// Load and merge everything; returns the validated config plus the
@@ -418,6 +570,30 @@ impl ConfigLoader {
             .iter()
             .map(|p| (p.key.clone(), p.token.clone()))
             .collect();
+
+        // What the host config says about every other source: read first.
+        let mode = self.host_mode(params);
+        let credentials: Vec<&str> = auth_env.keys().map(String::as_str).collect();
+        // `{file:}` in a project config reads inside the project.
+        let project_root = params
+            .worktree
+            .clone()
+            .unwrap_or_else(|| params.directory.clone());
+        let rules = |origin: ConfigOrigin| SourceRules {
+            origin,
+            mode: &mode,
+            root: matches!(origin, ConfigOrigin::Outside).then_some(project_root.as_path()),
+            credentials: &credentials,
+            own_env: None,
+        };
+        // A remote config is nobody's directory: no `{file:}` at all.
+        let remote_rules = |own_env: Option<&str>| SourceRules {
+            origin: ConfigOrigin::Outside,
+            mode: &mode,
+            root: None,
+            credentials: &credentials,
+            own_env: own_env.map(str::to_string),
+        };
 
         let mut result = Value::Object(Map::new());
 
@@ -441,6 +617,8 @@ impl ConfigLoader {
                     source: source.clone(),
                 },
                 &auth_env,
+                // Its own token, as upstream substitutes it.
+                &remote_rules(Some(&provider.key)),
             )?;
             let next = apply_key_trust(next, &source, ConfigOrigin::Outside);
             merge_config_concat_arrays(&mut result, &next);
@@ -459,7 +637,7 @@ impl ConfigLoader {
 
         // 4. OPENCODE_CONFIG env file (failures are fatal).
         if let Some(flag) = flags_value(&params.flags.config) {
-            let next = self.load_file(Path::new(flag), &auth_env)?;
+            let next = self.load_file(Path::new(flag), &auth_env, &rules(ConfigOrigin::Own))?;
             let next = apply_key_trust(next, flag, ConfigOrigin::Own);
             merge_config_concat_arrays(&mut result, &next);
         }
@@ -472,7 +650,7 @@ impl ConfigLoader {
                 params.worktree.as_deref(),
             );
             for file in files.into_iter().rev() {
-                let next = self.load_file(&file, &auth_env)?;
+                let next = self.load_file(&file, &auth_env, &rules(ConfigOrigin::Outside))?;
                 let next = apply_key_trust(next, &file.to_string_lossy(), ConfigOrigin::Outside);
                 merge_config_concat_arrays(&mut result, &next);
             }
@@ -513,7 +691,7 @@ impl ConfigLoader {
             if is_opencode_dir {
                 for name in ["opencode.json", "opencode.jsonc"] {
                     let file = dir.join(name);
-                    let next = self.load_file(&file, &auth_env)?;
+                    let next = self.load_file(&file, &auth_env, &rules(origin_of(dir)))?;
                     let next = apply_key_trust(next, &file.to_string_lossy(), origin_of(dir));
                     merge_config_concat_arrays(&mut result, &next);
                     // result.agent ??= {}; result.mode ??= {}; result.plugin ??= []
@@ -545,6 +723,7 @@ impl ConfigLoader {
                     source: "OPENCODE_CONFIG_CONTENT".to_owned(),
                 },
                 &auth_env,
+                &rules(ConfigOrigin::Own),
             )?;
             let next = apply_key_trust(next, "OPENCODE_CONFIG_CONTENT", ConfigOrigin::Own);
             merge_config_concat_arrays(&mut result, &next);
@@ -566,6 +745,7 @@ impl ConfigLoader {
                     source: source.clone(),
                 },
                 &auth_env,
+                &remote_rules(None),
             )?;
             let next = apply_key_trust(next, &source, ConfigOrigin::Outside);
             merge_config_concat_arrays(&mut result, &next);
@@ -581,7 +761,11 @@ impl ConfigLoader {
         let managed_dir = managed_config_dir(params);
         if managed_dir.exists() {
             for name in ["opencode.json", "opencode.jsonc"] {
-                let next = self.load_file(&managed_dir.join(name), &HashMap::new())?;
+                let next = self.load_file(
+                    &managed_dir.join(name),
+                    &HashMap::new(),
+                    &rules(ConfigOrigin::Managed),
+                )?;
                 merge_config_concat_arrays(&mut result, &next);
             }
         }
@@ -741,7 +925,15 @@ impl ConfigLoader {
 
         let mut result = Value::Object(Map::new());
         for name in crate::project_files::CONFIG_DIR_FILES {
-            let next = self.load_file(&params.paths.config.join(name), env)?;
+            let mode = HostMode::default();
+            let host = SourceRules {
+                origin: ConfigOrigin::Host,
+                mode: &mode,
+                root: None,
+                credentials: &[],
+                own_env: None,
+            };
+            let next = self.load_file(&params.paths.config.join(name), env, &host)?;
             merge_config_concat_arrays(&mut result, &next);
         }
 
@@ -800,8 +992,22 @@ impl ConfigLoader {
         text: &str,
         source: Source,
         env: &HashMap<String, String>,
+        rules: &SourceRules<'_>,
     ) -> Result<Value, CoreError> {
-        let expanded = substitute(text, &source, env, Missing::Error)?;
+        // The user's own config substitutes freely; a project's or a remote
+        // one reads only what `rules` lets it (`variable::Confinement`).
+        let env_allowed = |name: &str| {
+            rules.own_env.as_deref() == Some(name)
+                || rules
+                    .mode
+                    .env_allowed(rules.origin, name, rules.credentials)
+        };
+        let confinement = matches!(rules.origin, ConfigOrigin::Outside).then(|| Confinement {
+            root: rules.root.map(Path::to_path_buf),
+            env_allowed: &env_allowed,
+        });
+        let expanded =
+            substitute_confined(text, &source, env, Missing::Error, confinement.as_ref())?;
         let source_path = source_name(&source);
         let value = parse_jsonc(&expanded, &source_path)?;
         // `ConfigV2Compat.lower(normalizeLoadedConfig(input))` before the
@@ -831,7 +1037,12 @@ impl ConfigLoader {
 
     /// `loadFile` — read, substitute, parse, validate. Missing or empty
     /// files contribute `{}`; failures are fatal to the caller.
-    fn load_file(&self, path: &Path, env: &HashMap<String, String>) -> Result<Value, CoreError> {
+    fn load_file(
+        &self,
+        path: &Path,
+        env: &HashMap<String, String>,
+        rules: &SourceRules<'_>,
+    ) -> Result<Value, CoreError> {
         let text = match fs::read_to_string(path) {
             Ok(text) => text,
             Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Value::Object(Map::new())),
@@ -843,7 +1054,7 @@ impl ConfigLoader {
         if text.is_empty() {
             return Ok(Value::Object(Map::new()));
         }
-        self.load_config(&text, Source::Path(path.to_path_buf()), env)
+        self.load_config(&text, Source::Path(path.to_path_buf()), env, rules)
     }
 }
 
@@ -909,7 +1120,15 @@ fn managed_config_dir(params: &LoadParams) -> PathBuf {
         .ok()
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/etc/opencode"))
+        .unwrap_or_else(|| {
+            // A test run never reads the machine's own managed config: it
+            // would decide what the fixtures' projects may set.
+            if crate::paths::sandbox::under_test() {
+                std::env::temp_dir().join("alforria-no-managed-config")
+            } else {
+                PathBuf::from("/etc/opencode")
+            }
+        })
 }
 
 /// JS truthiness for a JSON value (absent counts as falsy).
@@ -1532,6 +1751,12 @@ mod tests {
             "server.directories" => json!(["/"]),
             "server.upload" => json!({ "max_bytes": 1_000_000_000u64, "directories": ["."] }),
             "server.resume" => json!("continue"),
+            "server.trust" => json!({
+                "project": "full",
+                "project_keys": ["mcp", "permission"],
+                "project_env": ["OPENCODE_SERVER_PASSWORD"],
+                "host": "user",
+            }),
             "shell_env" => json!({ "inherit": "all", "allow": ["*"] }),
             "permission.unattended" => json!({ "timeout": "1s", "on_timeout": "allow" }),
             "question" => json!({ "unattended": { "timeout": "1s", "on_timeout": "reject" } }),
@@ -1574,13 +1799,20 @@ mod tests {
             })
         }
         for (key, trust) in EXTENSION_KEYS {
-            for origin in [ConfigOrigin::Host, ConfigOrigin::Own, ConfigOrigin::Outside] {
+            for origin in [
+                ConfigOrigin::Managed,
+                ConfigOrigin::Host,
+                ConfigOrigin::Own,
+                ConfigOrigin::Outside,
+            ] {
                 let mut config = nest(key, widening(key));
                 config["model"] = json!("a/b");
                 let out = apply_key_trust(config.clone(), "some/opencode.json", origin);
                 assert_eq!(out["model"], "a/b", "{key}: other keys are untouched");
                 let expected = match (trust, origin) {
-                    (_, ConfigOrigin::Host) | (KeyTrust::Project, _) => true,
+                    (_, ConfigOrigin::Host | ConfigOrigin::Managed) | (KeyTrust::Project, _) => {
+                        true
+                    }
                     (KeyTrust::Host, _) => false,
                     (KeyTrust::UserOnly | KeyTrust::UserOnlyMayDisable, ConfigOrigin::Own) => true,
                     (KeyTrust::UserOnly | KeyTrust::UserOnlyMayDisable, ConfigOrigin::Outside) => {
@@ -1640,6 +1872,7 @@ mod tests {
             "server.auth",
             "server.directories",
             "server.upload",
+            "server.trust",
             "shell_env",
             "permission.unattended",
             "question",
@@ -1674,6 +1907,7 @@ mod tests {
                 "directories": [],
                 "upload": {},
                 "resume": "notify",
+                "trust": {},
             },
         }))
         .unwrap();
@@ -1687,6 +1921,97 @@ mod tests {
                 "server.{field} is not classified in EXTENSION_KEYS"
             );
         }
+    }
+
+    /// A project config cannot read the server's secrets or a file outside
+    /// the project through `{env:}` / `{file:}` (it put the server password,
+    /// a provider key and `auth.json` into an agent prompt). The user's own
+    /// config still substitutes freely.
+    #[test]
+    fn a_project_config_cannot_substitute_secrets_or_outside_files() {
+        let f = Fixture::new();
+        let work = f.root.join("work");
+        let outside = f.root.join("outside").join("auth.json");
+        write(&outside, r#"{"anthropic":{"key":"sk-file-secret"}}"#);
+        write(&work.join("notes.txt"), "project notes");
+        // Deny-listed names, set in this process only under names no other
+        // test reads.
+        std::env::set_var("ALFORRIA_H3TEST_SECRET", "hunter2-env-secret");
+        std::env::set_var("ALFORRIA_H3TEST_PLAIN", "plain-value");
+        let prompt = |text: &str| json!({ "agent": { "build": { "prompt": text } } }).to_string();
+        let loaded_prompt = |f: &Fixture| {
+            let (config, _) = f.load().unwrap();
+            config.agent.unwrap()["build"].prompt.clone().unwrap()
+        };
+
+        // `{env:}`: a withheld name is empty, an ordinary one substitutes,
+        // and a file inside the project is read.
+        write(
+            &work.join("opencode.json"),
+            &prompt("pw={env:ALFORRIA_H3TEST_SECRET} plain={env:ALFORRIA_H3TEST_PLAIN} notes={file:notes.txt}"),
+        );
+        assert_eq!(
+            loaded_prompt(&f),
+            "pw= plain=plain-value notes=project notes"
+        );
+
+        // `{file:}` outside the project is a config error, not content.
+        for reference in [
+            format!("{{file:{}}}", outside.display()),
+            "{file:../outside/auth.json}".to_string(),
+            "{file:~/.local/share/alforria/auth.json}".to_string(),
+        ] {
+            write(&work.join("opencode.json"), &prompt(&reference));
+            let error = f.load().unwrap_err().to_string();
+            assert!(error.contains("bad file reference"), "{reference}: {error}");
+            assert!(!error.contains("sk-file-secret"), "{error}");
+        }
+
+        // The same text in the user's own (global) config substitutes.
+        fs::remove_file(work.join("opencode.json")).unwrap();
+        write(
+            &f.root.join("config").join("opencode.json"),
+            &prompt(&format!(
+                "pw={{env:ALFORRIA_H3TEST_SECRET}} file={{file:{}}}",
+                outside.display()
+            )),
+        );
+        let own = loaded_prompt(&f);
+        assert!(own.contains("hunter2-env-secret"), "{own}");
+        assert!(own.contains("sk-file-secret"), "{own}");
+
+        // The host config can name a variable for project configs.
+        write(
+            &f.root.join("config").join("opencode.json"),
+            &json!({ "server": { "trust": { "project_env": ["ALFORRIA_H3TEST_SECRET"] } } })
+                .to_string(),
+        );
+        write(
+            &work.join("opencode.json"),
+            &prompt("pw={env:ALFORRIA_H3TEST_SECRET}"),
+        );
+        assert_eq!(loaded_prompt(&f), "pw=hunter2-env-secret");
+
+        // On an unattended server (`server.auth.bearer`), a project config
+        // reads only the names the host config lists: an ordinary variable
+        // is withheld too.
+        write(
+            &f.root.join("config").join("opencode.json"),
+            &json!({ "server": {
+                "auth": { "bearer": { "tokens_sha256": ["00"] } },
+                "trust": { "project_keys": ["agent.*.prompt"], "project_env": ["ALFORRIA_H3TEST_PLAIN"] },
+            } })
+            .to_string(),
+        );
+        write(
+            &work.join("opencode.json"),
+            &prompt(
+                "pw={env:ALFORRIA_H3TEST_SECRET} path={env:PATH} plain={env:ALFORRIA_H3TEST_PLAIN}",
+            ),
+        );
+        assert_eq!(loaded_prompt(&f), "pw= path= plain=plain-value");
+        std::env::remove_var("ALFORRIA_H3TEST_SECRET");
+        std::env::remove_var("ALFORRIA_H3TEST_PLAIN");
     }
 
     /// The loader applies the table to each source by where it came from:
