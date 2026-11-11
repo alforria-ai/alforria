@@ -324,6 +324,9 @@ impl MemoryService {
                 let Some(service) = weak.upgrade() else {
                     break;
                 };
+                if service.indexer_stopped() {
+                    break;
+                }
                 let pass = tokio::task::spawn_blocking(move || {
                     let progress = service.index_pending(BATCH, SETTLE_MS);
                     let caught_up = matches!(&progress, Ok(progress) if progress.scanned == 0);

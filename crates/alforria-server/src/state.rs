@@ -1599,6 +1599,10 @@ pub struct ServerContext {
     /// The worktree service (`worktree/index.ts`) + its dependencies.
     pub worktree: alforria_core::worktree::Worktree,
     pub worktree_deps: Arc<dyn alforria_core::worktree::Deps>,
+    /// Stops what the engines run by themselves (trigger schedulers,
+    /// transcript indexers). Called first in a shutdown, so nothing new
+    /// starts while the running turns are settled.
+    pub stop_background: Arc<dyn Fn() + Send + Sync>,
     /// The global directories this context was built over. `None` resolves
     /// them from the environment at each use (the unwired contexts); the
     /// production context pins the ones it was given, so a context built
@@ -1706,6 +1710,7 @@ impl ServerContext {
             vcs: Arc::new(NoVcs),
             worktree: alforria_core::worktree::Worktree::default(),
             paths: None,
+            stop_background: Arc::new(|| {}),
             worktree_deps: Arc::new(WorktreeDeps {
                 data_dir: alforria_core::GlobalPaths::from_env().data,
                 global_bus: global_bus_clone,

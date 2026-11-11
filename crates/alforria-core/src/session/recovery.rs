@@ -978,6 +978,10 @@ mod tests {
         assert_eq!(note.no_reply, Some(true));
         let resume = follow_up(&h.services, &found, ResumePolicy::Continue).unwrap();
         assert_eq!(resume.no_reply, None);
+        // Nobody is asking for either: they have no caller of their own,
+        // so the interrupted session's restriction is what binds them.
+        assert_eq!(note.caller, Caller::Session);
+        assert_eq!(resume.caller, Caller::Session);
         assert_eq!(resume.agent.as_deref(), Some("build"));
         let model = resume.model.as_ref().unwrap();
         assert_eq!(

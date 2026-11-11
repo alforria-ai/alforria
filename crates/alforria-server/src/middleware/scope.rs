@@ -24,7 +24,7 @@
 use crate::bearer::Scope;
 use crate::middleware::auth::route_matches;
 
-use Scope::{Chat, Connector};
+use Scope::{Chat, Connector, Hook};
 
 /// `(method, route, scope)` — the routes a token narrower than `admin` may
 /// call. Anything absent needs `admin`: config, provider credentials, MCP
@@ -85,6 +85,36 @@ pub const ROUTES: &[(&str, &str, Scope)] = &[
     ("GET", "/vcs", Chat),
     ("GET", "/vcs/status", Chat),
     ("GET", "/vcs/diff", Chat),
+    // Durable replay of one session's events (`?after=`), with the
+    // `event.reset` frame when retention dropped what the client missed.
+    // The one `/api` route below `admin`: its handler checks the session's
+    // directory against the allowlist itself (`sse::api_session_event`).
+    ("GET", "/api/session/{sessionID}/event", Chat),
+    // Schedules (`routes::trigger`). A caller below `admin` sets what the
+    // `schedule` tool can set and no more (never `permission`, `agent` or
+    // `model`), targets only sessions it may act in, and changes, fires or
+    // deletes only triggers a restricted caller created — the handlers
+    // enforce it, with `TriggerService::check_actor`.
+    ("GET", "/trigger", Chat),
+    ("POST", "/trigger", Chat),
+    ("GET", "/trigger/{id}", Chat),
+    ("PATCH", "/trigger/{id}", Chat),
+    ("DELETE", "/trigger/{id}", Chat),
+    ("POST", "/trigger/{id}/run", Chat),
+    ("GET", "/trigger/{id}/runs", Chat),
+    // The webhook entry: its own scope. `connector` and `admin` include
+    // it; `chat` does not (`Principal::allows`).
+    ("POST", "/trigger/{id}/hook", Hook),
+    // Memory (`routes::memory`). A caller below `admin` writes under the
+    // `memory` permission of the default agent, as a turn of its own would,
+    // and its writes never vouch for a record.
+    ("GET", "/memory", Chat),
+    ("POST", "/memory", Chat),
+    ("GET", "/memory/search", Chat),
+    ("GET", "/memory/session", Chat),
+    ("GET", "/memory/{id}", Chat),
+    ("PATCH", "/memory/{id}", Chat),
+    ("DELETE", "/memory/{id}", Chat),
     // --- connector: chat, plus local automation ------------------------
     // Every directory's events on one stream.
     ("GET", "/global/event", Connector),
@@ -121,6 +151,15 @@ const CWD_ROUTES: &[&str] = &[
     "/file/ticket",
     "/file/raw",
     "/file/content",
+    "/trigger",
+    "/trigger/{id}",
+    "/trigger/{id}/run",
+    "/trigger/{id}/hook",
+    "/trigger/{id}/runs",
+    "/memory",
+    "/memory/search",
+    "/memory/session",
+    "/memory/{id}",
 ];
 
 fn lookup_method(method: &str) -> &str {
@@ -176,7 +215,9 @@ mod tests {
     #[test]
     fn sensitive_families_are_admin_only() {
         let admin_only = |method: &str, route: &str| {
-            route.starts_with("/api")
+            // The whole v2 surface, but for the one durable replay route,
+            // which checks its session's directory itself.
+            (route.starts_with("/api") && route != "/api/session/{sessionID}/event")
                 || route.starts_with("/pty")
                 || route.starts_with("/config")
                 || route.starts_with("/auth")
@@ -233,12 +274,17 @@ mod tests {
             ("POST", "/session/ses_1/share"),
             ("POST", "/experimental/session/ses_1/background"),
             ("POST", "/experimental/worktree"),
-            // Families other branches are adding, and ones nobody has yet.
-            ("GET", "/trigger"),
-            ("POST", "/trigger"),
+            // Under the families that are listed, anything that is not.
             ("POST", "/trigger/trg_1/fire"),
-            ("GET", "/memory"),
+            ("PUT", "/trigger/trg_1"),
+            ("POST", "/trigger/trg_1/runs"),
             ("PUT", "/memory/note"),
+            ("POST", "/memory/search"),
+            ("POST", "/memory/mem_1/verify"),
+            ("GET", "/api/session/ses_1/history"),
+            ("GET", "/api/event"),
+            ("POST", "/api/session/ses_1/event"),
+            // And families nobody has yet.
             ("POST", "/anything/at/all"),
         ] {
             assert_eq!(required(method, path), Scope::Admin, "{method} {path}");
@@ -269,10 +315,26 @@ mod tests {
             ("POST", "/file/ticket"),
             ("GET", "/file/raw"),
             ("PUT", "/file/content"),
+            ("GET", "/trigger"),
+            ("POST", "/trigger"),
+            ("GET", "/trigger/{id}"),
+            ("PATCH", "/trigger/{id}"),
+            ("DELETE", "/trigger/{id}"),
+            ("POST", "/trigger/{id}/run"),
+            ("POST", "/trigger/{id}/hook"),
+            ("GET", "/trigger/{id}/runs"),
+            ("GET", "/memory"),
+            ("POST", "/memory"),
+            ("GET", "/memory/search"),
+            ("GET", "/memory/session"),
+            ("GET", "/memory/{id}"),
+            ("PATCH", "/memory/{id}"),
+            ("DELETE", "/memory/{id}"),
         ];
         for (method, route, _) in ROUTES {
             let known = v1::ROUTES
                 .iter()
+                .chain(v2::ROUTES.iter())
                 .chain(extensions.iter())
                 .any(|(known_method, known_route)| known_method == method && known_route == route);
             assert!(known, "{method} {route} is listed but is not a route");
@@ -299,6 +361,13 @@ mod tests {
             required("POST", "/workflow/run/run_1/abort"),
             Scope::Connector
         );
+        assert_eq!(required("POST", "/trigger/trg_1/hook"), Scope::Hook);
+        assert_eq!(required("POST", "/trigger/trg_1/run"), Scope::Chat);
+        assert_eq!(required("GET", "/memory/search"), Scope::Chat);
+        assert_eq!(required("DELETE", "/memory/mem_1"), Scope::Chat);
+        assert_eq!(required("GET", "/api/session/ses_1/event"), Scope::Chat);
+        assert!(defaults_to_cwd("/trigger/trg_1/hook"));
+        assert!(defaults_to_cwd("/memory/mem_1"));
         assert!(defaults_to_cwd("/workflow/run"));
         assert!(defaults_to_cwd("/session/ses_1/goal"));
         assert!(!defaults_to_cwd("/session/ses_1"));

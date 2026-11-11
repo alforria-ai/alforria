@@ -23,6 +23,12 @@ pub struct StoredSpec {
         skip_serializing_if = "Option::is_none"
     )]
     pub inherited: Option<PermissionV1Ruleset>,
+    /// Whoever created the trigger was restricted (`session::caller`): a
+    /// credential below `admin`, or the `schedule` tool in a restricted
+    /// session. Recorded when it is created and never changed; its runs
+    /// are bound by it for as long as it exists.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub restricted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -288,7 +294,7 @@ impl TriggerStore {
         })?;
         for mut run in unfinished.iter().cloned() {
             run.status = RunStatus::Failed;
-            run.error = Some("the server stopped before this run finished".to_string());
+            run.error = Some(crate::trigger::INTERRUPTED.to_string());
             run.time.ended = Some(now_ms);
             self.put_run(&run)?;
         }

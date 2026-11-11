@@ -92,6 +92,7 @@ fn remember_tool(
     written: Arc<AtomicUsize>,
     session_id: String,
     untrusted: bool,
+    restricted: bool,
 ) -> LlmTool {
     LlmTool {
         name: "memory".to_string(),
@@ -130,7 +131,7 @@ fn remember_tool(
                         kind,
                         content,
                         None,
-                        Provenance::flush(&session_id, untrusted),
+                        Provenance::flush(&session_id, untrusted).restricted(restricted),
                     )
                     .map_err(|error| {
                         written.fetch_sub(1, Ordering::SeqCst);
@@ -208,6 +209,10 @@ impl MemoryFlush {
                 written.clone(),
                 input.session_id.to_string(),
                 untrusted,
+                // A restriction that cannot be read counts as one.
+                self.sessions
+                    .is_restricted(input.session_id)
+                    .unwrap_or(true),
             )],
             retries: Some(1),
             tool_choice: None,

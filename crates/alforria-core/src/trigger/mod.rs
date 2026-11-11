@@ -43,6 +43,11 @@ pub const TRIGGER_SKIPPED: Definition = Definition::ephemeral("trigger.skipped")
 /// The set of triggers changed: `{ triggerID }`.
 pub const TRIGGER_UPDATED: Definition = Definition::ephemeral("trigger.updated");
 
+/// The error of a run the server died in the middle of. The turn itself is
+/// repaired like any other interrupted turn (`session::recovery`); the run
+/// is closed with this, so it never reads as still going.
+pub const INTERRUPTED: &str = "interrupted: the server stopped before this run finished";
+
 /// The longest webhook body a trigger accepts.
 pub const MAX_PAYLOAD_BYTES: usize = 256 * 1024;
 /// How many triggers one directory may hold in the `trigger` table.
@@ -60,6 +65,8 @@ pub enum TriggerError {
     Invalid(String),
     NotFound(String),
     Conflict(String),
+    /// The caller may not do this to this trigger.
+    Forbidden(String),
     Failed(String),
 }
 
@@ -70,6 +77,7 @@ impl std::fmt::Display for TriggerError {
             TriggerError::Invalid(message)
             | TriggerError::NotFound(message)
             | TriggerError::Conflict(message)
+            | TriggerError::Forbidden(message)
             | TriggerError::Failed(message) => f.write_str(message),
         }
     }
@@ -322,6 +330,10 @@ pub struct TriggerRecord {
     pub session_id: Option<String>,
     /// The session whose `schedule` tool created it.
     pub origin_session_id: Option<String>,
+    /// Created by a restricted caller (`session::caller`): its runs happen
+    /// in restricted sessions only, and it is one of the triggers such a
+    /// caller may change.
+    pub restricted: bool,
     pub time_created: u64,
     pub time_updated: u64,
     pub last_fired: Option<u64>,
@@ -348,6 +360,9 @@ impl TriggerRecord {
         }
         if let Some(origin) = &self.origin_session_id {
             object.insert("originSessionID".to_string(), json!(origin));
+        }
+        if self.restricted {
+            object.insert("restricted".to_string(), json!(true));
         }
         if let Some(error) = &self.error {
             object.insert("error".to_string(), json!(error));
@@ -463,6 +478,14 @@ pub struct TriggerTurn {
     /// The prompt carries text from outside: the run is read-only except
     /// for what `own` grants.
     pub untrusted: bool,
+    /// The trigger's creator was restricted: the run is that caller's,
+    /// replayed. It happens in a restricted session or not at all.
+    pub restricted: bool,
+    /// The prompt was written by the operator (the config, or an `admin`
+    /// request), not by a model or a restricted caller. Only then are the
+    /// `@file` and `@agent` mentions in it resolved: resolving one attaches
+    /// a file or names a subagent with no permission asked.
+    pub operator_authored: bool,
     pub prompt: String,
     pub payload: Option<TriggerPayload>,
     pub now_ms: u64,
@@ -481,8 +504,37 @@ pub struct TurnFailure {
     pub message: String,
 }
 
+/// What the scheduler learns about a session a trigger names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionTarget {
+    /// No such session in this project (one that exists in another project
+    /// reads the same: a trigger says nothing about sessions elsewhere).
+    Missing,
+    Found {
+        /// The session is restricted (`session::caller`).
+        restricted: bool,
+    },
+}
+
+/// Who is creating or changing a trigger.
+#[derive(Debug, Clone, Default)]
+pub struct Creator {
+    /// The session whose `schedule` tool is asking, if a tool is.
+    pub origin_session_id: Option<String>,
+    /// The effective rules of that session (`tool::schedule`).
+    pub inherited: Option<PermissionV1Ruleset>,
+    /// The creator is restricted (`session::caller`): a credential below
+    /// `admin`, or a tool call in a restricted session.
+    pub restricted: bool,
+}
+
 /// The session-engine seam behind the scheduler.
 pub trait TriggerOps: Send + Sync {
+    /// The session a trigger wants to run in (`session: "ses_…"`).
+    fn target(&self, _session_id: &str) -> SessionTarget {
+        SessionTarget::Found { restricted: false }
+    }
+
     /// Run one turn to completion and return its final answer.
     fn run_turn<'a>(
         &'a self,
@@ -621,6 +673,7 @@ mod tests {
             enabled: true,
             session_id: Some("ses_1".to_string()),
             origin_session_id: None,
+            restricted: false,
             time_created: 1,
             time_updated: 2,
             last_fired: None,

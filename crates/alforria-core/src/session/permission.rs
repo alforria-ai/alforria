@@ -175,7 +175,13 @@ pub struct PermissionService {
     events: Arc<EventBus>,
     state: Mutex<State>,
     unattended: Mutex<Option<Unattended>>,
+    /// Whether a session carries text from outside (alforria extension,
+    /// [`crate::session::store::carries_untrusted_input`]). Unset: none do.
+    untrusted: Mutex<Option<UntrustedLookup>>,
 }
+
+/// See [`PermissionService::set_untrusted_lookup`].
+pub type UntrustedLookup = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 /// Removes the pending entry when the ask future is dropped
 /// (permission/index.ts:101-108 — `Effect.ensuring(pending.delete(id))`).
@@ -210,7 +216,35 @@ impl PermissionService {
             events,
             state: Mutex::new(State::default()),
             unattended: Mutex::new(None),
+            untrusted: Mutex::new(None),
         }
+    }
+
+    /// Tell the service which sessions carry text from outside (a webhook
+    /// body, the names of changed files, or a parent that had them). For
+    /// such a session the rules it was given are a ceiling, whoever else
+    /// is configured to answer:
+    ///
+    /// * the project's `always` approvals do not apply — they were given
+    ///   for other sessions' requests, and appended after the session's
+    ///   rules they would hand back what its ceiling withheld;
+    /// * an `ask` is a deny, at once. Nobody is asked, and the unattended
+    ///   policy (`permission.unattended`, which may be `allow`) never
+    ///   answers for it.
+    pub fn set_untrusted_lookup(&self, lookup: Option<UntrustedLookup>) {
+        *self
+            .untrusted
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = lookup;
+    }
+
+    fn carries_untrusted_input(&self, session_id: &str) -> bool {
+        let lookup = self
+            .untrusted
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        lookup.is_some_and(|lookup| lookup(session_id))
     }
 
     /// Set (or clear) what happens to an ask nobody answers. Applies to
@@ -360,14 +394,22 @@ impl PermissionService {
     /// `ask` (permission/index.ts:67-107 — binding).
     pub async fn ask(&self, input: PermissionV1AskInput) -> Result<(), PermissionError> {
         let mut needs_ask = false;
+        let untrusted = self.carries_untrusted_input(&input.session_id);
+        let denied = |input: &PermissionV1AskInput| PermissionError::Denied {
+            ruleset: input
+                .ruleset
+                .iter()
+                .filter(|rule| wildcard_match(&input.permission, &rule.permission))
+                .cloned()
+                .collect(),
+        };
         {
             let state = self.lock_state();
+            let none = PermissionV1Ruleset::new();
+            // alforria extension: see `set_untrusted_lookup`.
+            let approved = if untrusted { &none } else { &state.approved };
             for pattern in &input.patterns {
-                let rule = evaluate(
-                    &input.permission,
-                    pattern,
-                    &[&input.ruleset, &state.approved],
-                );
+                let rule = evaluate(&input.permission, pattern, &[&input.ruleset, approved]);
                 match rule.action {
                     PermissionV1Action::Deny => {
                         let ruleset = input
@@ -385,6 +427,9 @@ impl PermissionService {
         }
         if !needs_ask {
             return Ok(());
+        }
+        if untrusted {
+            return Err(denied(&input));
         }
 
         let request = PermissionV1Request {
@@ -1579,5 +1624,79 @@ mod tests {
             .unwrap();
         replier.await.unwrap();
         assert_eq!(result.output.trim(), "hi");
+    }
+
+    /// A session that carries outside text is held to the rules it was
+    /// given: a standing approval does not widen them, and an `ask` is a
+    /// deny at once — nobody is asked, and the unattended policy (here the
+    /// widest, `allow`) never gets to answer.
+    #[tokio::test]
+    async fn a_session_carrying_outside_text_is_never_asked_about_or_approved() {
+        let events = bus();
+        let service = Arc::new(PermissionService::new(events.clone()));
+        service.set_unattended(Some(Unattended {
+            timeout: std::time::Duration::from_millis(20),
+            on_timeout: OnTimeout::Allow,
+        }));
+        service.set_untrusted_lookup(Some(Arc::new(|session_id: &str| session_id == "ses_hook")));
+        let mut asked = events.subscribe("permission.asked");
+        let input = |session: &str, ruleset: PermissionV1Ruleset| PermissionV1AskInput {
+            session_id: session.to_string(),
+            ruleset,
+            always: vec!["ls".to_string()],
+            ..ask_input(None)
+        };
+
+        // An ordinary session: asked, answered `always`, and from then on
+        // the approval stands for the project.
+        let ordinary = {
+            let service = service.clone();
+            let ruleset = vec![rule("bash", "*", PermissionV1Action::Ask)];
+            tokio::spawn(async move { service.ask(input("ses_plain", ruleset)).await })
+        };
+        let request = asked.recv().await.unwrap();
+        service
+            .reply(PermissionV1ReplyInput {
+                request_id: request.data["id"].as_str().unwrap().to_string(),
+                reply: PermissionV1Reply::Always,
+                message: None,
+            })
+            .unwrap();
+        ordinary.await.unwrap().unwrap();
+        service
+            .ask(input(
+                "ses_plain",
+                vec![rule("bash", "*", PermissionV1Action::Ask)],
+            ))
+            .await
+            .expect("approved for good");
+
+        // The same ask from the marked session: denied, with nothing
+        // published and nothing left pending — though the approval above
+        // matches it and the unattended policy would allow it.
+        for ruleset in [
+            vec![rule("bash", "*", PermissionV1Action::Ask)],
+            vec![],
+            // Its own ceiling says deny: the approval comes after it in
+            // the evaluation, and must not win.
+            vec![rule("*", "*", PermissionV1Action::Deny)],
+        ] {
+            let result = service.ask(input("ses_hook", ruleset.clone())).await;
+            assert!(
+                matches!(result, Err(PermissionError::Denied { .. })),
+                "{ruleset:?}: {result:?}"
+            );
+        }
+        assert!(service.list().is_empty());
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        assert!(asked.try_recv().is_err(), "nobody was asked");
+        // What its own rules allow, they allow.
+        service
+            .ask(input(
+                "ses_hook",
+                vec![rule("bash", "ls", PermissionV1Action::Allow)],
+            ))
+            .await
+            .unwrap();
     }
 }

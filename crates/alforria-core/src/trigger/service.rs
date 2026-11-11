@@ -23,10 +23,10 @@ use crate::tool::permission::from_config;
 use crate::trigger::store::{StoredSpec, StoredTrigger, TriggerState, TriggerStore};
 use crate::trigger::watch::{self, WatchHandle, WatchIgnore};
 use crate::trigger::{
-    format_duration, Report, RunStatus, RunTime, Schedule, SessionMode, TriggerError, TriggerOps,
-    TriggerPayload, TriggerRecord, TriggerRun, TriggerSource, TriggerSpec, TriggerTurn,
-    MAX_AGENT_TRIGGERS, MAX_PAYLOAD_BYTES, MAX_STORED_TRIGGERS, TRIGGER_COMPLETED, TRIGGER_FAILED,
-    TRIGGER_FIRED, TRIGGER_SKIPPED, TRIGGER_UPDATED,
+    format_duration, Creator, Report, RunStatus, RunTime, Schedule, SessionMode, SessionTarget,
+    TriggerError, TriggerOps, TriggerPayload, TriggerRecord, TriggerRun, TriggerSource,
+    TriggerSpec, TriggerTurn, MAX_AGENT_TRIGGERS, MAX_PAYLOAD_BYTES, MAX_STORED_TRIGGERS,
+    TRIGGER_COMPLETED, TRIGGER_FAILED, TRIGGER_FIRED, TRIGGER_SKIPPED, TRIGGER_UPDATED,
 };
 use crate::Clock;
 
@@ -85,6 +85,8 @@ struct Entry {
     spec: TriggerSpec,
     inherited: Option<PermissionV1Ruleset>,
     origin_session_id: Option<String>,
+    /// Its creator was restricted (`StoredSpec::restricted`).
+    restricted: bool,
     schedule: Result<Schedule, String>,
     state: TriggerState,
     time_created: u64,
@@ -109,6 +111,7 @@ impl Entry {
             enabled: self.enabled(),
             session_id: self.state.session_id.clone(),
             origin_session_id: self.origin_session_id.clone(),
+            restricted: self.restricted,
             time_created: self.time_created,
             time_updated: self.time_updated,
             last_fired: self.state.last_fired,
@@ -227,6 +230,8 @@ pub struct TriggerService {
     wake: tokio::sync::Notify,
     settled: tokio::sync::Notify,
     started: AtomicBool,
+    /// Set by [`TriggerService::stop`]: nothing fires any more.
+    stopped: AtomicBool,
 }
 
 impl TriggerService {
@@ -259,6 +264,7 @@ impl TriggerService {
                     spec.clone(),
                     None,
                     None,
+                    false,
                     now,
                     now,
                     now,
@@ -283,6 +289,7 @@ impl TriggerService {
                 stored.stored.spec,
                 stored.stored.inherited,
                 stored.origin_session_id,
+                stored.stored.restricted,
                 stored.time_created,
                 stored.time_updated,
                 now,
@@ -303,6 +310,7 @@ impl TriggerService {
             wake: tokio::sync::Notify::new(),
             settled: tokio::sync::Notify::new(),
             started: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
         })
     }
 
@@ -314,6 +322,7 @@ impl TriggerService {
         spec: TriggerSpec,
         inherited: Option<PermissionV1Ruleset>,
         origin_session_id: Option<String>,
+        restricted: bool,
         time_created: u64,
         time_updated: u64,
         now: u64,
@@ -340,6 +349,7 @@ impl TriggerService {
             spec,
             inherited,
             origin_session_id,
+            restricted,
             schedule,
             state,
             time_created: if source == TriggerSource::Config {
@@ -418,9 +428,9 @@ impl TriggerService {
 
     // -- Writing ----------------------------------------------------------
 
-    /// Create a stored trigger. `inherited` is the permission ruleset of the
-    /// session that asked for it, so a trigger an agent creates can do no
-    /// more than the agent could.
+    /// Create a stored trigger on the operator's behalf. `inherited` is the
+    /// permission ruleset of the session that asked for it, so a trigger an
+    /// agent creates can do no more than the agent could.
     pub fn create(
         self: &Arc<Self>,
         id: Option<String>,
@@ -428,8 +438,73 @@ impl TriggerService {
         origin_session_id: Option<String>,
         inherited: Option<PermissionV1Ruleset>,
     ) -> Result<TriggerRecord, TriggerError> {
+        self.create_as(
+            id,
+            spec,
+            Creator {
+                origin_session_id,
+                inherited,
+                restricted: false,
+            },
+        )
+    }
+
+    /// A session a trigger names must be one of this project's, and one its
+    /// creator may act in: a restricted creator's trigger runs in a
+    /// restricted session or not at all (`Caller::may_act_on`).
+    fn check_target(&self, spec: &TriggerSpec, restricted: bool) -> Result<(), TriggerError> {
+        let SessionMode::Existing(session_id) = spec.session_mode() else {
+            return Ok(());
+        };
+        match self.ops.target(&session_id) {
+            SessionTarget::Missing => Err(TriggerError::Invalid(format!(
+                "session {session_id} does not exist in this project"
+            ))),
+            SessionTarget::Found { restricted: false } if restricted => {
+                Err(TriggerError::Forbidden(format!(
+                    "session {session_id} belongs to the operator: a trigger created by a \
+                     restricted caller can only run in a restricted session"
+                )))
+            }
+            SessionTarget::Found { .. } => Ok(()),
+        }
+    }
+
+    /// Whether a caller that is, or is not, restricted may change, fire or
+    /// delete trigger `id`. A restricted caller acts on restricted
+    /// triggers only — its own kind, as with sessions: the config's and
+    /// the operator's are the operator's to change, and firing one would
+    /// start a turn with the operator's rights. An unknown id is left to
+    /// the operation's own answer.
+    pub fn check_actor(&self, id: &str, actor_restricted: bool) -> Result<(), TriggerError> {
+        if !actor_restricted {
+            return Ok(());
+        }
+        match self.lock().get(id) {
+            Some(entry) if !entry.restricted => Err(TriggerError::Forbidden(format!(
+                "trigger \"{id}\" belongs to the operator: this caller can read it, \
+                 but not change or fire it"
+            ))),
+            _ => Ok(()),
+        }
+    }
+
+    /// Create a stored trigger for `creator`. What the creator was is
+    /// recorded with it and binds every run (`StoredSpec::restricted`).
+    pub fn create_as(
+        self: &Arc<Self>,
+        id: Option<String>,
+        spec: TriggerSpec,
+        creator: Creator,
+    ) -> Result<TriggerRecord, TriggerError> {
+        let Creator {
+            origin_session_id,
+            inherited,
+            restricted,
+        } = creator;
         self.require_enabled()?;
         let schedule = spec.schedule().map_err(TriggerError::Invalid)?;
+        self.check_target(&spec, restricted)?;
         let id = match id {
             Some(id) if valid_id(&id) => id,
             Some(id) => {
@@ -456,11 +531,13 @@ impl TriggerService {
                 .values()
                 .filter(|entry| entry.source == TriggerSource::Runtime)
                 .count();
+            // Triggers nobody with the operator's rights wrote: an agent's,
+            // or a restricted caller's.
             let by_agents = entries
                 .values()
-                .filter(|entry| entry.origin_session_id.is_some())
+                .filter(|entry| entry.origin_session_id.is_some() || entry.restricted)
                 .count();
-            if origin_session_id.is_some() && by_agents >= MAX_AGENT_TRIGGERS {
+            if (origin_session_id.is_some() || restricted) && by_agents >= MAX_AGENT_TRIGGERS {
                 return Err(TriggerError::Conflict(format!(
                     "agents have already scheduled {MAX_AGENT_TRIGGERS} triggers here; delete some first"
                 )));
@@ -480,6 +557,7 @@ impl TriggerService {
                     stored: StoredSpec {
                         spec: spec.clone(),
                         inherited: inherited.clone(),
+                        restricted,
                     },
                     origin_session_id: origin_session_id.clone(),
                     time_created: now,
@@ -493,6 +571,7 @@ impl TriggerService {
                 spec,
                 inherited,
                 origin_session_id,
+                restricted,
                 schedule: Ok(schedule),
                 state,
                 time_created: now,
@@ -567,6 +646,11 @@ impl TriggerService {
                     self.watch_path(path, TriggerSource::Runtime)
                         .map_err(TriggerError::Invalid)?;
                 }
+                // Whoever changes it, the trigger stays its creator's: a
+                // new target is held to the creator's restriction.
+                if spec.session != entry.spec.session {
+                    self.check_target(&spec, entry.restricted)?;
+                }
                 let was = entry.enabled();
                 let rescheduled = entry.spec.on != spec.on;
                 entry.spec = spec;
@@ -591,6 +675,7 @@ impl TriggerService {
                         stored: StoredSpec {
                             spec: entry.spec.clone(),
                             inherited: entry.inherited.clone(),
+                            restricted: entry.restricted,
                         },
                         origin_session_id: entry.origin_session_id.clone(),
                         time_created: entry.time_created,
@@ -689,7 +774,7 @@ impl TriggerService {
 
     /// Make a trigger's watcher match its spec.
     fn sync_watch(self: &Arc<Self>, id: &str) {
-        if !self.started.load(Ordering::SeqCst) {
+        if !self.started.load(Ordering::SeqCst) || self.stopped() {
             return;
         }
         let target = {
@@ -800,6 +885,9 @@ impl TriggerService {
                 let Some(service) = weak.upgrade() else {
                     break;
                 };
+                if service.stopped.load(Ordering::SeqCst) {
+                    break;
+                }
                 let now = service.clock.now_ms();
                 service.tick(now);
                 let wait = service.until_next(service.clock.now_ms());
@@ -809,6 +897,23 @@ impl TriggerService {
                 }
             }
         });
+    }
+
+    /// Stop for good (a server shutting down): nothing fires from now on,
+    /// by the clock, a watch, a webhook or a request, and the watchers are
+    /// dropped. Runs already started are turns like any other and are
+    /// settled with them.
+    pub fn stop(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
+        for entry in self.lock().values_mut() {
+            entry.watcher = None;
+            entry.pending = None;
+        }
+        self.wake.notify_one();
+    }
+
+    pub fn stopped(&self) -> bool {
+        self.stopped.load(Ordering::SeqCst)
     }
 
     /// Milliseconds until something may be due.
@@ -834,7 +939,7 @@ impl TriggerService {
     /// Fire everything that is due at `now` and plan what comes next.
     /// Returns the runs it started or skipped.
     pub fn tick(self: &Arc<Self>, now: u64) -> Vec<TriggerRun> {
-        if !self.settings.enabled {
+        if !self.settings.enabled || self.stopped() {
             return Vec::new();
         }
         let mut due: Vec<(String, &'static str, Option<u64>, Option<TriggerPayload>)> = Vec::new();
@@ -943,6 +1048,11 @@ impl TriggerService {
         scheduled: Option<u64>,
         payload: Option<TriggerPayload>,
     ) -> Result<TriggerRun, TriggerError> {
+        if self.stopped() {
+            return Err(TriggerError::Conflict(
+                "the server is shutting down: nothing is fired any more".to_string(),
+            ));
+        }
         let now = self.clock.now_ms();
         let mut run = TriggerRun {
             id: new_id("trr"),
@@ -1005,6 +1115,8 @@ impl TriggerService {
                         .map(|own| from_config(own, &self.settings.home))
                         .unwrap_or_default(),
                     untrusted,
+                    restricted: entry.restricted,
+                    operator_authored: entry.origin_session_id.is_none() && !entry.restricted,
                     prompt: entry.spec.prompt.clone(),
                     payload,
                     now_ms: now,

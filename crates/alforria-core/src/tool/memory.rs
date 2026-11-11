@@ -145,6 +145,7 @@ pub fn memory_tool(
     agents: Arc<dyn Agents>,
     memory: Arc<MemoryService>,
     untrusted: Untrusted,
+    restricted: Untrusted,
 ) -> ToolDef {
     define(
         MEMORY_TOOL,
@@ -154,7 +155,13 @@ pub fn memory_tool(
         truncate,
         agents,
         move |params: MemoryParameters, ctx: ToolCtxRef<'_>| {
-            run_memory(params, ctx, Arc::clone(&memory), Arc::clone(&untrusted))
+            run_memory(
+                params,
+                ctx,
+                Arc::clone(&memory),
+                Arc::clone(&untrusted),
+                Arc::clone(&restricted),
+            )
         },
     )
 }
@@ -175,12 +182,16 @@ fn run_memory(
     ctx: ToolCtxRef<'_>,
     memory: Arc<MemoryService>,
     untrusted: Untrusted,
+    restricted: Untrusted,
 ) -> BoxFuture<'_, Result<ExecuteResult, ToolError>> {
     Box::pin(async move {
         let fail = |error| failed(MEMORY_TOOL, error);
         // Who is writing: this session, and whether it carries text from
         // outside. The service records it with whatever it changes.
-        let by = Provenance::tool(ctx.session_id, untrusted(ctx.session_id));
+        // Whether the session is restricted (`session::caller`) goes with
+        // it too: what such a session saves is shown to its own kind only.
+        let by = Provenance::tool(ctx.session_id, untrusted(ctx.session_id))
+            .restricted(restricted(ctx.session_id));
         // Refused before anyone is asked: such a session may add records
         // (when its trigger lets it), never touch existing ones.
         let outsiders_only_add = |what: &str| -> Result<(), ToolError> {
@@ -471,6 +482,7 @@ mod tests {
             fixed_agents(),
             memory.clone(),
             Arc::new(move |_session_id| outside),
+            Arc::new(|_: &str| false),
         );
         Setup { dir, memory, def }
     }
@@ -867,6 +879,7 @@ mod tests {
             fixed_agents(),
             memory.clone(),
             Arc::new(move |id: &str| crate::trigger::session_untrusted(&lookup, id)),
+            Arc::new(|_: &str| false),
         );
         let ask = RecordingAsk::new();
         let inst = instance(e.temp.path());

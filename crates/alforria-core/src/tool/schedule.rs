@@ -31,6 +31,11 @@ pub trait ScheduleSessions: Send + Sync {
     fn effective_rules(&self, session_id: &str, agent: &str) -> PermissionV1Ruleset;
     /// The session's parent, its parent's parent, and so on.
     fn ancestors(&self, session_id: &str) -> Vec<String>;
+    /// Whether the session is restricted (`session::caller`). A trigger
+    /// made there is a restricted caller's, like the session itself.
+    fn restricted(&self, _session_id: &str) -> bool {
+        false
+    }
 }
 
 /// [`ScheduleSessions`] over the session store and the agent registry.
@@ -50,6 +55,11 @@ impl ScheduleSessions for SessionTree {
             rules.extend(session.permission.unwrap_or_default());
         }
         rules
+    }
+
+    fn restricted(&self, session_id: &str) -> bool {
+        // A restriction that cannot be read counts as one.
+        self.sessions.is_restricted(session_id).unwrap_or(true)
     }
 
     fn ancestors(&self, session_id: &str) -> Vec<String> {
@@ -410,11 +420,16 @@ fn run(
                 // never do more than its creator could when it asked.
                 let inherited = sessions.effective_rules(ctx.session_id, ctx.agent);
                 let record = triggers
-                    .create(
+                    .create_as(
                         params.id.clone().filter(|id| !id.trim().is_empty()),
                         spec,
-                        Some(ctx.session_id.to_string()),
-                        Some(inherited),
+                        crate::trigger::Creator {
+                            origin_session_id: Some(ctx.session_id.to_string()),
+                            inherited: Some(inherited),
+                            // The session's restriction goes with the
+                            // trigger: its runs are bound as this turn is.
+                            restricted: sessions.restricted(ctx.session_id),
+                        },
                     )
                     .map_err(failed)?;
                 Ok(result("Scheduled", &record))

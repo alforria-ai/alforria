@@ -238,7 +238,10 @@ pub trait SystemPrompts: Send + Sync {
     /// The `<memory>` block (alforria extension): saved records, read again
     /// each step like the instruction files. `None` when memory is off or
     /// empty.
-    fn memory(&self) -> Option<String> {
+    ///
+    /// `session_id` is the session the turn runs in: what is shown depends
+    /// on whether it is restricted (`MemoryService::injection_for`).
+    fn memory(&self, _session_id: &str) -> Option<String> {
         None
     }
 }
@@ -685,7 +688,9 @@ pub async fn run_loop(
                 system.push(skills);
             }
             // Last, so a new memory does not unsettle the prefix before it.
-            if let Some(memory) = deps.systems.memory() {
+            let mut memory_block = 0usize;
+            if let Some(memory) = deps.systems.memory(session_id) {
+                memory_block = memory.len();
                 system.push(memory);
             }
             if json_schema_format {
@@ -724,8 +729,11 @@ pub async fn run_loop(
                     latest.finished.as_ref(),
                     &msgs,
                     &model_messages,
-                    &system,
-                    &tools,
+                    &FixedPart {
+                        system: &system,
+                        tools: &tools,
+                        memory_block,
+                    },
                 )
             {
                 compactions += 1;
@@ -922,6 +930,14 @@ fn append_output_length_continue(
 // Helpers
 // -------------------------------------------------------------------------
 
+/// The part of a request that is not conversation.
+struct FixedPart<'a> {
+    system: &'a [String],
+    tools: &'a [LlmTool],
+    /// The size of the `<memory>` block within `system`, in bytes.
+    memory_block: usize,
+}
+
 /// Whether the request about to be sent is larger than the model can take.
 /// The newest finished response's recorded tokens count for everything
 /// before it; what no provider has counted is estimated from its size.
@@ -931,9 +947,13 @@ fn request_overflows(
     finished: Option<&V1Message>,
     msgs: &[WithParts],
     model_messages: &[Message],
-    system: &[String],
-    tools: &[LlmTool],
+    fixed: &FixedPart<'_>,
 ) -> bool {
+    let FixedPart {
+        system,
+        tools,
+        memory_block,
+    } = *fixed;
     if auto_compaction_disabled(&deps.config) {
         return false;
     }
@@ -960,7 +980,13 @@ fn request_overflows(
             estimate_request(&RequestSize {
                 recorded: Some(recorded),
                 since: &since,
-                overhead: 0.0,
+                // The recorded count covers the system prompt as it was
+                // then. The `<memory>` block is the one part of it that
+                // grows between two steps (a turn saves a record, another
+                // session does): it is counted again in full, which can
+                // only overstate. A trigger's payload needs nothing of the
+                // kind: it is a part of the user message, in `since`.
+                overhead: crate::session::overflow::conservative_tokens(memory_block),
             })
         }
         None => estimate_request(&RequestSize {

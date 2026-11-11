@@ -1379,6 +1379,16 @@ impl SessionStore {
                 workspace_id: original.workspace_id.clone(),
                 title: Some(title),
                 metadata: original.metadata.clone(),
+                // alforria extension: a session that carries outside text
+                // is held to rules of its own (`trigger::rules`). Its fork
+                // holds the same text, so it keeps the same rules; the
+                // mark alone (copied with the metadata) would leave the
+                // fork with whatever its agent allows. Upstream's fork
+                // copies no rules, and for every other session neither
+                // does this one.
+                permission: carries_untrusted_input(&original)
+                    .then(|| original.permission.clone())
+                    .flatten(),
                 restricted: caller_restricted || self.is_restricted(session_id)?,
                 ..Default::default()
             },
@@ -2415,5 +2425,113 @@ mod integration_tests {
         assert_eq!(messages[0].parts.len(), 1);
         let title_should_bump = get_forked_title(&created.title);
         assert_eq!(fork.title, title_should_bump);
+    }
+
+    /// The two marks a session can carry are independent, and each is
+    /// inherited by children and forks whatever the other says. A fork of
+    /// a session that carries outside text keeps that session's rules
+    /// too: the text went with it.
+    #[test]
+    fn restriction_and_the_untrusted_mark_are_inherited_independently() {
+        use alforria_schema::permission_v1::{PermissionV1Action, PermissionV1Rule};
+        let dir = crate::storage::test_support::TempDir::new("store-two-marks");
+        let services = services(dir.path());
+        insert_project(&services, "proj_01");
+        let sessions = &services.sessions;
+        let context = ctx("proj_01");
+        let rules = vec![PermissionV1Rule {
+            permission: "*".to_string(),
+            pattern: "*".to_string(),
+            action: PermissionV1Action::Deny,
+        }];
+        let marked = |untrusted: bool| {
+            untrusted.then(|| {
+                let mut metadata = JsonMap::new();
+                metadata.insert(UNTRUSTED_INPUT_KEY.to_string(), serde_json::json!(true));
+                metadata
+            })
+        };
+        for (restricted, untrusted) in [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let root = sessions
+                .create(
+                    &context,
+                    &CreateInput {
+                        restricted,
+                        metadata: marked(untrusted),
+                        permission: Some(rules.clone()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let child = sessions
+                .create(
+                    &context,
+                    &CreateInput {
+                        parent_id: Some(root.id.clone()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let grandchild = sessions
+                .create(
+                    &context,
+                    &CreateInput {
+                        parent_id: Some(child.id.clone()),
+                        // A creator that says otherwise is not believed.
+                        restricted: false,
+                        metadata: Some(JsonMap::new()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let fork = sessions.fork(&context, &root.id, None).unwrap();
+            let fork_of_fork = sessions.fork(&context, &fork.id, None).unwrap();
+            for (name, session) in [
+                ("root", &root),
+                ("child", &child),
+                ("grandchild", &grandchild),
+                ("fork", &fork),
+                ("fork of fork", &fork_of_fork),
+            ] {
+                let at = format!("{name} of restricted={restricted} untrusted={untrusted}");
+                assert_eq!(
+                    sessions.is_restricted(&session.id).unwrap(),
+                    restricted,
+                    "{at}"
+                );
+                assert_eq!(carries_untrusted_input(session), untrusted, "{at}");
+            }
+            // Upstream's fork copies no rules; one that carries outside
+            // text keeps the rules that hold it.
+            assert_eq!(
+                fork.permission,
+                untrusted.then(|| rules.clone()),
+                "restricted={restricted} untrusted={untrusted}"
+            );
+            assert_eq!(fork_of_fork.permission, fork.permission);
+
+            // Replacing the metadata never clears the mark, and has no
+            // say over the restriction.
+            sessions.set_metadata(&root.id, JsonMap::new()).unwrap();
+            let mut cleared = JsonMap::new();
+            cleared.insert(UNTRUSTED_INPUT_KEY.to_string(), serde_json::json!(false));
+            sessions.set_metadata(&child.id, cleared).unwrap();
+            for id in [&root.id, &child.id] {
+                assert_eq!(
+                    carries_untrusted_input(&sessions.get(id).unwrap()),
+                    untrusted
+                );
+                assert_eq!(sessions.is_restricted(id).unwrap(), restricted);
+            }
+            // Lifting the restriction (the operator's act) leaves the
+            // other mark, and the children's own restriction, alone.
+            sessions.lift_restriction(&root.id).unwrap();
+            assert_eq!(
+                carries_untrusted_input(&sessions.get(&root.id).unwrap()),
+                untrusted
+            );
+            assert_eq!(sessions.is_restricted(&child.id).unwrap(), restricted);
+        }
     }
 }

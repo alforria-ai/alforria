@@ -578,9 +578,31 @@ fn parse_after(query: Option<&str>) -> Result<Option<i64>, String> {
 /// no `server.connected`, no heartbeat.
 pub async fn api_session_event(
     State(ctx): State<Arc<ServerContext>>,
+    principal: Option<axum::Extension<crate::bearer::Principal>>,
     Path(session_id): Path<String>,
     axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
 ) -> Response {
+    // alforria extension: the one `/api` route open below `admin`
+    // (`middleware::scope`). It is outside the v1 location middleware, so
+    // the check that middleware makes is made here: the session is looked
+    // up, and its own directory must be one the credential may open. A
+    // session that does not exist and one elsewhere answer alike.
+    if crate::confine::restricted(&principal) {
+        let allowed = ctx.sessions.get(&session_id).is_ok_and(|session| {
+            ctx.policy
+                .directories
+                .allows(std::path::Path::new(&session.directory))
+        });
+        if !allowed {
+            return ApiError::Forbidden {
+                message: format!(
+                    "session {session_id}: not a session this token may read \
+                     (unknown, or outside server.directories)"
+                ),
+            }
+            .into_response();
+        }
+    }
     let after = match parse_after(uri.query()) {
         Ok(after) => after,
         Err(message) => {

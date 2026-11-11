@@ -34,6 +34,9 @@ struct FakeOps {
     answer: Mutex<Result<String, String>>,
     gate: Option<tokio::sync::Semaphore>,
     sessions: AtomicU64,
+    /// What `target` answers for a session id; unlisted ids are found,
+    /// unrestricted.
+    targets: Mutex<BTreeMap<String, crate::trigger::SessionTarget>>,
 }
 
 impl FakeOps {
@@ -43,6 +46,7 @@ impl FakeOps {
             answer: Mutex::new(Ok(text.to_string())),
             gate: None,
             sessions: AtomicU64::new(0),
+            targets: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -52,6 +56,7 @@ impl FakeOps {
             answer: Mutex::new(Ok(text.to_string())),
             gate: Some(tokio::sync::Semaphore::new(0)),
             sessions: AtomicU64::new(0),
+            targets: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -65,6 +70,15 @@ impl FakeOps {
 }
 
 impl TriggerOps for FakeOps {
+    fn target(&self, session_id: &str) -> crate::trigger::SessionTarget {
+        self.targets
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .copied()
+            .unwrap_or(crate::trigger::SessionTarget::Found { restricted: false })
+    }
+
     fn run_turn<'a>(
         &'a self,
         turn: &'a TriggerTurn,
@@ -705,7 +719,8 @@ async fn a_run_cut_short_by_a_restart_is_closed_as_failed() {
     let service = f.service(config);
     let closed = service.run(&run.id).unwrap();
     assert_eq!(closed.status, RunStatus::Failed);
-    assert!(closed.error.unwrap().contains("server stopped"));
+    assert_eq!(closed.error.as_deref(), Some(crate::trigger::INTERRUPTED));
+    assert!(closed.time.ended.is_some());
     assert!(!service.get("job").unwrap().running);
 }
 
@@ -1129,4 +1144,271 @@ async fn runs_that_carry_outside_text_are_marked_untrusted_whatever_started_them
             "{error}"
         );
     }
+}
+
+/// A trigger remembers whether a restricted caller created it, across
+/// restarts and whoever changes it later, and is held to that: it targets
+/// restricted sessions only, its runs say so, and its prompt is text.
+#[tokio::test]
+async fn a_trigger_is_bound_by_who_created_it() {
+    use crate::trigger::{Creator, SessionTarget};
+    let f = Fixture::new(
+        "trigger-creator",
+        "2027-01-01T00:00:00Z",
+        FakeOps::answering("ok"),
+    );
+    {
+        let mut targets = f.ops.targets.lock().unwrap();
+        targets.insert("ses_gone".to_string(), SessionTarget::Missing);
+        targets.insert(
+            "ses_operators".to_string(),
+            SessionTarget::Found { restricted: false },
+        );
+        targets.insert(
+            "ses_mine".to_string(),
+            SessionTarget::Found { restricted: true },
+        );
+    }
+    let config = json!({ "nightly": { "on": { "cron": "0 3 * * *" }, "prompt": "Tidy" } });
+    let service = f.service(config.clone());
+    let restricted = || Creator {
+        restricted: true,
+        ..Default::default()
+    };
+    let job = |session: Option<&str>| {
+        let mut value = json!({ "on": { "interval": "1h" }, "prompt": "Check @notes.txt" });
+        if let Some(session) = session {
+            value["session"] = json!(session);
+        }
+        spec(value)
+    };
+
+    // The session it names: its own kind, in this project.
+    assert!(matches!(
+        service.create_as(None, job(Some("ses_operators")), restricted()),
+        Err(TriggerError::Forbidden(_))
+    ));
+    assert!(matches!(
+        service.create_as(None, job(Some("ses_gone")), restricted()),
+        Err(TriggerError::Invalid(_))
+    ));
+    // The operator is held to the project too, not to the restriction.
+    assert!(matches!(
+        service.create(None, job(Some("ses_gone")), None, None),
+        Err(TriggerError::Invalid(_))
+    ));
+    let mine = service
+        .create_as(
+            Some("mine".to_string()),
+            job(Some("ses_mine")),
+            restricted(),
+        )
+        .unwrap();
+    assert!(mine.restricted);
+    assert_eq!(mine.to_json()["restricted"], true);
+    let theirs = service
+        .create(
+            Some("theirs".to_string()),
+            job(Some("ses_operators")),
+            None,
+            None,
+        )
+        .unwrap();
+    assert!(!theirs.restricted);
+    assert!(theirs.to_json().get("restricted").is_none());
+    let agents = service
+        .create(
+            Some("agents".to_string()),
+            job(None),
+            Some("ses_origin".to_string()),
+            Some(Vec::new()),
+        )
+        .unwrap();
+    assert!(!agents.restricted);
+
+    // A restricted caller acts on restricted triggers only.
+    assert!(service.check_actor("mine", true).is_ok());
+    for id in ["theirs", "agents", "nightly"] {
+        assert!(
+            matches!(
+                service.check_actor(id, true),
+                Err(TriggerError::Forbidden(_))
+            ),
+            "{id}"
+        );
+        assert!(service.check_actor(id, false).is_ok(), "{id}");
+    }
+    assert!(service.check_actor("no-such-trigger", true).is_ok());
+
+    // Retargeting is held to the creator, whoever asks; the session is
+    // looked at again when the run is built.
+    assert!(matches!(
+        service.update("mine", &json!({ "session": "ses_operators" })),
+        Err(TriggerError::Forbidden(_))
+    ));
+    assert!(
+        service
+            .update("mine", &json!({ "title": "Mine" }))
+            .unwrap()
+            .restricted
+    );
+
+    // It survives a restart.
+    drop(service);
+    let service = f.service(config);
+    assert!(service.get("mine").unwrap().restricted);
+    assert!(!service.get("theirs").unwrap().restricted);
+
+    for id in ["mine", "theirs", "agents", "nightly"] {
+        let run = service.run_now(id).unwrap();
+        settle(&service, &[run]).await;
+    }
+    let turns = f.ops.turns();
+    let turn = |id: &str| turns.iter().find(|turn| turn.trigger_id == id).unwrap();
+    assert!(turn("mine").restricted);
+    assert!(!turn("mine").operator_authored);
+    assert!(!turn("theirs").restricted);
+    assert!(turn("theirs").operator_authored);
+    // A model wrote this one's prompt, in an unrestricted session.
+    assert!(!turn("agents").restricted);
+    assert!(!turn("agents").operator_authored);
+    assert!(turn("nightly").operator_authored);
+}
+
+/// Triggers nobody with the operator's rights wrote are capped together: a
+/// restricted caller cannot fill the table through the API any more than
+/// an agent can through the tool.
+#[tokio::test]
+async fn restricted_callers_share_the_agents_cap() {
+    use crate::trigger::Creator;
+    let f = Fixture::new(
+        "trigger-cap",
+        "2027-01-01T00:00:00Z",
+        FakeOps::answering("ok"),
+    );
+    let service = f.service(json!({}));
+    let job = || spec(json!({ "on": { "interval": "1h" }, "prompt": "x" }));
+    for _ in 0..MAX_AGENT_TRIGGERS {
+        service
+            .create_as(
+                None,
+                job(),
+                Creator {
+                    restricted: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+    assert!(matches!(
+        service.create_as(
+            None,
+            job(),
+            Creator {
+                restricted: true,
+                ..Default::default()
+            }
+        ),
+        Err(TriggerError::Conflict(_))
+    ));
+    // The operator is not counted against it.
+    assert!(service.create(None, job(), None, None).is_ok());
+}
+
+/// A stopped scheduler (the server is shutting down) fires nothing: not by
+/// the clock, a watch, a webhook or a request.
+#[tokio::test]
+async fn a_stopped_service_fires_nothing() {
+    let f = Fixture::new(
+        "trigger-stopped",
+        "2027-01-01T00:00:00Z",
+        FakeOps::answering("ok"),
+    );
+    let service = f.service(json!({
+        "tick": { "on": { "interval": "1h" }, "prompt": "Tick" },
+        "hook": { "on": { "webhook": true }, "prompt": "Hook" },
+        "watch": { "on": { "watch": { "path": "inbox" } }, "prompt": "Watch" },
+    }));
+    let next = service.get("tick").unwrap().next.unwrap();
+    service.path_changed("watch", &[f.directory().join("inbox/a")]);
+    service.stop();
+    assert!(service.stopped());
+    f.clock.set(next + 60_000);
+    assert!(service.tick(next + 60_000).is_empty());
+    assert!(matches!(
+        service.run_now("tick"),
+        Err(TriggerError::Conflict(_))
+    ));
+    assert!(matches!(
+        service.hook("hook", b"{}"),
+        Err(TriggerError::Conflict(_))
+    ));
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    assert!(f.ops.turns().is_empty());
+    for id in ["tick", "hook", "watch"] {
+        assert!(service.runs(id, 10).unwrap().is_empty(), "{id}");
+    }
+}
+
+/// The server is killed in the middle of a scheduled run. The tick was
+/// claimed before the run started, so the next server closes the run as
+/// interrupted and does not fire that tick again, with or without
+/// `catch_up` — the interrupted turn itself is `server.resume`'s to deal
+/// with, once. `catch_up` still makes up for a later tick that was missed.
+#[tokio::test]
+async fn a_tick_interrupted_by_a_crash_is_closed_and_never_fired_twice() {
+    let f = Fixture::new(
+        "trigger-crash",
+        "2027-01-01T00:00:00Z",
+        FakeOps::gated("ok"),
+    );
+    let config = json!({
+        "job": { "on": { "interval": "1h" }, "prompt": "Work", "catch_up": true },
+        "daily": { "on": { "cron": "30 1 * * *" }, "prompt": "Daily", "catch_up": true },
+    });
+    let start = f.clock.now_ms();
+    let hour = 3_600_000;
+    let interrupted = {
+        let service = f.service(config.clone());
+        // 01:30: both are due (the interval since 01:00).
+        f.clock.set(start + hour + hour / 2);
+        let runs = service.tick(f.clock.now_ms());
+        assert_eq!(runs.len(), 2, "{runs:?}");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        runs
+        // The process dies here: the runs never finish.
+    };
+    f.ops.release(8);
+
+    // Five minutes later the server is back.
+    f.clock.set(start + hour + hour / 2 + 300_000);
+    let service = f.service(config.clone());
+    for run in &interrupted {
+        let closed = service.run(&run.id).unwrap();
+        assert_eq!(closed.status, RunStatus::Failed, "{closed:?}");
+        assert_eq!(closed.error.as_deref(), Some(crate::trigger::INTERRUPTED));
+    }
+    assert!(
+        service.tick(f.clock.now_ms()).is_empty(),
+        "nothing is refired"
+    );
+    for id in ["job", "daily"] {
+        let record = service.get(id).unwrap();
+        assert!(!record.running, "{id}");
+        assert!(record.next.unwrap() > f.clock.now_ms(), "{id}");
+        assert_eq!(service.runs(id, 10).unwrap().len(), 1, "{id}");
+    }
+    drop(service);
+
+    // Down across the next interval tick: that one was missed, and is
+    // caught up once.
+    f.clock.set(start + 3 * hour);
+    let service = f.service(config);
+    let runs = settle(&service, &service.tick(f.clock.now_ms())).await;
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    assert_eq!(
+        (runs[0].trigger_id.as_str(), runs[0].reason.as_str()),
+        ("job", "catch_up")
+    );
+    assert!(service.tick(f.clock.now_ms()).is_empty());
 }

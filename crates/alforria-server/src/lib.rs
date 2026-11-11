@@ -100,6 +100,7 @@ impl Listener {
     /// before the listener shuts down so live sockets observe 1001).
     pub async fn stop(self) -> io::Result<()> {
         self.websockets.close_all();
+        (self.ctx.stop_background)();
         self.ctx.outbox.stop();
         self.shutdown
             .send(true)
@@ -126,6 +127,13 @@ impl Listener {
 
         // Stop accepting. In-flight requests keep running for now.
         let _ = self.shutdown.send(true);
+        // Nothing starts by itself from here on: the trigger schedulers
+        // stop firing (a tick, a watch and a webhook call alike) and the
+        // transcript indexers end. A trigger's turn that is already running
+        // is a turn like any other and is settled below, aborted or
+        // drained as `server.shutdown.sessions` says; its run is then
+        // closed by the scheduler as completed or failed.
+        (self.ctx.stop_background)();
         shutdown::settle_sessions(
             &self.ctx,
             options,
@@ -367,6 +375,10 @@ pub fn production_context(
     ctx.catalog = runtime.catalog;
     ctx.auth_store = runtime.auth;
     ctx.paths = Some(paths.clone());
+    ctx.stop_background = Arc::new({
+        let engines = engines.clone();
+        move || engines.stop_background()
+    });
     // Everything this context writes goes under the paths it was given:
     // worktrees too, which defaulted to the process's own data directory.
     ctx.worktree_deps = Arc::new(state::WorktreeDeps {

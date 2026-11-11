@@ -5,6 +5,29 @@
 //! message: every text part of the prompt carries
 //! `metadata.trigger = { id, run }`, so a client can tell it from something a
 //! person typed.
+//!
+//! # Who a run is
+//!
+//! Nobody is at the other end of a run, so its caller
+//! ([`crate::session::caller`]) is worked out from the two things that are
+//! known: who created the trigger, and the session the run lands in. The
+//! stricter of the two applies.
+//!
+//! * A trigger the operator wrote (the config, an `admin` request, the
+//!   `schedule` tool in an unrestricted session) runs as
+//!   [`Caller::Session`]: it has no caller of its own and is bound by the
+//!   session it runs in, restricted or not.
+//! * A trigger a restricted caller created (a `chat` or `connector` token,
+//!   or the `schedule` tool in a restricted session) runs as
+//!   [`Caller::Restricted`]: the run is that caller's request, replayed.
+//!   The engine then refuses it anywhere but in a restricted session, at
+//!   the point every turn passes through, so a session whose restriction
+//!   was lifted since is not prompted with the operator's rights. Sessions
+//!   such a trigger creates are created restricted.
+//!
+//! Independently, a run that carries text from outside is marked and held
+//! to read-only rules ([`crate::trigger::rules`]). The two are orthogonal
+//! and both hold.
 
 use std::sync::{Arc, Mutex};
 
@@ -12,12 +35,14 @@ use alforria_schema::schema::JsonMap;
 use alforria_schema::session_v1::{AssistantError, V1Message, V1Part};
 use serde_json::json;
 
+use crate::session::caller::Caller;
 use crate::session::prompt_input::{ModelRef, PromptInput, PromptPartInput};
 use crate::session::store::{CreateInput, SessionContext, SessionStore};
 use crate::session::task_ops::PromptFacade;
 use crate::tool::def::BoxFuture;
 use crate::trigger::{
-    fence_payload, format_instant, SessionMode, TriggerOps, TriggerTurn, TurnFailure, TurnOutcome,
+    fence_payload, format_instant, SessionMode, SessionTarget, TriggerOps, TriggerTurn,
+    TurnFailure, TurnOutcome,
 };
 
 /// The session-engine implementation of [`TriggerOps`].
@@ -90,6 +115,8 @@ impl ProductionTriggerOps {
                     agent: turn.agent.clone(),
                     permission: (!permission.is_empty()).then_some(permission),
                     metadata: Some(metadata),
+                    // The session is its creator's kind, for life.
+                    restricted: turn.restricted,
                     ..Default::default()
                 },
             )
@@ -97,14 +124,29 @@ impl ProductionTriggerOps {
         Ok(session.id)
     }
 
+    /// Whether a session is this instance's: of its project and in its
+    /// directory. The project alone is not enough — every directory that
+    /// is not a repository belongs to the one `global` project, and a
+    /// turn here would run with this directory's tools on a session that
+    /// lives in another.
+    fn owns(&self, session: &alforria_schema::session_v1::V1SessionInfo) -> bool {
+        session.project_id == self.context.project_id
+            && std::path::Path::new(&session.directory) == self.context.directory
+    }
+
     /// The session this turn runs in, created if need be.
     fn session_for(&self, turn: &TriggerTurn) -> Result<String, String> {
         match &turn.mode {
-            SessionMode::Existing(id) => self
-                .sessions
-                .get(id)
-                .map(|session| session.id)
-                .map_err(|_| format!("session {id} no longer exists")),
+            SessionMode::Existing(id) => match self.target(id) {
+                SessionTarget::Missing => Err(format!("session {id} no longer exists")),
+                // Refused again by the engine when the turn is built; said
+                // here so the run fails with the reason and no message.
+                SessionTarget::Found { restricted: false } if turn.restricted => Err(format!(
+                    "session {id} is not restricted (any more): a trigger created by a \
+                     restricted caller only runs in a restricted session"
+                )),
+                SessionTarget::Found { .. } => Ok(id.clone()),
+            },
             SessionMode::New => self.create_session(
                 turn,
                 format!("{} · {}", turn.title, format_instant(turn.now_ms)),
@@ -114,7 +156,16 @@ impl ProductionTriggerOps {
                     .session_id
                     .as_deref()
                     .and_then(|id| self.sessions.get(id).ok())
-                    .filter(|session| session.time.archived.is_none());
+                    .filter(|session| session.time.archived.is_none())
+                    // One that is no longer the trigger's kind (its
+                    // restriction was lifted) is left to the operator, and
+                    // the trigger starts a session of its own again. One
+                    // from another project is not this trigger's at all.
+                    .filter(|session| {
+                        self.owns(session)
+                            && (!turn.restricted
+                                || self.sessions.is_restricted(&session.id).unwrap_or(false))
+                    });
                 match kept {
                     Some(session) => {
                         // The rules may have changed since the session was made.
@@ -134,6 +185,21 @@ impl ProductionTriggerOps {
 }
 
 impl TriggerOps for ProductionTriggerOps {
+    /// Fetch, then compare: the session must be this instance's own
+    /// ([`Self::owns`]). One that exists elsewhere reads as missing.
+    fn target(&self, session_id: &str) -> SessionTarget {
+        match self.sessions.get(session_id) {
+            Ok(session) if self.owns(&session) => {
+                SessionTarget::Found {
+                    // A restriction that cannot be read is not one a
+                    // restricted trigger can rely on.
+                    restricted: self.sessions.is_restricted(session_id).unwrap_or(false),
+                }
+            }
+            _ => SessionTarget::Missing,
+        }
+    }
+
     fn run_turn<'a>(
         &'a self,
         turn: &'a TriggerTurn,
@@ -155,20 +221,30 @@ impl TriggerOps for ProductionTriggerOps {
                 );
                 Some(metadata)
             };
-            // `@file` mentions in the prompt resolve like they do in a command.
-            let mut parts = facade
-                .resolve_prompt_parts(&turn.prompt)
-                .await
-                .unwrap_or_else(|_| {
-                    vec![PromptPartInput::Text {
-                        id: None,
-                        text: turn.prompt.clone(),
-                        synthetic: None,
-                        ignored: None,
-                        time: None,
-                        metadata: None,
-                    }]
-                });
+            let plain = || {
+                vec![PromptPartInput::Text {
+                    id: None,
+                    text: turn.prompt.clone(),
+                    synthetic: None,
+                    ignored: None,
+                    time: None,
+                    metadata: None,
+                }]
+            };
+            // `@file` and `@agent` mentions resolve like they do in a
+            // command — for a prompt the operator wrote. Resolving one
+            // attaches the file's contents, or names a subagent the turn
+            // may then start, with no permission asked: a prompt a model
+            // wrote with the `schedule` tool, or a restricted caller sent,
+            // is text and nothing else.
+            let mut parts = if turn.operator_authored {
+                facade
+                    .resolve_prompt_parts(&turn.prompt)
+                    .await
+                    .unwrap_or_else(|_| plain())
+            } else {
+                plain()
+            };
             for part in &mut parts {
                 if let PromptPartInput::Text { metadata, .. } = part {
                     *metadata = mark();
@@ -198,8 +274,13 @@ impl TriggerOps for ProductionTriggerOps {
                 system: None,
                 variant: None,
                 parts,
-                // Nobody is asking: the run is bound by its session.
-                caller: crate::session::caller::Caller::Session,
+                // See the module docs: the stricter of who scheduled the
+                // run and the session it lands in.
+                caller: if turn.restricted {
+                    Caller::Restricted
+                } else {
+                    Caller::Session
+                },
             };
             let result = facade
                 .prompt(input)
@@ -272,6 +353,8 @@ mod tests {
                 action: PermissionV1Action::Deny,
             }],
             untrusted: false,
+            restricted: false,
+            operator_authored: true,
             prompt: "Write the morning brief".to_string(),
             payload: None,
             now_ms: 1_800_000_000_000,
@@ -390,5 +473,151 @@ mod tests {
             failure.message
         );
         assert_eq!(failure.session_id, None);
+    }
+
+    /// A trigger a restricted caller created runs as that caller would: in
+    /// a restricted session or not at all, and the engine refuses it where
+    /// the session stopped being one. An operator's trigger is bound by
+    /// whatever session it lands in.
+    #[tokio::test]
+    async fn a_restricted_triggers_runs_stay_in_restricted_sessions() {
+        let e = engine(
+            "trigger-ops-restricted",
+            (0..6)
+                .map(|index| text_stream(&format!("answer {index}")))
+                .collect(),
+        );
+        let ops = ops(&e);
+        let sessions = &e.services.sessions;
+        let context = e.services.instance_context(&e.worktree, None).unwrap();
+        let restricted_turn = |mode: SessionMode| {
+            let mut turn = turn(mode);
+            turn.restricted = true;
+            turn.operator_authored = false;
+            turn.own = Vec::new();
+            turn
+        };
+        let count = |session: &str| {
+            e.services
+                .messages
+                .stream_without_diffs(session)
+                .unwrap()
+                .len()
+        };
+
+        // A session it makes is restricted from the start.
+        let first = ops
+            .run_turn(&restricted_turn(SessionMode::New))
+            .await
+            .unwrap();
+        assert!(sessions.is_restricted(&first.session_id).unwrap());
+        assert_eq!(
+            ops.target(&first.session_id),
+            SessionTarget::Found { restricted: true }
+        );
+
+        // The operator's session is refused, and nothing is written there.
+        let operators = sessions.create(&context, &Default::default()).unwrap();
+        assert_eq!(
+            ops.target(&operators.id),
+            SessionTarget::Found { restricted: false }
+        );
+        let failure = ops
+            .run_turn(&restricted_turn(SessionMode::Existing(
+                operators.id.clone(),
+            )))
+            .await
+            .unwrap_err();
+        assert!(
+            failure.message.contains("restricted"),
+            "{}",
+            failure.message
+        );
+        assert_eq!(count(&operators.id), 0);
+
+        // A restricted session it names is fine.
+        let again = ops
+            .run_turn(&restricted_turn(SessionMode::Existing(
+                first.session_id.clone(),
+            )))
+            .await
+            .unwrap();
+        assert_eq!(again.session_id, first.session_id);
+
+        // A `reuse` trigger whose session lost its restriction starts a
+        // session of its own kind instead of prompting the operator's.
+        let before = count(&first.session_id);
+        sessions.lift_restriction(&first.session_id).unwrap();
+        let mut reuse = restricted_turn(SessionMode::Reuse);
+        reuse.session_id = Some(first.session_id.clone());
+        let moved = ops.run_turn(&reuse).await.unwrap();
+        assert_ne!(moved.session_id, first.session_id);
+        assert!(sessions.is_restricted(&moved.session_id).unwrap());
+        assert_eq!(count(&first.session_id), before);
+
+        // Even if the check above were skipped, the engine refuses the
+        // turn where every turn is built: the caller is `Restricted`.
+        let refused = e
+            .prompt
+            .prompt(PromptInput {
+                session_id: first.session_id.clone(),
+                message_id: None,
+                model: None,
+                agent: Some("build".to_string()),
+                no_reply: None,
+                tools: None,
+                format: None,
+                system: None,
+                variant: None,
+                parts: vec![PromptPartInput::Text {
+                    id: None,
+                    text: "x".to_string(),
+                    synthetic: None,
+                    ignored: None,
+                    time: None,
+                    metadata: None,
+                }],
+                caller: Caller::Restricted,
+            })
+            .await;
+        assert!(
+            matches!(
+                refused,
+                Err(crate::session::prompt_input::PromptError::Forbidden { .. })
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(count(&first.session_id), before);
+
+        // An operator's trigger may land in a restricted session: it runs,
+        // bound by that session like every turn in it.
+        let mut operators_turn = turn(SessionMode::Existing(moved.session_id.clone()));
+        operators_turn.own = Vec::new();
+        let ran = ops.run_turn(&operators_turn).await.unwrap();
+        assert_eq!(ran.session_id, moved.session_id);
+        assert!(sessions.is_restricted(&moved.session_id).unwrap());
+
+        // A session that lives in another directory is not this trigger's,
+        // whichever project it says it belongs to.
+        let elsewhere = sessions
+            .create(
+                &context,
+                &CreateInput {
+                    directory: Some("/somewhere/else".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(ops.target(&elsewhere.id), SessionTarget::Missing);
+        assert_eq!(ops.target("ses_no_such"), SessionTarget::Missing);
+        let failure = ops
+            .run_turn(&turn(SessionMode::Existing(elsewhere.id.clone())))
+            .await
+            .unwrap_err();
+        assert!(
+            failure.message.contains("no longer exists"),
+            "{}",
+            failure.message
+        );
     }
 }

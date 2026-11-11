@@ -46,7 +46,12 @@ struct Hook {
     url: String,
     events: Vec<String>,
     signer: Signer,
+    /// `trigger_text`: the one piece of content a delivery may carry.
+    trigger_text: bool,
 }
+
+/// The most of a trigger's final answer a delivery carries (`trigger_text`).
+const MAX_TRIGGER_TEXT: usize = 16 * 1024;
 
 /// Retry and retention settings (`hook.outbox`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,6 +170,7 @@ fn hook_from_config(index: usize, info: &WebhookInfo) -> Result<Hook, String> {
             .filter(|event| !event.is_empty())
             .collect(),
         signer,
+        trigger_text: info.trigger_text == Some(true),
     })
 }
 
@@ -172,7 +178,18 @@ fn hook_from_config(index: usize, info: &WebhookInfo) -> Result<Hook, String> {
 /// short labels. Everything else — message text, tool input and output,
 /// patterns, metadata — stays.
 fn small_properties(data: &Value) -> Map<String, Value> {
-    const LABELS: &[&str] = &["permission", "kind", "name", "status", "reason", "trigger"];
+    // `report` and `action` are the fixed words of `trigger.completed`
+    // (`final` / `none`) and `memory.updated` (`created`, `updated`, …).
+    const LABELS: &[&str] = &[
+        "permission",
+        "kind",
+        "name",
+        "status",
+        "reason",
+        "trigger",
+        "report",
+        "action",
+    ];
     let mut out = Map::new();
     let Some(fields) = data.as_object() else {
         return out;
@@ -362,7 +379,19 @@ impl Outbox {
     }
 
     /// What is sent for an event: small, and the same on every attempt.
-    fn body(&self, delivery_id: &str, payload: &Payload, now: u64) -> Value {
+    fn body(&self, hook: &Hook, delivery_id: &str, payload: &Payload, now: u64) -> Value {
+        let mut properties = small_properties(&payload.data);
+        // A trigger's final answer is content, and stays here like all
+        // content — unless this hook asked for it by name.
+        if hook.trigger_text && payload.r#type == "trigger.completed" {
+            if let Some(text) = payload.data.get("text").and_then(Value::as_str) {
+                let mut end = text.len().min(MAX_TRIGGER_TEXT);
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                properties.insert("text".to_string(), json!(&text[..end]));
+            }
+        }
         let session_id = payload
             .data
             .get("sessionID")
@@ -392,7 +421,7 @@ impl Outbox {
             "sessionID": session_id,
             "title": title,
             "kind": kind,
-            "properties": small_properties(&payload.data),
+            "properties": properties,
         })
     }
 
@@ -409,7 +438,7 @@ impl Outbox {
                 continue;
             }
             let id = format!("whd_{}", ulid::Ulid::new());
-            let body = self.body(&id, payload, now).to_string();
+            let body = self.body(hook, &id, payload, now).to_string();
             let inserted = self.storage.with_connection(|conn| {
                 conn.execute(
                     "INSERT INTO outbox (id, hook, event_type, body, time_created, attempts, time_next) \

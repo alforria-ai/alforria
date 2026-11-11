@@ -166,6 +166,19 @@ impl SessionServices {
         let status = Arc::new(SessionStatusService::new(events.clone()));
         let run_state = SessionRunState::new(background, status.clone());
         let permission = Arc::new(PermissionService::new(events.clone()));
+        // Whatever builds the engine on top, a session carrying outside
+        // text is held to its own rules (`set_untrusted_lookup`).
+        permission.set_untrusted_lookup(Some({
+            let sessions = sessions.clone();
+            Arc::new(move |session_id: &str| {
+                // Unlike `trigger::session_untrusted`, a session that is
+                // not stored is not presumed marked here: asks are raised
+                // for ids that are no session's (a workflow run's).
+                sessions
+                    .get(session_id)
+                    .is_ok_and(|session| crate::session::store::carries_untrusted_input(&session))
+            })
+        }));
         let question = Arc::new(QuestionService::new(events.clone()));
         let credentials = Arc::new(crate::credential::CredentialStore::new(
             storage.clone(),

@@ -659,13 +659,17 @@ struct EngineSystemPrompts {
     directory: PathBuf,
     worktree: PathBuf,
     memory: Arc<alforria_core::memory::MemoryService>,
+    sessions: alforria_core::session::store::SessionStore,
     /// `prompt.*` from the config.
     options: alforria_core::session::system::PromptOptions,
 }
 
 impl alforria_core::session::r#loop::SystemPrompts for EngineSystemPrompts {
-    fn memory(&self) -> Option<String> {
-        self.memory.injection()
+    fn memory(&self, session_id: &str) -> Option<String> {
+        // A session whose restriction cannot be read is shown what an
+        // unrestricted one is: the smaller set.
+        let restricted = self.sessions.is_restricted(session_id).unwrap_or(false);
+        self.memory.injection_for(restricted)
     }
 
     fn environment(&self, model: &alforria_core::session::llm::LlmModel) -> Vec<String> {
@@ -1328,9 +1332,14 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
             truncate.clone(),
             agents.clone(),
             memory.clone(),
-            Arc::new(move |session_id: &str| {
-                alforria_core::trigger::session_untrusted(&sessions, session_id)
+            Arc::new({
+                let sessions = sessions.clone();
+                move |session_id: &str| {
+                    alforria_core::trigger::session_untrusted(&sessions, session_id)
+                }
             }),
+            // A restriction that cannot be read counts as one.
+            Arc::new(move |session_id: &str| sessions.is_restricted(session_id).unwrap_or(true)),
         ));
         builtin.push(alforria_core::tool::memory::session_search_tool(
             truncate.clone(),
@@ -1461,6 +1470,7 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
         summary: summary.clone(),
         instruction,
         systems: Arc::new(EngineSystemPrompts {
+            sessions: services.sessions.clone(),
             agents: services.agents.clone(),
             skills: skill_service.clone(),
             mcp: mcp_service.clone(),
@@ -1612,6 +1622,24 @@ impl EngineStore {
                 },
             );
         Ok(())
+    }
+
+    /// Stop what the engines run on their own (a server shutting down):
+    /// every trigger scheduler, so nothing fires any more, and every
+    /// transcript indexer. Turns already running are settled by the
+    /// shutdown itself.
+    pub fn stop_background(&self) {
+        let engines: Vec<Arc<ProductionEngine>> = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .map(|entry| entry.engine.clone())
+            .collect();
+        for engine in engines {
+            engine.triggers.stop();
+            engine.memory.stop_indexer();
+        }
     }
 
     /// The `EngineFactory` seam — resolves the engine for a request's

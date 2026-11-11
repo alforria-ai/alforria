@@ -116,8 +116,14 @@ pub struct MemoryRecord {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Source {
-    /// A client, through `/memory`: the user's own act.
+    /// The operator, through `/memory` (Basic auth, an `admin` token, the
+    /// CLI): the user's own act, and the only one that vouches for a
+    /// record.
     Api,
+    /// A client below `admin`, through `/memory` (a `chat` or `connector`
+    /// token). It writes what a turn in one of its sessions could have
+    /// written with the `memory` tool, and vouches for nothing.
+    Client,
     /// A model, calling the `memory` tool during a turn.
     Tool,
     /// A model, in the flush before a compaction.
@@ -151,6 +157,12 @@ pub struct Provenance {
     /// file's name) when it wrote the record.
     #[serde(default)]
     pub untrusted: bool,
+    /// The writer was restricted (`session::caller`): a session created by,
+    /// or a request from, a credential below `admin`. Such a record is
+    /// injected into restricted sessions only — what a chat client had
+    /// saved does not enter the system context of the operator's sessions.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub restricted: bool,
     /// The latest changes, oldest first.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub history: Vec<Change>,
@@ -162,8 +174,27 @@ impl Provenance {
             source: Source::Api,
             session_id: None,
             untrusted: false,
+            restricted: false,
             history: Vec::new(),
         }
+    }
+
+    /// A client below `admin`, through `/memory`.
+    pub fn client() -> Provenance {
+        Provenance {
+            source: Source::Client,
+            session_id: None,
+            untrusted: false,
+            restricted: true,
+            history: Vec::new(),
+        }
+    }
+
+    /// The same origin, written from a session that is, or is not,
+    /// restricted.
+    pub fn restricted(mut self, restricted: bool) -> Provenance {
+        self.restricted = restricted;
+        self
     }
 
     pub fn tool(session_id: &str, untrusted: bool) -> Provenance {
@@ -171,6 +202,7 @@ impl Provenance {
             source: Source::Tool,
             session_id: Some(session_id.to_string()),
             untrusted,
+            restricted: false,
             history: Vec::new(),
         }
     }
@@ -180,6 +212,7 @@ impl Provenance {
             source: Source::Flush,
             session_id: Some(session_id.to_string()),
             untrusted,
+            restricted: false,
             history: Vec::new(),
         }
     }
@@ -399,6 +432,8 @@ pub struct MemoryService {
     events: Option<Arc<EventBus>>,
     clock: Arc<dyn Clock>,
     settings: MemorySettings,
+    /// Set by [`MemoryService::stop_indexer`].
+    indexer_stopped: std::sync::atomic::AtomicBool,
 }
 
 impl MemoryService {
@@ -413,7 +448,21 @@ impl MemoryService {
             events,
             clock,
             settings,
+            indexer_stopped: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// End the background transcript indexer (a server shutting down). The
+    /// pass under way finishes its batch; no other starts. Searches still
+    /// index what they need.
+    pub fn stop_indexer(&self) {
+        self.indexer_stopped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn indexer_stopped(&self) -> bool {
+        self.indexer_stopped
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub fn enabled(&self) -> bool {
@@ -663,6 +712,7 @@ impl MemoryService {
                         source: by.source,
                         session_id: by.session_id.clone(),
                         untrusted: by.untrusted || (by.source != Source::Api && unverified_before),
+                        restricted: by.restricted,
                         history: Vec::new(),
                     }
                 }
@@ -672,6 +722,7 @@ impl MemoryService {
                     source: by.source,
                     session_id: by.session_id.clone(),
                     untrusted: true,
+                    restricted: by.restricted,
                     history: Vec::new(),
                 },
             };
@@ -849,6 +900,17 @@ impl MemoryService {
     /// system context. Such records are found by search, on demand.
     /// `memory.inject.unverified` opts in to injecting them too.
     pub fn injection(&self) -> Option<String> {
+        self.injection_for(false)
+    }
+
+    /// [`Self::injection`] for a session that is, or is not, restricted
+    /// (`session::caller`). A record a restricted writer saved is injected
+    /// into restricted sessions only: the notes of a `chat` client are for
+    /// its own conversations, and would otherwise be a way for its text to
+    /// reach the system context of every session the operator opens. Such
+    /// records stay searchable everywhere, on demand, and
+    /// `memory.inject.unverified` opts in to injecting them too.
+    pub fn injection_for(&self, restricted_session: bool) -> Option<String> {
         if !self.settings.enabled
             || self.settings.inject_recent == 0
             || self.settings.inject_max_chars == 0
@@ -864,6 +926,14 @@ impl MemoryService {
             .ok()?
             .into_iter()
             .filter(|record| self.settings.inject_unverified || record.verified)
+            .filter(|record| {
+                self.settings.inject_unverified
+                    || restricted_session
+                    || !record
+                        .provenance
+                        .as_ref()
+                        .is_some_and(|provenance| provenance.restricted)
+            })
             .collect::<Vec<_>>();
         if records.is_empty() {
             return None;
@@ -1109,6 +1179,7 @@ mod tests {
             source,
             session_id: Some("ses_1".to_string()),
             untrusted,
+            restricted: false,
             history: Vec::new(),
         }
     }
@@ -1749,5 +1820,99 @@ mod tests {
         let mut none = settings("proj");
         none.inject_recent = 0;
         assert_eq!(service(storage, none).injection(), None);
+    }
+
+    /// What a restricted writer saved is injected into restricted sessions
+    /// only, and a client's rewrite never vouches for a record.
+    #[test]
+    fn a_restricted_writers_records_are_shown_to_its_own_kind_only() {
+        let temp = TempDir::new("memory-restricted");
+        let storage = Arc::new(Storage::open(temp.path().join("db.sqlite")).unwrap());
+        let memory = service(storage.clone(), settings("proj"));
+        memory
+            .remember(None, "The operator said so.", None)
+            .unwrap();
+        let client = memory
+            .remember_from(None, "A client said so.", None, Provenance::client())
+            .unwrap();
+        assert!(client.verified, "a client's note is its own to be shown");
+        memory
+            .remember_from(
+                None,
+                "A restricted session said so.",
+                None,
+                Provenance::tool("ses_r", false).restricted(true),
+            )
+            .unwrap();
+        let flushed = memory
+            .remember_from(
+                None,
+                "A restricted flush said so.",
+                None,
+                Provenance::flush("ses_r", false).restricted(true),
+            )
+            .unwrap();
+
+        let operators = memory.injection_for(false).unwrap();
+        assert!(operators.contains("The operator said so."), "{operators}");
+        assert!(!operators.contains("A client said so."), "{operators}");
+        assert!(!operators.contains("restricted session"), "{operators}");
+        assert_eq!(
+            memory.injection(),
+            Some(operators),
+            "the default is the strict one"
+        );
+        let own = memory.injection_for(true).unwrap();
+        for text in [
+            "The operator said so.",
+            "A client said so.",
+            "A restricted session said so.",
+        ] {
+            assert!(own.contains(text), "{text}: {own}");
+        }
+        assert!(
+            !own.contains("flush said so"),
+            "a flush is unverified for everyone"
+        );
+
+        // A client rewriting the flushed record does not verify it; the
+        // operator's rewrite does, and makes it the operator's.
+        let rewritten = memory
+            .update_by(
+                &flushed.id,
+                &MemoryPatch {
+                    content: Some("A client rewrote the flush.".to_string()),
+                    ..Default::default()
+                },
+                &Provenance::client(),
+            )
+            .unwrap();
+        assert!(!rewritten.verified);
+        let origin = rewritten.provenance.unwrap();
+        assert_eq!((origin.source, origin.restricted), (Source::Client, true));
+        let vouched = memory
+            .update(
+                &flushed.id,
+                &MemoryPatch {
+                    content: Some("The operator rewrote it.".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(vouched.verified);
+        assert!(!vouched.provenance.unwrap().restricted);
+        assert!(memory
+            .injection_for(false)
+            .unwrap()
+            .contains("The operator rewrote it."));
+
+        // Opting in to unverified records opts in to these too.
+        let mut open = settings("proj");
+        open.inject_unverified = true;
+        let memory = service(storage, open);
+        assert!(memory
+            .injection_for(false)
+            .unwrap()
+            .contains("A client said so."));
     }
 }

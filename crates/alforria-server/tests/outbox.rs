@@ -710,3 +710,187 @@ async fn a_waiting_agent_reaches_the_control_plane() {
     f.ctx.outbox.stop();
     let _ = worker.await;
 }
+
+/// The events of a trigger's run reach a webhook like any other: selected
+/// by pattern, small, ids and labels only. A run's final answer is content
+/// and stays behind unless the hook asks for it by name (`trigger_text`).
+/// A permission ask raised inside the run is delivered too, so someone can
+/// be told a scheduled turn is waiting.
+#[tokio::test]
+async fn a_triggers_events_are_delivered_small_and_its_answer_only_on_request() {
+    let plain = Receiver::start().await;
+    let wordy = Receiver::start().await;
+    let (plain_url, wordy_url) = (plain.url.clone(), wordy.url.clone());
+    let f = support::fixture_with(
+        move |_dirs| {
+            json!({
+                "permission": { "bash": "ask" },
+                "memory": { "enabled": true },
+                "trigger": { "brief": { "on": { "cron": "0 8 * * *" }, "prompt": "Write the brief" } },
+                "hook": { "webhook": [
+                    { "name": "plain", "url": plain_url, "secret": "whsec_a",
+                      "events": ["trigger.*", "permission.asked", "session.interrupted",
+                                 "session.media.omitted", "memory.updated"] },
+                    { "name": "wordy", "url": wordy_url, "secret": "whsec_b",
+                      "events": ["trigger.completed"], "trigger_text": true }
+                ] }
+            })
+        },
+        None,
+        vec![
+            support::tool_turn(
+                "call_1",
+                "bash",
+                json!({ "command": "echo secret-command", "description": "d" }),
+            ),
+            support::text_turn("The brief: all quiet. secret-answer"),
+        ],
+    );
+    tokio::spawn(f.ctx.outbox.clone().run());
+    let dir = format!(
+        "directory={}",
+        support::urlencode(&f.dirs.repo.display().to_string())
+    );
+
+    let response = support::call(
+        &f.router,
+        "POST",
+        &format!("/trigger/brief/run?{dir}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    // The run waits on its ask: the ask is delivered while it does.
+    let asked = loop {
+        let requests = plain.requests();
+        if let Some(request) = requests
+            .iter()
+            .find(|request| header(request, "x-alforria-event") == "permission.asked")
+        {
+            break serde_json::from_str::<Value>(&request.body).unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(asked["kind"], "permission");
+    assert_eq!(asked["properties"]["permission"], "bash");
+    assert!(asked["sessionID"].as_str().unwrap().starts_with("ses"));
+    assert!(!asked.to_string().contains("secret-command"), "{asked}");
+    let ask = asked["properties"]["id"].as_str().unwrap();
+    let reply = support::call(
+        &f.router,
+        "POST",
+        &format!("/permission/{ask}/reply?{dir}"),
+        None,
+        Some(json!({ "reply": "once" })),
+    )
+    .await;
+    assert_eq!(reply.status(), StatusCode::OK);
+
+    let wordy_got = wordy.wait_for(1).await;
+    let completed_with_text: Value = serde_json::from_str(&wordy_got[0].body).unwrap();
+    assert_eq!(completed_with_text["type"], "trigger.completed");
+    assert_eq!(
+        completed_with_text["properties"]["text"],
+        "The brief: all quiet. secret-answer"
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let completed = loop {
+        let requests = plain.requests();
+        if let Some(request) = requests
+            .iter()
+            .find(|request| header(request, "x-alforria-event") == "trigger.completed")
+        {
+            break serde_json::from_str::<Value>(&request.body).unwrap();
+        }
+        assert!(std::time::Instant::now() < deadline, "no trigger.completed");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    let properties = &completed["properties"];
+    assert_eq!(properties["triggerID"], "brief");
+    assert!(properties["runID"].as_str().unwrap().starts_with("trr_"));
+    assert_eq!(properties["sessionID"], asked["sessionID"]);
+    assert_eq!(properties["report"], "final");
+    assert_eq!(properties["quiet"], false);
+    assert!(properties["duration"].is_number());
+    assert!(properties.get("text").is_none(), "{completed}");
+    assert!(
+        !completed.to_string().contains("secret-answer"),
+        "{completed}"
+    );
+    assert!(completed.to_string().len() < 1024, "{completed}");
+
+    let types: Vec<String> = plain
+        .requests()
+        .iter()
+        .map(|request| header(request, "x-alforria-event").to_string())
+        .collect();
+    assert!(types.contains(&"trigger.fired".to_string()), "{types:?}");
+
+    // The other new events are selectable by name and carry no content.
+    let services = f.ctx.instances.load(&f.dirs.repo).unwrap();
+    for (definition, data) in [
+        (
+            &alforria_core::session::recovery::SESSION_INTERRUPTED,
+            json!({ "sessionID": "ses_x", "action": "notify", "tools": 2, "detail": "secret-detail text that is long" }),
+        ),
+        (
+            &alforria_core::session::media::MEDIA_OMITTED,
+            json!({ "sessionID": "ses_x", "providerID": "p", "modelID": "m",
+                    "omitted": [{ "mime": "image/png", "filename": "secret-name.png" }] }),
+        ),
+        (
+            &alforria_core::memory::MEMORY_UPDATED,
+            json!({ "id": "mem_1", "action": "created", "content": "secret-memory" }),
+        ),
+        (
+            &alforria_core::trigger::TRIGGER_FAILED,
+            json!({ "triggerID": "brief", "runID": "trr_9", "duration": 3, "error": "secret-error" }),
+        ),
+        (
+            &alforria_core::trigger::TRIGGER_SKIPPED,
+            json!({ "triggerID": "brief", "runID": "trr_8", "reason": "schedule", "cause": "busy" }),
+        ),
+    ] {
+        services
+            .events
+            .publish(definition, data, Default::default())
+            .unwrap();
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let requests = plain.requests();
+        let seen = |name: &str| {
+            requests
+                .iter()
+                .any(|request| header(request, "x-alforria-event") == name)
+        };
+        if [
+            "session.interrupted",
+            "session.media.omitted",
+            "memory.updated",
+            "trigger.failed",
+            "trigger.skipped",
+        ]
+        .iter()
+        .all(|name| seen(name))
+        {
+            let all: String = requests
+                .iter()
+                .map(|request| request.body.clone())
+                .collect();
+            assert!(!all.contains("secret-"), "{all}");
+            assert!(all.contains("\"action\":\"created\""), "{all}");
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "not every event arrived"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // Only what it selected, and nothing with the answer in it.
+    assert_eq!(wordy.requests().len(), 1);
+    f.ctx.outbox.stop();
+}

@@ -10,8 +10,12 @@
 //! * `chat` — talk to the agent: sessions, messages, events, permission and
 //!   question replies, files inside the project;
 //! * `connector` — `chat`, plus what local automation needs (the global
-//!   event stream, the session `shell` command, workflows, status reads);
-//! * `admin` — everything.
+//!   event stream, workflows, status reads, firing webhook triggers);
+//! * `admin` — everything;
+//! * `hook` — one thing only: `POST /trigger/{id}/hook`, the webhook entry
+//!   of a trigger. It is the credential to hand to whatever calls a webhook
+//!   from outside, which should hold neither a `chat` token (it could read
+//!   and prompt sessions) nor an `admin` one.
 //!
 //! The server holds no signing secret: static tokens are stored as SHA-256
 //! digests and JWTs are verified against configured public keys. Only
@@ -26,10 +30,13 @@ use alforria_core::Clock;
 use base64::Engine;
 use sha2::{Digest, Sha256};
 
-/// What a credential lets its holder do. Ordered: each scope includes the
-/// ones before it.
+/// What a credential lets its holder do. `chat`, `connector` and `admin`
+/// are ordered: each includes the ones before it. `hook` stands apart, below
+/// all three: it opens the webhook entry and nothing else, and `chat` does
+/// not include it ([`Principal::allows`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Scope {
+    Hook,
     Chat,
     Connector,
     Admin,
@@ -38,6 +45,7 @@ pub enum Scope {
 impl Scope {
     pub fn as_str(self) -> &'static str {
         match self {
+            Scope::Hook => "hook",
             Scope::Chat => "chat",
             Scope::Connector => "connector",
             Scope::Admin => "admin",
@@ -46,6 +54,7 @@ impl Scope {
 
     pub fn parse(name: &str) -> Option<Scope> {
         match name {
+            "hook" => Some(Scope::Hook),
             "chat" => Some(Scope::Chat),
             "connector" => Some(Scope::Connector),
             "admin" => Some(Scope::Admin),
@@ -54,7 +63,9 @@ impl Scope {
     }
 
     /// The widest scope named in a space-separated list; unknown names are
-    /// ignored.
+    /// ignored. A credential has one role: `hook` beside `chat` is `chat`,
+    /// which does not open the webhook entry — a webhook caller gets a
+    /// token of its own.
     pub fn widest(names: &str) -> Option<Scope> {
         names.split_whitespace().filter_map(Scope::parse).max()
     }
@@ -93,7 +104,13 @@ impl Principal {
     }
 
     pub fn allows(&self, required: Scope) -> bool {
-        self.scope >= required
+        match required {
+            // Delivering an outside event is not part of talking to the
+            // agent: a `hook` token does it, and so does the sidecar's
+            // `connector` (and `admin`); `chat` does not.
+            Scope::Hook => self.scope != Scope::Chat,
+            _ => self.scope >= required,
+        }
     }
 
     /// Whether the directory allowlist (`server.directories`) applies.
@@ -137,9 +154,9 @@ impl std::fmt::Display for BearerError {
             BearerError::NotYetValid => f.write_str("the token is not valid yet"),
             BearerError::Audience => f.write_str("the token is for a different audience"),
             BearerError::Issuer => f.write_str("the token is from a different issuer"),
-            BearerError::Scope => {
-                f.write_str("the token carries no scope this server knows (chat, connector, admin)")
-            }
+            BearerError::Scope => f.write_str(
+                "the token carries no scope this server knows (chat, connector, admin, hook)",
+            ),
         }
     }
 }
@@ -730,5 +747,42 @@ mod tests {
         }))
         .unwrap_err();
         assert!(err.contains("unknown scope"), "{err}");
+    }
+
+    /// `hook` is not a rung of the ladder: it opens the webhook entry and
+    /// nothing else, and `chat` does not include it.
+    #[test]
+    fn the_hook_scope_stands_apart() {
+        let holder = |scope| Principal {
+            scope,
+            subject: None,
+            via: Via::Jwt,
+        };
+        for (scope, hook, chat, connector, admin) in [
+            (Scope::Hook, true, false, false, false),
+            (Scope::Chat, false, true, false, false),
+            (Scope::Connector, true, true, true, false),
+            (Scope::Admin, true, true, true, true),
+        ] {
+            let principal = holder(scope);
+            assert_eq!(principal.allows(Scope::Hook), hook, "{scope:?} hook");
+            assert_eq!(principal.allows(Scope::Chat), chat, "{scope:?} chat");
+            assert_eq!(
+                principal.allows(Scope::Connector),
+                connector,
+                "{scope:?} connector"
+            );
+            assert_eq!(principal.allows(Scope::Admin), admin, "{scope:?} admin");
+            // Everything below `admin` is confined to the directory
+            // allowlist and prompts as a restricted caller, `hook` too.
+            assert_eq!(principal.restricted(), scope != Scope::Admin);
+        }
+        assert_eq!(Scope::parse("hook"), Some(Scope::Hook));
+        assert_eq!(Scope::Hook.as_str(), "hook");
+        // One credential, one role: `hook` beside a wider scope is that
+        // scope.
+        assert_eq!(Scope::widest("hook"), Some(Scope::Hook));
+        assert_eq!(Scope::widest("hook chat"), Some(Scope::Chat));
+        assert_eq!(Scope::widest("connector hook"), Some(Scope::Connector));
     }
 }

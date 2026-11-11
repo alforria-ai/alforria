@@ -267,6 +267,12 @@ pub struct WebhookInfo {
     /// key, so the receiver holds nothing that can forge one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signing_key: Option<String>,
+    /// Deliver a trigger run's final answer (`trigger.completed`, when its
+    /// `report` is `"final"`) as `properties.text`, cut to 16 KiB. Off by
+    /// default: a delivery carries ids, never content. This is the one
+    /// exception, for a receiver whose job is to pass that answer on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_text: Option<bool>,
 }
 
 /// `hook.outbox` — how deliveries are retried and how long they are kept.
