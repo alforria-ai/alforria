@@ -97,6 +97,7 @@ pub fn run(matches: &ArgMatches, ui: &mut Ui, raw: &[OsString]) -> Result<(), Ty
     let opts = network::resolve(&args, raw, &config);
     let mut listen = opts.listen_options();
     listen.password = generated.clone();
+    listen.schedule = true;
     let runtime = super::runtime()?;
     let listener = runtime
         .block_on(alforria_server::listen(&listen))

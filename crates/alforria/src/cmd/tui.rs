@@ -319,7 +319,10 @@ pub fn run(matches: &ArgMatches, ui: &mut Ui, raw: &[OsString]) -> Result<(), Ty
     let mut _listener = None;
     let (target, directory) = if external {
         let listener = runtime
-            .block_on(alforria_server::listen(&resolved.listen_options()))
+            .block_on(alforria_server::listen(&alforria_server::ListenOptions {
+                schedule: true,
+                ..resolved.listen_options()
+            }))
             .map_err(|err| TypedError::Unknown {
                 raw: err.to_string(),
             })?;
@@ -328,7 +331,12 @@ pub fn run(matches: &ArgMatches, ui: &mut Ui, raw: &[OsString]) -> Result<(), Ty
         (TuiTarget::Url(url), None)
     } else {
         let router = runtime
-            .block_on(async { alforria_server::in_process_router(&resolved.listen_options()) })
+            .block_on(async {
+                alforria_server::in_process_router(&alforria_server::ListenOptions {
+                    schedule: true,
+                    ..resolved.listen_options()
+                })
+            })
             .map_err(|err| TypedError::Unknown {
                 raw: err.to_string(),
             })?;

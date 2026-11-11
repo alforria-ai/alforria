@@ -7,6 +7,8 @@ pub mod doc;
 pub mod file_ext;
 pub mod goal;
 pub mod restriction;
+pub mod memory;
+pub mod trigger;
 pub mod ui;
 pub mod v1;
 pub mod v2;
@@ -40,6 +42,8 @@ pub fn build_router(ctx: Arc<ServerContext>) -> Router {
     router = restriction::register(router);
     router = file_ext::register(router);
     router = attention::register(router);
+    router = trigger::register(router);
+    router = memory::register(router);
 
     let router = router
         .fallback(ui::serve_ui_handler)

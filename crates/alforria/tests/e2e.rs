@@ -783,3 +783,117 @@ fn generate_outputs_openapi_with_code_samples() {
     }
     assert!(sampled > 10, "sampled {sampled} operations");
 }
+
+// -----------------------------------------------------------------------
+// import --format openai-chat (alforria extension)
+// -----------------------------------------------------------------------
+
+#[test]
+fn import_openai_chat_transcript_dry_run_import_and_idempotence() {
+    let env = env_with_llm("import-openai", "x");
+    let project = env.project_dir();
+    let messages: Vec<serde_json::Value> = (0..12)
+        .map(|index| {
+            serde_json::json!({
+                "role": if index % 2 == 0 { "user" } else { "assistant" },
+                "content": format!("line {index}"),
+                "created_at": 1_767_225_600 + index * 60,
+            })
+        })
+        .collect();
+    let file = project.join("history.json");
+    std::fs::write(
+        &file,
+        serde_json::json!({
+            "title": "Old harness chat",
+            "summary": "They counted lines.",
+            "import_id": "legacy-1",
+            "messages": messages,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let path = file.to_str().unwrap();
+    let base = [
+        "import",
+        "--format",
+        "openai-chat",
+        "--model",
+        "mock/mock-model",
+    ];
+
+    let dry = env.run(&[&base[..], &["--live-tail", "4", "--dry-run", path]].concat());
+    assert_eq!(dry.code, Some(0), "stderr={}", dry.stderr);
+    assert!(
+        dry.stdout.starts_with("Dry run, nothing written: "),
+        "{}",
+        dry.stdout
+    );
+    assert!(
+        dry.stdout.contains("\"archived\":8") && dry.stdout.contains("\"live\":4"),
+        "{}",
+        dry.stdout
+    );
+    let list = env.run(&["session", "list", "--format", "json"]);
+    assert!(!list.stdout.contains("Old harness chat"), "{}", list.stdout);
+
+    let imported = env.run(&[&base[..], &["--live-tail", "4", path]].concat());
+    assert_eq!(imported.code, Some(0), "stderr={}", imported.stderr);
+    let session_id = imported
+        .stdout
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("Imported session: "))
+        .expect("the session id is printed")
+        .to_string();
+    assert!(
+        imported.stdout.contains("\"boundary\":\"summary\""),
+        "{}",
+        imported.stdout
+    );
+    let list = env.run(&["session", "list", "--format", "json"]);
+    assert!(list.stdout.contains("Old harness chat"), "{}", list.stdout);
+
+    // The whole history is in the export, with the boundary after it.
+    let export = env.run(&["export", &session_id]);
+    assert_eq!(export.code, Some(0), "stderr={}", export.stderr);
+    let start = export
+        .stdout
+        .find('{')
+        .unwrap_or_else(|| panic!("stdout={}\nstderr={}", export.stdout, export.stderr));
+    let document: serde_json::Value = serde_json::from_str(&export.stdout[start..]).unwrap();
+    let exported = document["messages"].as_array().unwrap();
+    assert_eq!(exported.len(), 14);
+    assert_eq!(exported[0]["parts"][0]["text"], "line 0");
+    assert_eq!(exported[12]["parts"][0]["type"], "compaction");
+    assert_eq!(exported[13]["parts"][0]["text"], "They counted lines.");
+    assert_eq!(document["info"]["metadata"]["import"]["id"], "legacy-1");
+
+    // The same import id again changes nothing.
+    let again = env.run(&[&base[..], &[path]].concat());
+    assert_eq!(again.code, Some(0), "stderr={}", again.stderr);
+    assert_eq!(
+        again.stdout.trim(),
+        format!("Already imported: {session_id} (import id legacy-1)")
+    );
+
+    // What cannot be imported says why.
+    let bad = project.join("bad.json");
+    std::fs::write(&bad, r#"[{"role":"narrator","content":"x"}]"#).unwrap();
+    let refused = env.run(&[&base[..], &[bad.to_str().unwrap()]].concat());
+    assert_eq!(refused.code, Some(1));
+    assert!(
+        refused.stderr.contains("unknown role"),
+        "{}",
+        refused.stderr
+    );
+    let wrong = env.run(&["import", "--live-tail", "4", path]);
+    assert_eq!(wrong.code, Some(1));
+    assert!(
+        wrong
+            .stderr
+            .contains("only applies with --format openai-chat"),
+        "{}",
+        wrong.stderr
+    );
+}

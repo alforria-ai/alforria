@@ -244,7 +244,57 @@ pub fn cli() -> Command {
                     .arg(
                         Arg::new("file")
                             .required(true)
-                            .help("path to JSON file or share URL"),
+                            .help("path to JSON file or share URL (- reads a transcript from stdin)"),
+                    )
+                    .arg(
+                        Arg::new("format")
+                            .long("format")
+                            .value_parser(["alforria", "openai-chat"])
+                            .default_value("alforria")
+                            .help("alforria: an `alforria export` document; openai-chat: a list of {role, content, tool_calls?, tool_call_id?, created_at?} messages as JSON or JSONL"),
+                    )
+                    .arg(
+                        Arg::new("archive-before")
+                            .long("archive-before")
+                            .value_name("N|TIME")
+                            .conflicts_with("live-tail")
+                            .help("openai-chat: keep the first N messages, or those before an RFC 3339 time, as history behind a compaction boundary"),
+                    )
+                    .arg(
+                        Arg::new("live-tail")
+                            .long("live-tail")
+                            .value_name("N")
+                            .value_parser(clap::value_parser!(usize))
+                            .help("openai-chat: keep only the last N messages live; the rest become history behind a compaction boundary"),
+                    )
+                    .arg(
+                        Arg::new("dry-run")
+                            .long("dry-run")
+                            .action(ArgAction::SetTrue)
+                            .help("openai-chat: validate and report what would be imported, without writing"),
+                    )
+                    .arg(
+                        Arg::new("import-id")
+                            .long("import-id")
+                            .value_name("ID")
+                            .help("openai-chat: a name for this import; importing the same id again does nothing"),
+                    )
+                    .arg(
+                        Arg::new("model")
+                            .long("model")
+                            .short('m')
+                            .value_name("PROVIDER/MODEL")
+                            .help("openai-chat: the model recorded on the imported messages (default: the transcript's, then the configured model)"),
+                    )
+                    .arg(
+                        Arg::new("agent")
+                            .long("agent")
+                            .help("openai-chat: the agent recorded on the imported messages (default: the default agent)"),
+                    )
+                    .arg(
+                        Arg::new("title")
+                            .long("title")
+                            .help("openai-chat: the session title (default: the transcript's)"),
                     ),
             )
             .subcommand(github())

@@ -38,6 +38,61 @@ pre-1.0, so minor releases may include breaking changes.
   it.
 - A forked session starts with a note telling the model it is a fork, so it
   does not wait on or redo background work that belongs to the original.
+- Triggers: turns that start on a schedule or an event instead of a person.
+  A `trigger` map in the config (or `POST /trigger`) pairs a prompt with a
+  5-field cron expression in a real timezone, an interval, a one-shot time, a
+  watched path, or a webhook. Each run is an ordinary session under the
+  trigger's own permission rules, with the prompt marked
+  `metadata.trigger = { id, run }`. A tick that finds the last run still going
+  is skipped and recorded, missed ticks are not replayed (`catch_up` runs the
+  latest one), and `quiet_token` lets a check that found nothing stay silent.
+  Runs are announced by `trigger.fired`, `trigger.completed`, `trigger.failed`
+  and `trigger.skipped`. Triggers are read from your own config, never from a
+  project's, and a webhook run cannot act unless its trigger allows it. See
+  `docs/assistant.md`.
+- A `schedule` tool, so an agent can create, list, change, pause and delete
+  its own triggers and one-shot reminders, gated by a `schedule` permission.
+  It only changes triggers its own conversation scheduled, and what it
+  schedules runs under the rules its creator had.
+- Long-term memory (`memory.enabled`, off by default): a `memory` tool that
+  saves typed records (fact, preference, task, note) and searches them, the
+  most recent of which are added to the system context of every step in a
+  fenced `<memory>` block, and a `session_search` tool for full-text search
+  across past sessions. `memory.scope` keeps memory per project or shares it;
+  `memory.flush_before_compaction` gives the model one bounded chance to save
+  what matters before a compaction. Also `GET/POST /memory`,
+  `GET/PATCH/DELETE /memory/{id}`, `GET /memory/search` and
+  `GET /memory/session`. The transcript index is built in the background and
+  costs nothing when a message is written. Records carry where they came
+  from, and those written by a flush or by a run that carried outside text
+  are searched but not injected. `memory` and `trigger` settings are read
+  from your own config only; a project may at most switch memory off. See
+  `docs/assistant.md`.
+- `alforria import --format openai-chat <file|->` imports a chat transcript
+  from another tool: a JSON or JSONL list of `{role, content, tool_calls,
+  tool_call_id, created_at}` messages. Tool calls become tool parts with
+  their results, images become file parts. `--live-tail <n>` or
+  `--archive-before <n|time>` keeps older messages as readable, searchable
+  history behind a compaction boundary carrying the transcript's `summary`,
+  so the next prompt sends only the summary and the live messages.
+  `--dry-run` reports what would be imported, and an `import_id` makes the
+  import idempotent.
+- Persona controls for products that embed alforria: `prompt.environment`
+  (`true`, `false` or a template) for the `<env>` block,
+  `prompt.model_identity` and `prompt.empty_skills` for the other fixed
+  additions, and `tool.<name>.description` / `description_append` to reword
+  a built-in tool.
+- `provider.<id>.models.<name>.family` picks the default system prompt for a
+  model whose id does not say what it is (a family name or the underlying
+  model id).
+- The `websearch` tool can use LibertAI search (on by itself when the
+  `libertai` provider has a key) or any endpoint with the same contract
+  (`websearch: { provider: "http", url, headers }`), and is then offered to
+  every model.
+- The built-in `libertai` provider accepts its catalog's aliases
+  (`claw-flash`, `claw-core`, `deep-claw`, …) as model ids, with the target
+  model's limits, cost, capabilities and prompt, and lists
+  `deepseek-v4.1-flash-1017` and its `-thinking` variant.
 - `alforria migrate` moves an install from the `opencode` directories to
   alforria's own (see Changed). `--copy` copies the data instead of moving it,
   `--fresh` starts a new database and keeps the saved logins, `--dry-run`
@@ -253,6 +308,9 @@ pre-1.0, so minor releases may include breaking changes.
 - A global config file that does not parse now stops `alforria serve` and
   `alforria web` from listening, instead of serving with the defaults: the
   host config carries the server's access policy.
+- The default system prompts call the agent `alforria` instead of `opencode`
+  and point at alforria's repository and docs. A model told it was opencode
+  will now say it is alforria.
 - alforria keeps its global config, data, cache and state in `alforria`
   directories (`~/.config/alforria`, `~/.local/share/alforria`, …) instead of
   sharing upstream's `opencode` ones. opencode v2 migrates a shared database

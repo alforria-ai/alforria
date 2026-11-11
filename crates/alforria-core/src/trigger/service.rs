@@ -1,0 +1,1181 @@
+//! The trigger scheduler: what is due, what runs, and what is remembered.
+//!
+//! [`TriggerService::tick`] is the whole scheduler: given the time, it fires
+//! what is due and plans the next occurrence. The background loop only
+//! decides when to call it, so tests drive it with a clock of their own.
+//!
+//! A trigger never has two runs at once: a tick that arrives while the last
+//! run is still going (or still waiting for a slot) is recorded as skipped.
+//! Across triggers, `concurrency` runs go at a time and the rest wait, which
+//! cannot pile up because each trigger waits at most once.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+
+use alforria_schema::permission_v1::PermissionV1Ruleset;
+use serde_json::{json, Value};
+
+use crate::event::{EventBus, PublishOptions};
+use crate::tool::external_directory::{contains_real, real_path};
+use crate::tool::permission::from_config;
+use crate::trigger::store::{StoredSpec, StoredTrigger, TriggerState, TriggerStore};
+use crate::trigger::watch::{self, WatchHandle, WatchIgnore};
+use crate::trigger::{
+    format_duration, Report, RunStatus, RunTime, Schedule, SessionMode, TriggerError, TriggerOps,
+    TriggerPayload, TriggerRecord, TriggerRun, TriggerSource, TriggerSpec, TriggerTurn,
+    MAX_AGENT_TRIGGERS, MAX_PAYLOAD_BYTES, MAX_STORED_TRIGGERS, TRIGGER_COMPLETED, TRIGGER_FAILED,
+    TRIGGER_FIRED, TRIGGER_SKIPPED, TRIGGER_UPDATED,
+};
+use crate::Clock;
+
+/// Where triggers live and how the scheduler behaves.
+#[derive(Debug, Clone)]
+pub struct TriggerSettings {
+    pub directory: PathBuf,
+    pub project_id: String,
+    pub home: PathBuf,
+    pub enabled: bool,
+    /// How many runs go at once, across all triggers.
+    pub concurrency: usize,
+    /// The most entries one `watch` may cover.
+    pub max_watched: usize,
+    /// Directories no watch reports: alforria's own.
+    pub ignore: Vec<PathBuf>,
+    /// The `trigger` map from the config.
+    pub config: BTreeMap<String, TriggerSpec>,
+}
+
+impl TriggerSettings {
+    pub const DEFAULT_CONCURRENCY: usize = 1;
+    pub const DEFAULT_MAX_WATCHED: usize = 10_000;
+}
+
+/// The longest the loop sleeps without looking at the clock again, so a
+/// suspended machine or a changed clock is noticed.
+const MAX_SLEEP_MS: u64 = 15_000;
+/// A stream of changes fires a watch after this many debounce periods even
+/// if it never goes quiet.
+const MAX_DEBOUNCE_PERIODS: u64 = 10;
+/// How many changed paths a watch run is told about.
+const MAX_WATCH_PATHS: usize = 50;
+/// The longest final answer kept on a run.
+const MAX_RUN_TEXT: usize = 64 * 1024;
+/// Finished one-shot triggers are dropped after this long.
+const KEEP_FINISHED_MS: u64 = 24 * 60 * 60 * 1000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Due {
+    at: u64,
+    /// The tick being answered (differs from `at` for a caught-up tick).
+    scheduled: u64,
+    reason: &'static str,
+}
+
+#[derive(Debug)]
+struct PendingWatch {
+    first: u64,
+    deadline: u64,
+    paths: BTreeSet<String>,
+}
+
+struct Entry {
+    source: TriggerSource,
+    spec: TriggerSpec,
+    inherited: Option<PermissionV1Ruleset>,
+    origin_session_id: Option<String>,
+    schedule: Result<Schedule, String>,
+    state: TriggerState,
+    time_created: u64,
+    time_updated: u64,
+    next: Option<Due>,
+    busy: bool,
+    pending: Option<PendingWatch>,
+    watcher: Option<WatchHandle>,
+    watch_error: Option<String>,
+}
+
+impl Entry {
+    fn enabled(&self) -> bool {
+        self.spec.enabled.unwrap_or(true) && self.state.paused != Some(true)
+    }
+
+    fn record(&self, id: &str) -> TriggerRecord {
+        TriggerRecord {
+            id: id.to_string(),
+            source: self.source,
+            spec: self.spec.clone(),
+            enabled: self.enabled(),
+            session_id: self.state.session_id.clone(),
+            origin_session_id: self.origin_session_id.clone(),
+            time_created: self.time_created,
+            time_updated: self.time_updated,
+            last_fired: self.state.last_fired,
+            next: self.next.filter(|_| self.enabled()).map(|due| due.at),
+            running: self.busy,
+            error: self
+                .schedule
+                .as_ref()
+                .err()
+                .cloned()
+                .or_else(|| self.watch_error.clone()),
+        }
+    }
+}
+
+/// Plan the next occurrence. At startup a missed tick may be caught up;
+/// otherwise the next occurrence is always in the future, so a machine that
+/// slept through ten ticks fires once, not ten times.
+fn plan(
+    schedule: &Schedule,
+    spec: &TriggerSpec,
+    state: &TriggerState,
+    now: u64,
+    startup: bool,
+) -> Option<Due> {
+    let base = state.last_scheduled.unwrap_or(state.time_seen);
+    let catch_up = startup && spec.catch_up == Some(true);
+    match schedule {
+        Schedule::Cron(cron) => {
+            if catch_up {
+                if let Some(missed) = cron.previous_at_or_before(now).filter(|at| *at > base) {
+                    return Some(Due {
+                        at: now,
+                        scheduled: missed,
+                        reason: "catch_up",
+                    });
+                }
+            }
+            cron.next_after(now).map(|at| Due {
+                at,
+                scheduled: at,
+                reason: "schedule",
+            })
+        }
+        Schedule::Interval(every) => {
+            let due = base.saturating_add(*every);
+            if due > now {
+                return Some(Due {
+                    at: due,
+                    scheduled: due,
+                    reason: "schedule",
+                });
+            }
+            if catch_up {
+                return Some(Due {
+                    at: now,
+                    scheduled: due,
+                    reason: "catch_up",
+                });
+            }
+            let at = now.saturating_add(*every);
+            Some(Due {
+                at,
+                scheduled: at,
+                reason: "schedule",
+            })
+        }
+        Schedule::At(at) => {
+            if state.last_fired.is_some() || state.last_scheduled.is_some() {
+                return None;
+            }
+            if *at > now {
+                return Some(Due {
+                    at: *at,
+                    scheduled: *at,
+                    reason: "schedule",
+                });
+            }
+            // A reminder missed while the server was down is still wanted,
+            // unless the trigger says otherwise.
+            if startup && spec.catch_up == Some(false) {
+                return None;
+            }
+            Some(Due {
+                at: now,
+                scheduled: *at,
+                reason: if startup { "catch_up" } else { "schedule" },
+            })
+        }
+        Schedule::Watch { .. } | Schedule::Webhook => None,
+    }
+}
+
+fn valid_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        && !id.starts_with('.')
+}
+
+fn new_id(prefix: &str) -> String {
+    format!("{prefix}_{}", ulid::Ulid::new().to_string().to_lowercase())
+}
+
+pub struct TriggerService {
+    ops: Arc<dyn TriggerOps>,
+    events: Arc<EventBus>,
+    store: TriggerStore,
+    clock: Arc<dyn Clock>,
+    settings: TriggerSettings,
+    ignore: Arc<WatchIgnore>,
+    entries: Mutex<BTreeMap<String, Entry>>,
+    slots: Arc<tokio::sync::Semaphore>,
+    wake: tokio::sync::Notify,
+    settled: tokio::sync::Notify,
+    started: AtomicBool,
+}
+
+impl TriggerService {
+    /// Load the config's triggers and the stored ones, and plan each. Nothing
+    /// runs until [`Self::start`] (or a test calls [`Self::tick`]).
+    pub fn new(
+        ops: Arc<dyn TriggerOps>,
+        events: Arc<EventBus>,
+        storage: Arc<crate::storage::Storage>,
+        clock: Arc<dyn Clock>,
+        settings: TriggerSettings,
+    ) -> Arc<TriggerService> {
+        let store = TriggerStore::new(storage, &settings.directory, &settings.project_id);
+        let now = clock.now_ms();
+        if let Err(error) = store.fail_unfinished(now) {
+            tracing::warn!("failed to close unfinished trigger runs: {error}");
+        }
+        let mut entries = BTreeMap::new();
+        for (id, spec) in &settings.config {
+            if !valid_id(id) {
+                tracing::warn!("ignoring trigger \"{id}\": ids use letters, digits, - _ and .");
+                continue;
+            }
+            entries.insert(
+                id.clone(),
+                Self::load_entry(
+                    &store,
+                    id,
+                    TriggerSource::Config,
+                    spec.clone(),
+                    None,
+                    None,
+                    now,
+                    now,
+                    now,
+                ),
+            );
+        }
+        for stored in store.list().unwrap_or_else(|error| {
+            tracing::warn!("failed to load stored triggers: {error}");
+            Vec::new()
+        }) {
+            if entries.contains_key(&stored.id) {
+                tracing::warn!(
+                    "stored trigger \"{}\" is shadowed by the config's trigger of the same name",
+                    stored.id
+                );
+                continue;
+            }
+            let entry = Self::load_entry(
+                &store,
+                &stored.id,
+                TriggerSource::Runtime,
+                stored.stored.spec,
+                stored.stored.inherited,
+                stored.origin_session_id,
+                stored.time_created,
+                stored.time_updated,
+                now,
+            );
+            entries.insert(stored.id, entry);
+        }
+        let ignore = Arc::new(WatchIgnore::new(settings.ignore.clone()));
+        let slots = Arc::new(tokio::sync::Semaphore::new(settings.concurrency.max(1)));
+        Arc::new(TriggerService {
+            ops,
+            events,
+            store,
+            clock,
+            settings,
+            ignore,
+            entries: Mutex::new(entries),
+            slots,
+            wake: tokio::sync::Notify::new(),
+            settled: tokio::sync::Notify::new(),
+            started: AtomicBool::new(false),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn load_entry(
+        store: &TriggerStore,
+        id: &str,
+        source: TriggerSource,
+        spec: TriggerSpec,
+        inherited: Option<PermissionV1Ruleset>,
+        origin_session_id: Option<String>,
+        time_created: u64,
+        time_updated: u64,
+        now: u64,
+    ) -> Entry {
+        let known = store.state(id).ok().flatten();
+        let first_sight = known.is_none();
+        let state = known.unwrap_or(TriggerState {
+            time_seen: now,
+            ..Default::default()
+        });
+        if first_sight {
+            let _ = store.put_state(id, &state);
+        }
+        let schedule = spec.schedule();
+        let next = schedule
+            .as_ref()
+            .ok()
+            .and_then(|schedule| plan(schedule, &spec, &state, now, !first_sight));
+        if let Err(error) = &schedule {
+            tracing::warn!("trigger \"{id}\" cannot run: {error}");
+        }
+        Entry {
+            source,
+            spec,
+            inherited,
+            origin_session_id,
+            schedule,
+            state,
+            time_created: if source == TriggerSource::Config {
+                state_time(store, id, time_created)
+            } else {
+                time_created
+            },
+            time_updated,
+            next,
+            busy: false,
+            pending: None,
+            watcher: None,
+            watch_error: None,
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, BTreeMap<String, Entry>> {
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.settings.enabled
+    }
+
+    pub fn now_ms(&self) -> u64 {
+        self.clock.now_ms()
+    }
+
+    fn require_enabled(&self) -> Result<(), TriggerError> {
+        if self.settings.enabled {
+            Ok(())
+        } else {
+            Err(TriggerError::Disabled)
+        }
+    }
+
+    fn publish(&self, definition: &crate::event::definition::Definition, data: Value) {
+        let _ = self
+            .events
+            .publish(definition, data, PublishOptions::default());
+    }
+
+    fn changed(&self, id: &str) {
+        self.publish(&TRIGGER_UPDATED, json!({ "triggerID": id }));
+        self.wake.notify_one();
+    }
+
+    // -- Reading ----------------------------------------------------------
+
+    pub fn list(&self) -> Vec<TriggerRecord> {
+        self.lock()
+            .iter()
+            .map(|(id, entry)| entry.record(id))
+            .collect()
+    }
+
+    pub fn get(&self, id: &str) -> Option<TriggerRecord> {
+        self.lock().get(id).map(|entry| entry.record(id))
+    }
+
+    /// A trigger's runs, newest first.
+    pub fn runs(&self, id: &str, limit: usize) -> Result<Vec<TriggerRun>, TriggerError> {
+        if !self.lock().contains_key(id) {
+            return Err(TriggerError::NotFound(format!("trigger not found: {id}")));
+        }
+        self.store
+            .runs(id, limit.clamp(1, crate::trigger::MAX_RUNS_KEPT))
+            .map_err(|error| TriggerError::Failed(error.to_string()))
+    }
+
+    pub fn run(&self, run_id: &str) -> Option<TriggerRun> {
+        self.store.run(run_id).ok().flatten()
+    }
+
+    // -- Writing ----------------------------------------------------------
+
+    /// Create a stored trigger. `inherited` is the permission ruleset of the
+    /// session that asked for it, so a trigger an agent creates can do no
+    /// more than the agent could.
+    pub fn create(
+        self: &Arc<Self>,
+        id: Option<String>,
+        spec: TriggerSpec,
+        origin_session_id: Option<String>,
+        inherited: Option<PermissionV1Ruleset>,
+    ) -> Result<TriggerRecord, TriggerError> {
+        self.require_enabled()?;
+        let schedule = spec.schedule().map_err(TriggerError::Invalid)?;
+        let id = match id {
+            Some(id) if valid_id(&id) => id,
+            Some(id) => {
+                return Err(TriggerError::Invalid(format!(
+                    "\"{id}\" is not a valid trigger id: use up to 64 letters, digits, - _ or ."
+                )))
+            }
+            None => new_id("trg"),
+        };
+        let now = self.clock.now_ms();
+        self.prune_finished(now);
+        if let Schedule::Watch { path, .. } = &schedule {
+            self.watch_path(path, TriggerSource::Runtime)
+                .map_err(TriggerError::Invalid)?;
+        }
+        let record = {
+            let mut entries = self.lock();
+            if entries.contains_key(&id) {
+                return Err(TriggerError::Conflict(format!(
+                    "a trigger named \"{id}\" already exists"
+                )));
+            }
+            let stored = entries
+                .values()
+                .filter(|entry| entry.source == TriggerSource::Runtime)
+                .count();
+            let by_agents = entries
+                .values()
+                .filter(|entry| entry.origin_session_id.is_some())
+                .count();
+            if origin_session_id.is_some() && by_agents >= MAX_AGENT_TRIGGERS {
+                return Err(TriggerError::Conflict(format!(
+                    "agents have already scheduled {MAX_AGENT_TRIGGERS} triggers here; delete some first"
+                )));
+            }
+            if stored >= MAX_STORED_TRIGGERS {
+                return Err(TriggerError::Conflict(format!(
+                    "this directory already has {MAX_STORED_TRIGGERS} stored triggers; delete some first"
+                )));
+            }
+            let state = TriggerState {
+                time_seen: now,
+                ..Default::default()
+            };
+            self.store
+                .put(&StoredTrigger {
+                    id: id.clone(),
+                    stored: StoredSpec {
+                        spec: spec.clone(),
+                        inherited: inherited.clone(),
+                    },
+                    origin_session_id: origin_session_id.clone(),
+                    time_created: now,
+                    time_updated: now,
+                })
+                .and_then(|()| self.store.put_state(&id, &state))
+                .map_err(|error| TriggerError::Failed(error.to_string()))?;
+            let next = plan(&schedule, &spec, &state, now, false);
+            let entry = Entry {
+                source: TriggerSource::Runtime,
+                spec,
+                inherited,
+                origin_session_id,
+                schedule: Ok(schedule),
+                state,
+                time_created: now,
+                time_updated: now,
+                next,
+                busy: false,
+                pending: None,
+                watcher: None,
+                watch_error: None,
+            };
+            let record = entry.record(&id);
+            entries.insert(id.clone(), entry);
+            record
+        };
+        self.sync_watch(&id);
+        self.changed(&id);
+        Ok(self.get(&id).unwrap_or(record))
+    }
+
+    /// Change a trigger. `patch` is a JSON merge patch over the spec (`null`
+    /// removes a key). A config trigger only takes `enabled`: the rest of it
+    /// is the config's to say.
+    pub fn update(
+        self: &Arc<Self>,
+        id: &str,
+        patch: &Value,
+    ) -> Result<TriggerRecord, TriggerError> {
+        self.require_enabled()?;
+        let Some(patch_object) = patch.as_object() else {
+            return Err(TriggerError::Invalid(
+                "the body must be a JSON object".to_string(),
+            ));
+        };
+        let now = self.clock.now_ms();
+        {
+            let mut entries = self.lock();
+            let Some(entry) = entries.get_mut(id) else {
+                return Err(TriggerError::NotFound(format!("trigger not found: {id}")));
+            };
+            if entry.source == TriggerSource::Config {
+                let enabled = match (patch_object.len(), patch_object.get("enabled")) {
+                    (1, Some(Value::Bool(enabled))) => *enabled,
+                    _ => {
+                        return Err(TriggerError::Conflict(format!(
+                            "trigger \"{id}\" is defined in the config: edit it there. \
+                             Only `enabled` can be changed here, to pause or resume it."
+                        )))
+                    }
+                };
+                let was = entry.enabled();
+                entry.state.paused = Some(!enabled);
+                if entry.enabled() && !was {
+                    Self::replan(entry, now);
+                }
+                entry.time_updated = now;
+                self.store
+                    .put_state(id, &entry.state)
+                    .map_err(|error| TriggerError::Failed(error.to_string()))?;
+            } else {
+                let mut value = serde_json::to_value(&entry.spec)
+                    .map_err(|error| TriggerError::Failed(error.to_string()))?;
+                crate::merge::merge_patch(&mut value, patch);
+                // `on` holds exactly one kind, so a new one replaces the old
+                // one instead of joining it.
+                if let Some(on @ Value::Object(_)) = patch_object.get("on") {
+                    value["on"] = crate::merge::strip_nulls(on);
+                }
+                let spec: TriggerSpec = serde_json::from_value(value)
+                    .map_err(|error| TriggerError::Invalid(error.to_string()))?;
+                let schedule = spec.schedule().map_err(TriggerError::Invalid)?;
+                if let Schedule::Watch { path, .. } = &schedule {
+                    self.watch_path(path, TriggerSource::Runtime)
+                        .map_err(TriggerError::Invalid)?;
+                }
+                let was = entry.enabled();
+                let rescheduled = entry.spec.on != spec.on;
+                entry.spec = spec;
+                entry.schedule = Ok(schedule);
+                // Resuming through `enabled: true` also lifts a pause.
+                if patch_object.get("enabled") == Some(&Value::Bool(true)) {
+                    entry.state.paused = None;
+                }
+                if rescheduled {
+                    entry.state.last_scheduled = None;
+                    entry.state.last_fired = None;
+                    entry.state.time_seen = now;
+                    entry.pending = None;
+                }
+                if rescheduled || (entry.enabled() && !was) {
+                    Self::replan(entry, now);
+                }
+                entry.time_updated = now;
+                self.store
+                    .put(&StoredTrigger {
+                        id: id.to_string(),
+                        stored: StoredSpec {
+                            spec: entry.spec.clone(),
+                            inherited: entry.inherited.clone(),
+                        },
+                        origin_session_id: entry.origin_session_id.clone(),
+                        time_created: entry.time_created,
+                        time_updated: now,
+                    })
+                    .and_then(|()| self.store.put_state(id, &entry.state))
+                    .map_err(|error| TriggerError::Failed(error.to_string()))?;
+            }
+        }
+        self.sync_watch(id);
+        self.changed(id);
+        self.get(id)
+            .ok_or_else(|| TriggerError::NotFound(format!("trigger not found: {id}")))
+    }
+
+    /// A trigger that comes back from a pause, or whose `on` changed, starts
+    /// counting from now.
+    fn replan(entry: &mut Entry, now: u64) {
+        if matches!(entry.schedule, Ok(Schedule::Interval(_))) {
+            entry.state.last_scheduled = Some(now);
+        }
+        entry.next = entry
+            .schedule
+            .as_ref()
+            .ok()
+            .and_then(|schedule| plan(schedule, &entry.spec, &entry.state, now, false));
+    }
+
+    pub fn delete(self: &Arc<Self>, id: &str) -> Result<bool, TriggerError> {
+        self.require_enabled()?;
+        {
+            let mut entries = self.lock();
+            match entries.get(id) {
+                None => return Ok(false),
+                Some(entry) if entry.source == TriggerSource::Config => {
+                    return Err(TriggerError::Conflict(format!(
+                        "trigger \"{id}\" is defined in the config: remove it there, \
+                         or pause it with `enabled: false`"
+                    )));
+                }
+                Some(_) => {}
+            }
+            self.store
+                .delete(id)
+                .map_err(|error| TriggerError::Failed(error.to_string()))?;
+            entries.remove(id);
+        }
+        self.changed(id);
+        Ok(true)
+    }
+
+    /// Drop stored one-shot triggers that fired more than a day ago.
+    fn prune_finished(&self, now: u64) {
+        let mut entries = self.lock();
+        let finished: Vec<String> = entries
+            .iter()
+            .filter(|(_, entry)| {
+                entry.source == TriggerSource::Runtime
+                    && !entry.busy
+                    && matches!(entry.schedule, Ok(Schedule::At(_)))
+                    && entry
+                        .state
+                        .last_fired
+                        .is_some_and(|fired| fired.saturating_add(KEEP_FINISHED_MS) < now)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in finished {
+            if self.store.delete(&id).is_ok() {
+                entries.remove(&id);
+            }
+        }
+    }
+
+    // -- Watching ---------------------------------------------------------
+
+    /// Where a `watch` path points. A stored trigger stays inside the
+    /// directory; the config may name any path.
+    fn watch_path(&self, path: &str, source: TriggerSource) -> Result<PathBuf, String> {
+        let expanded = match path.strip_prefix("~/") {
+            Some(rest) => self.settings.home.join(rest),
+            None => PathBuf::from(path),
+        };
+        // Symlinks are resolved before the check, through the deepest
+        // existing ancestor when the path is not there yet: `project/link`
+        // is wherever `link` leads, not inside the project.
+        let resolved = real_path(&self.settings.directory.join(expanded));
+        if source == TriggerSource::Runtime && !contains_real(&self.settings.directory, &resolved) {
+            return Err(format!(
+                "watch path \"{path}\" is outside {}; only your own config may watch other places",
+                self.settings.directory.display()
+            ));
+        }
+        Ok(resolved)
+    }
+
+    /// Make a trigger's watcher match its spec.
+    fn sync_watch(self: &Arc<Self>, id: &str) {
+        if !self.started.load(Ordering::SeqCst) {
+            return;
+        }
+        let target = {
+            let mut entries = self.lock();
+            let Some(entry) = entries.get_mut(id) else {
+                return;
+            };
+            entry.watcher = None;
+            entry.watch_error = None;
+            match (&entry.schedule, entry.enabled()) {
+                (Ok(Schedule::Watch { path, .. }), true) => Some((path.clone(), entry.source)),
+                _ => None,
+            }
+        };
+        let Some((path, source)) = target else {
+            return;
+        };
+        let weak = Arc::downgrade(self);
+        let owner = id.to_string();
+        let result = self.watch_path(&path, source).and_then(|resolved| {
+            watch::watch(
+                &resolved,
+                (source == TriggerSource::Runtime).then_some(self.settings.directory.as_path()),
+                self.ignore.clone(),
+                self.settings.max_watched,
+                move |paths| {
+                    if let Some(service) = weak.upgrade() {
+                        service.path_changed(&owner, &paths);
+                    }
+                },
+            )
+        });
+        let mut entries = self.lock();
+        let Some(entry) = entries.get_mut(id) else {
+            return;
+        };
+        match result {
+            Ok(handle) => entry.watcher = Some(handle),
+            Err(error) => {
+                tracing::warn!("trigger \"{id}\" is not watching: {error}");
+                entry.watch_error = Some(error);
+            }
+        }
+    }
+
+    /// Something under a watched path changed: (re)start the debounce.
+    pub fn path_changed(&self, id: &str, paths: &[PathBuf]) {
+        let now = self.clock.now_ms();
+        {
+            let mut entries = self.lock();
+            let Some(entry) = entries.get_mut(id) else {
+                return;
+            };
+            let Ok(Schedule::Watch { debounce_ms, .. }) = &entry.schedule else {
+                return;
+            };
+            if !entry.enabled() {
+                return;
+            }
+            let debounce = *debounce_ms;
+            let pending = entry.pending.get_or_insert_with(|| PendingWatch {
+                first: now,
+                deadline: now,
+                paths: BTreeSet::new(),
+            });
+            let latest = pending
+                .first
+                .saturating_add(debounce.max(1000).saturating_mul(MAX_DEBOUNCE_PERIODS));
+            pending.deadline = now.saturating_add(debounce).min(latest);
+            for path in paths {
+                if pending.paths.len() >= MAX_WATCH_PATHS {
+                    break;
+                }
+                let shown = path
+                    .strip_prefix(&self.settings.directory)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .into_owned();
+                pending.paths.insert(shown);
+            }
+        }
+        self.wake.notify_one();
+    }
+
+    // -- Scheduling -------------------------------------------------------
+
+    /// Start the watchers and the loop that calls [`Self::tick`]. Needs a
+    /// tokio runtime; without one (or when triggers are disabled) nothing
+    /// is scheduled.
+    pub fn start(self: &Arc<Self>) {
+        if !self.settings.enabled {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!("no async runtime: triggers will not fire");
+            return;
+        };
+        if self.started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let ids: Vec<String> = self.lock().keys().cloned().collect();
+        for id in ids {
+            self.sync_watch(&id);
+        }
+        let weak = Arc::downgrade(self);
+        runtime.spawn(async move {
+            loop {
+                let Some(service) = weak.upgrade() else {
+                    break;
+                };
+                let now = service.clock.now_ms();
+                service.tick(now);
+                let wait = service.until_next(service.clock.now_ms());
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(wait)) => {}
+                    _ = service.wake.notified() => {}
+                }
+            }
+        });
+    }
+
+    /// Milliseconds until something may be due.
+    fn until_next(&self, now: u64) -> u64 {
+        let entries = self.lock();
+        let earliest = entries
+            .values()
+            .filter(|entry| entry.enabled())
+            .flat_map(|entry| {
+                entry
+                    .next
+                    .map(|due| due.at)
+                    .into_iter()
+                    .chain(entry.pending.as_ref().map(|pending| pending.deadline))
+            })
+            .min();
+        match earliest {
+            Some(at) => at.saturating_sub(now).clamp(20, MAX_SLEEP_MS),
+            None => MAX_SLEEP_MS,
+        }
+    }
+
+    /// Fire everything that is due at `now` and plan what comes next.
+    /// Returns the runs it started or skipped.
+    pub fn tick(self: &Arc<Self>, now: u64) -> Vec<TriggerRun> {
+        if !self.settings.enabled {
+            return Vec::new();
+        }
+        let mut due: Vec<(String, &'static str, Option<u64>, Option<TriggerPayload>)> = Vec::new();
+        {
+            let mut entries = self.lock();
+            for (id, entry) in entries.iter_mut() {
+                if !entry.enabled() {
+                    continue;
+                }
+                let Ok(schedule) = &entry.schedule else {
+                    continue;
+                };
+                if let Some(next) = entry.next.filter(|next| next.at <= now) {
+                    // Two servers on one database must not both run the tick.
+                    match self.store.claim_tick(id, entry.state.last_scheduled, now) {
+                        Ok(true) => {
+                            due.push((id.clone(), next.reason, Some(next.scheduled), None));
+                            entry.state.last_scheduled = Some(now);
+                        }
+                        Ok(false) => {
+                            if let Ok(Some(theirs)) = self.store.state(id) {
+                                entry.state.last_scheduled = theirs.last_scheduled;
+                                entry.state.last_fired = theirs.last_fired;
+                                entry.state.session_id = theirs.session_id;
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!("trigger \"{id}\" could not claim its tick: {error}");
+                            continue;
+                        }
+                    }
+                    entry.next = plan(schedule, &entry.spec, &entry.state, now, false);
+                }
+                if entry
+                    .pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.deadline <= now)
+                {
+                    let pending = entry.pending.take().expect("checked above");
+                    let mut text = pending.paths.into_iter().collect::<Vec<_>>().join("\n");
+                    if text.is_empty() {
+                        text = "(no paths reported)".to_string();
+                    }
+                    due.push((
+                        id.clone(),
+                        "watch",
+                        None,
+                        Some(TriggerPayload {
+                            label: "list of changed paths".to_string(),
+                            text,
+                        }),
+                    ));
+                }
+            }
+        }
+        due.into_iter()
+            .filter_map(|(id, reason, scheduled, payload)| {
+                self.fire(&id, reason, scheduled, payload).ok()
+            })
+            .collect()
+    }
+
+    /// `POST /trigger/{id}/run` — fire now, whatever the trigger waits for.
+    pub fn run_now(self: &Arc<Self>, id: &str) -> Result<TriggerRun, TriggerError> {
+        self.require_enabled()?;
+        self.fire(id, "manual", None, None)
+    }
+
+    /// `POST /trigger/{id}/hook` — the webhook entry. The body reaches the
+    /// turn as fenced, untrusted data.
+    pub fn hook(self: &Arc<Self>, id: &str, body: &[u8]) -> Result<TriggerRun, TriggerError> {
+        self.require_enabled()?;
+        {
+            let entries = self.lock();
+            let Some(entry) = entries.get(id) else {
+                return Err(TriggerError::NotFound(format!("trigger not found: {id}")));
+            };
+            if !matches!(entry.schedule, Ok(Schedule::Webhook)) {
+                return Err(TriggerError::Conflict(format!(
+                    "trigger \"{id}\" is not a webhook trigger (its `on` has no `webhook: true`)"
+                )));
+            }
+            if !entry.enabled() {
+                return Err(TriggerError::Conflict(format!(
+                    "trigger \"{id}\" is paused"
+                )));
+            }
+        }
+        if body.len() > MAX_PAYLOAD_BYTES {
+            return Err(TriggerError::Invalid(format!(
+                "the webhook body is larger than {MAX_PAYLOAD_BYTES} bytes"
+            )));
+        }
+        let text = String::from_utf8_lossy(body).trim().to_string();
+        let payload = (!text.is_empty()).then(|| TriggerPayload {
+            label: "webhook body".to_string(),
+            text,
+        });
+        self.fire(id, "webhook", None, payload)
+    }
+
+    fn fire(
+        self: &Arc<Self>,
+        id: &str,
+        reason: &str,
+        scheduled: Option<u64>,
+        payload: Option<TriggerPayload>,
+    ) -> Result<TriggerRun, TriggerError> {
+        let now = self.clock.now_ms();
+        let mut run = TriggerRun {
+            id: new_id("trr"),
+            trigger_id: id.to_string(),
+            status: RunStatus::Queued,
+            reason: reason.to_string(),
+            session_id: None,
+            scheduled,
+            time: RunTime {
+                started: now,
+                ended: None,
+            },
+            quiet: None,
+            report: None,
+            text: None,
+            error: None,
+            cause: None,
+        };
+        let turn = {
+            let mut entries = self.lock();
+            let Some(entry) = entries.get_mut(id) else {
+                return Err(TriggerError::NotFound(format!("trigger not found: {id}")));
+            };
+            if let Err(error) = &entry.schedule {
+                return Err(TriggerError::Invalid(format!(
+                    "trigger \"{id}\" cannot run: {error}"
+                )));
+            }
+            if entry.busy {
+                None
+            } else {
+                entry.busy = true;
+                // Keyed on what the run carries, not only on the kind of
+                // trigger: any payload is outside text. The rules themselves
+                // are put together where the agent's are known
+                // (`trigger::rules`).
+                let untrusted = payload.is_some()
+                    || matches!(
+                        entry.schedule,
+                        Ok(Schedule::Webhook | Schedule::Watch { .. })
+                    );
+                Some(TriggerTurn {
+                    trigger_id: id.to_string(),
+                    run_id: run.id.clone(),
+                    title: entry
+                        .spec
+                        .title
+                        .clone()
+                        .filter(|title| !title.trim().is_empty())
+                        .unwrap_or_else(|| id.to_string()),
+                    agent: entry.spec.agent.clone(),
+                    model: entry.spec.model_ref(),
+                    mode: entry.spec.session_mode(),
+                    session_id: entry.state.session_id.clone(),
+                    inherited: entry.inherited.clone().unwrap_or_default(),
+                    own: entry
+                        .spec
+                        .permission
+                        .as_ref()
+                        .map(|own| from_config(own, &self.settings.home))
+                        .unwrap_or_default(),
+                    untrusted,
+                    prompt: entry.spec.prompt.clone(),
+                    payload,
+                    now_ms: now,
+                })
+            }
+        };
+        let Some(turn) = turn else {
+            run.status = RunStatus::Skipped;
+            run.cause = Some("the previous run has not finished".to_string());
+            run.time.ended = Some(now);
+            let _ = self.store.put_run(&run);
+            let mut data = json!({
+                "triggerID": id,
+                "runID": run.id,
+                "reason": reason,
+                "cause": run.cause,
+            });
+            if let Some(scheduled) = scheduled {
+                data["scheduled"] = json!(scheduled);
+            }
+            self.publish(&TRIGGER_SKIPPED, data);
+            return Ok(run);
+        };
+        let _ = self.store.put_run(&run);
+        let mut data = json!({ "triggerID": id, "runID": run.id, "reason": reason });
+        if let Some(scheduled) = scheduled {
+            data["scheduled"] = json!(scheduled);
+        }
+        self.publish(&TRIGGER_FIRED, data);
+        let service = Arc::clone(self);
+        let queued = run.clone();
+        tokio::spawn(async move { service.execute(turn, queued).await });
+        Ok(run)
+    }
+
+    async fn execute(self: Arc<Self>, turn: TriggerTurn, mut run: TriggerRun) {
+        let slot = self.slots.clone().acquire_owned().await;
+        run.status = RunStatus::Running;
+        let _ = self.store.put_run(&run);
+        let result = self.ops.run_turn(&turn).await;
+        drop(slot);
+        let now = self.clock.now_ms();
+        let duration = now.saturating_sub(run.time.started);
+        run.time.ended = Some(now);
+        let (quiet_token, report) = {
+            let entries = self.lock();
+            entries
+                .get(&turn.trigger_id)
+                .map(|entry| (entry.spec.quiet_token.clone(), entry.spec.report()))
+                .unwrap_or((None, Report::Final))
+        };
+        let session_id = match result {
+            Ok(outcome) => {
+                let quiet = quiet_token
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|token| !token.is_empty() && outcome.text.trim() == token);
+                let decision = if quiet { Report::None } else { report };
+                let mut text = outcome.text;
+                if text.len() > MAX_RUN_TEXT {
+                    let mut end = MAX_RUN_TEXT;
+                    while !text.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    text.truncate(end);
+                }
+                run.status = RunStatus::Completed;
+                run.session_id = Some(outcome.session_id.clone());
+                run.quiet = Some(quiet);
+                run.report = Some(decision);
+                let mut data = json!({
+                    "triggerID": turn.trigger_id,
+                    "runID": run.id,
+                    "sessionID": outcome.session_id,
+                    "duration": duration,
+                    "quiet": quiet,
+                    "report": decision.as_str(),
+                });
+                if decision == Report::Final {
+                    data["text"] = json!(text);
+                }
+                run.text = Some(text);
+                let _ = self.store.put_run(&run);
+                self.publish(&TRIGGER_COMPLETED, data);
+                Some(outcome.session_id)
+            }
+            Err(failure) => {
+                run.status = RunStatus::Failed;
+                run.session_id = failure.session_id.clone();
+                run.error = Some(failure.message.clone());
+                let _ = self.store.put_run(&run);
+                let mut data = json!({
+                    "triggerID": turn.trigger_id,
+                    "runID": run.id,
+                    "duration": duration,
+                    "error": failure.message,
+                });
+                if let Some(session_id) = &failure.session_id {
+                    data["sessionID"] = json!(session_id);
+                }
+                self.publish(&TRIGGER_FAILED, data);
+                failure.session_id
+            }
+        };
+        {
+            let mut entries = self.lock();
+            if let Some(entry) = entries.get_mut(&turn.trigger_id) {
+                entry.busy = false;
+                entry.state.last_fired = Some(now);
+                if turn.mode == SessionMode::Reuse {
+                    if let Some(session_id) = session_id {
+                        entry.state.session_id = Some(session_id);
+                    }
+                }
+                let _ = self.store.put_state(&turn.trigger_id, &entry.state);
+            }
+        }
+        self.settled.notify_waiters();
+        self.wake.notify_one();
+    }
+
+    /// Wait for a run to finish (or be skipped) and return it.
+    pub async fn wait(&self, run_id: &str) -> Option<TriggerRun> {
+        loop {
+            let settled = self.settled.notified();
+            tokio::pin!(settled);
+            // Register before reading, so a finish in between is not missed.
+            settled.as_mut().enable();
+            let run = self.run(run_id)?;
+            if run.status.settled() {
+                return Some(run);
+            }
+            settled.await;
+        }
+    }
+
+    /// A one-line description of what a trigger waits for.
+    pub fn describe(record: &TriggerRecord) -> String {
+        let on = &record.spec.on;
+        if let Some(cron) = &on.cron {
+            return match &on.timezone {
+                Some(zone) => format!("cron {cron} ({zone})"),
+                None => format!("cron {cron} (UTC)"),
+            };
+        }
+        if let Some(interval) = &on.interval {
+            return match crate::trigger::parse_duration(interval) {
+                Ok(ms) => format!("every {}", format_duration(ms)),
+                Err(_) => format!("every {interval}"),
+            };
+        }
+        if let Some(at) = &on.at {
+            return format!("once at {at}");
+        }
+        if let Some(watch) = &on.watch {
+            return format!("when {} changes", watch.path);
+        }
+        "on a webhook call".to_string()
+    }
+}
+
+/// A config trigger has no row of its own: its age is when it was first seen.
+fn state_time(store: &TriggerStore, id: &str, fallback: u64) -> u64 {
+    store
+        .state(id)
+        .ok()
+        .flatten()
+        .map(|state| state.time_seen)
+        .unwrap_or(fallback)
+}
+
+#[cfg(test)]
+#[path = "service_tests.rs"]
+mod tests;

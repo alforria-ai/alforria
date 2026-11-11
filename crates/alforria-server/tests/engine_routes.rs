@@ -394,6 +394,7 @@ async fn experimental_tool_lists_production_registry() {
             "todowrite",
             "skill",
             "workflow",
+            "schedule",
         ]
     );
 }

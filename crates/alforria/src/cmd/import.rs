@@ -299,11 +299,164 @@ async fn fetch_share(base_url: &str, slug: &str) -> Result<Option<Value>, String
         .map_err(|_| "Share data was not valid JSON".to_string())
 }
 
+/// `alforria import --format openai-chat` (alforria extension): a chat
+/// transcript from another tool becomes a session
+/// (`alforria_core::session::import`).
+fn run_transcript(matches: &ArgMatches, file: &str, ui: &mut Ui) -> Result<(), TypedError> {
+    use alforria_core::session::import as transcript;
+    let cli = |message: String| TypedError::Cli(CliError::new(message));
+    let text = if file == "-" {
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)
+            .map_err(|err| cli(format!("Failed to read stdin: {err}")))?;
+        text
+    } else {
+        match std::fs::read_to_string(file) {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Err(cli(format!("File not found: {file}")));
+            }
+            Err(err) => return Err(cli(format!("Failed to read file: {err}"))),
+        }
+    };
+    let mut parsed = transcript::parse_transcript(&text)
+        .map_err(|message| cli(format!("Invalid transcript: {message}")))?;
+    if let Some(import_id) = matches.get_one::<String>("import-id") {
+        parsed.import_id = Some(import_id.clone());
+    }
+    if let Some(title) = matches.get_one::<String>("title") {
+        parsed.title = Some(title.clone());
+    }
+    let cutoff = match (
+        matches.get_one::<String>("archive-before"),
+        matches.get_one::<usize>("live-tail"),
+    ) {
+        (Some(before), _) => Some(
+            transcript::parse_archive_before(before)
+                .map_err(|message| cli(format!("--archive-before: {message}")))?,
+        ),
+        (None, Some(tail)) => Some(transcript::Cutoff::LiveTail(*tail)),
+        (None, None) => None,
+    };
+    let dry_run = matches.get_flag("dry-run");
+
+    let instance = crate::instance::boot(None)?;
+    let model = matches
+        .get_one::<String>("model")
+        .cloned()
+        .or_else(|| parsed.model.clone())
+        .or_else(|| instance.config.model.clone());
+    let Some((provider_id, model_id)) = model
+        .as_deref()
+        .and_then(|model| model.split_once('/'))
+        .filter(|(provider, model)| !provider.is_empty() && !model.is_empty())
+    else {
+        return Err(cli(
+            "The imported messages need a model to be recorded with, so the session can be \
+             continued. Pass --model provider/model, or set `model` in the config."
+                .to_string(),
+        ));
+    };
+    let agent = match matches.get_one::<String>("agent") {
+        Some(agent) => agent.clone(),
+        None => instance
+            .services
+            .agents
+            .default_agent()
+            .map_err(|err| cli(err.to_string()))?,
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default();
+    let options = transcript::ImportOptions {
+        agent: agent.clone(),
+        provider_id: provider_id.to_string(),
+        model_id: model_id.to_string(),
+        cwd: instance.directory.to_string_lossy().into_owned(),
+        root: instance.worktree.to_string_lossy().into_owned(),
+        cutoff,
+        now_ms,
+    };
+    let storage = &instance.services.storage;
+    if let Some(import_id) = &parsed.import_id {
+        let existing =
+            transcript::find_import(storage, import_id).map_err(|err| cli(err.to_string()))?;
+        if let Some(session_id) = existing {
+            ui.write_stdout(&format!(
+                "Already imported: {session_id} (import id {import_id})\n"
+            ));
+            return Ok(());
+        }
+    }
+    let session_id = alforria_core::session::ids::SessionId::descending(None)
+        .map_err(|err| cli(err.to_string()))?;
+    let plan = transcript::plan(&parsed, &session_id, &options)
+        .map_err(|message| cli(format!("Invalid transcript: {message}")))?;
+    let report = serde_json::to_string(&plan.report).unwrap_or_default();
+    if dry_run {
+        ui.write_stdout(&format!("Dry run, nothing written: {report}\n"));
+        return Ok(());
+    }
+    let context = instance
+        .services
+        .instance_context(&instance.directory, None)
+        .map_err(|err| cli(err.to_string()))?;
+    let session = instance
+        .services
+        .sessions
+        .create(
+            &context,
+            &alforria_core::CreateInput {
+                id: Some(session_id.clone()),
+                title: parsed
+                    .title
+                    .clone()
+                    .filter(|title| !title.trim().is_empty()),
+                agent: Some(agent),
+                metadata: Some(transcript::import_metadata(&parsed, &plan.report)),
+                ..Default::default()
+            },
+        )
+        .map_err(|err| cli(err.to_string()))?;
+    if let Err(err) = transcript::write(storage, &session.id, &plan, now_ms) {
+        // All or nothing: a session with no messages is not left behind.
+        let _ = instance.services.sessions.remove(&session.id);
+        return Err(cli(format!("Failed to write the import: {err}")));
+    }
+    ui.write_stdout(&format!("Imported session: {}\n{report}\n", session.id));
+    Ok(())
+}
+
 pub fn run(matches: &ArgMatches, ui: &mut Ui) -> Result<(), TypedError> {
     let file = matches
         .get_one::<String>("file")
         .map(String::as_str)
         .unwrap_or_default();
+    if matches.get_one::<String>("format").map(String::as_str) == Some("openai-chat") {
+        return run_transcript(matches, file, ui);
+    }
+    for flag in [
+        "archive-before",
+        "live-tail",
+        "import-id",
+        "model",
+        "agent",
+        "title",
+    ] {
+        if matches.contains_id(flag)
+            && matches.value_source(flag) == Some(clap::parser::ValueSource::CommandLine)
+        {
+            return Err(TypedError::Cli(CliError::new(format!(
+                "--{flag} only applies with --format openai-chat"
+            ))));
+        }
+    }
+    if matches.get_flag("dry-run") {
+        return Err(TypedError::Cli(CliError::new(
+            "--dry-run only applies with --format openai-chat",
+        )));
+    }
     let runtime = super::runtime()?;
     runtime.block_on(run_async(file, ui))
 }

@@ -42,6 +42,8 @@ regex = { workspace = true }
 rust_decimal = { workspace = true }
 tracing = { workspace = true }
 rquickjs = { workspace = true }
+croner = "4.0.3"
+chrono-tz = "0.10.4"
 
 [dev-dependencies]
 # `start_paused` for the M5.8 retry tests (deterministic clocks, no sleeps)

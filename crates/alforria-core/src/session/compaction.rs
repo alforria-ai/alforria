@@ -523,6 +523,9 @@ pub struct SessionCompaction {
     deps: CompactionDeps,
     /// See [`SessionCompaction::scale`], by `provider/model`.
     scales: std::sync::Mutex<std::collections::HashMap<String, f64>>,
+    /// Called once with the text about to be summarised (alforria
+    /// extension: `memory.flush_before_compaction`).
+    before: Option<Arc<dyn crate::memory::flush::BeforeCompaction>>,
 }
 
 /// The error a compaction ends with when no request small enough to send
@@ -569,6 +572,9 @@ struct Fold<'a> {
 struct Folded {
     conversation: String,
     previous_summary: Option<String>,
+    /// Whether older history was summarised on the way: `previous_summary`
+    /// then stands for conversation nothing else in this request shows.
+    summarised: bool,
 }
 
 enum FoldStop {
@@ -583,6 +589,19 @@ fn failed(message: String) -> FoldStop {
         message,
         r#ref: None,
     }))
+}
+
+/// What the pre-compaction hook reads: bounded by one summary request,
+/// whatever the session's size.
+fn flush_digest(folded: &Folded) -> std::borrow::Cow<'_, str> {
+    match folded.previous_summary.as_deref() {
+        Some(summary) if folded.summarised => std::borrow::Cow::Owned(format!(
+            "[Summary of the earlier part of this conversation]\n{summary}\n\n\
+             [The most recent part, in full]\n{}",
+            folded.conversation
+        )),
+        _ => std::borrow::Cow::Borrowed(&folded.conversation),
+    }
 }
 
 fn cursor_before(a: &Cursor, b: &Cursor) -> bool {
@@ -629,7 +648,17 @@ impl SessionCompaction {
         SessionCompaction {
             deps,
             scales: Default::default(),
+            before: None,
         }
+    }
+
+    /// Run `hook` once per compaction, before its summary is written.
+    pub fn with_before(
+        mut self,
+        hook: Option<Arc<dyn crate::memory::flush::BeforeCompaction>>,
+    ) -> SessionCompaction {
+        self.before = hook;
+        self
     }
 
     fn storage_error(message: impl Into<String>) -> SessionError {
@@ -951,6 +980,7 @@ impl SessionCompaction {
         };
         let scale_key = format!("{}/{}", model.llm.provider_id, model.llm.id);
         let mut scale = self.scale(&scale_key);
+        let mut flushed = false;
         let (handle, result) = loop {
             // Everything but the last request's worth is summarised here,
             // a chunk at a time; the last goes through the processor below
@@ -975,6 +1005,28 @@ impl SessionCompaction {
                     return self.fail(msg, error);
                 }
             };
+            // alforria extension, the single call site: before the
+            // conversation is replaced by its summary, the hook may save
+            // memories from it. It is called once per compaction, with what
+            // the final summary request carries and no more: the newest
+            // chunk in full and, when older history was folded on the way,
+            // the summary that stands for it. The whole history is never
+            // assembled for it.
+            if let Some(hook) = self.before.as_ref().filter(|_| !flushed) {
+                flushed = true;
+                let digest = flush_digest(&folded);
+                tokio::select! {
+                    biased;
+                    _ = input.cancel.cancelled() => {}
+                    _ = hook.before_compaction(crate::memory::flush::FlushInput {
+                        session_id: &input.session_id,
+                        conversation: &digest,
+                        agent: &user_agent,
+                        user: &user_message,
+                        model: &model,
+                    }) => {}
+                }
+            }
             let next_prompt = build_prompt(&BuildPrompt {
                 previous_summary: folded.previous_summary.as_deref(),
                 context: vec![folded.conversation],
@@ -1287,6 +1339,7 @@ impl SessionCompaction {
         };
 
         let mut rolling = fold.previous_summary.map(|summary| clip(summary, piece));
+        let mut summarised = false;
         let mut chunk: Vec<String> = Vec::new();
         let mut size = 0usize;
         let mut pending: std::collections::VecDeque<String> = std::collections::VecDeque::new();
@@ -1346,6 +1399,7 @@ impl SessionCompaction {
                     context: vec![chunk.join("\n\n")],
                 });
                 rolling = Some(clip(&self.summarise(fold, prompt).await?, piece));
+                summarised = true;
                 chunk.clear();
                 size = 0;
             }
@@ -1355,6 +1409,7 @@ impl SessionCompaction {
         Ok(Folded {
             conversation: chunk.join("\n\n"),
             previous_summary: rolling,
+            summarised,
         })
     }
 
@@ -2443,6 +2498,68 @@ mod tests {
         assert_eq!(result[0].user_index, 0);
         assert_eq!(result[0].assistant_index, 1);
         assert_eq!(result[0].summary.as_deref(), Some("done"));
+    }
+
+    /// alforria extension: the hook sees the conversation once, before the
+    /// summary request (`memory.flush_before_compaction`).
+    #[tokio::test]
+    async fn process_calls_the_before_hook_once_with_the_conversation() {
+        use crate::memory::flush::{BeforeCompaction, FlushInput};
+        use crate::session::message::filter_compacted;
+        use crate::session::test_support::{create_session, text_stream};
+
+        struct Recorder {
+            seen: std::sync::Mutex<Vec<(String, String, usize)>>,
+            llm: std::sync::Arc<crate::session::test_support::MockLlm>,
+        }
+        impl BeforeCompaction for Recorder {
+            fn before_compaction<'a>(
+                &'a self,
+                input: FlushInput<'a>,
+            ) -> crate::tool::def::BoxFuture<'a, ()> {
+                Box::pin(async move {
+                    self.seen.lock().unwrap().push((
+                        input.session_id.to_string(),
+                        input.conversation.to_string(),
+                        self.llm.calls(),
+                    ));
+                })
+            }
+        }
+
+        let h = harness("compaction-before-hook", vec![text_stream("## Objective")]);
+        let session = create_session(&h.services.sessions, &h.worktree);
+        push_message(&h, &user_message(&session.id, "msg_u1", 1.0));
+        h.services
+            .sessions
+            .update_part(&text_part(&session.id, "msg_u1", "prt_u1", "fix the bug"))
+            .unwrap();
+        create_compaction(&h, &session.id, true, false).await;
+        let parent_id = last_user_id(&h, &session.id);
+        let msgs = filter_compacted(h.services.messages.stream(&session.id).unwrap());
+        let recorder = std::sync::Arc::new(Recorder {
+            seen: std::sync::Mutex::new(Vec::new()),
+            llm: h.llm.clone(),
+        });
+        compaction_service(&h)
+            .with_before(Some(recorder.clone()))
+            .process(crate::session::r#loop::CompactionProcess {
+                messages: msgs,
+                complete: true,
+                cancel: CancellationToken::new(),
+                parent_id,
+                session_id: session.id.clone(),
+                auto: true,
+                overflow: None,
+            })
+            .await
+            .unwrap();
+        let seen = recorder.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, session.id);
+        assert!(seen[0].1.contains("fix the bug"), "{}", seen[0].1);
+        assert_eq!(seen[0].2, 0, "before the summary request");
+        assert_eq!(h.llm.calls(), 1);
     }
 
     #[test]

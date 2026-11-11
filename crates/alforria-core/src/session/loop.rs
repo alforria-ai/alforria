@@ -235,6 +235,12 @@ pub trait SystemPrompts: Send + Sync {
         agent: &'a str,
         permission: &'a Option<alforria_schema::permission_v1::PermissionV1Ruleset>,
     ) -> BoxFuture<'a, Option<String>>;
+    /// The `<memory>` block (alforria extension): saved records, read again
+    /// each step like the instruction files. `None` when memory is off or
+    /// empty.
+    fn memory(&self) -> Option<String> {
+        None
+    }
 }
 
 /// No-op default (M5.2 not landed).
@@ -677,6 +683,10 @@ pub async fn run_loop(
             }
             if let Some(skills) = deps.systems.skills(&agent.name).await {
                 system.push(skills);
+            }
+            // Last, so a new memory does not unsettle the prefix before it.
+            if let Some(memory) = deps.systems.memory() {
+                system.push(memory);
             }
             if json_schema_format {
                 system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT.to_string());

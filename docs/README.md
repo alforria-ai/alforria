@@ -14,6 +14,7 @@ This directory holds internal project documentation:
 | `plans/web-ui.md` | Web UI notes |
 | `plans/review-findings.md` | Review findings and decisions |
 | `unattended-server.md` | Reference for running `alforria serve` unattended: shutdown, tokens and scopes, shell environment, webhooks |
+| `assistant.md` | Reference for the always-on assistant features: triggers, memory, transcript import, persona controls |
 | `RELEASING.md` | Release checklist for binaries, GitHub notes, and the website |
 
 Start with [README.md](../README.md) for install and development, and

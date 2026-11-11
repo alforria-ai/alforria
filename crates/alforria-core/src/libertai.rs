@@ -99,7 +99,36 @@ struct AggregateCapabilitiesText {
 struct LtaiPricing {
     #[serde(default)]
     models: Vec<AggregateModel>,
+    /// Aliases the API accepts: `from` is served by the model `to`.
+    #[serde(default)]
+    redirections: Vec<AggregateRedirection>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AggregateRedirection {
+    from: String,
+    to: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    category: Option<String>,
+}
+
+/// Dated ids the API serves for a model the aggregate lists under its plain
+/// name: `(dated id, aggregate id, display name)`.
+///
+/// The API's `/v1/models` advertises a 1,048,576-token context for these,
+/// while the aggregate has listed DeepSeek at 262,144. The aggregate is the
+/// catalog of record, so when it lists the plain id its numbers are used for
+/// the dated ids too; only when it lists neither does the fallback below
+/// apply.
+const DATED_VARIANTS: [(&str, &str, &str); 1] = [(
+    "deepseek-v4.1-flash-1017",
+    "deepseek-v4.1-flash",
+    "DeepSeek V4.1 Flash (1017)",
+)];
+
+/// The context window of [`DATED_VARIANTS`] when the aggregate lists neither
+/// id (the size `/v1/models` advertises).
+const DATED_FALLBACK_CONTEXT: u32 = 1_048_576;
 
 // ---------------------------------------------------------------------------
 // conversion
@@ -175,6 +204,60 @@ fn models_from_pricing(pricing: &LtaiPricing) -> BTreeMap<String, Model> {
         thinking.id = format!("{base}-thinking");
         thinking.name = format!("{} (thinking)", model.name);
         models.insert(thinking.id.clone(), thinking);
+    }
+    for (dated, base, name) in DATED_VARIANTS {
+        let mut model = match (models.get(dated), models.get(base)) {
+            (Some(listed), _) => listed.clone(),
+            (None, Some(base)) => {
+                let mut model = base.clone();
+                model.name = name.to_string();
+                model
+            }
+            (None, None) => {
+                let mut model = fallback_model(dated, name, 0.25, 1.75);
+                model.limit.context = f64::from(DATED_FALLBACK_CONTEXT);
+                model
+            }
+        };
+        model.id = dated.to_string();
+        models
+            .entry(dated.to_string())
+            .or_insert_with(|| model.clone());
+        let thinking_id = format!("{dated}-thinking");
+        models.entry(thinking_id.clone()).or_insert_with(|| {
+            let mut thinking = model;
+            thinking.name = format!("{} (thinking)", thinking.name);
+            thinking.reasoning = true;
+            thinking.id = thinking_id;
+            thinking
+        });
+    }
+    // Aliases: accepted under their own id, with everything else (limits,
+    // cost, capabilities) the target's. The prompt follows the target too:
+    // an alias id says nothing about the model behind it.
+    for redirection in &pricing.redirections {
+        if redirection
+            .category
+            .as_deref()
+            .is_some_and(|category| category != "text")
+        {
+            continue;
+        }
+        let Some(target) = models.get(&redirection.to) else {
+            continue;
+        };
+        if models.contains_key(&redirection.from) {
+            continue;
+        }
+        let mut alias = target.clone();
+        alias.id = redirection.from.clone();
+        alias.name = format!("{} ({})", redirection.from, target.name);
+        models.insert(alias.id.clone(), alias);
+        crate::session::system::set_family_hint(
+            LIBERTAI_PROVIDER_ID,
+            &redirection.from,
+            Some(&redirection.to),
+        );
     }
     models
 }
@@ -411,6 +494,94 @@ mod tests {
 
     fn snapshot_pricing() -> LtaiPricing {
         serde_json::from_str(include_str!("libertai/snapshot.json")).unwrap()
+    }
+
+    #[test]
+    fn redirections_become_aliases_that_take_after_their_target() {
+        let pricing: LtaiPricing = serde_json::from_value(serde_json::json!({
+            "models": [
+                { "id": "qwen3.6-35b-a3b", "name": "Qwen 3.6 35B",
+                  "pricing": { "text": { "price_per_million_input_tokens": 0.1, "price_per_million_output_tokens": 0.4 } },
+                  "capabilities": { "text": { "vision": true, "reasoning": true, "context_window": 131072, "function_calling": true } } },
+                { "id": "deepseek-v4.1-flash", "name": "DeepSeek V4.1 Flash",
+                  "pricing": { "text": { "price_per_million_input_tokens": 0.25, "price_per_million_output_tokens": 1.75 } },
+                  "capabilities": { "text": { "vision": false, "reasoning": true, "context_window": 262144, "function_calling": true } } },
+            ],
+            "redirections": [
+                { "from": "claw-flash", "to": "qwen3.6-35b-a3b", "type": "INTERNAL", "category": "text" },
+                { "from": "claw-deep", "to": "deepseek-v4.1-flash" },
+                { "from": "claw-image", "to": "qwen3.6-35b-a3b", "category": "image" },
+                { "from": "claw-lost", "to": "no-such-model", "category": "text" },
+                { "from": "deepseek-v4.1-flash", "to": "qwen3.6-35b-a3b", "category": "text" },
+            ],
+        }))
+        .unwrap();
+        let models = models_from_pricing(&pricing);
+        let alias = &models["claw-flash"];
+        let target = &models["qwen3.6-35b-a3b"];
+        assert_eq!(alias.id, "claw-flash");
+        assert_eq!(alias.name, "claw-flash (Qwen 3.6 35B)");
+        assert_eq!(alias.limit, target.limit);
+        assert_eq!(alias.cost, target.cost);
+        assert_eq!(
+            (alias.attachment, alias.reasoning, alias.tool_call),
+            (target.attachment, target.reasoning, target.tool_call)
+        );
+        assert!(!models.contains_key("claw-image") && !models.contains_key("claw-lost"));
+        // A listed model is never replaced by an alias of the same name.
+        assert_eq!(models["deepseek-v4.1-flash"].name, "DeepSeek V4.1 Flash");
+        // The prompt follows the target: a DeepSeek alias gets the DeepSeek prompt.
+        use crate::session::system::{prompt_for, provider_for, PromptFamily};
+        assert_eq!(
+            provider_for("claw-deep", "claw-deep", LIBERTAI_PROVIDER_ID),
+            vec![prompt_for(PromptFamily::DeepSeek).to_string()]
+        );
+        assert_eq!(
+            provider_for("claw-flash", "claw-flash", LIBERTAI_PROVIDER_ID),
+            vec![prompt_for(PromptFamily::Default).to_string()]
+        );
+    }
+
+    #[test]
+    fn dated_deepseek_ids_follow_the_aggregate_and_fall_back_to_the_api_size() {
+        // The aggregate lists the plain id: its numbers win.
+        let listed: LtaiPricing = serde_json::from_value(serde_json::json!({
+            "models": [
+                { "id": "deepseek-v4.1-flash", "name": "DeepSeek V4.1 Flash",
+                  "pricing": { "text": { "price_per_million_input_tokens": 0.25, "price_per_million_output_tokens": 1.75 } },
+                  "capabilities": { "text": { "vision": false, "reasoning": true, "context_window": 262144, "function_calling": true } } },
+            ],
+        }))
+        .unwrap();
+        let models = models_from_pricing(&listed);
+        for id in [
+            "deepseek-v4.1-flash-1017",
+            "deepseek-v4.1-flash-1017-thinking",
+        ] {
+            assert_eq!(models[id].id, id);
+            assert_eq!(models[id].limit.context, 262_144.0, "{id}");
+            assert_eq!(models[id].cost, models["deepseek-v4.1-flash"].cost, "{id}");
+        }
+        assert!(models["deepseek-v4.1-flash-1017-thinking"].reasoning);
+        // It lists neither: the size /v1/models advertises.
+        let empty: LtaiPricing =
+            serde_json::from_value(serde_json::json!({ "models": [] })).unwrap();
+        let models = models_from_pricing(&empty);
+        for id in [
+            "deepseek-v4.1-flash-1017",
+            "deepseek-v4.1-flash-1017-thinking",
+        ] {
+            assert_eq!(models[id].limit.context, 1_048_576.0, "{id}");
+        }
+        // The shipped snapshot carries them, and the aliases.
+        let models = models_from_pricing(&snapshot_pricing());
+        assert_eq!(
+            models["deepseek-v4.1-flash-1017"].limit.context,
+            1_048_576.0
+        );
+        assert!(models.contains_key("deepseek-v4.1-flash-1017-thinking"));
+        assert_eq!(models["claw-flash"].limit, models["qwen3.6-35b-a3b"].limit);
+        assert!(models.contains_key("claw-core") && models.contains_key("deep-claw"));
     }
 
     #[test]

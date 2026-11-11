@@ -53,6 +53,10 @@ pub struct ListenOptions {
     pub hosts: Vec<String>,
     /// Overrides `OPENCODE_SERVER_PASSWORD` (a password `serve` generated).
     pub password: Option<String>,
+    /// Run the trigger scheduler (alforria extension). On for the long-lived
+    /// servers (`serve`, `web`, the TUI's own); off for one-shot commands,
+    /// which would start a scheduled turn only to exit under it.
+    pub schedule: bool,
 }
 
 impl Default for ListenOptions {
@@ -63,6 +67,7 @@ impl Default for ListenOptions {
             cors: Vec::new(),
             hosts: Vec::new(),
             password: None,
+            schedule: false,
         }
     }
 }
@@ -198,7 +203,53 @@ pub async fn listen_with(opts: &ListenOptions, ctx: Arc<ServerContext>) -> io::R
 /// Bind a server with a fresh environment-derived context.
 pub async fn listen(opts: &ListenOptions) -> io::Result<Listener> {
     let ctx = default_context(opts)?;
+    if opts.schedule {
+        boot_scheduled(&ctx);
+    }
     listen_with(opts, ctx).await
+}
+
+/// Boot the instances that have something scheduled, so triggers fire
+/// without a client having to open the directory first: the server's own
+/// directory (its config may declare triggers) and every directory the
+/// trigger tables know. Runs in the background; a directory that fails to
+/// boot is logged and skipped.
+pub fn boot_scheduled(ctx: &Arc<ServerContext>) {
+    let ctx = ctx.clone();
+    tokio::spawn(async move {
+        let mut directories = vec![state::resolve_directory(&state::cwd())];
+        let known = ctx.storage.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT directory FROM \"trigger\" UNION SELECT directory FROM trigger_state",
+            )?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok::<_, rusqlite::Error>(rows)
+        });
+        for directory in known.unwrap_or_default() {
+            let directory = std::path::PathBuf::from(directory);
+            if directory.is_dir() && !directories.contains(&directory) {
+                directories.push(directory);
+            }
+        }
+        for directory in directories {
+            let instances = ctx.clone();
+            let booted = tokio::task::spawn_blocking(move || {
+                instances.instances.load(&directory).map(|_| directory)
+            })
+            .await;
+            match booted {
+                Ok(Ok(directory)) => tracing::info!("triggers ready for {}", directory.display()),
+                Ok(Err(error)) => {
+                    tracing::warn!("could not boot an instance for its triggers: {error:?}")
+                }
+                Err(error) => {
+                    tracing::warn!("could not boot an instance for its triggers: {error}")
+                }
+            }
+        }
+    });
 }
 
 /// The server as a tower `Service`, with no listener: the router over a
@@ -261,6 +312,7 @@ pub fn production_context(
     let runtime = engine::EngineRuntime {
         catalog: state::default_catalog(),
         auth: Arc::new(state::FileAuthStore::new(paths.data.join("auth.json"))),
+        schedule: opts.schedule,
     };
     let instances = production_instance_factory(
         storage.clone(),
@@ -669,6 +721,7 @@ mod tests {
             engine::EngineRuntime {
                 catalog: crate::state::default_catalog(),
                 auth: Arc::new(crate::state::MemoryAuthStore::default()),
+                schedule: false,
             },
             engine::EngineSeams::default(),
         );

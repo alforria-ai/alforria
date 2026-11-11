@@ -331,7 +331,8 @@ pub fn prepare(input: &PrepareInput<'_>) -> Prepared {
     let mut system_blocks: Vec<String> = Vec::new();
     match &input.agent.prompt {
         Some(prompt) => system_blocks.push(prompt.clone()),
-        None => system_blocks.extend(crate::session::system::provider(
+        None => system_blocks.extend(crate::session::system::provider_for(
+            &input.model.id,
             &input.model.api_id,
             &input.model.provider_id,
         )),
