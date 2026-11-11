@@ -259,8 +259,10 @@ pub async fn auth_set(
     headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Result<Response, ServerError> {
-    ctx.auth_store
-        .audit(&format!("PUT /auth/{provider_id} {}", client_of(&headers)));
+    ctx.auth_store.audit(&format!(
+        "PUT /auth/{provider_id:?} {}",
+        client_of(&headers)
+    ));
     let payload: Value = serde_json::from_slice(&body)
         .map_err(|err| payload_error(format!("Invalid JSON payload: {err}")))?;
     if !auth_info_valid(&payload) {
@@ -278,7 +280,7 @@ pub async fn auth_remove(
     headers: axum::http::HeaderMap,
 ) -> Result<Response, ServerError> {
     ctx.auth_store.audit(&format!(
-        "DELETE /auth/{provider_id} {}",
+        "DELETE /auth/{provider_id:?} {}",
         client_of(&headers)
     ));
     let service = ctx.provider_auth.clone();

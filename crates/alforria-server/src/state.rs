@@ -705,7 +705,18 @@ impl FileAuthStore {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|elapsed| elapsed.as_millis())
             .unwrap_or_default();
-        let exe = std::env::args().collect::<Vec<_>>().join(" ");
+        // The program and its subcommand only: later arguments can carry a
+        // prompt or a password.
+        let exe = std::env::args()
+            .take(2)
+            .filter(|arg| !arg.starts_with('-'))
+            .collect::<Vec<_>>()
+            .join(" ");
+        // One record per line, whatever a client put in a header or path.
+        let line: String = line
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
         let mut options = std::fs::OpenOptions::new();
         options.append(true).create(true);
         #[cfg(unix)]
