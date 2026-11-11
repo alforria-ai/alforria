@@ -17,7 +17,8 @@
 //!
 //! There are two postures, and the host config decides which:
 //!
-//! * **standalone** (the default) — a child inherits everything except
+//! * **standalone** (the default: a developer's own loopback server) — a
+//!   child inherits everything except
 //!   what is alforria's own to protect: the host's `deny`; the server's
 //!   secrets and the provider key variables of [`BUILTIN_DENY`]; names
 //!   shaped like an API key ([`API_KEY_PATTERNS`]); and the names the
@@ -27,9 +28,12 @@
 //!   refers to). `GH_TOKEN`, `AWS_*`, `NPM_TOKEN`, `PGPASSWORD` and the
 //!   like are the user's, for the user's tools, and pass as they do
 //!   upstream;
-//! * **restricted** ([`ShellEnvPolicy::restricted`]: bearer auth is
-//!   configured, or `server.trust.project` is `"restricted"`) — nobody is
-//!   at the terminal of such a server. Names that look like a credential
+//! * **restricted** ([`ShellEnvPolicy::restricted`]: the server is
+//!   unattended or reachable from another machine — bearer auth, a
+//!   non-loopback bind, an unattended answer, a webhook, a `webhook` or
+//!   `watch` trigger, or `server.trust.project: "restricted"`; the server
+//!   crate's `ServerPolicy::unattended_or_remote`) — nobody is at the
+//!   terminal of such a server. Names that look like a credential
 //!   ([`CREDENTIAL_PATTERNS`]) are denied too, and a shell or a helper
 //!   starts from [`RESTRICTED_INHERIT`] plus what `allow` names instead of
 //!   from everything: no list of secret-looking names is ever complete.
@@ -168,8 +172,8 @@ pub struct ShellEnvPolicy {
     /// `shell_env.inherit`; `None` when the host did not say, and the
     /// default depends on `restricted`.
     inherit: Option<Inherit>,
-    /// The restricted posture (bearer auth, or `server.trust.project:
-    /// "restricted"`): [`CREDENTIAL_PATTERNS`] are denied, and a child
+    /// The restricted posture (an unattended or remotely reachable
+    /// server): [`CREDENTIAL_PATTERNS`] are denied, and a child
     /// inherits [`RESTRICTED_INHERIT`] and `allow` unless the host set
     /// `inherit`.
     restricted: bool,
@@ -260,8 +264,8 @@ impl ShellEnvPolicy {
         }
     }
 
-    /// The same policy in the restricted posture (`restricted`: bearer
-    /// auth is configured, or `server.trust.project` is `"restricted"`):
+    /// The same policy in the restricted posture (`restricted`: the
+    /// server is unattended or reachable from another machine):
     /// credential-like names are denied, and a child inherits
     /// [`RESTRICTED_INHERIT`] and `allow` instead of everything, unless the
     /// host set `inherit` itself.

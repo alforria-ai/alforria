@@ -172,6 +172,15 @@ pub struct TriggerSpec {
     pub catch_up: Option<bool>,
 }
 
+impl TriggerSpec {
+    /// Whether something outside the server starts this trigger's runs —
+    /// an HTTP delivery (`on.webhook`) or a change on disk (`on.watch`) —
+    /// rather than the clock. Disabled triggers start nothing.
+    pub fn starts_from_outside(&self) -> bool {
+        self.enabled != Some(false) && (self.on.webhook == Some(true) || self.on.watch.is_some())
+    }
+}
+
 /// Where a trigger's turns go.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionMode {

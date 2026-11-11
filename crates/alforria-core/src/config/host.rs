@@ -404,9 +404,8 @@ impl<'de> Deserialize<'de> for ShellEnvInherit {
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ShellEnvInfo {
     /// Which of the server's variables a shell starts with. Unset: all of
-    /// them on a standalone server, a short allowlist on a restricted one
-    /// (bearer auth, or `server.trust.project: "restricted"`;
-    /// `shell_env::RESTRICTED_INHERIT`).
+    /// them on a standalone server, a short allowlist on an unattended or
+    /// remotely reachable one (`shell_env::RESTRICTED_INHERIT`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inherit: Option<ShellEnvInherit>,
     /// Exact names exempt from the built-in deny list, and inherited on a

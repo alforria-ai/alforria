@@ -7,6 +7,7 @@ pub mod doc;
 pub mod file_ext;
 pub mod goal;
 pub mod memory;
+pub mod posture;
 pub mod restriction;
 pub mod trigger;
 pub mod ui;
@@ -44,6 +45,7 @@ pub fn build_router(ctx: Arc<ServerContext>) -> Router {
     router = attention::register(router);
     router = trigger::register(router);
     router = memory::register(router);
+    router = posture::register(router);
 
     let router = router
         .fallback(ui::serve_ui_handler)

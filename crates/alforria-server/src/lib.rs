@@ -440,6 +440,16 @@ pub fn production_context(
         seams,
     );
     let mut policy = ServerPolicy::load(&paths);
+    // The listener's address and the stored triggers complete the
+    // question of whether anybody is at this server's terminal; the shell
+    // environment's posture follows it, and is said once.
+    let outside_trigger = !engine::bool_env("OPENCODE_DISABLE_TRIGGERS")
+        && alforria_core::trigger::store::any_outside_trigger(&storage).unwrap_or_else(|error| {
+            tracing::warn!("could not read the stored triggers: {error}");
+            true
+        });
+    policy.observe(&opts.hostname, outside_trigger);
+    tracing::info!("{}", policy.posture_summary());
     // `hook.webhook`: the outbox captures from every instance's bus. A
     // hook that does not resolve is a host config error like any other.
     let outbox = match outbox::Outbox::new(storage.clone(), policy.hook.as_ref()) {

@@ -30,6 +30,57 @@ impl Default for ShutdownOptions {
     }
 }
 
+/// One reason a server counts as unattended or remotely reachable
+/// ([`ServerPolicy::unattended_or_remote`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PostureReason {
+    /// `server.auth.bearer` is configured.
+    Bearer,
+    /// `server.trust.project` is `"restricted"`: the host's own switch.
+    HostSwitch,
+    /// The listener is bound to an address that is not loopback.
+    RemoteBind,
+    /// `permission.unattended` answers an ask nobody answered.
+    UnattendedPermission,
+    /// `question.unattended` dismisses a question nobody answered.
+    UnattendedQuestion,
+    /// `hook.webhook` delivers events to another machine.
+    Webhook,
+    /// Triggers are enabled and a `webhook` or `watch` trigger exists, in
+    /// the host config or stored: runs start with nobody asking.
+    OutsideTrigger,
+}
+
+impl PostureReason {
+    /// The name the log line and `GET /server/posture` give it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PostureReason::Bearer => "bearer-auth",
+            PostureReason::HostSwitch => "trust-project-restricted",
+            PostureReason::RemoteBind => "non-loopback-bind",
+            PostureReason::UnattendedPermission => "permission-unattended",
+            PostureReason::UnattendedQuestion => "question-unattended",
+            PostureReason::Webhook => "hook-webhook",
+            PostureReason::OutsideTrigger => "webhook-or-watch-trigger",
+        }
+    }
+}
+
+/// Whether `hostname` — what a listener is asked to bind — is a loopback
+/// address: `localhost`, or an IP address in `127.0.0.0/8` or `::1`. Any
+/// other name or address can be reached from another machine.
+pub fn is_loopback_bind(hostname: &str) -> bool {
+    let host = hostname
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .is_ok_and(|address| address.is_loopback())
+}
+
 /// The project directories a credential narrower than `admin` may open
 /// (`server.directories`): exactly the listed ones. Unset, that is the
 /// server's working directory alone, so a `chat` token can never be pointed
@@ -120,6 +171,13 @@ pub struct ServerPolicy {
     pub hook: Option<alforria_core::config::host::HookInfo>,
     /// What the agent's shells see of the server's environment.
     pub shell_env: alforria_core::shell_env::ShellEnvPolicy,
+    /// Why this server counts as unattended or remotely reachable; empty
+    /// on a developer's own loopback server
+    /// ([`ServerPolicy::unattended_or_remote`]). Sorted, each once.
+    pub posture: Vec<PostureReason>,
+    /// Whether triggers are enabled (`triggers.enabled`, on by default):
+    /// what a stored trigger needs to count ([`ServerPolicy::observe`]).
+    pub triggers_enabled: bool,
     /// Why the host config could not be used, if it could not. A listener
     /// refuses to bind with this set ([`crate::listen_with`]): the policy
     /// in force would not be the one written down.
@@ -140,6 +198,8 @@ impl Default for ServerPolicy {
             unattended_question: None,
             hook: None,
             shell_env: alforria_core::shell_env::ShellEnvPolicy::default(),
+            posture: Vec::new(),
+            triggers_enabled: true,
             config_error: None,
         }
     }
@@ -227,21 +287,57 @@ impl ServerPolicy {
                 }
             },
         };
-        // The restricted posture — bearer auth, or the host's own switch
-        // (`server.trust.project: "restricted"`): credential-like names
-        // are denied and a child starts from an allowlist. A standalone
-        // install keeps the user's environment. In either one the
-        // variables the host's providers read their keys from are withheld
-        // (`ServerPolicy::load` adds the `{env:}` references, the server
-        // the model catalog's and each instance's).
-        let restricted = bearer.is_some()
-            || server
-                .and_then(|server| server.trust.as_ref())
-                .and_then(|trust| trust.project)
-                == Some(alforria_core::config::host::ProjectTrust::Restricted);
+        // What the host config alone says of `unattended_or_remote`; the
+        // listener and the stored triggers are added by
+        // `ServerPolicy::observe`.
+        let triggers_enabled = config
+            .triggers
+            .as_ref()
+            .and_then(|triggers| triggers.enabled)
+            .unwrap_or(true);
+        let mut posture = Vec::new();
+        if bearer.is_some() {
+            posture.push(PostureReason::Bearer);
+        }
+        if server
+            .and_then(|server| server.trust.as_ref())
+            .and_then(|trust| trust.project)
+            == Some(alforria_core::config::host::ProjectTrust::Restricted)
+        {
+            posture.push(PostureReason::HostSwitch);
+        }
+        if unattended_permission.is_some() {
+            posture.push(PostureReason::UnattendedPermission);
+        }
+        if unattended_question.is_some() {
+            posture.push(PostureReason::UnattendedQuestion);
+        }
+        if config
+            .hook
+            .as_ref()
+            .and_then(|hook| hook.webhook.as_ref())
+            .is_some_and(|webhooks| !webhooks.is_empty())
+        {
+            posture.push(PostureReason::Webhook);
+        }
+        if triggers_enabled
+            && config
+                .trigger
+                .iter()
+                .flatten()
+                .any(|(_, spec)| spec.starts_from_outside())
+        {
+            posture.push(PostureReason::OutsideTrigger);
+        }
+        // The restricted posture of the shell environment: credential-like
+        // names are denied and a child starts from an allowlist. A
+        // developer's own loopback server keeps the user's environment. In
+        // either one the variables the host's providers read their keys
+        // from are withheld (`ServerPolicy::load` adds the `{env:}`
+        // references, the server the model catalog's and each instance's).
         let mut shell_env =
             alforria_core::shell_env::ShellEnvPolicy::from_config(config.shell_env.as_ref())
-                .restricted(restricted);
+                .restricted(!posture.is_empty());
         shell_env.learn(
             alforria_core::shell_env::SOURCE_HOST_PROVIDERS,
             provider_env_names(config),
@@ -270,8 +366,63 @@ impl ServerPolicy {
                 .and_then(|upload| upload.directories.clone())
                 .unwrap_or_else(|| vec![DEFAULT_UPLOAD_DIRECTORY.to_string()]),
             shell_env,
+            posture,
+            triggers_enabled,
             config_error: None,
         })
+    }
+
+    /// Whether this server is unattended or can be reached from another
+    /// machine: bearer auth is configured; or the listener is bound to a
+    /// non-loopback address; or an unattended answer
+    /// (`permission.unattended`, `question.unattended`), a webhook
+    /// (`hook.webhook`) or a `webhook` / `watch` trigger is configured; or
+    /// the host said so itself (`server.trust.project: "restricted"`).
+    ///
+    /// It decides ONE thing: the posture of the shell environment
+    /// (`alforria_core::shell_env`) — nobody is at such a server's terminal
+    /// to own the credentials in its environment. What a project's config
+    /// may set, what `{env:}` and `{file:}` it may read and what a token
+    /// may do are decided elsewhere and more narrowly
+    /// (`alforria_core::config::HostMode::restricted`, the bearer scopes),
+    /// and do not follow this.
+    pub fn unattended_or_remote(&self) -> bool {
+        !self.posture.is_empty()
+    }
+
+    /// Add what only the running server knows to
+    /// [`ServerPolicy::unattended_or_remote`]: the address the listener
+    /// binds (`hostname`) and whether a stored trigger is started from
+    /// outside (`outside_trigger`, counted while triggers are enabled).
+    /// The shell environment's posture follows.
+    pub fn observe(&mut self, hostname: &str, outside_trigger: bool) {
+        if !is_loopback_bind(hostname) {
+            self.posture.push(PostureReason::RemoteBind);
+        }
+        if outside_trigger && self.triggers_enabled {
+            self.posture.push(PostureReason::OutsideTrigger);
+        }
+        self.posture.sort();
+        self.posture.dedup();
+        self.shell_env = std::mem::take(&mut self.shell_env).restricted(!self.posture.is_empty());
+    }
+
+    /// One line for the log: the shell environment's posture and why.
+    pub fn posture_summary(&self) -> String {
+        if self.posture.is_empty() {
+            "shell environment: standalone (a loopback server with no unattended feature): \
+             the agent's processes inherit the environment except alforria's own secrets and \
+             provider keys"
+                .to_string()
+        } else {
+            let reasons: Vec<&str> = self.posture.iter().map(|reason| reason.as_str()).collect();
+            format!(
+                "shell environment: restricted ({}): the agent's processes start from the \
+                 allowlist and credential-like variables are withheld; see shell_env in the \
+                 host config",
+                reasons.join(", ")
+            )
+        }
     }
 
     /// Load the host config under `paths` and resolve the policy. A config
@@ -464,6 +615,212 @@ mod tests {
         )
         .unwrap();
         assert!(policy.shell_env.is_restricted());
+    }
+
+    fn observed(config_value: serde_json::Value, hostname: &str, stored: bool) -> ServerPolicy {
+        let mut policy =
+            ServerPolicy::from_config_in(&config(config_value), Path::new("/home/test")).unwrap();
+        policy.observe(hostname, stored);
+        policy
+    }
+
+    /// `unattended_or_remote`, one trigger of it at a time: each puts the
+    /// shell environment in the restricted posture, and a developer's own
+    /// loopback server with none of them stays standalone.
+    #[test]
+    fn each_sign_of_an_unattended_or_remote_server_restricts_the_shell_environment() {
+        use PostureReason::*;
+        let webhook_trigger = serde_json::json!({ "trigger": {
+            "inbox": { "on": { "webhook": true }, "prompt": "Triage" }
+        } });
+        let watch_trigger = serde_json::json!({ "trigger": {
+            "drop": { "on": { "watch": { "path": "inbox" } }, "prompt": "Triage" }
+        } });
+        let cases: Vec<(&str, serde_json::Value, &str, bool, Vec<PostureReason>)> = vec![
+            (
+                "bearer auth",
+                serde_json::json!({ "server": { "auth": { "bearer": { "tokens_sha256": [DIGEST] } } } }),
+                "127.0.0.1",
+                false,
+                vec![Bearer],
+            ),
+            (
+                "the host switch",
+                serde_json::json!({ "server": { "trust": { "project": "restricted" } } }),
+                "127.0.0.1",
+                false,
+                vec![HostSwitch],
+            ),
+            (
+                "every interface",
+                serde_json::json!({}),
+                "0.0.0.0",
+                false,
+                vec![RemoteBind],
+            ),
+            (
+                "a LAN address",
+                serde_json::json!({}),
+                "192.168.1.20",
+                false,
+                vec![RemoteBind],
+            ),
+            (
+                "a host name",
+                serde_json::json!({}),
+                "agent.example.org",
+                false,
+                vec![RemoteBind],
+            ),
+            (
+                "every IPv6 interface",
+                serde_json::json!({}),
+                "::",
+                false,
+                vec![RemoteBind],
+            ),
+            (
+                "an unattended permission answer",
+                serde_json::json!({ "permission": { "unattended": { "timeout": "5m", "on_timeout": "deny" } } }),
+                "127.0.0.1",
+                false,
+                vec![UnattendedPermission],
+            ),
+            (
+                "an unattended question answer",
+                serde_json::json!({ "question": { "unattended": { "timeout": "5m", "on_timeout": "reject" } } }),
+                "127.0.0.1",
+                false,
+                vec![UnattendedQuestion],
+            ),
+            (
+                "a webhook",
+                serde_json::json!({ "hook": { "webhook": [
+                    { "url": "https://hooks.example.org/a", "events": ["session.idle"] }
+                ] } }),
+                "127.0.0.1",
+                false,
+                vec![Webhook],
+            ),
+            (
+                "a configured webhook trigger",
+                webhook_trigger.clone(),
+                "127.0.0.1",
+                false,
+                vec![OutsideTrigger],
+            ),
+            (
+                "a configured watch trigger",
+                watch_trigger,
+                "127.0.0.1",
+                false,
+                vec![OutsideTrigger],
+            ),
+            (
+                "a stored webhook or watch trigger",
+                serde_json::json!({}),
+                "127.0.0.1",
+                true,
+                vec![OutsideTrigger],
+            ),
+            (
+                "several at once",
+                serde_json::json!({
+                    "server": { "auth": { "bearer": { "tokens_sha256": [DIGEST] } } },
+                    "trigger": { "inbox": { "on": { "webhook": true }, "prompt": "Triage" } }
+                }),
+                "0.0.0.0",
+                true,
+                vec![Bearer, RemoteBind, OutsideTrigger],
+            ),
+        ];
+        for (what, config_value, hostname, stored, reasons) in cases {
+            let policy = observed(config_value, hostname, stored);
+            assert_eq!(policy.posture, reasons, "{what}");
+            assert!(policy.unattended_or_remote(), "{what}");
+            assert!(policy.shell_env.is_restricted(), "{what}");
+            assert_eq!(
+                names(&policy.shell_env.shell_env_from(server_env())),
+                ["HOME", "PATH", "TERM"],
+                "{what}"
+            );
+            assert!(policy.posture_summary().contains("restricted"), "{what}");
+            for reason in &policy.posture {
+                assert!(policy.posture_summary().contains(reason.as_str()), "{what}");
+            }
+        }
+
+        // None of them: a developer's own server.
+        let local: Vec<(&str, serde_json::Value, &str, bool)> = vec![
+            ("the default", serde_json::json!({}), "127.0.0.1", false),
+            ("localhost", serde_json::json!({}), "localhost", false),
+            ("IPv6 loopback", serde_json::json!({}), "::1", false),
+            (
+                "bracketed IPv6 loopback",
+                serde_json::json!({}),
+                "[::1]",
+                false,
+            ),
+            (
+                "asks that wait",
+                serde_json::json!({
+                    "permission": { "unattended": { "on_timeout": "wait" } },
+                    "question": { "unattended": { "on_timeout": "wait" } }
+                }),
+                "127.0.0.1",
+                false,
+            ),
+            (
+                "a clock trigger",
+                serde_json::json!({ "trigger": {
+                    "nightly": { "on": { "cron": "0 3 * * *" }, "prompt": "Tidy up" }
+                } }),
+                "127.0.0.1",
+                false,
+            ),
+            (
+                "a disabled webhook trigger",
+                serde_json::json!({ "trigger": {
+                    "inbox": { "on": { "webhook": true }, "prompt": "Triage", "enabled": false }
+                } }),
+                "127.0.0.1",
+                false,
+            ),
+            (
+                "triggers turned off",
+                {
+                    let mut value = webhook_trigger.clone();
+                    value["triggers"] = serde_json::json!({ "enabled": false });
+                    value
+                },
+                "127.0.0.1",
+                true,
+            ),
+            (
+                "no webhooks listed",
+                serde_json::json!({ "hook": { "webhook": [] } }),
+                "127.0.0.1",
+                false,
+            ),
+            (
+                "project config trusted in full",
+                serde_json::json!({ "server": { "trust": { "project": "full" } } }),
+                "127.0.0.1",
+                false,
+            ),
+        ];
+        for (what, config_value, hostname, stored) in local {
+            let policy = observed(config_value, hostname, stored);
+            assert_eq!(policy.posture, [], "{what}");
+            assert!(!policy.unattended_or_remote(), "{what}");
+            assert!(!policy.shell_env.is_restricted(), "{what}");
+            assert!(
+                names(&policy.shell_env.shell_env_from(server_env()))
+                    .contains(&"GITHUB_TOKEN".to_string()),
+                "{what}"
+            );
+            assert!(policy.posture_summary().contains("standalone"), "{what}");
+        }
     }
 
     /// With bearer auth the shell — and a helper — starts from the

@@ -61,6 +61,23 @@ pub struct TriggerState {
     pub time_seen: u64,
 }
 
+/// Whether any stored trigger, of any directory, is started from outside
+/// the server: a `webhook` or a `watch` trigger that is not disabled. Part
+/// of what makes a server unattended (`ServerPolicy::unattended_or_remote`
+/// in the server crate). A row this build cannot read does not count.
+pub fn any_outside_trigger(storage: &Storage) -> Result<bool, CoreError> {
+    storage.with_connection(|conn| {
+        let mut stmt = conn.prepare("SELECT spec FROM \"trigger\"")?;
+        let specs = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(specs
+            .iter()
+            .filter_map(|spec| serde_json::from_str::<StoredSpec>(spec).ok())
+            .any(|stored| stored.spec.starts_from_outside()))
+    })
+}
+
 /// One directory's slice of the trigger tables.
 #[derive(Clone)]
 pub struct TriggerStore {
