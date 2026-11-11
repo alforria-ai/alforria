@@ -40,17 +40,17 @@
 //! which has a property test below:
 //!
 //! 1. **the wrong path is judged** — the guard's idea of where a write
-//!    lands differs from the kernel's. The guard does not try to be clever
-//!    about it: a target with a `..` in it, a final component that is a
-//!    symlink, and a dangling symlink on the way are *refused* outright in
-//!    a guarded session ([`landing`]). What is left resolves the same way
-//!    for the guard and the kernel — links in existing directories followed
-//!    by `canonicalize`, the rest created as spelled. (This is the
-//!    conservative version. Judging and writing through one directory
-//!    handle — `openat` the parent, create the last component with
-//!    `O_NOFOLLOW` — would also close the window in which a link is swapped
-//!    between the check and the write; it is not done here, and a session
-//!    that can swap links has `bash` and needs no such trick.)
+//!    lands differs from the kernel's. There is one resolver,
+//!    [`resolve_path`], and it resolves as the kernel does: component by
+//!    component, links read where they stand, `..` applied to the resolved
+//!    path and never to the spelling, an error instead of a guess. It is
+//!    tested against the operating system. On top of it a guarded session
+//!    is refused a final component that is a symlink and a path through a
+//!    dangling one ([`landing`]): the write is not yet made through the
+//!    same directory handle (`openat` the parent, create the last component
+//!    with `O_NOFOLLOW`), which is what would also close the window in
+//!    which a link is swapped between the check and the write. A session
+//!    that can swap links has `bash` and needs no such trick.
 //! 2. **the protected set is incomplete** — a place a loader reads is not
 //!    in it. The set is built from the loaders' own answers, a loader name
 //!    is refused anywhere, and for the config's `instructions` — globs,
@@ -67,19 +67,117 @@ use std::path::{Path, PathBuf};
 
 use crate::project_files::is_loader_path;
 
-/// Where `path` really is: made absolute and normalised, the deepest
-/// existing ancestor canonicalised (every symlink on the way followed) and
-/// the part that does not exist yet appended. Both sides of every
-/// comparison in this module go through here, so a symlinked home, a
-/// location that has not been created yet and `..` are all compared like
-/// with like.
-pub fn resolve(path: &Path) -> PathBuf {
+/// Where a path leads, resolved the way the kernel resolves it — **the one
+/// resolver** of this crate's guard, confinement and loader-match code.
+///
+/// The path is walked component by component from the root. A component
+/// that exists and is a symlink is read and the walk continues from its
+/// target (at most [`MAX_LINKS`] of them, the kernel's `ELOOP`). A `..` is
+/// applied to the *resolved* path so far, never to the spelling:
+/// `link/../x` with `link -> /elsewhere/dir` is `/elsewhere/x`, not `x`.
+/// Once a component does not exist nothing further can be a link: the rest
+/// is appended as spelled — and a `..` there is an error, since what it
+/// would be relative to cannot be known. Any I/O error other than "not
+/// found" is an error too. Callers that decide something treat an error as
+/// the protected answer.
+pub fn resolve_path(path: &Path) -> std::io::Result<PathBuf> {
+    use std::collections::VecDeque;
+    use std::ffi::OsString;
+    use std::path::Component;
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        std::env::current_dir().unwrap_or_default().join(path)
+        std::env::current_dir()?.join(path)
     };
-    crate::tool::external_directory::real_path(&absolute)
+    let invalid = |message: &str| std::io::Error::new(std::io::ErrorKind::InvalidInput, message);
+    let mut out = PathBuf::new();
+    let mut pending: VecDeque<OsString> = VecDeque::new();
+    for part in absolute.components() {
+        match part {
+            Component::Prefix(_) | Component::RootDir => out.push(part.as_os_str()),
+            other => pending.push_back(other.as_os_str().to_os_string()),
+        }
+    }
+    let root = out.clone();
+    let (mut links, mut missing) = (0usize, false);
+    while let Some(part) = pending.pop_front() {
+        if part == "." {
+            continue;
+        }
+        if part == ".." {
+            if missing {
+                return Err(invalid(
+                    "a `..` after a component that does not exist cannot be resolved",
+                ));
+            }
+            // At the root `..` stays at the root, as for the kernel.
+            if out != root {
+                out.pop();
+            }
+            continue;
+        }
+        let next = out.join(&part);
+        if missing {
+            out = next;
+            continue;
+        }
+        match std::fs::symlink_metadata(&next) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                links += 1;
+                if links > MAX_LINKS {
+                    return Err(invalid("too many levels of symbolic links"));
+                }
+                let target = std::fs::read_link(&next)?;
+                // An absolute target starts over from the root; a relative
+                // one continues from the directory holding the link.
+                let mut front: Vec<OsString> = Vec::new();
+                for piece in target.components() {
+                    match piece {
+                        Component::Prefix(_) | Component::RootDir => {
+                            out = PathBuf::from(piece.as_os_str());
+                            if !target.has_root() {
+                                continue;
+                            }
+                            out = root.clone();
+                        }
+                        other => front.push(other.as_os_str().to_os_string()),
+                    }
+                }
+                for piece in front.into_iter().rev() {
+                    pending.push_front(piece);
+                }
+            }
+            Ok(meta) => {
+                if !meta.is_dir() && !pending.is_empty() {
+                    return Err(invalid("a component of the path is not a directory"));
+                }
+                out = next;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing = true;
+                out = next;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(out)
+}
+
+/// The kernel's limit on symlinks followed in one resolution.
+pub const MAX_LINKS: usize = 40;
+
+/// [`resolve_path`] for building a protected set, where an answer is
+/// needed for every location: one that cannot be resolved is kept as it is
+/// spelled, which still protects that spelling. (A decision about a write
+/// never comes through here: [`landing`] refuses on an error.)
+pub fn resolve(path: &Path) -> PathBuf {
+    resolve_path(path).unwrap_or_else(|_| {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir().unwrap_or_default().join(path)
+        }
+    })
 }
 
 /// Component-wise comparison key: case-folded where the filesystem is
@@ -116,61 +214,40 @@ pub struct Refusal {
     pub landing: Option<PathBuf>,
 }
 
-/// Where a write to `target` lands — the one resolver for that question —
-/// or why it cannot be said. `target` is taken as spelled, never normalised:
-/// a `..` component, a final component that is a symlink, and a dangling
-/// symlink where the path stops existing are refused; for anything else the
-/// deepest existing directory resolves as the kernel resolves it and the
-/// remainder is created as spelled.
+/// Where a write to `target` lands, or why it cannot be said:
+/// [`resolve_path`] — the kernel's own reading, `..` and links included —
+/// with two shapes refused rather than followed, because the write is not
+/// (yet) made through the same directory handle: a final component that is
+/// a symlink, and a path that goes through a dangling one. An error from
+/// the resolver is a refusal.
 pub fn landing(target: &Path) -> Result<PathBuf, String> {
+    let landing = resolve_path(target)
+        .map_err(|error| format!("{} cannot be resolved ({error})", target.display()))?;
     let absolute = if target.is_absolute() {
         target.to_path_buf()
     } else {
         std::env::current_dir().unwrap_or_default().join(target)
     };
-    if absolute
-        .components()
-        .any(|part| matches!(part, std::path::Component::ParentDir))
-    {
-        return Err(format!(
-            "{} has a `..` in it: where it leads cannot be judged safely",
-            target.display()
-        ));
-    }
-    // (An error here is "nothing by that name yet", which is not a link;
-    // the walk below then says whether something on the way is.)
+    // An error here is "nothing by that name yet", which is not a link.
     if std::fs::symlink_metadata(&absolute).is_ok_and(|meta| meta.file_type().is_symlink()) {
         return Err(format!("{} is a symbolic link", target.display()));
     }
-    // The deepest ancestor that exists, and what is yet to be created.
-    let mut existing = absolute.as_path();
-    let mut rest: Vec<&std::ffi::OsStr> = Vec::new();
-    // `canonicalize` is used here on purpose and its failure is never the
-    // permissive answer: it either steps up to the parent (the component
-    // does not exist) or refuses (it exists and does not resolve).
-    let real = loop {
-        match std::fs::canonicalize(existing) {
-            Ok(real) => break real,
-            Err(_) => {
-                // Not there — or a link to nowhere, which a write through
-                // it would follow.
-                if std::fs::symlink_metadata(existing).is_ok() {
-                    return Err(format!(
-                        "{} goes through a dangling symbolic link",
-                        target.display()
-                    ));
-                }
-                match (existing.parent(), existing.file_name()) {
-                    (Some(parent), Some(name)) => {
-                        rest.push(name);
-                        existing = parent;
-                    }
-                    _ => return Err(format!("{} cannot be resolved", target.display())),
-                }
-            }
+    // A link to nowhere on the way: the spelled path has a component that
+    // exists (as a link) below which nothing resolves. The resolver has
+    // followed it faithfully; a guarded session does not get to use it.
+    let mut prefix = PathBuf::new();
+    for part in absolute.components() {
+        prefix.push(part.as_os_str());
+        let is_link =
+            std::fs::symlink_metadata(&prefix).is_ok_and(|meta| meta.file_type().is_symlink());
+        if is_link && std::fs::metadata(&prefix).is_err() {
+            return Err(format!(
+                "{} goes through a dangling symbolic link",
+                target.display()
+            ));
         }
-    };
-    Ok(rest.iter().rev().fold(real, |path, part| path.join(part)))
+    }
+    Ok(landing)
 }
 
 /// See the module docs.
@@ -801,8 +878,6 @@ mod tests {
         );
         // The shapes by name.
         for (target, why) in [
-            ("to-elsewhere/../.opencode/x.md", ".."),
-            ("src/../AGENTS.md", ".."),
             ("to-agents", "symbolic link"),
             ("dangling", "symbolic link"),
             ("dangling/x.md", "dangling"),
@@ -811,6 +886,30 @@ mod tests {
             assert!(refusal.reason.contains(why), "{target}: {}", refusal.reason);
             assert_eq!(refusal.class, Class::Host, "{target}: not liftable");
         }
+        // `..` is applied to where the path has got to, not to its
+        // spelling: `to-elsewhere/..` is `elsewhere`, whose `.opencode` is
+        // a loader directory; and a `..` that stays inside is just a path.
+        let through = t
+            .protected
+            .guards(&project.join("to-elsewhere/../.opencode/x.md"))
+            .expect("refused");
+        assert_eq!(
+            through.landing,
+            Some(t.root.join("elsewhere/.opencode/x.md"))
+        );
+        assert!(t
+            .protected
+            .guards(&project.join("src/../AGENTS.md"))
+            .is_some());
+        assert_eq!(
+            t.protected.guards(&project.join("src/../docs/new.txt")),
+            None
+        );
+        // A `..` after something that does not exist cannot be resolved.
+        assert!(t
+            .protected
+            .guards(&project.join("no-such-dir/../x.txt"))
+            .is_some_and(|refusal| refusal.class == Class::Host));
         // A link to an ordinary directory is followed, like the kernel does.
         assert_eq!(t.protected.guards(&project.join("to-src/new.rs")), None);
         assert!(t
@@ -821,6 +920,143 @@ mod tests {
             .protected
             .guards(&project.join("to-data/auth.json"))
             .is_some());
+    }
+
+    /// The resolver against the operating system. Over a tree with
+    /// symlinks — to directories, to files, chained, relative with `..`,
+    /// absolute, dangling, looping — and generated spellings with `.`,
+    /// `..`, repeated slashes and links in every position: when the target
+    /// exists, `resolve_path` is `fs::canonicalize`; when its tail does
+    /// not, the tail is created through the spelling and the file is found
+    /// exactly where `resolve_path` said it would land.
+    #[cfg(unix)]
+    #[test]
+    fn the_resolver_agrees_with_the_kernel() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        for sub in ["a/b/c", "a/d", "e/f", "g"] {
+            std::fs::create_dir_all(root.join(sub)).unwrap();
+        }
+        std::fs::write(root.join("a/b/file.txt"), "x").unwrap();
+        std::fs::write(root.join("e/other.txt"), "x").unwrap();
+        symlink(root.join("e/f"), root.join("a/abs-link")).unwrap();
+        symlink("../e", root.join("a/rel-link")).unwrap();
+        symlink("b/c", root.join("a/down-link")).unwrap();
+        symlink("rel-link", root.join("a/chain")).unwrap();
+        symlink("b/file.txt", root.join("a/file-link")).unwrap();
+        symlink(root.join("nowhere/at/all"), root.join("a/dangling")).unwrap();
+        symlink("missing-sibling", root.join("e/dangling-rel")).unwrap();
+        symlink("loop-b", root.join("g/loop-a")).unwrap();
+        symlink("loop-a", root.join("g/loop-b")).unwrap();
+        symlink("..", root.join("a/b/up")).unwrap();
+
+        let parts = [
+            "a",
+            "b",
+            "c",
+            "d",
+            "e",
+            "f",
+            "g",
+            "abs-link",
+            "rel-link",
+            "down-link",
+            "chain",
+            "file-link",
+            "dangling",
+            "dangling-rel",
+            "loop-a",
+            "up",
+            "file.txt",
+            "other.txt",
+            "..",
+            "..",
+            ".",
+            "",
+            "new",
+            "fresh.txt",
+        ];
+        let mut seed = 0x2545f4914f6cdd1du64;
+        let mut next = move |bound: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % bound as u64) as usize
+        };
+        let (mut existing, mut created, mut refused) = (0, 0, 0);
+        for _ in 0..6000 {
+            let mut spelling = root.to_string_lossy().into_owned();
+            for _ in 0..(1 + next(6)) {
+                spelling.push('/');
+                spelling.push_str(parts[next(parts.len())]);
+            }
+            let path = Path::new(&spelling);
+            match std::fs::canonicalize(path) {
+                Ok(real) => {
+                    existing += 1;
+                    assert_eq!(resolve_path(path).ok(), Some(real), "{spelling}");
+                }
+                Err(_) => {
+                    let Ok(resolved) = resolve_path(path) else {
+                        // Refused: a loop, a file used as a directory, a
+                        // `..` after something that does not exist.
+                        refused += 1;
+                        continue;
+                    };
+                    // Stay inside the tree (a `..` chain can leave it).
+                    if !resolved.starts_with(&root) || resolved.exists() {
+                        continue;
+                    }
+                    // Create the tail through the spelling, as a tool does.
+                    let made = path
+                        .parent()
+                        .is_some_and(|parent| std::fs::create_dir_all(parent).is_ok())
+                        && std::fs::File::create(path).is_ok();
+                    if !made {
+                        continue;
+                    }
+                    created += 1;
+                    assert!(
+                        resolved.is_file(),
+                        "{spelling} was created, but not at {}",
+                        resolved.display()
+                    );
+                    assert_eq!(
+                        std::fs::canonicalize(path).unwrap(),
+                        std::fs::canonicalize(&resolved).unwrap(),
+                        "{spelling}"
+                    );
+                    // Leave the tree as it was for the next spelling.
+                    std::fs::remove_file(&resolved).unwrap();
+                    let mut up = resolved.parent().map(Path::to_path_buf);
+                    while let Some(parent) = up {
+                        if std::fs::remove_dir(&parent).is_err() {
+                            break;
+                        }
+                        up = parent.parent().map(Path::to_path_buf);
+                    }
+                    for sub in ["a/b/c", "a/d", "e/f", "g"] {
+                        std::fs::create_dir_all(root.join(sub)).unwrap();
+                    }
+                }
+            }
+        }
+        assert!(
+            existing > 500 && created > 100 && refused > 100,
+            "existing {existing}, created {created}, refused {refused}"
+        );
+        // By name: the differential this resolver exists for.
+        assert_eq!(
+            resolve_path(&root.join("a/abs-link/../x")).unwrap(),
+            root.join("e/x")
+        );
+        assert_eq!(
+            resolve_path(&root.join("a/dangling/x")).unwrap(),
+            root.join("nowhere/at/all/x")
+        );
+        assert!(resolve_path(&root.join("a/nope/../x")).is_err());
+        assert!(resolve_path(&root.join("g/loop-a/x")).is_err());
     }
 
     /// Failure 3, the grant: looked up per write and for that path; only an
@@ -876,7 +1112,7 @@ mod tests {
         let all = guard(Policy::plain(vec![rule("edit_loader", "*", Allow)]));
         assert!(all.check(&agents).is_ok());
         assert!(all.check(&config).is_ok());
-        for target in [host_file, global, t.project.join("src/../opencode.json")] {
+        for target in [host_file, global, t.project.join("gone/../opencode.json")] {
             let error = all.check(&target).unwrap_err();
             assert!(!error.contains("edit_loader"), "{error}");
         }
