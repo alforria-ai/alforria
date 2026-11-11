@@ -800,3 +800,53 @@ Deliberate deviations from the pinned TS server:
   (open decision 1), at any depth; TS `mergeDeep` writes the `null`, so a
   setting could never be cleared. The rest of the payload is still
   validated. The web client's "Server default" model sends `null`.
+
+## Long sessions and restarts (deliberate deviations)
+
+Upstream assumes a session lasts an afternoon and a process is stopped
+politely. These hold for sessions that live for months on a machine that is
+stopped by being killed.
+
+- **A request is sized before it is sent.** TS compacts when the last
+  response's recorded tokens reach the budget (`isOverflow`), which says
+  nothing about a history no provider has counted (imported, or never
+  compacted). Here the request about to go out is estimated: recorded tokens
+  where the newest response has them, three bytes a token for what nothing
+  has counted (`overflow.rs`). `isOverflow` itself is unchanged. A model
+  with `limit.context: 0` is still "unknown" to it, but is sized against
+  `compaction.default_context` (128,000).
+- **Compaction summarises in pieces.** TS puts the whole history in one
+  summary request. Here a history that does not fit one request is folded:
+  each piece is summarised together with the summary so far, and only the
+  last request goes through the processor and is stored. A history that
+  fits is one request, byte for byte as before. A summary request refused
+  as too large is retried at half the size, down to a sixteenth.
+- **A turn reads back to the last compaction and no further**, and holds at
+  most 8 MiB of history (`HISTORY_WINDOW_BYTES`); beyond that the session
+  is compacted from the database a page at a time. With
+  `compaction.auto: false` the whole history is read, as in TS.
+- **Three compactions in a row without a model response end the turn** with
+  a `ContextOverflowError`. TS would compact again.
+- **A turn's HTTP requests are not retried below the retry policy.** The
+  native executor's two retries under each of the policy's attempts tripled
+  them. `StreamInput.retries` (unset for a turn, two for a title) is now
+  what the transport does. Not checked against the pinned `llm.ts`, which
+  is not in `fixtures/`.
+- **An image is not sent to a model without image input**; the request
+  carries a line saying one was there. A model takes images when it lists
+  the `image` input modality or sets `attachment: true`; a custom model
+  declaring neither is treated as text-only.
+- **The event log can be pruned** (`storage.retention.events`), off by
+  default. `GET /api/session/{id}/event` then starts with an `event.reset`
+  frame when the events after `after` are gone; without retention the
+  stream is as upstream's. Event ids are ULIDs, so an event's age is read
+  from its id and no schema change was needed.
+- **`GET /session/{id}/message` without `limit` is streamed** for 100
+  messages or more (chunked, uncompressed). The body is the same bytes;
+  upstream returns the whole history here, so no default limit was imposed.
+- **A restart repairs interrupted turns** (`session/recovery.rs`) and,
+  with `server.resume`, notes or resumes them. Running turns are recorded
+  in `<data>/running/`, files like `/goal`'s, not a table.
+- **`synchronous` stays `NORMAL`** (upstream's, `database.ts:27-32`) unless
+  `storage.synchronous: "full"`. In WAL mode `NORMAL` cannot corrupt the
+  database on a crash or power cut; it can lose the commits not yet synced.

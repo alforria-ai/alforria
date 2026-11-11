@@ -93,7 +93,7 @@ pre-1.0, so minor releases may include breaking changes.
   published. The stored message keeps its image for a model that can read
   it. A custom model reads images when its config lists the `image` input
   modality or sets `attachment: true`; one that declares neither is treated
-  as text-only, as upstream does.
+  as text-only, so a custom vision model must now say so.
 - Whole numbers in provider requests (`max_tokens`, `temperature`,
   `budget_tokens`, …) are written as integers, `4096` rather than `4096.0`,
   which some OpenAI-compatible servers refuse.

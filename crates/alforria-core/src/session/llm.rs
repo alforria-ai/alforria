@@ -503,7 +503,8 @@ impl LlmStreamImpl {
     fn stream_with_sender(&self, input: StreamInput) -> LlmEventStream {
         let sender = self.sender.clone();
         let request = build_request(sender.as_ref(), &input);
-        // `maxRetries: input.retries ?? 0` (llm.ts:330).
+        // The transport retries as often as the caller asked, and not at
+        // all when it did not say.
         let retries = input.retries.unwrap_or(0);
         futures::stream::once(async move {
             match sender
@@ -531,7 +532,8 @@ impl LlmStream for LlmStreamImpl {
     ) -> LlmEventStream {
         let sender = self.sender.clone();
         let request = build_request(sender.as_ref(), &input);
-        // `maxRetries: input.retries ?? 0` (llm.ts:330).
+        // The transport retries as often as the caller asked, and not at
+        // all when it did not say.
         let retries = input.retries.unwrap_or(0);
         futures::stream::once(async move {
             match sender.send_with_retries(request, cancel, retries).await {
