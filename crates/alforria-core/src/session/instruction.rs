@@ -128,6 +128,9 @@ fn glob_matcher(pattern: &str) -> Option<globset::GlobSet> {
     globset::GlobSetBuilder::new().add(glob).build().ok()
 }
 
+/// Whether `path` is below `dir` and its relative path matches. A path
+/// that is not below this spelling of `dir` is simply not matched by it;
+/// [`EntrySearch::would_read`] asks the resolved spelling as well.
 fn glob_matches(globs: &globset::GlobSet, dir: &Path, path: &Path) -> bool {
     path.strip_prefix(dir)
         .is_ok_and(|relative| globs.is_match(relative.to_string_lossy().replace('\\', "/")))
@@ -240,19 +243,26 @@ impl EntrySearch {
         }
     }
 
-    /// Whether a file at `path` would be one of [`EntrySearch::files`]:
-    /// asked of the path as given and against each directory both as the
-    /// loader spells it and resolved, since the walk follows links.
+    /// Whether a file at `path` would be one of [`EntrySearch::files`] —
+    /// now, or once it and its directories exist. Asked against each
+    /// search directory as the loader spells it and as it resolves, with
+    /// the resolver the write guard resolves its targets with
+    /// (`protect::resolve`: the deepest existing ancestor made real, the
+    /// rest appended). That resolver has no failure case, so a directory
+    /// that does not exist yet, or sits behind a link, is compared like any
+    /// other: there is no error that could read as "not one of mine".
     pub fn would_read(&self, path: &Path) -> bool {
         let EntrySearch::Glob { pattern, dirs } = self else {
             return false;
         };
+        // A pattern the matcher cannot build finds no file for the loader
+        // either (`glob_files`): nothing is read, so nothing is claimed.
         let Some(globs) = glob_matcher(pattern) else {
             return false;
         };
         dirs.iter().any(|dir| {
             glob_matches(&globs, dir, path)
-                || std::fs::canonicalize(dir).is_ok_and(|real| glob_matches(&globs, &real, path))
+                || glob_matches(&globs, &crate::protect::resolve(dir), path)
         })
     }
 }

@@ -137,12 +137,17 @@ pub fn landing(target: &Path) -> Result<PathBuf, String> {
             target.display()
         ));
     }
+    // (An error here is "nothing by that name yet", which is not a link;
+    // the walk below then says whether something on the way is.)
     if std::fs::symlink_metadata(&absolute).is_ok_and(|meta| meta.file_type().is_symlink()) {
         return Err(format!("{} is a symbolic link", target.display()));
     }
     // The deepest ancestor that exists, and what is yet to be created.
     let mut existing = absolute.as_path();
     let mut rest: Vec<&std::ffi::OsStr> = Vec::new();
+    // `canonicalize` is used here on purpose and its failure is never the
+    // permissive answer: it either steps up to the parent (the component
+    // does not exist) or refuses (it exists and does not resolve).
     let real = loop {
         match std::fs::canonicalize(existing) {
             Ok(real) => break real,
@@ -414,6 +419,8 @@ impl WriteGuard {
         let lifted = refusal.class == Class::Loader
             && refusal.landing.as_ref().is_some_and(|landing| {
                 let absolute = landing.to_string_lossy();
+                // (Not under the worktree: there is no relative spelling to
+                // look a grant up by — the stricter answer.)
                 let relative = landing
                     .strip_prefix(resolve(&self.worktree))
                     .map(|path| path.to_string_lossy().into_owned());
@@ -579,6 +586,7 @@ mod tests {
             "conf/*/policy.md",
             "~/global-rules/**/*.md",
             "~/single.md",
+            "~/fresh/*.md",
             "plain/file.md",
         ];
         let t = tree(serde_json::json!({ "instructions": entries }));
@@ -643,6 +651,39 @@ mod tests {
             if !read.contains(file) {
                 assert_eq!(t.protected.guards(file), None, "{}", file.display());
             }
+        }
+        // A search directory that does not exist when the guard is asked:
+        // the write that would create it and a matching file is refused.
+        assert!(!project.join("conf/brand-new").exists());
+        assert!(t
+            .protected
+            .guards(&project.join("conf/brand-new/policy.md"))
+            .is_some());
+        // (An absolute or `~/` entry is matched by its last component in
+        // its own directory only — the loader's reading, `**` in the
+        // directory part included — so that is all the guard claims.)
+        assert!(!home.join("fresh").exists());
+        assert!(t.protected.guards(&home.join("fresh/x.md")).is_some());
+        assert_eq!(t.protected.guards(&home.join("fresh/x.txt")), None);
+        // A search directory behind a symlink: the landing is the real
+        // path, and it is refused there too.
+        #[cfg(unix)]
+        {
+            std::fs::create_dir_all(t.root.join("real-rules")).unwrap();
+            std::fs::remove_dir_all(project.join("rules")).unwrap();
+            std::os::unix::fs::symlink(t.root.join("real-rules"), project.join("rules")).unwrap();
+            assert!(t
+                .protected
+                .guards(&project.join("rules/security.txt"))
+                .is_some());
+            assert!(t
+                .protected
+                .guards(&t.root.join("real-rules/style.txt"))
+                .is_some());
+            assert_eq!(
+                t.protected.guards(&t.root.join("real-rules/other.txt")),
+                None
+            );
         }
         // Files that do not exist yet but would be read once written.
         assert!(t
