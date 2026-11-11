@@ -744,14 +744,8 @@ fn instance_for_directory(
         host_config: Some(host_config),
         // What a restricted or outside-input session's tools may not
         // write: everything the loaders consult for this instance.
-        protected: Some(Arc::new(alforria_core::protect::Protected::for_instance(
-            &paths,
-            &alforria_core::ConfigLoader::new().managed_dir(&params),
-            &alforria_core::ConfigLoader::new().search_dirs(&params),
-            &params.flags,
-            &config,
-            directory,
-            &worktree,
+        protected: Some(Arc::new(alforria_core::protect::Protected::for_loaded(
+            &params, &config, &worktree,
         ))),
     };
     // M7.2: the background-job service backs the run-state cancel seam.

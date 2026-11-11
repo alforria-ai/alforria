@@ -443,6 +443,30 @@ impl Protected {
         out
     }
 
+    /// [`Protected::for_instance`] for an instance whose config was loaded
+    /// with `params`: the one constructor every entry point that boots an
+    /// instance uses — the server's instance factory and the CLI's one-shot
+    /// instance (`alforria run`) alike — so the set is the same wherever a
+    /// guarded session runs. The managed directory, the search directories
+    /// and the flags are the config loader's own answers for those
+    /// parameters.
+    pub fn for_loaded(
+        params: &crate::LoadParams,
+        config: &crate::config::schema::Config,
+        worktree: &Path,
+    ) -> Protected {
+        let loader = crate::ConfigLoader::new();
+        Protected::for_instance(
+            &params.paths,
+            &loader.managed_dir(params),
+            &loader.search_dirs(params),
+            &params.flags,
+            config,
+            &params.directory,
+            worktree,
+        )
+    }
+
     /// Every protected location, host and loader.
     pub fn locations(&self) -> Vec<(String, PathBuf)> {
         self.host.iter().chain(&self.loader).cloned().collect()

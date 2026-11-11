@@ -434,7 +434,9 @@ pre-1.0, so minor releases may include breaking changes.
   was judged, through its directory's handle with no link followed, so a
   rename or link swap between the check and the write cannot redirect it
   (Unix; what the guard does not cover is listed in
-  `docs/unattended-server.md`).
+  `docs/unattended-server.md`). The guard is the same wherever such a
+  session runs: `alforria run --session` on one protects the same resolved
+  locations as the server.
 - When the global config does not load, a project's capability-bearing keys
   are not applied until it does (the load itself still degrades to defaults,
   as before).

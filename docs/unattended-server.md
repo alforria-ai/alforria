@@ -760,7 +760,10 @@ which of the three it is, or it does not compile.
   `"allow"` for all of them) — a grant only a project wrote counts for
   nothing, and no rule lifts a host location (the data, state, cache, global
   and managed config directories, the binary's directory). The operator's
-  own sessions are not guarded.
+  own sessions are not guarded. The guard goes with the session, not with
+  the server: a restricted or outside-started session continued from the
+  command line (`alforria run --session`) is held to the same set, built by
+  the same constructor (`Protected::for_loaded`).
 
   **This is not the control.** A session that may run `bash` writes any
   file the server's user can, and the guard does not see it; session
