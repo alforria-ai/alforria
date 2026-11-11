@@ -675,9 +675,12 @@ pub async fn create_user_message(
     //
     // What binds this turn: the caller of the request, and the session's
     // own restriction — which is what binds a turn nobody is requesting.
-    let bounds = input
+    let session_restricted = deps.sessions.is_restricted(&input.session_id)?;
+    input
         .caller
-        .bounds(deps.sessions.is_restricted(&input.session_id)?);
+        .may_act_on(session_restricted)
+        .map_err(|message| PromptError::Forbidden { message })?;
+    let bounds = input.caller.bounds(session_restricted);
     let assigned;
     let input = if bounds.restricted && bounds.from_request {
         assigned = without_caller_ids(input);

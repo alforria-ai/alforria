@@ -249,10 +249,8 @@ impl Rejection {
                 .into_response()
             }
             Rejection::Load(err) => err.into_response(),
-            Rejection::Forbidden(directory) => crate::error::ApiError::Forbidden {
-                message: format!(
-                    "this token may not open {directory}: it is outside server.directories"
-                ),
+            Rejection::Forbidden(what) => crate::error::ApiError::Forbidden {
+                message: format!("this token may not open {what}"),
             }
             .into_response(),
         }
@@ -374,7 +372,9 @@ impl<S> LocationService<S> {
             .get::<crate::bearer::Principal>()
             .is_some_and(|principal| principal.restricted());
         if restricted && !self.ctx.policy.directories.allows(Path::new(directory)) {
-            return Err(Rejection::Forbidden(directory.to_string()));
+            return Err(Rejection::Forbidden(format!(
+                "{directory}: it is outside server.directories"
+            )));
         }
         self.ctx
             .instances
@@ -419,6 +419,34 @@ impl<S> LocationService<S> {
         if let Some(id) = &workspace_id {
             if env_workspace_id.is_none() {
                 return Err(Rejection::MissingWorkspace(id.clone()));
+            }
+        }
+
+        // alforria extension: a credential below `admin` acts only in
+        // restricted sessions — its own kind. It may read an operator's
+        // session and fork it (the fork is restricted); anything else there
+        // could schedule turns that run with the operator's rights. The
+        // engine refuses those turns itself; this refuses the request.
+        if let Some(session) = &session {
+            let restricted_caller = req
+                .extensions()
+                .get::<crate::bearer::Principal>()
+                .is_some_and(|principal| principal.restricted());
+            let reads = matches!(*req.method(), Method::GET | Method::HEAD);
+            let forks = uri.path().ends_with("/fork");
+            if restricted_caller
+                && !reads
+                && !forks
+                && !self
+                    .ctx
+                    .sessions
+                    .is_restricted(&session.id)
+                    .unwrap_or(false)
+            {
+                return Err(Rejection::Forbidden(format!(
+                    "session {}: it belongs to the operator, and this token can read or fork it but not act in it",
+                    session.id
+                )));
             }
         }
 

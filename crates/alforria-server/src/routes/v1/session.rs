@@ -858,6 +858,7 @@ pub async fn update(
 pub async fn fork(
     State(ctx): State<Arc<ServerContext>>,
     axum::Extension(location): axum::Extension<LocationContext>,
+    principal: Option<axum::Extension<crate::bearer::Principal>>,
     Path(session_id): Path<String>,
     body: Bytes,
 ) -> Result<Response, ServerError> {
@@ -882,7 +883,12 @@ pub async fn fork(
     let info = location
         .services
         .sessions
-        .fork(&session, &session_id, payload.message_id.as_deref())
+        .fork_as(
+            &session,
+            &session_id,
+            payload.message_id.as_deref(),
+            crate::confine::restricted(&principal),
+        )
         .map_err(session_error)?;
     // Best effort: the fork exists either way.
     if let Ok(engine) = engine(&ctx, &location) {

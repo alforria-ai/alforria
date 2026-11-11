@@ -33,26 +33,28 @@ pub fn apply(conn: &mut Connection) -> Result<(), CoreError> {
         [],
     )?;
     for (id, sql) in MIGRATIONS {
-        let applied: bool = conn.query_row(
+        // Check and apply under one write lock: two processes opening the
+        // same database at once (a TUI beside `alforria web`) must not both
+        // decide the migration is theirs to run.
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let applied: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM alforria_migration WHERE id = ?1)",
             [id],
             |row| row.get(0),
         )?;
-        if applied {
-            continue;
+        if !applied {
+            tx.execute_batch(sql)?;
+            tx.execute(
+                "INSERT INTO alforria_migration (id, time_completed) VALUES (?1, ?2)",
+                rusqlite::params![
+                    id,
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|elapsed| elapsed.as_millis() as i64)
+                        .unwrap_or(0)
+                ],
+            )?;
         }
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        tx.execute_batch(sql)?;
-        tx.execute(
-            "INSERT INTO alforria_migration (id, time_completed) VALUES (?1, ?2)",
-            rusqlite::params![
-                id,
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|elapsed| elapsed.as_millis() as i64)
-                    .unwrap_or(0)
-            ],
-        )?;
         tx.commit()?;
     }
     Ok(())
@@ -98,6 +100,28 @@ mod tests {
         let mut own: Vec<String> = OWN_TABLES.iter().map(|name| name.to_string()).collect();
         own.sort();
         assert_eq!(tables, own);
+    }
+
+    /// Several processes share one database file; opening it from many at
+    /// once must not make any of them fail.
+    #[test]
+    fn concurrent_opens_do_not_race() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.sqlite");
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let mut conn = Connection::open(&path).unwrap();
+                    conn.busy_timeout(std::time::Duration::from_secs(10))
+                        .unwrap();
+                    apply(&mut conn)
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap().unwrap();
+        }
     }
 
     #[test]

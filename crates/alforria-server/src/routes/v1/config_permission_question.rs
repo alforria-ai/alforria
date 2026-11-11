@@ -119,6 +119,9 @@ pub async fn permission_reply(
     let restricted = crate::confine::restricted(&principal);
     if restricted {
         crate::confine::check_reply(&ctx, payload.reply)?;
+        if let Some(session) = crate::confine::ask_session(&ctx, &request_id) {
+            crate::confine::check_ask_session(&ctx, Some(&session))?;
+        }
     }
     let input = PermissionV1ReplyInput {
         request_id: request_id.clone(),
@@ -185,6 +188,11 @@ pub async fn question_reply(
 ) -> Result<Response, ServerError> {
     let restricted = crate::confine::restricted(&principal);
     require_param("que", &request_id)?;
+    if restricted {
+        if let Some(session) = crate::confine::ask_session(&ctx, &request_id) {
+            crate::confine::check_ask_session(&ctx, Some(&session))?;
+        }
+    }
     let payload: QuestionReplyPayload = parse_payload(&body)?;
     let mut result = location
         .services
@@ -233,6 +241,11 @@ pub async fn question_reject(
 ) -> Result<Response, ServerError> {
     let restricted = crate::confine::restricted(&principal);
     require_param("que", &request_id)?;
+    if restricted {
+        if let Some(session) = crate::confine::ask_session(&ctx, &request_id) {
+            crate::confine::check_ask_session(&ctx, Some(&session))?;
+        }
+    }
     let mut result = location.services.question.reject(&request_id);
     if matches!(result, Err(alforria_core::QuestionError::NotFound { .. })) {
         for services in ctx.instances.cached() {

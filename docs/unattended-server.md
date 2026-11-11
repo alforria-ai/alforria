@@ -270,6 +270,7 @@ What it **cannot** cause, and what stops it:
 | Grant itself permissions | `permission` on session create and update is refused (403); a `tools` map with any `true` (which becomes an allow rule) is refused |
 | Make a standing allow rule | `always` on a permission reply is refused unless `server.auth.bearer.reply_always` is `true` |
 | Run as a hidden or subagent-only agent | The agent a turn resolves to — named in the request, stored on the session, configured on the command, or the default — is checked before the turn is stored, for requests and for the engine's own turns alike. Naming one on a new session is refused outright |
+| Act in an operator's session, or borrow its rights for later turns | It acts only in restricted sessions; an operator's session it may read or fork (see "Whose session it is") |
 | Outlive its limits through the engine | The session it created is restricted for life, with its children and forks; goal rounds, subagent runs and resumes in it are bound as its requests were |
 | Skip the `task` permission ask, or start a subagent directly | `agent` and `subtask` parts are refused. An `@agent` in a template does not become an agent part for such a caller |
 | Prompt a subagent's session | A session with a parent is driven by its parent's turn; prompting it directly is refused |
@@ -283,6 +284,46 @@ Refusals are `403` with a message, except on `POST …/prompt_async`, which
 answers `204` before the engine has looked at the prompt: there the refusal
 arrives as a `session.error` event and nothing is stored or run.
 
+#### Whose session it is
+
+A caller below `admin` acts only in restricted sessions — the ones such a
+caller created, their subagent sessions and their forks. In a session the
+operator created it may **read** (messages, todo, diff, goal, children) and
+**fork**; every other request to it is refused with 403: prompts, commands
+(`/goal` and its `pause` / `resume` / `clear` included), `init`, `summarize`,
+`revert`, `abort`, rename, delete, and answering that session's permission
+asks and questions.
+
+The reason is the turns that follow. Anything started in a session can
+schedule work the engine runs later — the next goal round, a continuation, a
+subagent's result — and that work runs with the session's rights. In an
+operator's session those are the operator's. So the rule is not "track who
+caused each scheduled turn" but "a restricted caller cannot cause one there
+at all": the effective restriction of any engine turn is then the stricter
+of the session's and its causer's by construction, because the two are
+never different. The engine enforces it where turns are made
+(`Caller::may_act_on`, checked in `create_user_message` and at the top of
+`command`, before `/goal` arms anything); the routes refuse the request
+early.
+
+- **Forks** are the bridge: a fork made by a restricted caller is restricted
+  whatever its source was (`restricted = source restricted || caller
+  restricted`); the source is untouched.
+- **The other direction** is allowed and bounded: the operator may prompt a
+  restricted session, and is held to that session's restriction while doing
+  so. Its prompt does not lift anything; rounds that follow stay restricted.
+- **A goal** records who set it (`GoalState.startedBy`). Pausing, resuming
+  or clearing it is acting in the session, under the same rule; a resumed
+  goal's rounds are bound by the session, which cannot have become less
+  restricted in between.
+- **Reads across sessions.** A `chat` token can list and read every session
+  of the directories it may open, the operator's included, and receives
+  their events on `GET /event`. With one user per machine that is intended:
+  cross-session read is acceptable, cross-session privilege gain is not.
+  There is no per-token isolation between sessions today; a deployment that
+  puts several mutually untrusting users on one server needs one, and
+  should not rely on scopes for it.
+
 #### Every field a `chat` token can send
 
 | Request | Field | What the engine derives from it | Where it is judged |
@@ -290,6 +331,7 @@ arrives as a `session.error` event and nothing is stored or run.
 | any | `?directory=`, `x-opencode-directory` | the project instance | auth layer and location layer: must equal a `server.directories` entry |
 | any | `?workspace=` | a workspace | refused (auth layer) |
 | any `/session/{id}/…` | the session id | the project (the session's own directory) | location layer, same allowlist |
+| any `/session/{id}/…` except `GET` and `fork` | the session id | whose rights later engine turns run with | location layer (403 early) and core (`Caller::may_act_on`): the session must be restricted |
 | `POST /session` | `title`, `metadata` | stored text | not restricted |
 | | `parentID` | a child session | allowed; the child cannot then be prompted by this token |
 | | `agent`, `model` | stored on the session | route: a hidden or subagent-only agent is refused; core: whatever agent a later turn resolves to is judged when it runs |
@@ -312,10 +354,11 @@ arrives as a `session.error` event and nothing is stored or run.
 | | `parts[]` (files) | file reads | core, at the read |
 | | `model`, `variant`, `messageID` | as for a prompt | as for a prompt |
 | `POST …/init`, `…/summarize` | `providerID`, `modelID`, `messageID`, `auto` | a model turn | as for a prompt |
-| `POST …/fork`, `…/revert` | `messageID`, `partID` | a point in the session's own history | must belong to the session; not otherwise restricted |
-| `POST /permission/{id}/reply`, `…/permissions/{id}` | `reply` / `response` | the answer to an ask | route: `always` refused; the ask must be in an allowed project |
+| `POST …/fork` | `messageID` | a new session copied up to that point | the fork is restricted (core, `fork_as`) |
+| `POST …/revert` | `messageID`, `partID` | a point in the session's own history | restricted sessions only; must belong to the session |
+| `POST /permission/{id}/reply`, `…/permissions/{id}` | `reply` / `response` | the answer to an ask | route: `always` refused; the ask must belong to a restricted session in an allowed project |
 | | `message` | feedback text for the model | not restricted |
-| `POST /question/{id}/reply`, `/reject` | `answers` | the answer | the question must be in an allowed project |
+| `POST /question/{id}/reply`, `/reject` | `answers` | the answer | the question must belong to a restricted session in an allowed project |
 | `GET /file`, `/file/content`, `/file/raw`, `POST /file/ticket` | `path` | a file or directory read | route: inside the project, resolved |
 | `PUT /file/content` | `path` | a file write | route: inside the upload area, not a loader name |
 | `GET /find*`, `/vcs*` | `query`, `pattern`, `mode`, … | a search or diff of the project | no caller-chosen path |
@@ -334,14 +377,14 @@ the session is.
 
 | Turn source | Where its restriction comes from |
 | --- | --- |
-| `/goal` rounds after the first, and the goal reviewer's verdicts | the session. `GoalState.startedBy` records who set the goal; the first round is the caller's own request. The round cap and stall limit are unchanged |
+| `/goal` rounds after the first, and the goal reviewer's verdicts | the session. A caller below `admin` can only set, pause, resume or clear a goal in a restricted session, so the session's restriction is never weaker than the goal starter's. `GoalState.startedBy` records who set it. The round cap and stall limit are unchanged |
 | A subagent run by the task tool | the child session, which inherits from its parent when it is created. Its agent is the one the model chose under the parent's `task` permission, so the "an agent a client could pick" rule does not apply to it; everything else does |
 | A subagent's result delivered into its parent | the parent session |
 | A command's configured subtask | the session; below `admin` a command configured to run as a subagent is refused |
 | Workflow agents started by the `workflow` tool | child sessions of the session that called the tool: inherited. (Starting a workflow over HTTP is `admin`.) |
 | A fork's notice to the model | the fork, which inherits from its source |
 | Compaction, titles and summaries | side calls to the model, not turns: no agent of anyone's choosing, no tools, no files |
-| Restart resume, triggers (other branches) | must pass `Caller::Session`, and create any session with `CreateInput::restricted` set from whoever the turn is for. A session created with a `parent_id` inherits without being asked |
+| Restart resume, triggers (other branches) | must pass `Caller::Session`, and create any session with `CreateInput::restricted` set from whoever the turn is for (a trigger made by a caller below `admin` runs in a restricted session, or is refused on an unrestricted one with `Caller::may_act_on`). A session created with a `parent_id` inherits without being asked |
 
 `Caller` has no default value: every place that builds a prompt has to say
 which of the three it is, or it does not compile.

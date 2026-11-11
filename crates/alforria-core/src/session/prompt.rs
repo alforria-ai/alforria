@@ -279,6 +279,13 @@ impl SessionPrompt {
     /// `command` (prompt.ts:1361-1481).
     pub async fn command(&self, input: CommandInput) -> Result<WithParts, PromptError> {
         let deps = &self.deps;
+        // Before anything else — `/goal` arms an autonomous loop before it
+        // ever builds a prompt: a caller below `admin` runs commands in
+        // restricted sessions only (`Caller::may_act_on`).
+        input
+            .caller
+            .may_act_on(deps.services.sessions.is_restricted(&input.session_id)?)
+            .map_err(|message| PromptError::Forbidden { message })?;
         if input.command == "goal" {
             return match self.goal_command(&input).await {
                 Ok(Some(turn)) => turn,

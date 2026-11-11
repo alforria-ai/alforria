@@ -1266,6 +1266,20 @@ impl SessionStore {
         session_id: &str,
         message_id: Option<&str>,
     ) -> Result<V1SessionInfo, SessionError> {
+        self.fork_as(ctx, session_id, message_id, false)
+    }
+
+    /// [`SessionStore::fork`] on behalf of a caller that is, or is not,
+    /// below `admin` (alforria extension). The fork is restricted when
+    /// either its source or the caller forking it is: a fork never has
+    /// more rights than whoever made it.
+    pub fn fork_as(
+        &self,
+        ctx: &SessionContext,
+        session_id: &str,
+        message_id: Option<&str>,
+        caller_restricted: bool,
+    ) -> Result<V1SessionInfo, SessionError> {
         let original = self.get(session_id)?;
         let title = get_forked_title(&original.title);
         let session = self.create_next(
@@ -1276,8 +1290,7 @@ impl SessionStore {
                 workspace_id: original.workspace_id.clone(),
                 title: Some(title),
                 metadata: original.metadata.clone(),
-                // A fork of a restricted session is restricted.
-                restricted: self.is_restricted(session_id)?,
+                restricted: caller_restricted || self.is_restricted(session_id)?,
                 ..Default::default()
             },
         )?;

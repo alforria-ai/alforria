@@ -1101,6 +1101,17 @@ async fn no_entry_point_runs_an_agent_a_narrow_token_could_not_pick() {
         ("omitted", "child-of-subagent", true),
         ("omitted", "stored-hidden-agent", false),
         ("omitted", "plain", false),
+        // The "session created by" axis: the same requests against a
+        // session the operator made are refused, every one — whatever a
+        // narrow token started there would go on with the operator's
+        // rights.
+        ("field:hidden", "operators", true),
+        ("field:subagent", "operators", true),
+        ("part:agent", "operators", true),
+        ("part:subtask", "operators", true),
+        ("command:configured-subagent", "operators", true),
+        ("argument:agent-mention", "operators", true),
+        ("omitted", "operators", true),
     ];
 
     for scope in ["chat", "connector"] {
@@ -1123,13 +1134,18 @@ async fn no_entry_point_runs_an_agent_a_narrow_token_could_not_pick() {
                             Some(json!({ "agent": "ghost" })),
                         )
                         .await;
-                        body_json(response).await["id"]
+                        let id = body_json(response).await["id"]
                             .as_str()
                             .unwrap()
-                            .to_string()
+                            .to_string();
+                        // A restricted session holding an agent its token
+                        // could not have stored.
+                        f.ctx.sessions.restrict(&id).unwrap();
+                        id
                     }
+                    "operators" => create_session(&f, &f.dirs.repo, &basic()).await,
                     "child-of-subagent" => {
-                        let parent = create_session(&f, &f.dirs.repo, &basic()).await;
+                        let parent = create_session(&f, &f.dirs.repo, &token).await;
                         let response = call(
                             &f.router,
                             "POST",
@@ -1155,7 +1171,7 @@ async fn no_entry_point_runs_an_agent_a_narrow_token_could_not_pick() {
                 )
                 .await;
                 let case = format!("{scope} {route} {vector} {kind}");
-                if *route == "prompt_async" {
+                if *route == "prompt_async" && *kind != "operators" {
                     // Answers 204 before the engine decides; wait for the
                     // turn (or its refusal) to settle.
                     assert!(response.status().is_success(), "{case}");
@@ -1834,7 +1850,7 @@ async fn narrow_tokens_cannot_answer_another_projects_asks() {
     // Load the allowed project too, so the reply has somewhere to start from.
     create_session(&f, &f.dirs.repo, &chat).await;
 
-    assert_eq!(reply(&f, &id, &chat, "once").await, StatusCode::NOT_FOUND);
+    assert_eq!(reply(&f, &id, &chat, "once").await, StatusCode::FORBIDDEN);
     assert_eq!(
         pending_permission(&f, &f.dirs.other, &basic()).await,
         id,
@@ -1842,4 +1858,213 @@ async fn narrow_tokens_cannot_answer_another_projects_asks() {
     );
     // The operator's reply does cross projects, as before.
     assert_eq!(reply(&f, &id, &basic(), "once").await, StatusCode::OK);
+}
+
+/// A narrow token acts only in restricted sessions. In an operator's
+/// session anything it started — a goal above all — would go on running
+/// with the operator's rights, so it starts nothing there: it may read the
+/// session, and fork it into a restricted one of its own.
+#[tokio::test]
+async fn narrow_tokens_cannot_act_in_an_operators_session() {
+    let signer = Signer::new();
+    let f = fixture_with(
+        policy_config(&signer, false),
+        Some(PASSWORD),
+        vec![bash_ask()],
+    );
+    f.llm
+        .set_toolless(r#"{"verdict":"continue","reason":"not done","next_step":"go on"}"#);
+    let chat = bearer(&signer.token(AUDIENCE, "chat"));
+    let operators = create_session(&f, &f.dirs.repo, &basic()).await;
+    let text = json!({ "parts": [{ "type": "text", "text": "hi" }] });
+
+    // An ask waiting in the operator's session is not the token's to answer.
+    let response = call(
+        &f.router,
+        "POST",
+        &format!("/session/{operators}/prompt_async"),
+        Some(&basic()),
+        Some(text.clone()),
+    )
+    .await;
+    assert!(response.status().is_success());
+    let ask = pending_permission(&f, &f.dirs.repo, &basic()).await;
+    assert_eq!(reply(&f, &ask, &chat, "once").await, StatusCode::FORBIDDEN);
+    assert_eq!(
+        call(
+            &f.router,
+            "POST",
+            &format!("/session/{operators}/permissions/{ask}"),
+            Some(&chat),
+            Some(json!({ "response": "once" })),
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(pending_permission(&f, &f.dirs.repo, &basic()).await, ask);
+    assert_eq!(reply(&f, &ask, &basic(), "reject").await, StatusCode::OK);
+    wait_idle(&f, &operators).await;
+    let baseline = f.llm.request_count();
+
+    // Every way of acting in it is refused...
+    for (method, path, body) in [
+        ("POST", "message", text.clone()),
+        ("POST", "prompt_async", text.clone()),
+        (
+            "POST",
+            "command",
+            json!({ "command": "goal", "arguments": "take over" }),
+        ),
+        (
+            "POST",
+            "command",
+            json!({ "command": "echo", "arguments": "x" }),
+        ),
+        (
+            "POST",
+            "init",
+            json!({ "providerID": "anthropic", "modelID": "claude", "messageID": "msg_1" }),
+        ),
+        (
+            "POST",
+            "summarize",
+            json!({ "providerID": "anthropic", "modelID": "claude" }),
+        ),
+        ("POST", "revert", json!({ "messageID": "msg_1" })),
+        ("POST", "unrevert", json!({})),
+        ("POST", "abort", json!({})),
+        ("PATCH", "", json!({ "title": "mine now" })),
+        ("DELETE", "", json!({})),
+    ] {
+        let uri = if path.is_empty() {
+            format!("/session/{operators}")
+        } else {
+            format!("/session/{operators}/{path}")
+        };
+        let response = call(&f.router, method, &uri, Some(&chat), Some(body)).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {uri}");
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    assert_eq!(
+        f.llm.request_count(),
+        baseline,
+        "nothing ran in the operator's session"
+    );
+    let goal_of = |session: String, auth: String| {
+        let (router, query) = (f.router.clone(), dir_query(&f.dirs.repo));
+        async move {
+            body_json(
+                call(
+                    &router,
+                    "GET",
+                    &format!("/session/{session}/goal?{query}"),
+                    Some(&auth),
+                    None,
+                )
+                .await,
+            )
+            .await
+        }
+    };
+    let goal = goal_of(operators.clone(), basic()).await;
+    assert!(goal.is_null(), "no goal was armed: {goal}");
+    assert!(!restricted(&f, &operators).await);
+
+    // ...including through a goal the operator started: it cannot be
+    // resumed, paused or cleared by the token.
+    assert_eq!(
+        run_command(&f, &operators, &basic(), "goal", "the operator's goal").await,
+        StatusCode::OK
+    );
+    wait_idle(&f, &operators).await;
+    let operator_rounds = f.llm.request_count();
+    assert!(operator_rounds > baseline);
+    for verb in ["resume", "pause", "clear"] {
+        assert_eq!(
+            run_command(&f, &operators, &chat, "goal", verb).await,
+            StatusCode::FORBIDDEN,
+            "goal {verb}"
+        );
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    assert_eq!(
+        f.llm.request_count(),
+        operator_rounds,
+        "no round was triggered"
+    );
+    assert_eq!(
+        goal_of(operators.clone(), basic()).await["startedBy"],
+        "operator"
+    );
+
+    // Reading is allowed (one user per machine), and so is forking: the
+    // fork is restricted, and what the engine runs in it is too.
+    assert_eq!(
+        status(&f, "GET", &format!("/session/{operators}/message"), &chat).await,
+        StatusCode::OK
+    );
+    let fork = call(
+        &f.router,
+        "POST",
+        &format!("/session/{operators}/fork"),
+        Some(&chat),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(fork.status(), StatusCode::OK);
+    let fork = body_json(fork).await["id"].as_str().unwrap().to_string();
+    assert!(restricted(&f, &fork).await, "a fork made by a narrow token");
+    assert!(!restricted(&f, &operators).await, "the source is untouched");
+    wait_idle(&f, &fork).await;
+    let before = f.llm.request_count();
+    assert_eq!(
+        run_command(&f, &fork, &chat, "goal", "work in the fork").await,
+        StatusCode::OK
+    );
+    wait_idle(&f, &fork).await;
+    let ran = agents_run(&f, before);
+    assert!(ran.len() >= 3, "the fork's goal ran its rounds: {ran:?}");
+    assert!(ran.iter().all(|agent| agent == "build"), "{ran:?}");
+    assert_eq!(
+        goal_of(fork.clone(), chat.clone()).await["startedBy"],
+        "restricted"
+    );
+
+    // An operator's prompt to the restricted fork is bound like anyone's,
+    // and does not lift the restriction for what follows.
+    let response = call(
+        &f.router,
+        "POST",
+        &format!("/session/{fork}/message"),
+        Some(&basic()),
+        Some(json!({ "agent": "ghost", "parts": [{ "type": "text", "text": "hi" }] })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let response = call(
+        &f.router,
+        "POST",
+        &format!("/session/{fork}/message"),
+        Some(&basic()),
+        Some(text),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(restricted(&f, &fork).await);
+    assert_eq!(
+        run_command(&f, &fork, &basic(), "status", "").await,
+        StatusCode::FORBIDDEN,
+        "still no inline shell in the restricted fork, for anyone"
+    );
+    // A goal the operator resumes there keeps running restricted.
+    let before = f.llm.request_count();
+    assert_eq!(
+        run_command(&f, &fork, &basic(), "goal", "resume").await,
+        StatusCode::OK
+    );
+    wait_idle(&f, &fork).await;
+    let ran = agents_run(&f, before);
+    assert!(ran.iter().all(|agent| agent == "build"), "{ran:?}");
+    assert!(restricted(&f, &fork).await);
 }

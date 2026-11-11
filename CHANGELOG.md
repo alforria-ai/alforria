@@ -67,8 +67,10 @@ pre-1.0, so minor releases may include breaking changes.
   the engine on the values it resolves, not on the request as written, and
   they stay with the session: one created by such a token is restricted for
   life, with its subagent sessions and forks, so goal rounds and other turns
-  the engine starts are bound too. `DELETE /session/{id}/restriction`
-  (`admin`) lifts it. The threat model is in `docs/unattended-server.md`.
+  the engine starts are bound too. Such a token acts only in restricted
+  sessions: an operator's session it may read or fork (the fork is
+  restricted), nothing else. `DELETE /session/{id}/restriction` (`admin`)
+  lifts a restriction. The threat model is in `docs/unattended-server.md`.
 - Files for browser clients: `POST /file/ticket` mints a short-lived read
   ticket for one project file, usable as `?ticket=` on the new
   `GET /file/raw` (the file's bytes, with ranges, served sandboxed) and on

@@ -62,6 +62,27 @@ pub struct Bounds {
 }
 
 impl Caller {
+    /// Whether this caller may act on a session at all: prompt it, run a
+    /// command or a goal in it.
+    ///
+    /// A caller below `admin` acts only on restricted sessions — its own
+    /// kind. Anything it starts in a session can schedule turns the engine
+    /// runs later with the *session's* rights (goal rounds, continuations,
+    /// subagent results); in an operator's session those would be the
+    /// operator's rights. Rather than track who caused each scheduled turn,
+    /// the rule is that it cannot cause any there. (A fork is how it gets a
+    /// session of its own from an operator's: the fork is restricted.)
+    pub fn may_act_on(self, session_restricted: bool) -> Result<(), String> {
+        if self == Caller::Restricted && !session_restricted {
+            return Err(
+                "this session belongs to the operator: this token can read it or fork it, \
+                 but not act in it"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
     /// The bounds of a turn from this caller on a session that is, or is
     /// not, itself restricted.
     pub fn bounds(self, session_restricted: bool) -> Bounds {
@@ -192,6 +213,16 @@ mod tests {
         assert!(!Caller::Session.bounds(false).restricted);
         assert!(Caller::Operator.bounds(false).from_request);
         assert!(!Caller::Session.bounds(true).from_request);
+    }
+
+    #[test]
+    fn a_restricted_caller_acts_only_on_restricted_sessions() {
+        assert!(Caller::Restricted.may_act_on(true).is_ok());
+        assert!(Caller::Restricted.may_act_on(false).is_err());
+        for caller in [Caller::Operator, Caller::Session] {
+            assert!(caller.may_act_on(true).is_ok());
+            assert!(caller.may_act_on(false).is_ok());
+        }
     }
 
     #[test]

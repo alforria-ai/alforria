@@ -117,6 +117,47 @@ pub fn check_reply(
     Ok(())
 }
 
+/// A credential below `admin` answers the asks of restricted sessions
+/// only. An ask in an operator's session is the operator's turn waiting;
+/// answering it would steer that turn. An unknown session id is refused
+/// too.
+pub fn check_ask_session(
+    ctx: &crate::state::ServerContext,
+    session_id: Option<&str>,
+) -> Result<(), ServerError> {
+    let restricted = session_id
+        .map(|session_id| ctx.sessions.is_restricted(session_id).unwrap_or(false))
+        .unwrap_or(false);
+    if restricted {
+        Ok(())
+    } else {
+        Err(forbid(
+            "this request belongs to an operator's session: this token may not answer it",
+        ))
+    }
+}
+
+/// The session a pending permission ask or question belongs to, wherever
+/// it is loaded.
+pub fn ask_session(ctx: &crate::state::ServerContext, request_id: &str) -> Option<String> {
+    ctx.instances.cached().iter().find_map(|services| {
+        services
+            .permission
+            .list()
+            .into_iter()
+            .find(|request| request.id == request_id)
+            .map(|request| request.session_id)
+            .or_else(|| {
+                services
+                    .question
+                    .list()
+                    .into_iter()
+                    .find(|request| request.id == request_id)
+                    .map(|request| request.session_id)
+            })
+    })
+}
+
 /// Whether an instance belongs to a directory a credential below `admin`
 /// may open.
 pub fn instance_allowed(
