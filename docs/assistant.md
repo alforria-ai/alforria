@@ -6,7 +6,8 @@ history imported from another tool, and switches that let a product replace
 the coding-agent persona. All of it is an alforria extension: none of it
 exists in upstream opencode, the routes sit outside the frozen v1/v2 tables,
 and the tables are created by alforria's own migrations
-(`crates/alforria-core/src/storage/migrations/`).
+(`crates/alforria-core/src/storage/alforria_migration.rs`, shared with the
+unattended-server tables: one journal, one ordered list).
 
 This page is the reference for those features. The public docs at
 alforria.ai are written from it.

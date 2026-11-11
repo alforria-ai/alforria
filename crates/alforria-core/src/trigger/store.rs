@@ -1,5 +1,5 @@
 //! The `trigger`, `trigger_state` and `trigger_run` tables
-//! (`storage/migrations/trigger_0001_init.sql`).
+//! (`storage/alforria_migrations/trigger_0001_init.sql`).
 
 use std::sync::Arc;
 

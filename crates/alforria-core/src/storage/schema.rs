@@ -1001,9 +1001,8 @@ mod tests {
             .map(|(_, sql)| sql)
             .collect();
         // `sqlite_master` rows appear in creation order, so this also pins
-        // the statement order. alforria's own tables (`storage::extension`)
-        // are created after the upstream schema.
-        assert_eq!(actual[..SCHEMA_SQL.len()], SCHEMA_SQL.to_vec());
+        // the statement order.
+        assert_eq!(actual, SCHEMA_SQL.to_vec());
     }
 
     /// Regression (battle test): the row mappers bind columns by NAME

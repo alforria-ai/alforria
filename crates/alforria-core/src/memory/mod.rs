@@ -1345,7 +1345,7 @@ mod tests {
     /// over; what cannot be told stays unverified.
     #[test]
     fn records_from_before_the_origin_columns_are_classified_by_the_migration() {
-        use crate::storage::extension::{apply_set, MIGRATIONS};
+        use crate::storage::alforria_migration::{apply_set, MIGRATIONS};
         let temp = TempDir::new("memory-migrate");
         let path = temp.path().join("db.sqlite");
         {
