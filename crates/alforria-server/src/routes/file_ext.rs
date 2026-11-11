@@ -106,87 +106,153 @@ fn over_quota(message: String) -> FileError {
     FileError::Status(StatusCode::PAYLOAD_TOO_LARGE, "UploadQuotaError", message)
 }
 
-/// The name prefix of an upload still being received.
+/// The name prefix of an upload still being received. A credential below
+/// `admin` may not upload to a path with a component that starts with it
+/// ([`restricted_upload_allowed`]), and nothing is left out of the count
+/// for carrying it.
 const TEMPORARY_PREFIX: &str = ".alforria-upload-";
 
-/// What an upload directory holds: bytes and entries that are not
-/// directories, no link followed, uploads still being received left out.
-/// The walk stops once it has seen more than `enough` files — the answer
-/// is "over" from there on, and a huge tree is not walked for it.
-fn area_usage(root: &Path, enough: u64) -> (u64, u64) {
-    let (mut bytes, mut files) = (0u64, 0u64);
-    let mut pending = vec![root.to_path_buf()];
-    while let Some(directory) = pending.pop() {
+/// How deep below its upload directory a credential below `admin` may
+/// upload, in path components, and how deep the count goes.
+pub const UPLOAD_MAX_DEPTH: usize = 8;
+
+/// How long a directory's usage is trusted before it is counted again:
+/// files the agent's shell adds or removes are noticed after this long, or
+/// on restart.
+const USAGE_MAX_AGE: Duration = Duration::from_secs(300);
+
+/// What an upload directory holds, as the server last counted it and has
+/// kept up to date since with every upload it wrote.
+#[derive(Clone, Copy)]
+struct Usage {
+    bytes: u64,
+    /// Files, links and directories alike.
+    entries: u64,
+    /// The count did not finish — too many entries, or too deep: the
+    /// directory is treated as full.
+    over: bool,
+    counted: std::time::Instant,
+}
+
+#[derive(Default)]
+struct Areas {
+    usage: std::collections::HashMap<PathBuf, Usage>,
+    walks: std::collections::HashMap<PathBuf, u64>,
+}
+
+/// Usage per upload directory. Held for map operations and for the one
+/// `rename` that makes an upload count — never across a walk or an await.
+static AREAS: std::sync::LazyLock<std::sync::Mutex<Areas>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn areas() -> std::sync::MutexGuard<'static, Areas> {
+    AREAS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// How many times `area` has been counted by walking it (for tests: an
+/// upload does not walk).
+#[doc(hidden)]
+pub fn upload_area_walks(area: &Path) -> u64 {
+    areas().walks.get(area).copied().unwrap_or(0)
+}
+
+/// Count what `root` holds: every entry, directories included, no link
+/// followed, nothing skipped by name. Bounded: it gives up — `over` — past
+/// `max_entries` entries or below [`UPLOAD_MAX_DEPTH`].
+fn count_area(root: &Path, max_entries: u64) -> Usage {
+    let mut usage = Usage {
+        bytes: 0,
+        entries: 0,
+        over: false,
+        counted: std::time::Instant::now(),
+    };
+    let mut pending = vec![(root.to_path_buf(), 0usize)];
+    while let Some((directory, depth)) = pending.pop() {
         let Ok(entries) = std::fs::read_dir(&directory) else {
             continue;
         };
         for entry in entries.flatten() {
+            usage.entries += 1;
+            if usage.entries > max_entries {
+                usage.over = true;
+                return usage;
+            }
             let Ok(meta) = entry.metadata() else {
                 continue;
             };
             if meta.is_dir() {
-                pending.push(entry.path());
-                continue;
-            }
-            if entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(TEMPORARY_PREFIX)
-            {
-                continue;
-            }
-            files += 1;
-            bytes = bytes.saturating_add(meta.len());
-            if files > enough {
-                return (bytes, files);
+                if depth + 1 >= UPLOAD_MAX_DEPTH {
+                    usage.over = true;
+                    return usage;
+                }
+                pending.push((entry.path(), depth + 1));
+            } else {
+                usage.bytes = usage.bytes.saturating_add(meta.len());
             }
         }
     }
-    (bytes, files)
+    usage
 }
 
-/// Serializes the last quota check with the rename that makes an upload
-/// count, so two uploads cannot both fit into the same remainder.
-static UPLOAD_QUOTA: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// The usage of `area`, counted now if it never was or was too long ago.
+async fn usage_of(ctx: &ServerContext, area: &Path) -> Result<Usage, FileError> {
+    if let Some(usage) = areas().usage.get(area) {
+        if usage.counted.elapsed() < USAGE_MAX_AGE {
+            return Ok(*usage);
+        }
+    }
+    let max_entries = ctx.policy.upload_max_files;
+    let root = area.to_path_buf();
+    let counted = tokio::task::spawn_blocking(move || count_area(&root, max_entries))
+        .await
+        .map_err(|join| storage_error(&std::io::Error::other(join.to_string())))?;
+    let mut areas = areas();
+    *areas.walks.entry(area.to_path_buf()).or_default() += 1;
+    areas.usage.insert(area.to_path_buf(), counted);
+    Ok(counted)
+}
 
-/// Whether `area` has room for an upload of `incoming` bytes to `target`
-/// (`server.upload.max_total_bytes`, `server.upload.max_files`); the bytes
-/// left for it when it has. The file being replaced does not count against
-/// its replacement.
-async fn quota_room(
+/// What an upload adds to its directory.
+#[derive(Clone, Copy)]
+struct Addition {
+    /// The upload's size.
+    bytes: u64,
+    /// The size of the file it replaces.
+    replaced: u64,
+    /// The file, when new, and the directories created for it.
+    entries: u64,
+}
+
+/// Whether `usage` has room for `addition` (`server.upload.max_total_bytes`,
+/// `server.upload.max_files`); the bytes left for the upload when it has.
+fn room(
     ctx: &ServerContext,
     area: &Path,
-    target: &Path,
-    incoming: u64,
+    usage: &Usage,
+    addition: Addition,
 ) -> Result<u64, FileError> {
-    let (max_bytes, max_files) = (
+    let (max_bytes, max_entries) = (
         ctx.policy.upload_max_total_bytes,
         ctx.policy.upload_max_files,
     );
-    let (area, target) = (area.to_path_buf(), target.to_path_buf());
-    let shown = area.display().to_string();
-    let (bytes, files, replaced) = tokio::task::spawn_blocking(move || {
-        let (bytes, files) = area_usage(&area, max_files);
-        (bytes, files, std::fs::symlink_metadata(&target).ok())
-    })
-    .await
-    .map_err(|join| storage_error(&std::io::Error::other(join.to_string())))?;
-    let files = files.saturating_sub(u64::from(replaced.is_some()));
-    if files >= max_files {
+    let shown = area.display();
+    if usage.over || usage.entries + addition.entries > max_entries {
         return Err(over_quota(format!(
-            "the upload directory {shown} already holds {max_files} files or more \
-             (server.upload.max_files)"
+            "the upload directory {shown} may hold {max_entries} files and directories, \
+             no more than {UPLOAD_MAX_DEPTH} deep, and is full (server.upload.max_files)"
         )));
     }
-    let used = bytes.saturating_sub(replaced.map_or(0, |meta| meta.len()));
-    let room = max_bytes.saturating_sub(used);
-    if incoming > room {
+    let used = usage.bytes.saturating_sub(addition.replaced);
+    let left = max_bytes.saturating_sub(used);
+    if addition.bytes > left {
         return Err(over_quota(format!(
             "the upload does not fit: the upload directory {shown} holds {used} of the \
              {max_bytes} bytes it may (server.upload.max_total_bytes)"
         )));
     }
-    Ok(room)
+    Ok(left)
 }
 
 /// The project a request addresses: the directory the auth layer resolved
@@ -561,12 +627,37 @@ fn restricted_upload_allowed(
             .ok()
             .filter(|root| within(root, &project) && within(target, root))
     });
+    // The area is a directory of its own: one that is the project itself
+    // (a link to it, say) holds nothing.
+    let upload_area = upload_area.filter(|root| *root != project);
     let Some(upload_area) = upload_area else {
         return Err(format!(
             "this token may only upload into {} (server.upload.directories)",
             ctx.policy.upload_directories.join(", ")
         ));
     };
+    let below: Vec<String> = target
+        .strip_prefix(&upload_area)
+        .map(|relative| {
+            relative
+                .components()
+                .map(|part| part.as_os_str().to_string_lossy().to_lowercase())
+                .collect()
+        })
+        .unwrap_or_default();
+    if below.len() > UPLOAD_MAX_DEPTH {
+        return Err(format!(
+            "{} is more than {UPLOAD_MAX_DEPTH} levels below the upload directory",
+            target.display()
+        ));
+    }
+    // The server's own name for an upload in progress is not a client's.
+    if below.iter().any(|part| part.starts_with(TEMPORARY_PREFIX)) {
+        return Err(format!(
+            "{} uses a name reserved for uploads in progress ({TEMPORARY_PREFIX}*)",
+            target.display()
+        ));
+    }
     // The same guard the edit tools' writes go through
     // (`alforria_core::protect`): loader names anywhere on the resolved
     // path, and every location the loaders consult for this instance.
@@ -651,9 +742,25 @@ async fn upload(
     }
     // The quota of the upload directory, before anything is written: a
     // body that declares its length is refused here, one that does not is
-    // cut off at what is left.
-    let room = match &area {
-        Some(area) => Some(quota_room(&ctx, area, &target, declared.unwrap_or(0)).await?),
+    // cut off at what is left. Counted from the server's running usage —
+    // an upload does not walk the directory.
+    let mut addition = Addition {
+        bytes: declared.unwrap_or(0),
+        replaced: 0,
+        entries: 0,
+    };
+    let room_left = match &area {
+        Some(area) => {
+            addition.replaced = std::fs::symlink_metadata(&target).map_or(0, |meta| meta.len());
+            // The file itself and every directory to be made for it.
+            addition.entries = target
+                .ancestors()
+                .take_while(|path| path.starts_with(area) && *path != area.as_path())
+                .filter(|path| std::fs::symlink_metadata(path).is_err())
+                .count() as u64;
+            let usage = usage_of(&ctx, area).await?;
+            Some(room(&ctx, area, &usage, addition)?)
+        }
         None => None,
     };
     let io = |err: std::io::Error| storage_error(&err);
@@ -690,7 +797,7 @@ async fn upload(
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|err| Some(std::io::Error::other(err.to_string())))?;
             written += chunk.len() as u64;
-            if written > limit || room.is_some_and(|room| written > room) {
+            if written > limit || room_left.is_some_and(|left| written > left) {
                 return Err(None);
             }
             file.write_all(&chunk).await.map_err(Some)?;
@@ -706,35 +813,55 @@ async fn upload(
             let _ = directory.remove_file(&temporary);
             return Err(match cause {
                 None if written > limit => too_large(limit),
-                None => match &area {
-                    // Says which limit it was.
-                    Some(area) => match quota_room(&ctx, area, &target, written).await {
-                        Err(refusal) => refusal,
-                        Ok(_) => too_large(limit),
-                    },
-                    None => too_large(limit),
-                },
+                None => over_quota(format!(
+                    "the upload does not fit in what is left of the upload directory's \
+                     {} bytes (server.upload.max_total_bytes)",
+                    ctx.policy.upload_max_total_bytes
+                )),
                 Some(err) => io(err),
             });
         }
     }
-    // Checked again with what was received, and held until the rename, so
-    // that concurrent uploads share one remainder.
-    let quota = match &area {
-        Some(_) => Some(UPLOAD_QUOTA.lock().await),
-        None => None,
-    };
-    if let Some(area) = &area {
-        if let Err(refusal) = quota_room(&ctx, area, &target, written).await {
-            let _ = directory.remove_file(&temporary);
-            return Err(refusal);
+    // Checked again with what was received, against the usage as it is
+    // now, and counted in the same breath as the rename: concurrent
+    // uploads share one remainder.
+    let renamed = match &area {
+        Some(area) => {
+            addition.bytes = written;
+            let mut areas = areas();
+            let usage = areas.usage.get(area).copied().unwrap_or(Usage {
+                bytes: 0,
+                entries: 0,
+                over: true,
+                counted: std::time::Instant::now(),
+            });
+            match room(&ctx, area, &usage, addition) {
+                Err(refusal) => {
+                    drop(areas);
+                    let _ = directory.remove_file(&temporary);
+                    return Err(refusal);
+                }
+                Ok(_) => {
+                    let renamed = directory.rename(&temporary, &name);
+                    if renamed.is_ok() {
+                        if let Some(usage) = areas.usage.get_mut(area) {
+                            usage.bytes = usage
+                                .bytes
+                                .saturating_sub(addition.replaced)
+                                .saturating_add(written);
+                            usage.entries += addition.entries;
+                        }
+                    }
+                    renamed
+                }
+            }
         }
-    }
-    if let Err(err) = directory.rename(&temporary, &name) {
+        None => directory.rename(&temporary, &name),
+    };
+    if let Err(err) = renamed {
         let _ = directory.remove_file(&temporary);
         return Err(io(err));
     }
-    drop(quota);
     // Clients watching the project learn of the file like any other edit.
     let _ = location.services.events.publish(
         &alforria_core::tool::edit::FILE_EDITED,

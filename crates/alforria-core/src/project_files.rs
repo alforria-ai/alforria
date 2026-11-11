@@ -72,59 +72,47 @@ pub fn is_loader_path(relative: &Path) -> bool {
     })
 }
 
-/// Config files of the formatters and language servers the server starts
+/// Config files of formatters, language servers and build tools
 /// (`lsp/server.rs`, upstream's `format/formatter.ts`): a file with one of
 /// these names is run as code by such a tool (`eslint.config.js`,
-/// `build.rs` through `Cargo.toml`, `flake.nix`), names plugins or commands
-/// it loads (`biome.json`, `tsconfig.json`, `.clangd`,
+/// `build.rs` through `Cargo.toml`, `flake.nix`, a `Makefile`), names
+/// plugins or commands it loads (`biome.json`, `tsconfig.json`, `.clangd`,
 /// `compile_commands.json`), or decides which binary is started
-/// (`package.json`). An agent edits them as part of its work, so the write
-/// guard leaves them alone; a file *uploaded* by a credential below `admin`
-/// is a write nobody asked the model for, and is refused these names
-/// ([`is_tool_config_path`]).
+/// (`package.json`, a lockfile). An agent edits them as part of its work,
+/// so the write guard leaves them alone; a file *uploaded* by a credential
+/// below `admin` is a write nobody asked the model for, and is refused
+/// these names ([`is_tool_config_path`]).
+///
+/// **Defence in depth, not the control.** A hand-kept list falls behind.
+/// What keeps an upload from configuring a tool is that the upload area is
+/// a directory of its own (the server refuses the project root as one) and
+/// that no formatter or language server is started on, or configured from,
+/// a file inside it while tokens below `admin` can upload.
+///
+/// Exact names, lower case.
 pub const TOOL_CONFIG_FILES: &[&str] = &[
     // JavaScript / TypeScript.
     "package.json",
-    "tsconfig.json",
-    "jsconfig.json",
-    "deno.json",
-    "deno.jsonc",
-    "biome.json",
-    "biome.jsonc",
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "pnpm-workspace.yaml",
+    "bun.lock",
+    "bun.lockb",
+    "bunfig.toml",
+    ".npmrc",
+    ".yarnrc",
+    ".yarnrc.yml",
     ".oxlintrc.json",
-    ".eslintrc",
-    ".eslintrc.js",
-    ".eslintrc.cjs",
-    ".eslintrc.json",
-    ".eslintrc.yaml",
-    ".eslintrc.yml",
-    "eslint.config.js",
-    "eslint.config.mjs",
-    "eslint.config.cjs",
-    "eslint.config.ts",
-    "eslint.config.mts",
-    "eslint.config.cts",
-    ".prettierrc",
-    ".prettierrc.json",
-    ".prettierrc.yaml",
-    ".prettierrc.yml",
-    ".prettierrc.toml",
-    ".prettierrc.js",
-    ".prettierrc.cjs",
-    ".prettierrc.mjs",
-    "prettier.config.js",
-    "prettier.config.cjs",
-    "prettier.config.mjs",
-    "prettier.config.ts",
-    "svelte.config.js",
-    "astro.config.mjs",
     // Rust.
-    "Cargo.toml",
+    "cargo.toml",
+    "cargo.lock",
     "build.rs",
     "rustfmt.toml",
     ".rustfmt.toml",
     "rust-toolchain",
     "rust-toolchain.toml",
+    "clippy.toml",
     // Python.
     "pyproject.toml",
     "setup.py",
@@ -133,17 +121,27 @@ pub const TOOL_CONFIG_FILES: &[&str] = &[
     ".ruff.toml",
     "ty.toml",
     "pyrightconfig.json",
-    "Pipfile",
+    "pipfile",
+    "pipfile.lock",
+    "poetry.lock",
+    "uv.lock",
+    "requirements.txt",
+    "conftest.py",
+    "tox.ini",
     // Go, Ruby, Elixir, Zig, PHP, Dart, OCaml, Gleam, Typst, Julia, Haskell.
     "go.mod",
+    "go.sum",
     "go.work",
-    "Gemfile",
+    "gemfile",
+    "gemfile.lock",
     ".rubocop.yml",
     "mix.exs",
+    "mix.lock",
     ".formatter.exs",
     "build.zig",
     "build.zig.zon",
     "composer.json",
+    "composer.lock",
     "pubspec.yaml",
     "analysis_options.yaml",
     "dune-project",
@@ -152,15 +150,18 @@ pub const TOOL_CONFIG_FILES: &[&str] = &[
     ".ocamlformat",
     "gleam.toml",
     "typst.toml",
-    "Project.toml",
+    "project.toml",
+    "manifest.toml",
     "stack.yaml",
     "cabal.project",
     "hie.yaml",
     // C / C++.
     ".clangd",
     ".clang-format",
+    ".clang-tidy",
     "compile_commands.json",
     "compile_flags.txt",
+    "cmakelists.txt",
     // JVM, .NET.
     "pom.xml",
     "build.gradle",
@@ -168,34 +169,101 @@ pub const TOOL_CONFIG_FILES: &[&str] = &[
     "settings.gradle",
     "settings.gradle.kts",
     "global.json",
-    // Lua, Nix, LaTeX, editor-wide.
+    // Lua, Nix, LaTeX.
     ".luarc.json",
     ".luarc.jsonc",
+    ".luacheckrc",
     "stylua.toml",
     ".stylua.toml",
     "selene.toml",
     "flake.nix",
+    "flake.lock",
+    "shell.nix",
+    "default.nix",
     ".latexmkrc",
     "latexmkrc",
+    // Build runners, editor-wide, CI.
+    "makefile",
+    "gnumakefile",
+    "justfile",
+    ".justfile",
+    "taskfile.yml",
+    "dockerfile",
     ".editorconfig",
+    ".envrc",
+    ".gitlab-ci.yml",
+    ".pre-commit-config.yaml",
+    "lefthook.yml",
 ];
 
-/// Directories a formatter or language server takes its executable or its
-/// settings from: `node_modules/.bin/<server>` is started in preference to
-/// the one on `PATH`, `.cargo/config.toml` names a compiler wrapper,
-/// `.venv` holds the interpreter.
-pub const TOOL_CONFIG_DIRS: &[&str] = &["node_modules", ".cargo", ".venv", "venv", ".vscode"];
+/// Names matched by their beginning, whatever follows — the extension a
+/// tool accepts its config in (`eslint.config.js`, `.mjs`, `.cjs`, `.ts`,
+/// …; `.prettierrc`, `.prettierrc.json5`, …). Lower case.
+pub const TOOL_CONFIG_STEMS: &[&str] = &[
+    "prettier.config.",
+    ".prettierrc",
+    "eslint.config.",
+    ".eslintrc",
+    "svelte.config.",
+    "astro.config.",
+    "vite.config.",
+    "vitest.config.",
+    "postcss.config.",
+    ".postcssrc",
+    "tailwind.config.",
+    "babel.config.",
+    ".babelrc",
+    "webpack.config.",
+    "rollup.config.",
+    "next.config.",
+    "nuxt.config.",
+    "jest.config.",
+    "stylelint.config.",
+    ".stylelintrc",
+    "biome.json",
+    "deno.json",
+    "tsconfig.",
+    "jsconfig.",
+    "docker-compose.",
+    "compose.",
+];
 
-/// Whether a path inside the project names a formatter's or language
-/// server's config ([`TOOL_CONFIG_FILES`], [`TOOL_CONFIG_DIRS`]) in any
-/// component, without regard to case.
+/// Names matched by both ends: `tsconfig.build.json`.
+const TOOL_CONFIG_BRACKETS: &[(&str, &str)] = &[("tsconfig", ".json"), ("jsconfig", ".json")];
+
+/// Directories a formatter, a language server or the forge takes
+/// executables, settings or jobs from: `node_modules/.bin/<server>` is
+/// started in preference to the one on `PATH`, `.cargo/config.toml` names a
+/// compiler wrapper, `.venv` holds the interpreter, `.husky` git hooks,
+/// `.github` workflows. Lower case.
+pub const TOOL_CONFIG_DIRS: &[&str] = &[
+    "node_modules",
+    ".cargo",
+    ".venv",
+    "venv",
+    ".vscode",
+    ".husky",
+    ".githooks",
+    ".github",
+    ".gitlab",
+    ".circleci",
+    ".devcontainer",
+];
+
+/// Whether a path inside the project names a tool's config
+/// ([`TOOL_CONFIG_FILES`], [`TOOL_CONFIG_STEMS`], [`TOOL_CONFIG_DIRS`]) in
+/// any component, without regard to case.
 pub fn is_tool_config_path(relative: &Path) -> bool {
     relative.components().any(|component| {
-        let name = component.as_os_str().to_string_lossy();
+        let name = component.as_os_str().to_string_lossy().to_lowercase();
         TOOL_CONFIG_FILES
             .iter()
             .chain(TOOL_CONFIG_DIRS)
-            .any(|tool| tool.eq_ignore_ascii_case(&name))
+            .any(|tool| *tool == name)
+            || TOOL_CONFIG_STEMS.iter().any(|stem| name.starts_with(stem))
+            || TOOL_CONFIG_BRACKETS
+                .iter()
+                .any(|(start, end)| name.starts_with(start) && name.ends_with(end))
     })
 }
 
@@ -247,6 +315,30 @@ mod tests {
             "package.json",
             "uploads/PACKAGE.JSON",
             "uploads/eslint.config.js",
+            "uploads/ESLint.Config.MTS",
+            "prettier.config.js",
+            "prettier.config.mjs",
+            "prettier.config.cjs",
+            "prettier.config.ts",
+            ".prettierrc",
+            ".prettierrc.json5",
+            ".eslintrc.yaml",
+            "svelte.config.ts",
+            "astro.config.ts",
+            "vite.config.mts",
+            "postcss.config.cjs",
+            "tailwind.config.js",
+            "babel.config.json",
+            ".babelrc.js",
+            "tsconfig.json",
+            "tsconfig.build.json",
+            "biome.jsonc",
+            "deno.jsonc",
+            "yarn.lock",
+            "Makefile",
+            "justfile",
+            ".github/workflows/ci.yml",
+            ".husky/pre-commit",
             "uploads/node_modules/.bin/biome",
             "a/.cargo/config.toml",
             "Cargo.toml",
@@ -255,7 +347,13 @@ mod tests {
         ] {
             assert!(is_tool_config_path(Path::new(path)), "{path}");
         }
-        for path in ["uploads/report.pdf", "src/main.rs", "package.json.bak"] {
+        for path in [
+            "uploads/report.pdf",
+            "src/main.rs",
+            "package.json.bak",
+            "tsconfiguration.md",
+            "composer.txt",
+        ] {
             assert!(!is_tool_config_path(Path::new(path)), "{path}");
         }
         // An agent's own edits are not refused these names.

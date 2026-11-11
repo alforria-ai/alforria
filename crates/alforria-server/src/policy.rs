@@ -175,6 +175,34 @@ pub const DEFAULT_UPLOAD_MAX_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
 /// `server.upload.max_files` when unset, per upload directory.
 pub const DEFAULT_UPLOAD_MAX_FILES: u64 = 1000;
 
+/// `server.upload.directories`, checked: each is a directory of its own
+/// below the project. The project itself (`.`), a path that leaves it, and
+/// a directory the loaders or the tools read (`.opencode`, `.git`,
+/// `node_modules`, …) are refused — what keeps an upload from being config
+/// is where it lands, not a list of names it may not have.
+fn upload_directories(entries: Vec<String>) -> Result<Vec<String>, String> {
+    for entry in &entries {
+        let refuse = |why: &str| {
+            Err(format!(
+                "server.upload.directories: `{entry}` {why}; name a directory used for \
+                 uploads only, such as `uploads`"
+            ))
+        };
+        let Some(relative) = alforria_core::beneath::normalize_relative(Path::new(entry)) else {
+            return refuse(
+                "is the project directory itself or outside it — every config, instruction \
+                 and tool file in the project would be inside the upload area",
+            );
+        };
+        if alforria_core::project_files::is_loader_path(&relative)
+            || alforria_core::project_files::is_tool_config_path(&relative)
+        {
+            return refuse("is a directory the agent's configuration or a tool is loaded from");
+        }
+    }
+    Ok(entries)
+}
+
 /// Everything the server resolved from the host config.
 #[derive(Debug, Clone)]
 pub struct ServerPolicy {
@@ -400,10 +428,12 @@ impl ServerPolicy {
                 .and_then(|server| server.upload.as_ref())
                 .and_then(|upload| upload.max_bytes)
                 .unwrap_or(DEFAULT_UPLOAD_MAX_BYTES),
-            upload_directories: server
-                .and_then(|server| server.upload.as_ref())
-                .and_then(|upload| upload.directories.clone())
-                .unwrap_or_else(|| vec![DEFAULT_UPLOAD_DIRECTORY.to_string()]),
+            upload_directories: upload_directories(
+                server
+                    .and_then(|server| server.upload.as_ref())
+                    .and_then(|upload| upload.directories.clone())
+                    .unwrap_or_else(|| vec![DEFAULT_UPLOAD_DIRECTORY.to_string()]),
+            )?,
             upload_max_total_bytes: server
                 .and_then(|server| server.upload.as_ref())
                 .and_then(|upload| upload.max_total_bytes)
@@ -949,6 +979,47 @@ mod tests {
             names(&policy.shell_env.shell_env_from(server_env())),
             ["EDITOR", "HF_TOKEN", "HOME", "PATH", "TERM"]
         );
+    }
+
+    /// The upload area is a directory of its own: the project itself, a
+    /// path out of it and a loader or tool directory are a config error
+    /// (the server then refuses to listen), the default is not.
+    #[test]
+    fn the_upload_area_may_not_be_the_project_or_a_loader_directory() {
+        let policy = |directories: serde_json::Value| {
+            let config: Config = serde_json::from_value(serde_json::json!({
+                "server": { "upload": { "directories": directories } }
+            }))
+            .unwrap();
+            ServerPolicy::from_config_in(&config, Path::new("/home/nobody"))
+        };
+        for refused in [
+            ".",
+            "",
+            "./",
+            "uploads/..",
+            "..",
+            "../elsewhere",
+            "/srv/uploads",
+            ".opencode",
+            ".opencode/uploads",
+            ".git/uploads",
+            ".claude",
+            "node_modules/uploads",
+            ".github",
+        ] {
+            let error = policy(serde_json::json!(["uploads", refused])).unwrap_err();
+            assert!(
+                error.contains("server.upload.directories"),
+                "{refused}: {error}"
+            );
+        }
+        for accepted in ["uploads", "inbox/files", "./uploads/", "a/../uploads"] {
+            assert!(policy(serde_json::json!([accepted])).is_ok(), "{accepted}");
+        }
+        let unset: Config = serde_json::from_value(serde_json::json!({})).unwrap();
+        let default = ServerPolicy::from_config_in(&unset, Path::new("/home/nobody"));
+        assert_eq!(default.unwrap().upload_directories, ["uploads"]);
     }
 
     /// A variable the host config reads through `{env:NAME}` is one the

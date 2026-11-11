@@ -146,13 +146,19 @@ pre-1.0, so minor releases may include breaking changes.
   stored watch paths all use that one resolver. A token below `admin`
   uploads only into `server.upload.directories` (default `uploads/`) and
   never to a config, instruction, agent, command, skill, workflow or git
-  file, nor to a file a formatter or language server is configured or
-  started from (`package.json`, `eslint.config.js`, `Cargo.toml`,
-  `node_modules/`, …). Such a token's uploads are also held to a quota per
-  upload directory: `server.upload.max_total_bytes` (default 1 GiB) and
-  `server.upload.max_files` (default 1000), answered `413`
-  `UploadQuotaError` before anything is written. The write guard also
-  protects the files a `formatter` or `lsp` entry's `command` names.
+  file, nor to a file a formatter, language server or build tool is
+  configured or started from (`package.json`, `eslint.config.*`,
+  `Cargo.toml`, `node_modules/`, … — by name, any extension, defence in
+  depth). The upload directory must be a directory of its own: `"."`, a
+  path out of the project or a loader or tool directory in
+  `server.upload.directories` is a config error and the server does not
+  listen. Such a token's uploads are also held to a quota per upload
+  directory — `server.upload.max_total_bytes` (default 1 GiB) and
+  `server.upload.max_files` (default 1000 entries, directories included),
+  at most 8 levels deep — answered `413` `UploadQuotaError` before
+  anything is written, from a running count that is re-read at most every
+  5 minutes. The write guard also protects the files a `formatter` or
+  `lsp` entry's `command` names.
 - `permission.unattended` and `question.unattended` (global config) bound how
   long a permission ask or a question waits for a person: after `timeout`, an
   ask is denied or allowed once and a question is dismissed, the model is

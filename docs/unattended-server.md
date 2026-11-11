@@ -1337,8 +1337,14 @@ asked the model for:
 - it must land inside an upload directory: `server.upload.directories`,
   relative to the project, default `["uploads"]`. Everything else in the
   project needs `admin`. This is an allowlist on purpose: "anywhere except
-  the files that matter" is a list that falls behind. `["."]` opens the
-  whole project to uploads, for deployments that want it;
+  the files that matter" is a list that falls behind. The upload
+  directory must be a directory of its own: `"."`, a path out of the
+  project, and a directory the loaders or tools read (`.opencode`, `.git`,
+  `node_modules`, …) are a config error, and a server with a config error
+  does not listen. **This is the control**: an upload cannot become config
+  because of where it lands (and because no language server or formatter is
+  run on a file inside the upload directory while bearer tokens are
+  configured), not because of a list of names it may not have;
 - in either mode, no component of the path may be a name the loaders act
   on, in any case and at any depth, existing or to be created:
   `opencode.json`, `opencode.jsonc`, `config.json`, `AGENTS.md`,
@@ -1347,28 +1353,41 @@ asked the model for:
   the loaders themselves discover by, so a discovery location added there
   is closed to uploads at the same time;
 - nor may a component below the project be a file or directory a
-  formatter or a language server is configured or started from:
-  `package.json`, `tsconfig.json`, `eslint.config.*`, `.prettierrc*`,
-  `biome.json`, `Cargo.toml`, `build.rs`, `pyproject.toml`, `.clangd`,
-  `compile_commands.json`, `flake.nix`, `node_modules/`, `.cargo/`,
-  `.venv/` and the rest of `project_files::TOOL_CONFIG_FILES` /
-  `TOOL_CONFIG_DIRS`. Those run code or name what is run when a language
-  server starts. (The agent's own edit tools are not refused these names —
-  editing them is its work — but the write guard does protect the files a
-  `formatter.<name>.command` or `lsp.<name>.command` in the config is
-  spelled with, e.g. `./tools/fmt.sh`.) That list is curated by hand from
-  `lsp/server.rs`: a server added there needs its config names added too;
+  formatter, a language server or a build tool is configured or started
+  from: `package.json`, lockfiles, `tsconfig*.json`, `eslint.config.*`,
+  `.eslintrc*`, `prettier.config.*`, `.prettierrc*`, `vite.config.*`,
+  `biome.json*`, `Cargo.toml`, `build.rs`, `pyproject.toml`, `.clangd`,
+  `Makefile`, `justfile`, `flake.nix`, `node_modules/`, `.cargo/`,
+  `.venv/`, `.github/`, `.husky/` and the rest of
+  `project_files::TOOL_CONFIG_FILES`, `TOOL_CONFIG_STEMS` (matched by
+  their beginning, any extension) and `TOOL_CONFIG_DIRS`, in any case.
+  This list is kept by hand and is **defence in depth only** — the
+  dedicated directory above is the control. (The agent's own edit tools are
+  not refused these names — editing them is its work — but the write guard
+  does protect the files a `formatter.<name>.command` or
+  `lsp.<name>.command` in the config is spelled with, e.g.
+  `./tools/fmt.sh`.);
+- nor may a component begin with `.alforria-upload-`, the server's name
+  for an upload in progress, and the path may be at most 8 levels below
+  the upload directory;
 - these rules apply to the resolved path, so a symlink inside the upload
-  area does not lead out of it or into a loader directory;
+  area does not lead out of it or into a loader directory (an upload
+  directory that is a link to the project itself holds nothing);
 - each upload directory has a quota: `server.upload.max_total_bytes`
   (default 1 GiB = 1073741824) and `server.upload.max_files` (default
-  1000), counted over everything the directory holds, whoever put it
-  there. An upload that would exceed either is answered `413` with
+  1000 — files, links and directories all count), over everything the
+  directory holds, whoever put it there and whatever it is called. An
+  upload that would exceed either is answered `413` with
   `{"name": "UploadQuotaError"}` before anything is written (a body with
   no declared length is cut off at what is left and removed); replacing a
-  file counts the difference. With `"."` as the upload directory the whole
-  project counts, so raise both limits there. `admin` and the operator are
-  held to `max_bytes` only.
+  file counts the difference. The server counts a directory once — a
+  bounded walk that gives up, and reports the directory full, past
+  `max_files` entries or 8 levels — and then keeps the figure up to date
+  with each upload it writes; it does not walk per upload. What is added
+  or removed by other means (the agent's shell deleting old uploads) is
+  noticed when the directory is counted again: at most every 5 minutes,
+  and after a restart. `admin` and the operator are held to `max_bytes`
+  only, and their uploads are likewise noticed at the next count.
 
 A `file.edited` event is published for the written file.
 

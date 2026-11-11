@@ -709,8 +709,8 @@ async fn an_upload_area_has_a_quota_for_narrow_tokens() {
         StatusCode::OK
     );
 
-    // Three files, at any depth; the fourth is refused, a replacement is not.
-    for path in ["uploads/b.bin", "uploads/deep/c.bin"] {
+    // Three entries; the fourth is refused, a replacement is not.
+    for path in ["uploads/b.bin", "uploads/c.bin"] {
         assert_eq!(
             status(put(&f, Some(&chat), path, "", b"x").await),
             StatusCode::CREATED,
@@ -742,20 +742,25 @@ async fn an_upload_area_has_a_quota_for_narrow_tokens() {
     );
 }
 
-/// The files a formatter or a language server is configured or started
-/// from are not a narrow token's to upload, even with the whole project as
-/// the upload area; the operator's upload is unaffected.
+/// The files a formatter, a language server or a build tool is configured
+/// or started from are not a narrow token's to upload, in any extension
+/// the tool takes them in; the operator's upload is unaffected.
 #[tokio::test]
 async fn narrow_tokens_cannot_upload_formatter_or_language_server_config() {
-    use alforria_core::project_files::{TOOL_CONFIG_DIRS, TOOL_CONFIG_FILES};
+    use alforria_core::project_files::{TOOL_CONFIG_DIRS, TOOL_CONFIG_FILES, TOOL_CONFIG_STEMS};
 
     let signer = Signer::new();
-    let f = fixture_uploading_into(&signer, Some(json!(["."])));
+    let f = fixture(&signer);
     let chat = bearer(&signer.token(AUDIENCE, "chat"));
     let mut paths: Vec<String> = Vec::new();
     for name in TOOL_CONFIG_FILES {
         paths.push(name.to_string());
         paths.push(format!("pkg/{}", name.to_uppercase()));
+    }
+    for stem in TOOL_CONFIG_STEMS {
+        for extension in ["js", "mjs", "cjs", "ts", "JSON"] {
+            paths.push(format!("{stem}{extension}"));
+        }
     }
     for name in TOOL_CONFIG_DIRS {
         paths.push(format!("{name}/.bin/biome"));
@@ -764,22 +769,28 @@ async fn narrow_tokens_cannot_upload_formatter_or_language_server_config() {
     for known in [
         "package.json",
         "eslint.config.js",
+        "prettier.config.mjs",
+        "tsconfig.build.json",
         "biome.json",
         "Cargo.toml",
         "build.rs",
         ".clangd",
+        "Makefile",
         "node_modules/.bin/typescript-language-server",
         ".cargo/config.toml",
     ] {
         paths.push(known.to_string());
     }
     for path in &paths {
-        let response = put(&f, Some(&chat), path, "", b"x").await;
+        let path = format!("uploads/{path}");
+        let response = put(&f, Some(&chat), &path, "", b"x").await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
-        assert!(!f.dirs.repo.join(path).exists(), "{path}");
+        assert!(!f.dirs.repo.join(&path).exists(), "{path}");
     }
     assert_eq!(
-        put(&f, Some(&chat), "src/lib.rs", "", b"x").await.status(),
+        put(&f, Some(&chat), "uploads/src/lib.rs", "", b"x")
+            .await
+            .status(),
         StatusCode::CREATED
     );
     assert_eq!(
@@ -788,6 +799,115 @@ async fn narrow_tokens_cannot_upload_formatter_or_language_server_config() {
             .status(),
         StatusCode::CREATED
     );
+}
+
+fn quota_fixture(signer: &Signer, total: u64, files: u64) -> Fixture {
+    let f = fixture_with(
+        |dirs| {
+            json!({
+                "server": {
+                    "auth": { "bearer": { "keys": [signer.public_key()], "audience": AUDIENCE } },
+                    "directories": [dirs.repo.display().to_string()],
+                    "upload": { "max_bytes": 1024, "max_total_bytes": total, "max_files": files }
+                }
+            })
+        },
+        Some(PASSWORD),
+        Vec::new(),
+    );
+    std::fs::create_dir_all(f.dirs.repo.join("uploads")).unwrap();
+    f
+}
+
+/// Nothing in the upload directory is left out of the count for its name:
+/// a file carrying the server's own prefix for an upload in progress
+/// counts like any other, and a narrow token cannot create one.
+#[tokio::test]
+async fn the_quota_counts_files_named_like_an_upload_in_progress() {
+    let signer = Signer::new();
+    let f = quota_fixture(&signer, 100, 10);
+    let chat = bearer(&signer.token(AUDIENCE, "chat"));
+    let uploads = f.dirs.repo.join("uploads");
+    std::fs::write(uploads.join(".alforria-upload-left-behind"), [b'x'; 80]).unwrap();
+
+    let refused = put(&f, Some(&chat), "uploads/a.bin", "", &[b'a'; 60]).await;
+    assert_eq!(refused.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(body_json(refused).await["name"], "UploadQuotaError");
+
+    for path in [
+        "uploads/.alforria-upload-mine",
+        "uploads/.ALFORRIA-UPLOAD-mine",
+        "uploads/.alforria-upload-dir/x.bin",
+    ] {
+        assert_eq!(
+            put(&f, Some(&chat), path, "", b"x").await.status(),
+            StatusCode::FORBIDDEN,
+            "{path}"
+        );
+        assert!(!f.dirs.repo.join(path).exists(), "{path}");
+    }
+}
+
+/// Directories count against `max_files`, a count that does not finish
+/// refuses, depth is capped, and an upload does not walk the directory.
+#[tokio::test]
+async fn the_quota_counts_directories_and_is_not_a_walk_per_upload() {
+    use alforria_server::routes::file_ext::{upload_area_walks, UPLOAD_MAX_DEPTH};
+
+    let signer = Signer::new();
+    let f = quota_fixture(&signer, 1000, 6);
+    let chat = bearer(&signer.token(AUDIENCE, "chat"));
+    let uploads = f.dirs.repo.join("uploads");
+    let status = |response: axum::http::Response<Body>| response.status();
+
+    // A file and the two directories made for it are three entries.
+    assert_eq!(
+        status(put(&f, Some(&chat), "uploads/a/b/one.bin", "", b"1").await),
+        StatusCode::CREATED
+    );
+    for path in [
+        "uploads/a/two.bin",
+        "uploads/a/b/three.bin",
+        "uploads/four.bin",
+    ] {
+        assert_eq!(
+            status(put(&f, Some(&chat), path, "", b"1").await),
+            StatusCode::CREATED,
+            "{path}"
+        );
+    }
+    // Six entries: a seventh is refused, and so is one that needs two.
+    for path in ["uploads/five.bin", "uploads/c/five.bin"] {
+        let refused = put(&f, Some(&chat), path, "", b"1").await;
+        assert_eq!(refused.status(), StatusCode::PAYLOAD_TOO_LARGE, "{path}");
+        assert_eq!(body_json(refused).await["name"], "UploadQuotaError");
+    }
+    assert!(
+        !uploads.join("c").exists(),
+        "no directory is made for a refusal"
+    );
+    assert_eq!(
+        upload_area_walks(&uploads),
+        1,
+        "counted once, then kept up to date"
+    );
+
+    // Deeper than the cap: refused whatever the quota.
+    let deep = format!("uploads/{}x.bin", "d/".repeat(UPLOAD_MAX_DEPTH));
+    assert_eq!(
+        status(put(&f, Some(&chat), &deep, "", b"1").await),
+        StatusCode::FORBIDDEN
+    );
+
+    // A tree of empty directories somebody else made fills the directory:
+    // the count stops at the limit and the answer is "full".
+    let g = quota_fixture(&signer, 1000, 6);
+    for n in 0..50 {
+        std::fs::create_dir_all(g.dirs.repo.join(format!("uploads/empty-{n}"))).unwrap();
+    }
+    let refused = put(&g, Some(&chat), "uploads/a.bin", "", b"1").await;
+    assert_eq!(refused.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(body_json(refused).await["name"], "UploadQuotaError");
 }
 
 fn basic() -> String {
@@ -947,7 +1067,7 @@ async fn narrow_tokens_upload_into_the_upload_area_only() {
 /// Every name the loaders act on — taken from the constants the loaders
 /// themselves use — is closed to an upload below `admin`, at any depth, in
 /// any case, as a file or as a directory to be created, inside the upload
-/// area and with the whole project opened up as the upload area. A new
+/// area, whichever it is. A new
 /// discovery location added to `alforria_core::project_files` is covered
 /// here without touching this test.
 #[tokio::test]
@@ -1008,9 +1128,9 @@ async fn narrow_tokens_cannot_upload_anything_the_loaders_read() {
     for (mode, directories, prefixes) in [
         ("default area", None, vec!["uploads/"]),
         (
-            "whole project",
-            Some(json!(["."])),
-            vec!["", "uploads/", "sub/"],
+            "two areas",
+            Some(json!(["uploads", "sub"])),
+            vec!["uploads/", "sub/"],
         ),
     ] {
         let f = fixture_uploading_into(&signer, directories);
