@@ -68,6 +68,15 @@ pre-1.0, so minor releases may include breaking changes.
   are searched but not injected. `memory` and `trigger` settings are read
   from your own config only; a project may at most switch memory off. See
   `docs/assistant.md`.
+- `alforria import --format openai-chat <file|->` imports a chat transcript
+  from another tool: a JSON or JSONL list of `{role, content, tool_calls,
+  tool_call_id, created_at}` messages. Tool calls become tool parts with
+  their results, images become file parts. `--live-tail <n>` or
+  `--archive-before <n|time>` keeps older messages as readable, searchable
+  history behind a compaction boundary carrying the transcript's `summary`,
+  so the next prompt sends only the summary and the live messages.
+  `--dry-run` reports what would be imported, and an `import_id` makes the
+  import idempotent.
 - `alforria migrate` moves an install from the `opencode` directories to
   alforria's own (see Changed). `--copy` copies the data instead of moving it,
   `--fresh` starts a new database and keeps the saved logins, `--dry-run`

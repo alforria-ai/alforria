@@ -9,6 +9,7 @@ pub mod event_definitions;
 pub mod from_error;
 pub mod goal;
 pub mod ids;
+pub mod import;
 pub mod instruction;
 pub mod llm;
 pub mod r#loop;

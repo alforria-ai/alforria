@@ -382,6 +382,90 @@ A record is `{ id, projectID, kind, content, metadata?, archived,
 time: { created, updated } }`. Changes are announced by `memory.updated`
 (`{ id, action }`, `action` being `remembered`, `updated` or `forgotten`).
 
+## Importing a transcript
+
+`alforria import` reads alforria's own export by default. With
+`--format openai-chat` it reads the lingua franca of chat history instead, so
+a conversation from another tool can be continued here:
+
+```sh
+alforria import --format openai-chat --live-tail 40 --model libertai/claw-core history.json
+cat history.jsonl | alforria import --format openai-chat --dry-run -
+```
+
+The input is a JSON array of messages, a JSON object, or JSONL (a line with a
+`role` is a message; any other line is such an object):
+
+```jsonc
+{
+  "title": "Old assistant chat",        // optional
+  "summary": "What happened so far…",   // optional, see below
+  "import_id": "legacy-agent-7",        // optional
+  "model": "libertai/claw-core",        // optional
+  "metadata": { "source": "old-harness" },
+  "messages": [
+    { "role": "user", "content": "…", "created_at": 1767225600 },
+    { "role": "assistant", "content": "…",
+      "tool_calls": [{ "id": "call_1", "type": "function",
+                       "function": { "name": "read_file", "arguments": "{\"path\":\"a\"}" } }] },
+    { "role": "tool", "tool_call_id": "call_1", "content": "…" }
+  ]
+}
+```
+
+| Flag | |
+| --- | --- |
+| `--live-tail <n>` | Keep only the last `n` messages live. |
+| `--archive-before <n\|time>` | Archive the first `n` messages, or those before an RFC 3339 time. |
+| `--dry-run` | Validate and print the counts; write nothing. |
+| `--import-id <id>` | A name for this import (overrides the file's). Importing the same id again prints the existing session and changes nothing. |
+| `--model <provider/model>` | The model recorded on the imported messages. Default: the file's `model`, then the configured `model`. One is required, because a session continues with the model of its messages. |
+| `--agent`, `--title` | The agent recorded on the messages (default: the default agent) and the session title. |
+
+How messages map:
+
+- `user` and `assistant` messages become messages of one new session, in file
+  order. `created_at` (seconds, milliseconds or RFC 3339) becomes the message
+  time; a missing or out-of-order time follows its predecessor, and a file
+  with no times at all ends just before now. Ids ascend in the same order.
+- `content` is a string or a list of parts: `text` becomes a text part,
+  `image_url` a file part (a data URL keeps its mime type; a link gets one
+  from its extension), and any other part type is kept as text.
+- An assistant message's `tool_calls` become tool parts on that message. The
+  matching `role: "tool"` message supplies the result; a call with none is
+  stored in the error state "Tool execution was interrupted". Tool names are
+  kept as they are, whether or not such a tool exists here. A tool message
+  that answers no call is dropped and counted.
+- `system` messages are not imported: the session has its own system prompt.
+- The file's `directory` is not acted on: the session is created in the
+  directory the command runs in.
+
+A long history must not be sent to the model whole on the first prompt. With
+a cutoff, the messages before it are stored as ordinary messages (readable in
+any client, searchable with `session_search`) and a compaction boundary is
+written after the live ones, exactly as a compaction leaves it: a user
+message with a `compaction` part whose `tail_start_id` names the first live
+message, answered by a `summary: true` assistant message carrying the file's
+`summary`. The next prompt then sends the summary, the live messages and the
+new message, and nothing older. The live part always starts at a user
+message, so the cutoff moves forward to the next one if needed. Counts are in
+imported messages (user and assistant).
+
+Without a `summary`, the boundary's summary message says that earlier
+messages exist, were not summarised and can be searched, and it is marked
+(`metadata.import.needsSummary` on its text part and on the session) so that
+a product can replace it with a real summary later. alforria does not
+summarise the archive by itself at import time.
+
+Without a cutoff, every message is live, as if the conversation had happened
+here.
+
+The import is all or nothing: the messages are written in one transaction,
+and the session is removed if that fails. The command prints the session id
+and a report:
+`{ messages, user, assistant, parts, toolCalls, interruptedToolCalls,
+orphanToolResults, images, systemSkipped, archived, live, boundary? }`.
+
 ## Which config may set what
 
 Some of these settings decide what runs unattended, whose data is read, or
