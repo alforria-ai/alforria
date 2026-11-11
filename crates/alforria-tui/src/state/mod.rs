@@ -690,6 +690,10 @@ pub enum Effect {
         session_id: String,
         previous_workspace: Option<String>,
     },
+    /// Read a session's `/goal`.
+    GoalRefresh {
+        session_id: String,
+    },
     /// Read the workflow runs, and the saved workflows if asked.
     WorkflowsRefresh {
         definitions: bool,
@@ -925,6 +929,25 @@ impl App {
 }
 
 /// The update function — pure state transitions; effects carry all
+/// A goal changes when a turn ends (the reviewer runs then) or when a
+/// `/goal` control answers with a toast. The server announces it with
+/// `goal.changed`, which is not in the frozen event union this client
+/// decodes, so the open session's goal is re-read on those two signals.
+fn goal_refresh(app: &App, event: &alforria_schema::event_manifest::Event) -> Option<Effect> {
+    use alforria_schema::event_manifest::Event;
+    let Route::Session { session_id, .. } = &app.state.route.data else {
+        return None;
+    };
+    let relevant = match event {
+        Event::SessionStatus(status) => status.session_id == *session_id,
+        Event::TuiToastShow(_) => true,
+        _ => false,
+    };
+    relevant.then(|| Effect::GoalRefresh {
+        session_id: session_id.clone(),
+    })
+}
+
 /// async work.
 pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
     let mut effects = Vec::new();
@@ -936,6 +959,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                 effects.extend(crate::app::on_bus_event(app, event.clone()));
                 effects.extend(crate::attention::on_bus_event(app, &event.event));
                 crate::ui::workflows::on_bus_event(app, &event.event);
+                effects.extend(goal_refresh(app, &event.event));
             }
         }
         // Only presses act. A release (reported where the terminal sends

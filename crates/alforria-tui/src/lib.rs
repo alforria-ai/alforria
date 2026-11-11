@@ -980,6 +980,10 @@ pub async fn execute_effect(
                         state::sync::session_sync_shared(&**app, api.as_ref(), &session_id).await;
                     // `scroll.scrollBy(100_000)` — snap to bottom.
                     app.lock().await.ui.session_scroll.snap_to_bottom();
+                    let goal = Effect::GoalRefresh {
+                        session_id: session_id.clone(),
+                    };
+                    Box::pin(execute_effect(app, Arc::clone(&api), goal)).await;
                     // `Task`'s `onMount` sync (`session/index.tsx:2215-2328`).
                     let children = state::sync::unsynced_task_children(
                         &app.lock().await.state.sync,
@@ -1058,6 +1062,16 @@ pub async fn execute_effect(
         Effect::SessionResync { session_id } => {
             app.lock().await.state.sync.full_synced.remove(&session_id);
             let _ = state::sync::session_sync_shared(&**app, api.as_ref(), &session_id).await;
+        }
+        Effect::GoalRefresh { session_id } => {
+            // A failed read keeps what is shown: the next signal retries.
+            if let Ok(goal) = api.session_goal(&Location::default(), &session_id).await {
+                let goals = &mut app.lock().await.state.sync.goal;
+                match goal {
+                    Some(goal) => goals.insert(session_id, goal),
+                    None => goals.remove(&session_id),
+                };
+            }
         }
         Effect::WorkflowsRefresh { definitions } => {
             let location = workflow_runs_location(&*app.lock().await);

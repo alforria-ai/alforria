@@ -279,7 +279,7 @@ impl SessionPrompt {
     pub async fn command(&self, input: CommandInput) -> Result<WithParts, PromptError> {
         let deps = &self.deps;
         if input.command == "goal" {
-            return match self.goal_command(&input.session_id, &input.arguments).await {
+            return match self.goal_command(&input).await {
                 Ok(Some(turn)) => turn,
                 // Nothing was said to the model: hand back where the
                 // conversation stands.

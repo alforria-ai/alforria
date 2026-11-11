@@ -574,6 +574,9 @@ kbd {
   display: inline-flex;
   gap: 2px;
 }
+.rail-row .badges .tag {
+  white-space: nowrap;
+}
 .rail-row .badges i {
   font: 500 10px/14px var(--f-mono);
   font-style: normal;
@@ -2382,6 +2385,46 @@ button.tool-row:hover {
 .work-row .detail.fault {
   color: var(--ink);
 }
+/* The session's goal: a lamp and a state code, then the objective (press to
+   read it whole), the reviewer's reason once it stops, and its controls. */
+.work-row .code {
+  flex: none;
+  font: 500 10.5px/1 var(--f-mono);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.work-row .code.active,
+.work-row .code.paused {
+  color: var(--ink);
+}
+.work-row.goal .what {
+  flex: 0 1 auto;
+  text-align: left;
+}
+.goal-full {
+  padding: 2px 0 6px 17px;
+  color: var(--ink-2);
+  overflow-wrap: anywhere;
+}
+.goal-full p {
+  margin: 0;
+  white-space: pre-wrap;
+}
+.goal-full .why {
+  margin-top: 4px;
+  color: var(--ink-3);
+}
+.sys-note.goal {
+  align-items: flex-start;
+}
+.sys-note.goal svg {
+  margin-top: 2px;
+}
+.sys-note.goal span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
 .link-btn {
   display: inline-flex;
   align-items: center;
@@ -2641,6 +2684,7 @@ button.tool-row:hover {
   .revert-dock .link-btn,
   .queue-dock .link-btn,
   .composer .queue-btn,
+  .work-row.goal .link-btn,
   .review-note .link-btn {
     min-height: 40px;
   }

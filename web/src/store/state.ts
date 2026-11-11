@@ -2,6 +2,7 @@
 // permission or question exists once however many views render it, and a
 // streamed delta touches exactly one part.
 import type {
+  Goal,
   SnapshotFileDiff,
   Message,
   Part,
@@ -50,6 +51,8 @@ export interface State {
   permissions: Record<string, PermissionRequest>
   questions: Record<string, QuestionRequest>
   todos: Record<string, Todo[]>
+  /** sessionID → its goal (`/goal`), kept live by `goal.changed`; absent when none is set. */
+  goals: Record<string, Goal>
   /** The latest `session.diff` per session (non-empty only after a revert, as in TS). */
   diffs: Record<string, SnapshotFileDiff[]>
   errors: Record<string, SessionError>
@@ -81,6 +84,7 @@ export function emptyState(): State {
     permissions: {},
     questions: {},
     todos: {},
+    goals: {},
     diffs: {},
     errors: {},
     loaded: {},

@@ -126,6 +126,7 @@ pub fn lines(app: &App, theme: &Theme, session_id: &str) -> Vec<Line<'static>> {
 /// joined by the `gap={1}` of the content box (`sidebar.tsx:48-86`).
 pub fn section_lines(app: &App, theme: &Theme, session_id: &str) -> Vec<Line<'static>> {
     let sections = vec![
+        goal_lines(app, theme, session_id),
         context_lines(app, theme, session_id),
         mcp_lines(app, theme),
         lsp_lines(app, theme),
@@ -293,6 +294,52 @@ fn is_truthy(value: Option<&Value>) -> bool {
         Some(Value::String(text)) => !text.is_empty(),
         Some(_) => true,
     }
+}
+
+/// The session's `/goal`: where it stands, the objective, and why it last
+/// changed. Nothing when the session has no goal.
+fn goal_lines(app: &App, theme: &Theme, session_id: &str) -> Vec<Line<'static>> {
+    let Some(goal) = app.state.sync.goal.get(session_id) else {
+        return Vec::new();
+    };
+    let (status, color) = match goal.status.as_str() {
+        "active" if goal.rounds > 0 => (format!("active · round {}", goal.rounds), theme.warning),
+        "active" => ("active".to_string(), theme.warning),
+        "complete" => ("achieved".to_string(), theme.success),
+        // Paused goals wait on the user.
+        _ => ("paused".to_string(), theme.error),
+    };
+    let mut rows = vec![
+        Line::from(vec![
+            Span::styled(
+                "Goal ",
+                Style::new()
+                    .fg(theme.text.to_color())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(status, color.to_color()),
+        ]),
+        Line::styled(clip(&goal.objective, GOAL_TEXT), theme.text.to_color()),
+    ];
+    if let Some(reason) = goal.reason.as_deref().filter(|_| goal.status != "active") {
+        rows.push(Line::styled(
+            clip(reason, GOAL_TEXT),
+            theme.text_muted.to_color(),
+        ));
+    }
+    rows
+}
+
+/// The most of an objective or reason the sidebar shows.
+const GOAL_TEXT: usize = 160;
+
+fn clip(text: &str, limit: usize) -> String {
+    let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if line.chars().count() <= limit {
+        return line;
+    }
+    let head: String = line.chars().take(limit - 1).collect();
+    format!("{head}…")
 }
 
 /// `internal:sidebar-todo` (`feature-plugins/sidebar/todo.tsx`) — the
@@ -846,6 +893,49 @@ mod tests {
             status: status.into(),
             priority: "high".into(),
         }
+    }
+
+    #[test]
+    fn goal_section_shows_status_objective_and_why_it_stopped() {
+        let mut app = app();
+        let theme = crate::ui::session::test_theme();
+        assert!(goal_lines(&app, &theme, "ses_1").is_empty());
+        let goal = |status: &str, rounds, reason: Option<&str>| crate::transport::api::Goal {
+            objective: "make\nthe tests pass".into(),
+            status: status.into(),
+            reason: reason.map(str::to_string),
+            rounds,
+        };
+        let shown = |app: &App| -> Vec<String> {
+            goal_lines(app, &theme, "ses_1").iter().map(text).collect()
+        };
+
+        app.state.sync.goal.insert(
+            "ses_1".into(),
+            goal("active", 2, Some("2 tests still fail")),
+        );
+        // The reviewer's last note is not a stop reason while it is running.
+        assert_eq!(
+            shown(&app),
+            ["Goal active · round 2", "make the tests pass"]
+        );
+
+        app.state.sync.goal.insert(
+            "ses_1".into(),
+            goal("paused", 2, Some("needs a deploy key")),
+        );
+        assert_eq!(
+            shown(&app),
+            ["Goal paused", "make the tests pass", "needs a deploy key"]
+        );
+
+        let mut long = goal("complete", 3, None);
+        long.objective = "x".repeat(500);
+        app.state.sync.goal.insert("ses_1".into(), long);
+        let rows = shown(&app);
+        assert_eq!(rows[0], "Goal achieved");
+        assert_eq!(rows[1].chars().count(), GOAL_TEXT);
+        assert!(rows[1].ends_with('…'));
     }
 
     #[test]

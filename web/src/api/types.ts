@@ -55,6 +55,28 @@ export interface MessageWithParts {
   parts: Part[]
 }
 
+// alforria extension — session goals (hand-written; the route and its event
+// sit outside the OpenAPI document).
+export interface Goal {
+  id: string
+  objective: string
+  status: "active" | "paused" | "complete"
+  /** The reviewer's last reason, or what paused it. */
+  reason?: string
+  /** Continuations sent so far. */
+  rounds: number
+  maxRounds: number
+  stalls?: number
+  boot: string
+  updatedAt: number
+}
+
+/** `goal.changed`: fires on every change; `null` means the goal was cleared. */
+export interface GoalChanged {
+  type: "goal.changed"
+  properties: { sessionID: string; goal: Goal | null }
+}
+
 // alforria extension — dynamic workflows (hand-written; no upstream schema).
 export type WorkflowSource = "project" | "global" | "external" | "builtin"
 export type WorkflowState = "queued" | "running" | "completed" | "failed" | "cancelled"

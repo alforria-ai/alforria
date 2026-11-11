@@ -12,6 +12,7 @@ import { autoAccepting } from "./queue/auto"
 import { state } from "../store/store"
 import { age, now } from "../ui/format"
 import { Icon } from "../ui/icons"
+import { GoalTag } from "./focus/goal"
 import { nowLabel } from "./table"
 
 /** A session that finished or failed while nobody was looking: an ink block and a word. */
@@ -231,6 +232,7 @@ export function Rail(props: {
                         <Show when={r.subagents.length}>
                           <RailFold id={id} subagents={r.subagents} onFold={props.onFold} />
                         </Show>
+                        <GoalTag id={id} />
                         <AutoTag id={id} />
                         <For each={cols()}>
                           {(i) => (

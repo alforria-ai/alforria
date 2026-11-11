@@ -67,6 +67,7 @@ beforeEach(() => {
     messages: vi.fn(async () => []),
     messagePage: vi.fn(async () => ({ items: [] })),
     todos: vi.fn(async () => []),
+    goal: vi.fn(async () => null),
     session: vi.fn(async () => Promise.reject(notFound())),
     providers: vi.fn(async () => ({ providers: [], default: {} })),
     vcs: vi.fn(async () => ({})),

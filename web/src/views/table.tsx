@@ -19,6 +19,7 @@ import { state } from "../store/store"
 import { age, money, now, tildify } from "../ui/format"
 import { Icon } from "../ui/icons"
 import { server } from "./server"
+import { GoalTag } from "./focus/goal"
 import { AutoTag, UnseenMark } from "./rail"
 
 const STATE_WORD: Record<FleetState, string> = {
@@ -182,6 +183,7 @@ function SessionRow(props: {
           <Show when={props.subagents.length}>
             <FoldToggle id={id()} subagents={props.subagents} onFold={props.onFold} />
           </Show>
+          <GoalTag id={id()} />
           <AutoTag id={id()} />
           <button
             class="row-more"

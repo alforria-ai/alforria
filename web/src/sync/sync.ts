@@ -8,6 +8,7 @@ import { anyDirectory, GLOBAL_PROJECT, HISTORY_WINDOW } from "../fleet/fleet"
 import {
   applyDirSnapshot,
   applyEarlier,
+  applyGoal,
   applyMessages,
   applySnapshot,
   applyTail,
@@ -121,6 +122,24 @@ export async function loadTranscript(sessionID: string) {
   } catch (err) {
     if (!notFound(err)) throw err
     forget(sessionID)
+    return
+  }
+  void loadGoal(sessionID)
+}
+
+/**
+ * A session's goal, read once with its transcript; `goal.changed` keeps it
+ * live after that. A server without the route simply has no goals.
+ */
+async function loadGoal(sessionID: string) {
+  try {
+    const directory = state.sessions[sessionID]?.directory ?? (await api.session(sessionID)).directory
+    await withSnapshot(
+      () => api.goal(sessionID, directory),
+      (d, goal) => applyGoal(d, sessionID, goal),
+    )
+  } catch {
+    // Not there to read: the event stream still reports changes.
   }
 }
 
@@ -227,9 +246,15 @@ async function loadRecentActivity() {
   await Promise.all(
     [...busy].filter(unread).map((id) =>
       withSnapshot(
-        () => Promise.all([api.messages(id, { limit: UNREAD_TAIL }), api.todos(id).catch(() => undefined)]),
-        (d, [list, todos]) => {
+        () =>
+          Promise.all([
+            api.messages(id, { limit: UNREAD_TAIL }),
+            api.todos(id).catch(() => undefined),
+            api.goal(id, state.sessions[id]!.directory).catch(() => undefined),
+          ]),
+        (d, [list, todos, goal]) => {
           if (todos) d.todos[id] = todos
+          if (goal !== undefined) applyGoal(d, id, goal)
           applyTail(d, id, list)
         },
         // A view may have opened it meanwhile: its full transcript wins.

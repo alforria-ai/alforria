@@ -227,6 +227,20 @@ pub struct MoveSessionDestination {
 /// The server API seam — one async trait method per generated SDK client
 /// call the TUI makes. Tests target `FakeApi` scriptable doubles (the
 /// sync reducer drives these).
+/// A session's `/goal` as `GET /session/{id}/goal` returns it (the fields
+/// the TUI shows).
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Goal {
+    pub objective: String,
+    /// `active` | `paused` | `complete`.
+    pub status: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub rounds: u64,
+}
+
 #[async_trait]
 pub trait ServerApi: Send + Sync {
     async fn path_get(&self, loc: &Location) -> Result<Value>;
@@ -271,6 +285,11 @@ pub trait ServerApi: Send + Sync {
         limit: Option<u64>,
     ) -> Result<Vec<MessageWithParts>>;
     async fn session_todo(&self, loc: &Location, session_id: &str) -> Result<Vec<TodoInfo>>;
+    /// alforria extension: the session's `/goal`. Test doubles keep the
+    /// default (no goal).
+    async fn session_goal(&self, _loc: &Location, _session_id: &str) -> Result<Option<Goal>> {
+        Ok(None)
+    }
     // alforria extension: dynamic workflows. Test doubles keep the defaults.
     async fn workflow_list(&self, _loc: &Location) -> Result<Vec<WorkflowDefinition>> {
         Err(anyhow!("workflows are not available"))
@@ -764,6 +783,11 @@ impl ServerApi for HttpServerApi {
 
     async fn session_todo(&self, loc: &Location, session_id: &str) -> Result<Vec<TodoInfo>> {
         self.get(&format!("/session/{}/todo", seg(session_id)), loc)
+            .await
+    }
+
+    async fn session_goal(&self, loc: &Location, session_id: &str) -> Result<Option<Goal>> {
+        self.get(&format!("/session/{}/goal", seg(session_id)), loc)
             .await
     }
 

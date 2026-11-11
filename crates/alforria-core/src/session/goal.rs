@@ -625,7 +625,7 @@ impl SessionPrompt {
         feedback.extend(next_step.as_deref());
         let text = continuation_text(&next.objective, Feedback::Reviewer(&feedback));
         drop(_claim);
-        self.send_goal_message(session_id, &next.id, None, text)
+        self.send_goal_message(session_id, &next.id, None, text, None)
             .await;
     }
 
@@ -707,20 +707,29 @@ impl SessionPrompt {
 
     /// Start a turn with a message from the goal loop. `visible` is shown to
     /// the user as their own words; `note` is for the model.
+    ///
+    /// `chosen` is the agent, model and variant picked in the client that
+    /// ran `/goal`; rounds the loop starts on its own keep the session's.
     async fn send_goal_message(
         &self,
         session_id: &str,
         goal_id: &str,
         visible: Option<String>,
         note: String,
+        chosen: Option<&crate::session::prompt::CommandInput>,
     ) -> Option<Result<WithParts, PromptError>> {
-        let agent = self
-            .deps
-            .services
-            .sessions
-            .get(session_id)
-            .ok()
-            .and_then(|session| session.agent.clone());
+        let agent = chosen.and_then(|input| input.agent.clone()).or_else(|| {
+            self.deps
+                .services
+                .sessions
+                .get(session_id)
+                .ok()
+                .and_then(|session| session.agent.clone())
+        });
+        let model = chosen
+            .and_then(|input| input.model.as_deref())
+            .map(crate::session::prompt::parse_model);
+        let variant = chosen.and_then(|input| input.variant.clone());
         let mut parts = Vec::new();
         if let Some(visible) = visible {
             parts.push(PromptPartInput::Text {
@@ -744,13 +753,13 @@ impl SessionPrompt {
             self.prompt(PromptInput {
                 session_id: session_id.to_string(),
                 message_id: None,
-                model: None,
+                model,
                 agent,
                 no_reply: None,
                 tools: None,
                 format: None,
                 system: None,
-                variant: None,
+                variant,
                 parts,
             })
             .await,
@@ -771,9 +780,9 @@ impl SessionPrompt {
     /// it only changed the goal, and `Err` with what to show otherwise.
     pub(crate) async fn goal_command(
         &self,
-        session_id: &str,
-        arguments: &str,
+        input: &crate::session::prompt::CommandInput,
     ) -> Result<Option<Result<WithParts, PromptError>>, String> {
+        let (session_id, arguments) = (input.session_id.as_str(), input.arguments.as_str());
         let session = self
             .deps
             .services
@@ -830,7 +839,7 @@ impl SessionPrompt {
                     Feedback::Note("The user resumed the goal."),
                 );
                 return Ok(self
-                    .send_goal_message(session_id, &resumed.id, None, text)
+                    .send_goal_message(session_id, &resumed.id, None, text, Some(input))
                     .await);
             }
             "clear" => {
@@ -867,6 +876,7 @@ impl SessionPrompt {
                 &created.id,
                 Some(format!("Goal: {text}")),
                 kickoff_text(text),
+                Some(input),
             )
             .await)
     }

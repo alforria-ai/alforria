@@ -5,6 +5,7 @@
 import type {
   Agent,
   Command,
+  Goal,
   SnapshotFileDiff,
   VcsFileDiff,
   MessageWithParts,
@@ -213,6 +214,8 @@ export const api = {
     return { items: body, next: headers.get("x-next-cursor") ?? undefined }
   },
   todos: (id: string) => request<Todo[]>("GET", `/session/${id}/todo`),
+  /** The session's goal, or `null`. An alforria extension: it takes the session's directory. */
+  goal: (id: string, directory: string) => request<Goal | null>("GET", `/session/${id}/goal`, { directory }),
   /** TS answers [] without a messageID; a turn's diff is its user message's `summary.diffs`. */
   diff: (id: string, messageID?: string) =>
     request<SnapshotFileDiff[]>("GET", `/session/${id}/diff`, { query: { messageID } }),

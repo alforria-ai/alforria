@@ -16,8 +16,9 @@ import { toast } from "../toast"
 import { setComposerDraft } from "./composer"
 import { replyMarkdown } from "./export"
 import { PartView } from "./parts"
+import { goalNoteOf } from "./goal-notes"
 import { noteOf, type Note } from "./subagent-notes"
-import { NoteView } from "./subagents"
+import { GoalNoteView, NoteView } from "./subagents"
 import { canRestoreFiles, isReverted, promptText, revertBoundary, revertTo } from "./revert"
 
 /**
@@ -341,10 +342,25 @@ function TurnView(props: {
     }
     return found
   }
+  // Nor has a goal continuation: every text part is the loop's, none the user's.
+  const goalNote = () => {
+    const u = user()
+    if (!u) return undefined
+    const texts = (state.parts[u.id] ?? [])
+      .map((pid) => state.part[pid] as { type?: string; synthetic?: boolean; text?: string } | undefined)
+      .filter((p) => p?.type === "text")
+    if (!texts.length || texts.some((p) => !p!.synthetic)) return undefined
+    for (const p of texts) {
+      const note = goalNoteOf(p!.text ?? "")
+      if (note) return note
+    }
+    return undefined
+  }
   return (
     <>
       <For each={notes()}>{(note) => <NoteView note={note} onOpen={props.onOpenSession} />}</For>
-      <Show when={!notes().length && user()}>
+      <Show when={goalNote()}>{(note) => <GoalNoteView note={note()} />}</Show>
+      <Show when={!notes().length && !goalNote() && user()}>
         {(u) => (
           <div class="msg msg-user" tabindex="-1" classList={{ reverted: props.reverted }}>
             <div class="msg-label">

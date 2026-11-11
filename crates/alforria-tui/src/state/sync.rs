@@ -64,6 +64,8 @@ pub struct SyncState {
     pub session_status: BTreeMap<String, SessionStatusInfo>,
     pub session_diff: BTreeMap<String, Vec<SnapshotFileDiff>>,
     pub todo: BTreeMap<String, Vec<TodoInfo>>,
+    /// Sessions with a `/goal`, by session id (alforria extension).
+    pub goal: BTreeMap<String, crate::transport::api::Goal>,
     pub message: BTreeMap<String, Vec<V1Message>>,
     pub part: BTreeMap<String, Vec<V1Part>>,
     pub lsp: Vec<Value>,

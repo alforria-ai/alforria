@@ -3,6 +3,8 @@
 // or the network.
 import type {
   GlobalEvent,
+  Goal,
+  GoalChanged,
   MessageWithParts,
   Part,
   Payload,
@@ -23,6 +25,11 @@ import { insertSorted, removeId, type State } from "./state"
 export function reduce(s: State, frame: GlobalEvent, replayed = false) {
   const ev = frame.payload
   s.conn.lastFrame = Date.now()
+  // An alforria extension, outside the generated event union.
+  if ((ev.type as string) === "goal.changed") {
+    const { sessionID, goal } = (ev as unknown as GoalChanged).properties
+    return applyGoal(s, sessionID, goal)
+  }
   switch (ev.type) {
     case "session.created":
     case "session.updated":
@@ -114,6 +121,12 @@ export function reduce(s: State, frame: GlobalEvent, replayed = false) {
   }
 }
 
+/** Set a session's goal; `null` (cleared, or none set) removes it. */
+export function applyGoal(s: State, sessionID: string, goal: Goal | null) {
+  if (goal) s.goals[sessionID] = goal
+  else delete s.goals[sessionID]
+}
+
 function upsertPart(s: State, part: Part) {
   s.part[part.id] = part
   insertSorted((s.parts[part.messageID] ??= []), part.id)
@@ -149,6 +162,7 @@ function dropSessionData(s: State, sessionID: string) {
   for (const mid of [...(s.messages[sessionID] ?? [])]) dropMessage(s, sessionID, mid)
   delete s.messages[sessionID]
   delete s.todos[sessionID]
+  delete s.goals[sessionID]
   delete s.diffs[sessionID]
   delete s.errors[sessionID]
   delete s.loaded[sessionID]
@@ -211,7 +225,7 @@ export function applySnapshot(
   ]
   for (const id of live) if (!sessions[id] && s.sessions[id]) sessions[id] = s.sessions[id]
   // Sessions that left the snapshot take their transcripts and records along.
-  const held = [s.sessions, s.messages, s.todos, s.diffs, s.errors, s.loaded].flatMap((m) => Object.keys(m))
+  const held = [s.sessions, s.messages, s.todos, s.goals, s.diffs, s.errors, s.loaded].flatMap((m) => Object.keys(m))
   for (const id of new Set(held)) if (!sessions[id] && !kept.has(id)) dropSessionData(s, id)
   s.sessions = sessions
   s.status = status

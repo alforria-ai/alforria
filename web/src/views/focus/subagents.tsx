@@ -6,6 +6,8 @@ import type { Session } from "../../api/types"
 import { fleetState, activity, lastError, type FleetState } from "../../fleet/derive"
 import { state } from "../../store/store"
 import { Icon } from "../../ui/icons"
+import { GoalRow } from "./goal"
+import { goalNoteLabel, type GoalNote } from "./goal-notes"
 import { firstLine, shortTitle, type Note } from "./subagent-notes"
 
 export function NoteView(props: { note: Note; onOpen: (id: string, beside: boolean) => void }) {
@@ -29,6 +31,19 @@ export function NoteView(props: { note: Note; onOpen: (id: string, beside: boole
         </div>
       )}
     </Show>
+  )
+}
+
+/** A goal continuation: the loop's prompt, said as what happened plus what the reviewer noted. */
+export function GoalNoteView(props: { note: GoalNote }) {
+  return (
+    <div class="sys-note goal">
+      <Icon name="history" />
+      <span>
+        {goalNoteLabel(props.note)}
+        <For each={props.note.feedback}>{(line) => <> · {line}</>}</For>
+      </span>
+    </div>
   )
 }
 
@@ -91,7 +106,7 @@ function rows(parent: string): Row[] {
   )
 }
 
-/** The list above the composer: who is working on what, and the todo in progress. */
+/** The list above the composer: the goal, who is working on what, and the todo in progress. */
 export function WorkStatus(props: { sessionID: string; onOpen: (id: string, beside: boolean) => void }) {
   const subagents = createMemo(() => rows(props.sessionID))
   const todos = () => state.todos[props.sessionID] ?? []
@@ -99,8 +114,9 @@ export function WorkStatus(props: { sessionID: string; onOpen: (id: string, besi
   const current = () => open().find((todo) => todo.status === "in_progress") ?? open()[0]
   const done = () => todos().filter((todo) => todo.status === "completed").length
   return (
-    <Show when={subagents().length || current()}>
+    <Show when={state.goals[props.sessionID] || subagents().length || current()}>
       <div class="work-status">
+        <GoalRow sessionID={props.sessionID} />
         <For each={subagents()}>
           {(row) => (
             <div class="work-row">

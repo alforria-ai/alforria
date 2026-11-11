@@ -27,8 +27,65 @@ pre-1.0, so minor releases may include breaking changes.
   the toggle says how many subagents are working or waiting. Nested subagents
   indent one step per level.
 
+- `/goal <objective>` keeps a session working until a reviewer agrees the
+  objective is met. After each turn the model judges the conversation against
+  the objective, with no tools, and either finishes the goal or sends the
+  session on with its notes. It stops when the user stops the session, when a
+  turn fails, when the reviewer says the user is needed, after 3 rounds
+  without progress, after 50 rounds, or when the server restarts. `/goal
+  pause`, `resume` and `clear` control it. The TUI sidebar and the web client
+  show the goal; `GET /session/{id}/goal` and the `goal.changed` event expose
+  it.
+- A forked session starts with a note telling the model it is a fork, so it
+  does not wait on or redo background work that belongs to the original.
+- `alforria migrate` moves an install from the `opencode` directories to
+  alforria's own (see Changed). `--copy` copies the data instead of moving it,
+  `--fresh` starts a new database and keeps the saved logins, `--dry-run`
+  previews.
+- Remote MCP servers stay signed in: OAuth tokens refresh before they expire
+  and on a 401.
+- ACP clients are told when a turn is waiting on a provider retry.
+
 ### Fixed
 
+- A file path containing `..` could write, search or read outside the project
+  without the `external_directory` prompt, through `apply_patch`, `grep`,
+  `glob` and `lsp`.
+- `webfetch` followed redirects without checking them against the `webfetch`
+  permission, accepted credentials in the URL, and buffered a response of any
+  size before applying the 5 MB limit.
+- Shell redirections (`> file`) now count for `external_directory`, and a
+  command made only of a redirection still needs the `bash` permission.
+- A patch that moved a file onto itself deleted it.
+- Undoing a turn that renamed a file restores the original path.
+- A custom command no longer re-expands `$1` or `$ARGUMENTS` typed as an
+  argument, and `$0` stays literal.
+- A session title can no longer inject terminal escape sequences through the
+  TUI's window title.
+- MCP logins were forgotten on every restart, and saving one login erased the
+  others.
+- `~` expands in a local MCP server's `cwd`.
+- OpenAI-compatible streams: an error sent inside the stream is reported as
+  what it is (rate limit, context overflow, authentication) instead of an
+  undecodable event; keepalive frames, frames without `choices` and tool-call
+  deltas without an `index` are accepted; a tool call cut off by the output
+  limit no longer fails the turn; cached tokens are counted wherever the
+  provider reports them.
+- Context-overflow detection recognises LiteLLM, DeepInfra, Novita, Z.ai,
+  Nova and Workers AI wording, and no longer mistakes an output-limit error or
+  Bedrock throttling for overflow.
+- Anthropic: a usage-only `message_delta` no longer ends the message twice,
+  and thinking from another model is not replayed without a signature.
+- Gemini: tool-use prompt tokens count as input.
+- ACP: an approved edit is no longer written twice; the command list arrives
+  after the response that announces the session; a permission answered in
+  another client is settled; a session opened and closed without a prompt is
+  deleted.
+- Web client: text that streamed in during an overlapping reload is no longer
+  truncated; the Changes pane no longer blanks when a turn ends; the
+  transcript keeps its reading position across Changes and Files; queued
+  follow-ups wait for the previous prompt to start; notifications from
+  same-titled sessions no longer replace each other.
 - A turn whose snapshots include a large unignored directory, such as
   `node_modules`, no longer costs tens of GB of memory and disk. Each turn keeps
   at most 4 MB of patches, with line counts for every file, the event log no
@@ -36,6 +93,14 @@ pre-1.0, so minor releases may include breaking changes.
 
 ### Changed
 
+- alforria keeps its global config, data, cache and state in `alforria`
+  directories (`~/.config/alforria`, `~/.local/share/alforria`, …) instead of
+  sharing upstream's `opencode` ones. opencode v2 migrates a shared database
+  to a schema alforria cannot read. An existing `opencode` directory is still
+  used until its `alforria` counterpart exists, so nothing changes for a
+  current install until `alforria migrate` is run. A database already migrated
+  by opencode v2 is refused with an explanation. Project-level `opencode.json`
+  and `.opencode/` are read as before.
 - A subagent that stops on a recoverable provider error resumes automatically,
   up to twice. If it still fails, its parent gets the partial output and how to
   continue it.
