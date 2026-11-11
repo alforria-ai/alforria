@@ -13,8 +13,9 @@
 //! `<number>_<area>_<what>.sql` with the next free number, and append it to
 //! [`MIGRATIONS`]. Never edit a file that has shipped, never rename an id
 //! and never reorder the list: the journal knows a migration by its id, and
-//! a database that has already run it must find the same id again.
-//! To change what a shipped migration did, add a new one that repairs it, as
+//! a database that has already run it must find the same id again. A test
+//! pins the hash of every body (`shipped_migration_bodies_are_pinned`); to
+//! change what a shipped migration did, add a new one that repairs it, as
 //! `0008_session_mark_backfill` does for `memory_0002_provenance`, whose
 //! body was once edited in place. The bodies an id used to have are kept
 //! under `alforria_migrations/test_data/` and only tests read them.
@@ -617,6 +618,70 @@ mod tests {
 
     fn demoted() -> (String, Option<bool>) {
         ("unverified".to_string(), Some(true))
+    }
+
+    /// A shipped migration is never edited: a database that already ran it
+    /// keeps the old result for ever, under the same journal id. That
+    /// happened once (`memory_0002_provenance`, repaired by 0008). The
+    /// hashes are of the bodies with `\n` line endings.
+    #[test]
+    fn shipped_migration_bodies_are_pinned() {
+        use sha2::{Digest, Sha256};
+        const PINNED: &[(&str, &str)] = &[
+            (
+                "0001_session_restriction",
+                "2e81edc344effae1b7af87042a69d46ec41180868dba0b2df0564a07045ce89d",
+            ),
+            (
+                "0002_outbox_create",
+                "4de716388aded6cae627de60e8540a84ec64e74237a26de39a81e968e8f56198",
+            ),
+            (
+                "trigger_0001_init",
+                "f33c6b4ae267f8d0b82196ee3b059f2bdb8087bf581e406da5cdc367d2d5f26b",
+            ),
+            (
+                "memory_0001_init",
+                "4f46423c619f5cdec3cec2761b545c91269b2c2c35ec5e3ec343b3f4914debb5",
+            ),
+            (
+                "memory_0002_provenance",
+                "b3e7e8f5e17d76c854b2c5ba5ce1fa6290cdb6b62e76c44435c702cf19def23f",
+            ),
+            (
+                "0006_session_mark",
+                "4e68e2abceac34b8ba942e1c25121b9d5e926848c117177944046514802dc3e5",
+            ),
+            (
+                "0007_session_ceiling",
+                "bf29a6e49e5db952c1278d34b24be67b67d8d7825f1707d83a752195773d277a",
+            ),
+            (
+                "0008_session_mark_backfill",
+                "08507915238e88562725d53d034ba76d2913013e7754944e91db15b53cb246b7",
+            ),
+        ];
+        for (id, sql) in MIGRATIONS {
+            let hash = format!("{:x}", Sha256::digest(sql.replace("\r\n", "\n")));
+            match PINNED.iter().find(|(pinned, _)| pinned == id) {
+                Some((_, pinned)) => assert_eq!(
+                    &hash, pinned,
+                    "the body of migration {id} changed. A migration that has shipped is never \
+                     edited: databases that already ran it would keep the old result under the \
+                     same id. Restore the file and add a NEW migration (the next free number, \
+                     appended to MIGRATIONS) that makes the change, with its hash here."
+                ),
+                None => panic!(
+                    "migration {id} has no pinned hash: add (\"{id}\", \"{hash}\") to PINNED \
+                     once its body is final. It must not change after that."
+                ),
+            }
+        }
+        assert_eq!(
+            PINNED.len(),
+            MIGRATIONS.len(),
+            "a pinned migration is gone from MIGRATIONS: shipped migrations are never removed"
+        );
     }
 
     /// M4. `memory_0002_provenance` had two bodies under one id. A database
