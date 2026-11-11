@@ -22,9 +22,10 @@
 //! and the shared name constants, so a new search location is protected
 //! where it is searched. One function, [`Protected::guards`], says whether
 //! a write may go ahead; every mutating file operation of the edit tools
-//! calls it with the destination it is about to modify
-//! ([`crate::tool::def::InstanceContext::about_to_modify`]) — enforcement
-//! does not depend on what a tool put in a permission ask.
+//! goes through it with the destination it is about to modify
+//! ([`crate::tool::def::InstanceContext::write_file`], `remove_file`, and
+//! `about_to_modify` for a check ahead of a batch) — enforcement does not
+//! depend on what a tool put in a permission ask.
 //!
 //! This is defence in depth, not the control: a session that may run `bash`
 //! writes any file the server's user can. What keeps a project from
@@ -46,11 +47,17 @@
 //!    path and never to the spelling, an error instead of a guess. It is
 //!    tested against the operating system. On top of it a guarded session
 //!    is refused a final component that is a symlink and a path through a
-//!    dangling one ([`landing`]): the write is not yet made through the
-//!    same directory handle (`openat` the parent, create the last component
-//!    with `O_NOFOLLOW`), which is what would also close the window in
-//!    which a link is swapped between the check and the write. A session
-//!    that can swap links has `bash` and needs no such trick.
+//!    dangling one ([`landing`]). And the write is made *on the landing
+//!    that was judged*, not on the name again: [`WriteGuard::admit`]
+//!    returns it, and [`write_at`] / [`remove_at`] / [`open_parent_of`]
+//!    open its parent from the root one component at a time with
+//!    `O_NOFOLLOW` (creating what is missing) and create, replace or
+//!    unlink the last component through that handle, not followed either
+//!    (`beneath::NoFollowDir`). There is no second resolution of the name
+//!    for a rename or a link swapped in between to redirect: such a write
+//!    fails. `write`, `edit`, `apply_patch` (through
+//!    `InstanceContext::write_file` / `remove_file`) and the upload route
+//!    write this way.
 //! 2. **the protected set is incomplete** — a place a loader reads is not
 //!    in it. The set is built from the loaders' own answers, a loader name
 //!    is refused anywhere, and for the config's `instructions` — globs,
@@ -63,6 +70,30 @@
 //!    project-level loader files alone. Host locations — the data, state,
 //!    cache, global and managed config directories, the binary's
 //!    directory — are lifted by nothing.
+//!
+//! # What the guard does not cover
+//!
+//! * **Other writers.** `bash`, a formatter, an LSP or MCP server, a
+//!   workflow script: anything that is not one of the guarded operations
+//!   above writes what the server's user can.
+//! * **A directory renamed afterwards.** The guard judges where a write
+//!   lands when it is made. A process that can rename inside the project —
+//!   which here means the session's own shell — can let the write land in
+//!   `plain/` and then rename `plain` to `.opencode`; no race is needed and
+//!   no check at the write can see it. Handle-based writing closes the
+//!   check-to-write window; it does not make names permanent.
+//! * **Platforms without `openat` (Windows).** There is no directory
+//!   handle to write through, so the write is made by name — with the
+//!   judged landing resolved again immediately before each step (creating
+//!   the directories, creating the file, the rename, the removal) and the
+//!   step refused when it no longer resolves to itself
+//!   (`beneath::NoFollowDir`'s non-Unix half, the one place this is
+//!   decided for every guarded write and the upload route). A link swapped
+//!   in between the judgement and that comparison is refused; one swapped
+//!   in between the comparison and the system call that follows it is not
+//!   seen. The window is an instant, not closed.
+//! * **Unguarded sessions.** The operator's own sessions have no guard and
+//!   write by name exactly as upstream does.
 //!
 //! # The resolver is shared
 //!
@@ -237,10 +268,11 @@ pub struct Refusal {
 
 /// Where a write to `target` lands, or why it cannot be said:
 /// [`resolve_path`] — the kernel's own reading, `..` and links included —
-/// with two shapes refused rather than followed, because the write is not
-/// (yet) made through the same directory handle: a final component that is
-/// a symlink, and a path that goes through a dangling one. An error from
-/// the resolver is a refusal.
+/// with two shapes refused rather than followed: a final component that is
+/// a symlink, and a path that goes through a dangling one (a guarded
+/// session has no business writing through either, and the write, made on
+/// the landing with no link followed, would not create the latter's
+/// target). An error from the resolver is a refusal.
 pub fn landing(target: &Path) -> Result<PathBuf, String> {
     let landing = resolve_path(target)
         .map_err(|error| format!("{} cannot be resolved ({error})", target.display()))?;
@@ -418,10 +450,18 @@ impl Protected {
 
     /// Why a write to `target` is refused, if it is.
     pub fn guards(&self, target: &Path) -> Option<Refusal> {
+        self.judge(target).err()
+    }
+
+    /// Where a write to `target` lands ([`landing`]) when it may go ahead;
+    /// why not otherwise. The landing returned is the one that was judged:
+    /// a caller that writes there through [`write_at`] writes what was
+    /// judged and nothing else.
+    pub fn judge(&self, target: &Path) -> Result<PathBuf, Refusal> {
         let landing = match landing(target) {
             Ok(landing) => landing,
             Err(reason) => {
-                return Some(Refusal {
+                return Err(Refusal {
                     class: Class::Host,
                     reason,
                     landing: None,
@@ -429,7 +469,7 @@ impl Protected {
             }
         };
         let refusal = |class, reason: String| {
-            Some(Refusal {
+            Err(Refusal {
                 class,
                 reason,
                 landing: Some(landing.clone()),
@@ -477,7 +517,7 @@ impl Protected {
                 ),
             );
         }
-        None
+        Ok(landing)
     }
 
     /// The protected location `directory` overlaps — one contains the
@@ -510,8 +550,18 @@ pub struct WriteGuard {
 impl WriteGuard {
     /// Whether the write to `target` may go ahead; `Err` is why not.
     pub fn check(&self, target: &Path) -> Result<(), String> {
-        let Some(refusal) = self.protected.guards(target) else {
-            return Ok(());
+        self.admit(target).map(|_| ())
+    }
+
+    /// [`WriteGuard::check`], answering with where the write lands: the
+    /// resolved path that was judged (or that a grant was found for). The
+    /// write is then made there through the directory handle
+    /// ([`write_at`], [`remove_at`]), so what is written is what was
+    /// judged.
+    pub fn admit(&self, target: &Path) -> Result<PathBuf, String> {
+        let refusal = match self.protected.judge(target) {
+            Ok(landing) => return Ok(landing),
+            Err(refusal) => refusal,
         };
         let grant = crate::project_files::EDIT_LOADER_PERMISSION;
         let lifted = refusal.class == Class::Loader
@@ -525,8 +575,8 @@ impl WriteGuard {
                 self.policy.explicitly_allows(grant, &absolute)
                     || relative.is_ok_and(|path| self.policy.explicitly_allows(grant, &path))
             });
-        if lifted {
-            return Ok(());
+        if let (true, Some(landing)) = (lifted, &refusal.landing) {
+            return Ok(landing.clone());
         }
         Err(match refusal.class {
             Class::Loader => format!(
@@ -541,6 +591,93 @@ impl WriteGuard {
                 refusal.reason
             ),
         })
+    }
+}
+
+/// Write `contents` to `landing` — a path a guard judged
+/// ([`WriteGuard::admit`], [`Protected::judge`]): absolute, resolved, no
+/// link in it. Its directories are created and the file is created or
+/// truncated through the parent's handle, no component followed
+/// (`beneath::NoFollowDir`). Anything swapped in after the judgement — a
+/// link for a directory, a link for the file — makes this fail instead of
+/// landing the write where the link points.
+pub fn write_at(landing: &Path, contents: &[u8]) -> std::io::Result<()> {
+    #[cfg(any(test, feature = "fail-points"))]
+    fail_point::fire(landing);
+    crate::beneath::write_no_follow(landing, contents)
+}
+
+/// Remove the file at a judged `landing`, through the parent's handle; see
+/// [`write_at`].
+pub fn remove_at(landing: &Path) -> std::io::Result<()> {
+    #[cfg(any(test, feature = "fail-points"))]
+    fail_point::fire(landing);
+    crate::beneath::remove_no_follow(landing)
+}
+
+/// The parent directory of a judged `landing`, opened (and created) with no
+/// component followed, for a caller that writes in several steps — the
+/// upload route's temporary file and rename. See [`write_at`].
+pub fn open_parent_of(landing: &Path) -> std::io::Result<crate::beneath::NoFollowDir> {
+    #[cfg(any(test, feature = "fail-points"))]
+    fail_point::fire(landing);
+    let parent = landing.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "the path has no parent")
+    })?;
+    crate::beneath::NoFollowDir::open(parent, true)
+}
+
+/// Test instrumentation: run something between a guard's judgement of a
+/// path and the write that follows it, which is where a concurrent rename
+/// or link swap would have to happen. Compiled for tests only.
+#[cfg(any(test, feature = "fail-points"))]
+pub mod fail_point {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+
+    type Hook = Arc<dyn Fn(&Path) + Send + Sync>;
+    static HOOKS: Mutex<Vec<(u64, PathBuf, Hook)>> = Mutex::new(Vec::new());
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// Disarms its hook when dropped.
+    pub struct Armed(u64);
+
+    impl Drop for Armed {
+        fn drop(&mut self) {
+            HOOKS
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .retain(|(id, _, _)| *id != self.0);
+        }
+    }
+
+    /// Run `hook` with the judged landing before every guarded write that
+    /// lands under `under` (a test's own directory, so tests sharing a
+    /// process do not see each other's).
+    pub fn between_check_and_write(
+        under: &Path,
+        hook: impl Fn(&Path) + Send + Sync + 'static,
+    ) -> Armed {
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        HOOKS.lock().unwrap_or_else(|p| p.into_inner()).push((
+            id,
+            under.to_path_buf(),
+            Arc::new(hook),
+        ));
+        Armed(id)
+    }
+
+    pub(super) fn fire(landing: &Path) {
+        let hooks: Vec<Hook> = HOOKS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|(_, under, _)| landing.starts_with(under))
+            .map(|(_, _, hook)| hook.clone())
+            .collect();
+        for hook in hooks {
+            hook(landing);
+        }
     }
 }
 

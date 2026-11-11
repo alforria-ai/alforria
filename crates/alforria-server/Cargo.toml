@@ -35,6 +35,8 @@ reqwest = { workspace = true }
 http-body.workspace = true
 
 [dev-dependencies]
+# `protect::fail_point`: a swap between the write guard's check and the write.
+alforria-core = { workspace = true, features = ["fail-points"] }
 tempfile = "3"
 reqwest = { workspace = true }
 tokio-tungstenite = { workspace = true }

@@ -430,7 +430,11 @@ pre-1.0, so minor releases may include breaking changes.
   watch run), cannot write `opencode.json`, `.opencode/`, `AGENTS.md` and
   the other loader files with
   its edit tools (`permission.edit_loader: "allow"` in the host config hands
-  it back).
+  it back). Such a write, and an upload, is made on the resolved path that
+  was judged, through its directory's handle with no link followed, so a
+  rename or link swap between the check and the write cannot redirect it
+  (Unix; what the guard does not cover is listed in
+  `docs/unattended-server.md`).
 - When the global config does not load, a project's capability-bearing keys
   are not applied until it does (the load itself still degrades to defaults,
   as before).

@@ -746,9 +746,15 @@ which of the three it is, or it does not compile.
   the global config directory, the managed directory, the data, state and
   cache directories, the binary's directory, and what the config names
   (`OPENCODE_CONFIG*`, `skills.paths`, `workflows.paths`, local
-  `instructions`, globs included). A path with a `..` in it, one whose last
-  component is a symlink, and one through a dangling link are refused
-  outright in such a session: the guard does not guess where they lead.
+  `instructions`, globs included). The path is resolved the way the kernel
+  resolves it; one that cannot be (a `..` after a directory that does not
+  exist), one whose last component is a symlink, and one through a dangling
+  link are refused outright in such a session: the guard does not guess
+  where they lead. The write is then made on the resolved path that was
+  judged — its parent directory is opened from the root one component at a
+  time with no link followed, and the file is created, replaced or removed
+  through that handle — so a rename or a link swapped in between the check
+  and the write makes the write fail instead of redirecting it.
   The `edit_loader` permission in the host config hands back *project-level
   loader files*, per path (`"edit_loader": { "docs/AGENTS.md": "allow" }`, or
   `"allow"` for all of them) — a grant only a project wrote counts for
@@ -763,6 +769,15 @@ which of the three it is, or it does not compile.
   the host's permission ceiling, and project config restricted to keys that
   carry nothing. Deny `bash` (or run the agent as a user that cannot write
   these places) if the files themselves must be safe.
+
+  What the write guard does not cover:
+
+  | Not covered | Who can use it | What it means |
+  | --- | --- | --- |
+  | Writes by anything but `write`, `edit`, `apply_patch` and the upload route: `bash`, a formatter, an LSP or MCP server, a workflow script | The session itself, when its policy lets it run them | The guard never sees these. Deny `bash` and do not hand the session such helpers, or run the server as a user that cannot write the loader files |
+  | A directory renamed after the write: the write lands in `plain/`, then `plain` is renamed `.opencode` | A process able to rename inside the project while the session runs — in practice the session's own shell (`bash` allowed) or another local process of the same user | No race is involved and no check at the write can see it. It needs exactly the capability of the row above, so it adds nothing to it. The window between the guard's check and its write is closed (the write goes through the judged directory's handle); names changing afterwards are not something a write-time guard decides |
+  | The last instant of the check-to-write window on a platform without `openat` (Windows) | The same process, racing the write | There is no directory handle to write through. The write is made by name, with the judged path resolved again immediately before each step (creating directories, creating the file, the rename, a removal) and the step refused when the path has changed: a link swapped in before that comparison is refused, one swapped in between the comparison and the system call after it is followed. Unattended deployments are expected on Unix, where the window is closed |
+  | Sessions without a guard: the operator's own (not restricted, not started by outside input) | — | By design. They write by name, exactly as upstream does |
 - The host config (`server.*`, `shell_env`, `hook.*`) is never read from the
   project, whatever the agent writes there.
 

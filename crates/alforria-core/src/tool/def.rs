@@ -107,10 +107,85 @@ impl InstanceContext {
     /// will pass it to the filesystem, before it does. Enforcement lives
     /// here, at the write, and does not depend on what the tool put in a
     /// permission ask; a grant is looked up here too, for this path.
+    ///
+    /// This is the check alone — what a tool uses to refuse a whole batch
+    /// before it applies any of it. The write itself goes through
+    /// [`InstanceContext::write_file`] or [`InstanceContext::remove_file`],
+    /// which judge again and, in a guarded session, write what they judged.
     pub fn about_to_modify(&self, path: &Path) -> Result<(), ToolError> {
         match &self.write_guard {
             None => Ok(()),
             Some(guard) => guard.check(path).map_err(ToolError::Permission),
+        }
+    }
+
+    /// Create or overwrite `path` with `contents`, creating its
+    /// directories: **the one way a tool writes a file.**
+    ///
+    /// Without a write guard this is `create_dir_all` and `write` on the
+    /// path as given, as it always was. With one, the guard judges where
+    /// the path lands and the write is made *there*, through the resolved
+    /// parent directory's handle with no link followed
+    /// (`protect::write_at`): there is no second lookup of the name between
+    /// the judgement and the write for a concurrent rename or link swap to
+    /// redirect.
+    pub async fn write_file(&self, path: &Path, contents: &[u8]) -> Result<(), ModifyError> {
+        let Some(guard) = &self.write_guard else {
+            if let Some(parent) = path.parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(|error| ModifyError::CreateDir(parent.to_path_buf(), error))?;
+            }
+            return tokio::fs::write(path, contents)
+                .await
+                .map_err(ModifyError::Io);
+        };
+        let landing = guard.admit(path).map_err(ModifyError::Refused)?;
+        let contents = contents.to_vec();
+        tokio::task::spawn_blocking(move || crate::protect::write_at(&landing, &contents))
+            .await
+            .unwrap_or_else(|join| Err(std::io::Error::other(join.to_string())))
+            .map_err(ModifyError::Io)
+    }
+
+    /// Remove the file `path`: the one way a tool deletes a file. Guarded
+    /// like [`InstanceContext::write_file`].
+    pub async fn remove_file(&self, path: &Path) -> Result<(), ModifyError> {
+        let Some(guard) = &self.write_guard else {
+            return tokio::fs::remove_file(path).await.map_err(ModifyError::Io);
+        };
+        let landing = guard.admit(path).map_err(ModifyError::Refused)?;
+        tokio::task::spawn_blocking(move || crate::protect::remove_at(&landing))
+            .await
+            .unwrap_or_else(|join| Err(std::io::Error::other(join.to_string())))
+            .map_err(ModifyError::Io)
+    }
+}
+
+/// Why [`InstanceContext::write_file`] or [`InstanceContext::remove_file`]
+/// did not go through. The caller words the I/O failures as it always did.
+#[derive(Debug)]
+pub enum ModifyError {
+    /// The write guard refused the path.
+    Refused(String),
+    /// A parent directory could not be created.
+    CreateDir(std::path::PathBuf, std::io::Error),
+    /// The write or the removal itself failed.
+    Io(std::io::Error),
+}
+
+impl ModifyError {
+    /// The tool error, with `io` wording a failed write or removal and
+    /// `create_dir` a failed directory creation.
+    pub fn into_tool_error(
+        self,
+        create_dir: impl FnOnce(&Path, &std::io::Error) -> String,
+        io: impl FnOnce(&std::io::Error) -> String,
+    ) -> ToolError {
+        match self {
+            ModifyError::Refused(reason) => ToolError::Permission(reason),
+            ModifyError::CreateDir(parent, error) => ToolError::Failed(create_dir(&parent, &error)),
+            ModifyError::Io(error) => ToolError::Failed(io(&error)),
         }
     }
 }

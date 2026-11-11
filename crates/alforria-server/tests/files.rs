@@ -415,6 +415,51 @@ async fn an_upload_area_behind_a_link_is_where_the_link_leads() {
     assert!(!f.dirs.other.join("new").exists());
 }
 
+/// An upload is written through the handle of the directory that was
+/// judged: a link put in the way between the check and the write — here by
+/// a hook that runs exactly there — is not followed into `.opencode`.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_upload_is_not_redirected_by_a_swap_after_the_check() {
+    use alforria_core::protect::fail_point::between_check_and_write;
+    let signer = Signer::new();
+    let f = fixture(&signer);
+    let chat = bearer(&signer.token(AUDIENCE, "chat"));
+    let agents = f.dirs.repo.join(".opencode/agent");
+    std::fs::create_dir_all(&agents).unwrap();
+    std::fs::create_dir_all(f.dirs.repo.join("uploads/sub")).unwrap();
+    let repo = std::fs::canonicalize(&f.dirs.repo).unwrap();
+
+    let (at, moved, link_to) = (
+        repo.join("uploads/sub"),
+        repo.join("uploads/sub-was"),
+        repo.join(".opencode/agent"),
+    );
+    let armed = between_check_and_write(&repo.join("uploads/sub"), move |_| {
+        std::fs::rename(&at, &moved).unwrap();
+        std::os::unix::fs::symlink(&link_to, &at).unwrap();
+    });
+    let response = put(&f, Some(&chat), "uploads/sub/x.md", "", b"be sneaky").await;
+    let status = response.status();
+    drop(armed);
+    assert!(repo.join("uploads/sub").is_symlink(), "the swap happened");
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "{}",
+        body_string(response).await
+    );
+    assert_eq!(
+        std::fs::read_dir(&agents).unwrap().count(),
+        0,
+        "nothing was written into .opencode/agent"
+    );
+
+    // Without a swap the same upload goes through.
+    let response = put(&f, Some(&chat), "uploads/other/x.md", "", b"fine").await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+}
+
 /// The raw route with a bearer header: ranges, media types, and the same
 /// project boundary.
 #[tokio::test]

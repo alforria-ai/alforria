@@ -544,22 +544,33 @@ async fn upload(
         ));
     }
     let io = |err: std::io::Error| storage_error(&err);
-    let parent = target
-        .parent()
-        .ok_or_else(|| bad_request("path has no parent directory"))?
-        .to_path_buf();
-    tokio::fs::create_dir_all(&parent).await.map_err(io)?;
-    // Creating the directories may have followed a link that did not exist
-    // a moment ago; judge the final location again before writing to it.
-    let target = upload_target(&location, &target.display().to_string())?;
-    if crate::confine::restricted(&principal) {
-        restricted_upload_allowed(&ctx, &location, &target).map_err(forbidden)?;
-    }
-    let temporary = parent.join(format!(
+    let name = target
+        .file_name()
+        .ok_or_else(|| bad_request("path has no file name"))?
+        .to_os_string();
+    // The target has been resolved and judged; from here on it is not
+    // looked up by name again. Its parent is opened — and created — one
+    // component at a time with no link followed, and the temporary file
+    // and the rename go through that handle
+    // (`alforria_core::protect::open_parent_of`). A link put in the way
+    // after the judgement is a refusal, not a different destination.
+    let directory = {
+        let target = target.clone();
+        tokio::task::spawn_blocking(move || alforria_core::protect::open_parent_of(&target))
+            .await
+            .unwrap_or_else(|join| Err(std::io::Error::other(join.to_string())))
+            .map_err(|err| match err.kind() {
+                std::io::ErrorKind::PermissionDenied => {
+                    forbidden(format!("{path} changed while it was being written: {err}"))
+                }
+                _ => io(err),
+            })?
+    };
+    let temporary = std::ffi::OsString::from(format!(
         ".alforria-upload-{}",
         uuid::Uuid::new_v4().simple()
     ));
-    let mut file = tokio::fs::File::create(&temporary).await.map_err(io)?;
+    let mut file = tokio::fs::File::from_std(directory.create(&temporary, true).map_err(io)?);
     let mut written: u64 = 0;
     let mut stream = body.into_data_stream();
     let outcome: Result<(), Option<std::io::Error>> = async {
@@ -579,15 +590,15 @@ async fn upload(
     match outcome {
         Ok(()) => {}
         Err(cause) => {
-            let _ = tokio::fs::remove_file(&temporary).await;
+            let _ = directory.remove_file(&temporary);
             return Err(match cause {
                 None => too_large(limit),
                 Some(err) => io(err),
             });
         }
     }
-    if let Err(err) = tokio::fs::rename(&temporary, &target).await {
-        let _ = tokio::fs::remove_file(&temporary).await;
+    if let Err(err) = directory.rename(&temporary, &name) {
+        let _ = directory.remove_file(&temporary);
         return Err(io(err));
     }
     // Clients watching the project learn of the file like any other edit.

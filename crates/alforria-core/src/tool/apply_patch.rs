@@ -352,29 +352,13 @@ async fn run(
                         &bom::join(&change.new_content, change.bom),
                     )
                     .await?;
-                    instance.about_to_modify(Path::new(&change.file_path))?;
-                    tokio::fs::remove_file(&change.file_path)
-                        .await
-                        .map_err(|error| {
-                            ToolError::Failed(format!(
-                                "Failed to remove file {}: {error}",
-                                change.file_path
-                            ))
-                        })?;
+                    remove(instance, &change.file_path).await?;
                     updates.push((change.file_path.clone(), "unlink"));
                     updates.push((move_path.clone(), "add"));
                 }
             }
             "delete" => {
-                instance.about_to_modify(Path::new(&change.file_path))?;
-                tokio::fs::remove_file(&change.file_path)
-                    .await
-                    .map_err(|error| {
-                        ToolError::Failed(format!(
-                            "Failed to remove file {}: {error}",
-                            change.file_path
-                        ))
-                    })?;
+                remove(instance, &change.file_path).await?;
                 updates.push((change.file_path.clone(), "unlink"));
             }
             _ => {}
@@ -388,10 +372,7 @@ async fn run(
                         let source = bom::split(&String::from_utf8_lossy(&raw));
                         let joined = bom::join(&source.text, source.bom);
                         if !raw.is_empty() && joined.as_bytes() != raw.as_slice() {
-                            instance.about_to_modify(Path::new(edited))?;
-                            tokio::fs::write(edited, joined).await.map_err(|error| {
-                                ToolError::Failed(format!("Failed to write file {edited}: {error}"))
-                            })?;
+                            write_all(instance, edited, &joined).await?;
                         }
                     }
                 }
@@ -481,18 +462,28 @@ async fn write_all(
     path: &str,
     contents: &str,
 ) -> Result<(), ToolError> {
-    instance.about_to_modify(Path::new(path))?;
-    if let Some(parent) = std::path::Path::new(path).parent() {
-        tokio::fs::create_dir_all(parent).await.map_err(|error| {
-            ToolError::Failed(format!(
-                "Failed to create directory {}: {error}",
-                parent.display()
-            ))
-        })?;
-    }
-    tokio::fs::write(path, contents)
+    instance
+        .write_file(Path::new(path), contents.as_bytes())
         .await
-        .map_err(|error| ToolError::Failed(format!("Failed to write file {path}: {error}")))
+        .map_err(|error| {
+            error.into_tool_error(
+                |parent, error| format!("Failed to create directory {}: {error}", parent.display()),
+                |error| format!("Failed to write file {path}: {error}"),
+            )
+        })
+}
+
+/// Every removal of the patch tool (`InstanceContext::remove_file`).
+async fn remove(instance: &crate::tool::def::InstanceContext, path: &str) -> Result<(), ToolError> {
+    instance
+        .remove_file(Path::new(path))
+        .await
+        .map_err(|error| {
+            error.into_tool_error(
+                |_, error| format!("Failed to remove file {path}: {error}"),
+                |error| format!("Failed to remove file {path}: {error}"),
+            )
+        })
 }
 
 #[cfg(test)]
