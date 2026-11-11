@@ -922,7 +922,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         std::env::remove_var("OCPROVIDERS_TEST_ENV_KEY");
         let dir = tempfile::tempdir().unwrap();
-        let paths = GlobalPaths::resolve(PathBuf::from(dir.path()).join("home"));
+        let paths = GlobalPaths::resolve_with(PathBuf::from(dir.path()).join("home"), |_| None);
         let auth = FileAuthStore::new(paths.data.join("auth.json"));
         auth.set("anthropic", serde_json::json!({"type": "api", "key": "sk"}))
             .unwrap();

@@ -1784,7 +1784,7 @@ mod tests {
             lsp: Some(crate::config::schema::LspInfo::Entries(entries)),
             directory: temp.path().to_path_buf(),
             worktree: temp.path().to_path_buf(),
-            paths: crate::paths::GlobalPaths::resolve(temp.path().to_path_buf()),
+            paths: crate::paths::GlobalPaths::resolve_with(temp.path().to_path_buf(), |_| None),
             events: None,
             flags: crate::lsp::server::Flags::default(),
         };

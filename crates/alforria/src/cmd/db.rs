@@ -296,7 +296,8 @@ mod tests {
 
     #[test]
     fn database_path_is_data_opencode_db() {
-        let paths = alforria_core::GlobalPaths::resolve(std::path::PathBuf::from("/home"));
+        let paths =
+            alforria_core::GlobalPaths::resolve_with(std::path::PathBuf::from("/home"), |_| None);
         let path = database_path(&paths);
         assert!(path.ends_with("opencode.db"), "{}", path.display());
     }

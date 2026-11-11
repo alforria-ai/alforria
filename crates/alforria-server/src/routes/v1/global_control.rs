@@ -30,8 +30,8 @@ use crate::state::ServerContext;
 // ---------------------------------------------------------------------------
 
 /// `Global.Path.state` (`global.ts:14`).
-fn global_state_path() -> PathBuf {
-    alforria_core::GlobalPaths::from_env().state
+fn global_state_path(ctx: &ServerContext) -> PathBuf {
+    ctx.global_paths().state
 }
 
 /// `FSUtil.contains` — whether `path` stays inside `directory`.
@@ -79,8 +79,8 @@ fn publish(
 // ---------------------------------------------------------------------------
 
 /// `globalConfigFile` (config.ts:140-146).
-fn global_config_file() -> PathBuf {
-    let paths = alforria_core::GlobalPaths::from_env();
+fn global_config_file(ctx: &ServerContext) -> PathBuf {
+    let paths = ctx.global_paths();
     let candidates = [
         paths.config.join("opencode.jsonc"),
         paths.config.join("opencode.json"),
@@ -101,8 +101,10 @@ pub async fn global_health() -> Result<Response, ServerError> {
 }
 
 /// `configGet` (`handlers/global.ts:64-66`).
-pub async fn global_config_get() -> Result<Response, ServerError> {
-    let file = global_config_file();
+pub async fn global_config_get(
+    State(ctx): State<Arc<ServerContext>>,
+) -> Result<Response, ServerError> {
+    let file = global_config_file(&ctx);
     let value = match std::fs::read_to_string(&file) {
         Ok(text) if !text.trim().is_empty() => alforria_core::parse_jsonc(&text, &file)?,
         _ => json!({}),
@@ -123,7 +125,7 @@ pub async fn global_config_update(
     if !payload.is_object() {
         return Err(payload_error("Expected an object"));
     }
-    let file = global_config_file();
+    let file = global_config_file(&ctx);
     let before = std::fs::read_to_string(&file).unwrap_or_else(|_| "{}".to_string());
     let mut merged = if std::fs::exists(&file).unwrap_or(false) {
         alforria_core::parse_jsonc(&before, &file)?
@@ -332,12 +334,13 @@ pub async fn instance_dispose(
 
 /// `getPath` (`handlers/instance.ts:24-32`).
 pub async fn path_info(
+    State(ctx): State<Arc<ServerContext>>,
     axum::Extension(location): axum::Extension<LocationContext>,
 ) -> Result<Response, ServerError> {
-    let paths = alforria_core::GlobalPaths::from_env();
+    let paths = ctx.global_paths();
     Ok(json_ok(json!({
         "home": paths.home,
-        "state": global_state_path(),
+        "state": global_state_path(&ctx),
         "config": paths.config,
         "worktree": location.directory,
         "directory": location.directory,

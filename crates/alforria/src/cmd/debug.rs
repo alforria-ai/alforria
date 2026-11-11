@@ -979,7 +979,8 @@ mod tests {
     #[test]
     fn paths_pad_keys_to_ten_columns() {
         let (mut ui, captured) = Ui::capture(false);
-        let global = alforria_core::GlobalPaths::resolve(PathBuf::from("/home/user"));
+        let global =
+            alforria_core::GlobalPaths::resolve_with(PathBuf::from("/home/user"), |_| None);
         paths(&mut ui, &global);
         let stdout = captured.stdout();
         assert!(stdout.contains("home       /home/user\n"), "{stdout}");
@@ -1099,7 +1100,7 @@ mod tests {
             lsp: None,
             directory: dir.path().to_path_buf(),
             worktree: dir.path().to_path_buf(),
-            paths: alforria_core::GlobalPaths::resolve(dir.path().to_path_buf()),
+            paths: alforria_core::GlobalPaths::resolve_with(dir.path().to_path_buf(), |_| None),
             events: None,
             flags: alforria_core::lsp::server::Flags::from_env(),
         });

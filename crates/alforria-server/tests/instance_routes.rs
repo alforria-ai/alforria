@@ -745,6 +745,14 @@ fn git_fixture(_tag: &str) -> Fixture {
         Arc::new(EmptyUiBackend),
     );
     ctx.vcs = Arc::new(alforria_server::state::CoreVcs::default());
+    // Worktrees go under the fixture, whatever XDG_DATA_HOME says: the
+    // default is the process's own data directory.
+    ctx.worktree_deps = Arc::new(alforria_server::state::WorktreeDeps {
+        data_dir: dir.path().join("data"),
+        global_bus: ctx.global_bus.clone(),
+        instances: ctx.instances.clone(),
+        projects: ctx.projects.clone(),
+    });
     Fixture {
         _dir: dir,
         ctx: Arc::new(ctx),

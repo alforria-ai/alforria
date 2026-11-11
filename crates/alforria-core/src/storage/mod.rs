@@ -2,8 +2,8 @@
 
 pub mod alforria_migration;
 pub mod connection;
-pub mod maintenance;
 pub mod extension;
+pub mod maintenance;
 pub mod migration;
 pub mod schema;
 

@@ -302,6 +302,7 @@ pub fn fixture_with(
         models: Some(Arc::new(FixedModels)),
         input_models: Some(Arc::new(FixedInputModels)),
         share_http: None,
+        env: alforria_server::engine::no_ambient_env(),
     };
     let mut ctx =
         alforria_server::production_context(&ListenOptions::default(), paths.clone(), seams)

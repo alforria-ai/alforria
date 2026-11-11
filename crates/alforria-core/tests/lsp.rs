@@ -92,7 +92,7 @@ fn service_with_command(dir: &Path, command: Vec<String>) -> Arc<LspService> {
         lsp: Some(LspInfo::Entries(entries)),
         directory: dir.to_path_buf(),
         worktree: dir.to_path_buf(),
-        paths: GlobalPaths::resolve(dir.to_path_buf()),
+        paths: GlobalPaths::resolve_with(dir.to_path_buf(), |_| None),
         events: None,
         flags: Flags::default(),
     })

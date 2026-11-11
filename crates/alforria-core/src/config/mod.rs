@@ -7,8 +7,8 @@
 
 pub mod agent;
 pub mod command;
-pub mod host;
 pub mod extension;
+pub mod host;
 pub mod precedence;
 pub mod schema;
 pub mod v2_compat;

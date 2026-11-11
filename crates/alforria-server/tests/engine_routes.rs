@@ -195,7 +195,7 @@ struct Fixture {
 fn fixture(llm_text: &str) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("repo")).unwrap();
-    let paths = alforria_core::GlobalPaths::resolve(dir.path().to_path_buf());
+    let paths = alforria_core::GlobalPaths::resolve_with(dir.path().to_path_buf(), |_| None);
     let seams = EngineSeams {
         llm: Some(Arc::new(ScriptLlm {
             script: text_stream(llm_text),
@@ -203,6 +203,7 @@ fn fixture(llm_text: &str) -> Fixture {
         models: Some(Arc::new(FixedModels)),
         input_models: Some(Arc::new(FixedInputModels)),
         share_http: None,
+        env: alforria_server::engine::no_ambient_env(),
     };
     let mut ctx =
         alforria_server::production_context(&ListenOptions::default(), paths, seams).unwrap();
@@ -512,12 +513,13 @@ async fn session_create_auto_shares_when_config_auto() {
     )
     .unwrap();
     let share_http = Arc::new(RecordingShareHttp::default());
-    let paths = alforria_core::GlobalPaths::resolve(dir.path().to_path_buf());
+    let paths = alforria_core::GlobalPaths::resolve_with(dir.path().to_path_buf(), |_| None);
     let seams = EngineSeams {
         llm: None,
         models: None,
         input_models: None,
         share_http: Some(share_http.clone()),
+        env: alforria_server::engine::no_ambient_env(),
     };
     let mut ctx =
         alforria_server::production_context(&ListenOptions::default(), paths, seams).unwrap();

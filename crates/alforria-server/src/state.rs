@@ -1467,10 +1467,15 @@ impl alforria_core::catalog::Fetcher for NeverFetch {
 }
 
 pub fn default_catalog() -> CatalogSource {
-    let paths = alforria_core::GlobalPaths::from_env();
+    catalog_in(alforria_core::GlobalPaths::from_env().cache)
+}
+
+/// The catalog read from `cache`: a context built over explicit paths (a
+/// test's temporary ones) reads its own cache, not the user's.
+pub fn catalog_in(cache: PathBuf) -> CatalogSource {
     let cfg = alforria_core::CatalogConfig::from_env();
     let service = alforria_core::CatalogService::new(
-        paths.cache,
+        cache,
         alforria_core::CatalogConfig {
             disable_fetch: true,
             ..cfg
@@ -1594,6 +1599,11 @@ pub struct ServerContext {
     /// The worktree service (`worktree/index.ts`) + its dependencies.
     pub worktree: alforria_core::worktree::Worktree,
     pub worktree_deps: Arc<dyn alforria_core::worktree::Deps>,
+    /// The global directories this context was built over. `None` resolves
+    /// them from the environment at each use (the unwired contexts); the
+    /// production context pins the ones it was given, so a context built
+    /// over temporary directories never reads or writes the user's own.
+    pub paths: Option<alforria_core::GlobalPaths>,
     /// `Skill.Service` status list.
     pub skills: Arc<dyn StatusSeam>,
     /// `LSP.Service.status`.
@@ -1695,6 +1705,7 @@ impl ServerContext {
             auth_store: Arc::new(MemoryAuthStore::default()),
             vcs: Arc::new(NoVcs),
             worktree: alforria_core::worktree::Worktree::default(),
+            paths: None,
             worktree_deps: Arc::new(WorktreeDeps {
                 data_dir: alforria_core::GlobalPaths::from_env().data,
                 global_bus: global_bus_clone,
@@ -1724,6 +1735,13 @@ impl ServerContext {
     /// Context backed by an in-memory database and an instance factory that
     /// always fails — M6.1 routes never load instances; M6.3 replaces the
     /// factory.
+    /// See [`ServerContext::paths`].
+    pub fn global_paths(&self) -> alforria_core::GlobalPaths {
+        self.paths
+            .clone()
+            .unwrap_or_else(alforria_core::GlobalPaths::from_env)
+    }
+
     pub fn for_tests() -> ServerContext {
         Self::for_tests_with_auth(AuthConfig::new("alforria", None))
     }

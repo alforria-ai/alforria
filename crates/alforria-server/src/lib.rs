@@ -310,7 +310,7 @@ pub fn production_context(
     // M7.7: the provider-runtime inputs — the models-dev catalog and the
     // `auth.json` store shared by the routes and every instance engine.
     let runtime = engine::EngineRuntime {
-        catalog: state::default_catalog(),
+        catalog: state::catalog_in(paths.cache.clone()),
         auth: Arc::new(state::FileAuthStore::new(paths.data.join("auth.json"))),
         schedule: opts.schedule,
     };
@@ -366,6 +366,15 @@ pub fn production_context(
     ctx.vcs = Arc::new(state::CoreVcs::default());
     ctx.catalog = runtime.catalog;
     ctx.auth_store = runtime.auth;
+    ctx.paths = Some(paths.clone());
+    // Everything this context writes goes under the paths it was given:
+    // worktrees too, which defaulted to the process's own data directory.
+    ctx.worktree_deps = Arc::new(state::WorktreeDeps {
+        data_dir: paths.data.clone(),
+        global_bus: ctx.global_bus.clone(),
+        instances: ctx.instances.clone(),
+        projects: ctx.projects.clone(),
+    });
     let ctx = Arc::new(ctx);
     // Before the first request: no client sees a session a dead process
     // left mid-turn.
@@ -711,7 +720,7 @@ mod tests {
     #[test]
     fn production_factory_builds_services_and_maps_config_errors() {
         let root = tempfile::tempdir().unwrap();
-        let paths = alforria_core::GlobalPaths::resolve(root.path().join("home"));
+        let paths = alforria_core::GlobalPaths::resolve_with(root.path().join("home"), |_| None);
         std::fs::create_dir_all(root.path().join("data")).unwrap();
         let storage = Arc::new(Storage::open(root.path().join("data/db.sqlite")).unwrap());
         let store = production_instance_factory(

@@ -807,6 +807,28 @@ pub struct EngineSeams {
     pub models: Option<Arc<dyn ModelSource>>,
     pub input_models: Option<Arc<dyn InputModels>>,
     pub share_http: Option<Arc<dyn alforria_core::share::ShareHttp>>,
+    /// Where the engine looks up ambient credentials (`LIBERTAI_API_KEY`
+    /// for the search backend). `None` is the process environment; a test
+    /// passes [`no_ambient_env`] so a key in the developer's shell cannot
+    /// change what the scripted model is offered.
+    pub env: Option<EnvLookup>,
+}
+
+/// See [`EngineSeams::env`].
+pub type EnvLookup = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+
+/// An [`EnvLookup`] that finds nothing.
+pub fn no_ambient_env() -> Option<EnvLookup> {
+    Some(Arc::new(|_| None))
+}
+
+impl EngineSeams {
+    fn env(&self, name: &str) -> Option<String> {
+        match &self.env {
+            Some(lookup) => lookup(name),
+            None => std::env::var(name).ok(),
+        }
+    }
 }
 
 /// `Shell.preferred` (core/shell.ts:205-208) — config value, else `$SHELL`,
@@ -862,12 +884,13 @@ fn prompt_options(
 fn search_backend(
     config: &alforria_core::config::schema::Config,
     auth: &dyn crate::state::AuthStore,
+    seams: &EngineSeams,
 ) -> Option<alforria_core::tool::websearch::HttpSearch> {
     use alforria_core::tool::websearch::HttpSearch;
     let websearch = config.websearch.clone().unwrap_or_default();
     let libertai_key = || {
-        std::env::var("LIBERTAI_API_KEY")
-            .ok()
+        seams
+            .env("LIBERTAI_API_KEY")
             .filter(|key| !key.is_empty())
             .or_else(|| {
                 let stored = auth.all().ok()?;
@@ -1178,7 +1201,7 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
         },
     ));
     // alforria's own search backend, if one is configured.
-    let search_backend = search_backend(&input.config, input.runtime.auth.as_ref());
+    let search_backend = search_backend(&input.config, input.runtime.auth.as_ref(), &input.seams);
     // A model the config declares under a name of its own can say what it
     // really is (`provider.<id>.models.<name>.family`).
     for (provider_id, provider) in input.config.provider.iter().flatten() {

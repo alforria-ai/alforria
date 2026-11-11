@@ -234,7 +234,7 @@ struct Server {
 async fn spawn_server(llm_text: &'static str) -> Server {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("repo")).unwrap();
-    let paths = alforria_core::GlobalPaths::resolve(dir.path().to_path_buf());
+    let paths = alforria_core::GlobalPaths::resolve_with(dir.path().to_path_buf(), |_| None);
     let seams = EngineSeams {
         llm: Some(Arc::new(ScriptLlm {
             script: text_stream(llm_text),
@@ -242,6 +242,7 @@ async fn spawn_server(llm_text: &'static str) -> Server {
         models: Some(Arc::new(FixedModels)),
         input_models: Some(Arc::new(FixedInputModels)),
         share_http: Some(Arc::new(StubShareHttp)),
+        env: alforria_server::engine::no_ambient_env(),
     };
     let mut ctx = alforria_server::production_context(&ListenOptions::default(), paths, seams)
         .expect("server context");

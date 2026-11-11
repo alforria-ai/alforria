@@ -58,6 +58,22 @@ impl MockServer {
     }
 }
 
+/// What a spawned binary inherits from the test runner: where programs
+/// are, and what the platform needs to start one. No credential, no
+/// directory of the developer's.
+const PASSED_THROUGH: &[&str] = &[
+    "PATH",
+    "TMPDIR",
+    // Windows: process creation and the shell need these.
+    "SystemRoot",
+    "SYSTEMROOT",
+    "SystemDrive",
+    "TEMP",
+    "TMP",
+    "PATHEXT",
+    "COMSPEC",
+];
+
 /// One e2e environment, isolated HOME + XDG dirs and a project directory
 /// whose `opencode.json` wires the mock provider at the given LLM URL.
 pub struct Env {
@@ -146,10 +162,24 @@ impl Env {
         .expect("write opencode.json");
     }
 
+    /// The binary, with nothing of the developer's environment but `PATH`:
+    /// a temporary home and XDG directories, the model fixture, and no
+    /// inherited provider key, token or real directory. A spawned test
+    /// process must never read or write the owner's own files.
     pub fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_alforria"));
+        command.env_clear();
+        for name in PASSED_THROUGH {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
         command
             .args(args)
+            // Anything that falls back to the OS home (a login shell, git,
+            // `~` expansion) lands in the temporary one.
+            .env("HOME", &self.home)
+            .env("USERPROFILE", &self.home)
             .env("OPENCODE_TEST_HOME", &self.home)
             .env("PWD", self.project_dir())
             .env("XDG_CONFIG_HOME", self.home.join(".config"))
