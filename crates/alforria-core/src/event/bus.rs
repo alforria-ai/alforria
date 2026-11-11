@@ -33,6 +33,45 @@ pub const CHANNEL_CAPACITY: usize = 1024;
 /// Capacity for the per-aggregate durable wake channels (TS `PubSub.sliding(1)`).
 pub const WAKE_CAPACITY: usize = 32;
 
+/// Events a durable stream reads from the log at a time.
+const DURABLE_PAGE: usize = 256;
+
+/// The event type of the marker a durable stream starts with when the
+/// events its reader asked to resume from are gone (an alforria extension).
+/// A client that sees it must load the session afresh instead of applying
+/// what follows to what it has.
+pub const EVENT_RESET: &str = "event.reset";
+
+/// A hole between where a reader left off and what the log still holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DurableGap {
+    /// The sequence the reader resumed after (`-1` for the start).
+    pub after: i64,
+    /// The first sequence the log still holds; `latest + 1` when it holds
+    /// none.
+    pub earliest: i64,
+    pub latest: i64,
+}
+
+impl DurableGap {
+    /// The marker frame for this gap.
+    pub fn marker(&self, aggregate_id: &str) -> Payload {
+        Payload {
+            id: new_event_id(),
+            metadata: None,
+            r#type: EVENT_RESET.to_string(),
+            durable: None,
+            location: None,
+            data: serde_json::json!({
+                "sessionID": aggregate_id,
+                "after": self.after,
+                "earliest": self.earliest,
+                "latest": self.latest,
+            }),
+        }
+    }
+}
+
 /// In-memory listener callback (`Subscriber` in `event.ts:18`).
 pub type Listener = Arc<dyn Fn(&Payload) + Send + Sync>;
 
@@ -279,6 +318,33 @@ impl EventBus {
             buffer: VecDeque::new(),
             wake,
         }
+    }
+
+    /// Whether the log no longer holds the events right after `after`
+    /// (`None` reads from the start, as [`Self::durable_stream`] does):
+    /// retention dropped them, and a reader resuming there would miss them
+    /// without knowing. Always `None` for a log nothing was pruned from.
+    pub fn durable_gap(
+        &self,
+        aggregate_id: &str,
+        after: Option<i64>,
+    ) -> Result<Option<DurableGap>, CoreError> {
+        let after = after.unwrap_or(-1);
+        self.storage.with_connection(|conn| {
+            let latest = sql::latest_sequence(conn, aggregate_id)?;
+            if latest < 0 {
+                return Ok(None);
+            }
+            let earliest = sql::earliest_sequence(conn, aggregate_id)?.unwrap_or(latest + 1);
+            if earliest <= after + 1 {
+                return Ok(None);
+            }
+            Ok(Some(DurableGap {
+                after,
+                earliest,
+                latest,
+            }))
+        })
     }
 
     /// Replay a serialized event into the durable log (`event.ts:441-478`).
@@ -684,7 +750,7 @@ impl DurableStream {
 
     fn read_after(&self) -> Result<Vec<Payload>, CoreError> {
         let rows = self.storage.with_connection(|conn| {
-            sql::list_events_after(conn, &self.aggregate_id, self.last_seq)
+            sql::list_events_page(conn, &self.aggregate_id, self.last_seq, DURABLE_PAGE)
         })?;
         rows.iter()
             .map(|row| {
@@ -1193,6 +1259,79 @@ mod tests {
         diverged.data = serde_json::json!({"sessionID": "ses_1", "changed": true});
         let err = bus.replay(diverged, ReplayOpts::default()).unwrap_err();
         assert!(err.to_string().contains("Replay diverged"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_durable_stream_reads_a_long_log_in_pages_and_reports_pruned_history() {
+        let (bus, _dir) = bus_with_manifest();
+        let total = DURABLE_PAGE as i64 * 2 + 7;
+        for _ in 0..total {
+            bus.publish(
+                &durable_def(),
+                durable_data("ses_1"),
+                PublishOptions::default(),
+            )
+            .unwrap();
+        }
+        let mut stream = bus.durable_stream("ses_1", None);
+        for expected in 0..total {
+            let event = stream.next().await.unwrap().unwrap();
+            assert_eq!(event.durable().unwrap().seq, expected);
+            assert!(stream.buffer.len() < DURABLE_PAGE);
+        }
+
+        // Nothing pruned: no gap wherever a reader resumes.
+        assert_eq!(bus.durable_gap("ses_1", None).unwrap(), None);
+        assert_eq!(bus.durable_gap("ses_1", Some(3)).unwrap(), None);
+        assert_eq!(bus.durable_gap("ses_none", None).unwrap(), None);
+
+        // Retention drops everything through seq 99.
+        bus.storage
+            .with_connection(|conn| sql::prune_events(conn, "ses_1", 99, 10_000))
+            .unwrap();
+        let gap = DurableGap {
+            after: 40,
+            earliest: 100,
+            latest: total - 1,
+        };
+        assert_eq!(bus.durable_gap("ses_1", Some(40)).unwrap(), Some(gap));
+        assert_eq!(
+            bus.durable_gap("ses_1", None).unwrap(),
+            Some(DurableGap { after: -1, ..gap })
+        );
+        // Resuming at or past the cut misses nothing.
+        assert_eq!(bus.durable_gap("ses_1", Some(99)).unwrap(), None);
+        assert_eq!(bus.durable_gap("ses_1", Some(total)).unwrap(), None);
+        let marker = gap.marker("ses_1");
+        assert_eq!(marker.r#type, "event.reset");
+        assert_eq!(
+            marker.data,
+            serde_json::json!({
+                "sessionID": "ses_1", "after": 40, "earliest": 100, "latest": total - 1,
+            })
+        );
+
+        // A log with nothing left still says where it stands.
+        bus.storage
+            .with_connection(|conn| sql::prune_events(conn, "ses_1", total, 10_000))
+            .unwrap();
+        assert_eq!(
+            bus.durable_gap("ses_1", Some(40)).unwrap(),
+            Some(DurableGap {
+                after: 40,
+                earliest: total,
+                latest: total - 1,
+            })
+        );
+        // The next event carries on the numbering.
+        let next = bus
+            .publish(
+                &durable_def(),
+                durable_data("ses_1"),
+                PublishOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(next.durable().unwrap().seq, total);
     }
 
     #[test]

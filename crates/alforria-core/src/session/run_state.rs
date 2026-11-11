@@ -24,8 +24,10 @@ use alforria_schema::session_status::SessionStatusInfo;
 
 use crate::session::error::{BusyError, SessionError};
 use crate::session::message::WithParts;
+use crate::session::recovery::RunMarkers;
 use crate::session::status::SessionStatusService;
 use crate::CoreError;
+use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
 
 use crate::tool::def::BoxFuture;
@@ -592,6 +594,9 @@ pub struct SessionRunState {
     /// turn leaves the runner at once and winds down afterwards; shutdown
     /// waits on this, not on the runners.
     in_flight: Arc<AtomicU64>,
+    /// Where running turns are recorded for the next process to find, and
+    /// the instance directory they run in.
+    markers: Mutex<Option<(RunMarkers, PathBuf)>>,
 }
 
 struct InFlight(Arc<AtomicU64>);
@@ -599,6 +604,17 @@ struct InFlight(Arc<AtomicU64>);
 impl Drop for InFlight {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Removes a run marker when the work it brackets ends, however it ends: a
+/// turn cancelled by a shutdown is dropped, not finished, and must not look
+/// like one the process died in.
+struct MarkerGuard(RunMarkers, String);
+
+impl Drop for MarkerGuard {
+    fn drop(&mut self) {
+        self.0.end(&self.1);
     }
 }
 
@@ -616,6 +632,53 @@ impl SessionRunState {
             cancels: Mutex::new(HashMap::new()),
             cancel_listeners: Mutex::new(Vec::new()),
             in_flight: Arc::new(AtomicU64::new(0)),
+            markers: Mutex::new(None),
+        })
+    }
+
+    /// Record every turn this instance runs under `markers`, so a process
+    /// that dies mid-turn leaves word of it
+    /// ([`crate::session::recovery`]). Off until called.
+    pub fn track_runs(&self, markers: RunMarkers, directory: PathBuf) {
+        *self
+            .markers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((markers, directory));
+    }
+
+    /// `work`, bracketed by the session's run marker. The marker spans the
+    /// work itself, not the call: a caller joining a run already under way
+    /// starts nothing.
+    fn marked(
+        &self,
+        session_id: &str,
+        work: Work<WithParts, SessionError>,
+    ) -> Work<WithParts, SessionError> {
+        let Some((markers, directory)) = self
+            .markers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        else {
+            return work;
+        };
+        let session_id = session_id.to_string();
+        Arc::new(move || {
+            let (markers, directory, session_id, work) = (
+                markers.clone(),
+                directory.clone(),
+                session_id.clone(),
+                work.clone(),
+            );
+            Box::pin(async move {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_millis() as u64)
+                    .unwrap_or(0);
+                markers.begin(&session_id, &directory, now);
+                let _guard = MarkerGuard(markers, session_id);
+                (work)().await
+            })
         })
     }
 
@@ -782,6 +845,7 @@ impl SessionRunState {
         work: Work<WithParts, SessionError>,
     ) -> Result<WithParts, RunnerError<SessionError>> {
         let runner = self.runner(session_id, on_interrupt);
+        let work = self.marked(session_id, work);
         runner.ensure_running(cancel, self.tracked(work)).await
     }
 
@@ -795,6 +859,7 @@ impl SessionRunState {
         ready: Option<Latch>,
     ) -> Result<WithParts, SessionError> {
         let runner = self.runner(session_id, on_interrupt);
+        let work = self.marked(session_id, work);
         runner
             .start_shell(self.tracked(work), ready)
             .await

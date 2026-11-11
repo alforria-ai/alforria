@@ -88,7 +88,7 @@ fn prompt_input(session_id: &str, body: &str) -> PromptInput {
     prompt_input_for("msg_user1", session_id, body)
 }
 
-fn prompt_input_for(message_id: &str, session_id: &str, body: &str) -> PromptInput {
+pub(crate) fn prompt_input_for(message_id: &str, session_id: &str, body: &str) -> PromptInput {
     PromptInput {
         caller: crate::session::caller::Caller::Operator,
         session_id: session_id.to_string(),
@@ -1424,8 +1424,14 @@ mod tests {
         );
         // A goal another process is driving right now is left alone: several
         // alforria processes can share a data directory.
+        // (Not this process's own id: under another boot's name that is a
+        // server from before a reboot, and gone.)
+        #[cfg(unix)]
+        let neighbour = std::os::unix::process::parent_id();
+        #[cfg(not(unix))]
+        let neighbour = 1;
         let live = GoalState {
-            pid: Some(std::process::id()),
+            pid: Some(neighbour),
             ..stale.clone()
         };
         let other = create_engine_session(&e);
@@ -1437,6 +1443,23 @@ mod tests {
         assert_eq!(
             e.prompt.goals().read(&other.id).unwrap().status,
             GoalStatus::Active
+        );
+
+        // After a reboot the new server often gets the old one's id: a
+        // goal from another boot under this very id has no one driving it.
+        let rebooted = GoalState {
+            pid: Some(std::process::id()),
+            ..stale.clone()
+        };
+        let third = create_engine_session(&e);
+        std::fs::write(
+            dir.join(format!("{}.json", third.id)),
+            serde_json::to_vec(&rebooted).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            e.prompt.goals().read(&third.id).unwrap().status,
+            GoalStatus::Paused
         );
 
         // An ordinary prompt does not wake it.

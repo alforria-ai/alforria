@@ -1145,6 +1145,16 @@ impl SessionStore {
         Ok(result)
     }
 
+    /// `message_id` and every message after it, oldest first, with every
+    /// `summary.diffs` empty. Never write one back to the store.
+    pub fn messages_since(
+        &self,
+        session_id: &str,
+        message_id: &str,
+    ) -> Result<Vec<WithParts>, SessionError> {
+        self.messages.since(session_id, message_id)
+    }
+
     /// One message with its parts (`MessageV2.get`, message-v2.ts:506-519).
     pub fn get_message(
         &self,

@@ -382,6 +382,7 @@ impl RuntimeModels {
                 output: model["limit"]["output"].as_f64().unwrap_or(0.0),
             },
             output_token_max: self.0.output_token_max,
+            media: media_support(&model),
         })
     }
 
@@ -865,16 +866,38 @@ impl RouteLlmSender {
     }
 }
 
+/// What media a runtime model takes. An image goes to a model that lists
+/// the image modality, or that is declared to take attachments at all:
+/// catalogs differ on which of the two they fill in.
+fn media_support(model: &Value) -> alforria_core::session::media::MediaSupport {
+    let capabilities = &model["capabilities"];
+    alforria_core::session::media::MediaSupport {
+        image: capabilities["input"]["image"].as_bool().unwrap_or(true)
+            || capabilities["attachment"].as_bool().unwrap_or(false),
+    }
+}
+
 impl RouteLlmSender {
     fn route_send(
         request: alforria_llm::schema::messages::LlmRequest,
         cancel: tokio_util::sync::CancellationToken,
+        retries: u32,
     ) -> BoxFuture<
         'static,
         Result<alforria_core::session::llm::LlmEventStream, alforria_llm::LlmError>,
     > {
         Box::pin(async move {
             let handle = request.model.route.clone();
+            // The executor's own default (two retries) would triple every
+            // attempt of the session's retry policy.
+            let executor = || {
+                alforria_llm::route::executor::RequestExecutor::new().with_retry_config(
+                    alforria_llm::route::executor::RetryConfig {
+                        max_retries: retries as usize,
+                        ..Default::default()
+                    },
+                )
+            };
             match handle.protocol_id.as_str() {
                 "anthropic-messages" => {
                     let route = Route {
@@ -882,7 +905,7 @@ impl RouteLlmSender {
                         protocol: Arc::new(
                             alforria_llm::protocols::anthropic_messages::AnthropicMessages,
                         ),
-                        executor: Default::default(),
+                        executor: executor(),
                     };
                     Ok(route.stream_with_halt(&request, cancel).await?)
                 }
@@ -890,7 +913,7 @@ impl RouteLlmSender {
                     let route = Route {
                         handle,
                         protocol: Arc::new(alforria_llm::protocols::openai_chat::OpenAiChat),
-                        executor: Default::default(),
+                        executor: executor(),
                     };
                     Ok(route.stream_with_halt(&request, cancel).await?)
                 }
@@ -900,7 +923,7 @@ impl RouteLlmSender {
                         protocol: Arc::new(
                             alforria_llm::protocols::openai_responses::OpenAiResponses,
                         ),
-                        executor: Default::default(),
+                        executor: executor(),
                     };
                     Ok(route.stream_with_halt(&request, cancel).await?)
                 }
@@ -908,7 +931,7 @@ impl RouteLlmSender {
                     let route = Route {
                         handle,
                         protocol: Arc::new(alforria_llm::protocols::gemini::Gemini),
-                        executor: Default::default(),
+                        executor: executor(),
                     };
                     Ok(route.stream_with_halt(&request, cancel).await?)
                 }
@@ -918,7 +941,7 @@ impl RouteLlmSender {
                         protocol: Arc::new(
                             alforria_llm::protocols::bedrock_converse::BedrockConverse,
                         ),
-                        executor: Default::default(),
+                        executor: executor(),
                     };
                     Ok(route.stream_with_halt(&request, cancel).await?)
                 }
@@ -946,7 +969,7 @@ impl LlmRequestSender for RouteLlmSender {
         'static,
         Result<alforria_core::session::llm::LlmEventStream, alforria_llm::LlmError>,
     > {
-        Self::route_send(request, tokio_util::sync::CancellationToken::new())
+        Self::route_send(request, tokio_util::sync::CancellationToken::new(), 0)
     }
 
     fn send_with_cancel(
@@ -957,7 +980,19 @@ impl LlmRequestSender for RouteLlmSender {
         'static,
         Result<alforria_core::session::llm::LlmEventStream, alforria_llm::LlmError>,
     > {
-        Self::route_send(request, cancel)
+        Self::route_send(request, cancel, 0)
+    }
+
+    fn send_with_retries(
+        &self,
+        request: alforria_llm::schema::messages::LlmRequest,
+        cancel: tokio_util::sync::CancellationToken,
+        retries: u32,
+    ) -> BoxFuture<
+        'static,
+        Result<alforria_core::session::llm::LlmEventStream, alforria_llm::LlmError>,
+    > {
+        Self::route_send(request, cancel, retries)
     }
 }
 

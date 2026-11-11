@@ -867,6 +867,34 @@ fn db() -> Command {
                         ),
                 ),
         )
+        .subcommand(
+            Command::new("prune")
+                .about("drop old events from the log; safe while alforria is running")
+                .long_about(
+                    "Drop durable events the retention policy no longer keeps, then fold the write-ahead log into the database file. Messages and sessions are untouched. Without flags the policy is `storage.retention.events` from the config; with neither, nothing is dropped.",
+                )
+                .arg(
+                    Arg::new("max-age")
+                        .long("max-age")
+                        .value_name("DURATION")
+                        .help("drop events older than this, e.g. 30d, 12h (default: storage.retention.events.max_age)"),
+                )
+                .arg(
+                    Arg::new("keep-last")
+                        .long("keep-last")
+                        .value_name("N")
+                        .value_parser(clap::value_parser!(u64).range(1..))
+                        .help("keep each session's newest N events whatever their age (default: storage.retention.events.keep_last)"),
+                )
+                .arg(
+                    Arg::new("vacuum")
+                        .long("vacuum")
+                        .action(clap::ArgAction::SetTrue)
+                        .help(
+                            "then shrink the file; stop alforria first, and have free disk the size of the database",
+                        ),
+                ),
+        )
 }
 
 fn show(ui: &Ui, out: &str) {

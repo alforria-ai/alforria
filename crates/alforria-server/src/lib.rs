@@ -13,6 +13,7 @@ pub mod policy;
 pub mod provider;
 pub mod provider_runtime;
 pub mod pty;
+pub mod recovery;
 pub mod routes;
 pub mod shutdown;
 pub mod sse;
@@ -242,6 +243,9 @@ pub fn production_context(
     let storage = Storage::open_default(&paths.data)
         .map_err(|err| io::Error::other(format!("storage open failed: {err}")))?;
     let storage = Arc::new(storage);
+    let global = global_config(&paths);
+    apply_synchronous(&storage, &global);
+    start_maintenance(&storage, &global);
     // The session durable manifest — required by the durable streams
     // (`/api/session/:id/event`, `/api/session/:id/history`).
     let manifest = Arc::new(alforria_core::session::event_definitions::SessionManifest::new());
@@ -310,7 +314,57 @@ pub fn production_context(
     ctx.vcs = Arc::new(state::CoreVcs::default());
     ctx.catalog = runtime.catalog;
     ctx.auth_store = runtime.auth;
-    Ok(Arc::new(ctx))
+    let ctx = Arc::new(ctx);
+    // Before the first request: no client sees a session a dead process
+    // left mid-turn.
+    recovery::sweep(
+        &ctx,
+        &paths.data,
+        alforria_core::session::recovery::ResumePolicy::from_config(&global),
+    );
+    Ok(ctx)
+}
+
+/// `storage.synchronous`.
+fn apply_synchronous(storage: &Storage, config: &alforria_core::config::schema::Config) {
+    use alforria_core::config::schema::SynchronousMode;
+    let mode = config
+        .storage
+        .as_ref()
+        .and_then(|storage| storage.synchronous);
+    if let Some(mode) = mode {
+        if let Err(error) = storage.set_synchronous(mode == SynchronousMode::Full) {
+            tracing::warn!("could not set storage.synchronous: {error}");
+        }
+    }
+}
+
+/// The merged global config, for what the server decides once rather than
+/// per directory. A config that does not load counts as empty here: the
+/// directory that needs it reports the error.
+pub(crate) fn global_config(
+    paths: &alforria_core::GlobalPaths,
+) -> alforria_core::config::schema::Config {
+    let params = alforria_core::LoadParams::new(paths.config.clone()).paths(paths.clone());
+    alforria_core::ConfigLoader::new()
+        .load(&params)
+        .map(|(config, _)| config)
+        .unwrap_or_else(|_| serde_json::from_str("{}").expect("an empty config decodes"))
+}
+
+/// Event-log retention (`storage.retention`) and write-ahead-log
+/// checkpoints: now, then periodically for as long as the server runs.
+/// Without a runtime to run on (the in-process server is built before the
+/// TUI starts one) the startup pass still happens.
+fn start_maintenance(storage: &Arc<Storage>, config: &alforria_core::config::schema::Config) {
+    use alforria_core::storage::maintenance;
+    let retention = maintenance::event_retention(config);
+    match tokio::runtime::Handle::try_current() {
+        Ok(_) => {
+            maintenance::spawn(storage, retention);
+        }
+        Err(_) => maintenance::run_once(storage, &retention),
+    }
 }
 
 /// The per-directory instance factory (TS `InstanceStore.boot` +
@@ -456,6 +510,12 @@ fn instance_for_directory(
         workspace_id: None,
     };
     services.set_instance_location(instance_location);
+    // Every turn leaves word that it is running, for the process that
+    // comes after one that dies mid-turn.
+    services.run_state.track_runs(
+        alforria_core::session::recovery::RunMarkers::new(&paths.data),
+        directory.to_path_buf(),
+    );
     // M7.2: the production engine for this instance — prompt facade,
     // revert/summary and the tool registry (`/experimental/tool`).
     engines.boot(&engine::EngineInput {

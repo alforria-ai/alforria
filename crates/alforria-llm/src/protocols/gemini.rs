@@ -188,7 +188,10 @@ struct GeminiToolConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct GeminiThinkingConfig {
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "alforria_schema::js_number::js_opt_f64"
+    )]
     thinking_budget: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     include_thoughts: Option<bool>,
@@ -197,13 +200,25 @@ struct GeminiThinkingConfig {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct GeminiGenerationConfig {
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "alforria_schema::js_number::js_opt_f64"
+    )]
     max_output_tokens: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "alforria_schema::js_number::js_opt_f64"
+    )]
     temperature: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "alforria_schema::js_number::js_opt_f64"
+    )]
     top_p: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "alforria_schema::js_number::js_opt_f64"
+    )]
     top_k: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stop_sequences: Option<Vec<String>>,

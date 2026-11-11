@@ -40,9 +40,10 @@ use crate::event::bus::{EventBus, PublishOptions};
 use crate::event::definition::Definition;
 use crate::session::error::SessionError;
 use crate::session::llm::StreamInput;
-use crate::session::message::{filter_compacted, latest, WithParts};
+use crate::session::message::{latest, WithParts};
 use crate::session::prompt::SessionPrompt;
 use crate::session::prompt_input::{PromptError, PromptInput, PromptPartInput};
+use crate::session::r#loop::HISTORY_WINDOW_BYTES;
 use crate::session::render::to_model_messages;
 use crate::session::run_state::RunnerError;
 
@@ -114,6 +115,9 @@ impl GoalState {
             return false;
         }
         match self.pid {
+            // After a reboot the new server often has the id the old one
+            // had: another boot's goal under this process's id is nobody's.
+            Some(pid) if pid == std::process::id() => true,
             Some(pid) => !process_alive(pid),
             // Written before owners were recorded.
             None => true,
@@ -648,8 +652,8 @@ impl SessionPrompt {
             .deps
             .services
             .messages
-            .stream_without_diffs(session_id)
-            .map(filter_compacted)
+            .window(session_id, HISTORY_WINDOW_BYTES)
+            .map(|window| window.messages)
             .unwrap_or_default();
         let stalled =
             same_reason(latest.reason.as_deref(), &reason) || !used_tools(&history, &latest.id);
@@ -730,8 +734,12 @@ impl SessionPrompt {
         let Ok(session) = deps.services.sessions.get(session_id) else {
             return Review::Failed("the session no longer exists".to_string());
         };
-        let history = match deps.services.messages.stream_without_diffs(session_id) {
-            Ok(history) => filter_compacted(history),
+        let history = match deps
+            .services
+            .messages
+            .window(session_id, HISTORY_WINDOW_BYTES)
+        {
+            Ok(window) => window.messages,
             Err(error) => return Review::Failed(error.to_string()),
         };
         let Some(user) = latest(&history).user else {
@@ -757,6 +765,7 @@ impl SessionPrompt {
             }
         };
         let mut messages = to_model_messages(&history, &model.render(), None);
+        crate::session::media::omit_unreadable_media(&mut messages, &model.media);
         messages.push(alforria_llm::schema::messages::Message::user(judge_text(
             &goal.objective,
         )));

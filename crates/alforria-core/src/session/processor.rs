@@ -566,6 +566,17 @@ fn source_error(error: &LlmError) -> SourceError {
     }
 }
 
+/// The wire error a failed request outside a processor run surfaces as.
+pub(crate) fn assistant_error(error: &LlmError, provider_id: &str) -> AssistantError {
+    from_error(
+        &source_error(error),
+        FromErrorCtx {
+            provider_id: provider_id.to_string(),
+            aborted: false,
+        },
+    )
+}
+
 /// The `APICallError` ai-sdk's `createJsonErrorResponseHandler` builds for
 /// a failed response: the provider's `error.message` when the body parses
 /// (the openai, openai-compatible, anthropic and google error schemas),

@@ -528,8 +528,8 @@ impl ProductionTaskOps {
         }
         let has_turns = self
             .messages
-            .stream(&parent_id)
-            .is_ok_and(|messages| !messages.is_empty());
+            .newest(&parent_id)
+            .is_ok_and(|newest| newest.is_some());
         if !has_turns {
             return;
         }

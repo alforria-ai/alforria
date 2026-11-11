@@ -56,6 +56,7 @@ fn test_model() -> ResolvedModel {
             output: 100.0,
         },
         output_token_max: None,
+        media: Default::default(),
     }
 }
 

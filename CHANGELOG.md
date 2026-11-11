@@ -98,6 +98,37 @@ pre-1.0, so minor releases may include breaking changes.
 - `shell_env` (global config) controls what the agent's shells inherit from
   the server's environment: `inherit` (`"all"`, `"none"` or a list), `allow`,
   `set` and `deny`.
+- `compaction.default_context`: the context window, in tokens, assumed for a
+  model that declares none (128,000 when unset).
+- A restart repairs the sessions the last process died in the middle of.
+  Every running turn leaves a marker on disk; at startup, before the first
+  request, a turn whose process is gone has its running tool calls closed as
+  errors ("interrupted by a server restart"), its assistant message
+  completed and its status set idle, so the history is valid for the next
+  prompt and no client sees a session stuck busy. A `session.interrupted`
+  event is published for each.
+- `server.resume` says what happens next: `"none"` (the default) leaves it
+  there, `"notify"` adds a note the model reads with the next prompt, and
+  `"continue"` prompts the model to carry on. A turn is resumed once: if the
+  server dies again while resuming, the turn is left with a note. Subagents
+  and `!shell` commands are repaired but never resumed, and `/goal` still
+  comes back paused.
+- `storage.synchronous`: `"full"` puts every commit on disk before it
+  returns, for machines that are stopped by being killed; `"normal"`, the
+  default and upstream's setting, never corrupts the database but can lose
+  the last few seconds on a power cut.
+- `storage.retention.events` bounds the event log, which until now only
+  shrank when a session was deleted: `max_age` (`"30d"`, `"12h"`, …) drops
+  older events, `keep_last` keeps each session's newest N whatever their age
+  (on its own, only those). The server applies it at startup and daily.
+  Unset, nothing is dropped. Messages and sessions are never touched.
+- `alforria db prune [--max-age <duration>] [--keep-last <n>] [--vacuum]`
+  applies that policy on demand.
+- `GET /api/session/{id}/event` starts with an `event.reset` frame when the
+  events after `after` have been pruned, so a client reloads the session
+  instead of silently missing them. Without retention it never appears.
+- The server folds the write-ahead log back into the database every five
+  minutes, so the `-wal` file no longer sits at its high-water mark.
 
 ### Fixed
 
@@ -116,6 +147,57 @@ pre-1.0, so minor releases may include breaking changes.
   (rather than as a value) need rewriting.
 - Stopping a session `shell` command (`POST /session/{id}/shell`) did not
   kill it: the command was never given the process group the stop signals.
+- A model that stayed unavailable (a 503 on every request) was asked three
+  times for each of the retry policy's attempts, because the HTTP client
+  retried twice by itself underneath it: eighteen requests where the policy
+  says one attempt and five retries. A turn's requests are now retried by
+  the policy alone, and the turn ends with the provider's error after the
+  fifth retry. Title generation keeps its own two HTTP retries.
+- An image sent to a model that takes no image input was dropped by the
+  provider without a word, and the model answered that nothing was attached.
+  The request now carries `[image omitted: the current model cannot read
+  images]` in its place, the message gets a note saying so (shown to the
+  person, never sent to the model), and a `session.media.omitted` event is
+  published. The stored message keeps its image for a model that can read
+  it. A custom model reads images when its config lists the `image` input
+  modality or sets `attachment: true`; one that declares neither is treated
+  as text-only, so a custom vision model must now say so.
+- Whole numbers in provider requests (`max_tokens`, `temperature`,
+  `budget_tokens`, …) are written as integers, `4096` rather than `4096.0`,
+  which some OpenAI-compatible servers refuse.
+- A goal armed before a reboot could stay "active" with nothing driving it
+  when the new server got the process id the old one had.
+- A session whose history no provider had counted (imported, or long and
+  never compacted) was sent whole on the next prompt, however large. The
+  request is now sized before it is sent, from the provider's own token
+  counts where there are any and from the size of the text where there are
+  none, and the session compacts first when it would not fit. A model with no
+  declared context limit is held to a default ceiling instead of none.
+- A request that still does not fit after three compactions in a row ends the
+  turn with a `ContextOverflowError` instead of compacting forever.
+- Compaction sent the whole history to be summarised in one request, so a
+  history larger than the context window could never be compacted and every
+  later prompt failed with "Conversation history too large to compact". The
+  history is now summarised in pieces that each fit, every piece building on
+  the summary of the ones before it, and is read from the database a page at
+  a time: a turn holds at most 8 MiB of history in memory, whatever the
+  session's size. A session already stuck in that state compacts on its next
+  prompt. When a provider refuses a summary request as too large (its real
+  limit is below the declared one), the pieces are halved and tried again.
+- Every step of a turn re-read the session's whole history from the
+  database, several times over, however much of it a compaction had already
+  put behind a summary. A step now reads back to the last compaction and no
+  further, so its cost follows the conversation since then, not the session's
+  age. The per-turn diff summary, pruning, goal review and subagent reports
+  got the same treatment, and a turn's tools share one copy of the history
+  instead of holding one each.
+- A reader of `GET /api/session/{id}/event` that was far behind got the
+  session's whole event log loaded into memory at once. It now arrives in
+  pages.
+- `GET /session/{id}/message` without `limit` built the whole history in
+  memory before answering. A history of 100 messages or more is now written
+  out a page at a time. Clients that can should still pass `limit` and page
+  with `before`.
 - A file path containing `..` could write, search or read outside the project
   without the `external_directory` prompt, through `apply_patch`, `grep`,
   `glob` and `lsp`.

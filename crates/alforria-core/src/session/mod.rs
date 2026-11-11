@@ -13,6 +13,7 @@ pub mod ids;
 pub mod instruction;
 pub mod llm;
 pub mod r#loop;
+pub mod media;
 pub mod message;
 pub mod overflow;
 pub mod permission;
@@ -20,6 +21,7 @@ pub mod processor;
 pub mod prompt;
 pub mod prompt_input;
 pub mod question;
+pub mod recovery;
 pub mod reminders;
 pub mod render;
 pub mod retry;
@@ -39,6 +41,8 @@ pub mod workflow_ops;
 
 #[cfg(test)]
 pub(crate) mod e2e;
+#[cfg(test)]
+pub(crate) mod long_session;
 #[cfg(test)]
 pub(crate) mod test_support;
 

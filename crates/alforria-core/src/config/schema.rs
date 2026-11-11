@@ -220,6 +220,24 @@ pub struct ServerInfo {
     pub directories: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upload: Option<super::host::UploadInfo>,
+    /// alforria extension: what to do, at startup, with a turn the last
+    /// process died in the middle of.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume: Option<ResumeMode>,
+}
+
+/// `server.resume`. Whatever it says, the interrupted turn's history is
+/// repaired first: its running tool calls are marked interrupted and its
+/// assistant message is completed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResumeMode {
+    /// Repair and leave it (the default).
+    None,
+    /// Repair, and leave a note the model reads with the next prompt.
+    Notify,
+    /// Repair, and prompt the model to carry on. A turn is resumed once.
+    Continue,
 }
 
 // ---------------------------------------------------------------------------
@@ -278,6 +296,108 @@ pub struct WorkflowsInfo {
         skip_serializing_if = "Option::is_none"
     )]
     pub claude_compat: Option<bool>,
+}
+
+// ---------------------------------------------------------------------------
+// storage (alforria extension)
+// ---------------------------------------------------------------------------
+
+/// A length of time written as a number and a unit: `45s`, `90m`, `12h`,
+/// `30d`, `2w`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfigDuration(pub std::time::Duration);
+
+impl ConfigDuration {
+    pub fn parse(text: &str) -> Option<ConfigDuration> {
+        let text = text.trim();
+        let digits = text.bytes().take_while(u8::is_ascii_digit).count();
+        let amount: u64 = text[..digits].parse().ok()?;
+        let unit = match text[digits..].trim() {
+            "s" => 1,
+            "m" => 60,
+            "h" => 60 * 60,
+            "d" => 24 * 60 * 60,
+            "w" => 7 * 24 * 60 * 60,
+            _ => return None,
+        };
+        Some(ConfigDuration(std::time::Duration::from_secs(
+            amount.checked_mul(unit)?,
+        )))
+    }
+
+    pub fn as_millis(self) -> u64 {
+        self.0.as_millis() as u64
+    }
+}
+
+impl Serialize for ConfigDuration {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let seconds = self.0.as_secs();
+        let text = [
+            (7 * 24 * 60 * 60, "w"),
+            (24 * 60 * 60, "d"),
+            (60 * 60, "h"),
+            (60, "m"),
+        ]
+        .iter()
+        .find(|(unit, _)| seconds > 0 && seconds.checked_rem(*unit) == Some(0))
+        .map(|(unit, name)| format!("{}{name}", seconds / unit))
+        .unwrap_or_else(|| format!("{seconds}s"));
+        serializer.serialize_str(&text)
+    }
+}
+
+impl<'de> Deserialize<'de> for ConfigDuration {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        ConfigDuration::parse(&text).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "expected a duration such as \"30d\", \"12h\" or \"90m\", got {text:?}"
+            ))
+        })
+    }
+}
+
+/// `storage.retention.events` — which durable events the log may drop.
+/// Unset, nothing is dropped. An event is kept when either rule keeps it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct EventRetentionInfo {
+    /// Drop events older than this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_age: Option<ConfigDuration>,
+    /// Keep this many of each session's newest events whatever their age;
+    /// on its own, keep only these.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_last: Option<PositiveInt>,
+}
+
+/// `storage.retention` — what the database sheds as it ages.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RetentionInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub events: Option<EventRetentionInfo>,
+}
+
+/// `storage.synchronous` — how hard SQLite pushes a commit to disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SynchronousMode {
+    /// Upstream's setting, and the default. A crash never corrupts the
+    /// database, but a machine that loses power (or is killed by its host)
+    /// can lose the last few seconds of commits.
+    Normal,
+    /// Every commit is on disk before it returns: nothing acknowledged is
+    /// lost, for one `fsync` per commit.
+    Full,
+}
+
+/// `storage` — how the database is kept.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct StorageInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention: Option<RetentionInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synchronous: Option<SynchronousMode>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1184,6 +1304,10 @@ pub struct CompactionInfo {
     pub preserve_recent_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reserved: Option<u64>,
+    /// alforria extension: the context window, in tokens, assumed for a model
+    /// that declares none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_context: Option<PositiveInt>,
 }
 
 /// `core/policy.ts` `Effect`.
@@ -1257,6 +1381,8 @@ pub struct Config {
     pub skills: Option<SkillsInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflows: Option<WorkflowsInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage: Option<StorageInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub references: Option<ReferenceInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1394,6 +1520,7 @@ fn collect_issues(value: &serde_json::Value) -> Vec<crate::SchemaIssue> {
             "command" => check!(issues, key, BTreeMap<String, CommandInfo>),
             "skills" => check!(issues, key, SkillsInfo),
             "workflows" => check!(issues, key, WorkflowsInfo),
+            "storage" => check!(issues, key, StorageInfo),
             "references" => check!(issues, key, ReferenceInfo),
             "reference" => check!(issues, key, ReferenceInfo),
             "watcher" => check!(issues, key, WatcherInfo),

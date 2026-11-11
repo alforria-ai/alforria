@@ -170,12 +170,8 @@ impl ProductionWorkflowOps {
     /// The model and variant of a session's latest turn. A fresh run session
     /// has none, and its agents use the default model.
     fn session_model(&self, session_id: &str) -> (Option<ModelRef>, Option<String>) {
-        // `stream` is newest-first.
-        let messages = self
-            .messages
-            .stream_without_diffs(session_id)
-            .unwrap_or_default();
-        match messages.first().map(|message| &message.info) {
+        let newest = self.messages.newest(session_id).unwrap_or_default();
+        match newest.as_ref().map(|message| &message.info) {
             Some(V1Message::Assistant {
                 model_id,
                 provider_id,

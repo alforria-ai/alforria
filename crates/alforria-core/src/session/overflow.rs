@@ -2,6 +2,8 @@
 //! the `ProviderTransform.maxOutputTokens` helper it depends on
 //! (transform.ts:18, 1468).
 
+use alforria_llm::schema::messages::{ContentPart, Message, ToolResultValue};
+use alforria_schema::llm::ToolContent;
 use alforria_schema::session_v1::V1StepTokens;
 
 use crate::config::schema::Config;
@@ -100,6 +102,140 @@ pub fn is_overflow(input: &IsOverflowInput<'_>) -> bool {
             model: input.model,
             output_token_max: input.output_token_max,
         })
+}
+
+// ---------------------------------------------------------------------------
+// Request sizing (alforria extension)
+// ---------------------------------------------------------------------------
+
+/// The context window assumed for a model that declares none (`limit.context`
+/// of 0), unless `compaction.default_context` says otherwise. Such a model
+/// stays "unknown" to [`is_overflow`]; this only bounds what is sent to it.
+pub const DEFAULT_CONTEXT_CEILING: f64 = 128_000.0;
+
+/// What one image or PDF is counted as: providers bill media by size on
+/// screen, not by the length of its base64.
+pub const MEDIA_TOKEN_ESTIMATE: f64 = 2_000.0;
+
+/// A token count for text no provider has counted yet. Three bytes per token
+/// overshoots prose and stays close for code, JSON and non-Latin text, where
+/// the usual four characters undershoots.
+pub fn conservative_tokens(bytes: usize) -> f64 {
+    (bytes as f64 / 3.0).ceil()
+}
+
+/// The limits to size a request against: the model's own, or the default
+/// ceiling when the model declares no context window.
+pub fn effective_limits(cfg: &Config, model: &ModelLimits) -> ModelLimits {
+    if js_truthy(model.context) {
+        return *model;
+    }
+    let ceiling = cfg
+        .compaction
+        .as_ref()
+        .and_then(|compaction| compaction.default_context)
+        .map(|ceiling| ceiling.get() as f64)
+        .unwrap_or(DEFAULT_CONTEXT_CEILING);
+    ModelLimits {
+        context: ceiling,
+        input: None,
+        output: model.output,
+    }
+}
+
+/// The tokens a request may hold: [`usable`] over [`effective_limits`].
+pub fn request_budget(cfg: &Config, model: &ModelLimits, output_token_max: Option<f64>) -> f64 {
+    usable(&UsableInput {
+        cfg,
+        model: &effective_limits(cfg, model),
+        output_token_max,
+    })
+}
+
+fn estimate_part(part: &ContentPart) -> f64 {
+    match part {
+        ContentPart::Text { text, .. } => conservative_tokens(text.len()),
+        ContentPart::Media { .. } => MEDIA_TOKEN_ESTIMATE,
+        ContentPart::ToolCall { name, input, .. } => {
+            conservative_tokens(name.len() + json_len(input))
+        }
+        ContentPart::ToolResult { name, result, .. } => {
+            conservative_tokens(name.len())
+                + match result {
+                    ToolResultValue::Json { value }
+                    | ToolResultValue::Text { value }
+                    | ToolResultValue::Error { value } => conservative_tokens(json_len(value)),
+                    ToolResultValue::Content { value } => value
+                        .iter()
+                        .map(|item| match item {
+                            ToolContent::Text { text } => conservative_tokens(text.len()),
+                            ToolContent::File { .. } => MEDIA_TOKEN_ESTIMATE,
+                        })
+                        .sum(),
+                }
+        }
+        ContentPart::Reasoning {
+            text, encrypted, ..
+        } => conservative_tokens(text.len() + encrypted.as_ref().map_or(0, String::len)),
+    }
+}
+
+fn json_len(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::String(text) => text.len(),
+        other => serde_json::to_string(other).map_or(0, |text| text.len()),
+    }
+}
+
+/// A conservative token count for rendered messages.
+pub fn estimate_messages(messages: &[Message]) -> f64 {
+    messages
+        .iter()
+        .map(|message| 4.0 + message.content.iter().map(estimate_part).sum::<f64>())
+        .sum()
+}
+
+/// A conservative token count for the fixed part of a request: the system
+/// prompt and the tool definitions.
+pub fn estimate_overhead<'a>(
+    system: &[String],
+    tools: impl Iterator<Item = (&'a str, &'a str, &'a serde_json::Value)>,
+) -> f64 {
+    let system: usize = system.iter().map(String::len).sum();
+    let tools: usize = tools
+        .map(|(name, description, schema)| name.len() + description.len() + json_len(schema))
+        .sum();
+    conservative_tokens(system + tools)
+}
+
+/// The tokens a provider recorded for a finished response: everything it
+/// was sent plus what it wrote.
+pub fn recorded_tokens(tokens: &V1StepTokens) -> f64 {
+    match tokens.total.filter(|total| js_truthy(*total)) {
+        Some(total) => total,
+        None => tokens.input + tokens.output + tokens.cache.read + tokens.cache.write,
+    }
+}
+
+/// The size of a request about to be sent.
+pub struct RequestSize<'a> {
+    /// The newest finished response's recorded tokens, when the provider
+    /// counted them and no compaction has replaced the history since. They
+    /// cover the system prompt, the tools and every message before `since`.
+    pub recorded: Option<f64>,
+    /// The messages nothing has counted: all of them without `recorded`,
+    /// else that response and what follows it.
+    pub since: &'a [Message],
+    /// [`estimate_overhead`]; counted only without `recorded`.
+    pub overhead: f64,
+}
+
+/// A conservative token count for a request.
+pub fn estimate_request(input: &RequestSize<'_>) -> f64 {
+    match input.recorded.filter(|recorded| js_truthy(*recorded)) {
+        Some(recorded) => recorded + estimate_messages(input.since),
+        None => input.overhead + estimate_messages(input.since),
+    }
 }
 
 /// JS number truthiness — `0`, `-0` and `NaN` are falsy.
@@ -319,5 +455,72 @@ mod tests {
             model: &model(200_000.0, Some(100_000.0), 8_192.0),
             output_token_max: None,
         }));
+    }
+
+    #[test]
+    fn a_model_without_a_limit_is_sized_against_the_default_ceiling() {
+        let unknown = model(0.0, None, 8_192.0);
+        assert_eq!(
+            request_budget(&cfg(), &unknown, None),
+            DEFAULT_CONTEXT_CEILING - 8_192.0
+        );
+        let configured = cfg_compaction(r#"{"compaction": {"default_context": 32000}}"#);
+        assert_eq!(
+            request_budget(&configured, &unknown, None),
+            32_000.0 - 8_192.0
+        );
+        // A declared limit is never replaced.
+        let known = model(200_000.0, None, 8_192.0);
+        assert_eq!(request_budget(&configured, &known, None), 191_808.0);
+        // ...and the recorded-token check still treats 0 as unknown.
+        assert!(!is_overflow(&IsOverflowInput {
+            cfg: &cfg(),
+            tokens: &tokens(Some(1_000_000.0), 0.0, 0.0, 0.0, 0.0),
+            model: &unknown,
+            output_token_max: None,
+        }));
+    }
+
+    #[test]
+    fn a_request_is_sized_from_recorded_tokens_plus_what_nothing_counted() {
+        let text = Message::user("x".repeat(3_000));
+        let image = Message {
+            id: None,
+            role: alforria_llm::schema::ids::MessageRole::User,
+            content: vec![ContentPart::media("image/png", "A".repeat(4_000_000))],
+            metadata: None,
+            native: None,
+        };
+        // 3,000 bytes at three a token, plus the per-message allowance.
+        assert_eq!(estimate_messages(std::slice::from_ref(&text)), 1_004.0);
+        // An image counts as an image, not as megabytes of base64.
+        assert_eq!(
+            estimate_messages(std::slice::from_ref(&image)),
+            4.0 + MEDIA_TOKEN_ESTIMATE
+        );
+        let schema = serde_json::json!({ "type": "object" });
+        let overhead = estimate_overhead(
+            &["s".repeat(300)],
+            [("read", "Reads a file", &schema)].into_iter(),
+        );
+        assert_eq!(overhead, ((300 + 4 + 12 + 17) as f64 / 3.0).ceil());
+        // Nothing recorded: everything is estimated.
+        assert_eq!(
+            estimate_request(&RequestSize {
+                recorded: None,
+                since: std::slice::from_ref(&text),
+                overhead,
+            }),
+            overhead + 1_004.0
+        );
+        // Recorded tokens already cover the system prompt and the tools.
+        assert_eq!(
+            estimate_request(&RequestSize {
+                recorded: Some(50_000.0),
+                since: std::slice::from_ref(&text),
+                overhead,
+            }),
+            51_004.0
+        );
     }
 }

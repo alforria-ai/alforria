@@ -2,6 +2,7 @@
 //! `packages/core/src/database/database.ts`).
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use rusqlite::Connection;
@@ -27,6 +28,8 @@ const OPEN_PRAGMAS: &[&str] = &[
 #[derive(Debug)]
 pub struct Storage {
     conn: Mutex<Connection>,
+    /// Message rows read back with their parts since this handle opened.
+    message_rows_read: AtomicU64,
 }
 
 impl Storage {
@@ -42,6 +45,7 @@ impl Storage {
         crate::storage::alforria_migration::apply(&mut conn)?;
         Ok(Storage {
             conn: Mutex::new(conn),
+            message_rows_read: AtomicU64::new(0),
         })
     }
 
@@ -54,7 +58,33 @@ impl Storage {
         crate::storage::alforria_migration::apply(&mut conn)?;
         Ok(Storage {
             conn: Mutex::new(conn),
+            message_rows_read: AtomicU64::new(0),
         })
+    }
+
+    /// `PRAGMA synchronous`: `full` puts every commit on disk before it
+    /// returns, `normal` (the default at open) leaves the write-ahead log
+    /// to the operating system between checkpoints.
+    pub fn set_synchronous(&self, full: bool) -> Result<(), CoreError> {
+        self.with_connection(|conn| {
+            conn.execute_batch(if full {
+                "PRAGMA synchronous = FULL"
+            } else {
+                "PRAGMA synchronous = NORMAL"
+            })?;
+            Ok(())
+        })
+    }
+
+    /// How many message rows have been read back with their parts: what a
+    /// step costs in history, for tests and diagnostics.
+    pub fn message_rows_read(&self) -> u64 {
+        self.message_rows_read.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn count_message_rows(&self, rows: usize) {
+        self.message_rows_read
+            .fetch_add(rows as u64, Ordering::Relaxed);
     }
 
     /// Open `<data_dir>/opencode.db` (`database.ts:53`).

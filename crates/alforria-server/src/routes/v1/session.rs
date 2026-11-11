@@ -689,14 +689,20 @@ pub async fn messages(
     require_session(&location, &session_id)?;
     match limit {
         None | Some(0) => {
-            let items = location
-                .services
-                .sessions
-                .messages(&session_id, None)
+            // Upstream returns the whole history here, so no limit is
+            // imposed; a long one is written out a page at a time instead
+            // of being built in memory first. Clients that can should pass
+            // `limit` and page with `before`.
+            let store = location.services.messages.clone();
+            let first = store
+                .page_after_with_diffs(&session_id, None, MESSAGE_STREAM_PAGE)
                 .map_err(session_error)?;
-            Ok(json_ok(
-                items.iter().map(with_parts_json).collect::<Vec<_>>(),
-            ))
+            if first.len() < MESSAGE_STREAM_PAGE {
+                return Ok(json_ok(
+                    first.iter().map(with_parts_json).collect::<Vec<_>>(),
+                ));
+            }
+            Ok(stream_messages(store, session_id, first))
         }
         Some(limit) => {
             let page = location
@@ -730,6 +736,76 @@ pub async fn messages(
             }
         }
     }
+}
+
+/// Messages per chunk of an unpaginated history response; a session with
+/// fewer is answered in one buffered body, as before.
+const MESSAGE_STREAM_PAGE: usize = 100;
+
+/// The whole history as one JSON array, read and written page by page.
+fn stream_messages(
+    store: session::MessageStore,
+    session_id: String,
+    first: Vec<session::WithParts>,
+) -> Response {
+    struct State {
+        store: session::MessageStore,
+        session_id: String,
+        page: Option<Vec<session::WithParts>>,
+        started: bool,
+        closed: bool,
+    }
+    let state = State {
+        store,
+        session_id,
+        page: Some(first),
+        started: false,
+        closed: false,
+    };
+    let stream = futures::stream::unfold(state, |mut state| async move {
+        if state.closed {
+            return None;
+        }
+        let Some(page) = state.page.take() else {
+            state.closed = true;
+            let end: &'static [u8] = if state.started { b"]" } else { b"[]" };
+            return Some((Ok::<Bytes, std::io::Error>(Bytes::from_static(end)), state));
+        };
+        let mut out = Vec::new();
+        for message in &page {
+            out.push(if state.started { b',' } else { b'[' });
+            state.started = true;
+            serde_json::to_writer(&mut out, &with_parts_json(message))
+                .expect("serialization cannot fail");
+        }
+        if page.len() == MESSAGE_STREAM_PAGE {
+            let last = page.last().expect("a full page");
+            let after = session::Cursor {
+                id: session::message::message_id(&last.info).to_string(),
+                time: session::message::message_time_created(&last.info),
+            };
+            match state.store.page_after_with_diffs(
+                &state.session_id,
+                Some(&after),
+                MESSAGE_STREAM_PAGE,
+            ) {
+                Ok(next) if !next.is_empty() => state.page = Some(next),
+                Ok(_) => {}
+                // The status line is long gone: cut the body short so the
+                // client sees a broken response, not a truncated history.
+                Err(error) => {
+                    state.closed = true;
+                    return Some((Err(std::io::Error::other(error.to_string())), state));
+                }
+            }
+        }
+        Some((Ok(Bytes::from(out)), state))
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from_stream(stream))
+        .expect("static response parts are valid")
 }
 
 /// `message` (`handlers/session.ts:147-153`).
@@ -1028,16 +1104,15 @@ pub async fn summarize(
 
     let session = require_session(&location, &session_id)?;
     engine.cleanup(&session).map_err(session_error)?;
-    let messages = location
+    let default_agent = location.services.agents.default_info().map_err(defect)?;
+    // Newest first, stopping at the first user message.
+    let current_agent = location
         .services
         .sessions
-        .messages(&session_id, None)
-        .map_err(session_error)?;
-    let default_agent = location.services.agents.default_info().map_err(defect)?;
-    let current_agent = messages
-        .iter()
-        .rev()
-        .find(|message| matches!(message.info, V1Message::User { .. }))
+        .find_message(&session_id, &|message| {
+            matches!(message.info, V1Message::User { .. })
+        })
+        .map_err(session_error)?
         .and_then(|message| match &message.info {
             V1Message::User { agent, .. } => Some(agent.clone()),
             _ => None,
