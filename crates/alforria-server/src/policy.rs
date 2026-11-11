@@ -169,6 +169,12 @@ pub const DEFAULT_UPLOAD_DIRECTORY: &str = "uploads";
 /// `server.upload.max_bytes` when unset: 32 MiB.
 pub const DEFAULT_UPLOAD_MAX_BYTES: u64 = 32 * 1024 * 1024;
 
+/// `server.upload.max_total_bytes` when unset: 1 GiB per upload directory.
+pub const DEFAULT_UPLOAD_MAX_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// `server.upload.max_files` when unset, per upload directory.
+pub const DEFAULT_UPLOAD_MAX_FILES: u64 = 1000;
+
 /// Everything the server resolved from the host config.
 #[derive(Debug, Clone)]
 pub struct ServerPolicy {
@@ -189,6 +195,12 @@ pub struct ServerPolicy {
     /// `server.upload.directories`: where, inside the project, a
     /// credential below `admin` may upload.
     pub upload_directories: Vec<String>,
+    /// `server.upload.max_total_bytes`: the most bytes one upload directory
+    /// may hold after an upload by a credential below `admin`.
+    pub upload_max_total_bytes: u64,
+    /// `server.upload.max_files`: the most files one upload directory may
+    /// hold after such an upload.
+    pub upload_max_files: u64,
     /// `permission.unattended`: what an unanswered permission ask
     /// resolves to, and when. `None`: it waits.
     pub unattended_permission: Option<alforria_core::session::permission::Unattended>,
@@ -222,6 +234,8 @@ impl Default for ServerPolicy {
             reply_always: false,
             upload_max_bytes: DEFAULT_UPLOAD_MAX_BYTES,
             upload_directories: vec![DEFAULT_UPLOAD_DIRECTORY.to_string()],
+            upload_max_total_bytes: DEFAULT_UPLOAD_MAX_TOTAL_BYTES,
+            upload_max_files: DEFAULT_UPLOAD_MAX_FILES,
             unattended_permission: None,
             unattended_question: None,
             hook: None,
@@ -390,6 +404,14 @@ impl ServerPolicy {
                 .and_then(|server| server.upload.as_ref())
                 .and_then(|upload| upload.directories.clone())
                 .unwrap_or_else(|| vec![DEFAULT_UPLOAD_DIRECTORY.to_string()]),
+            upload_max_total_bytes: server
+                .and_then(|server| server.upload.as_ref())
+                .and_then(|upload| upload.max_total_bytes)
+                .unwrap_or(DEFAULT_UPLOAD_MAX_TOTAL_BYTES),
+            upload_max_files: server
+                .and_then(|server| server.upload.as_ref())
+                .and_then(|upload| upload.max_files)
+                .unwrap_or(DEFAULT_UPLOAD_MAX_FILES),
             shell_env,
             posture,
             triggers_enabled,

@@ -1346,11 +1346,33 @@ asked the model for:
   `.alforria/`. The list is `alforria_core::project_files`, the constants
   the loaders themselves discover by, so a discovery location added there
   is closed to uploads at the same time;
-- both rules apply to the resolved path, so a symlink inside the upload
-  area does not lead out of it or into a loader directory.
+- nor may a component below the project be a file or directory a
+  formatter or a language server is configured or started from:
+  `package.json`, `tsconfig.json`, `eslint.config.*`, `.prettierrc*`,
+  `biome.json`, `Cargo.toml`, `build.rs`, `pyproject.toml`, `.clangd`,
+  `compile_commands.json`, `flake.nix`, `node_modules/`, `.cargo/`,
+  `.venv/` and the rest of `project_files::TOOL_CONFIG_FILES` /
+  `TOOL_CONFIG_DIRS`. Those run code or name what is run when a language
+  server starts. (The agent's own edit tools are not refused these names —
+  editing them is its work — but the write guard does protect the files a
+  `formatter.<name>.command` or `lsp.<name>.command` in the config is
+  spelled with, e.g. `./tools/fmt.sh`.) That list is curated by hand from
+  `lsp/server.rs`: a server added there needs its config names added too;
+- these rules apply to the resolved path, so a symlink inside the upload
+  area does not lead out of it or into a loader directory;
+- each upload directory has a quota: `server.upload.max_total_bytes`
+  (default 1 GiB = 1073741824) and `server.upload.max_files` (default
+  1000), counted over everything the directory holds, whoever put it
+  there. An upload that would exceed either is answered `413` with
+  `{"name": "UploadQuotaError"}` before anything is written (a body with
+  no declared length is cut off at what is left and removed); replacing a
+  file counts the difference. With `"."` as the upload directory the whole
+  project counts, so raise both limits there. `admin` and the operator are
+  held to `max_bytes` only.
 
 A `file.edited` event is published for the written file.
 
 ```jsonc
-{ "server": { "upload": { "max_bytes": 33554432, "directories": ["uploads"] } } }
+{ "server": { "upload": { "max_bytes": 33554432, "directories": ["uploads"],
+                         "max_total_bytes": 1073741824, "max_files": 1000 } } }
 ```

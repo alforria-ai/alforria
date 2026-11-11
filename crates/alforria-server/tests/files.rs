@@ -642,6 +642,154 @@ async fn uploads_are_size_limited() {
     assert_eq!(leftovers, 0, "the partial upload was removed");
 }
 
+/// An upload directory holds so many bytes and so many files for the
+/// tokens below `admin` (`server.upload.max_total_bytes`, `max_files`):
+/// an upload that would go over is refused before it is written, with or
+/// without a declared length, and replacing a file counts the difference.
+#[tokio::test]
+async fn an_upload_area_has_a_quota_for_narrow_tokens() {
+    let signer = Signer::new();
+    let f = fixture_with(
+        |dirs| {
+            json!({
+                "server": {
+                    "auth": { "bearer": { "keys": [signer.public_key()], "audience": AUDIENCE } },
+                    "directories": [dirs.repo.display().to_string()],
+                    "upload": { "max_bytes": 1024, "max_total_bytes": 100, "max_files": 3 }
+                }
+            })
+        },
+        Some(PASSWORD),
+        Vec::new(),
+    );
+    let chat = bearer(&signer.token(AUDIENCE, "chat"));
+    let uploads = f.dirs.repo.join("uploads");
+    let status = |response: axum::http::Response<Body>| response.status();
+
+    // 60 bytes fit; 60 more do not, declared or streamed.
+    assert_eq!(
+        status(put(&f, Some(&chat), "uploads/a.bin", "", &[b'a'; 60]).await),
+        StatusCode::CREATED
+    );
+    let refused = put(&f, Some(&chat), "uploads/b.bin", "", &[b'b'; 60]).await;
+    assert_eq!(refused.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let body = body_json(refused).await;
+    assert_eq!(body["name"], "UploadQuotaError", "{body}");
+    assert!(
+        body["data"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("server.upload.max_total_bytes"),
+        "{body}"
+    );
+    let chunks: Vec<Result<Vec<u8>, std::io::Error>> = (0..3).map(|_| Ok(vec![b'c'; 20])).collect();
+    let request = Request::builder()
+        .method("PUT")
+        .uri(format!("/file/content?path=uploads%2Fb.bin&{}", dir(&f)))
+        .header("authorization", &chat)
+        .body(Body::from_stream(futures::stream::iter(chunks)))
+        .unwrap();
+    let streamed = f.router.clone().oneshot(request).await.unwrap();
+    assert_eq!(streamed.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(body_json(streamed).await["name"], "UploadQuotaError");
+    assert!(!uploads.join("b.bin").exists());
+    assert_eq!(
+        std::fs::read_dir(&uploads).unwrap().count(),
+        1,
+        "nothing is left of a refused upload"
+    );
+
+    // Replacing a file counts what it becomes, not both.
+    assert_eq!(
+        status(put(&f, Some(&chat), "uploads/a.bin", "", &[b'a'; 90]).await),
+        StatusCode::OK
+    );
+    assert_eq!(
+        status(put(&f, Some(&chat), "uploads/a.bin", "", &[b'a'; 10]).await),
+        StatusCode::OK
+    );
+
+    // Three files, at any depth; the fourth is refused, a replacement is not.
+    for path in ["uploads/b.bin", "uploads/deep/c.bin"] {
+        assert_eq!(
+            status(put(&f, Some(&chat), path, "", b"x").await),
+            StatusCode::CREATED,
+            "{path}"
+        );
+    }
+    let fourth = put(&f, Some(&chat), "uploads/d.bin", "", b"x").await;
+    assert_eq!(fourth.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let body = body_json(fourth).await;
+    assert_eq!(body["name"], "UploadQuotaError", "{body}");
+    assert!(
+        body["data"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("server.upload.max_files"),
+        "{body}"
+    );
+    assert!(!uploads.join("d.bin").exists());
+    assert_eq!(
+        status(put(&f, Some(&chat), "uploads/b.bin", "", b"yy").await),
+        StatusCode::OK
+    );
+
+    // The quota is the narrow tokens': the operator's upload is held to
+    // `max_bytes` alone, as before.
+    assert_eq!(
+        status(put(&f, Some(&basic()), "uploads/e.bin", "", &[b'e'; 500]).await),
+        StatusCode::CREATED
+    );
+}
+
+/// The files a formatter or a language server is configured or started
+/// from are not a narrow token's to upload, even with the whole project as
+/// the upload area; the operator's upload is unaffected.
+#[tokio::test]
+async fn narrow_tokens_cannot_upload_formatter_or_language_server_config() {
+    use alforria_core::project_files::{TOOL_CONFIG_DIRS, TOOL_CONFIG_FILES};
+
+    let signer = Signer::new();
+    let f = fixture_uploading_into(&signer, Some(json!(["."])));
+    let chat = bearer(&signer.token(AUDIENCE, "chat"));
+    let mut paths: Vec<String> = Vec::new();
+    for name in TOOL_CONFIG_FILES {
+        paths.push(name.to_string());
+        paths.push(format!("pkg/{}", name.to_uppercase()));
+    }
+    for name in TOOL_CONFIG_DIRS {
+        paths.push(format!("{name}/.bin/biome"));
+        paths.push(format!("pkg/{name}/x"));
+    }
+    for known in [
+        "package.json",
+        "eslint.config.js",
+        "biome.json",
+        "Cargo.toml",
+        "build.rs",
+        ".clangd",
+        "node_modules/.bin/typescript-language-server",
+        ".cargo/config.toml",
+    ] {
+        paths.push(known.to_string());
+    }
+    for path in &paths {
+        let response = put(&f, Some(&chat), path, "", b"x").await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+        assert!(!f.dirs.repo.join(path).exists(), "{path}");
+    }
+    assert_eq!(
+        put(&f, Some(&chat), "src/lib.rs", "", b"x").await.status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        put(&f, Some(&basic()), "package.json", "", b"{}")
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+}
+
 fn basic() -> String {
     use base64::Engine;
     format!(

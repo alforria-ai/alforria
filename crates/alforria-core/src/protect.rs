@@ -15,7 +15,8 @@
 //!   the managed directory, the data, state and cache directories, the
 //!   binary's own directory, and whatever the instance's config names
 //!   (`OPENCODE_CONFIG*`, `skills.paths`, `workflows.paths`, local
-//!   `instructions`).
+//!   `instructions`, and the files a `formatter` or `lsp` entry's
+//!   `command` is spelled with).
 //!
 //! The set is assembled from the loaders' own answers
 //! ([`crate::config::ConfigLoader::search_dirs`], the config they produced)
@@ -424,6 +425,37 @@ impl Protected {
                     None => directory.join(&entry),
                 };
                 Self::add(&mut out.loader, what, &path);
+            }
+        }
+        // Files the config's formatters and language servers are started
+        // from: an argument of `formatter.<name>.command` or
+        // `lsp.<name>.command` that is spelled as a path (`./tools/fmt.sh`,
+        // `node scripts/lsp.js`) names code the server runs.
+        let mut commands: Vec<(String, Vec<String>)> = Vec::new();
+        if let Some(crate::config::schema::FormatterInfo::Entries(entries)) = &config.formatter {
+            for (name, entry) in entries {
+                if let Some(command) = &entry.command {
+                    commands.push((format!("formatter.{name}.command"), command.clone()));
+                }
+            }
+        }
+        if let Some(crate::config::schema::LspInfo::Entries(entries)) = &config.lsp {
+            for (name, entry) in entries {
+                if let crate::config::schema::LspEntry::Server { command, .. } = entry {
+                    commands.push((format!("lsp.{name}.command"), command.clone()));
+                }
+            }
+        }
+        for (what, command) in commands {
+            for argument in command {
+                if argument.starts_with('-') || !argument.contains(['/', '\\']) {
+                    continue;
+                }
+                let path = match argument.strip_prefix("~/") {
+                    Some(rest) => paths.home.join(rest),
+                    None => directory.join(&argument),
+                };
+                Self::add(&mut out.loader, &what, &path);
             }
         }
         // Instruction entries: the loader's own search, not a copy of it.
@@ -838,6 +870,43 @@ mod tests {
             project.join("src/main.rs"),
             project.join("docs/readme.md"),
             root.join("outer/notes.txt"),
+        ] {
+            assert_eq!(refused(target.clone()), None, "{}", target.display());
+        }
+    }
+
+    /// A file the config starts a formatter or a language server from is
+    /// code the server runs: protected like the other loader locations.
+    #[test]
+    fn files_a_formatter_or_lsp_command_names_are_protected() {
+        let t = tree(serde_json::json!({
+            "formatter": {
+                "mine": { "command": ["./tools/fmt.sh", "--write", "$FILE"], "extensions": [".x"] },
+                "node": { "command": ["node", "scripts/format.js"], "extensions": [".y"] },
+            },
+            "lsp": {
+                "custom": { "command": ["~/bin/custom-lsp", "--stdio"], "extensions": [".x"] },
+                "off": { "disabled": true },
+            },
+        }));
+        let refused = |target: PathBuf| t.protected.guards(&target).map(|refusal| refusal.class);
+        for target in [
+            t.project.join("tools/fmt.sh"),
+            t.project.join("scripts/format.js"),
+            t.home.join("bin/custom-lsp"),
+        ] {
+            assert_eq!(
+                refused(target.clone()),
+                Some(Class::Loader),
+                "{}",
+                target.display()
+            );
+        }
+        for target in [
+            t.project.join("tools/other.sh"),
+            t.project.join("node"),
+            t.project.join("--write"),
+            t.project.join("$FILE"),
         ] {
             assert_eq!(refused(target.clone()), None, "{}", target.display());
         }

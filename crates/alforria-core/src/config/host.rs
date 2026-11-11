@@ -189,6 +189,14 @@ pub struct UploadInfo {
     /// upload into (default `["uploads"]`). `"."` is the whole project.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub directories: Option<Vec<String>>,
+    /// The most bytes one upload directory may hold after an upload by a
+    /// token below `admin`, counting everything in it (default 1 GiB).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_total_bytes: Option<u64>,
+    /// The most files one upload directory may hold after an upload by a
+    /// token below `admin` (default 1000).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_files: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------

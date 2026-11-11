@@ -102,6 +102,93 @@ fn too_large(limit: u64) -> FileError {
     )
 }
 
+fn over_quota(message: String) -> FileError {
+    FileError::Status(StatusCode::PAYLOAD_TOO_LARGE, "UploadQuotaError", message)
+}
+
+/// The name prefix of an upload still being received.
+const TEMPORARY_PREFIX: &str = ".alforria-upload-";
+
+/// What an upload directory holds: bytes and entries that are not
+/// directories, no link followed, uploads still being received left out.
+/// The walk stops once it has seen more than `enough` files — the answer
+/// is "over" from there on, and a huge tree is not walked for it.
+fn area_usage(root: &Path, enough: u64) -> (u64, u64) {
+    let (mut bytes, mut files) = (0u64, 0u64);
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if meta.is_dir() {
+                pending.push(entry.path());
+                continue;
+            }
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(TEMPORARY_PREFIX)
+            {
+                continue;
+            }
+            files += 1;
+            bytes = bytes.saturating_add(meta.len());
+            if files > enough {
+                return (bytes, files);
+            }
+        }
+    }
+    (bytes, files)
+}
+
+/// Serializes the last quota check with the rename that makes an upload
+/// count, so two uploads cannot both fit into the same remainder.
+static UPLOAD_QUOTA: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Whether `area` has room for an upload of `incoming` bytes to `target`
+/// (`server.upload.max_total_bytes`, `server.upload.max_files`); the bytes
+/// left for it when it has. The file being replaced does not count against
+/// its replacement.
+async fn quota_room(
+    ctx: &ServerContext,
+    area: &Path,
+    target: &Path,
+    incoming: u64,
+) -> Result<u64, FileError> {
+    let (max_bytes, max_files) = (
+        ctx.policy.upload_max_total_bytes,
+        ctx.policy.upload_max_files,
+    );
+    let (area, target) = (area.to_path_buf(), target.to_path_buf());
+    let shown = area.display().to_string();
+    let (bytes, files, replaced) = tokio::task::spawn_blocking(move || {
+        let (bytes, files) = area_usage(&area, max_files);
+        (bytes, files, std::fs::symlink_metadata(&target).ok())
+    })
+    .await
+    .map_err(|join| storage_error(&std::io::Error::other(join.to_string())))?;
+    let files = files.saturating_sub(u64::from(replaced.is_some()));
+    if files >= max_files {
+        return Err(over_quota(format!(
+            "the upload directory {shown} already holds {max_files} files or more \
+             (server.upload.max_files)"
+        )));
+    }
+    let used = bytes.saturating_sub(replaced.map_or(0, |meta| meta.len()));
+    let room = max_bytes.saturating_sub(used);
+    if incoming > room {
+        return Err(over_quota(format!(
+            "the upload does not fit: the upload directory {shown} holds {used} of the \
+             {max_bytes} bytes it may (server.upload.max_total_bytes)"
+        )));
+    }
+    Ok(room)
+}
+
 /// The project a request addresses: the directory the auth layer resolved
 /// and the allowlist admitted (`middleware::directory`).
 fn location(
@@ -455,27 +542,31 @@ fn storage_error(err: &std::io::Error) -> FileError {
 ///   (`alforria_core::project_files`: config files, `.opencode`, `.claude`,
 ///   `.agents`, instruction files, `.git`), wherever it sits — which is
 ///   what keeps `"."` as an upload directory from being a way in.
+///
+/// Returns the upload directory the target is in, which is what the quota
+/// is counted over ([`quota_room`]).
 fn restricted_upload_allowed(
     ctx: &ServerContext,
     location: &LocationContext,
     target: &Path,
-) -> Result<(), String> {
+) -> Result<PathBuf, String> {
     use alforria_core::protect::{resolve, resolve_path, within};
     // Where the project is for the kernel, like the target (`project_file`).
     let project = resolve(&location.directory);
-    let inside_upload_area = ctx.policy.upload_directories.iter().any(|directory| {
+    let upload_area = ctx.policy.upload_directories.iter().find_map(|directory| {
         // The area as the kernel reaches it: a configured `uploads/../x`
         // or a link is where it leads. One that cannot be resolved holds
         // nothing. The area itself must be inside the project too.
         resolve_path(&project.join(directory))
-            .is_ok_and(|root| within(&root, &project) && within(target, &root))
+            .ok()
+            .filter(|root| within(root, &project) && within(target, root))
     });
-    if !inside_upload_area {
+    let Some(upload_area) = upload_area else {
         return Err(format!(
             "this token may only upload into {} (server.upload.directories)",
             ctx.policy.upload_directories.join(", ")
         ));
-    }
+    };
     // The same guard the edit tools' writes go through
     // (`alforria_core::protect`): loader names anywhere on the resolved
     // path, and every location the loaders consult for this instance.
@@ -496,7 +587,21 @@ fn restricted_upload_allowed(
              workflow or git files"
         ));
     }
-    Ok(())
+    // And the names a formatter or a language server is configured or
+    // started from, below the project (`project_files::TOOL_CONFIG_FILES`):
+    // the write guard leaves those to the agent, an upload has no business
+    // with them.
+    if target
+        .strip_prefix(&project)
+        .is_ok_and(alforria_core::project_files::is_tool_config_path)
+    {
+        return Err(format!(
+            "{} is a file a formatter or language server is configured or started from: \
+             this token may not upload it",
+            target.display()
+        ));
+    }
+    Ok(upload_area)
 }
 
 /// `PUT /file/content?path=[&overwrite=false]` — write the request body to
@@ -531,9 +636,10 @@ async fn upload(
     if target.is_dir() {
         return Err(bad_request(format!("{path} is a directory")));
     }
-    if crate::confine::restricted(&principal) {
-        restricted_upload_allowed(&ctx, &location, &target).map_err(forbidden)?;
-    }
+    let area = match crate::confine::restricted(&principal) {
+        true => Some(restricted_upload_allowed(&ctx, &location, &target).map_err(forbidden)?),
+        false => None,
+    };
     let existed = target.exists();
     let overwrite = query_param(uri.query(), "overwrite").is_none_or(|value| value != "false");
     if existed && !overwrite {
@@ -543,6 +649,13 @@ async fn upload(
             format!("{path} already exists"),
         ));
     }
+    // The quota of the upload directory, before anything is written: a
+    // body that declares its length is refused here, one that does not is
+    // cut off at what is left.
+    let room = match &area {
+        Some(area) => Some(quota_room(&ctx, area, &target, declared.unwrap_or(0)).await?),
+        None => None,
+    };
     let io = |err: std::io::Error| storage_error(&err);
     let name = target
         .file_name()
@@ -567,7 +680,7 @@ async fn upload(
             })?
     };
     let temporary = std::ffi::OsString::from(format!(
-        ".alforria-upload-{}",
+        "{TEMPORARY_PREFIX}{}",
         uuid::Uuid::new_v4().simple()
     ));
     let mut file = tokio::fs::File::from_std(directory.create(&temporary, true).map_err(io)?);
@@ -577,7 +690,7 @@ async fn upload(
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|err| Some(std::io::Error::other(err.to_string())))?;
             written += chunk.len() as u64;
-            if written > limit {
+            if written > limit || room.is_some_and(|room| written > room) {
                 return Err(None);
             }
             file.write_all(&chunk).await.map_err(Some)?;
@@ -592,15 +705,36 @@ async fn upload(
         Err(cause) => {
             let _ = directory.remove_file(&temporary);
             return Err(match cause {
-                None => too_large(limit),
+                None if written > limit => too_large(limit),
+                None => match &area {
+                    // Says which limit it was.
+                    Some(area) => match quota_room(&ctx, area, &target, written).await {
+                        Err(refusal) => refusal,
+                        Ok(_) => too_large(limit),
+                    },
+                    None => too_large(limit),
+                },
                 Some(err) => io(err),
             });
+        }
+    }
+    // Checked again with what was received, and held until the rename, so
+    // that concurrent uploads share one remainder.
+    let quota = match &area {
+        Some(_) => Some(UPLOAD_QUOTA.lock().await),
+        None => None,
+    };
+    if let Some(area) = &area {
+        if let Err(refusal) = quota_room(&ctx, area, &target, written).await {
+            let _ = directory.remove_file(&temporary);
+            return Err(refusal);
         }
     }
     if let Err(err) = directory.rename(&temporary, &name) {
         let _ = directory.remove_file(&temporary);
         return Err(io(err));
     }
+    drop(quota);
     // Clients watching the project learn of the file like any other edit.
     let _ = location.services.events.publish(
         &alforria_core::tool::edit::FILE_EDITED,
