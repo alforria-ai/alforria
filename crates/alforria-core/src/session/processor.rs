@@ -696,15 +696,16 @@ impl Handle {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// alforria extension: a tool's own list of the files it returned for
-    /// one call, handed to where the call's result will be judged
+    /// alforria extension: a tool's own report of what it opened and
+    /// returned for one call, handed to where the call's result will be
+    /// judged
     /// (`SessionStore::report_returned_paths`).
     pub fn report_returned_paths(
         &self,
         call_id: &str,
         tool: &str,
         input: &Value,
-        paths: Vec<std::path::PathBuf>,
+        paths: crate::tool::outside::ReturnedPaths,
     ) {
         self.inner.deps.sessions.report_returned_paths(
             &self.inner.session_id,

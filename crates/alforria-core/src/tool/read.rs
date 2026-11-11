@@ -94,6 +94,10 @@ fn run(
     Box::pin(async move {
         let instance = ctx.instance;
         let filepath = ts_resolve(&instance.directory, &params.file_path);
+        // alforria extension: the path every operation below opens, for
+        // the session's provenance mark (`tool::outside`) — reported
+        // before anything can fail, so a failed read is judged by it too.
+        ctx.extra.returned_paths.report_opened(&filepath);
         let title = ts_relative(&instance.worktree, &filepath);
 
         let stat = tokio::fs::metadata(&filepath).await.ok();

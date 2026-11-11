@@ -584,19 +584,19 @@ pub struct SessionStore {
     /// clone: files there were put by a client, and a tool that reads one
     /// brings outside content into the session (`tool::outside`).
     uploads: Arc<std::sync::RwLock<Vec<String>>>,
-    /// The files a search listed as returned, by `(session, call)`, from
+    /// What a file tool reported for a call, by `(session, call)`, from
     /// the moment the tool finishes to the moment its result is appended
     /// ([`SessionStore::report_returned_paths`]). In memory only.
     returned_paths:
         Arc<std::sync::Mutex<std::collections::HashMap<(String, String), ReturnedPathsReport>>>,
 }
 
-/// What a tool listed for one call, and the call it listed it for.
+/// What a tool reported for one call, and the call it reported it for.
 struct ReturnedPathsReport {
     tool: String,
     input: Value,
     /// `None`: two reports came in under one call id, and neither is used.
-    paths: Option<Vec<PathBuf>>,
+    paths: Option<crate::tool::outside::ReturnedPaths>,
 }
 
 /// More unclaimed reports than this and all are dropped: the calls they
@@ -631,8 +631,8 @@ impl SessionStore {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = directories;
     }
 
-    /// A tool's own list of the files it returned something of, for the
-    /// call `call_id` of `session_id` (alforria extension;
+    /// A tool's own report of what it opened and returned, for the call
+    /// `call_id` of `session_id` (alforria extension;
     /// `tool::outside::ReturnedPaths`). Kept until the call's result is
     /// appended, and used there only for a result of the same tool with the
     /// same input.
@@ -642,7 +642,7 @@ impl SessionStore {
         call_id: &str,
         tool: &str,
         input: &Value,
-        paths: Vec<PathBuf>,
+        paths: crate::tool::outside::ReturnedPaths,
     ) {
         let mut reports = self
             .returned_paths
@@ -674,7 +674,7 @@ impl SessionStore {
         &self,
         session_id: &str,
         result: &crate::tool::outside::ToolResult<'_>,
-    ) -> Option<Vec<PathBuf>> {
+    ) -> Option<crate::tool::outside::ReturnedPaths> {
         let report = self
             .returned_paths
             .lock()
@@ -715,7 +715,9 @@ impl SessionStore {
         }
         // Taken whatever follows, so that it does not stay behind.
         let returned = match class {
-            Outside::SearchesPath(_) => self.take_returned_paths(session_id, result),
+            Outside::ReadsPath | Outside::SearchesPath => {
+                self.take_returned_paths(session_id, result)
+            }
             _ => None,
         };
         if self.has_mark(session_id, SessionMark::OutsideContent)? {
@@ -727,7 +729,7 @@ impl SessionStore {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
         let directory = match class {
-            Outside::ReadsPath(_) | Outside::SearchesPath(_) if !uploads.is_empty() => {
+            Outside::ReadsPath | Outside::SearchesPath if !uploads.is_empty() => {
                 PathBuf::from(self.get(session_id)?.directory)
             }
             _ => PathBuf::new(),
@@ -749,7 +751,7 @@ impl SessionStore {
             directory: &directory,
             uploads: &uploads,
             child_marked: &child_marked,
-            returned: returned.as_deref(),
+            returned: returned.as_ref(),
         };
         if carries_outside_content(result, &facts) {
             self.mark(session_id, SessionMark::OutsideContent)?;

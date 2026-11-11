@@ -625,7 +625,7 @@ async fn every_registered_tool_is_classified_as_returning_outside_content_or_not
     for id in ["memory", "session_search"] {
         assert_eq!(classify(id), Outside::Flagged, "{id}");
     }
-    assert_eq!(classify("read"), Outside::ReadsPath("filePath"));
+    assert_eq!(classify("read"), Outside::ReadsPath);
     // An MCP tool is keyed `<server>_<tool>`: never in the table.
     for id in ["github_create_issue", "linear_search", "anything_new"] {
         assert_eq!(classify(id), Outside::Always, "{id}");

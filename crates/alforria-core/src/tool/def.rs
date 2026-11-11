@@ -82,10 +82,10 @@ pub struct Extra {
     pub bypass_agent_check: bool,
     /// `extra.model` (websearch model name, spec M4.5).
     pub model: Option<Value>,
-    /// alforria extension: where `grep` and `glob` leave the list of files
-    /// they returned, for the session's provenance mark
+    /// alforria extension: where `read`, `grep` and `glob` report what
+    /// they opened and returned, for the session's provenance mark
     /// (`tool::outside::ReturnedPaths`). Not part of the result.
-    pub returned_paths: crate::tool::outside::ReturnedPaths,
+    pub returned_paths: crate::tool::outside::ReturnedPathsSlot,
 }
 
 /// TS `InstanceState.context` (project/instance-context.ts:5-9).

@@ -453,37 +453,50 @@ and `outsideStart`.
 #### Searches and the upload area
 
 `uploads/` is the default upload area, and plenty of projects have a
-directory of that name. A search marks its session for what it *returned*,
-not for where it looked:
+directory of that name. `read`, `grep` and `glob` mark their session for
+what they *returned*, and the decision has one source: the tool's own
+report of the call.
 
-- `grep` and `glob` hand the server the list of files their result holds a
-  line or a name of — the list the tool computed, not the text it printed,
-  and built from the directory the tool actually walked, not from the path
-  as the call spelled it (the two differ when the path is, or goes through,
-  a link; the printed paths keep the call's spelling). Each path is resolved
-  (links followed, as the kernel would) and compared with the resolved
-  upload directories. A file of the upload area in the list marks the
-  session; a list with none does not, even when the searched tree holds the
-  area. A path that cannot be resolved, or names a file that is not there,
-  counts as an upload.
-- A search whose resolved root is inside the upload area, or is the area,
-  marks the session whatever it returned. So does a search through a link
-  into it: `grep` of `src/link.txt -> uploads/a.txt`, or `glob` in
+- **The report.** Each of the three tools reports the path it handed to
+  the filesystem — the very variable it opened or walked, not the call's
+  input resolved a second time — and the files its result holds a line or a
+  name of. `read` reports the path it opened (a file, or the directory it
+  listed). `grep` and `glob` report the directory they walked, before the
+  walk, and then the files they returned; a result cut at the tool's limit
+  (250 matches for `grep`, 100 files for `glob`) has no file list. The
+  report never reaches the model, the session's parts or the wire, and the
+  tools' output is unchanged: paths are still printed as the call spelled
+  them.
+- **The decision**, when an upload directory holds at least one entry:
+  - no report for the call → marked;
+  - the reported path cannot be resolved → marked;
+  - a report without a file list → marked when the walked tree is inside,
+    is, or contains an upload directory;
+  - a file list → marked when one of the files is under an upload
+    directory, or cannot be resolved; not marked otherwise, even when the
+    walked tree holds the area.
+
+  Paths are resolved as the kernel would (`protect::resolve_path`: links
+  followed, `..` applied to the resolved path) and compared with the
+  resolved upload directories. Nothing else is looked at: not the call's
+  input, not the text of the result. A matched line that spells an upload's
+  path, a project file under some other `uploads` directory, or an upload
+  whose name is written to read like a project file's heading change
+  nothing.
+- **Links.** A call through a link into the area is a call on the area:
+  `grep` of `src/link.txt -> uploads/a.txt`, `glob` or `read` of
   `src/drop -> uploads`. A search of a tree that merely *contains* such a
   link does not follow it, returns nothing of the area and marks nothing.
-- The text of a result decides nothing. A matched line that spells an
-  upload's path, a project file under some other `uploads` directory, or an
-  upload whose name is written to read like a project file's heading do not
-  change the answer.
-- When there is no complete list — the result was cut at the tool's limit
-  (250 matches for `grep`, 100 files for `glob`), the call failed, or the
-  list cannot be matched to the call — the session is marked if the
-  resolved tree the call's input names (for a file, the directory it is in)
-  is inside, is, or contains the upload area. Input that cannot be resolved
-  marks.
-- All of this is about an upload directory that holds at least one entry.
-  One that is merely there, empty, marks nothing; one that exists but
-  cannot be listed or resolved counts as holding uploads.
+- **An upload directory that is merely there**, empty, marks nothing,
+  whatever is reported. One that exists but cannot be listed or resolved
+  counts as holding uploads.
+- **Failed calls.** A failure's message is appended to the session too, and
+  is judged the same way. A `read` of a file that is not there is judged by
+  the path it tried; a `grep` whose pattern is invalid by the tree it was
+  about to walk, as a cut result is. A call that fails before the tool
+  knows what it would open (arguments that do not parse, a refused
+  external directory, a `glob` given a file) has no report and marks. This
+  errs towards marking, and only where uploads exist.
 
 #### What the mark costs when nothing reads it
 

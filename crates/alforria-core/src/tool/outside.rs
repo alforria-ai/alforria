@@ -14,13 +14,13 @@
 //! A name that is not in the table — every MCP tool, every plugin tool — is
 //! [`Outside::Always`].
 //!
-//! `grep` and `glob` are judged by the files they returned, as the tool
-//! itself lists them ([`ReturnedPaths`]) — data the tool computed, each
-//! path resolved here; never by reading the text it printed, which holds
-//! file names and file content an uploader chose. A search that could not
-//! list everything it returned (a result cut at the tool's limit, a failed
-//! call) is judged by the tree its input names instead, and only when the
-//! upload area holds something.
+//! `read`, `grep` and `glob` are judged by what the tool itself reports
+//! ([`ReturnedPaths`]): the path it actually opened or walked — the very
+//! variable it handed to the filesystem, not the call's input resolved a
+//! second time here — and the files it returned something of. Never by
+//! the text it printed, which holds file names and file content an
+//! uploader chose. Without a report, or with one that cannot be resolved,
+//! the result counts as outside content.
 //!
 //! What this does not cover, on purpose: `bash` (a shell can fetch
 //! anything; marking it would mark every coding session and leave memory
@@ -32,45 +32,68 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 
-/// Where a tool that returns files leaves the list of them, for the
-/// marking decision (`Extra::returned_paths`): every file a line or a name
-/// of which is in its result, as the tool resolved it. A tool sets it only
-/// when the list is complete; a result cut at the tool's limit sets
-/// nothing, and the decision falls back to the tree that was searched.
-/// It never reaches the model, the session's parts or the wire.
-#[derive(Debug, Clone, Default)]
-pub struct ReturnedPaths(Arc<Mutex<Option<Vec<PathBuf>>>>);
+/// What a file-reading tool did, as the tool itself reports it for the
+/// marking decision. It never reaches the model, the session's parts or
+/// the wire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReturnedPaths {
+    /// The path the tool opened or walked: the variable it handed to the
+    /// filesystem, as it handed it.
+    pub searched: PathBuf,
+    /// Every file a line or a name of which is in the result. `None`: the
+    /// tool cannot say — the result was cut at its limit.
+    pub files: Option<Vec<PathBuf>>,
+}
 
-impl ReturnedPaths {
+/// Where a tool leaves its [`ReturnedPaths`] (`Extra::returned_paths`).
+#[derive(Debug, Clone, Default)]
+pub struct ReturnedPathsSlot(Arc<Mutex<Option<ReturnedPaths>>>);
+
+impl ReturnedPathsSlot {
     /// **The one way a tool reports what it returned.** `searched` is the
-    /// directory the tool actually walked — not the path as the call
-    /// spelled it, which may go through a link to somewhere else — and
-    /// `found` the files it returned something of, relative to it, as the
-    /// walk produced them. `complete: false` (the result was cut at the
-    /// tool's limit) reports nothing: a call without a report is judged by
-    /// the tree it searched, towards marking.
+    /// path the tool actually opened or walked — pass the variable that
+    /// goes to the filesystem, never one computed again from the input —
+    /// and `found` the files it returned something of, relative to it, as
+    /// the walk produced them. `complete: false`: the result was cut at
+    /// the tool's limit, and the list says nothing.
     pub fn report<P: AsRef<Path>>(
         &self,
         searched: &Path,
         found: impl IntoIterator<Item = P>,
         complete: bool,
     ) {
-        if !complete {
-            return;
-        }
-        let mut paths: Vec<PathBuf> = found
-            .into_iter()
-            .map(|path| searched.join(path.as_ref()))
-            .collect();
-        paths.dedup();
+        let files = complete.then(|| {
+            let mut files: Vec<PathBuf> = found
+                .into_iter()
+                .map(|path| searched.join(path.as_ref()))
+                .collect();
+            files.dedup();
+            files
+        });
         *self
             .0
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(paths);
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(ReturnedPaths {
+            searched: searched.to_path_buf(),
+            files,
+        });
     }
 
-    /// The list, if the tool left one.
-    pub fn take(&self) -> Option<Vec<PathBuf>> {
+    /// The report of a tool that opens the one path its input names
+    /// (`read`): `opened` is what it hands to the filesystem, and all it
+    /// returns something of.
+    pub fn report_opened(&self, opened: &Path) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(ReturnedPaths {
+            searched: opened.to_path_buf(),
+            files: Some(vec![opened.to_path_buf()]),
+        });
+    }
+
+    /// The report, if the tool left one.
+    pub fn take(&self) -> Option<ReturnedPaths> {
         self.0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -91,19 +114,19 @@ pub enum Outside {
     /// `memory` when it returns an unverified record, `session_search`
     /// when a hit comes from a marked session.
     Flagged,
-    /// It reads the file its input names under this key: outside content
-    /// when the file is in the upload area.
-    ReadsPath(&'static str),
-    /// It searches the tree its input names under this key (the session's
-    /// directory when it names none) and prints names or lines of what it
-    /// finds. With an upload area that holds something, it is outside
-    /// content when the resolved tree is inside or is the area; otherwise
-    /// when a file it returned is in the area, by the tool's own list of
-    /// them ([`ReturnedPaths::report`]); and without a complete list — the
-    /// result was cut at the tool's limit, or the call failed — when the
-    /// tree contains the area. Never decided from the text the tool
-    /// printed, and whatever cannot be resolved counts.
-    SearchesPath(&'static str),
+    /// It returns the file, or the names in the directory, that its input
+    /// names: outside content when what it opened is in the upload area.
+    /// Decided as [`Outside::SearchesPath`] is, from its report.
+    ReadsPath,
+    /// It walks a tree and prints names or lines of what it finds. Decided
+    /// from its report ([`ReturnedPaths`]) alone, and only for an upload
+    /// area that holds something: no report, or a walked path that cannot
+    /// be resolved, counts; a report without a file list (a result cut at
+    /// the limit) counts when the walked tree and the area overlap, either
+    /// way round; a file list counts when one of its files is in the area
+    /// or cannot be resolved. Never decided from the call's input or from
+    /// the text the tool printed.
+    SearchesPath,
     /// It returns what a child session produced: outside content when a
     /// child of the session is marked.
     Child,
@@ -120,10 +143,10 @@ pub const BUILTIN: &[(&str, Outside)] = &[
     ("question", Outside::Never),
     // See the module comment: a stated limit.
     ("bash", Outside::Never),
-    ("read", Outside::ReadsPath("filePath")),
+    ("read", Outside::ReadsPath),
     // File names are an uploader's words too.
-    ("glob", Outside::SearchesPath("path")),
-    ("grep", Outside::SearchesPath("path")),
+    ("glob", Outside::SearchesPath),
+    ("grep", Outside::SearchesPath),
     ("edit", Outside::Never),
     ("write", Outside::Never),
     ("apply_patch", Outside::Never),
@@ -180,9 +203,8 @@ pub struct SessionFacts<'a> {
     pub uploads: &'a [String],
     /// Whether a child of the session is marked.
     pub child_marked: &'a dyn Fn() -> bool,
-    /// The files this call returned something of, as the tool listed them
-    /// ([`ReturnedPaths`]). `None`: it left no complete list.
-    pub returned: Option<&'a [PathBuf]>,
+    /// What the tool reported for this call. `None`: nothing.
+    pub returned: Option<&'a ReturnedPaths>,
 }
 
 /// The upload directories that exist, resolved as the kernel would
@@ -212,12 +234,12 @@ fn holds_something(root: &Path) -> bool {
 }
 
 /// Whether `result` brings outside content into the session. Decided from
-/// the call's structured input, the tool's own list of the files it
-/// returned and the filesystem, never from the text a tool printed;
-/// whatever cannot be decided counts as outside content.
+/// the tool's classification, what the tool reported, and the filesystem —
+/// never from the text a tool printed, and for a file tool never from the
+/// call's input; whatever cannot be decided counts as outside content.
 pub fn carries_outside_content(result: &ToolResult<'_>, facts: &SessionFacts<'_>) -> bool {
-    let class = classify(result.tool);
-    match class {
+    use crate::protect::resolve_path;
+    match classify(result.tool) {
         Outside::Never => false,
         Outside::Always => true,
         Outside::Flagged => {
@@ -227,65 +249,36 @@ pub fn carries_outside_content(result: &ToolResult<'_>, facts: &SessionFacts<'_>
                 .and_then(|metadata| metadata.get(FLAG))
                 .is_some_and(|flag| !matches!(flag, Value::Bool(false) | Value::Null))
         }
-        Outside::ReadsPath(key) | Outside::SearchesPath(key) => {
+        Outside::ReadsPath | Outside::SearchesPath => {
             let mut roots = match upload_roots(facts) {
-                Ok(roots) if roots.is_empty() => return false,
                 Ok(roots) => roots,
                 Err(()) => return true,
             };
-            let named = match result.input.get(key) {
-                Some(Value::String(path)) => Some(facts.directory.join(path)),
-                // A search with no root searches the session's directory;
-                // a read always names its file.
-                None | Some(Value::Null) if matches!(class, Outside::SearchesPath(_)) => {
-                    Some(facts.directory.to_path_buf())
-                }
-                // Not the shape the tool takes: it cannot be told.
-                _ => None,
-            };
-            let named = named.and_then(|named| crate::protect::resolve_path(&named).ok());
-            if matches!(class, Outside::ReadsPath(_)) {
-                return match named {
-                    Some(path) => roots.iter().any(|root| path.starts_with(root)),
-                    None => true,
-                };
-            }
-            // A search. An upload directory that is merely there has
-            // nothing to return, whatever was searched.
+            // An upload directory that is merely there has nothing to
+            // return, whatever was opened.
             roots.retain(|root| holds_something(root));
             if roots.is_empty() {
                 return false;
             }
-            // What was searched cannot be told: it counts.
-            let Some(mut tree) = named else {
+            // The tool did not say what it opened — a failed call, a list
+            // that could not be matched to this call: it counts.
+            let Some(returned) = facts.returned else {
                 return true;
             };
-            // `grep` given a file searches the directory the file is in.
-            if !tree.is_dir() {
-                tree.pop();
-            }
-            // A search in the area itself returns the area's content.
-            if roots.iter().any(|root| tree.starts_with(root)) {
+            let Ok(searched) = resolve_path(&returned.searched) else {
                 return true;
-            }
-            match facts.returned {
-                // The tool said which files it returned: those decide. One
-                // that cannot be resolved, or is not there, cannot be
-                // placed, and counts.
-                Some(returned) => {
-                    returned
-                        .iter()
-                        .any(|path| match crate::protect::resolve_path(path) {
-                            Ok(path) => {
-                                std::fs::symlink_metadata(&path).is_err()
-                                    || roots.iter().any(|root| path.starts_with(root))
-                            }
-                            Err(_) => true,
-                        })
-                }
-                // It did not — the result was cut at the tool's limit, or
-                // the call failed: a tree that holds the area counts.
-                None => roots.iter().any(|root| root.starts_with(&tree)),
+            };
+            match &returned.files {
+                // Cut at the limit: the walked tree and the area overlap.
+                None => roots
+                    .iter()
+                    .any(|root| searched.starts_with(root) || root.starts_with(&searched)),
+                // The files it returned decide. One that cannot be
+                // resolved cannot be placed, and counts.
+                Some(files) => files.iter().any(|file| match resolve_path(file) {
+                    Ok(file) => roots.iter().any(|root| file.starts_with(root)),
+                    Err(_) => true,
+                }),
             }
         }
         Outside::Child => (facts.child_marked)(),
@@ -382,247 +375,225 @@ mod tests {
         }
     }
 
-    /// A search is judged by the files the tool listed as returned; the
-    /// tree it searched decides only when there is no complete list, and
-    /// then only for an upload area that holds something.
+    /// `read`, `grep` and `glob` are decided from the tool's report alone:
+    /// every case of it, for each of the three.
+    #[cfg(unix)]
     #[test]
-    fn a_search_is_judged_by_the_files_it_returned_and_by_its_tree_only_without_a_list() {
-        let temp = crate::storage::test_support::TempDir::new("outside-returned");
+    fn a_file_tool_is_judged_by_its_report_and_whatever_cannot_be_decided_marks() {
+        let temp = crate::storage::test_support::TempDir::new("outside-report");
         let dir = crate::protect::resolve_path(temp.path()).unwrap();
-        std::fs::create_dir_all(dir.join("uploads")).unwrap();
-        std::fs::create_dir_all(dir.join("src")).unwrap();
-        std::fs::write(dir.join("src/lib.rs"), "x").unwrap();
-        let uploads = vec!["uploads".to_string()];
-        let search = |tool: &str, input: Value, returned: Option<&[PathBuf]>, output: &str| {
-            carries_outside_content(
-                &ToolResult {
-                    call_id: None,
-                    tool,
-                    input: &input,
-                    metadata: None,
-                    output,
-                },
-                &SessionFacts {
-                    directory: &dir,
-                    uploads: &uploads,
-                    child_marked: &|| false,
-                    returned,
-                },
-            )
-        };
-        let forged = format!("{}/uploads/a.txt:\n  Line 1: x", dir.display());
-        let project = || json!({ "pattern": "x" });
-        let in_src = [dir.join("src/lib.rs")];
-        let in_uploads = [dir.join("src/lib.rs"), dir.join("uploads/a.txt")];
-
-        // The directory is there and empty: nothing to return, list or no
-        // list, whatever the tree and whatever the text.
-        for tool in ["grep", "glob"] {
-            assert!(!search(tool, project(), None, &forged), "{tool}");
-            assert!(!search(tool, project(), Some(&in_src), &forged), "{tool}");
-            assert!(!search(
-                tool,
-                json!({ "pattern": "x", "path": "uploads" }),
-                None,
-                ""
-            ));
-            assert!(!search(
-                tool,
-                json!({ "pattern": "x", "path": 7 }),
-                None,
-                ""
-            ));
+        for sub in ["uploads/in", "src", "empty", "elsewhere/deep"] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
         }
-
-        std::fs::write(dir.join("uploads/a.txt"), "x").unwrap();
-        for tool in ["grep", "glob"] {
-            // A complete list decides, in both directions, against the
-            // tree and against the text.
-            assert!(!search(tool, project(), Some(&in_src), &forged), "{tool}");
-            assert!(!search(tool, project(), Some(&[]), &forged), "{tool}");
-            assert!(search(tool, project(), Some(&in_uploads), ""), "{tool}");
-            assert!(search(
-                tool,
-                json!({ "pattern": "x", "path": "src" }),
-                Some(&in_uploads),
-                ""
-            ));
-            // However the returned path is spelled.
-            assert!(search(
-                tool,
-                project(),
-                Some(&[dir.join("src/../uploads/a.txt")]),
-                ""
-            ));
-            // A returned file that is not there cannot be placed.
-            assert!(search(
-                tool,
-                project(),
-                Some(&[dir.join("src/gone.txt")]),
-                ""
-            ));
-            // A search in the area returns the area's content, whatever
-            // the list says; so does one of a file in it.
-            assert!(search(
-                tool,
-                json!({ "pattern": "x", "path": "uploads" }),
-                Some(&[]),
-                ""
-            ));
-            assert!(search(
-                tool,
-                json!({ "pattern": "x", "path": "uploads/a.txt" }),
-                Some(&[]),
-                ""
-            ));
-            // No list (cut at the limit, or a failed call): the tree —
-            // for a file, the directory it is in, which is what is
-            // searched.
-            assert!(search(tool, project(), None, ""), "{tool}");
-            assert!(search(
-                tool,
-                json!({ "pattern": "x", "path": "src/../none.txt" }),
-                None,
-                ""
-            ));
-            assert!(!search(
-                tool,
-                json!({ "pattern": "x", "path": "src" }),
-                None,
-                &forged
-            ));
-            assert!(search(tool, json!({ "pattern": "x", "path": 7 }), None, ""));
-        }
-        #[cfg(unix)]
-        {
-            // A returned file that is a link into the area is in the area;
-            // one that cannot be resolved cannot be placed, and counts.
-            std::os::unix::fs::symlink(dir.join("uploads/a.txt"), dir.join("src/link.txt"))
-                .unwrap();
-            assert!(search(
-                "grep",
-                project(),
-                Some(&[dir.join("src/link.txt")]),
-                ""
-            ));
-            std::os::unix::fs::symlink(dir.join("src/loop"), dir.join("src/loop")).unwrap();
-            assert!(search("glob", project(), Some(&[dir.join("src/loop")]), ""));
-        }
-        // An upload area that is a file, not a directory, holds something.
-        let odd = vec!["src/lib.rs".to_string()];
-        assert!(carries_outside_content(
-            &ToolResult {
-                call_id: None,
-                tool: "grep",
-                input: &project(),
-                metadata: None,
-                output: "",
-            },
-            &SessionFacts {
-                directory: &dir,
-                uploads: &odd,
-                child_marked: &|| false,
-                returned: None,
-            },
-        ));
-    }
-
-    #[test]
-    fn a_read_under_the_upload_area_is_outside_content_however_it_is_named() {
-        let temp = crate::storage::test_support::TempDir::new("outside-uploads");
-        let dir = crate::protect::resolve_path(temp.path()).unwrap();
-        std::fs::create_dir_all(dir.join("uploads/in")).unwrap();
-        std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::write(dir.join("uploads/in/a.txt"), "x").unwrap();
         std::fs::write(dir.join("src/lib.rs"), "x").unwrap();
-        let uploads = vec!["uploads".to_string()];
-        let none = json!({});
-        let read = |path: &str| {
-            carries_outside_content(
-                &result("read", &json!({ "filePath": path }), &none),
-                &facts(&dir, &uploads),
-            )
+        let link = |target: &str, name: &str| {
+            std::os::unix::fs::symlink(dir.join(target), dir.join(name)).unwrap()
         };
-        assert!(read("uploads/in/a.txt"));
-        assert!(read(&dir.join("uploads/in/a.txt").to_string_lossy()));
-        assert!(read("src/../uploads/in/a.txt"));
-        assert!(!read("src/lib.rs"));
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(dir.join("uploads/in/a.txt"), dir.join("src/link.txt"))
-                .unwrap();
-            assert!(read("src/link.txt"), "a link into the area reads the area");
-        }
-        // No upload area configured, or none on disk: nothing to tell.
-        assert!(!carries_outside_content(
-            &result("read", &json!({ "filePath": "uploads/in/a.txt" }), &none),
-            &facts(&dir, &[]),
-        ));
-        // A search is judged by the tree it searches, not by what it
-        // printed: inside the area, the area itself, or a tree holding it.
-        let search = |tool: &str, input: Value, output: &str| {
-            carries_outside_content(
-                &ToolResult {
-                    call_id: None,
-                    tool,
-                    input: &input,
-                    metadata: None,
-                    output,
-                },
-                &facts(&dir, &uploads),
-            )
+        link("uploads/in/a.txt", "src/link.txt");
+        link("uploads", "src/drop");
+        link("elsewhere/deep", "lnk");
+        link("loop", "loop");
+
+        let at = |path: &str| dir.join(path);
+        let report = |searched: &str, files: Option<&[&str]>| {
+            Some(ReturnedPaths {
+                searched: at(searched),
+                files: files.map(|files| files.iter().map(|file| at(file)).collect()),
+            })
         };
-        for tool in ["grep", "glob"] {
+        // (what, the report, marked with files in the upload area)
+        let cases: Vec<(&str, Option<ReturnedPaths>, bool)> = vec![
+            ("no report", None, true),
+            (
+                "the walked path cannot be resolved",
+                report("loop", Some(&[])),
+                true,
+            ),
+            (
+                "no file list, the tree inside the area",
+                report("uploads/in", None),
+                true,
+            ),
+            (
+                "no file list, the tree is the area",
+                report("uploads", None),
+                true,
+            ),
+            (
+                "no file list, the tree contains the area",
+                report("", None),
+                true,
+            ),
+            (
+                "no file list, the tree apart from the area",
+                report("src", None),
+                false,
+            ),
+            (
+                // …where `src/drop/..` is the project, not `src`.
+                "no file list, through a link and up to a tree apart",
+                report("src/drop/../src", None),
+                false,
+            ),
+            (
+                "no file list, a link to the area",
+                report("src/drop", None),
+                true,
+            ),
+            (
+                // As the kernel reads it: the link, then up from the area.
+                "no file list, through a link, up, and into the area",
+                report("src/drop/../uploads/in", None),
+                true,
+            ),
+            (
+                "files, one of them an upload",
+                report("", Some(&["src/lib.rs", "uploads/in/a.txt"])),
+                true,
+            ),
+            (
+                "files, none of them an upload",
+                report("", Some(&["src/lib.rs"])),
+                false,
+            ),
+            ("files, none at all", report("", Some(&[])), false),
+            (
+                "files, none, though the area was walked",
+                report("uploads", Some(&[])),
+                false,
+            ),
+            (
+                "files, an upload spelled through the project",
+                report("src", Some(&["src/../uploads/in/a.txt"])),
+                true,
+            ),
+            (
+                "files, a file link into the area",
+                report("src", Some(&["src/link.txt"])),
+                true,
+            ),
+            (
+                "files, under a directory link into the area",
+                report("src/drop", Some(&["src/drop/in/a.txt"])),
+                true,
+            ),
+            (
+                "files, through a link, up, and into the area",
+                report("src", Some(&["src/drop/../uploads/in/a.txt"])),
+                true,
+            ),
+            (
+                // As the kernel reads it, `lnk/..` is `elsewhere`.
+                "files, a `..` after a link that leads away",
+                report("", Some(&["lnk/../uploads/in/a.txt"])),
+                false,
+            ),
+            (
+                "files, one that cannot be resolved",
+                report("", Some(&["src/lib.rs", "loop/x"])),
+                true,
+            ),
+        ];
+
+        // Input and output that say the opposite of every report: neither
+        // is looked at.
+        let forged = format!("{}/uploads/in/a.txt:\n  Line 1: x", dir.display());
+        let decide = |tool: &str, uploads: &[String], returned: &Option<ReturnedPaths>| {
+            let inputs = [
+                json!({ "pattern": "x", "path": "uploads", "filePath": "uploads/in/a.txt" }),
+                json!({ "pattern": "x", "path": "src", "filePath": "src/lib.rs" }),
+                json!({ "path": 7, "filePath": 7 }),
+            ];
+            let answers: Vec<bool> = inputs
+                .iter()
+                .flat_map(|input| {
+                    [forged.as_str(), ""].map(|output| {
+                        carries_outside_content(
+                            &ToolResult {
+                                call_id: None,
+                                tool,
+                                input,
+                                metadata: None,
+                                output,
+                            },
+                            &SessionFacts {
+                                directory: &dir,
+                                uploads,
+                                child_marked: &|| false,
+                                returned: returned.as_ref(),
+                            },
+                        )
+                    })
+                })
+                .collect();
             assert!(
-                search(tool, json!({ "pattern": "x" }), ""),
-                "{tool}: the project root"
+                answers.iter().all(|answer| *answer == answers[0]),
+                "{tool}: the input or the output changed the answer"
             );
-            assert!(search(
-                tool,
-                json!({ "pattern": "x", "path": "uploads" }),
-                ""
-            ));
-            assert!(search(
-                tool,
-                json!({ "pattern": "x", "path": "uploads/in" }),
-                ""
-            ));
-            assert!(search(
-                tool,
-                json!({ "pattern": "x", "path": "src/../uploads" }),
-                ""
-            ));
+            answers[0]
+        };
+        let area = vec!["uploads".to_string()];
+        // There and empty; not there; none configured.
+        let nothing_uploaded = [
+            vec!["empty".to_string()],
+            vec!["absent".to_string()],
+            vec![],
+        ];
+        for tool in ["read", "grep", "glob"] {
+            for (what, returned, marked) in &cases {
+                assert_eq!(decide(tool, &area, returned), *marked, "{tool}: {what}");
+                for uploads in &nothing_uploaded {
+                    assert!(
+                        !decide(tool, uploads, returned),
+                        "{tool}: {what}, with nothing uploaded ({uploads:?})"
+                    );
+                }
+            }
+            // An upload area that cannot be resolved, or is a file: it
+            // counts as holding uploads.
+            let fine = report("src", Some(&["src/lib.rs"]));
+            assert!(decide(tool, &["loop".to_string()], &fine), "{tool}");
             assert!(
-                search(tool, json!({ "pattern": "x", "path": 7 }), ""),
-                "not a path"
+                decide(tool, &["src/lib.rs".to_string()], &None),
+                "{tool}: an area that is a file"
             );
-            // Elsewhere: not marked, whatever the output mentions.
-            let forged = format!("{}/uploads/in/a.txt:\n  Line 1: x", dir.display());
-            assert!(!search(
-                tool,
-                json!({ "pattern": "x", "path": "src" }),
-                &forged
-            ));
         }
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(dir.join("uploads"), dir.join("src/drop")).unwrap();
-            assert!(search(
-                "grep",
-                json!({ "pattern": "x", "path": "src/drop" }),
-                ""
-            ));
-        }
-        // An upload area that cannot be resolved: the marking answer.
-        let looping = vec!["loop".to_string()];
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(dir.join("loop"), dir.join("loop")).unwrap();
-            assert!(carries_outside_content(
-                &result("read", &json!({ "filePath": "src/lib.rs" }), &none),
-                &facts(&dir, &looping),
-            ));
-        }
-        let _ = looping;
+    }
+
+    /// The reports the tools make: `searched` is the variable handed in,
+    /// the files are under it, and a cut result has no file list.
+    #[test]
+    fn a_report_names_what_was_walked_and_lists_files_only_when_complete() {
+        let slot = ReturnedPathsSlot::default();
+        assert_eq!(slot.take(), None);
+        slot.report(Path::new("/p/src"), ["a.rs", "a.rs", "sub/b.rs"], true);
+        assert_eq!(
+            slot.take(),
+            Some(ReturnedPaths {
+                searched: PathBuf::from("/p/src"),
+                files: Some(vec![
+                    PathBuf::from("/p/src/a.rs"),
+                    PathBuf::from("/p/src/sub/b.rs")
+                ]),
+            })
+        );
+        slot.report(Path::new("/p/src"), ["a.rs"], false);
+        assert_eq!(
+            slot.take(),
+            Some(ReturnedPaths {
+                searched: PathBuf::from("/p/src"),
+                files: None,
+            })
+        );
+        slot.report_opened(Path::new("/p/src/a.rs"));
+        assert_eq!(
+            slot.take(),
+            Some(ReturnedPaths {
+                searched: PathBuf::from("/p/src/a.rs"),
+                files: Some(vec![PathBuf::from("/p/src/a.rs")]),
+            })
+        );
+        assert_eq!(slot.take(), None);
     }
 }

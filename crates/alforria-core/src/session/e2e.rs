@@ -2439,6 +2439,15 @@ mod tests {
                         output.clone(),
                         Value::Object(metadata.clone()),
                     )),
+                    // A failed call: its message is what was appended.
+                    V1Part::Tool {
+                        call_id,
+                        tool,
+                        state: V1ToolState::Error { error, .. },
+                        ..
+                    } if *call_id == call => {
+                        Some((tool.clone(), String::new(), error.clone(), Value::Null))
+                    }
                     _ => None,
                 })
                 .unwrap_or_else(|| panic!("{call} completed"))
@@ -2527,6 +2536,11 @@ mod tests {
                     json!({ "pattern": "*.txt", "path": "src/drop/../drop" }),
                 ),
                 ("read", json!({ "filePath": "uploads/drop.txt" })),
+                ("read", json!({ "filePath": "lnk/../uploads/drop.txt" })),
+                ("read", json!({ "filePath": "src/drop" })),
+                ("read", json!({ "filePath": "src/missing.rs" })),
+                ("grep", json!({ "pattern": "(", "path": "src" })),
+                ("grep", json!({ "pattern": "(" })),
                 ("glob", json!({ "pattern": "many/*.txt" })),
                 ("grep", json!({ "pattern": "bulkneedle" })),
                 ("glob", json!({ "pattern": "*.txt", "path": "many" })),
@@ -2616,6 +2630,36 @@ mod tests {
             assert!(marked, "{what}");
         }
         assert!(runs.run().await.0, "a read of an upload");
+        // `read` opens the path with `..` taken out of the spelling, so
+        // this is the upload — though read as the kernel would read the
+        // input, `lnk/..` is somewhere else. What the tool opened decides.
+        std::fs::create_dir_all(runs.e.worktree.join("elsewhere/deep")).unwrap();
+        std::os::unix::fs::symlink(
+            runs.e.worktree.join("elsewhere/deep"),
+            runs.e.worktree.join("lnk"),
+        )
+        .unwrap();
+        let (marked, output) = runs.run().await;
+        assert!(output.contains("uploadneedle, from outside"), "{output}");
+        assert!(
+            marked,
+            "a read of an upload spelled through a link and back"
+        );
+        let (marked, output) = runs.run().await;
+        assert!(output.contains("linked.txt"), "{output}");
+        assert!(marked, "a listing of the area through a directory link");
+
+        // A call that fails is judged by what it had opened: a missing
+        // project file and a bad pattern under `src` are not uploads; a
+        // bad pattern over the project is not told apart from a search
+        // that was cut, and marks.
+        let (marked, output) = runs.run().await;
+        assert!(output.contains("File not found"), "{output}");
+        assert!(!marked, "a read of a project file that is not there");
+        let (marked, output) = runs.run().await;
+        assert!(output.contains("regex"), "{output}");
+        assert!(!marked, "a search under src that failed");
+        assert!(runs.run().await.0, "a search of the project that failed");
 
         // Cut at the limit: no complete list, so the tree decides — the
         // project holds the (non-empty) upload area.

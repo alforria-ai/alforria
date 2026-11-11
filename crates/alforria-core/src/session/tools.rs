@@ -230,17 +230,19 @@ pub async fn resolve(
                         metadata: &sink,
                     };
                     let input = args.clone();
-                    let result = match (tool.execute)(args, ctx).await {
-                        Ok(result) => {
-                            // alforria extension: a search's own list of
-                            // the files it returned, kept for when the
-                            // processor appends the result
-                            // (`SessionStore::note_tool_result`).
-                            if let Some(paths) = extra.returned_paths.take() {
-                                processor.report_returned_paths(&call_id, tool.id, &input, paths);
-                            }
-                            result
+                    let executed = (tool.execute)(args, ctx).await;
+                    // alforria extension: a file tool's own report of what
+                    // it opened and returned, kept for when the processor
+                    // appends the result or the failure's message
+                    // (`SessionStore::note_tool_result`). A rejection is
+                    // not appended as a result, and needs none.
+                    if !matches!(executed, Err(crate::tool::error::ToolError::Rejected(_))) {
+                        if let Some(paths) = extra.returned_paths.take() {
+                            processor.report_returned_paths(&call_id, tool.id, &input, paths);
                         }
+                    }
+                    let result = match executed {
+                        Ok(result) => result,
                         // TS: the native runtime surfaces tool failures as
                         // a ToolFailure value carrying the error class
                         // (native-runtime.ts:188).
