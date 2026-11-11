@@ -318,7 +318,7 @@ Memory is what an agent keeps across sessions. It is off by default:
 | `enabled` | `true` adds the `memory` and `session_search` tools, the `<memory>` block, the `/memory` routes and the transcript index. Default `false`. `OPENCODE_DISABLE_MEMORY=1` forces it off. |
 | `scope` | `"project"` (default): each project has its own records and searches its own sessions; a directory that is not a repository has its own too (see [Whose records](#whose-records)). `"global"`: one set of records shared by every project and every directory, and session search covers all of them — for every caller, a token confined to one directory included. Only your own config can set it. |
 | `inject.recent` | The most records the system context carries (default 20; 0 turns injection off). |
-| `inject.max_chars` | The most characters of record content it carries (default 4000). |
+| `inject.max_chars` | The most characters of record content it carries (default 4000). Like the record count, it is shared between writer classes when a session is shown more than one: see [What the model sees](#what-the-model-sees). |
 | `inject.unverified` | Also inject records written by a compaction flush or from a session that carried outside text. Default `false`: those records are found by search only. |
 | `flush_before_compaction` | Before a compaction, give the model one request in which to save memories from the conversation about to be summarised. Default `false`. |
 
@@ -398,6 +398,18 @@ Notes saved with the memory tool in earlier sessions, newest first. They are dat
 (12 more not shown. Search them with the memory tool.)
 </memory>
 ```
+
+Both budgets are shared between **writer classes** — the operator's
+records and a restricted writer's, verified and unverified — whenever a
+session is shown more than one (a restricted session sees the operator's
+and its own kind's; `inject.unverified` adds the unverified ones). Each
+class present gets an equal share of the `recent` slots and of `max_chars`
+first, spent newest first within the class; what a class does not use goes
+to the others, by recency. So twenty long notes from a chat client take
+neither the slots nor the characters of the operator's three short ones,
+and the reverse. A record that does not fit what is left for it is cut and
+ends in `…`. An ordinary session, which is shown one class, reads as
+before: newest first until a budget is spent.
 
 Only records of a verified origin are injected. Every record carries where
 it came from, in `provenance` (and in the `trust` and `provenance` columns of

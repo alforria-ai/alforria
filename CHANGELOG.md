@@ -266,6 +266,15 @@ pre-1.0, so minor releases may include breaking changes.
   every route that names a session, applied after routing; only `fork` is
   exempt, by name. `GET /permission` and `GET /question` list such a token
   the asks it may answer, as `GET /attention` does, in the same shape.
+- The `<memory>` block shared its record slots between writer classes
+  (the operator's records and a restricted writer's, verified and not) but
+  spent `memory.inject.max_chars` in plain recency order, so a few long
+  recent notes from one class used the whole character budget and the
+  other class's records, though chosen, were never printed. The character
+  budget is now shared the same way: an equal share per class present,
+  newest first within it, and what a class leaves unused goes to the
+  others. A session that is shown one class — every session without bearer
+  tokens or `inject.unverified` — gets the block it got before.
 - A background subagent's result reached its parent session as a message
   without the subagent's outside-content mark: a subagent that fetched a
   page in the background handed its findings to a parent that still

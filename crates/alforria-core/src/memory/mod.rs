@@ -700,11 +700,14 @@ impl MemoryService {
     /// restricted writers', verified and not): each class present gets an
     /// equal share of the slots first, and only the slots a class leaves
     /// unused go to the others by recency. No class crowds out another.
+    ///
+    /// Each record comes with its writer class, for the character budget,
+    /// which is shared out the same way ([`Self::injection_for`]).
     fn injectable(
         &self,
         restricted_session: bool,
         limit: usize,
-    ) -> Result<Vec<MemoryRecord>, MemoryError> {
+    ) -> Result<Vec<(MemoryRecord, i64)>, MemoryError> {
         // One definition of "a restricted writer saved it", matching
         // `Provenance::restricted` as `row_to_record` reads it.
         // (`CASE`, not `AND`: SQLite may evaluate both sides, and
@@ -795,7 +798,7 @@ impl MemoryService {
             .into_iter()
             .zip(chosen)
             .filter(|(_, chosen)| *chosen)
-            .map(|((record, _), _)| record)
+            .map(|(row, _)| row)
             .collect())
     }
 
@@ -1266,25 +1269,50 @@ impl MemoryService {
                 )
             })
             .unwrap_or(records.len() as i64);
-        let mut left = self.settings.inject_max_chars;
+        // The character budget is shared out like the slots
+        // (`Self::injectable`): each writer class present gets an equal
+        // share first, spent newest first within the class, and only what
+        // a class leaves unused goes to the others, by recency. The slots
+        // alone did not keep a class in the block: a few long, recent
+        // records of one class used to spend the whole budget before an
+        // older record of another class was reached. With one class
+        // present this is the old reading: newest first until the budget
+        // is spent.
+        let sizes: Vec<usize> = records
+            .iter()
+            .map(|(record, _)| record.content.chars().count())
+            .collect();
+        let mut classes: Vec<i64> = records.iter().map(|(_, class)| *class).collect();
+        classes.sort_unstable();
+        classes.dedup();
+        let budget = self.settings.inject_max_chars;
+        let share = budget / classes.len().max(1);
+        let mut unspent: std::collections::HashMap<i64, usize> =
+            classes.iter().map(|class| (*class, share)).collect();
+        let mut granted = vec![0usize; records.len()];
+        for (index, (_, class)) in records.iter().enumerate() {
+            let left = unspent.entry(*class).or_default();
+            granted[index] = sizes[index].min(*left);
+            *left -= granted[index];
+        }
+        let mut spare = budget - granted.iter().sum::<usize>();
+        for (index, size) in sizes.iter().enumerate() {
+            let more = (size - granted[index]).min(spare);
+            granted[index] += more;
+            spare -= more;
+        }
         let mut lines = Vec::new();
-        for record in &records {
-            if left == 0 {
-                break;
+        for ((record, _), (size, granted)) in records.iter().zip(sizes.into_iter().zip(granted)) {
+            if granted == 0 {
+                continue;
             }
-            let size = record.content.chars().count();
-            let content: String = if size > left {
-                let mut cut: String = record
-                    .content
-                    .chars()
-                    .take(left.saturating_sub(1))
-                    .collect();
+            let content: String = if size > granted {
+                let mut cut: String = record.content.chars().take(granted - 1).collect();
                 cut.push('…');
                 cut
             } else {
                 record.content.clone()
             };
-            left = left.saturating_sub(size.min(left));
             lines.push(format!(
                 "<record id=\"{}\" kind=\"{}\" updated=\"{}\">{}</record>",
                 record.id,
@@ -2330,6 +2358,94 @@ mod tests {
             assert!(block.contains(&format!("client note {i}")), "{block}");
         }
         assert_eq!(block.matches("<record ").count(), 20, "{block}");
+    }
+
+    /// The character budget is shared between writer classes like the
+    /// slots are. Twenty slots did not help the operator's three short
+    /// facts when a chat client's four newest notes were a thousand
+    /// characters each: the budget was spent in recency order and ran out
+    /// before the facts were reached.
+    #[test]
+    fn no_writer_class_spends_another_classes_share_of_the_character_budget() {
+        let budget = MemorySettings::DEFAULT_INJECT_MAX_CHARS;
+        let long = |tag: &str, i: usize| format!("{tag} {i}: {}", "x".repeat(1000));
+        let records = |block: &str| block.matches("<record ").count();
+
+        // Older, short operator facts; newer, long notes from a chat client.
+        let (_dir, store) = storage("mem-chars-a");
+        let memory = service(store, settings("proj"));
+        for i in 0..3 {
+            memory
+                .remember(Some("fact"), &format!("Operator fact {i}."), None)
+                .unwrap();
+        }
+        for i in 0..20 {
+            memory
+                .remember_from(None, &long("chat filler", i), None, Provenance::client())
+                .unwrap();
+        }
+        let block = memory.injection_for(true).unwrap();
+        for i in 0..3 {
+            assert!(block.contains(&format!("Operator fact {i}.")), "{block}");
+        }
+        // The client's notes are there too, newest first, and get what the
+        // operator's short facts left of their half.
+        assert!(block.contains("chat filler 19: xxx"), "{block}");
+        assert!(block.matches("chat filler").count() >= 3, "{block}");
+        let shown: usize = block
+            .lines()
+            .filter(|line| line.starts_with("<record "))
+            .map(|line| {
+                let content = &line[line.find('>').unwrap() + 1..line.rfind("</record>").unwrap()];
+                content.chars().count()
+            })
+            .sum();
+        assert!(shown <= budget, "{shown} > {budget}");
+        assert!(
+            shown > budget - 50,
+            "the unused share is handed on: {shown}"
+        );
+
+        // The other way round: the operator's long recent notes do not
+        // push a chat client's short ones out of its own sessions' block.
+        let (_dir, store) = storage("mem-chars-b");
+        let memory = service(store, settings("proj"));
+        for i in 0..3 {
+            memory
+                .remember_from(
+                    None,
+                    &format!("client note {i}"),
+                    None,
+                    Provenance::client(),
+                )
+                .unwrap();
+        }
+        for i in 0..20 {
+            memory
+                .remember(Some("fact"), &long("Operator essay", i), None)
+                .unwrap();
+        }
+        let block = memory.injection_for(true).unwrap();
+        for i in 0..3 {
+            assert!(block.contains(&format!("client note {i}")), "{block}");
+        }
+        assert!(block.contains("Operator essay 19: xxx"), "{block}");
+
+        // One class alone spends the budget as before: newest first, the
+        // last one cut, nothing after it.
+        let (_dir, store) = storage("mem-chars-c");
+        let memory = service(store, settings("proj"));
+        for i in 0..20 {
+            memory
+                .remember(Some("fact"), &long("Operator essay", i), None)
+                .unwrap();
+        }
+        let block = memory.injection_for(false).unwrap();
+        assert_eq!(records(&block), 4, "{block}");
+        for i in 16..20 {
+            assert!(block.contains(&format!("Operator essay {i}: ")), "{block}");
+        }
+        assert_eq!(block.matches('…').count(), 1, "{block}");
     }
 
     #[test]
