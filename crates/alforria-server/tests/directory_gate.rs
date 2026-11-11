@@ -319,3 +319,62 @@ async fn a_bearer_server_outside_its_allowlist_warns_at_startup() {
     let plain = fixture_with(|_| json!({}), Some("pw"), Vec::new());
     assert!(alforria_server::startup_warnings(&plain.ctx).is_empty());
 }
+
+/// A bearer server does not listen when a directory its tokens may open
+/// contains the host config or the data directory: the agent could write
+/// the policy it runs under (the project at `$HOME`).
+#[tokio::test]
+async fn a_bearer_server_does_not_serve_a_directory_holding_its_host_config() {
+    let signer = Signer::new();
+    let key = signer.public_key();
+    let bearer_over = |directory: fn(&Dirs) -> std::path::PathBuf| {
+        let key = key.clone();
+        move |dirs: &Dirs| {
+            json!({ "server": {
+                "auth": { "bearer": { "keys": [key], "audience": AUDIENCE } },
+                "directories": [directory(dirs).display().to_string()],
+            } })
+        }
+    };
+    // The home directory holds `.config/alforria` and `.local/share/alforria`.
+    let f = fixture_with(
+        bearer_over(|dirs| dirs.home.clone()),
+        Some("pw"),
+        Vec::new(),
+    );
+    let reason = alforria_server::startup_refusal(&f.ctx).expect("must refuse");
+    assert!(reason.contains("server.directories"), "{reason}");
+    let error = alforria_server::listen_with(
+        &alforria_server::ListenOptions {
+            port: 0,
+            ..Default::default()
+        },
+        f.ctx.clone(),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("refusing to listen"), "{error}");
+
+    // The config directory itself, or a parent of it.
+    let f = fixture_with(
+        bearer_over(|dirs| dirs.home.join(".config")),
+        Some("pw"),
+        Vec::new(),
+    );
+    assert!(alforria_server::startup_refusal(&f.ctx).is_some());
+
+    // A project beside the home, and a server without bearer auth over
+    // anything: served.
+    let f = fixture_with(
+        bearer_over(|dirs| dirs.repo.clone()),
+        Some("pw"),
+        Vec::new(),
+    );
+    assert_eq!(alforria_server::startup_refusal(&f.ctx), None);
+    let f = fixture_with(
+        |dirs| json!({ "server": { "directories": [dirs.home.display().to_string()] } }),
+        Some("pw"),
+        Vec::new(),
+    );
+    assert_eq!(alforria_server::startup_refusal(&f.ctx), None);
+}

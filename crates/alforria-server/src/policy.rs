@@ -98,6 +98,9 @@ pub struct ServerPolicy {
     pub bearer: Option<Arc<crate::bearer::BearerAuth>>,
     /// `server.directories`.
     pub directories: DirectoryAllowlist,
+    /// `server.trust.host: "managed"`: the user's config files carry no
+    /// host key.
+    pub managed_only: bool,
     /// `server.auth.bearer.reply_always`: whether a credential below
     /// `admin` may answer a permission request `always`.
     pub reply_always: bool,
@@ -129,6 +132,7 @@ impl Default for ServerPolicy {
             shutdown: ShutdownOptions::default(),
             bearer: None,
             directories: DirectoryAllowlist::default(),
+            managed_only: false,
             reply_always: false,
             upload_max_bytes: DEFAULT_UPLOAD_MAX_BYTES,
             upload_directories: vec![DEFAULT_UPLOAD_DIRECTORY.to_string()],
@@ -219,6 +223,9 @@ impl ServerPolicy {
             hook: config.hook.clone(),
             bearer,
             directories,
+            // Decided by the loader, from the managed directory alone
+            // (`ServerPolicy::load`).
+            managed_only: false,
             reply_always: server
                 .and_then(|server| server.auth.as_ref())
                 .and_then(|auth| auth.bearer.as_ref())
@@ -247,7 +254,15 @@ impl ServerPolicy {
             .map_err(|err| err.to_string())
             .and_then(|config| ServerPolicy::from_config_in(&config, &paths.home));
         match resolved {
-            Ok(policy) => policy,
+            Ok(mut policy) => {
+                policy.managed_only = alforria_core::ConfigLoader::new()
+                    .host_mode(&alforria_core::LoadParams::new(
+                        paths.home.clone(),
+                        paths.clone(),
+                    ))
+                    .managed_only;
+                policy
+            }
             Err(error) => {
                 tracing::warn!("host config not applied: {error}");
                 ServerPolicy {

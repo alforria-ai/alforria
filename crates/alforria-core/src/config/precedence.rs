@@ -1399,7 +1399,16 @@ impl ConfigLoader {
         let text = match fs::read_to_string(path) {
             Ok(text) => text,
             Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Value::Object(Map::new())),
-            Err(err) if err.kind() == ErrorKind::PermissionDenied => {
+            // A project file the server cannot read contributes nothing,
+            // as upstream. A host, managed or environment-named file that
+            // exists and cannot be read is an error: treating it as empty
+            // silently dropped the operator's policy (and `serve` then
+            // printed a generated password for a server meant to take
+            // bearer tokens only).
+            Err(err)
+                if err.kind() == ErrorKind::PermissionDenied
+                    && rules.origin == ConfigOrigin::Outside =>
+            {
                 return Ok(Value::Object(Map::new()))
             }
             Err(err) => return Err(CoreError::invalid(path, err.to_string())),
@@ -3044,6 +3053,65 @@ mod tests {
                 "{permission}"
             );
         }
+    }
+
+    /// A host or managed config file that exists and cannot be read is an
+    /// error, not an empty config: the host config load fails (the server
+    /// refuses to listen) and a managed one fails every load.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_host_or_managed_config_is_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut f = Fixture::new();
+        let managed = f.root.join("managed");
+        f.params = std::mem::replace(
+            &mut f.params,
+            LoadParams::new(
+                PathBuf::new(),
+                GlobalPaths::resolve_with(PathBuf::from("/x"), |_| None),
+            ),
+        )
+        .managed_config_dir(managed.clone());
+        let unreadable = |path: &Path| {
+            write(
+                path,
+                &json!({ "permission": { "bash": "deny" } }).to_string(),
+            );
+            fs::set_permissions(path, fs::Permissions::from_mode(0o000)).unwrap();
+        };
+        let readable = |path: &Path| {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o644)).unwrap();
+        };
+        let global = f.root.join("config").join("opencode.json");
+        unreadable(&global);
+        if fs::read_to_string(&global).is_ok() {
+            // Running as root: permissions do not bind.
+            return;
+        }
+        // The host config must load: an error, where it used to be `{}`.
+        let error = ConfigLoader.check_global(&f.params).unwrap_err();
+        assert!(error.to_string().contains("opencode.json"), "{error}");
+        assert!(crate::config::host::load_host_config(&f.params.paths).is_err());
+        // The per-directory load still degrades, with project config
+        // restricted meanwhile.
+        assert!(f.load().is_ok());
+        assert!(ConfigLoader.host_mode(&f.params).restricted);
+        readable(&global);
+
+        let managed_file = managed.join("opencode.json");
+        unreadable(&managed_file);
+        assert!(
+            f.load().is_err(),
+            "an unreadable managed config must not load as empty"
+        );
+        readable(&managed_file);
+        assert!(f.load().is_ok());
+
+        // A project file the server cannot read is still skipped.
+        let project = f.root.join("work").join("opencode.json");
+        unreadable(&project);
+        assert!(f.load().is_ok());
+        readable(&project);
     }
 
     /// A host config that does not load leaves project config untrusted.

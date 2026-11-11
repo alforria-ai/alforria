@@ -318,6 +318,13 @@ pre-1.0, so minor releases may include breaking changes.
 
 ### Changed
 
+- `alforria serve` / `web` refuse to listen on a host config that does not
+  parse **or cannot be read** (an unreadable file in the global config
+  directory, `~/.opencode` or the managed directory used to count as empty,
+  silently dropping the policy in it), and — with bearer auth configured —
+  when a directory tokens may open contains the data directory or the host
+  config.
+
 - A host or managed `permission` rule is a ceiling: a project's
   `permission` or `agent.<name>.permission` can narrow it and no longer
   widens it (upstream's last-match-wins let a project file overrule a host

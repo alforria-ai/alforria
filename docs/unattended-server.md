@@ -20,9 +20,11 @@ A project's `opencode.json` and `.opencode/` directory are **not** consulted
 for them. Those are files the agent can write; the server's access policy
 must not be one of the things it can edit.
 
-Unlike the per-project config, a host config file that does not parse is an
-error: `alforria serve` and `alforria web` refuse to listen rather than run
-with a policy other than the one written down. Project config is treated as
+Unlike the per-project config, a host config file that does not parse — or
+that exists and cannot be read, in the global config directory, `~/.opencode`
+or the managed directory — is an error: `alforria serve` and `alforria web`
+refuse to listen rather than run with a policy other than the one written
+down. (A project file the server cannot read is skipped, as upstream.) Project config is treated as
 restricted (see `server.trust`) for as long as the host config does not
 load.
 
@@ -526,6 +528,11 @@ the agent can write host config. For an unattended deployment put the policy
 in the managed directory (`/etc/opencode`), owned by another user, and set
 `"server": { "trust": { "host": "managed" } }` there: the user's files then
 carry no host key at all.
+
+With bearer auth configured the server **refuses to listen** when a directory
+in `server.directories` (or the working directory, when the list is empty)
+is or contains the data directory, or — unless `server.trust.host` is
+`"managed"` — the global config directory or `~/.opencode`.
 
 ### Turns nobody requests, and callers that are not people
 

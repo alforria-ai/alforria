@@ -196,6 +196,9 @@ pub async fn listen_with(opts: &ListenOptions, ctx: Arc<ServerContext>) -> io::R
             "refusing to listen: the host config could not be applied ({error})"
         )));
     }
+    if let Some(reason) = startup_refusal(&ctx) {
+        return Err(io::Error::other(format!("refusing to listen: {reason}")));
+    }
     let listener = bind_with_port_fallback(opts).await?;
     let port = listener.local_addr()?.port();
     let url = format!("http://{}:{}", opts.hostname, port);
@@ -224,6 +227,41 @@ pub async fn listen_with(opts: &ListenOptions, ctx: Arc<ServerContext>) -> io::R
         task,
         ctx,
     })
+}
+
+/// A configuration the server will not serve: bearer authentication with
+/// a directory a token may open that is, or contains, a place the host
+/// config is read from or the data directory.
+///
+/// The host config — who may connect, what the agent's shells see, the
+/// permission ceiling — is the global config directory and `~/.opencode`
+/// (unless `server.trust.host` is `"managed"`), and the data directory holds
+/// `auth.json` and the database. An agent working in a directory that
+/// contains one of them can write it with its ordinary tools: the project at
+/// `$HOME` is the usual way to get there.
+pub fn startup_refusal(ctx: &ServerContext) -> Option<String> {
+    ctx.policy.bearer.as_ref()?;
+    let paths = &ctx.paths;
+    let mut locations = vec![("the data directory", paths.data.clone())];
+    if !ctx.policy.managed_only {
+        locations.push(("the global config directory", paths.config.clone()));
+        locations.push(("~/.opencode", paths.home.join(".opencode")));
+    }
+    for root in ctx.policy.directories.roots() {
+        for (name, location) in &locations {
+            if state::resolve_directory(location).starts_with(root) {
+                return Some(format!(
+                    "{} is in server.directories (or is the working directory) and contains \
+                     {name} ({}): the agent could rewrite the host config or read the \
+                     credentials. Serve a directory that does not contain it, or move the host \
+                     config to the managed directory and set server.trust.host to \"managed\".",
+                    root.display(),
+                    location.display()
+                ));
+            }
+        }
+    }
+    None
 }
 
 /// Configurations that work but probably do not mean what the operator
