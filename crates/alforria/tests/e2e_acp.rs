@@ -216,6 +216,13 @@ fn acp_end_to_end_flow() {
         .expect("sessionId")
         .to_string();
     assert!(!session_id.is_empty());
+    // Updates about a session must not reach the client before the response
+    // that tells it the session exists.
+    assert!(
+        acp.session_updates().is_empty(),
+        "session/update overtook the session/new response: {:?}",
+        acp.session_updates()
+    );
     let model_option = session["configOptions"]
         .as_array()
         .and_then(|options| options.iter().find(|option| option["id"] == "model"))
@@ -339,4 +346,28 @@ fn acp_end_to_end_flow() {
     // close_session — removes it.
     let _ = acp.must("session/close", json!({ "sessionId": session_id }));
     acp.drain_notifications(1);
+
+    // A session opened and closed without a prompt is deleted, not left
+    // behind empty; the prompted one above is kept.
+    let unused = acp.must("session/new", json!({ "cwd": project, "mcpServers": [] }));
+    let unused_id = unused["sessionId"].as_str().expect("sessionId").to_string();
+    let _ = acp.must("session/close", json!({ "sessionId": unused_id }));
+    let listed = acp.must("session/list", json!({ "cwd": project }));
+    let listed_ids: Vec<&str> = listed["sessions"]
+        .as_array()
+        .map(|sessions| {
+            sessions
+                .iter()
+                .filter_map(|session| session["sessionId"].as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        !listed_ids.contains(&unused_id.as_str()),
+        "unprompted session survived close: {listed}"
+    );
+    assert!(
+        listed_ids.contains(&session_id.as_str()),
+        "prompted session was removed: {listed}"
+    );
 }

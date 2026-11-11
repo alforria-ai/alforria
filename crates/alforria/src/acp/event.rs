@@ -35,7 +35,14 @@ pub struct Subscription {
     shell_snapshots: Mutex<HashMap<String, String>>,
     tool_starts: Mutex<std::collections::HashSet<String>>,
     permission_queues: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
+    /// Permission id → signal fired when the server reports it replied.
+    permission_settled: Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>,
+    /// Sessions currently shown to the client as waiting on a provider retry.
+    retrying: Mutex<std::collections::HashSet<String>>,
 }
+
+/// `_meta` key carrying provider retry status on `session_info_update`.
+const RETRY_META: &str = "opencode/retry";
 
 /// `start` (event.ts:33-37).
 pub fn start(
@@ -54,6 +61,8 @@ pub fn start(
         shell_snapshots: Mutex::new(HashMap::new()),
         tool_starts: Mutex::new(std::collections::HashSet::new()),
         permission_queues: Mutex::new(HashMap::new()),
+        permission_settled: Mutex::new(HashMap::new()),
+        retrying: Mutex::new(std::collections::HashSet::new()),
     });
     let subscription_clone = subscription.clone();
     tokio::spawn(async move {
@@ -197,16 +206,29 @@ impl Subscription {
             .unwrap_or_default()
         {
             "session.status" => {
-                if let Some(session_id) = payload
+                let session_id = payload
                     .pointer("/properties/sessionID")
-                    .and_then(Value::as_str)
-                    .filter(|_| payload["properties"]["status"]["type"] == json!("idle"))
-                {
-                    self.idle(session_id);
+                    .and_then(Value::as_str);
+                if let Some(session_id) = session_id {
+                    let status = &payload["properties"]["status"];
+                    self.forward_retry(session_id, status).await;
+                    if status["type"] == json!("idle") {
+                        self.idle(session_id);
+                    }
                 }
             }
             "permission.asked" => {
                 self.queue_permission(payload);
+            }
+            "permission.replied" => {
+                let request_id = payload
+                    .pointer("/properties/requestID")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let settled = self.permission_settled.lock().unwrap().remove(request_id);
+                if let Some(settled) = settled {
+                    let _ = settled.send(());
+                }
             }
             "message.part.updated" => {
                 self.handle_part_updated(payload).await;
@@ -216,6 +238,39 @@ impl Subscription {
             }
             _ => {}
         }
+    }
+
+    /// Tell the client a turn is waiting on a provider retry, and clear the
+    /// notice when the session moves on. Without this a rate-limited turn
+    /// looks hung: no chunks arrive and nothing says why.
+    async fn forward_retry(&self, session_id: &str, status: &Value) {
+        if self.sessions.try_get(session_id).is_none() {
+            return;
+        }
+        let meta = if status["type"] == json!("retry") {
+            self.retrying.lock().unwrap().insert(session_id.to_string());
+            json!({
+                "attempt": status["attempt"],
+                "nextRetryAt": status["next"],
+                "message": status["message"],
+            })
+        } else if self.retrying.lock().unwrap().remove(session_id) {
+            Value::Null
+        } else {
+            return;
+        };
+        self.connection
+            .send_notification(
+                "session/update",
+                json!({
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "session_info_update",
+                        "_meta": { RETRY_META: meta },
+                    },
+                }),
+            )
+            .await;
     }
 
     /// Per-session FIFO permission queue (`Handler.handle`,
@@ -229,6 +284,13 @@ impl Subscription {
         else {
             return;
         };
+        let (settle, settled) = tokio::sync::oneshot::channel();
+        if let Some(permission_id) = permission.pointer("/properties/id").and_then(Value::as_str) {
+            self.permission_settled
+                .lock()
+                .unwrap()
+                .insert(permission_id.to_string(), settle);
+        }
         let mut queues = self.permission_queues.lock().unwrap();
         let previous = queues.remove(&session_id);
         let task = tokio::spawn({
@@ -245,6 +307,7 @@ impl Subscription {
                     &server,
                     &permission["properties"],
                     |session_id| sessions.try_get(session_id).map(|session| session.cwd),
+                    settled,
                 )
                 .await;
             }

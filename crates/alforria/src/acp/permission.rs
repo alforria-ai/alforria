@@ -2,8 +2,6 @@
 //! permission asks into ACP `session/request_permission` requests, plus
 //! the proposed-edit preview (`applyPatch`).
 
-use std::sync::Arc;
-
 use serde_json::{json, Value};
 
 use crate::acp::jsonrpc::Connection;
@@ -16,10 +14,6 @@ const PERMISSION_OPTIONS: &[(&str, &str, &str)] = &[
     ("always", "allow_always", "Always allow"),
     ("reject", "reject_once", "Reject"),
 ];
-
-fn string_value(value: Option<&Value>) -> Option<String> {
-    value.and_then(Value::as_str).map(str::to_string)
-}
 
 /// `permissionTitle` (permission.ts:139-163).
 fn permission_title(tool_name: &str, input: &Value) -> Option<String> {
@@ -178,6 +172,7 @@ pub async fn handle(
     server: &ServerClient,
     permission: &Value,
     try_get_cwd: impl Fn(&str) -> Option<String>,
+    settled: tokio::sync::oneshot::Receiver<()>,
 ) {
     let session_id = permission.get("sessionID").and_then(Value::as_str);
     let Some(session_id) = session_id else {
@@ -215,9 +210,13 @@ pub async fn handle(
             .collect::<Vec<_>>(),
     });
 
-    let result = connection
-        .send_request("session/request_permission", request)
-        .await;
+    // The same permission can be answered from another client (the web UI,
+    // the TUI). When that happens the server tells us it is settled: stop
+    // waiting on this client, and do not send a second, conflicting reply.
+    let result = tokio::select! {
+        result = connection.send_request("session/request_permission", request) => result,
+        _ = settled => return,
+    };
     let result = match result {
         Ok(result) => Some(result),
         Err(_) => {
@@ -236,40 +235,11 @@ pub async fn handle(
         return;
     };
 
-    if tool_name == "edit" {
-        write_proposed_edit(connection.clone(), session_id, &metadata);
-    }
+    // The edit tool writes the file itself once the reply lands. Asking the
+    // client to write the same content first (`fs/write_text_file`) made
+    // editors see every edit twice and race the tool's own write.
 
     let _ = server.permission_reply(&cwd, permission_id, reply).await;
-}
-
-/// `writeProposedEdit` (permission.ts:99-115) — fire and forget.
-fn write_proposed_edit(connection: Arc<Connection>, session_id: &str, metadata: &Value) {
-    let Some(filepath) =
-        string_value(metadata.get("filepath")).or_else(|| string_value(metadata.get("filePath")))
-    else {
-        return;
-    };
-    let Some(diff) = string_value(metadata.get("diff")) else {
-        return;
-    };
-    let content = std::fs::read_to_string(&filepath).ok().unwrap_or_default();
-    let Some(next) = apply_patch(&content, &diff) else {
-        return;
-    };
-    let session_id = session_id.to_string();
-    tokio::spawn(async move {
-        let _ = connection
-            .send_request(
-                "fs/write_text_file",
-                json!({
-                    "sessionId": session_id,
-                    "path": filepath,
-                    "content": next,
-                }),
-            )
-            .await;
-    });
 }
 
 // ---------------------------------------------------------------------------

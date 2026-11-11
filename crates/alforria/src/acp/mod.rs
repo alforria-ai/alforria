@@ -35,6 +35,16 @@ pub struct AcpAgent {
     events: Arc<event::Subscription>,
     registered_mcp: Mutex<HashMap<String, HashSet<String>>>,
     session_snapshots: Mutex<HashMap<String, Arc<Snapshot>>>,
+    /// Sessions this connection created and has not prompted yet. Editors
+    /// open a session per panel and often close it untouched; those are
+    /// removed on close instead of piling up as empty sessions.
+    unprompted: Mutex<HashSet<String>>,
+}
+
+tokio::task_local! {
+    /// Notifications a request handler wants sent only after its own
+    /// response is on the wire.
+    static AFTER_RESPONSE: std::cell::RefCell<Vec<(&'static str, Value)>>;
 }
 
 impl AcpAgent {
@@ -50,6 +60,7 @@ impl AcpAgent {
             events,
             registered_mcp: Mutex::new(HashMap::new()),
             session_snapshots: Mutex::new(HashMap::new()),
+            unprompted: Mutex::new(HashSet::new()),
         })
     }
 
@@ -71,7 +82,7 @@ impl AcpAgent {
             match message {
                 Message::Request { id, method, params } => {
                     let this = Arc::clone(&self);
-                    tokio::spawn(async move {
+                    tokio::spawn(AFTER_RESPONSE.scope(Default::default(), async move {
                         let result = this.dispatch(&method, &params).await;
                         let response = match result {
                             Ok(result) => json!({
@@ -98,7 +109,11 @@ impl AcpAgent {
                             }
                         };
                         this.connection.transport().write(&response.to_string());
-                    });
+                        let deferred = AFTER_RESPONSE.with(|deferred| deferred.take());
+                        for (method, params) in deferred {
+                            this.connection.send_notification(method, params).await;
+                        }
+                    }));
                 }
                 Message::Notification { method, params } => {
                     if method == "session/cancel" {
@@ -242,6 +257,7 @@ impl AcpAgent {
         self.register_mcp_servers(&cwd, &state.id, &state.mcp_servers)
             .await;
         self.send_available_commands(&state.id, &snapshot).await;
+        self.unprompted.lock().unwrap().insert(state.id.clone());
 
         Ok(json!({
             "sessionId": state.id,
@@ -471,8 +487,20 @@ impl AcpAgent {
         let removed = self.sessions.remove(session_id);
         self.registered_mcp.lock().unwrap().remove(session_id);
         self.session_snapshots.lock().unwrap().remove(session_id);
+        let unprompted = self.unprompted.lock().unwrap().remove(session_id);
         if let Some(removed) = removed {
             self.abort_backing_session(&removed).await;
+            if unprompted {
+                // Another client of the same server may have used it since.
+                let empty = self
+                    .server
+                    .session_messages(&removed.cwd, session_id, Some(1))
+                    .await
+                    .is_ok_and(|messages| messages.is_empty());
+                if empty {
+                    let _ = self.server.session_delete(&removed.cwd, session_id).await;
+                }
+            }
         }
         Ok(json!({}))
     }
@@ -704,6 +732,7 @@ impl AcpAgent {
 
     async fn prompt(self: &Arc<Self>, params: &Value) -> Result<Value, AcpError> {
         let session_id = params["sessionId"].as_str().unwrap_or_default();
+        self.unprompted.lock().unwrap().remove(session_id);
         let current = self.get_session(session_id)?;
         let snapshot = self.directory_snapshot(&current.cwd).await?;
         let selected = current
@@ -892,36 +921,36 @@ impl AcpAgent {
         }
     }
 
-    /// `sendAvailableCommands` (service.ts:988-1008) — `setTimeout(0)`
-    /// fires the notification after the response.
+    /// `sendAvailableCommands` (service.ts:988-1008). The notification names
+    /// a session the client only learns about from the response, so it is
+    /// queued to go out after that response rather than raced against it.
     async fn send_available_commands(&self, session_id: &str, snapshot: &Snapshot) {
-        let connection = self.connection.clone();
-        let session_id = session_id.to_string();
-        let commands = snapshot.available_commands.clone();
-        tokio::spawn(async move {
-            // `setTimeout(0)` (service.ts:992) — the notification must not
-            // overtake the response for the dispatch that scheduled it;
-            // yield a tick so the response write wins the race.
-            tokio::time::sleep(std::time::Duration::ZERO).await;
-            let _ = connection
-                .send_notification(
-                    "session/update",
-                    json!({
-                        "sessionId": session_id,
-                        "update": {
-                            "sessionUpdate": "available_commands_update",
-                            "availableCommands": commands
-                                .iter()
-                                .map(|command| json!({
-                                    "name": command["name"],
-                                    "description": command.get("description").cloned().unwrap_or_else(|| json!("")),
-                                }))
-                                .collect::<Vec<_>>(),
-                        },
-                    }),
-                )
-                .await;
+        let params = json!({
+            "sessionId": session_id,
+            "update": {
+                "sessionUpdate": "available_commands_update",
+                "availableCommands": snapshot
+                    .available_commands
+                    .iter()
+                    .map(|command| json!({
+                        "name": command["name"],
+                        "description": command.get("description").cloned().unwrap_or_else(|| json!("")),
+                    }))
+                    .collect::<Vec<_>>(),
+            },
         });
+        let queued = AFTER_RESPONSE
+            .try_with(|deferred| {
+                deferred
+                    .borrow_mut()
+                    .push(("session/update", params.clone()))
+            })
+            .is_ok();
+        if !queued {
+            self.connection
+                .send_notification("session/update", params)
+                .await;
+        }
     }
 
     async fn send_config_option_update(&self, session_id: &str, options: &[Value]) {

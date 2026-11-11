@@ -159,6 +159,17 @@ impl ServerClient {
         .await
     }
 
+    /// `session.delete` — `DELETE /session/{sessionID}`.
+    pub async fn session_delete(&self, directory: &str, session_id: &str) -> Result<Value, String> {
+        self.json(
+            directory,
+            reqwest::Method::DELETE,
+            &format!("/session/{session_id}"),
+            None,
+        )
+        .await
+    }
+
     /// `session.fork` — `POST /session/{sessionID}/fork`.
     pub async fn session_fork(&self, directory: &str, session_id: &str) -> Result<Value, String> {
         self.json(
