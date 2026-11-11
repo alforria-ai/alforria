@@ -507,7 +507,7 @@ mod tests {
         .collect();
         let info = serde_json::from_value(serde_json::json!({ "allow": ["MCP_ALLOWED"] })).unwrap();
         let mut policy = ShellEnvPolicy::from_config(Some(&info)).restricted(true);
-        policy.learn(crate::shell_env::SOURCE_CATALOG, ["ACME_GATEWAY_AUTH"]);
+        policy.deny_names(["ACME_GATEWAY_AUTH"]);
 
         let dir = tempfile::tempdir().unwrap();
         let mut environment = BTreeMap::new();

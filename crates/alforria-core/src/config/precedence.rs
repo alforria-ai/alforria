@@ -862,7 +862,7 @@ impl ConfigLoader {
     /// `~/.opencode` and the `OPENCODE_CONFIG*` environment, read as text.
     /// The host put a secret in each of them more often than not, so the
     /// shell environment policy keeps them from the agent's processes
-    /// (`ShellEnvPolicy::learn`). A file that cannot be read adds
+    /// (`ShellEnvPolicy::deny_names`). A file that cannot be read adds
     /// nothing here; loading it is where that is an error.
     pub fn host_env_references(&self, params: &LoadParams) -> Vec<String> {
         let mut files = Vec::new();
@@ -893,7 +893,7 @@ impl ConfigLoader {
     /// from the directory up to the worktree and the `.opencode`
     /// directories beside them, read as text. A project that reads a key
     /// from a variable has named one the agent's processes should not see
-    /// (`shell_env::learn`, per instance). A remote config is not a file
+    /// (`shell_env::learn`, at each instance boot). A remote config is not a file
     /// and adds nothing here.
     pub fn project_env_references(&self, params: &LoadParams) -> Vec<String> {
         if params.flags.disable_project_config {

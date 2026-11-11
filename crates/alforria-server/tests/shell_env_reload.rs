@@ -1,5 +1,6 @@
-//! The names the shell environment policy learns follow the configs and
-//! the catalog as they are read again.
+//! The names the shell environment policy learns from the configs and the
+//! catalog: learned at every boot and read, and kept until the process
+//! exits.
 //!
 //! The policy is process-wide, so this file holds one test: it is the only
 //! one in its binary to install or teach a policy.
@@ -56,16 +57,28 @@ fn provider(env: &str) -> alforria_core::catalog::Provider {
     }
 }
 
+fn context(paths: &alforria_core::GlobalPaths) -> Arc<alforria_server::state::ServerContext> {
+    let seams = EngineSeams {
+        env: alforria_server::engine::no_ambient_env(),
+        ..EngineSeams::default()
+    };
+    let ctx = alforria_server::production_context(&ListenOptions::default(), paths.clone(), seams)
+        .unwrap();
+    assert_eq!(ctx.policy.config_error, None);
+    ctx
+}
+
 /// A standalone server. A project declares a provider of its own that
 /// reads its key from `MY_CORP_LLM_KEY` — a name no list or pattern knows —
 /// and refers to `{env:PROJECT_REFERENCED}`: both are withheld from the
-/// agent's shell once the instance has booted, stay withheld when the
-/// instance is disposed, and are released only when the directory boots
-/// again with a config that no longer names them. The host
-/// config and the catalog are followed the same way. `GITHUB_TOKEN` and
+/// agent's shell once the instance has booted, and stay withheld when the
+/// instance is disposed (its processes can outlive it) and when the
+/// project stops naming them and its config is read again. What a later
+/// boot, the host config or the catalog names is added. `shell_env.allow`
+/// releases a name; only a restart forgets one. `GITHUB_TOKEN` and
 /// `AWS_PROFILE` pass throughout.
 #[test]
-fn learned_names_follow_a_config_or_catalog_reload() {
+fn learned_names_are_added_at_every_boot_and_kept_until_restart() {
     let dir = tempfile::tempdir().unwrap();
     let root = std::fs::canonicalize(dir.path()).unwrap();
     let repo = root.join("repo");
@@ -83,12 +96,7 @@ fn learned_names_follow_a_config_or_catalog_reload() {
         }),
     );
 
-    let seams = EngineSeams {
-        env: alforria_server::engine::no_ambient_env(),
-        ..EngineSeams::default()
-    };
-    let ctx = alforria_server::production_context(&ListenOptions::default(), paths, seams).unwrap();
-    assert_eq!(ctx.policy.config_error, None);
+    let ctx = context(&paths);
     assert!(!shell_env::current().is_restricted());
 
     // Before any instance: nothing of the project's is known.
@@ -106,10 +114,6 @@ fn learned_names_follow_a_config_or_catalog_reload() {
         "my_corp_llm_key",
     ];
     assert_eq!(shell_names(), everything);
-
-    // The instance boots: its project's provider variable and reference
-    // are withheld, whatever the case.
-    ctx.instances.load(&repo).unwrap();
     let without = |gone: &[&str]| -> Vec<&str> {
         everything
             .iter()
@@ -117,49 +121,38 @@ fn learned_names_follow_a_config_or_catalog_reload() {
             .filter(|name| !gone.contains(name))
             .collect()
     };
-    assert_eq!(
-        shell_names(),
-        without(&["MY_CORP_LLM_KEY", "my_corp_llm_key", "PROJECT_REFERENCED"])
-    );
+
+    // The instance boots: its project's provider variable and reference
+    // are withheld, whatever the case.
+    ctx.instances.load(&repo).unwrap();
+    let mut gone = vec!["MY_CORP_LLM_KEY", "my_corp_llm_key", "PROJECT_REFERENCED"];
+    assert_eq!(shell_names(), without(&gone));
+
+    // Disposing forgets nothing: the instance's turns, terminals and MCP
+    // servers can still be starting processes.
+    ctx.instances.dispose_directory(&repo);
+    assert_eq!(shell_names(), without(&gone), "after a dispose");
+    ctx.instances.load(&repo).unwrap();
+    ctx.instances.dispose_all();
+    assert_eq!(shell_names(), without(&gone), "after disposing all");
 
     // The project swaps its provider for another; the config is read
-    // again at the next boot. The old names are released, the new one is
-    // withheld.
+    // again at the next boot. The new name is withheld and the old ones
+    // stay so.
     write(
         &project_file,
         serde_json::json!({ "provider": { "corp": { "env": ["MY_CORP_OTHER"] } } }),
     );
-    ctx.instances.dispose_directory(&repo);
-    // Disposing forgets nothing: the instance's turns, terminals and MCP
-    // servers can still be starting processes.
+    ctx.instances.load(&repo).unwrap();
+    gone.push("MY_CORP_OTHER");
     assert_eq!(
         shell_names(),
-        without(&["MY_CORP_LLM_KEY", "my_corp_llm_key", "PROJECT_REFERENCED"]),
-        "a disposed instance's names stay withheld"
+        without(&gone),
+        "after the provider is removed"
     );
-    ctx.instances.load(&repo).unwrap();
-    assert_eq!(shell_names(), without(&["MY_CORP_OTHER"]));
-    ctx.instances.dispose_all();
-    assert_eq!(shell_names(), without(&["MY_CORP_OTHER"]));
 
-    // Boots and disposals of one directory racing each other never leave
-    // the name released.
-    std::thread::scope(|scope| {
-        for _ in 0..4 {
-            scope.spawn(|| {
-                for _ in 0..5 {
-                    ctx.instances.load(&repo).unwrap();
-                    ctx.instances.dispose_directory(&repo);
-                }
-            });
-        }
-    });
-    assert_eq!(shell_names(), without(&["MY_CORP_OTHER"]));
-    // A boot that started before those and reports only now is ignored.
-    shell_env::learn_at(&shell_env::source_instance(&repo), 0, [] as [&str; 0]);
-    assert_eq!(shell_names(), without(&["MY_CORP_OTHER"]));
-
-    // The host config gains a provider and a reference after startup.
+    // The host config gains a provider and a reference after startup, and
+    // the project names nothing any more.
     write(
         &host_file,
         serde_json::json!({
@@ -170,17 +163,24 @@ fn learned_names_follow_a_config_or_catalog_reload() {
     write(&project_file, serde_json::json!({}));
     ctx.instances.dispose_directory(&repo);
     ctx.instances.load(&repo).unwrap();
-    assert_eq!(
-        shell_names(),
-        without(&["HOST_GATEWAY_AUTH", "HOST_REFERENCED"])
-    );
-    // And loses them again.
-    write(&host_file, serde_json::json!({}));
-    ctx.instances.dispose_directory(&repo);
-    ctx.instances.load(&repo).unwrap();
-    assert_eq!(shell_names(), everything);
+    gone.extend(["HOST_GATEWAY_AUTH", "HOST_REFERENCED"]);
+    assert_eq!(shell_names(), without(&gone));
 
-    // The catalog: each read teaches the policy what it names now.
+    // Boots and disposals of one directory racing each other take
+    // nothing out.
+    std::thread::scope(|scope| {
+        for _ in 0..4 {
+            scope.spawn(|| {
+                for _ in 0..5 {
+                    ctx.instances.load(&repo).unwrap();
+                    ctx.instances.dispose_directory(&repo);
+                }
+            });
+        }
+    });
+    assert_eq!(shell_names(), without(&gone));
+
+    // The catalog: each read adds what it names now.
     let providers = Arc::new(Mutex::new(BTreeMap::from([(
         "catalog".to_string(),
         provider("CATALOG_ONE"),
@@ -190,11 +190,32 @@ fn learned_names_follow_a_config_or_catalog_reload() {
         Arc::new(move || Ok(providers.lock().unwrap().clone()))
     });
     catalog().unwrap();
-    assert_eq!(shell_names(), without(&["CATALOG_ONE"]));
+    gone.push("CATALOG_ONE");
+    assert_eq!(shell_names(), without(&gone));
     providers
         .lock()
         .unwrap()
         .insert("catalog".to_string(), provider("CATALOG_TWO"));
     catalog().unwrap();
-    assert_eq!(shell_names(), without(&["CATALOG_TWO"]));
+    gone.push("CATALOG_TWO");
+    assert_eq!(shell_names(), without(&gone));
+
+    // A restart is a fresh registry: a policy loaded from the configs as
+    // they are now knows none of what was learned and since removed.
+    write(&host_file, serde_json::json!({}));
+    let fresh = alforria_server::ServerPolicy::load(&paths).shell_env;
+    for name in &gone {
+        assert!(!fresh.denied(name), "{name} is forgotten by a restart");
+    }
+
+    // The way out without one: `shell_env.allow` names the variable. (The
+    // host config is read at startup, so this is a second server in the
+    // same process: it keeps the registry and honours the `allow`.)
+    write(
+        &host_file,
+        serde_json::json!({ "shell_env": { "allow": ["MY_CORP_LLM_KEY"] } }),
+    );
+    let _allowing = context(&paths);
+    gone.retain(|name| *name != "MY_CORP_LLM_KEY");
+    assert_eq!(shell_names(), without(&gone));
 }

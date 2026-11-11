@@ -375,8 +375,7 @@ impl InstanceStore {
         if removed {
             // What the instance's config had the shell environment policy
             // withhold stays withheld: its turns, terminals and MCP
-            // servers can outlive the cache entry. Only the next boot of
-            // the directory replaces it (`shell_env::learn_at`).
+            // servers can outlive the cache entry (`shell_env::learn`).
             self.emit_disposed(&directory.display().to_string());
         }
     }
@@ -1502,13 +1501,12 @@ pub fn catalog_in(
 
 /// `source`, with every read teaching the shell environment policy the
 /// variables the catalog's providers read their keys from
-/// (`alforria_core::shell_env::SOURCE_CATALOG`): the names follow the
-/// catalog as it is now, not as it was when the server started.
+/// (`alforria_core::shell_env::learn`): a provider that appears in the
+/// catalog after the server started is covered too.
 pub fn learning_catalog(source: CatalogSource) -> CatalogSource {
     Arc::new(move || {
         let providers = source()?;
         alforria_core::shell_env::learn(
-            alforria_core::shell_env::SOURCE_CATALOG,
             providers.values().flat_map(|provider| provider.env.iter()),
         );
         Ok(providers)

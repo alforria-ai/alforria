@@ -338,10 +338,7 @@ impl ServerPolicy {
         let mut shell_env =
             alforria_core::shell_env::ShellEnvPolicy::from_config(config.shell_env.as_ref())
                 .restricted(!posture.is_empty());
-        shell_env.learn(
-            alforria_core::shell_env::SOURCE_HOST_PROVIDERS,
-            provider_env_names(config),
-        );
+        shell_env.deny_names(provider_env_names(config));
         Ok(ServerPolicy {
             shutdown,
             unattended_permission,
@@ -439,10 +436,9 @@ impl ServerPolicy {
                 policy.managed_only = loader.host_mode(&params).managed_only;
                 // What the host config reads through `{env:NAME}` stays
                 // out of the agent's shells.
-                policy.shell_env.learn(
-                    alforria_core::shell_env::SOURCE_HOST_REFERENCES,
-                    loader.host_env_references(&params),
-                );
+                policy
+                    .shell_env
+                    .deny_names(loader.host_env_references(&params));
                 policy
             }
             Err(error) => {

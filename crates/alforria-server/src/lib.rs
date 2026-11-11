@@ -597,39 +597,23 @@ fn production_instance_factory(
 }
 
 /// Teach the shell environment policy the variables the configs of the
-/// instance at `params.directory` read a key or a secret from, replacing
-/// what the previous boot learned: the host's own (`provider.*.env[]`,
-/// `{env:NAME}`), shared by every instance, and this instance's — its
-/// merged config's providers (a project can declare one of its own) and
-/// the `{env:NAME}` of its project files. A name is withheld while any
-/// source names it. Nothing is forgotten when an instance is disposed —
-/// its processes can outlive it — and a boot of an older `generation`
-/// that arrives late changes nothing.
+/// instance at `params.directory` read a key or a secret from: the host's
+/// own (`provider.*.env[]`, `{env:NAME}`) as they are now, and this
+/// instance's — its merged config's providers (a project can declare one
+/// of its own) and the `{env:NAME}` of its project files. Added to what
+/// the process already withholds; nothing is taken out before it exits
+/// (`alforria_core::shell_env::learn`).
 fn learn_config_names(
-    generation: u64,
     params: &alforria_core::LoadParams,
     config: &alforria_core::config::schema::Config,
     host_config: &alforria_core::config::schema::Config,
 ) {
-    use alforria_core::shell_env;
     let loader = alforria_core::ConfigLoader::new();
-    shell_env::learn_at(
-        shell_env::SOURCE_HOST_PROVIDERS,
-        generation,
-        policy::provider_env_names(host_config),
-    );
-    shell_env::learn_at(
-        shell_env::SOURCE_HOST_REFERENCES,
-        generation,
-        loader.host_env_references(params),
-    );
-    let mut names: Vec<String> = policy::provider_env_names(config).cloned().collect();
+    let mut names: Vec<String> = policy::provider_env_names(host_config).cloned().collect();
+    names.extend(policy::provider_env_names(config).cloned());
+    names.extend(loader.host_env_references(params));
     names.extend(loader.project_env_references(params));
-    shell_env::learn_at(
-        &shell_env::source_instance(&params.directory),
-        generation,
-        names,
-    );
+    alforria_core::shell_env::learn(names);
 }
 
 /// One instance boot: config load + project resolution + service wiring
@@ -644,14 +628,11 @@ fn instance_for_directory(
     directory: &std::path::Path,
 ) -> Result<Arc<alforria_core::SessionServices>, ServerError> {
     let params = alforria_core::LoadParams::new(directory.to_path_buf(), paths.clone());
-    // Taken before the configs are read: of two boots, the one that read
-    // them later is the one whose names stand.
-    let generation = alforria_core::shell_env::next_generation();
     let (config, _opencode_dirs) = alforria_core::ConfigLoader::new().load(&params)?;
     let host_config = alforria_core::ConfigLoader::new().load_trusted(&params)?;
     // A boot is where a config is read again: what it has the shell
-    // environment policy withhold replaces what the last one said.
-    learn_config_names(generation, &params, &config, &host_config);
+    // environment policy withhold is added to what is already withheld.
+    learn_config_names(&params, &config, &host_config);
 
     // `skill.dirs()` — directory sources from the config (`skills.paths`);
     // http(s) entries are URL sources materialized through the discovery
