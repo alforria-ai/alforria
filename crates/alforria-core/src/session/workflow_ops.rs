@@ -100,6 +100,7 @@ impl ProductionWorkflowOps {
             })
             .or(parent_model);
         let input = PromptInput {
+            caller: crate::session::caller::Caller::Session,
             session_id: session_id.to_string(),
             message_id: Some(
                 crate::session::ids::MessageId::ascending(None)
@@ -417,6 +418,7 @@ mod tests {
         for model_id in ["first-model", "second-model"] {
             e.prompt
                 .prompt(PromptInput {
+                    caller: crate::session::caller::Caller::Operator,
                     session_id: session.id.clone(),
                     message_id: None,
                     model: Some(ModelRef {

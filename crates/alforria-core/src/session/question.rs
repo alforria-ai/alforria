@@ -43,6 +43,8 @@ pub const QUESTION_REJECTED: Definition = Definition::ephemeral("question.reject
 pub enum QuestionError {
     /// `Question.RejectedError`.
     Rejected,
+    /// Nobody answered within the unattended timeout (alforria extension).
+    Unavailable { waited: std::time::Duration },
     /// `Question.NotFoundError`.
     NotFound { request_id: String },
     /// An event-bus defect (TS: a failing `events.publish` effect).
@@ -53,6 +55,13 @@ impl std::fmt::Display for QuestionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             QuestionError::Rejected => f.write_str("The user dismissed this question"),
+            QuestionError::Unavailable { waited } => write!(
+                f,
+                "The user is not available: nobody answered within {}. Do not ask again. \
+                 Proceed on your best judgment where that is safe, and stop where the answer \
+                 is needed.",
+                crate::session::permission::describe_duration(*waited)
+            ),
             QuestionError::NotFound { request_id } => {
                 write!(f, "Question.NotFoundError: requestID: {request_id}")
             }
@@ -74,12 +83,26 @@ pub struct QuestionAskInput {
 struct PendingEntry {
     info: QuestionV1Request,
     done: oneshot::Sender<Result<Vec<QuestionV1Answer>, QuestionError>>,
+    /// When the question was asked (ms since the epoch).
+    asked_at: u64,
+}
+
+/// A pending question with its age, for [`QuestionService::pending_asks`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingQuestion {
+    pub request: QuestionV1Request,
+    pub asked_at: u64,
+    /// When the unattended timeout will dismiss it, if one is set.
+    pub expires_at: Option<u64>,
 }
 
 /// `Question.Service` (question/index.ts:48-61).
 pub struct QuestionService {
     events: Arc<EventBus>,
     pending: Mutex<Vec<PendingEntry>>,
+    /// How long a question waits for a person (alforria extension,
+    /// `question.unattended` in the host config). `None`: forever.
+    unattended: Mutex<Option<std::time::Duration>>,
 }
 
 /// Removes the pending entry when the ask future is dropped
@@ -120,7 +143,61 @@ impl QuestionService {
         QuestionService {
             events,
             pending: Mutex::new(Vec::new()),
+            unattended: Mutex::new(None),
         }
+    }
+
+    /// Set (or clear) how long a question waits before it is dismissed on
+    /// nobody's behalf. Applies to questions asked from now on.
+    pub fn set_unattended(&self, timeout: Option<std::time::Duration>) {
+        *self
+            .unattended
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = timeout;
+    }
+
+    pub fn unattended(&self) -> Option<std::time::Duration> {
+        *self
+            .unattended
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The pending questions with their ages, in insertion order.
+    pub fn pending_asks(&self) -> Vec<PendingQuestion> {
+        let timeout = self.unattended().map(|timeout| timeout.as_millis() as u64);
+        self.lock_pending()
+            .iter()
+            .map(|entry| PendingQuestion {
+                request: entry.info.clone(),
+                asked_at: entry.asked_at,
+                expires_at: timeout.map(|timeout| entry.asked_at + timeout),
+            })
+            .collect()
+    }
+
+    /// Dismiss a question nobody answered: the usual `question.rejected`,
+    /// marked `automatic: true`, and an error that tells the model the user
+    /// is unavailable. A no-op when it was answered meanwhile.
+    fn dismiss_unattended(&self, request_id: &str, waited: std::time::Duration) {
+        let entry = {
+            let mut pending = self.lock_pending();
+            pending
+                .iter()
+                .position(|entry| entry.info.id == request_id)
+                .map(|position| pending.remove(position))
+        };
+        let Some(entry) = entry else { return };
+        if let Ok(mut data) = serde_json::to_value(QuestionRejectedData {
+            session_id: entry.info.session_id.clone(),
+            request_id: entry.info.id.clone(),
+        }) {
+            if let Some(fields) = data.as_object_mut() {
+                fields.insert("automatic".to_string(), serde_json::Value::Bool(true));
+            }
+            let _ = self.publish(&QUESTION_REJECTED, data);
+        }
+        let _ = entry.done.send(Err(QuestionError::Unavailable { waited }));
     }
 
     fn lock_pending(&self) -> MutexGuard<'_, Vec<PendingEntry>> {
@@ -168,6 +245,7 @@ impl QuestionService {
             pending.push(PendingEntry {
                 info: info.clone(),
                 done,
+                asked_at: crate::session::permission::now_ms(),
             });
         }
         let guard = PendingCleanup {
@@ -183,7 +261,18 @@ impl QuestionService {
         .map_err(|err| QuestionError::Publish(err.to_string()))?;
         self.publish(&QUESTION_ASKED, data)?;
 
-        let result = match rx.await {
+        let mut rx = rx;
+        let answer = match self.unattended() {
+            Some(timeout) => match tokio::time::timeout(timeout, &mut rx).await {
+                Ok(answer) => answer,
+                Err(_) => {
+                    self.dismiss_unattended(&info.id, timeout);
+                    rx.await
+                }
+            },
+            None => rx.await,
+        };
+        let result = match answer {
             Ok(result) => result,
             // The service went away with the ask still pending — the TS
             // finalizer fails every pending deferred with RejectedError
@@ -274,6 +363,11 @@ impl crate::tool::question::Question for QuestionService {
             {
                 Ok(answers) => Ok(answers),
                 Err(QuestionError::Rejected) => Err(crate::tool::question::rejected()),
+                // Not a dismissal by the user: the model is told why, and
+                // the turn goes on.
+                Err(unavailable @ QuestionError::Unavailable { .. }) => {
+                    Err(ToolError::Failed(unavailable.to_string()))
+                }
                 Err(other) => Err(ToolError::Failed(other.to_string())),
             }
         })
@@ -426,6 +520,75 @@ mod tests {
             event.data,
             serde_json::json!({ "sessionID": "ses_test", "requestID": request_id })
         );
+    }
+
+    /// An unanswered question is dismissed with an error that tells the
+    /// model the user is unavailable, and `question.rejected` says nobody
+    /// answered.
+    #[tokio::test(start_paused = true)]
+    async fn an_unanswered_question_times_out() {
+        let events = bus();
+        let mut rejected = events.subscribe("question.rejected");
+        let service = Arc::new(QuestionService::new(events));
+        service.set_unattended(Some(std::time::Duration::from_secs(120)));
+        let asking = tokio::spawn({
+            let service = service.clone();
+            async move { service.ask(ask_input()).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_secs(119)).await;
+        let pending = service.pending_asks();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].expires_at, Some(pending[0].asked_at + 120_000));
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let error = asking.await.unwrap().unwrap_err();
+        assert_eq!(
+            error,
+            QuestionError::Unavailable {
+                waited: std::time::Duration::from_secs(120)
+            }
+        );
+        let message = error.to_string();
+        assert!(message.contains("not available"), "{message}");
+        assert!(message.contains("within 2m"), "{message}");
+        assert!(service.list().is_empty());
+        let event = rejected.recv().await.unwrap();
+        assert_eq!(event.data["automatic"], true);
+        assert_eq!(event.data["requestID"], pending[0].request.id);
+    }
+
+    /// Without a timeout a question waits; with one, an answer in time
+    /// still wins and is published as any answer is.
+    #[tokio::test(start_paused = true)]
+    async fn a_question_answered_in_time_is_unaffected() {
+        let events = bus();
+        let mut rejected = events.subscribe("question.rejected");
+        let service = Arc::new(QuestionService::new(events));
+        let waiting = tokio::spawn({
+            let service = service.clone();
+            async move { service.ask(ask_input()).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_secs(86_400)).await;
+        assert_eq!(service.list().len(), 1, "no timeout: still pending");
+        let id = service.list()[0].id.clone();
+        service.reject(&id).unwrap();
+        assert_eq!(waiting.await.unwrap(), Err(QuestionError::Rejected));
+        let event = rejected.recv().await.unwrap();
+        assert!(
+            event.data.get("automatic").is_none(),
+            "a person's dismissal"
+        );
+
+        service.set_unattended(Some(std::time::Duration::from_secs(60)));
+        let asking = tokio::spawn({
+            let service = service.clone();
+            async move { service.ask(ask_input()).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        let id = service.list()[0].id.clone();
+        service.reply(&id, vec![vec!["Yes".to_string()]]).unwrap();
+        assert_eq!(asking.await.unwrap(), Ok(vec![vec!["Yes".to_string()]]));
+        tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+        assert!(rejected.try_recv().is_err());
     }
 
     #[test]

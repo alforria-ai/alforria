@@ -90,6 +90,7 @@ fn prompt_input(session_id: &str, body: &str) -> PromptInput {
 
 fn prompt_input_for(message_id: &str, session_id: &str, body: &str) -> PromptInput {
     PromptInput {
+        caller: crate::session::caller::Caller::Operator,
         session_id: session_id.to_string(),
         message_id: Some(message_id.to_string()),
         model: Some(crate::session::prompt_input::ModelRef {
@@ -1079,6 +1080,7 @@ mod tests {
             arguments: arguments.to_string(),
             command: "goal".to_string(),
             parts: Vec::new(),
+            caller: crate::session::caller::Caller::Operator,
         }
     }
 
@@ -1407,6 +1409,7 @@ mod tests {
             // No such process: the owner is gone.
             pid: Some(u32::MAX),
             updated_at: 1,
+            started_by: None,
         };
         std::fs::write(
             dir.join(format!("{}.json", session.id)),

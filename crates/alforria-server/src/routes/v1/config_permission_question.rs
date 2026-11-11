@@ -110,11 +110,23 @@ pub async fn permission_list(
 pub async fn permission_reply(
     State(ctx): State<Arc<ServerContext>>,
     axum::Extension(location): axum::Extension<LocationContext>,
+    principal: Option<axum::Extension<crate::bearer::Principal>>,
     PathParam(request_id): PathParam<String>,
     body: Bytes,
 ) -> Result<Response, ServerError> {
     require_param("per", &request_id)?;
     let payload: PermissionReplyPayload = parse_payload(&body)?;
+    let restricted = crate::confine::restricted(&principal);
+    if restricted {
+        crate::confine::check_reply(&ctx, payload.reply)?;
+    }
+    crate::confine::authorise_answer(
+        &ctx,
+        &principal,
+        crate::confine::Ask::Permission,
+        &request_id,
+        None,
+    )?;
     let input = PermissionV1ReplyInput {
         request_id: request_id.clone(),
         reply: payload.reply,
@@ -128,6 +140,11 @@ pub async fn permission_reply(
         // request id from any other loaded instance before giving up.
         for services in ctx.instances.cached() {
             if Arc::ptr_eq(&services, &location.services) {
+                continue;
+            }
+            // Below `admin`, another project's asks are only reachable
+            // when that project is one the credential may open.
+            if restricted && !crate::confine::instance_allowed(&ctx, &services) {
                 continue;
             }
             if services.permission.reply(input.clone()).is_ok() {
@@ -169,10 +186,19 @@ pub async fn question_list(
 pub async fn question_reply(
     State(ctx): State<Arc<ServerContext>>,
     axum::Extension(location): axum::Extension<LocationContext>,
+    principal: Option<axum::Extension<crate::bearer::Principal>>,
     PathParam(request_id): PathParam<String>,
     body: Bytes,
 ) -> Result<Response, ServerError> {
+    let restricted = crate::confine::restricted(&principal);
     require_param("que", &request_id)?;
+    crate::confine::authorise_answer(
+        &ctx,
+        &principal,
+        crate::confine::Ask::Question,
+        &request_id,
+        None,
+    )?;
     let payload: QuestionReplyPayload = parse_payload(&body)?;
     let mut result = location
         .services
@@ -182,6 +208,11 @@ pub async fn question_reply(
         // Same id-across-instances fallback as `permission_reply`.
         for services in ctx.instances.cached() {
             if Arc::ptr_eq(&services, &location.services) {
+                continue;
+            }
+            // Below `admin`, another project's asks are only reachable
+            // when that project is one the credential may open.
+            if restricted && !crate::confine::instance_allowed(&ctx, &services) {
                 continue;
             }
             if services
@@ -211,13 +242,27 @@ pub async fn question_reply(
 pub async fn question_reject(
     State(ctx): State<Arc<ServerContext>>,
     axum::Extension(location): axum::Extension<LocationContext>,
+    principal: Option<axum::Extension<crate::bearer::Principal>>,
     PathParam(request_id): PathParam<String>,
 ) -> Result<Response, ServerError> {
+    let restricted = crate::confine::restricted(&principal);
     require_param("que", &request_id)?;
+    crate::confine::authorise_answer(
+        &ctx,
+        &principal,
+        crate::confine::Ask::Question,
+        &request_id,
+        None,
+    )?;
     let mut result = location.services.question.reject(&request_id);
     if matches!(result, Err(alforria_core::QuestionError::NotFound { .. })) {
         for services in ctx.instances.cached() {
             if Arc::ptr_eq(&services, &location.services) {
+                continue;
+            }
+            // Below `admin`, another project's asks are only reachable
+            // when that project is one the credential may open.
+            if restricted && !crate::confine::instance_allowed(&ctx, &services) {
                 continue;
             }
             if services.question.reject(&request_id).is_ok() {

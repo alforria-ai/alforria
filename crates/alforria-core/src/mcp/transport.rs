@@ -90,7 +90,9 @@ pub struct StdioTransport {
 impl StdioTransport {
     /// `connectLocal` env (index.ts:352-356): the process env, the
     /// `opencode`-command `BUN_BE_BUN` marker, then the configured
-    /// `environment`. `directory` is the `roots` capability root
+    /// `environment`. The process env goes through the host's deny list
+    /// first (`crate::shell_env`): a server gets a secret only when its own
+    /// `environment` names it. `directory` is the `roots` capability root
     /// (index.ts:77-79).
     pub async fn spawn(
         command: &str,
@@ -100,6 +102,7 @@ impl StdioTransport {
         directory: &Path,
     ) -> Result<StdioTransport, McpError> {
         let mut command_builder = tokio::process::Command::new(command);
+        crate::shell_env::apply_scrubbed(command_builder.as_std_mut());
         command_builder
             .args(args)
             .current_dir(cwd.unwrap_or_else(|| Path::new(".")))
@@ -423,6 +426,43 @@ pub fn initialize_params() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stdio server inherits the environment minus the denied names, and
+    /// gets a denied one only when its own `environment` supplies it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_servers_do_not_inherit_denied_secrets() {
+        std::env::set_var("OPENCODE_SERVER_PASSWORD", "hunter2");
+        std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-leak");
+        std::env::set_var("MCPENVTEST_PLAIN", "visible");
+        let dir = std::env::temp_dir().join(format!("alforria-mcp-env-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut environment = BTreeMap::new();
+        environment.insert("ANTHROPIC_API_KEY".to_string(), "sk-configured".to_string());
+        let transport = StdioTransport::spawn(
+            "sh",
+            &["-c".to_string(), "env > env.txt; cat".to_string()],
+            Some(&dir),
+            Some(&environment),
+            &dir,
+        )
+        .await
+        .unwrap();
+        let mut env = String::new();
+        for _ in 0..200 {
+            env = std::fs::read_to_string(dir.join("env.txt")).unwrap_or_default();
+            if env.contains("MCPENVTEST_PLAIN") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        transport.close().await;
+        assert!(env.contains("MCPENVTEST_PLAIN=visible"), "{env}");
+        assert!(!env.contains("hunter2"), "{env}");
+        assert!(!env.contains("sk-ant-leak"), "{env}");
+        assert!(env.contains("ANTHROPIC_API_KEY=sk-configured"), "{env}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn sse_response_matches_the_request_id() {

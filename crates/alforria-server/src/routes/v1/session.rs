@@ -35,6 +35,7 @@ use crate::error::{ApiError, ServerError};
 use crate::middleware::auth::query_param;
 use crate::middleware::location::LocationContext;
 use crate::state::{ServerContext, SessionEngine};
+use alforria_core::session::prompt_input::PromptError;
 
 // ---------------------------------------------------------------------------
 // wire payloads (groups/session.ts)
@@ -285,6 +286,58 @@ struct ShellPayload {
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+/// A message (and optionally one of its parts) named beside a session must
+/// belong to that session (alforria extension). The path's session is what
+/// the request was authorised for; the message or part is what gets acted
+/// on. One that exists elsewhere is answered like one that does not exist,
+/// so the route says nothing about other sessions; one that exists nowhere
+/// is left to the handler, whose behaviour for it is upstream's.
+fn require_owned(
+    location: &LocationContext,
+    session_id: &str,
+    message_id: &str,
+    part_id: Option<&str>,
+) -> Result<(), ServerError> {
+    let not_found = || {
+        ServerError::Api(ApiError::MessageNotFound {
+            session_id: session_id.to_string(),
+            message_id: message_id.to_string(),
+            message: format!("Message not found: {message_id}"),
+        })
+    };
+    let sessions = &location.services.sessions;
+    if let Some(owner) = sessions
+        .message_session(message_id)
+        .map_err(session_error)?
+    {
+        if owner != session_id {
+            return Err(not_found());
+        }
+    }
+    if let Some(part_id) = part_id {
+        if let Some((part_session, part_message)) =
+            sessions.part_owner(part_id).map_err(session_error)?
+        {
+            if part_session != session_id || part_message != message_id {
+                return Err(not_found());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A prompt or command the engine refused: 403 when the caller may not do
+/// it (alforria extension, `alforria_core::session::caller`), else the
+/// empty 400 upstream answers with.
+fn prompt_refusal(error: PromptError) -> Result<Response, ServerError> {
+    match error {
+        PromptError::Forbidden { message } => {
+            Err(ServerError::Api(ApiError::Forbidden { message }))
+        }
+        _ => Ok(bad_request_empty()),
+    }
+}
 
 fn json_ok(value: impl serde::Serialize) -> Response {
     let body = serde_json::to_string(&value).expect("serialization cannot fail");
@@ -698,6 +751,7 @@ pub async fn message(
 pub async fn create(
     State(state): State<Arc<ServerContext>>,
     axum::Extension(location): axum::Extension<LocationContext>,
+    principal: Option<axum::Extension<crate::bearer::Principal>>,
     body: Bytes,
 ) -> Result<Response, ServerError> {
     let payload: Option<CreatePayload> = if String::from_utf8_lossy(&body).trim().is_empty() {
@@ -716,12 +770,29 @@ pub async fn create(
             }
         }
     };
+    // alforria extension: below `admin`, a session cannot be created with
+    // its own permission rules, a workspace, or an agent a client could not
+    // pick. The session is then restricted for life (`CreateInput::
+    // restricted`), which is what binds every later turn in it.
+    if let (true, Some(payload)) = (crate::confine::restricted(&principal), &payload) {
+        crate::confine::check_no_ruleset(payload.permission.is_some())?;
+        crate::confine::check_agent(&location, payload.agent.as_deref())?;
+        if payload.workspace_id.is_some() {
+            return Err(ServerError::Api(ApiError::Forbidden {
+                message: "selecting a workspace needs the admin scope".to_string(),
+            }));
+        }
+    }
     let input = match payload.map(|p| decode_create_payload(&p)) {
         Some(Ok(input)) => Some(input),
         Some(Err(())) => return Ok(bad_request_empty()),
         None => None,
     }
     .unwrap_or_default();
+    let input = session::CreateInput {
+        restricted: crate::confine::restricted(&principal),
+        ..input
+    };
     let ctx = session_ctx(&location)?;
     let info = location
         .services
@@ -775,10 +846,14 @@ pub async fn remove(
 /// `update` (`handlers/session.ts:183-204`).
 pub async fn update(
     axum::Extension(location): axum::Extension<LocationContext>,
+    principal: Option<axum::Extension<crate::bearer::Principal>>,
     Path(session_id): Path<String>,
     body: Bytes,
 ) -> Result<Response, ServerError> {
     let payload: UpdatePayload = parse_payload(&body)?;
+    if crate::confine::restricted(&principal) {
+        crate::confine::check_no_ruleset(payload.permission.is_some())?;
+    }
     let current = require_session(&location, &session_id)?;
     if let Some(title) = &payload.title {
         location
@@ -823,6 +898,7 @@ pub async fn update(
 pub async fn fork(
     State(ctx): State<Arc<ServerContext>>,
     axum::Extension(location): axum::Extension<LocationContext>,
+    principal: Option<axum::Extension<crate::bearer::Principal>>,
     Path(session_id): Path<String>,
     body: Bytes,
 ) -> Result<Response, ServerError> {
@@ -847,7 +923,12 @@ pub async fn fork(
     let info = location
         .services
         .sessions
-        .fork(&session, &session_id, payload.message_id.as_deref())
+        .fork_as(
+            &session,
+            &session_id,
+            payload.message_id.as_deref(),
+            crate::confine::restricted(&principal),
+        )
         .map_err(session_error)?;
     // Best effort: the fork exists either way.
     if let Ok(engine) = engine(&ctx, &location) {
@@ -875,6 +956,7 @@ pub async fn abort(
 pub async fn init(
     State(ctx): State<Arc<ServerContext>>,
     axum::Extension(location): axum::Extension<LocationContext>,
+    principal: Option<axum::Extension<crate::bearer::Principal>>,
     Path(session_id): Path<String>,
     body: Bytes,
 ) -> Result<Response, ServerError> {
@@ -892,11 +974,12 @@ pub async fn init(
             arguments: String::new(),
             command: "init".to_string(),
             parts: Vec::new(),
+            caller: crate::confine::caller(&principal),
         })
         .await
     {
         Ok(_) => Ok(json_ok(true)),
-        Err(_) => Ok(bad_request_empty()),
+        Err(error) => prompt_refusal(error),
     }
 }
 
@@ -1009,6 +1092,7 @@ pub async fn summarize(
 pub async fn prompt(
     State(ctx): State<Arc<ServerContext>>,
     axum::Extension(location): axum::Extension<LocationContext>,
+    principal: Option<axum::Extension<crate::bearer::Principal>>,
     Path(session_id): Path<String>,
     body: Bytes,
 ) -> Result<Response, ServerError> {
@@ -1020,6 +1104,7 @@ pub async fn prompt(
     let engine = engine(&ctx, &location)?;
     let message = match engine
         .prompt(PromptInput {
+            caller: crate::confine::caller(&principal),
             session_id: session_id.clone(),
             message_id: payload.message_id,
             model: payload.model.map(|m| session::prompt_input::ModelRef {
@@ -1041,7 +1126,7 @@ pub async fn prompt(
         .await
     {
         Ok(message) => message,
-        Err(_) => return Ok(bad_request_empty()),
+        Err(error) => return prompt_refusal(error),
     };
     Ok(json_ok(with_parts_json(&message)))
 }
@@ -1051,6 +1136,7 @@ pub async fn prompt(
 pub async fn prompt_async(
     State(ctx): State<Arc<ServerContext>>,
     axum::Extension(location): axum::Extension<LocationContext>,
+    principal: Option<axum::Extension<crate::bearer::Principal>>,
     Path(session_id): Path<String>,
     body: Bytes,
 ) -> Result<Response, ServerError> {
@@ -1062,6 +1148,7 @@ pub async fn prompt_async(
     let engine = engine(&ctx, &location)?;
     let services = location.services.clone();
     let input = PromptInput {
+        caller: crate::confine::caller(&principal),
         session_id: session_id.clone(),
         message_id: payload.message_id,
         model: payload.model.map(|m| session::prompt_input::ModelRef {
@@ -1104,6 +1191,7 @@ pub async fn prompt_async(
 pub async fn command(
     State(ctx): State<Arc<ServerContext>>,
     axum::Extension(location): axum::Extension<LocationContext>,
+    principal: Option<axum::Extension<crate::bearer::Principal>>,
     Path(session_id): Path<String>,
     body: Bytes,
 ) -> Result<Response, ServerError> {
@@ -1131,11 +1219,12 @@ pub async fn command(
                     url: part.url,
                 })
                 .collect(),
+            caller: crate::confine::caller(&principal),
         })
         .await
     {
         Ok(message) => message,
-        Err(_) => return Ok(bad_request_empty()),
+        Err(error) => return prompt_refusal(error),
     };
     Ok(json_ok(with_parts_json(&message)))
 }
@@ -1182,6 +1271,12 @@ pub async fn revert(
     let payload: RevertPayload = parse_payload(&body)?;
     require_payload_id("msg", &payload.message_id)?;
     require_session(&location, &session_id)?;
+    require_owned(
+        &location,
+        &session_id,
+        &payload.message_id,
+        payload.part_id.as_deref(),
+    )?;
     let engine = engine(&ctx, &location)?;
     match engine
         .revert(RevertInput {
@@ -1214,13 +1309,27 @@ pub async fn unrevert(
 
 /// `permissionRespond` (`handlers/session.ts:362-378`) — deprecated.
 pub async fn permission_respond(
+    State(ctx): State<Arc<ServerContext>>,
     axum::Extension(location): axum::Extension<LocationContext>,
+    principal: Option<axum::Extension<crate::bearer::Principal>>,
     Path((session_id, permission_id)): Path<(String, String)>,
     body: Bytes,
 ) -> Result<Response, ServerError> {
     require_param("per", &permission_id)?;
     require_session(&location, &session_id)?;
     let payload: PermissionResponsePayload = parse_payload(&body)?;
+    if crate::confine::restricted(&principal) {
+        crate::confine::check_reply(&ctx, payload.response)?;
+    }
+    // The ask must be this session's: the path names a session, the reply
+    // acts on an ask, and they are only the same thing if checked.
+    crate::confine::authorise_answer(
+        &ctx,
+        &principal,
+        crate::confine::Ask::Permission,
+        &permission_id,
+        Some(&session_id),
+    )?;
     match location.services.permission.reply(PermissionV1ReplyInput {
         request_id: permission_id,
         reply: payload.response,
@@ -1245,6 +1354,7 @@ pub async fn delete_message(
 ) -> Result<Response, ServerError> {
     require_param("msg", &message_id)?;
     require_session(&location, &session_id)?;
+    require_owned(&location, &session_id, &message_id, None)?;
     if let Err(err) = location.services.run_state.assert_not_busy(&session_id) {
         return Err(busy_error(&err.session_id).into());
     }
@@ -1264,6 +1374,7 @@ pub async fn delete_part(
     require_param("msg", &message_id)?;
     require_param("prt", &part_id)?;
     require_session(&location, &session_id)?;
+    require_owned(&location, &session_id, &message_id, Some(&part_id))?;
     location
         .services
         .sessions
@@ -1282,6 +1393,7 @@ pub async fn update_part(
     require_param("msg", &message_id)?;
     require_param("prt", &part_id)?;
     require_session(&location, &session_id)?;
+    require_owned(&location, &session_id, &message_id, Some(&part_id))?;
     let part: V1Part = parse_payload(&body)?;
     let ids_match = match &part {
         V1Part::Text {

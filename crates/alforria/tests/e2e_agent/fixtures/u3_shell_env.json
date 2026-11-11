@@ -1,0 +1,23 @@
+{
+  "comment": "U3 — the agent dumps its shell environment to a file",
+  "turns": [
+    {
+      "frames": [
+        {
+          "tool_call": {
+            "id": "cal_1",
+            "name": "bash",
+            "arguments": { "command": "env > bash-env.txt", "description": "dump env" }
+          }
+        },
+        { "finish": { "reason": "tool_calls", "usage": { "input": 50, "output": 5 } } }
+      ]
+    },
+    {
+      "frames": [
+        { "text": "dumped" },
+        { "finish": { "reason": "stop", "usage": { "input": 60, "output": 3 } } }
+      ]
+    }
+  ]
+}

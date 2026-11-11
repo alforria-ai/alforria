@@ -444,6 +444,11 @@ pub struct CreateInput {
     pub workspace_id: Option<String>,
     pub directory: Option<String>,
     pub path: Option<String>,
+    /// alforria extension: created by a caller below `admin`
+    /// (`session::caller`). The session is restricted for life. A child of
+    /// a restricted session and a fork of one are restricted whatever this
+    /// says.
+    pub restricted: bool,
 }
 
 /// `Session.Service` (session.ts:486-985).
@@ -537,7 +542,94 @@ impl SessionStore {
                 info: info.clone(),
             })?,
         )?;
+        // alforria extension: restriction is inherited. Every session is
+        // created here, so a child or fork of a restricted session cannot
+        // come out unrestricted because its creator did not think of it.
+        let inherited = match &input.parent_id {
+            Some(parent) => self.is_restricted(parent)?,
+            None => false,
+        };
+        if input.restricted || inherited {
+            self.restrict(&info.id)?;
+        }
         Ok(info)
+    }
+
+    /// The session a message belongs to, if the message exists (alforria
+    /// extension): routes that take a session and a message check the two
+    /// go together before acting on the message.
+    pub fn message_session(&self, message_id: &str) -> Result<Option<String>, SessionError> {
+        self.storage
+            .with_connection(|conn| {
+                let mut statement = conn.prepare("SELECT session_id FROM message WHERE id = ?1")?;
+                let mut rows = statement.query([message_id])?;
+                match rows.next()? {
+                    Some(row) => Ok::<_, CoreError>(Some(row.get::<_, String>(0)?)),
+                    None => Ok(None),
+                }
+            })
+            .map_err(SessionError::from)
+    }
+
+    /// The session and message a part belongs to, if the part exists.
+    pub fn part_owner(&self, part_id: &str) -> Result<Option<(String, String)>, SessionError> {
+        self.storage
+            .with_connection(|conn| {
+                let mut statement =
+                    conn.prepare("SELECT session_id, message_id FROM part WHERE id = ?1")?;
+                let mut rows = statement.query([part_id])?;
+                match rows.next()? {
+                    Some(row) => Ok::<_, CoreError>(Some((row.get(0)?, row.get(1)?))),
+                    None => Ok(None),
+                }
+            })
+            .map_err(SessionError::from)
+    }
+
+    /// Whether a session is restricted (alforria extension,
+    /// `session::caller`): created by a caller below `admin`, or descended
+    /// from such a session.
+    pub fn is_restricted(&self, session_id: &str) -> Result<bool, SessionError> {
+        self.storage
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM session_restriction WHERE session_id = ?1)",
+                    [session_id],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(CoreError::from)
+            })
+            .map_err(SessionError::from)
+    }
+
+    /// Restrict a session, for life.
+    pub fn restrict(&self, session_id: &str) -> Result<(), SessionError> {
+        let now = self.now() as i64;
+        self.storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "INSERT OR IGNORE INTO session_restriction (session_id, time_created) VALUES (?1, ?2)",
+                    rusqlite::params![session_id, now],
+                )
+                .map(|_| ())
+                .map_err(CoreError::from)
+            })
+            .map_err(SessionError::from)
+    }
+
+    /// Lift a session's restriction. The one way out, and an operator's
+    /// decision: nothing in the engine calls it.
+    pub fn lift_restriction(&self, session_id: &str) -> Result<bool, SessionError> {
+        self.storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "DELETE FROM session_restriction WHERE session_id = ?1",
+                    [session_id],
+                )
+                .map(|rows| rows > 0)
+                .map_err(CoreError::from)
+            })
+            .map_err(SessionError::from)
     }
 
     /// `create` (session.ts:667-689).
@@ -1205,6 +1297,20 @@ impl SessionStore {
         session_id: &str,
         message_id: Option<&str>,
     ) -> Result<V1SessionInfo, SessionError> {
+        self.fork_as(ctx, session_id, message_id, false)
+    }
+
+    /// [`SessionStore::fork`] on behalf of a caller that is, or is not,
+    /// below `admin` (alforria extension). The fork is restricted when
+    /// either its source or the caller forking it is: a fork never has
+    /// more rights than whoever made it.
+    pub fn fork_as(
+        &self,
+        ctx: &SessionContext,
+        session_id: &str,
+        message_id: Option<&str>,
+        caller_restricted: bool,
+    ) -> Result<V1SessionInfo, SessionError> {
         let original = self.get(session_id)?;
         let title = get_forked_title(&original.title);
         let session = self.create_next(
@@ -1215,6 +1321,7 @@ impl SessionStore {
                 workspace_id: original.workspace_id.clone(),
                 title: Some(title),
                 metadata: original.metadata.clone(),
+                restricted: caller_restricted || self.is_restricted(session_id)?,
                 ..Default::default()
             },
         )?;

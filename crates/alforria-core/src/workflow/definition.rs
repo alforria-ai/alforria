@@ -204,7 +204,10 @@ fn scan_dirs(settings: &WorkflowSettings) -> Vec<(PathBuf, WorkflowSource)> {
 
     if settings.claude_compat {
         push(
-            settings.home.join(".claude").join("workflows"),
+            settings
+                .home
+                .join(crate::project_files::CLAUDE_DIR)
+                .join("workflows"),
             WorkflowSource::External,
         );
     }
@@ -228,16 +231,16 @@ fn scan_dirs(settings: &WorkflowSettings) -> Vec<(PathBuf, WorkflowSource)> {
         for dir in &ancestors {
             if settings.claude_compat {
                 push(
-                    dir.join(".claude").join("workflows"),
+                    dir.join(crate::project_files::CLAUDE_DIR).join("workflows"),
                     WorkflowSource::External,
                 );
             }
             push(
-                dir.join(".opencode").join("workflows"),
+                dir.join(crate::project_files::CONFIG_DIR).join("workflows"),
                 WorkflowSource::Project,
             );
             push(
-                dir.join(".opencode").join("workflow"),
+                dir.join(crate::project_files::CONFIG_DIR).join("workflow"),
                 WorkflowSource::Project,
             );
         }

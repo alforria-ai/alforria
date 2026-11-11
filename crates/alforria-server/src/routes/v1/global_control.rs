@@ -692,6 +692,7 @@ pub async fn find_symbol() -> Result<Response, ServerError> {
 /// `list` (`handlers/file.ts:66-93`).
 pub async fn file_list(
     axum::Extension(location): axum::Extension<LocationContext>,
+    principal: Option<axum::Extension<crate::bearer::Principal>>,
     uri: Uri,
 ) -> Result<Response, ServerError> {
     let path = match query_param(uri.query(), "path") {
@@ -700,6 +701,15 @@ pub async fn file_list(
     };
     let directory = &location.directory;
     let target = directory.join(&path);
+    // The operator's clients browse the whole filesystem through this route
+    // (the folder picker). A credential narrower than `admin` is confined
+    // to the project, like `content` below.
+    let restricted = principal.is_some_and(|principal| principal.0.restricted());
+    if restricted && !path_contains(directory, &target) {
+        return Err(ServerError::Api(crate::error::ApiError::Forbidden {
+            message: "this token may only list files inside the project".to_string(),
+        }));
+    }
     let entries = std::fs::read_dir(&target).map_err(defect)?;
     let ignore = CombinedIgnore::load(directory);
     let mut out: Vec<Value> = Vec::new();
@@ -758,7 +768,9 @@ impl CombinedIgnore {
 
 /// `content` (`handlers/file.ts:95-135`).
 pub async fn file_content(
+    State(ctx): State<Arc<ServerContext>>,
     axum::Extension(location): axum::Extension<LocationContext>,
+    principal: Option<axum::Extension<crate::bearer::Principal>>,
     uri: Uri,
 ) -> Result<Response, ServerError> {
     let path = match query_param(uri.query(), "path") {
@@ -769,6 +781,17 @@ pub async fn file_content(
     let file = directory.join(&path);
     if !path_contains(directory, &file) {
         return Err(defect("Path escapes the location"));
+    }
+    // alforria extension: a request admitted on a file ticket reads that
+    // ticket's file only (`routes::file_ext`).
+    if let Err(refusal) = crate::routes::file_ext::check_ticket(
+        &ctx,
+        &principal,
+        &uri,
+        &location,
+        &crate::confine::resolve_for_access(&file),
+    ) {
+        return Ok(axum::response::IntoResponse::into_response(refusal));
     }
     if !file.exists() {
         return Ok(json_ok(json!({"type": "text", "content": ""})));

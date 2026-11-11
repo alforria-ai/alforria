@@ -27,9 +27,13 @@ use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
 use base64::Engine;
 use tower::Service;
 
+use crate::bearer::{BearerError, Principal, Via};
+use crate::middleware::scope;
+use crate::policy::DirectoryAllowlist;
 use crate::pty::ticket::TicketCache;
 use crate::routes::{ui, v1, v2};
 use crate::state::AuthConfig;
+use crate::ticket::{FileScope, FileTickets};
 
 /// `WWW_AUTHENTICATE` (v1 authorization.ts:14, v2 authorization.ts:10).
 pub const WWW_AUTHENTICATE: &str = "Basic realm=\"Secure Area\"";
@@ -266,26 +270,168 @@ fn is_openapi(method: &Method, path: &str) -> bool {
 }
 
 /// The rejection a rejected request takes: the empty 401 (v1 + raw surfaces)
-/// or the v2 `UnauthorizedError` JSON.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// or the v2 `UnauthorizedError` JSON for a request without Basic
+/// credentials; for a bearer credential, why it was refused (401) or what
+/// it may not do (403).
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Rejection {
     Empty,
     V2,
+    Bearer(String),
+    Forbidden(String),
 }
 
-fn check(
-    auth: &AuthConfig,
-    tickets: &TicketCache,
-    method: &Method,
+/// `^Bearer\s+(.+)$/i` on the `Authorization` header (RFC 6750 §2.1).
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    if !value.as_bytes().get(..6)?.eq_ignore_ascii_case(b"bearer") {
+        return None;
+    }
+    let rest = &value[6..];
+    let token = rest.trim_start_matches([' ', '\t']);
+    (token.len() < rest.len() && !token.is_empty()).then_some(token)
+}
+
+/// The directory allowlist for a credential narrower than `admin`
+/// (`server.directories`): a directory the request names, and the working
+/// directory an alforria route would fall back to, must be allowed, and
+/// workspaces are not selectable at all. A session-derived directory is
+/// checked where it is resolved (`middleware::location`).
+fn check_directories(
+    directories: &DirectoryAllowlist,
     uri: &Uri,
     headers: &HeaderMap,
 ) -> Result<(), Rejection> {
+    let query = uri.query();
+    let header_text = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| !value.is_empty())
+            .map(url_decode_strict)
+    };
+    let named = [
+        query_param(query, "directory").filter(|value| !value.is_empty()),
+        query_param(query, "location[directory]").filter(|value| !value.is_empty()),
+        header_text("x-opencode-directory"),
+    ];
+    let mut any = false;
+    for directory in named.into_iter().flatten() {
+        any = true;
+        if !directories.allows(std::path::Path::new(&directory)) {
+            return Err(Rejection::Forbidden(format!(
+                "this token may not open {directory}: it is outside server.directories"
+            )));
+        }
+    }
+    let workspace = query_param(query, "workspace")
+        .or_else(|| query_param(query, "location[workspace]"))
+        .filter(|value| !value.is_empty())
+        .or_else(|| header_text("x-opencode-workspace"));
+    if workspace.is_some() {
+        return Err(Rejection::Forbidden(
+            "selecting a workspace needs the admin scope".to_string(),
+        ));
+    }
+    if !any && scope::defaults_to_cwd(uri.path()) && !directories.allows(&crate::state::cwd()) {
+        return Err(Rejection::Forbidden(
+            "this token may not open the server's working directory: pass ?directory= with one \
+             of server.directories"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// `decodeURIComponent`, best effort (`instance-context.ts:15-21`): the
+/// header is percent-encoded by clients; `+` is literal, unlike in a query.
+fn url_decode_strict(input: &str) -> String {
+    url_decode(&input.replace('+', "%2B"))
+}
+
+fn check_bearer(
+    auth: &AuthConfig,
+    directories: &DirectoryAllowlist,
+    token: &str,
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+) -> Result<Principal, Rejection> {
+    let Some(bearer) = &auth.bearer else {
+        return Err(Rejection::Bearer(
+            "bearer authentication is not configured on this server".to_string(),
+        ));
+    };
+    let principal = bearer
+        .verify(token)
+        .map_err(|err: BearerError| Rejection::Bearer(err.to_string()))?;
+    let required = scope::required(method.as_str(), uri.path());
+    if !principal.allows(required) {
+        return Err(Rejection::Forbidden(format!(
+            "{} {} needs the {} scope; this token has {}",
+            method,
+            uri.path(),
+            required.as_str(),
+            principal.scope.as_str()
+        )));
+    }
+    if principal.restricted() {
+        check_directories(directories, uri, headers)?;
+    }
+    Ok(principal)
+}
+
+/// The routes a file ticket opens (`routes::file_ext`): reads only.
+fn is_file_read(method: &Method, path: &str) -> bool {
+    (method == Method::GET || method == Method::HEAD)
+        && (path == "/file/raw" || path == "/file/content")
+}
+
+/// Whether the request carries a live file ticket issued for exactly the
+/// file and project it asks for. The handler checks again against the file
+/// it opens.
+fn file_ticketed(file_tickets: &FileTickets, uri: &Uri, headers: &HeaderMap) -> bool {
+    let Some(ticket) = query_param(uri.query(), "ticket").filter(|ticket| !ticket.is_empty())
+    else {
+        return false;
+    };
+    let Some(path) = query_param(uri.query(), "path").filter(|path| !path.is_empty()) else {
+        return false;
+    };
+    let directory = crate::middleware::location::request_directory(uri.query(), headers);
+    let file = if std::path::Path::new(&path).is_absolute() {
+        std::path::PathBuf::from(&path)
+    } else {
+        directory.join(&path)
+    };
+    file_tickets.admits(
+        &ticket,
+        &FileScope {
+            file: crate::confine::resolve_for_access(&file),
+            directory,
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check(
+    auth: &AuthConfig,
+    tickets: &TicketCache,
+    file_tickets: &FileTickets,
+    directories: &DirectoryAllowlist,
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+) -> Result<Option<Principal>, Rejection> {
     let path = uri.path();
     if is_openapi(method, path) {
-        return Ok(());
+        return Ok(None);
     }
     if is_public_ui_path(method, path) {
-        return Ok(());
+        return Ok(None);
+    }
+    if is_file_read(method, path) && file_ticketed(file_tickets, uri, headers) {
+        return Ok(Some(Principal::operator(Via::Ticket)));
     }
     let surface = surface(method, path);
     if surface != Surface::Raw {
@@ -304,11 +450,15 @@ fn check(
             })
         });
         if ticketed {
-            return Ok(());
+            return Ok(Some(Principal::operator(Via::Ticket)));
         }
     }
+    // A bearer credential is judged as one: it never falls back to Basic.
+    if let Some(token) = bearer_token(headers) {
+        return check_bearer(auth, directories, token, method, uri, headers).map(Some);
+    }
     if is_authorized(auth, uri, headers) {
-        return Ok(());
+        return Ok(Some(Principal::operator(Via::Basic)));
     }
     Err(match surface {
         Surface::V2Api => Rejection::V2,
@@ -324,25 +474,59 @@ fn is_authorized(auth: &AuthConfig, uri: &Uri, headers: &HeaderMap) -> bool {
 /// `HttpApiError.Unauthorized` — an empty 401 response
 /// (HttpApiError.js:97-100) with the `www-authenticate` header appended by
 /// `validateCredential`/`validateRawCredential`.
-fn unauthorized_raw() -> Response<Body> {
+fn unauthorized_raw(challenge: &'static str) -> Response<Body> {
     Response::builder()
         .status(StatusCode::UNAUTHORIZED)
-        .header("www-authenticate", WWW_AUTHENTICATE)
+        .header("www-authenticate", challenge)
         .body(Body::empty())
         .expect("static response parts are valid")
 }
 
-/// v2 401: `UnauthorizedError { message: "Authentication required" }` JSON
-/// (v2 authorization.ts:54; protocol errors.ts:13-16).
-fn unauthorized_v2() -> Response<Body> {
+/// The challenge of a server that only takes bearer credentials.
+pub const WWW_AUTHENTICATE_BEARER: &str = "Bearer realm=\"alforria\"";
+
+/// 401 for a refused bearer credential (RFC 6750 §3.1): the reason in the
+/// body and in the challenge.
+fn unauthorized_bearer(reason: &str) -> Response<Body> {
     let mut response = crate::error::ApiError::Unauthorized {
-        message: "Authentication required".to_string(),
+        message: reason.to_string(),
+    }
+    .into_response();
+    let description: String = reason
+        .chars()
+        .filter(|c| c.is_ascii() && !c.is_ascii_control() && *c != '"' && *c != '\\')
+        .collect();
+    if let Ok(value) = HeaderValue::from_str(&format!(
+        "Bearer realm=\"alforria\", error=\"invalid_token\", error_description=\"{description}\""
+    )) {
+        response.headers_mut().insert("www-authenticate", value);
+    }
+    response
+}
+
+/// 403 for a valid bearer credential that may not do this.
+fn forbidden(reason: &str) -> Response<Body> {
+    let mut response = crate::error::ApiError::Forbidden {
+        message: reason.to_string(),
     }
     .into_response();
     response.headers_mut().insert(
         "www-authenticate",
-        HeaderValue::from_static(WWW_AUTHENTICATE),
+        HeaderValue::from_static("Bearer realm=\"alforria\", error=\"insufficient_scope\""),
     );
+    response
+}
+
+/// v2 401: `UnauthorizedError { message: "Authentication required" }` JSON
+/// (v2 authorization.ts:54; protocol errors.ts:13-16).
+fn unauthorized_v2(challenge: &'static str) -> Response<Body> {
+    let mut response = crate::error::ApiError::Unauthorized {
+        message: "Authentication required".to_string(),
+    }
+    .into_response();
+    response
+        .headers_mut()
+        .insert("www-authenticate", HeaderValue::from_static(challenge));
     response
 }
 
@@ -352,11 +536,30 @@ fn unauthorized_v2() -> Response<Body> {
 pub struct AuthLayer {
     auth: AuthConfig,
     tickets: TicketCache,
+    file_tickets: FileTickets,
+    directories: DirectoryAllowlist,
 }
 
 impl AuthLayer {
     pub fn new(auth: AuthConfig, tickets: TicketCache) -> AuthLayer {
-        AuthLayer { auth, tickets }
+        AuthLayer {
+            auth,
+            tickets,
+            file_tickets: FileTickets::default(),
+            directories: DirectoryAllowlist::default(),
+        }
+    }
+
+    /// The cache `POST /file/ticket` issues from.
+    pub fn with_file_tickets(mut self, file_tickets: FileTickets) -> AuthLayer {
+        self.file_tickets = file_tickets;
+        self
+    }
+
+    /// The directories a credential narrower than `admin` may open.
+    pub fn with_directories(mut self, directories: DirectoryAllowlist) -> AuthLayer {
+        self.directories = directories;
+        self
     }
 }
 
@@ -368,6 +571,8 @@ impl<S> tower::Layer<S> for AuthLayer {
             inner,
             auth: self.auth.clone(),
             tickets: self.tickets.clone(),
+            file_tickets: self.file_tickets.clone(),
+            directories: self.directories.clone(),
         }
     }
 }
@@ -377,6 +582,8 @@ pub struct AuthService<S> {
     inner: S,
     auth: AuthConfig,
     tickets: TicketCache,
+    file_tickets: FileTickets,
+    directories: DirectoryAllowlist,
 }
 
 impl<S> Service<axum::http::Request<Body>> for AuthService<S>
@@ -392,7 +599,7 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, req: axum::http::Request<Body>) -> Self::Future {
+    fn call(&mut self, mut req: axum::http::Request<Body>) -> Self::Future {
         let mut inner = self.inner.clone();
         if !self.auth.required() {
             return Box::pin(async move { inner.call(req).await });
@@ -400,15 +607,32 @@ where
         let result = check(
             &self.auth,
             &self.tickets,
+            &self.file_tickets,
+            &self.directories,
             req.method(),
             req.uri(),
             req.headers(),
         );
+        // A server with no Basic password to offer challenges for Bearer.
+        let challenge = if self.auth.password_required() {
+            WWW_AUTHENTICATE
+        } else {
+            WWW_AUTHENTICATE_BEARER
+        };
         Box::pin(async move {
             match result {
-                Ok(()) => inner.call(req).await,
-                Err(Rejection::Empty) => Ok(unauthorized_raw()),
-                Err(Rejection::V2) => Ok(unauthorized_v2()),
+                Ok(principal) => {
+                    // Handlers and the location layer read who is calling
+                    // from here; absent means the operator.
+                    if let Some(principal) = principal {
+                        req.extensions_mut().insert(principal);
+                    }
+                    inner.call(req).await
+                }
+                Err(Rejection::Empty) => Ok(unauthorized_raw(challenge)),
+                Err(Rejection::V2) => Ok(unauthorized_v2(challenge)),
+                Err(Rejection::Bearer(reason)) => Ok(unauthorized_bearer(&reason)),
+                Err(Rejection::Forbidden(reason)) => Ok(forbidden(&reason)),
             }
         })
     }

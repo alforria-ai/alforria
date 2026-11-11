@@ -101,6 +101,64 @@ impl std::error::Error for PermissionError {}
 struct PendingEntry {
     info: PermissionV1Request,
     done: oneshot::Sender<Result<(), PermissionError>>,
+    /// When the ask was registered (ms since the epoch).
+    asked_at: u64,
+}
+
+/// What an ask resolves to when nobody answers it in time (alforria
+/// extension, `permission.unattended` in the host config).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnTimeout {
+    /// As if rejected with a message: the model is told the request was
+    /// denied because nobody answered, and carries on without it.
+    Deny,
+    /// As if answered `once`.
+    Allow,
+}
+
+/// The unattended policy: how long an ask waits for a person, and what
+/// happens then. Without one an ask waits forever (upstream behaviour).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Unattended {
+    pub timeout: std::time::Duration,
+    pub on_timeout: OnTimeout,
+}
+
+/// A pending ask with its age, for [`PermissionService::pending`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingPermission {
+    pub request: PermissionV1Request,
+    /// When the ask was registered (ms since the epoch).
+    pub asked_at: u64,
+    /// When the unattended policy will answer it, if one is set.
+    pub expires_at: Option<u64>,
+}
+
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// `"30s"`, `"5m"`, `"1h 30m"` — for the message the model reads.
+pub(crate) fn describe_duration(duration: std::time::Duration) -> String {
+    let secs = duration.as_secs();
+    if secs == 0 {
+        return format!("{}ms", duration.as_millis());
+    }
+    let (hours, minutes, seconds) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    let mut parts = Vec::new();
+    if hours > 0 {
+        parts.push(format!("{hours}h"));
+    }
+    if minutes > 0 {
+        parts.push(format!("{minutes}m"));
+    }
+    if seconds > 0 {
+        parts.push(format!("{seconds}s"));
+    }
+    parts.join(" ")
 }
 
 /// `State` (permission/index.ts:23-26): insertion-ordered pending registry
@@ -116,6 +174,7 @@ struct State {
 pub struct PermissionService {
     events: Arc<EventBus>,
     state: Mutex<State>,
+    unattended: Mutex<Option<Unattended>>,
 }
 
 /// Removes the pending entry when the ask future is dropped
@@ -150,7 +209,73 @@ impl PermissionService {
         PermissionService {
             events,
             state: Mutex::new(State::default()),
+            unattended: Mutex::new(None),
         }
+    }
+
+    /// Set (or clear) what happens to an ask nobody answers. Applies to
+    /// asks made from now on.
+    pub fn set_unattended(&self, policy: Option<Unattended>) {
+        *self
+            .unattended
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = policy;
+    }
+
+    pub fn unattended(&self) -> Option<Unattended> {
+        *self
+            .unattended
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The pending asks with their ages, in insertion order.
+    pub fn pending(&self) -> Vec<PendingPermission> {
+        let timeout = self
+            .unattended()
+            .map(|policy| policy.timeout.as_millis() as u64);
+        self.lock_state()
+            .pending
+            .iter()
+            .map(|entry| PendingPermission {
+                request: entry.info.clone(),
+                asked_at: entry.asked_at,
+                expires_at: timeout.map(|timeout| entry.asked_at + timeout),
+            })
+            .collect()
+    }
+
+    /// Answer an ask on nobody's behalf (the unattended policy). Unlike a
+    /// person's reply this resolves that one ask only: it does not reject
+    /// or approve the session's other pending asks, each of which has its
+    /// own deadline. Publishes the usual `permission.replied`, marked
+    /// `automatic: true`. A no-op when the ask was answered meanwhile.
+    fn resolve_unattended(&self, request_id: &str, policy: Unattended) {
+        let entry = {
+            let mut state = self.lock_state();
+            state
+                .pending
+                .iter()
+                .position(|entry| entry.info.id == request_id)
+                .map(|position| state.pending.remove(position))
+        };
+        let Some(entry) = entry else { return };
+        let (reply, result) = match policy.on_timeout {
+            OnTimeout::Allow => (PermissionV1Reply::Once, Ok(())),
+            OnTimeout::Deny => (
+                PermissionV1Reply::Reject,
+                Err(PermissionError::Corrected {
+                    feedback: format!(
+                        "No one was available to answer this permission request within {}, so \
+                         it was denied automatically. Do not ask again: continue without it, or \
+                         stop if you cannot.",
+                        describe_duration(policy.timeout)
+                    ),
+                }),
+            ),
+        };
+        let _ = self.publish_reply(&entry.info.session_id, &entry.info.id, reply, true);
+        let _ = entry.done.send(result);
     }
 
     fn lock_state(&self) -> MutexGuard<'_, State> {
@@ -192,12 +317,30 @@ impl PermissionService {
         request_id: &str,
         reply: PermissionV1Reply,
     ) -> Result<(), PermissionError> {
-        let data = serde_json::to_value(PermissionRepliedData {
+        self.publish_reply(session_id, request_id, reply, false)
+    }
+
+    /// `permission.replied`. An answer nobody gave (the unattended policy)
+    /// carries `automatic: true` beside the upstream fields; a person's
+    /// reply is byte-identical to upstream's.
+    fn publish_reply(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        reply: PermissionV1Reply,
+        automatic: bool,
+    ) -> Result<(), PermissionError> {
+        let mut data = serde_json::to_value(PermissionRepliedData {
             session_id: session_id.to_string(),
             request_id: request_id.to_string(),
             reply,
         })
         .map_err(|err| PermissionError::Publish(err.to_string()))?;
+        if automatic {
+            if let Some(fields) = data.as_object_mut() {
+                fields.insert("automatic".to_string(), Value::Bool(true));
+            }
+        }
         self.events
             .publish(&PERMISSION_REPLIED, data, PublishOptions::default())
             .map(|_| ())
@@ -264,6 +407,7 @@ impl PermissionService {
             state.pending.push(PendingEntry {
                 info: request.clone(),
                 done,
+                asked_at: now_ms(),
             });
         }
         let guard = PendingCleanup {
@@ -271,7 +415,21 @@ impl PermissionService {
             id: request.id.clone(),
         };
         self.publish_asked(&request)?;
-        let result = match rx.await {
+        let mut rx = rx;
+        // With an unattended policy the wait is bounded: when it runs out
+        // the ask is answered on nobody's behalf, and the receiver then
+        // holds that answer (or a person's, if one got in first).
+        let answer = match self.unattended() {
+            Some(policy) => match tokio::time::timeout(policy.timeout, &mut rx).await {
+                Ok(answer) => answer,
+                Err(_) => {
+                    self.resolve_unattended(&request.id, policy);
+                    rx.await
+                }
+            },
+            None => rx.await,
+        };
+        let result = match answer {
             Ok(result) => result,
             // The service went away with the ask still pending — the TS
             // finalizer fails every pending deferred with RejectedError
@@ -978,6 +1136,159 @@ mod tests {
                 "requestID": "per_ev",
                 "reply": "once",
             })
+        );
+    }
+
+    fn unattended(on_timeout: OnTimeout) -> Unattended {
+        Unattended {
+            timeout: std::time::Duration::from_secs(30),
+            on_timeout,
+        }
+    }
+
+    /// With no policy an ask waits for as long as it takes.
+    #[tokio::test(start_paused = true)]
+    async fn an_ask_waits_forever_without_an_unattended_policy() {
+        let service = Arc::new(PermissionService::new(bus()));
+        let asking = tokio::spawn({
+            let service = service.clone();
+            async move { service.ask(ask_input(Some("per_wait"))).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_secs(86_400)).await;
+        assert_eq!(service.list().len(), 1, "still pending a day later");
+        assert!(!asking.is_finished());
+        service.reply(reply_once("per_wait")).unwrap();
+        assert_eq!(asking.await.unwrap(), Ok(()));
+    }
+
+    /// An unanswered ask is denied like a reject with a message: the model
+    /// is told why, and `permission.replied` says nobody answered.
+    #[tokio::test(start_paused = true)]
+    async fn an_unanswered_ask_times_out_to_deny() {
+        let events = bus();
+        let mut replied = events.subscribe("permission.replied");
+        let service = Arc::new(PermissionService::new(events));
+        service.set_unattended(Some(unattended(OnTimeout::Deny)));
+        let asking = tokio::spawn({
+            let service = service.clone();
+            async move { service.ask(ask_input(Some("per_deny"))).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_secs(29)).await;
+        let pending = service.pending();
+        assert_eq!(pending.len(), 1, "not yet");
+        assert_eq!(
+            pending[0].expires_at,
+            Some(pending[0].asked_at + 30_000),
+            "the deadline is reported"
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let result = asking.await.unwrap();
+        let Err(PermissionError::Corrected { feedback }) = &result else {
+            panic!("expected a rejection with feedback, got {result:?}");
+        };
+        assert!(feedback.contains("within 30s"), "{feedback}");
+        assert!(feedback.contains("denied automatically"), "{feedback}");
+        assert!(service.list().is_empty());
+        let event = replied.recv().await.unwrap();
+        assert_eq!(
+            event.data,
+            serde_json::json!({
+                "sessionID": "ses_test", "requestID": "per_deny", "reply": "reject", "automatic": true
+            })
+        );
+        // A late reply finds nothing, like any reply to an answered ask.
+        assert!(matches!(
+            service.reply(reply_once("per_deny")),
+            Err(PermissionError::NotFound { .. })
+        ));
+    }
+
+    /// `allow` answers once, and writes no standing rule.
+    #[tokio::test(start_paused = true)]
+    async fn an_unanswered_ask_times_out_to_allow_once() {
+        let events = bus();
+        let mut replied = events.subscribe("permission.replied");
+        let service = Arc::new(PermissionService::new(events));
+        service.set_unattended(Some(unattended(OnTimeout::Allow)));
+        assert_eq!(service.ask(ask_input(Some("per_allow"))).await, Ok(()));
+        let event = replied.recv().await.unwrap();
+        assert_eq!(event.data["reply"], "once");
+        assert_eq!(event.data["automatic"], true);
+        // The same ask asks again next time: nothing was approved for good.
+        let again = tokio::spawn({
+            let service = service.clone();
+            async move { service.ask(ask_input(Some("per_again"))).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        assert_eq!(service.list().len(), 1);
+        again.abort();
+    }
+
+    /// A person who answers in time is what counts; their reply carries no
+    /// `automatic` mark and the timer does nothing afterwards.
+    #[tokio::test(start_paused = true)]
+    async fn an_answer_in_time_beats_the_timeout() {
+        let events = bus();
+        let mut replied = events.subscribe("permission.replied");
+        let service = Arc::new(PermissionService::new(events));
+        service.set_unattended(Some(unattended(OnTimeout::Deny)));
+        let asking = tokio::spawn({
+            let service = service.clone();
+            async move { service.ask(ask_input(Some("per_fast"))).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        service.reply(reply_once("per_fast")).unwrap();
+        assert_eq!(asking.await.unwrap(), Ok(()));
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        let event = replied.recv().await.unwrap();
+        assert_eq!(
+            event.data,
+            serde_json::json!({ "sessionID": "ses_test", "requestID": "per_fast", "reply": "once" })
+        );
+        assert!(replied.try_recv().is_err(), "nothing was published twice");
+    }
+
+    /// Each ask has its own deadline: one timing out does not sweep the
+    /// session's other asks along, as a person's reject does.
+    #[tokio::test(start_paused = true)]
+    async fn a_timeout_resolves_only_its_own_ask() {
+        let service = Arc::new(PermissionService::new(bus()));
+        service.set_unattended(Some(unattended(OnTimeout::Deny)));
+        let first = tokio::spawn({
+            let service = service.clone();
+            async move { service.ask(ask_input(Some("per_first"))).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+        let second = tokio::spawn({
+            let service = service.clone();
+            async move { service.ask(ask_input(Some("per_second"))).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+        assert!(first.is_finished());
+        assert_eq!(
+            service
+                .list()
+                .iter()
+                .map(|request| request.id.as_str())
+                .collect::<Vec<_>>(),
+            ["per_second"]
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+        assert!(matches!(
+            second.await.unwrap(),
+            Err(PermissionError::Corrected { .. })
+        ));
+    }
+
+    #[test]
+    fn durations_read_naturally() {
+        let describe = |secs: u64| describe_duration(std::time::Duration::from_secs(secs));
+        assert_eq!(describe(30), "30s");
+        assert_eq!(describe(300), "5m");
+        assert_eq!(describe(5400), "1h 30m");
+        assert_eq!(
+            describe_duration(std::time::Duration::from_millis(250)),
+            "250ms"
         );
     }
 

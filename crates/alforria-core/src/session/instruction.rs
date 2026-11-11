@@ -18,9 +18,10 @@ use crate::session::message::WithParts;
 /// `AGENTS.md`, `CLAUDE.md` (flag-gated), `CONTEXT.md` (deprecated)
 /// (instruction.ts:64-68).
 fn instruction_files(disable_claude_code_prompt: bool) -> &'static [&'static str] {
+    use crate::project_files::{AGENTS_FILE, CLAUDE_FILE, CONTEXT_FILE};
     match disable_claude_code_prompt {
-        true => &["AGENTS.md", "CONTEXT.md"],
-        false => &["AGENTS.md", "CLAUDE.md", "CONTEXT.md"],
+        true => &[AGENTS_FILE, CONTEXT_FILE],
+        false => &[AGENTS_FILE, CLAUDE_FILE, CONTEXT_FILE],
     }
 }
 

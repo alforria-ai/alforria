@@ -34,6 +34,9 @@ use crate::sse::{GlobalBus, GlobalEvent, INSTANCE_DISPOSED_TYPE};
 pub struct AuthConfig {
     pub username: String,
     pub password: Option<String>,
+    /// Bearer authentication (alforria extension, `server.auth.bearer`):
+    /// static tokens and Ed25519 JWTs with scopes, next to Basic.
+    pub bearer: Option<Arc<crate::bearer::BearerAuth>>,
 }
 
 impl AuthConfig {
@@ -41,7 +44,21 @@ impl AuthConfig {
         AuthConfig {
             username: username.into(),
             password,
+            bearer: None,
         }
+    }
+
+    /// The same config, also accepting bearer credentials.
+    pub fn with_bearer(mut self, bearer: Option<Arc<crate::bearer::BearerAuth>>) -> AuthConfig {
+        self.bearer = bearer;
+        self
+    }
+
+    /// Whether Basic auth has a password to check (`auth.ts:24-26`).
+    pub fn password_required(&self) -> bool {
+        self.password
+            .as_ref()
+            .is_some_and(|password| !password.is_empty())
     }
 
     pub fn from_env() -> AuthConfig {
@@ -52,6 +69,7 @@ impl AuthConfig {
             username: std::env::var("OPENCODE_SERVER_USERNAME")
                 .unwrap_or_else(|_| "alforria".to_string()),
             password: std::env::var("OPENCODE_SERVER_PASSWORD").ok(),
+            bearer: None,
         }
     }
 
@@ -61,20 +79,21 @@ impl AuthConfig {
         uuid::Uuid::new_v4().simple().to_string()
     }
 
-    /// Auth is enforced only when the password is present *and* non-empty
-    /// (`auth.ts:24-26`).
+    /// Auth is enforced when the password is present *and* non-empty
+    /// (`auth.ts:24-26`), or when bearer authentication is configured.
     pub fn required(&self) -> bool {
-        match &self.password {
-            Some(password) => !password.is_empty(),
-            None => false,
-        }
+        self.password_required() || self.bearer.is_some()
     }
 
-    /// `authorized` (`auth.ts:22-28`).
+    /// `authorized` (`auth.ts:22-28`). An empty password never authorizes:
+    /// upstream only gets here with one set, but with bearer authentication
+    /// configured a request can reach this check without.
     pub fn authorized(&self, username: &str, password: &str) -> bool {
         match &self.password {
-            Some(expected) => username == self.username && password == expected,
-            None => false,
+            Some(expected) if !expected.is_empty() => {
+                username == self.username && password == expected
+            }
+            _ => false,
         }
     }
 
@@ -231,7 +250,12 @@ pub struct InstanceStore {
     /// Disposal emissions feed the GlobalBus (`disposeContext`,
     /// `instance-store.ts:78-93`).
     global_bus: Arc<Mutex<Option<GlobalBus>>>,
+    /// Run on every instance right after it boots (alforria extension):
+    /// host policy that lives on per-instance services is applied here.
+    on_boot: Arc<Mutex<Option<BootHook>>>,
 }
+
+type BootHook = Arc<dyn Fn(&SessionServices) + Send + Sync>;
 
 impl InstanceStore {
     pub fn new(factory: InstanceFactory) -> InstanceStore {
@@ -239,7 +263,13 @@ impl InstanceStore {
             factory,
             entries: Arc::new(Mutex::new(HashMap::new())),
             global_bus: Arc::new(Mutex::new(None)),
+            on_boot: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Run `hook` on every instance booted from now on.
+    pub fn set_on_boot(&self, hook: impl Fn(&SessionServices) + Send + Sync + 'static) {
+        *self.on_boot.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(hook));
     }
 
     /// The GlobalBus to emit `server.instance.disposed` events into — wired
@@ -279,6 +309,14 @@ impl InstanceStore {
             return Ok(existing.clone());
         }
         let services = (self.factory)(&directory)?;
+        let on_boot = self
+            .on_boot
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        if let Some(on_boot) = on_boot {
+            on_boot(&services);
+        }
         // M7.1: the instance bus feeds the global bus so per-instance
         // events reach `/global/event` and `/event` with their location
         // (`event-v2-bridge.ts:26-62`).
@@ -372,7 +410,7 @@ pub fn cwd() -> PathBuf {
 
 /// `path.resolve`-style lexical normalization — collapse `.`/`..` without
 /// touching the filesystem; `..` above the root clamps to the root.
-fn lexical_normalize(path: &Path) -> PathBuf {
+pub(crate) fn lexical_normalize(path: &Path) -> PathBuf {
     let mut parts: Vec<OsString> = Vec::new();
     let mut root = PathBuf::new();
     for component in path.components() {
@@ -1577,6 +1615,14 @@ pub struct ServerContext {
     /// `Project.Service` (M7.1) — the project registry over the shared
     /// storage; its `project.updated` emissions feed the GlobalBus.
     pub projects: Arc<alforria_core::project::registry::ProjectRegistry>,
+    /// The unattended-server settings from the host config (alforria
+    /// extension, `policy.rs`). Defaults everywhere outside production.
+    pub policy: Arc<crate::policy::ServerPolicy>,
+    /// Read tickets for single files (alforria extension, `ticket.rs`).
+    pub file_tickets: crate::ticket::FileTickets,
+    /// Webhook deliveries (alforria extension, `outbox.rs`). Captures and
+    /// delivers nothing unless `hook.webhook` is configured.
+    pub outbox: Arc<crate::outbox::Outbox>,
 }
 
 impl ServerContext {
@@ -1621,6 +1667,8 @@ impl ServerContext {
             Arc::new(NoBackgroundJobs),
             Arc::new(alforria_core::catalog::SystemClock),
         );
+        let outbox = crate::outbox::Outbox::new(storage.clone(), None)
+            .expect("an outbox without hooks cannot fail");
         ServerContext {
             auth,
             instances,
@@ -1659,6 +1707,9 @@ impl ServerContext {
             ptys: crate::pty::PtyRegistry::default(),
             websockets: WebSocketTracker::default(),
             projects,
+            policy: Arc::new(crate::policy::ServerPolicy::default()),
+            file_tickets: crate::ticket::FileTickets::default(),
+            outbox,
         }
     }
 

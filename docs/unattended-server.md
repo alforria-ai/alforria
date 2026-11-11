@@ -1,0 +1,721 @@
+# Running alforria unattended
+
+`alforria serve` can run as the engine of an always-on machine: bound to
+localhost behind a reverse proxy, started by a supervisor, with nobody at a
+terminal. This page is the reference for the settings and routes that exist
+for that. All of them are alforria extensions; none is part of the upstream
+opencode API, and none changes a frozen route or schema.
+
+## Where these settings live: the host config
+
+The keys on this page marked **host** are read once, when the server starts,
+from the *host config*:
+
+- the global config directory (`~/.config/alforria/opencode.json`,
+  `opencode.jsonc` or `config.json`; see `crates/alforria-core/src/paths.rs`),
+- `~/.opencode/`,
+- the managed config directory (`/etc/opencode`).
+
+A project's `opencode.json` and `.opencode/` directory are **not** consulted
+for them. Those are files the agent can write; the server's access policy
+must not be one of the things it can edit.
+
+Unlike the per-project config, a host config file that does not parse is an
+error: `alforria serve` and `alforria web` refuse to listen rather than run
+with a policy other than the one written down.
+
+alforria's own tables (`session_restriction`, `outbox`) are created by its
+own migrations (`crates/alforria-core/src/storage/alforria_migration.rs`),
+beside the upstream schema and journal, which stay byte-compatible.
+
+Durations are strings with a unit (`"500ms"`, `"30s"`, `"5m"`, `"2h"`,
+`"1d"`) or a bare number of milliseconds.
+
+## Stopping: `server.shutdown` (host)
+
+```jsonc
+{
+  "server": {
+    "shutdown": {
+      "timeout": "10s",     // the whole budget; default 10s
+      "sessions": "abort"   // "abort" (default) or "drain"
+    }
+  }
+}
+```
+
+On `SIGTERM` or `SIGINT` (ctrl-c elsewhere), `alforria serve` and
+`alforria web`:
+
+1. stop accepting connections;
+2. settle the running turns. `abort` cancels them at once, exactly as
+   `POST /session/{id}/abort` would, so each is recorded as interrupted.
+   `drain` lets them finish and cancels whatever is still running shortly
+   before the deadline;
+3. kill the terminals and every process group a tool still has running (the
+   bash tool, the session `shell` command and terminals each run their child
+   in its own process group, so nothing is orphaned);
+4. close the remaining connections. Event streams never end on their own and
+   are not waited for;
+5. checkpoint the SQLite write-ahead log into the database file
+   (`wal_checkpoint(TRUNCATE)`);
+6. exit 0.
+
+A second signal skips the wait. Give the supervisor a kill timeout a little
+longer than `timeout` (systemd `TimeoutStopSec=`, s6 `timeout-kill`).
+
+A hard kill (`SIGKILL`, power loss) is safe for the database: SQLite replays
+the write-ahead log on the next start. What a hard kill cannot do is stop the
+tool processes or record the interrupted turn.
+
+## What the agent's shell can see: `shell_env` (host)
+
+```jsonc
+{
+  "shell_env": {
+    "inherit": "all",                  // "all" (default), "none", or ["PATH", "HOME", "LC_*"]
+    "allow":   ["OPENAI_API_KEY"],     // exact names exempt from the built-in deny list
+    "set":     { "TERM": "dumb" },     // set in every shell, over anything inherited
+    "deny":    ["MY_SECRET_*"]         // never inherited; names or * / ? patterns
+  }
+}
+```
+
+The key is `shell_env` rather than `shell.env` because upstream's `shell` is
+a string (the shell to run).
+
+Every shell the agent or a client drives starts from this policy instead of
+the server's whole environment: the `bash` tool, the session `shell` command,
+`` !`cmd` `` substitutions in command templates, terminals (`/pty`) and
+worktree start scripts.
+
+A variable reaches a shell when, in order:
+
+1. `set` names it (the configured value wins over everything); otherwise
+2. no `deny` pattern matches it, and
+3. it is not on the built-in deny list, unless `allow` names it or `inherit`
+   is a list that names it exactly (a pattern such as `"*"` does not release a
+   built-in denied name), and
+4. `inherit` selects it.
+
+The built-in deny list (`BUILTIN_DENY` in
+`crates/alforria-core/src/shell_env.rs`) holds the server's own secrets
+(`OPENCODE_SERVER_PASSWORD`, `OPENCODE_SERVER_USERNAME`,
+`OPENCODE_AUTH_CONTENT`, `OPENCODE_CONFIG_CONTENT`, `OPENCODE_API_KEY`,
+`ALFORRIA_*_SECRET`, `ALFORRIA_*_TOKEN`, `ALFORRIA_*_KEY`,
+`ALFORRIA_*_PASSWORD`) and the variables model providers and search backends
+read their keys from (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
+`GEMINI_API_KEY`, `OPENROUTER_API_KEY`, `LIBERTAI_API_KEY`, `EXA_API_KEY`, …).
+General-purpose credentials such as `AWS_*` or `GITHUB_TOKEN` are not on it:
+the agent's own tools need them, and whether it should have them is yours to
+decide with `deny`.
+
+MCP stdio servers and language servers are started with everything except
+the denied names, then their own configured `environment`. An MCP server
+therefore gets a provider key only when its `environment` names it, for
+example `"environment": { "OPENAI_API_KEY": "{env:OPENAI_API_KEY}" }`.
+
+With `"inherit": "none"` a shell has no `PATH` or `HOME` unless `set`
+provides them; a list such as `["PATH", "HOME", "LANG", "LC_*", "TERM",
+"USER", "SHELL", "TMPDIR"]` is usually what is wanted.
+
+This is not a sandbox. A shell running as the server's user can still read
+`/proc/<server pid>/environ` and the server's files (`auth.json`, the
+database). Keeping those from the agent takes a separate user for its shell,
+or secrets that never enter the server's environment.
+
+## Who may connect: `server.auth.bearer` and `server.directories` (host)
+
+HTTP Basic (`OPENCODE_SERVER_USERNAME` / `OPENCODE_SERVER_PASSWORD`) is
+unchanged: it is the operator and may do anything. Next to it the server
+accepts bearer credentials that say what their holder may do. The server
+holds no signing secret for them: static tokens are stored as SHA-256
+digests, and JWTs are verified against public keys.
+
+```jsonc
+{
+  "server": {
+    "auth": {
+      "bearer": {
+        // Ed25519 public keys of whoever mints the JWTs. PEM ("BEGIN PUBLIC
+        // KEY"), or base64 / hex of the raw 32 bytes or of the SPKI DER.
+        "keys": ["MCowBQYDK2VwAyEA…"],
+        // The `aud` a JWT must carry: a string or a list. Required with keys.
+        "audience": "agent-42",
+        // Optional: the `iss` a JWT must carry.
+        "issuer": "https://control-plane.example",
+        // Clock skew tolerated on exp / nbf. Default 30s.
+        "leeway": "30s",
+        // Static tokens, as hex SHA-256 digests. A bare digest is `admin`.
+        "tokens_sha256": [
+          "9f86d081884c7d65…",
+          { "sha256": "2c26b46b68ffc68f…", "scope": "connector", "name": "telegram-sidecar" }
+        ],
+        // Let tokens below `admin` answer a permission ask "always" (a
+        // standing allow rule). Default false: "once" and "reject" only.
+        "reply_always": false
+      }
+    },
+    // The project directories a token narrower than `admin` may open,
+    // matched exactly. Default: the server's working directory.
+    "directories": ["/home/agent/workspace"]
+  }
+}
+```
+
+A client sends `Authorization: Bearer <token>` on every request, event
+streams included (`?auth_token=` remains a Basic-only form).
+
+### JWTs
+
+- The algorithm is `EdDSA` (Ed25519). A token whose header names anything
+  else (`none`, `HS256`, `RS256`, …) is refused before any key is used.
+- `exp` is required. `nbf` is honoured when present. Both allow `leeway`.
+- `aud` must contain one of the configured audiences.
+- `iss` must equal `issuer` when `issuer` is configured.
+- `scope` is a space-separated string or an array; it must name at least one
+  of `chat`, `connector`, `admin`. The widest one named applies. `sub` is
+  kept for logs.
+
+A refused credential gets `401` with `WWW-Authenticate: Bearer
+error="invalid_token"` and the reason in the body; a valid one that may not
+do what it asked gets `403` (`ForbiddenError`). A request with a bearer
+credential is never retried as Basic.
+
+With `server.auth.bearer` configured and no `OPENCODE_SERVER_PASSWORD`,
+`alforria serve` does not generate or print a password: Basic is simply off,
+and requests without a token get `401` with `WWW-Authenticate: Bearer`.
+
+### Scopes
+
+Each scope includes the ones above it in this table. **A route that is not
+listed needs `admin`**, so a route added later — a whole new family included
+— is closed to narrower tokens until it is listed
+(`crates/alforria-server/src/middleware/scope.rs`).
+
+| Scope | For | Routes |
+| --- | --- | --- |
+| `chat` | A person talking to the agent from a browser or a phone | `GET /global/health`, `GET /event`, `GET /attention`; sessions: `GET`/`POST /session`, `GET /session/status`, `GET`/`PATCH`/`DELETE /session/{id}`, `…/children`, `…/todo`, `…/diff`, `…/goal`, `GET`/`POST …/message`, `GET …/message/{id}`, `…/prompt_async`, `…/command`, `…/abort`, `…/fork`, `…/init`, `…/summarize`, `…/revert`, `…/unrevert`, `…/permissions/{id}`; replies: `GET /permission`, `POST /permission/{id}/reply`, `GET /question`, `POST /question/{id}/reply`, `…/reject`; files in the project: `GET /file`, `/file/content`, `/file/status`, `/find`, `/find/file`, `/find/symbol`, `POST /file/ticket`, `GET /file/raw`, `PUT /file/content`; and what a client draws itself with: `GET /agent`, `/command`, `/skill`, `/path`, `/project/current`, `/vcs`, `/vcs/status`, `/vcs/diff` |
+| `connector` | A trusted sidecar on the same machine (a messaging bridge, a scheduler) | everything in `chat`, plus `GET /global/event` (every directory's events on one stream), `POST /log`, status reads (`GET /mcp`, `/lsp`, `/formatter`, `/experimental/tool`, `/experimental/tool/ids`, `/experimental/resource`, `/project`, `/project/{id}/directories`), and watching and stopping workflow runs (`GET /workflow`, `GET /workflow/run`, `GET /workflow/run/{id}`, `POST …/wait`, `POST …/abort`) |
+| `admin` | The control plane, the operator | everything: config, provider credentials (`/auth`, `/provider`, `/config/providers`), MCP management and OAuth, terminals (`/pty`), the session `shell` command, saving and starting workflows, `/tui/*`, message and part edits and deletes, `/instance/dispose`, the `/global` routes, sync, sharing, `/experimental/*`, the v2 `/api` surface, the web UI |
+
+### Threat model: what each scope can cause
+
+The principle: **a `chat` token can converse with the agent and answer its
+asks. It can never execute anything except through the model, under the
+operator's permission policy, and it can never change that policy.**
+`connector` is `chat` with a wider view and obeys the same principle. Only
+`admin` (and Basic auth, which is the operator) executes directly or sets
+policy.
+
+How it is enforced, in three layers:
+
+1. The scope table decides which routes a token reaches.
+2. A route says where a prompt or command comes from (`Caller`,
+   `crates/alforria-core/src/session/caller.rs`): the operator, a caller
+   below `admin`, or the engine itself. The engine then judges the values it
+   actually resolves, at the point it uses them: the agent the turn will run
+   as, the parts as they will be stored, the file about to be read. There is
+   no second spelling of a value for a check to look at. (Routes also refuse
+   early what could never run, such as a hidden agent named on a new
+   session; that is a courtesy, not the control.)
+3. **The restriction stays with the session.** A session created by a caller
+   below `admin` is restricted for its whole life, and so is every session
+   descended from it: the subagent sessions the task tool makes, forks,
+   workflow agents. A restricted session bounds *every* turn in it, whoever
+   or whatever starts it — a later request from the operator included, and
+   above all the turns nobody requests: a `/goal` round, a subagent's run, a
+   resume, a trigger. The restriction is read from the session at the one
+   place every turn passes through, so a turn source that knows nothing
+   about callers is still bound.
+
+An operator who wants to take a restricted session over lifts the
+restriction first, with an `admin` credential:
+`DELETE /session/{id}/restriction` (`GET` reports
+`{ "restricted": true|false }`). Until then the operator's own prompts to
+that session are refused the same things a `chat` token's are. That is
+deliberate: a session is a conversation someone else shaped, and running it
+with full rights should be a decision, not a side effect of who happened to
+send the next message.
+
+What a holder of a `chat` or `connector` token **can** cause:
+
+- Whatever the agent does in the allowed project when prompted, to the
+  extent the operator's `permission` config allows it or asks. If `bash` is
+  `allow`, a prompt can get shell run: that is the operator's policy, not a
+  bypass of it. Write the policy for the least trusted token holder.
+- Answering the agent's permission asks `once` or `reject`, and its
+  questions. An `ask` rule is therefore a decision delegated to whoever
+  holds a `chat` token; a `deny` rule is not theirs to lift.
+- Choosing among the agents a client's picker shows (not hidden, not
+  subagent-only) and among the configured models. An agent's own
+  `permission` block is part of the operator's policy: if one visible agent
+  is broader than another, a token holder can pick it. Disable agents that
+  should not be reachable.
+- Running the configured custom commands (`/name`) that contain no inline
+  shell, with arguments that are text.
+- Undoing the agent's own edits (`revert` / `unrevert`), which restores
+  project files from the snapshots its turns took; forking, summarising,
+  renaming, archiving and deleting sessions; aborting a turn.
+- Switching tools *off* for a session (`tools: { name: false }`).
+- Reading and listing files inside the project, its git status and diff,
+  and uploading files into the upload area.
+- Spending the operator's model budget.
+
+What it **cannot** cause, and what stops it:
+
+| It cannot | Because |
+| --- | --- |
+| Run shell directly | `POST /session/{id}/shell`, `/pty`, `/tui/*` and workflow scripts are `admin` |
+| Run a command that has inline shell | A command whose template contains `` !`…` `` is refused whole (403) below `admin`, whatever the `bash` permission says. No attempt is made to judge the inline shell: what the shell would run depends on the arguments |
+| Inject shell through a command's arguments | For every caller, the operator included: inline shell is taken from the configured template only, and the arguments reach it as shell parameters (`$1`, `$ARGUMENTS`), never as part of the command line |
+| Attach or mention a file through a command's arguments | Below `admin` the arguments are text. `@file` and `@agent` mentions are resolved in the operator's template only; a mention typed as an argument, quoted or not, stays text |
+| Read a file outside the project through a prompt | Every `file:` part, whatever produced it, is checked where it is read: the path, with `..` and symlinks resolved, must be inside the project. Other schemes (`http(s):`, anything but `data:` and `file:`), bare paths and MCP resource parts are refused, so the server and the provider are never told to fetch a URL of the caller's choosing |
+| Grant itself permissions | `permission` on session create and update is refused (403); a `tools` map with any `true` (which becomes an allow rule) is refused |
+| Make a standing allow rule | `always` on a permission reply is refused unless `server.auth.bearer.reply_always` is `true` |
+| Run as a hidden or subagent-only agent | The agent a turn resolves to — named in the request, stored on the session, configured on the command, or the default — is checked before the turn is stored, for requests and for the engine's own turns alike. Naming one on a new session is refused outright |
+| Act in an operator's session, or borrow its rights for later turns | It acts only in restricted sessions; an operator's session it may read or fork (see "Whose session it is") |
+| Outlive its limits through the engine | The session it created is restricted for life, with its children and forks; goal rounds, subagent runs and resumes in it are bound as its requests were |
+| Skip the `task` permission ask, or start a subagent directly | `agent` and `subtask` parts are refused. An `@agent` in a template does not become an agent part for such a caller |
+| Prompt a subagent's session | A session with a parent is driven by its parent's turn; prompting it directly is refused |
+| Rewrite what the model reads as its history | Message deletes and part edits and deletes are `admin`. Message and part ids on a prompt are ignored (the server assigns them), so a prompt cannot name an existing message or part and replace it |
+| Answer another project's asks | A reply looks its ask up by id across loaded projects only within `server.directories` |
+| Open another project, or a subdirectory as a project | `server.directories` is matched exactly |
+| Plant config, instructions, agents, commands, skills, workflows or git hooks | Uploads below `admin` go to the upload area only, and never to a name the loaders act on (see "Files for a browser") |
+| Read or change config, credentials or MCP servers | Those routes are `admin` |
+
+Refusals are `403` with a message, except on `POST …/prompt_async`, which
+answers `204` before the engine has looked at the prompt: there the refusal
+arrives as a `session.error` event and nothing is stored or run.
+
+#### Whose session it is
+
+A caller below `admin` acts only in restricted sessions — the ones such a
+caller created, their subagent sessions and their forks. In a session the
+operator created it may **read** (messages, todo, diff, goal, children) and
+**fork**; every other request to it is refused with 403: prompts, commands
+(`/goal` and its `pause` / `resume` / `clear` included), `init`, `summarize`,
+`revert`, `abort`, rename, delete, and answering that session's permission
+asks and questions.
+
+The reason is the turns that follow. Anything started in a session can
+schedule work the engine runs later — the next goal round, a continuation, a
+subagent's result — and that work runs with the session's rights. In an
+operator's session those are the operator's. So the rule is not "track who
+caused each scheduled turn" but "a restricted caller cannot cause one there
+at all": the effective restriction of any engine turn is then the stricter
+of the session's and its causer's by construction, because the two are
+never different. The engine enforces it where turns are made
+(`Caller::may_act_on`, checked in `create_user_message` and at the top of
+`command`, before `/goal` arms anything); the routes refuse the request
+early.
+
+- **Forks** are the bridge: a fork made by a restricted caller is restricted
+  whatever its source was (`restricted = source restricted || caller
+  restricted`); the source is untouched.
+- **The other direction** is allowed and bounded: the operator may prompt a
+  restricted session, and is held to that session's restriction while doing
+  so. Its prompt does not lift anything; rounds that follow stay restricted.
+- **A goal** records who set it (`GoalState.startedBy`). Pausing, resuming
+  or clearing it is acting in the session, under the same rule; a resumed
+  goal's rounds are bound by the session, which cannot have become less
+  restricted in between.
+- **Reads across sessions.** A `chat` token can list and read every session
+  of the directories it may open, the operator's included, and receives
+  their events on `GET /event`. With one user per machine that is intended:
+  cross-session read is acceptable, cross-session privilege gain is not.
+  There is no per-token isolation between sessions today; a deployment that
+  puts several mutually untrusting users on one server needs one, and
+  should not rely on scopes for it.
+
+#### Routes with two identifiers
+
+Where a route names a session and something inside it, the inner object is
+looked up first and must belong to the outer one before anything is done
+with it; one that belongs elsewhere is answered like one that does not
+exist. This holds for every caller.
+
+| Route | Inner id | Checked against |
+| --- | --- | --- |
+| `POST /session/{id}/permissions/{permissionID}` | the pending ask | the ask's own session must be `{id}` (404); below `admin` that session must be restricted |
+| `POST /permission/{id}/reply` | the pending ask | below `admin`: the ask's own session must be restricted and in an allowed project |
+| `POST /question/{id}/reply`, `/reject` | the pending question | the same |
+| `GET`, `DELETE /session/{id}/message/{messageID}` | the message | its session must be `{id}` (404) |
+| `PATCH`, `DELETE /session/{id}/message/{messageID}/part/{partID}` | the message and the part | the message's session must be `{id}`, and the part must be that message's (404) |
+| `POST /session/{id}/revert` | `messageID`, `partID` | the same |
+| `POST /session/{id}/fork` | `messageID` | only messages of `{id}` are copied; a foreign id copies nothing of the other session |
+| v2 `/api/session/{id}/permission/{requestID}/…`, `/question/{requestID}/…` | the pending request | the request's session must be `{id}` (`owned_request`, `owned_question`) |
+| `GET /file/raw`, `/file/content` with `?ticket=` | the ticket | the ticket's directory and resolved file must be the request's. A ticket is a bearer capability for that one file: it is not bound to a session or to who asked for it, by design (an `<img>` sends nothing else) |
+| `/pty/{ptyID}/…` | the terminal | terminals are kept per project directory; an id from another directory is not found. `admin` only |
+| `/workflow/run/{runID}/…` | the run | runs are kept per project instance; an id from another directory is not found |
+
+One shared step does the lookup-then-authorise for answers
+(`confine::authorise_answer`) and one for messages and parts
+(`require_owned`). Trigger and memory routes from other branches need the
+same: fetch by the inner id, compare its directory or session with the
+outer scope, then act.
+
+#### Every field a `chat` token can send
+
+| Request | Field | What the engine derives from it | Where it is judged |
+| --- | --- | --- | --- |
+| any | `?directory=`, `x-opencode-directory` | the project instance | auth layer and location layer: must equal a `server.directories` entry |
+| any | `?workspace=` | a workspace | refused (auth layer) |
+| any `/session/{id}/…` | the session id | the project (the session's own directory) | location layer, same allowlist |
+| any `/session/{id}/…` except `GET` and `fork` | the session id | whose rights later engine turns run with | location layer (403 early) and core (`Caller::may_act_on`): the session must be restricted |
+| `POST /session` | `title`, `metadata` | stored text | not restricted |
+| | `parentID` | a child session | allowed; the child cannot then be prompted by this token |
+| | `agent`, `model` | stored on the session | route: a hidden or subagent-only agent is refused; core: whatever agent a later turn resolves to is judged when it runs |
+| | (the request itself) | the session's restriction | core: a session created below `admin` is restricted for life, with its children and forks |
+| | `permission` | the session's ruleset | refused (route) |
+| | `workspaceID` | a workspace | refused (route) |
+| `PATCH /session/{id}` | `title`, `metadata`, `time.archived` | stored | not restricted |
+| | `permission` | the session's ruleset | refused (route) |
+| `POST …/message`, `…/prompt_async` | `parts[].text`, `system` | text for the model | not restricted: this is the conversation |
+| | `parts[]` of type `file` | a file read, or inline data | core, at the read: `data:` or a `file:` inside the project |
+| | `parts[]` of type `agent`, `subtask` | a turn that skips the `task` ask; a subagent run | refused (core) |
+| | `parts[].id`, `messageID` | which stored row is written | ignored (core): ids are assigned |
+| | `agent` | the agent of the turn | core, on the resolved agent |
+| | `model`, `variant` | the model of the turn | any configured model; not restricted |
+| | `tools` | session permission rules | core: `false` only |
+| | `format`, `noReply`, `synthetic`, `ignored`, `metadata`, `time` | output shape and bookkeeping | not restricted |
+| `POST …/command` | `command` | which template runs | core: refused when the template has inline shell |
+| | `arguments` | text substituted into the template | core: text only, never scanned |
+| | `agent`, and the command's configured `agent` | the agent of the turn | core, on the resolved agent |
+| | `parts[]` (files) | file reads | core, at the read |
+| | `model`, `variant`, `messageID` | as for a prompt | as for a prompt |
+| `POST …/init`, `…/summarize` | `providerID`, `modelID`, `messageID`, `auto` | a model turn | as for a prompt |
+| `POST …/fork` | `messageID` | a new session copied up to that point | the fork is restricted (core, `fork_as`) |
+| `POST …/revert` | `messageID`, `partID` | a point in the session's own history | restricted sessions only; must belong to the session |
+| `POST /permission/{id}/reply`, `…/permissions/{id}` | `reply` / `response` | the answer to an ask | route: `always` refused; the ask must belong to a restricted session in an allowed project |
+| | `message` | feedback text for the model | not restricted |
+| `POST /question/{id}/reply`, `/reject` | `answers` | the answer | the question must belong to a restricted session in an allowed project |
+| `GET /file`, `/file/content`, `/file/raw`, `POST /file/ticket` | `path` | a file or directory read | route: inside the project, resolved |
+| `PUT /file/content` | `path` | a file write | route: inside the upload area, not a loader name |
+| `GET /find*`, `/vcs*` | `query`, `pattern`, `mode`, … | a search or diff of the project | no caller-chosen path |
+
+The checks in routes are of two kinds. Those on requests that never become
+a prompt (`permission` and `workspaceID` on session create and update,
+`always` on a reply, file paths) each judge the very value the handler then
+uses. The agent check on session create is early validation only; the
+engine's check on the agent a turn runs as is the one that counts.
+
+#### Turns the engine starts by itself
+
+No request is being made when these run, so there is no caller to check.
+Each is bound by the session it runs in (`Caller::Session`): restricted if
+the session is.
+
+| Turn source | Where its restriction comes from |
+| --- | --- |
+| `/goal` rounds after the first, and the goal reviewer's verdicts | the session. A caller below `admin` can only set, pause, resume or clear a goal in a restricted session, so the session's restriction is never weaker than the goal starter's. `GoalState.startedBy` records who set it. The round cap and stall limit are unchanged |
+| A subagent run by the task tool | the child session, which inherits from its parent when it is created. Its agent is the one the model chose under the parent's `task` permission, so the "an agent a client could pick" rule does not apply to it; everything else does |
+| A subagent's result delivered into its parent | the parent session |
+| A command's configured subtask | the session; below `admin` a command configured to run as a subagent is refused |
+| Workflow agents started by the `workflow` tool | child sessions of the session that called the tool: inherited. (Starting a workflow over HTTP is `admin`.) |
+| A fork's notice to the model | the fork, which inherits from its source |
+| Compaction, titles and summaries | side calls to the model, not turns: no agent of anyone's choosing, no tools, no files |
+| Restart resume, triggers (other branches) | must pass `Caller::Session`, and create any session with `CreateInput::restricted` set from whoever the turn is for (a trigger made by a caller below `admin` runs in a restricted session, or is refused on an unrestricted one with `Caller::may_act_on`). A session created with a `parent_id` inherits without being asked |
+
+`Caller` has no default value: every place that builds a prompt has to say
+which of the three it is, or it does not compile.
+
+#### What stays with the operator
+
+- The `permission` config is the whole of what a token holder can make the
+  agent do. A server whose config allows `bash` to every agent gives every
+  `chat` token holder shell in the project, through the model. For an
+  unattended agent that is usually the point; when it is not, set `bash`
+  (and `edit`, `webfetch`, …) to `ask` or `deny` and decide who holds tokens
+  that can answer.
+- **`edit` / `write` permission on the project includes the project's own
+  config and instructions.** The model can write `opencode.json`,
+  `.opencode/` (agents, commands with inline shell), `AGENTS.md`,
+  `.claude/` skills and workflows or `.git/hooks` with its ordinary tools
+  whenever the policy lets it edit files there, and the next instance of that
+  project loads them. The upload route refuses these names to tokens below
+  `admin`; the agent's tools are governed by the `permission` config, which
+  is the operator's to write. To keep project files from carrying policy at
+  all:
+  - put the policy in the managed config directory (`/etc/opencode`), which
+    is merged last and wins over anything in the project, and which the
+    agent's user should not be able to write;
+  - or set `OPENCODE_DISABLE_PROJECT_CONFIG=1`, so project `opencode.json`
+    files and `.opencode/` directories are not loaded at all;
+  - and deny `edit` on those paths in the `permission` config.
+- The host config (`server.*`, `shell_env`, `hook.*`) is never read from the
+  project, whatever the agent writes there.
+
+### What a token narrower than `admin` is confined to
+
+- **Directories.** The directory a request resolves to must be exactly one
+  of `server.directories`, however it is named: `?directory=`, the
+  `x-opencode-directory` header, the directory of the session in the path,
+  or the server's working directory when nothing is named. Symlinks and
+  `..` are resolved first. A directory *below* a listed one is not allowed:
+  opened as a project of its own it would load config from inside the
+  project. Selecting a workspace is refused.
+- **Files.** Reads and listings stay inside the project; uploads go to the
+  upload area (see "Files for a browser").
+
+Basic auth, `admin` tokens and a server with no authentication are not
+confined.
+
+## When nobody answers: `permission.unattended`, `question.unattended` (host)
+
+A permission ask and a question both wait for a person. With no client
+connected, a turn that asks waits forever. These settings bound the wait.
+They are read from the host config only: a project file cannot turn asks
+into allows.
+
+```jsonc
+{
+  "permission": {
+    "bash": "ask",
+    "unattended": {
+      "timeout": "5m",        // how long an ask waits for a person
+      "on_timeout": "deny"    // "wait" (default), "deny" or "allow"
+    }
+  },
+  "question": {
+    "unattended": {
+      "timeout": "5m",
+      "on_timeout": "reject"  // "wait" (default) or "reject"
+    }
+  }
+}
+```
+
+`timeout` is required unless `on_timeout` is `wait`. `wait` is today's
+behaviour and the default. (`permission.unattended` is this policy only when
+it is an object with `timeout` or `on_timeout`; an action such as
+`"unattended": "allow"` is still a rule for a permission of that name.)
+
+- **`deny`** resolves the ask exactly as a person's *reject with a message*
+  does: the tool call fails with "No one was available to answer this
+  permission request within 5m, so it was denied automatically…", the model
+  reads that and the turn continues. (A bare reject would stop the turn and
+  leave the session waiting for the person who is not there.)
+- **`allow`** resolves it as `once`: this call goes through, and nothing is
+  approved for next time.
+- A question that times out fails its tool call with "The user is not
+  available: nobody answered within 5m. Do not ask again. Proceed on your
+  best judgment where that is safe, and stop where the answer is needed."
+  The turn continues.
+
+Each ask has its own deadline. A timeout resolves that one ask; it does not
+sweep the session's other pending asks along the way a person's reject does.
+An answer that arrives in time wins as usual.
+
+The usual events are published, with one added property so a client can tell
+nobody answered: `permission.replied` carries `"automatic": true` (with
+`reply: "reject"` or `"once"`), and `question.rejected` carries
+`"automatic": true`. A person's reply is unchanged, byte for byte.
+
+### `GET /attention`
+
+Everything that is waiting for a person, across every loaded project —
+state, not events, so it is there for a client that was not connected when
+the ask was made. Scope `chat`; a token below `admin` sees the projects it
+may open.
+
+```jsonc
+{
+  "count": 1,
+  "items": [{
+    "kind": "permission",              // or "question"
+    "id": "per_…",                     // what POST /permission/{id}/reply names
+    "sessionID": "ses_…",
+    "title": "Deploy the site",        // the session's title
+    "directory": "/home/agent/workspace",
+    "summary": "bash: git push",       // the command or first pattern; a question's text
+    "asked": 1794408349584,            // ms since the epoch
+    "age": 5321,                       // ms
+    "expires": 1794408649584           // when the unattended policy answers; null if it waits
+  }]
+}
+```
+
+Oldest first. An item leaves the list when it is answered, times out, or
+its turn is aborted.
+
+## Telling a control plane: `hook.webhook` (host)
+
+`permission.asked`, `question.asked` and `session.idle` are bus events: they
+reach whoever is connected at that moment. A control plane that must learn
+an agent is waiting, with no client attached and across restarts on either
+side, needs them delivered. Selected events are written to a durable outbox
+and delivered until the receiver accepts them.
+
+```jsonc
+{
+  "hook": {
+    "webhook": [
+      {
+        "name": "control-plane",              // optional; defaults to the url
+        "url": "https://api.example/agents/42/events",
+        // Event types, by name or * / ? pattern.
+        "events": ["permission.asked", "question.asked", "session.idle", "session.error", "trigger.*"],
+        // Exactly one of:
+        "secret": "{env:ALFORRIA_WEBHOOK_SECRET}",   // HMAC-SHA256
+        "signing_key": "<base64 or hex of a 32-byte Ed25519 seed>"
+      }
+    ],
+    "outbox": {                 // all optional; defaults shown
+      "retry_initial": "5s",    // first retry delay, doubling…
+      "retry_max": "5m",        // …up to this
+      "max_age": "72h",         // an undelivered event is abandoned after this
+      "retention": "24h",       // delivered and abandoned rows are kept this long
+      "timeout": "10s",         // per attempt
+      "max_pending": 10000      // undelivered rows kept; the oldest are dropped beyond it
+    }
+  }
+}
+```
+
+Any event type on the bus can be selected; the names are matched as
+strings, so events other subsystems publish (`trigger.fired`,
+`trigger.completed`) need no change here. A hook without `secret` or
+`signing_key` is a config error: deliveries are always signed.
+
+**The request.** `POST <url>`, `Content-Type: application/json`, with:
+
+| Header | |
+| --- | --- |
+| `X-Alforria-Delivery` | the delivery id (`whd_…`): the same on every attempt of this delivery. Deduplicate on it |
+| `X-Alforria-Event` | the event type |
+| `X-Alforria-Timestamp` | when this attempt was signed, unix seconds |
+| `X-Alforria-Attempt` | 1, 2, … |
+| `X-Alforria-Signature` | `t=<timestamp>,v1=<hex>` — HMAC-SHA256 of `"<timestamp>.<body>"` with `secret`; or `t=<timestamp>,ed25519=<base64>` — an Ed25519 signature of the same bytes with `signing_key` |
+
+Verify the signature over the raw body, and reject a timestamp too far from
+now to stop replays. With `signing_key` the receiver holds only the public
+key and can forge nothing.
+
+**The body** is small and the same on every attempt:
+
+```jsonc
+{
+  "id": "whd_01JC…",                       // the delivery id again
+  "type": "permission.asked",
+  "event": "evt_…",                        // the bus event's id
+  "time": 1794408349584,                   // when it was recorded, ms
+  "directory": "/home/agent/workspace",
+  "sessionID": "ses_…",                    // when the event has one
+  "title": "Nightly deploy",               // that session's title
+  "kind": "permission",                    // "permission" | "question" | null
+  "properties": { "id": "per_…", "sessionID": "ses_…", "permission": "bash" }
+}
+```
+
+`properties` holds only identifiers (`id`, `…ID`), short labels
+(`permission`, `kind`, `name`, `status`, `reason`, `trigger`), numbers and
+booleans from the event, and for `session.error` the error's name. Message
+text, tool input and output, patterns and metadata never leave the machine.
+To act on a `permission.asked`, call `GET /attention` or `GET /permission`
+with a token.
+
+**Delivery.** A 2xx is success. Anything else — another status, a timeout,
+a refused connection — is retried after `retry_initial`, doubling up to
+`retry_max`, until it succeeds or the event is `max_age` old. Redirects are
+not followed. Deliveries are attempted in the order they were recorded but
+are not ordered across retries; use `time`. Delivery is at least once: a
+receiver that accepted a request whose response was lost sees it again,
+with the same delivery id.
+
+The outbox is a table in the server's database (`outbox`), so it survives a
+restart: a server that stops while a delivery is backing off resumes it when
+it starts again. Each hook owns its deliveries by `name`; removing or
+renaming a hook abandons what it was still owed.
+
+## Files for a browser: tickets, raw reads, uploads
+
+The frozen file routes return JSON and need an `Authorization` header. A
+browser showing a workspace image in an `<img>`, or offering a download
+link, can send neither a header nor parse JSON; and nothing could put a file
+*into* the workspace. Three routes outside the frozen tables cover that,
+plus one addition to a frozen route. All take `?directory=` (or the
+`x-opencode-directory` header) like the rest of the v1 surface, and need the
+`chat` scope.
+
+Every `path` is relative to the project directory (an absolute path is
+accepted when it is inside). `..` and existing symlinks are resolved first,
+and the result must be inside the project directory or its git worktree —
+the boundary the tools draw with `external_directory`. A tool can ask the
+user to cross it; an HTTP request cannot, so it gets `403`, whoever sends
+it.
+
+### `POST /file/ticket`
+
+```jsonc
+// request
+{ "path": "out/chart.png", "ttl": 60 }   // ttl in seconds: default 60, at most 600
+// 200
+{
+  "ticket": "5b0c1f0e-…",
+  "expires_in": 60,
+  "path": "out/chart.png",
+  "url": "/file/raw?path=out/chart.png&directory=%2Fhome%2Fagent%2Fworkspace&ticket=5b0c1f0e-…"
+}
+```
+
+The ticket reads that one existing file of that one project, and nothing
+else: another path, another directory, another route or a write with it gets
+`401`. It is not consumed by use (a browser fetches an embedded image more
+than once); it stops working when it expires. `404` when the file does not
+exist, `400` when it is a directory.
+
+### `GET /file/raw?path=…[&ticket=…][&download=1]`
+
+The file's bytes, with its media type, `Content-Length`, single-range
+`Range` support (`206`, `416`), and `Content-Disposition: inline` (or
+`attachment` with `download=1`). Authenticated by a ticket in the URL or by
+the usual header.
+
+The response is `nosniff`, `Cache-Control: private, no-store`, and carries
+`Content-Security-Policy: sandbox`: an HTML or SVG file the agent wrote is
+shown as an inert document, not run as a page of the server's origin.
+
+The frozen `GET /file/content?path=…` (JSON) accepts `&ticket=…` the same
+way.
+
+### `PUT /file/content?path=…[&overwrite=false]`
+
+The request body is the file, byte for byte (no multipart, no JSON
+envelope). Missing directories are created. The body is streamed to a
+temporary file beside the target and renamed over it, so a failed or
+oversized upload leaves the old file as it was.
+
+```jsonc
+// 201 when created, 200 when replaced
+{ "path": "inbox/report.pdf", "absolute": "/home/agent/workspace/inbox/report.pdf", "size": 48213, "created": true }
+```
+
+- `413` when the body exceeds `server.upload.max_bytes` (host config,
+  default 32 MiB = 33554432), declared or not.
+- `409` with `overwrite=false` when the file exists.
+- `400` when the path is a directory; `403` when it leaves the project.
+
+Below `admin`, an upload is further limited, because it is a write nobody
+asked the model for:
+
+- it must land inside an upload directory: `server.upload.directories`,
+  relative to the project, default `["uploads"]`. Everything else in the
+  project needs `admin`. This is an allowlist on purpose: "anywhere except
+  the files that matter" is a list that falls behind. `["."]` opens the
+  whole project to uploads, for deployments that want it;
+- in either mode, no component of the path may be a name the loaders act
+  on, in any case and at any depth, existing or to be created:
+  `opencode.json`, `opencode.jsonc`, `config.json`, `AGENTS.md`,
+  `CLAUDE.md`, `CONTEXT.md`, `.opencode/`, `.claude/`, `.agents/`, `.git/`,
+  `.alforria/`. The list is `alforria_core::project_files`, the constants
+  the loaders themselves discover by, so a discovery location added there
+  is closed to uploads at the same time;
+- both rules apply to the resolved path, so a symlink inside the upload
+  area does not lead out of it or into a loader directory.
+
+A `file.edited` event is published for the written file.
+
+```jsonc
+{ "server": { "upload": { "max_bytes": 33554432, "directories": ["uploads"] } } }
+```

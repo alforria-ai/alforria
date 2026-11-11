@@ -210,6 +210,16 @@ pub struct ServerInfo {
     pub mdns_domain: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cors: Option<Vec<String>>,
+    // --- alforria extensions (`config::host`), read from the host config ---
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shutdown: Option<super::host::ShutdownInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<super::host::ServerAuthInfo>,
+    /// The project directories a token without the `admin` scope may open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directories: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upload: Option<super::host::UploadInfo>,
 }
 
 // ---------------------------------------------------------------------------
@@ -356,11 +366,24 @@ const PERMISSION_ACTION_KEYS: &[&str] = &[
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct PermissionInfo {
     pub rules: BTreeMap<String, PermissionRule>,
+    /// alforria extension: the `unattended` key, when it holds a policy
+    /// object rather than a rule (`config::host`). Not a rule, and only
+    /// acted on from the host config.
+    pub unattended: Option<super::host::PermissionUnattendedInfo>,
 }
 
 impl Serialize for PermissionInfo {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.rules.serialize(serializer)
+        let Some(unattended) = &self.unattended else {
+            return self.rules.serialize(serializer);
+        };
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.rules.len() + 1))?;
+        for (key, rule) in &self.rules {
+            map.serialize_entry(key, rule)?;
+        }
+        map.serialize_entry("unattended", unattended)?;
+        map.end()
     }
 }
 
@@ -381,7 +404,10 @@ impl<'de> Deserialize<'de> for PermissionInfo {
                 .map_err(serde::de::Error::custom)?;
                 let mut rules = BTreeMap::new();
                 rules.insert("*".to_owned(), rule);
-                Ok(PermissionInfo { rules })
+                Ok(PermissionInfo {
+                    rules,
+                    unattended: None,
+                })
             }
 
             fn visit_map<A: serde::de::MapAccess<'de>>(
@@ -389,8 +415,22 @@ impl<'de> Deserialize<'de> for PermissionInfo {
                 mut map: A,
             ) -> Result<Self::Value, A::Error> {
                 let mut rules = BTreeMap::new();
+                let mut unattended = None;
                 while let Some(key) = map.next_key::<String>()? {
                     let value = map.next_value::<serde_json::Value>()?;
+                    // `unattended` with a policy object is the unattended
+                    // policy; with an action or a pattern record it is a
+                    // rule for a permission of that name, as upstream
+                    // would read it.
+                    if key == "unattended"
+                        && value.as_object().is_some_and(|object| {
+                            object.contains_key("timeout") || object.contains_key("on_timeout")
+                        })
+                    {
+                        unattended =
+                            Some(serde_json::from_value(value).map_err(serde::de::Error::custom)?);
+                        continue;
+                    }
                     let rule: PermissionRule = if PERMISSION_ACTION_KEYS.contains(&key.as_str()) {
                         // Typed as a bare `Action` — a record is invalid here.
                         let action: PermissionAction =
@@ -406,7 +446,7 @@ impl<'de> Deserialize<'de> for PermissionInfo {
                     };
                     rules.insert(key, rule);
                 }
-                Ok(PermissionInfo { rules })
+                Ok(PermissionInfo { rules, unattended })
             }
         }
         deserializer.deserialize_any(V)
@@ -1277,6 +1317,13 @@ pub struct Config {
     pub compaction: Option<CompactionInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub experimental: Option<ExperimentalInfo>,
+    // --- alforria extensions (`config::host`), read from the host config ---
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell_env: Option<super::host::ShellEnvInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question: Option<super::host::QuestionInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook: Option<super::host::HookInfo>,
 }
 
 /// Decode + validate a raw config value against the full wire schema.
@@ -1377,6 +1424,9 @@ fn collect_issues(value: &serde_json::Value) -> Vec<crate::SchemaIssue> {
             "tool_output" => check!(issues, key, ToolOutputInfo),
             "compaction" => check!(issues, key, CompactionInfo),
             "experimental" => check!(issues, key, ExperimentalInfo),
+            "shell_env" => check!(issues, key, super::host::ShellEnvInfo),
+            "question" => check!(issues, key, super::host::QuestionInfo),
+            "hook" => check!(issues, key, super::host::HookInfo),
             _ => {}
         }
     }

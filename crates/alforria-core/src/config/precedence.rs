@@ -284,7 +284,7 @@ impl ConfigLoader {
         // 5. Project files, deepest last.
         if !params.flags.disable_project_config {
             let files = up(
-                &["opencode.jsonc", "opencode.json"],
+                crate::project_files::PROJECT_CONFIG_FILES,
                 &params.directory,
                 params.worktree.as_deref(),
             );
@@ -304,7 +304,7 @@ impl ConfigLoader {
         // 6. .opencode directory sources.
         for dir in &directories {
             let dir_str = dir.to_string_lossy();
-            let is_opencode_dir = dir_str.ends_with(".opencode")
+            let is_opencode_dir = dir_str.ends_with(crate::project_files::CONFIG_DIR)
                 || flags_value(&params.flags.config_dir).is_some_and(|d| d == dir_str);
             if is_opencode_dir {
                 for name in ["opencode.json", "opencode.jsonc"] {
@@ -486,6 +486,19 @@ impl ConfigLoader {
         Ok((config, directories))
     }
 
+    /// Fail when a global config file does not load. [`ConfigLoader::load`]
+    /// degrades that to an empty config; the host config
+    /// (`config::host::load_host_config`) must not.
+    pub fn check_global(&self, params: &LoadParams) -> Result<(), CoreError> {
+        let auth_env: HashMap<String, String> = params
+            .auth
+            .all()
+            .iter()
+            .map(|p| (p.key.clone(), p.token.clone()))
+            .collect();
+        self.load_global(params, &auth_env).map(|_| ())
+    }
+
     /// The global config dir: seed + merge `config.json`, `opencode.json`,
     /// `opencode.jsonc` (`config.ts:260-293`). Any failure propagates to the
     /// caller, which degrades the whole thing to `{}`.
@@ -512,7 +525,7 @@ impl ConfigLoader {
         }
 
         let mut result = Value::Object(Map::new());
-        for name in ["config.json", "opencode.json", "opencode.jsonc"] {
+        for name in crate::project_files::CONFIG_DIR_FILES {
             let next = self.load_file(&params.paths.config.join(name), env)?;
             merge_config_concat_arrays(&mut result, &next);
         }
@@ -537,13 +550,13 @@ impl ConfigLoader {
         let mut list = vec![params.paths.config.clone()];
         if !params.flags.disable_project_config {
             list.extend(up(
-                &[".opencode"],
+                &[crate::project_files::CONFIG_DIR],
                 &params.directory,
                 params.worktree.as_deref(),
             ));
         }
         list.extend(up(
-            &[".opencode"],
+            &[crate::project_files::CONFIG_DIR],
             &params.paths.home,
             Some(params.paths.home.as_path()),
         ));

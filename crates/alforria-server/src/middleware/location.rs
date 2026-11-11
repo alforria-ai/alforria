@@ -218,6 +218,9 @@ enum Rejection {
     SessionNotFound { session_id: String },
     /// Instance-load failure (config errors carry their own 400 envelope).
     Load(crate::error::ServerError),
+    /// The resolved directory is outside `server.directories` for a
+    /// credential narrower than `admin` (alforria extension).
+    Forbidden(String),
 }
 
 impl From<crate::error::ServerError> for Rejection {
@@ -246,6 +249,10 @@ impl Rejection {
                 .into_response()
             }
             Rejection::Load(err) => err.into_response(),
+            Rejection::Forbidden(what) => crate::error::ApiError::Forbidden {
+                message: format!("this token may not open {what}"),
+            }
+            .into_response(),
         }
     }
 }
@@ -351,7 +358,24 @@ impl<S> LocationService<S> {
         }
     }
 
-    fn load(&self, directory: &str) -> Result<Arc<SessionServices>, Rejection> {
+    /// Load the instance for the request's resolved directory. This is
+    /// where a session-derived directory meets the directory allowlist:
+    /// a credential narrower than `admin` is refused before the instance
+    /// (its config, its project) is touched.
+    fn load(
+        &self,
+        req: &Request<Body>,
+        directory: &str,
+    ) -> Result<Arc<SessionServices>, Rejection> {
+        let restricted = req
+            .extensions()
+            .get::<crate::bearer::Principal>()
+            .is_some_and(|principal| principal.restricted());
+        if restricted && !self.ctx.policy.directories.allows(Path::new(directory)) {
+            return Err(Rejection::Forbidden(format!(
+                "{directory}: it is outside server.directories"
+            )));
+        }
         self.ctx
             .instances
             .load(Path::new(directory))
@@ -398,6 +422,34 @@ impl<S> LocationService<S> {
             }
         }
 
+        // alforria extension: a credential below `admin` acts only in
+        // restricted sessions — its own kind. It may read an operator's
+        // session and fork it (the fork is restricted); anything else there
+        // could schedule turns that run with the operator's rights. The
+        // engine refuses those turns itself; this refuses the request.
+        if let Some(session) = &session {
+            let restricted_caller = req
+                .extensions()
+                .get::<crate::bearer::Principal>()
+                .is_some_and(|principal| principal.restricted());
+            let reads = matches!(*req.method(), Method::GET | Method::HEAD);
+            let forks = uri.path().ends_with("/fork");
+            if restricted_caller
+                && !reads
+                && !forks
+                && !self
+                    .ctx
+                    .sessions
+                    .is_restricted(&session.id)
+                    .unwrap_or(false)
+            {
+                return Err(Rejection::Forbidden(format!(
+                    "session {}: it belongs to the operator, and this token can read or fork it but not act in it",
+                    session.id
+                )));
+            }
+        }
+
         // Local plan (`:181-184`): the route session's directory wins.
         let directory = session
             .filter(|session| !session.directory.is_empty())
@@ -406,7 +458,7 @@ impl<S> LocationService<S> {
         // `provideInstanceContext` decodes the resolved directory
         // (`instance-context.ts:15-21`).
         let directory = decode_best_effort(&directory);
-        let services = self.load(&directory)?;
+        let services = self.load(req, &directory)?;
         Ok(LocationContext {
             directory: crate::state::resolve_directory(Path::new(&directory)),
             workspace_id: env_workspace_id.or(workspace_id),
@@ -451,7 +503,7 @@ impl<S> LocationService<S> {
                 None => crate::state::cwd().display().to_string(),
             },
         };
-        let services = self.load(&directory)?;
+        let services = self.load(req, &directory)?;
         Ok(LocationContext {
             directory: crate::state::resolve_directory(Path::new(&directory)),
             workspace_id,
@@ -481,7 +533,7 @@ impl<S> LocationService<S> {
         };
         let directory = info.directory.clone();
         let workspace_id = info.workspace_id.clone();
-        let services = self.load(&directory)?;
+        let services = self.load(req, &directory)?;
         Ok(LocationContext {
             directory: crate::state::resolve_directory(Path::new(&directory)),
             workspace_id,
@@ -491,6 +543,15 @@ impl<S> LocationService<S> {
 }
 
 /// `defaultDirectory` (`workspace-routing.ts:86-88`).
+/// The directory a request names, resolved the way the v1 location
+/// resolves it when no session routes the request: `?directory=`, else the
+/// `x-opencode-directory` header, else the working directory. alforria's own
+/// routes outside the frozen tables resolve their project through this.
+pub(crate) fn request_directory(query: Option<&str>, headers: &HeaderMap) -> PathBuf {
+    let directory = decode_best_effort(&default_directory(query, headers));
+    crate::state::resolve_directory(Path::new(&directory))
+}
+
 fn default_directory(query: Option<&str>, headers: &HeaderMap) -> String {
     non_empty(query_param(query, "directory"))
         .or_else(|| header_value(headers, "x-opencode-directory"))

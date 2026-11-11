@@ -134,7 +134,7 @@ fn open_browser(url: &str) {
 }
 
 pub fn run(matches: &ArgMatches, ui: &mut Ui, raw: &[OsString]) -> Result<(), TypedError> {
-    if !serve::password_set() {
+    if !serve::password_set() && !serve::bearer_configured() {
         ui.println(&warning_line());
     }
     let args = NetworkOptions::from_matches(matches);
@@ -159,8 +159,8 @@ pub fn run(matches: &ArgMatches, ui: &mut Ui, raw: &[OsString]) -> Result<(), Ty
         ui.println(&line);
     }
     open_browser(&url);
-    // web.ts:78 `Effect.never` — run until interrupted.
-    runtime.block_on(tokio::signal::ctrl_c()).ok();
+    // web.ts:78 `Effect.never` — run until told to stop.
+    super::serve::run_until_stopped(runtime, listener);
     Ok(())
 }
 
