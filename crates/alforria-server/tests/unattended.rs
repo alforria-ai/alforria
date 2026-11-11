@@ -360,15 +360,18 @@ async fn attention_reports_the_deadline_and_clears_on_timeout() {
     wait_for_attention(&f, None, 0).await;
 }
 
-/// A token below `admin` sees what waits in the projects it may open, and
-/// only those; the route needs a credential at all.
+/// A token below `admin` sees the asks it could answer and only those: in
+/// the projects it may open, in the sessions it may act in. An operator's
+/// session waiting in the same project is not its to see, nor is anything
+/// in another directory. An admin sees all of it. The route needs a
+/// credential at all.
 #[tokio::test]
-async fn attention_is_scoped_to_the_callers_projects() {
+async fn attention_is_scoped_to_what_the_caller_may_answer() {
     let signer = Signer::new();
     let f = fixture_with(
         config(Some(&signer), None, None),
         Some("hunter2"),
-        vec![bash("echo one"), bash("echo two")],
+        vec![bash("echo one"), bash("echo two"), bash("echo three")],
     );
     use base64::Engine;
     let basic = format!(
@@ -376,22 +379,85 @@ async fn attention_is_scoped_to_the_callers_projects() {
         base64::engine::general_purpose::STANDARD.encode("alforria:hunter2")
     );
     let chat = bearer(&signer.token(AUDIENCE, "chat"));
+    let connector = bearer(&signer.token(AUDIENCE, "connector"));
+    let admin = bearer(&signer.token(AUDIENCE, "admin"));
 
     let anonymous = call(&f.router, "GET", "/attention", None, None).await;
     assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
 
-    let here = create_session(&f, &f.dirs.repo, Some(&basic)).await;
-    prompt_async(&f, &here, Some(&basic)).await;
+    // The token's own session, in the directory it is confined to.
+    let mine = create_session(&f, &f.dirs.repo, Some(&chat)).await;
+    prompt_async(&f, &mine, Some(&chat)).await;
     wait_for_attention(&f, Some(&basic), 1).await;
+    // The operator's session in that same directory.
+    let operators = create_session(&f, &f.dirs.repo, Some(&basic)).await;
+    prompt_async(&f, &operators, Some(&basic)).await;
+    wait_for_attention(&f, Some(&basic), 2).await;
+    // And one in a directory outside the allowlist.
     let elsewhere = create_session(&f, &f.dirs.other, Some(&basic)).await;
     prompt_async(&f, &elsewhere, Some(&basic)).await;
-    let all = wait_for_attention(&f, Some(&basic), 2).await;
-    assert_eq!(all["items"][0]["sessionID"], json!(here), "oldest first");
-    assert_eq!(all["items"][1]["sessionID"], json!(elsewhere));
 
-    let mine = attention(&f, Some(&chat)).await;
-    assert_eq!(mine["count"], 1);
-    assert_eq!(mine["items"][0]["sessionID"], json!(here));
+    for operator in [&basic, &admin] {
+        let all = wait_for_attention(&f, Some(operator), 3).await;
+        let sessions: Vec<&Value> = all["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| &item["sessionID"])
+            .collect();
+        assert_eq!(
+            sessions,
+            [&json!(mine), &json!(operators), &json!(elsewhere)],
+            "oldest first"
+        );
+    }
+    for token in [&chat, &connector] {
+        let seen = attention(&f, Some(token)).await;
+        assert_eq!(seen["count"], 1, "{seen}");
+        assert_eq!(seen["items"][0]["sessionID"], json!(mine));
+        assert_eq!(
+            seen["items"][0]["directory"],
+            json!(f.dirs.repo.display().to_string())
+        );
+    }
+}
+
+/// The outbox counters are the whole server's, across every directory: the
+/// operator reads them (Basic or an `admin` token), a `chat` or `connector`
+/// token gets `/attention` without them.
+#[tokio::test]
+async fn the_outbox_counters_are_shown_to_the_operator_only() {
+    let signer = Signer::new();
+    let f = fixture_with(
+        |dirs| {
+            let mut value = config(Some(&signer), None, None)(dirs);
+            // Nothing listens there, and nothing is sent: the delivery loop
+            // is not started.
+            value["hook"] = json!({
+                "webhook": [{
+                    "url": "http://127.0.0.1:9/hook", "secret": "s", "events": ["session.idle"]
+                }]
+            });
+            value
+        },
+        Some("hunter2"),
+        Vec::new(),
+    );
+    use base64::Engine;
+    let basic = format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode("alforria:hunter2")
+    );
+    assert!(f.ctx.outbox.enabled());
+    let counters = json!({ "pending": 0, "failed": 0, "dropped": 0 });
+    for operator in [basic, bearer(&signer.token(AUDIENCE, "admin"))] {
+        let body = attention(&f, Some(&operator)).await;
+        assert_eq!(body["outbox"], counters, "{body}");
+    }
+    for scope in ["chat", "connector"] {
+        let body = attention(&f, Some(&bearer(&signer.token(AUDIENCE, scope)))).await;
+        assert_eq!(body, json!({ "count": 0, "items": [] }), "{scope}");
+    }
 }
 
 /// The policy is the host's: a project file cannot turn asks into allows.

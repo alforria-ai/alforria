@@ -22,14 +22,21 @@
 //! }
 //! ```
 //!
-//! Oldest first. A credential below `admin` sees the projects it may open
-//! (`server.directories`). Outside the frozen v1/v2 tables.
+//! Oldest first. A credential below `admin` sees what it could answer and
+//! nothing else: asks in the projects it may open (`server.directories`)
+//! and, there, in the sessions it may act in (restricted ones — the same
+//! line `confine::check_ask_session` draws for a reply). An operator's
+//! session waiting in the same project is the operator's. Outside the
+//! frozen v1/v2 tables.
 //!
-//! On a server with `hook.webhook` configured there is one more member,
+//! For the operator (no authentication, Basic, or an `admin` token) on a
+//! server with `hook.webhook` configured there is one more member,
 //! `"outbox": { "pending": 0, "failed": 0, "dropped": 0 }`: deliveries still
 //! owed, deliveries given up that `hook.outbox.retention` still keeps, and
 //! undelivered events this process dropped beyond `hook.outbox.max_pending`
-//! since it started. Without hooks the member is absent.
+//! since it started. The numbers are the whole server's, across every
+//! directory, so a credential below `admin` never gets them. Without hooks
+//! the member is absent.
 
 use std::sync::Arc;
 
@@ -83,7 +90,14 @@ async fn attention(
                 .ok()
                 .map(|session| session.title)
         };
+        // A credential below `admin` is shown the asks it may answer.
+        let visible = |session_id: &str| {
+            !restricted || ctx.sessions.is_restricted(session_id).unwrap_or(false)
+        };
         for pending in services.permission.pending() {
+            if !visible(&pending.request.session_id) {
+                continue;
+            }
             items.push((
                 pending.asked_at,
                 json!({
@@ -100,6 +114,9 @@ async fn attention(
             ));
         }
         for pending in services.question.pending_asks() {
+            if !visible(&pending.request.session_id) {
+                continue;
+            }
             let summary: String = pending
                 .request
                 .questions
@@ -127,7 +144,8 @@ async fn attention(
     let mut body = json!({ "count": items.len(), "items": items });
     // The webhook outbox in numbers, on a server that has hooks: what is
     // still owed, what was given up, and what was dropped for want of room.
-    if ctx.outbox.enabled() {
+    // They count every directory's events: the operator's to read.
+    if !restricted && ctx.outbox.enabled() {
         let stats = ctx.outbox.stats();
         body["outbox"] = json!({
             "pending": stats.pending,

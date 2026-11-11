@@ -1019,8 +1019,11 @@ cannot answer for text that came from outside.
 
 Everything that is waiting for a person, across every loaded project —
 state, not events, so it is there for a client that was not connected when
-the ask was made. Scope `chat`; a token below `admin` sees the projects it
-may open.
+the ask was made. Scope `chat`; a token below `admin` sees the asks it could
+answer and nothing else: those in the projects it may open
+(`server.directories`) and, there, in the sessions it may act in. An ask
+waiting in an operator's session is not listed for it, in whatever
+directory.
 
 ```jsonc
 {
@@ -1040,8 +1043,9 @@ may open.
 ```
 
 Oldest first. An item leaves the list when it is answered, times out, or
-its turn is aborted. On a server with `hook.webhook` configured the answer
-has one more member, `outbox`, described with the hooks below.
+its turn is aborted. On a server with `hook.webhook` configured the
+operator's answer (no authentication, Basic, or an `admin` token) has one
+more member, `outbox`, described with the hooks below.
 
 ## Telling a control plane: `hook.webhook` (host)
 
@@ -1176,7 +1180,10 @@ renaming a hook abandons what it was still owed.
 **Bounded, and it says so.** Beyond `max_pending` undelivered events the
 oldest are deleted: those deliveries are never made. Each time it happens
 the server logs a warning (at most one a minute, with the running total),
-and `GET /attention` carries the numbers on a server that has hooks:
+and `GET /attention` carries the numbers on a server that has hooks, for
+the operator (no authentication, Basic, or an `admin` token) — they count
+every directory's events, so a `chat` or `connector` token is not given
+them:
 
 ```jsonc
 { "count": 0, "items": [],
@@ -1187,7 +1194,8 @@ and `GET /attention` carries the numbers on a server that has hooks:
   } }
 ```
 
-Without `hook.webhook` the `outbox` member is absent.
+Without `hook.webhook`, or for a token below `admin`, the `outbox` member
+is absent.
 
 **Several servers on one data directory.** Every server records the
 deliveries its own events owe, in the shared table; one of them sends. The

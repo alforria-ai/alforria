@@ -154,7 +154,9 @@ pre-1.0, so minor releases may include breaking changes.
   old behaviour. An automatic answer is marked `automatic: true` on
   `permission.replied` and `question.rejected`.
 - `GET /attention` lists the permission asks and questions currently waiting
-  for a person, across projects, with their session, title and age.
+  for a person, across projects, with their session, title and age. A token
+  below `admin` is shown the ones it could answer: in the directories it may
+  open, in the sessions it may act in, and not an operator's session's.
 - `hook.webhook` (global config) delivers selected events
   (`permission.asked`, `question.asked`, `session.idle`, `session.error`, or
   any other by name or pattern) to a URL through a durable outbox: at least
@@ -167,7 +169,9 @@ pre-1.0, so minor releases may include breaking changes.
   hangs delays only its own deliveries. A 4xx other than 408, 425 and 429
   is given up at once instead of retried until `max_age`. Events deleted
   beyond `hook.outbox.max_pending` are logged and counted, and on a server
-  with hooks `GET /attention` carries `outbox: { pending, failed, dropped }`.
+  with hooks `GET /attention` carries `outbox: { pending, failed, dropped }`
+  for the operator (no authentication, Basic, or an `admin` token; never
+  for `chat` or `connector`).
   Stopping the server does not wait for a receiver. Of several servers on
   one data directory, one delivers (`<data>/lock/outbox.lock`).
 - `shell_env` (global config) controls what the agent's shells and helper
