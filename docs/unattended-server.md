@@ -24,6 +24,10 @@ Unlike the per-project config, a host config file that does not parse is an
 error: `alforria serve` and `alforria web` refuse to listen rather than run
 with a policy other than the one written down.
 
+alforria's own tables (`session_restriction`, `outbox`) are created by its
+own migrations (`crates/alforria-core/src/storage/alforria_migration.rs`),
+beside the upstream schema and journal, which stay byte-compatible.
+
 Durations are strings with a unit (`"500ms"`, `"30s"`, `"5m"`, `"2h"`,
 `"1d"`) or a bare number of milliseconds.
 
@@ -507,6 +511,95 @@ may open.
 
 Oldest first. An item leaves the list when it is answered, times out, or
 its turn is aborted.
+
+## Telling a control plane: `hook.webhook` (host)
+
+`permission.asked`, `question.asked` and `session.idle` are bus events: they
+reach whoever is connected at that moment. A control plane that must learn
+an agent is waiting, with no client attached and across restarts on either
+side, needs them delivered. Selected events are written to a durable outbox
+and delivered until the receiver accepts them.
+
+```jsonc
+{
+  "hook": {
+    "webhook": [
+      {
+        "name": "control-plane",              // optional; defaults to the url
+        "url": "https://api.example/agents/42/events",
+        // Event types, by name or * / ? pattern.
+        "events": ["permission.asked", "question.asked", "session.idle", "session.error", "trigger.*"],
+        // Exactly one of:
+        "secret": "{env:ALFORRIA_WEBHOOK_SECRET}",   // HMAC-SHA256
+        "signing_key": "<base64 or hex of a 32-byte Ed25519 seed>"
+      }
+    ],
+    "outbox": {                 // all optional; defaults shown
+      "retry_initial": "5s",    // first retry delay, doubling…
+      "retry_max": "5m",        // …up to this
+      "max_age": "72h",         // an undelivered event is abandoned after this
+      "retention": "24h",       // delivered and abandoned rows are kept this long
+      "timeout": "10s",         // per attempt
+      "max_pending": 10000      // undelivered rows kept; the oldest are dropped beyond it
+    }
+  }
+}
+```
+
+Any event type on the bus can be selected; the names are matched as
+strings, so events other subsystems publish (`trigger.fired`,
+`trigger.completed`) need no change here. A hook without `secret` or
+`signing_key` is a config error: deliveries are always signed.
+
+**The request.** `POST <url>`, `Content-Type: application/json`, with:
+
+| Header | |
+| --- | --- |
+| `X-Alforria-Delivery` | the delivery id (`whd_…`): the same on every attempt of this delivery. Deduplicate on it |
+| `X-Alforria-Event` | the event type |
+| `X-Alforria-Timestamp` | when this attempt was signed, unix seconds |
+| `X-Alforria-Attempt` | 1, 2, … |
+| `X-Alforria-Signature` | `t=<timestamp>,v1=<hex>` — HMAC-SHA256 of `"<timestamp>.<body>"` with `secret`; or `t=<timestamp>,ed25519=<base64>` — an Ed25519 signature of the same bytes with `signing_key` |
+
+Verify the signature over the raw body, and reject a timestamp too far from
+now to stop replays. With `signing_key` the receiver holds only the public
+key and can forge nothing.
+
+**The body** is small and the same on every attempt:
+
+```jsonc
+{
+  "id": "whd_01JC…",                       // the delivery id again
+  "type": "permission.asked",
+  "event": "evt_…",                        // the bus event's id
+  "time": 1794408349584,                   // when it was recorded, ms
+  "directory": "/home/agent/workspace",
+  "sessionID": "ses_…",                    // when the event has one
+  "title": "Nightly deploy",               // that session's title
+  "kind": "permission",                    // "permission" | "question" | null
+  "properties": { "id": "per_…", "sessionID": "ses_…", "permission": "bash" }
+}
+```
+
+`properties` holds only identifiers (`id`, `…ID`), short labels
+(`permission`, `kind`, `name`, `status`, `reason`, `trigger`), numbers and
+booleans from the event, and for `session.error` the error's name. Message
+text, tool input and output, patterns and metadata never leave the machine.
+To act on a `permission.asked`, call `GET /attention` or `GET /permission`
+with a token.
+
+**Delivery.** A 2xx is success. Anything else — another status, a timeout,
+a refused connection — is retried after `retry_initial`, doubling up to
+`retry_max`, until it succeeds or the event is `max_age` old. Redirects are
+not followed. Deliveries are attempted in the order they were recorded but
+are not ordered across retries; use `time`. Delivery is at least once: a
+receiver that accepted a request whose response was lost sees it again,
+with the same delivery id.
+
+The outbox is a table in the server's database (`outbox`), so it survives a
+restart: a server that stops while a delivery is backing off resumes it when
+it starts again. Each hook owns its deliveries by `name`; removing or
+renaming a hook abandons what it was still owed.
 
 ## Files for a browser: tickets, raw reads, uploads
 

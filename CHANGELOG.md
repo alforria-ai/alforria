@@ -88,6 +88,13 @@ pre-1.0, so minor releases may include breaking changes.
   `permission.replied` and `question.rejected`.
 - `GET /attention` lists the permission asks and questions currently waiting
   for a person, across projects, with their session, title and age.
+- `hook.webhook` (global config) delivers selected events
+  (`permission.asked`, `question.asked`, `session.idle`, `session.error`, or
+  any other by name or pattern) to a URL through a durable outbox: at least
+  once, with exponential backoff, a delivery id to deduplicate on, an
+  HMAC-SHA256 or Ed25519 signature over timestamp and body, and bounded
+  retention. Deliveries survive a restart. The payload carries ids, the
+  session and its title, never message content.
 - `shell_env` (global config) controls what the agent's shells inherit from
   the server's environment: `inherit` (`"all"`, `"none"` or a list), `allow`,
   `set` and `deny`.

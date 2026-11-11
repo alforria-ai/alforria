@@ -116,7 +116,7 @@ fn is_literal(name: &str) -> bool {
 /// Whether `name` matches a `*` / `?` pattern, case-sensitively. Written
 /// out rather than compiled: this runs for every variable against every
 /// pattern each time a child is spawned.
-fn glob_match(name: &str, pattern: &str) -> bool {
+pub fn glob_match(name: &str, pattern: &str) -> bool {
     let (name, pattern) = (name.as_bytes(), pattern.as_bytes());
     let (mut n, mut p) = (0, 0);
     let mut star: Option<(usize, usize)> = None;

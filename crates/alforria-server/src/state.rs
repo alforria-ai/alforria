@@ -1526,6 +1526,9 @@ pub struct ServerContext {
     pub policy: Arc<crate::policy::ServerPolicy>,
     /// Read tickets for single files (alforria extension, `ticket.rs`).
     pub file_tickets: crate::ticket::FileTickets,
+    /// Webhook deliveries (alforria extension, `outbox.rs`). Captures and
+    /// delivers nothing unless `hook.webhook` is configured.
+    pub outbox: Arc<crate::outbox::Outbox>,
 }
 
 impl ServerContext {
@@ -1570,6 +1573,8 @@ impl ServerContext {
             Arc::new(NoBackgroundJobs),
             Arc::new(alforria_core::catalog::SystemClock),
         );
+        let outbox = crate::outbox::Outbox::new(storage.clone(), None)
+            .expect("an outbox without hooks cannot fail");
         ServerContext {
             auth,
             instances,
@@ -1611,6 +1616,7 @@ impl ServerContext {
             projects,
             policy: Arc::new(crate::policy::ServerPolicy::default()),
             file_tickets: crate::ticket::FileTickets::default(),
+            outbox,
         }
     }
 

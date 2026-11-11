@@ -16,15 +16,21 @@ use rusqlite::Connection;
 use crate::CoreError;
 
 /// `(id, sql)`, in the order they are applied.
-pub const MIGRATIONS: &[(&str, &str)] = &[(
-    "0001_session_restriction",
-    include_str!("alforria_migrations/0001_session_restriction.sql"),
-)];
+pub const MIGRATIONS: &[(&str, &str)] = &[
+    (
+        "0001_session_restriction",
+        include_str!("alforria_migrations/0001_session_restriction.sql"),
+    ),
+    (
+        "0002_outbox_create",
+        include_str!("alforria_migrations/0002_outbox_create.sql"),
+    ),
+];
 
 /// Every table these migrations own, the journal included. The upstream
 /// schema comparison leaves them out; a migration that adds a table adds
 /// it here (a test checks).
-pub const OWN_TABLES: &[&str] = &["alforria_migration", "session_restriction"];
+pub const OWN_TABLES: &[&str] = &["alforria_migration", "session_restriction", "outbox"];
 
 /// Apply every migration not yet in the journal.
 pub fn apply(conn: &mut Connection) -> Result<(), CoreError> {

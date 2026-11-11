@@ -8,6 +8,7 @@ pub mod engine;
 pub mod error;
 pub mod middleware;
 pub mod openapi;
+pub mod outbox;
 pub mod policy;
 pub mod provider;
 pub mod provider_runtime;
@@ -93,6 +94,7 @@ impl Listener {
     /// before the listener shuts down so live sockets observe 1001).
     pub async fn stop(self) -> io::Result<()> {
         self.websockets.close_all();
+        self.ctx.outbox.stop();
         self.shutdown
             .send(true)
             .map_err(|_| io::Error::other("server task already stopped"))?;
@@ -126,6 +128,10 @@ impl Listener {
         )
         .await;
         shutdown::kill_processes(&self.ctx, &mut report);
+        // What the turns just published (their `session.idle`) is written
+        // down before the process goes; delivery resumes on the next start.
+        self.ctx.outbox.flush();
+        self.ctx.outbox.stop();
 
         // Whatever is still connected now is a stream: close the websockets
         // with 1001, give in-flight responses the rest of the budget, then
@@ -173,6 +179,8 @@ pub async fn listen_with(opts: &ListenOptions, ctx: Arc<ServerContext>) -> io::R
         let _ = shutdown_rx.changed().await;
     });
     let task = tokio::spawn(async move { serve.await });
+    // Webhook deliveries, including whatever an earlier process left.
+    tokio::spawn(ctx.outbox.clone().run());
 
     let hostname = opts.hostname.clone();
     Ok(Listener {
@@ -257,15 +265,26 @@ pub fn production_context(
         runtime.clone(),
         seams,
     );
-    let policy = Arc::new(ServerPolicy::load(&paths));
+    let mut policy = ServerPolicy::load(&paths);
+    // `hook.webhook`: the outbox captures from every instance's bus. A
+    // hook that does not resolve is a host config error like any other.
+    let outbox = match outbox::Outbox::new(storage.clone(), policy.hook.as_ref()) {
+        Ok(outbox) => outbox,
+        Err(error) => {
+            policy.config_error.get_or_insert(error);
+            outbox::Outbox::new(storage.clone(), None).map_err(io::Error::other)?
+        }
+    };
+    let policy = Arc::new(policy);
     // The unattended policy sits on each instance's ask services.
     instances.set_on_boot({
-        let policy = policy.clone();
+        let (policy, outbox) = (policy.clone(), outbox.clone());
         move |services| {
             services
                 .permission
                 .set_unattended(policy.unattended_permission);
             services.question.set_unattended(policy.unattended_question);
+            outbox.attach(&services.events);
         }
     });
     let mut auth = AuthConfig::from_env().with_bearer(policy.bearer.clone());
@@ -281,6 +300,7 @@ pub fn production_context(
         ui_backend(),
     );
     ctx.policy = policy;
+    ctx.outbox = outbox;
     alforria_core::shell_env::install(ctx.policy.shell_env.clone());
     ctx.hosts = middleware::host::HostAllowlist::new(&opts.hostname, &opts.hosts, &opts.cors);
     ctx.engine_factory = engines.factory();

@@ -243,6 +243,66 @@ pub struct QuestionInfo {
 }
 
 // ---------------------------------------------------------------------------
+// hook.webhook
+// ---------------------------------------------------------------------------
+
+/// One webhook: where selected events are delivered, and how each delivery
+/// is signed.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct WebhookInfo {
+    /// A label for this hook; defaults to its URL. Deliveries are tied to
+    /// it, so renaming a hook abandons its undelivered events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub url: String,
+    /// Event types to deliver, by name or `*` / `?` pattern:
+    /// `"permission.asked"`, `"session.*"`, `"trigger.*"`.
+    pub events: Vec<String>,
+    /// A shared secret: deliveries carry an HMAC-SHA256 of the timestamp
+    /// and body. Exactly one of `secret` and `signing_key` is required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<String>,
+    /// An Ed25519 private key (base64 or hex of the 32-byte seed):
+    /// deliveries carry a signature the receiver checks with the public
+    /// key, so the receiver holds nothing that can forge one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing_key: Option<String>,
+}
+
+/// `hook.outbox` — how deliveries are retried and how long they are kept.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct OutboxInfo {
+    /// How long a delivered (or abandoned) delivery is kept (default 24h).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention: Option<DurationSetting>,
+    /// How long an undelivered event is retried before it is abandoned
+    /// (default 72h).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_age: Option<DurationSetting>,
+    /// The first retry delay, doubling up to `retry_max` (defaults 5s, 5m).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_initial: Option<DurationSetting>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_max: Option<DurationSetting>,
+    /// How long one delivery attempt may take (default 10s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<DurationSetting>,
+    /// The most undelivered events kept; beyond it the oldest are dropped
+    /// (default 10000).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_pending: Option<u64>,
+}
+
+/// `hook`.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct HookInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook: Option<Vec<WebhookInfo>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outbox: Option<OutboxInfo>,
+}
+
+// ---------------------------------------------------------------------------
 // shell_env
 // ---------------------------------------------------------------------------
 

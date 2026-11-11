@@ -113,6 +113,8 @@ pub struct ServerPolicy {
     /// `question.unattended`: how long a question waits before it is
     /// dismissed. `None`: it waits.
     pub unattended_question: Option<Duration>,
+    /// `hook`: webhooks and their outbox settings, as configured.
+    pub hook: Option<alforria_core::config::host::HookInfo>,
     /// What the agent's shells see of the server's environment.
     pub shell_env: alforria_core::shell_env::ShellEnvPolicy,
     /// Why the host config could not be used, if it could not. A listener
@@ -132,6 +134,7 @@ impl Default for ServerPolicy {
             upload_directories: vec![DEFAULT_UPLOAD_DIRECTORY.to_string()],
             unattended_permission: None,
             unattended_question: None,
+            hook: None,
             shell_env: alforria_core::shell_env::ShellEnvPolicy::default(),
             config_error: None,
         }
@@ -217,6 +220,7 @@ impl ServerPolicy {
             shutdown,
             unattended_permission,
             unattended_question,
+            hook: config.hook.clone(),
             bearer,
             directories,
             reply_always: server

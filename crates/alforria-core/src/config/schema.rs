@@ -1322,6 +1322,8 @@ pub struct Config {
     pub shell_env: Option<super::host::ShellEnvInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub question: Option<super::host::QuestionInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook: Option<super::host::HookInfo>,
 }
 
 /// Decode + validate a raw config value against the full wire schema.
@@ -1424,6 +1426,7 @@ fn collect_issues(value: &serde_json::Value) -> Vec<crate::SchemaIssue> {
             "experimental" => check!(issues, key, ExperimentalInfo),
             "shell_env" => check!(issues, key, super::host::ShellEnvInfo),
             "question" => check!(issues, key, super::host::QuestionInfo),
+            "hook" => check!(issues, key, super::host::HookInfo),
             _ => {}
         }
     }
