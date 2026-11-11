@@ -255,6 +255,17 @@ pre-1.0, so minor releases may include breaking changes.
   default agent's as before. The goal reviewer's request, which has no
   tools, now carries the session's policy too. For a session with no rules
   or ceilings of its own, nothing changes.
+- A token below `admin` could write to an operator's session by
+  percent-encoding the session id in the path (`/session/ses%5F…` with a
+  `?directory=` it may open): the check that keeps it out looked the
+  session up under the raw path segment, found none and refused nothing,
+  and the handler then decoded the id — rename, metadata, archive, delete,
+  revert, abort and the rest. The same spelling read a session of a
+  directory outside `server.directories`. The session in a path is now
+  resolved as the router decodes it, and the write check is one guard over
+  every route that names a session, applied after routing; only `fork` is
+  exempt, by name. `GET /permission` and `GET /question` list such a token
+  the asks it may answer, as `GET /attention` does, in the same shape.
 - A trigger the `schedule` tool made, running in a session it names
   (`session: "current"`, or a session id after an update), ran under that
   session's policy alone: its creator's bounds were stored only for

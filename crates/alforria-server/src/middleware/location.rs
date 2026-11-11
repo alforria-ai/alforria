@@ -129,7 +129,15 @@ pub fn is_local_workspace_route(method: &str, path: &str) -> bool {
 }
 
 /// `getWorkspaceRouteSessionID` (`shared/workspace-routing.ts:20-29`).
-pub fn workspace_route_session_id(path: &str) -> Option<&str> {
+///
+/// alforria extension: the id is returned **as the handler will read it**
+/// — the path segment percent-decoded, which is what the router's `Path`
+/// extractor hands a handler. This layer runs before routing, on the raw
+/// path; taken raw, `/session/ses%5F1` named no session here (so the
+/// request was placed by its `?directory=` instead of by the session's
+/// own directory, and judged without the session) and then named `ses_1`
+/// to the handler.
+pub fn workspace_route_session_id(path: &str) -> Option<String> {
     if path == "/session/status" {
         return None;
     }
@@ -142,7 +150,34 @@ pub fn workspace_route_session_id(path: &str) -> Option<&str> {
                 .and_then(|rest| rest.strip_suffix("/background"))
                 .filter(|id| !id.is_empty() && !id.contains('/'))
         })?;
-    Some(id)
+    Some(decode_segment(id))
+}
+
+/// One path segment, percent-decoded as the router decodes a path
+/// parameter: `%XX` is the byte, anything else stands for itself. A segment
+/// that does not decode to UTF-8 is returned as written — the router
+/// refuses it (400) before any handler reads it.
+fn decode_segment(segment: &str) -> String {
+    let bytes = segment.as_bytes();
+    let hex = |byte: u8| (byte as char).to_digit(16).map(|digit| digit as u8);
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        let pair = (bytes[at] == b'%')
+            .then(|| Some(hex(*bytes.get(at + 1)?)? << 4 | hex(*bytes.get(at + 2)?)?))
+            .flatten();
+        match pair {
+            Some(byte) => {
+                out.push(byte);
+                at += 3;
+            }
+            None => {
+                out.push(bytes[at]);
+                at += 1;
+            }
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| segment.to_string())
 }
 
 /// `WorkspaceV2.ID` — `Schema.String.check(Schema.isStartsWith("wrk"))`
@@ -385,33 +420,10 @@ impl<S> LocationService<S> {
             }
         }
 
-        // alforria extension: a credential below `admin` acts only in
-        // restricted sessions — its own kind. It may read an operator's
-        // session and fork it (the fork is restricted); anything else there
-        // could schedule turns that run with the operator's rights. The
-        // engine refuses those turns itself; this refuses the request.
-        if let Some(session) = &session {
-            let restricted_caller = req
-                .extensions()
-                .get::<crate::bearer::Principal>()
-                .is_some_and(|principal| principal.restricted());
-            let reads = matches!(*req.method(), Method::GET | Method::HEAD);
-            let forks = uri.path().ends_with("/fork");
-            if restricted_caller
-                && !reads
-                && !forks
-                && !self
-                    .ctx
-                    .sessions
-                    .is_restricted(&session.id)
-                    .unwrap_or(false)
-            {
-                return Err(Rejection::Forbidden(format!(
-                    "session {}: it belongs to the operator, and this token can read or fork it but not act in it",
-                    session.id
-                )));
-            }
-        }
+        // Whether the caller may write to this session is not decided
+        // here: this layer sees the raw path, before routing, and the
+        // handler reads the session id decoded. `confine::
+        // guard_session_writes` decides it on the route that matched.
 
         // Local plan (`:181-184`): the route session's directory wins.
         // `provideInstanceContext` decodes the resolved directory
@@ -435,11 +447,11 @@ impl<S> LocationService<S> {
         let Some(id) = workspace_route_session_id(path) else {
             return Ok(None);
         };
-        if !is_session_id(id) {
+        if !is_session_id(&id) {
             // `SessionID.make` throws on non-`ses` ids (defect 500).
             return Err(Rejection::Defect);
         }
-        match self.ctx.sessions.get(id) {
+        match self.ctx.sessions.get(&id) {
             Ok(session) => Ok(Some(session)),
             Err(SessionError::NotFound(_)) => Ok(None),
             Err(_) => Err(Rejection::Defect),
@@ -506,27 +518,37 @@ mod tests {
 
     #[test]
     fn workspace_route_session_id_matrix() {
-        assert_eq!(workspace_route_session_id("/session/status"), None);
-        assert_eq!(workspace_route_session_id("/session"), None);
-        assert_eq!(workspace_route_session_id("/session/"), None);
-        assert_eq!(workspace_route_session_id("/session/ses_1"), Some("ses_1"));
+        let id = |path: &str| workspace_route_session_id(path);
+        assert_eq!(id("/session/status"), None);
+        assert_eq!(id("/session"), None);
+        assert_eq!(id("/session/"), None);
+        assert_eq!(id("/session/ses_1").as_deref(), Some("ses_1"));
+        assert_eq!(id("/session/ses_1/message").as_deref(), Some("ses_1"));
         assert_eq!(
-            workspace_route_session_id("/session/ses_1/message"),
-            Some("ses_1")
-        );
-        assert_eq!(
-            workspace_route_session_id("/experimental/session/ses_1/background"),
+            id("/experimental/session/ses_1/background").as_deref(),
             Some("ses_1")
         );
         // Not an exact background match.
+        assert_eq!(id("/experimental/session/ses_1/other"), None);
+        assert_eq!(id("/experimental/session/a/b/background"), None);
+        // The id is the one the handler will read: decoded.
+        for spelled in [
+            "/session/ses%5F1",
+            "/session/%73es_1/message",
+            "/session/s%65s%5f1",
+        ] {
+            assert_eq!(id(spelled).as_deref(), Some("ses_1"), "{spelled}");
+        }
         assert_eq!(
-            workspace_route_session_id("/experimental/session/ses_1/other"),
-            None
+            id("/experimental/session/ses%5F1/background").as_deref(),
+            Some("ses_1")
         );
-        assert_eq!(
-            workspace_route_session_id("/experimental/session/a/b/background"),
-            None
-        );
+        // What is not an escape stands for itself, and bytes that are not
+        // UTF-8 leave the segment as written (the router refuses it).
+        assert_eq!(id("/session/ses%zz").as_deref(), Some("ses%zz"));
+        assert_eq!(id("/session/ses%4").as_deref(), Some("ses%4"));
+        assert_eq!(id("/session/ses%ff").as_deref(), Some("ses%ff"));
+        assert_eq!(id("/session/ses%2Fx").as_deref(), Some("ses/x"));
     }
 
     #[test]

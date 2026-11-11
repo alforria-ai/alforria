@@ -596,6 +596,28 @@ never different. The engine enforces it where turns are made
 `command`, before `/goal` arms anything); the routes refuse the request
 early.
 
+At the HTTP layer there is one predicate (`confine::may_act_on`) and one
+guard (`confine::guard_session_writes`), laid over the whole router rather
+than written into handlers. For a credential below `admin` it refuses every
+request that is not a `GET` on a route with a `{sessionID}` in it — v1, v2
+and alforria's own — unless the session is one the caller may act on. The
+only exception is listed by name (`POST /session/{id}/fork`), so a route
+added later is refused on an operator's session without anyone remembering
+it; a test walks the route tables and holds each to that. The guard runs
+after routing, on the route that matched and the session id as the handler
+reads it. It used to sit in front of routing and looked the session up
+under the raw path segment: a percent-encoded id (`/session/ses%5F…`)
+named no session there — so nothing was refused, and the request was
+placed by its `?directory=` instead of by the session's own directory —
+and then named the operator's session to the handler. The same lookup now
+decodes the segment as the router does. A session that does not exist is
+the handler's 404.
+
+The same predicate decides which pending asks a credential below `admin`
+is shown: `GET /attention`, and the frozen `GET /permission` and
+`GET /question`, list it the ones it may answer and leave out an
+operator's session's. The lists keep upstream's shape.
+
 - **Forks** are the bridge: a fork made by a restricted caller is restricted
   whatever its source was (`restricted = source restricted || caller
   restricted`); the source is untouched.

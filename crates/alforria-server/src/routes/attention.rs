@@ -91,9 +91,8 @@ async fn attention(
                 .map(|session| session.title)
         };
         // A credential below `admin` is shown the asks it may answer.
-        let visible = |session_id: &str| {
-            !restricted || ctx.sessions.is_restricted(session_id).unwrap_or(false)
-        };
+        let visible =
+            |session_id: &str| !restricted || crate::confine::may_act_on(&ctx, session_id).is_ok();
         for pending in services.permission.pending() {
             if !visible(&pending.request.session_id) {
                 continue;

@@ -46,6 +46,13 @@ pub fn build_router(ctx: Arc<ServerContext>) -> Router {
     router = trigger::register(router);
     router = memory::register(router);
     router = posture::register(router);
+    // alforria extension: one guard over every route registered above
+    // that names a session, on the route as matched and the id as decoded
+    // (`confine::guard_session_writes`). A route added above is under it.
+    let router = router.route_layer(axum::middleware::from_fn_with_state(
+        ctx.clone(),
+        crate::confine::guard_session_writes,
+    ));
 
     let router = router
         .fallback(ui::serve_ui_handler)

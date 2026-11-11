@@ -149,6 +149,7 @@ fn located(
 ///
 /// `None` when there is no agent to judge by: nothing is allowed.
 fn caller_policy(
+    ctx: &ServerContext,
     services: &alforria_core::SessionServices,
     directory: &RequestDirectory,
     uri: &Uri,
@@ -172,13 +173,7 @@ fn caller_policy(
     if std::path::Path::new(&session.directory) != directory.0.as_path() {
         return Err(not_found());
     }
-    alforria_core::session::caller::Caller::Restricted
-        .may_act_on(
-            services
-                .sessions
-                .is_restricted(&session_id)
-                .unwrap_or(false),
-        )
+    crate::confine::may_act_on(ctx, &session_id)
         .map_err(|message| ServerError::Api(ApiError::Forbidden { message }))?;
     let agent = match session.agent.as_deref() {
         Some(name) => services.agents.get(name).cloned(),
@@ -202,7 +197,7 @@ fn writer(
     if !crate::confine::restricted(principal) {
         return Ok((memory, project_id, Provenance::api()));
     }
-    let allowed = caller_policy(&services, directory, uri)?.is_some_and(|policy| {
+    let allowed = caller_policy(ctx, &services, directory, uri)?.is_some_and(|policy| {
         policy.evaluate(permission, pattern).action
             == alforria_schema::permission_v1::PermissionV1Action::Allow
     });

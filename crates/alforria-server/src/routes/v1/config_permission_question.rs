@@ -100,11 +100,20 @@ struct PermissionReplyPayload {
     message: Option<String>,
 }
 
-/// `list` (`handlers/permission.ts:13-18`).
+/// `list` (`handlers/permission.ts:13-18`). alforria extension: a
+/// credential below `admin` is listed the asks it may answer
+/// (`confine::answerable`); the shape is upstream's.
 pub async fn permission_list(
+    State(ctx): State<Arc<ServerContext>>,
     axum::Extension(location): axum::Extension<LocationContext>,
+    principal: Option<axum::Extension<crate::bearer::Principal>>,
 ) -> Result<Response, ServerError> {
-    Ok(json_ok(location.services.permission.list()))
+    Ok(json_ok(crate::confine::answerable(
+        &ctx,
+        &principal,
+        location.services.permission.list(),
+        |request| request.session_id.as_str(),
+    )))
 }
 
 /// `reply` (`handlers/permission.ts:20-43`).
@@ -176,11 +185,20 @@ struct QuestionReplyPayload {
     answers: Vec<QuestionV1Answer>,
 }
 
-/// `list` (`handlers/question.ts:13-17`).
+/// `list` (`handlers/question.ts:13-17`). alforria extension: a
+/// credential below `admin` is listed the questions it may answer
+/// (`confine::answerable`); the shape is upstream's.
 pub async fn question_list(
+    State(ctx): State<Arc<ServerContext>>,
     axum::Extension(location): axum::Extension<LocationContext>,
+    principal: Option<axum::Extension<crate::bearer::Principal>>,
 ) -> Result<Response, ServerError> {
-    Ok(json_ok(location.services.question.list()))
+    Ok(json_ok(crate::confine::answerable(
+        &ctx,
+        &principal,
+        location.services.question.list(),
+        |request| request.session_id.as_str(),
+    )))
 }
 
 /// `reply` (`handlers/question.ts:19-44`).

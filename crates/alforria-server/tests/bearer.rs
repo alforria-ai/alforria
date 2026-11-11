@@ -2474,3 +2474,235 @@ async fn an_outside_input_sessions_edit_tools_refuse_loader_locations() {
         assert_eq!(target.exists(), expected, "{}", target.display());
     }
 }
+
+/// Every route that names a session and is not a read, in both generations
+/// and alforria's own, taken from the route tables — so a route added to
+/// one is tested here without anyone remembering to.
+fn mutating_session_routes() -> Vec<(&'static str, &'static str)> {
+    let mut routes: Vec<(&str, &str)> = alforria_server::routes::v1::ROUTES
+        .iter()
+        .chain(alforria_server::routes::v2::ROUTES.iter())
+        .copied()
+        .chain(
+            alforria_server::middleware::scope::ROUTES
+                .iter()
+                .map(|(method, route, _)| (*method, *route)),
+        )
+        // alforria's own, outside every table.
+        .chain([("DELETE", "/session/{sessionID}/restriction")])
+        .collect();
+    routes.sort();
+    routes.dedup();
+    // The guard keys on the parameter's name: every table spells it so.
+    for (_, route) in &routes {
+        assert_eq!(
+            route.contains("/session/{"),
+            route.contains("/session/{sessionID}"),
+            "{route}: a session in a path is `{{sessionID}}`"
+        );
+    }
+    routes
+        .into_iter()
+        .filter(|(method, route)| *method != "GET" && route.contains("{sessionID}"))
+        .collect()
+}
+
+/// A route template with the session filled in and every other parameter
+/// given a placeholder.
+fn filled(route: &str, session: &str) -> String {
+    route
+        .split('/')
+        .map(|segment| match segment {
+            "{sessionID}" => session.to_string(),
+            "{messageID}" => "msg_x".to_string(),
+            "{partID}" => "prt_x".to_string(),
+            "{permissionID}" | "{requestID}" => "per_x".to_string(),
+            other if other.starts_with('{') => "x".to_string(),
+            other => other.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// A token below `admin` writes nothing to an operator's session, on any
+/// route that names one — title, metadata, archive, delete, share, revert,
+/// summarize, abort, init, command, shell, message and part edits, the v2
+/// routes — however the session id is spelled. The check used to look the
+/// session up under the raw path segment: `/session/ses%5F…` named none,
+/// nothing was refused, and the handler then decoded it to the operator's
+/// session.
+#[tokio::test]
+async fn every_mutating_session_route_refuses_a_narrow_token_on_an_operators_session() {
+    use alforria_server::bearer::Scope;
+    let signer = Signer::new();
+    let f = fixture_with(policy_config(&signer, false), Some(PASSWORD), Vec::new());
+    let chat = bearer(&signer.token(AUDIENCE, "chat"));
+    let routes = mutating_session_routes();
+    assert!(routes.len() > 25, "{routes:?}");
+    let exempt = alforria_server::confine::NOT_AN_ACT_IN_THE_SESSION;
+    assert_eq!(exempt, [("POST", "/session/{sessionID}/fork")]);
+    let send = |method: &'static str, uri: String, auth: String| {
+        let router = f.router.clone();
+        async move {
+            // A request that is let through may start a turn nobody ends.
+            let sent = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                call(&router, method, &uri, Some(&auth), Some(json!({}))),
+            )
+            .await;
+            match sent {
+                Ok(response) => {
+                    let status = response.status();
+                    (Some(status), body_string(response).await)
+                }
+                Err(_) => (None, String::new()),
+            }
+        }
+    };
+    for (method, route) in routes {
+        if exempt.contains(&(method, route)) {
+            continue;
+        }
+        let operators = create_session(&f, &f.dirs.repo, &basic()).await;
+        let open_to_chat =
+            alforria_server::middleware::scope::required(method, &filled(route, &operators))
+                <= Scope::Chat;
+        // Plain, percent-encoded, and encoded with a directory the token
+        // may open named beside it (which is where the request was placed
+        // when the encoded id named no session).
+        let encoded = operators.replace('_', "%5F");
+        for uri in [
+            filled(route, &operators),
+            filled(route, &encoded),
+            format!("{}?{}", filled(route, &encoded), dir_query(&f.dirs.repo)),
+        ] {
+            let (status, body) = send(method, uri.clone(), chat.clone()).await;
+            assert_eq!(
+                status,
+                Some(StatusCode::FORBIDDEN),
+                "{method} {uri}: {body}"
+            );
+            // Where the scope table lets `chat` in, it is the session
+            // guard that refuses.
+            if open_to_chat {
+                assert!(
+                    body.contains("belongs to the operator"),
+                    "{method} {uri}: {body}"
+                );
+            }
+        }
+        // Nothing happened to it.
+        let after = call(
+            &f.router,
+            "GET",
+            &format!("/session/{operators}"),
+            Some(&basic()),
+            None,
+        )
+        .await;
+        assert_eq!(after.status(), StatusCode::OK, "{method} {route}");
+        let after = body_json(after).await;
+        assert!(
+            after["share"].is_null() && after["revert"].is_null(),
+            "{after}"
+        );
+        assert!(after["time"]["archived"].is_null(), "{after}");
+        assert!(!restricted(&f, &operators).await);
+
+        // The operator is not refused…
+        let (status, body) = send(method, filled(route, &operators), basic()).await;
+        assert!(
+            !matches!(
+                status,
+                Some(StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED)
+            ),
+            "admin {method} {route}: {status:?} {body}"
+        );
+        // …and neither is the token in a session of its own.
+        if open_to_chat {
+            for encoded in [false, true] {
+                // One each: the route may be the one that deletes it.
+                let mine = create_session(&f, &f.dirs.repo, &chat).await;
+                let spelled = if encoded {
+                    mine.replace('_', "%5F")
+                } else {
+                    mine
+                };
+                let uri = filled(route, &spelled);
+                let (status, body) = send(method, uri.clone(), chat.clone()).await;
+                assert_ne!(
+                    status,
+                    Some(StatusCode::FORBIDDEN),
+                    "{method} {uri}: {body}"
+                );
+            }
+        }
+    }
+
+    // A session read by an encoded id is placed by the session's own
+    // directory, as by its plain id: one in a directory the token may not
+    // open is not readable through a `?directory=` it may.
+    let elsewhere = create_session(&f, &f.dirs.other, &basic()).await;
+    for spelled in [elsewhere.clone(), elsewhere.replace('_', "%5F")] {
+        let uri = format!("/session/{spelled}/message?{}", dir_query(&f.dirs.repo));
+        assert_eq!(
+            status(&f, "GET", &uri, &chat).await,
+            StatusCode::FORBIDDEN,
+            "{uri}"
+        );
+    }
+}
+
+/// The frozen `GET /permission` lists a token below `admin` the asks it
+/// may answer — not an operator's session's, which it could only read
+/// about — in upstream's shape.
+#[tokio::test]
+async fn pending_asks_are_listed_to_whoever_may_answer_them() {
+    let signer = Signer::new();
+    let f = fixture_with(
+        policy_config(&signer, false),
+        Some(PASSWORD),
+        vec![bash_ask(), bash_ask()],
+    );
+    let chat = bearer(&signer.token(AUDIENCE, "chat"));
+    let list = |auth: String| {
+        let (router, uri) = (
+            f.router.clone(),
+            format!("/permission?{}", dir_query(&f.dirs.repo)),
+        );
+        async move { body_json(call(&router, "GET", &uri, Some(&auth), None).await).await }
+    };
+    let operators = start_bash_ask(&f, &f.dirs.repo, &basic()).await;
+    assert_eq!(list(chat.clone()).await, json!([]));
+    let questions = call(
+        &f.router,
+        "GET",
+        &format!("/question?{}", dir_query(&f.dirs.repo)),
+        Some(&chat),
+        None,
+    )
+    .await;
+    assert_eq!(body_json(questions).await, json!([]));
+
+    let mine = start_bash_ask(&f, &f.dirs.repo, &chat).await;
+    assert_ne!(mine, operators);
+    let shown = list(chat.clone()).await;
+    assert_eq!(shown.as_array().unwrap().len(), 1, "{shown}");
+    assert_eq!(shown[0]["id"], mine.as_str());
+    // The entry is upstream's, whole.
+    for key in [
+        "id",
+        "sessionID",
+        "permission",
+        "patterns",
+        "metadata",
+        "always",
+    ] {
+        assert!(!shown[0][key].is_null(), "{key}: {shown}");
+    }
+    let all = list(basic()).await;
+    assert_eq!(all.as_array().unwrap().len(), 2, "{all}");
+    for id in [&operators, &mine] {
+        assert_eq!(reply(&f, id, &basic(), "reject").await, StatusCode::OK);
+    }
+}

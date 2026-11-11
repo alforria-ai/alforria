@@ -6,7 +6,9 @@
 //! [`caller`] into the engine, which judges the values it actually resolves
 //! (`alforria_core::session::caller`). What remains at the HTTP layer are
 //! the requests that never become a prompt: setting a session's permission
-//! rules, answering a permission ask `always`, listing a directory.
+//! rules, answering a permission ask `always`, listing a directory — and
+//! every other write to a session, which goes through one guard
+//! ([`guard_session_writes`]) and one predicate ([`may_act_on`]).
 
 use std::path::{Path, PathBuf};
 
@@ -119,24 +121,147 @@ pub fn check_reply(
     Ok(())
 }
 
-/// A credential below `admin` answers the asks of restricted sessions
-/// only. An ask in an operator's session is the operator's turn waiting;
-/// answering it would steer that turn. An unknown session id is refused
-/// too.
+/// **Whether a credential below `admin` may act on a session**: the one
+/// predicate behind every refusal of a write to a session — the guard over
+/// the session routes, an answer to a pending ask, what `/attention`,
+/// `GET /permission` and `GET /question` show such a credential, and a
+/// session a memory write names. It is `Caller::may_act_on`
+/// (`alforria_core::session::caller`) asked of the session's stored
+/// restriction: restricted sessions only. A restriction that cannot be
+/// read, or a session that does not exist, is not one it may act on.
+pub fn may_act_on(ctx: &crate::state::ServerContext, session_id: &str) -> Result<(), String> {
+    alforria_core::session::caller::Caller::Restricted
+        .may_act_on(ctx.sessions.is_restricted(session_id).unwrap_or(false))
+}
+
+/// Requests to a `{sessionID}` route that are not an act *in* that session
+/// although they are not a `GET`. A credential below `admin` may make them
+/// on an operator's session.
+///
+/// * `fork`: the source is read, not written; the fork is a session of the
+///   caller's own, created restricted.
+///
+/// Everything else under a session id is refused there by
+/// [`guard_session_writes`]. A route added later is covered without being
+/// listed anywhere: it has to be listed *here* to be let through.
+pub const NOT_AN_ACT_IN_THE_SESSION: &[(&str, &str)] = &[("POST", "/session/{sessionID}/fork")];
+
+/// The name every route gives the session in its path. The guard keys on
+/// it (`routes::tests` holds the tables to it).
+pub const SESSION_PARAM: &str = "sessionID";
+
+/// The guard over every route that names a session, in both generations
+/// and alforria's own (`routes::build_router` puts it on the whole
+/// router): a credential below `admin` writes only to sessions it may act
+/// on ([`may_act_on`]). Title, metadata, archive, delete, share, revert,
+/// summarize, abort, init, command, shell, a message or part edit — not
+/// only prompts, which the engine refuses by itself as well.
+///
+/// It runs after routing, on the route that matched and the session id as
+/// the handler will read it — percent-decoded by the same extractor. (The
+/// check used to sit in the location middleware and looked the session up
+/// under the raw path segment: `/session/ses%5F…` named no session there,
+/// so nothing was refused, and then named the operator's session to the
+/// handler.)
+///
+/// A session that does not exist is the handler's to answer (404): there
+/// is nothing of the operator's to protect, and the handler reads the same
+/// id.
+pub async fn guard_session_writes(
+    axum::extract::State(ctx): axum::extract::State<std::sync::Arc<crate::state::ServerContext>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::extract::FromRequestParts;
+    use axum::response::IntoResponse;
+    let is_restricted = request
+        .extensions()
+        .get::<Principal>()
+        .is_some_and(|principal| principal.restricted());
+    let method = request.method().clone();
+    if !is_restricted || matches!(method, axum::http::Method::GET | axum::http::Method::HEAD) {
+        return next.run(request).await;
+    }
+    let route = request
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|matched| matched.as_str().to_string())
+        .unwrap_or_default();
+    if !route.contains(&format!("{{{SESSION_PARAM}}}"))
+        || NOT_AN_ACT_IN_THE_SESSION
+            .iter()
+            .any(|(exempt_method, exempt)| *exempt_method == method.as_str() && *exempt == route)
+    {
+        return next.run(request).await;
+    }
+    let (mut parts, body) = request.into_parts();
+    let params =
+        axum::extract::Path::<std::collections::HashMap<String, String>>::from_request_parts(
+            &mut parts, &ctx,
+        )
+        .await;
+    // A session id that cannot be read off the route is not one the caller
+    // may act on.
+    let session_id = params
+        .ok()
+        .and_then(|axum::extract::Path(mut params)| params.remove(SESSION_PARAM));
+    let verdict = match &session_id {
+        None => Err("this token may not act in a session that cannot be named".to_string()),
+        Some(session_id) => match ctx.sessions.get(session_id) {
+            Err(alforria_core::SessionError::NotFound(_)) => Ok(()),
+            Err(_) => Err(format!("session {session_id}: it cannot be read")),
+            Ok(_) => may_act_on(&ctx, session_id).map_err(|_| {
+                format!(
+                    "session {session_id}: it belongs to the operator, and this token can \
+                     read or fork it but not act in it"
+                )
+            }),
+        },
+    };
+    match verdict {
+        Ok(()) => {
+            next.run(axum::extract::Request::from_parts(parts, body))
+                .await
+        }
+        Err(message) => forbid(message).into_response(),
+    }
+}
+
+/// A credential below `admin` answers the asks of sessions it may act on
+/// ([`may_act_on`]) only. An ask in an operator's session is the
+/// operator's turn waiting; answering it would steer that turn. An unknown
+/// session id is refused too.
 pub fn check_ask_session(
     ctx: &crate::state::ServerContext,
     session_id: Option<&str>,
 ) -> Result<(), ServerError> {
-    let restricted = session_id
-        .map(|session_id| ctx.sessions.is_restricted(session_id).unwrap_or(false))
-        .unwrap_or(false);
-    if restricted {
+    if session_id.is_some_and(|session_id| may_act_on(ctx, session_id).is_ok()) {
         Ok(())
     } else {
         Err(forbid(
             "this request belongs to an operator's session: this token may not answer it",
         ))
     }
+}
+
+/// What a list of pending asks or questions shows a caller: everything to
+/// the operator, and to a credential below `admin` the ones it may answer
+/// ([`may_act_on`] the session each belongs to) — the line `/attention`
+/// draws, on the frozen `GET /permission` and `GET /question` too. The
+/// lists keep their shape; an entry is there or it is not.
+pub fn answerable<T>(
+    ctx: &crate::state::ServerContext,
+    principal: &Option<Extension<Principal>>,
+    pending: Vec<T>,
+    session_of: impl Fn(&T) -> &str,
+) -> Vec<T> {
+    if !restricted(principal) {
+        return pending;
+    }
+    pending
+        .into_iter()
+        .filter(|item| may_act_on(ctx, session_of(item)).is_ok())
+        .collect()
 }
 
 /// Which kind of pending request a reply names.
