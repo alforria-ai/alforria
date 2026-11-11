@@ -1483,6 +1483,9 @@ pub struct ServerContext {
     /// `Project.Service` (M7.1) — the project registry over the shared
     /// storage; its `project.updated` emissions feed the GlobalBus.
     pub projects: Arc<alforria_core::project::registry::ProjectRegistry>,
+    /// The unattended-server settings from the host config (alforria
+    /// extension, `policy.rs`). Defaults everywhere outside production.
+    pub policy: Arc<crate::policy::ServerPolicy>,
 }
 
 impl ServerContext {
@@ -1566,6 +1569,7 @@ impl ServerContext {
             ptys: crate::pty::PtyRegistry::default(),
             websockets: WebSocketTracker::default(),
             projects,
+            policy: Arc::new(crate::policy::ServerPolicy::default()),
         }
     }
 

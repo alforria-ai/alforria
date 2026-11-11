@@ -23,6 +23,7 @@ pub mod lsp;
 pub mod mcp;
 pub mod merge;
 pub mod paths;
+pub mod process_group;
 pub mod project;
 pub mod project_copy;
 pub mod provider;

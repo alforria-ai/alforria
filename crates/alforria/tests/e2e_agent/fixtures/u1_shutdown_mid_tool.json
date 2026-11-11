@@ -1,0 +1,31 @@
+{
+  "comment": "U1 — a bash call that never returns on its own: the server is stopped while the tool process is running",
+  "turns": [
+    {
+      "frames": [
+        {
+          "tool_call": {
+            "id": "cal_1",
+            "name": "bash",
+            "arguments": {
+              "command": "echo $$ > tool.pid; sleep 600",
+              "description": "wait"
+            }
+          }
+        },
+        {
+          "finish": {
+            "reason": "tool_calls",
+            "usage": { "input": 50, "output": 5 }
+          }
+        }
+      ]
+    },
+    {
+      "frames": [
+        { "text": "after the tool" },
+        { "finish": { "reason": "stop", "usage": { "input": 60, "output": 3 } } }
+      ]
+    }
+  ]
+}

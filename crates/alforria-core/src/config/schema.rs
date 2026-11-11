@@ -210,6 +210,9 @@ pub struct ServerInfo {
     pub mdns_domain: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cors: Option<Vec<String>>,
+    // --- alforria extensions (`config::host`), read from the host config ---
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shutdown: Option<super::host::ShutdownInfo>,
 }
 
 // ---------------------------------------------------------------------------

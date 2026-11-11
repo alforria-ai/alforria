@@ -639,6 +639,7 @@ impl ShellSpawner for TokioSpawner {
                 .spawn()
                 .map_err(|err| ToolError::Failed(format!("Failed to spawn command: {err}")))?;
             let pid = child.id().unwrap_or(0);
+            let group = crate::process_group::register(pid);
 
             let stdout = child.stdout.take();
             let stderr = child.stderr.take();
@@ -681,6 +682,7 @@ impl ShellSpawner for TokioSpawner {
                     Err(_) => None,
                 };
                 exited_flag.store(true, AtomicOrdering::SeqCst);
+                drop(group);
                 let _ = exit_tx.send(code);
             });
 

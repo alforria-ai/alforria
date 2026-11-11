@@ -1002,17 +1002,24 @@ pub async fn shell_impl(
     // stdin ignored, force kill after 3 seconds.
     let sh = preferred(deps.config.shell.as_deref());
     let cwd = deps.instance.directory.clone();
-    let mut child = tokio::process::Command::new(&sh)
+    let mut command = tokio::process::Command::new(&sh);
+    command
         .arg("-c")
         .arg(&input.command)
         .current_dir(&cwd)
         .env("TERM", "dumb")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    // Its own process group: `kill_process_group` signals the group, which
+    // only exists when the child leads one.
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command
         .spawn()
         .map_err(|err| crate::CoreError::Storage(format!("Failed to spawn command: {err}")))?;
     let pid = child.id().unwrap_or(0);
+    let _group = crate::process_group::register(pid);
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();

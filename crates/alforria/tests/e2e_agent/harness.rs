@@ -229,11 +229,18 @@ impl Serve {
     // through the struct handle.
     #[allow(clippy::zombie_processes)]
     pub fn spawn(env: &Env) -> Serve {
+        Serve::spawn_with(env, |_| {})
+    }
+
+    /// `spawn`, with a last word on the command (extra environment).
+    #[allow(dead_code, clippy::zombie_processes)]
+    pub fn spawn_with(env: &Env, configure: impl FnOnce(&mut Command)) -> Serve {
         // An empty password is the explicit opt-out of the generated one:
         // the harness clients (and the TS parity side) talk without auth.
-        let mut child = env
-            .command(&["serve", "--port", "0"])
-            .env("OPENCODE_SERVER_PASSWORD", "")
+        let mut command = env.command(&["serve", "--port", "0"]);
+        command.env("OPENCODE_SERVER_PASSWORD", "");
+        configure(&mut command);
+        let mut child = command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -278,6 +285,33 @@ impl Serve {
                 return Serve { port, child };
             }
             assert!(Instant::now() < deadline, "serve handshake timed out");
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl Serve {
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Send the server a signal (unix).
+    #[cfg(unix)]
+    pub fn signal(&self, signal: i32) {
+        unsafe { libc::kill(self.child.id() as libc::pid_t, signal) };
+    }
+
+    /// Wait for the server to exit on its own; `None` on timeout.
+    pub fn wait_exit(&mut self, timeout: Duration) -> Option<std::process::ExitStatus> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Ok(Some(status)) = self.child.try_wait() {
+                return Some(status);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 }

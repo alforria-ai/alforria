@@ -6,10 +6,12 @@ pub mod engine;
 pub mod error;
 pub mod middleware;
 pub mod openapi;
+pub mod policy;
 pub mod provider;
 pub mod provider_runtime;
 pub mod pty;
 pub mod routes;
+pub mod shutdown;
 pub mod sse;
 pub mod state;
 pub mod workspace;
@@ -20,6 +22,8 @@ use std::sync::Arc;
 use alforria_core::Storage;
 
 pub use error::{ApiError, ServerError};
+pub use policy::{ServerPolicy, ShutdownOptions};
+pub use shutdown::ShutdownReport;
 pub use state::{
     AuthConfig, EngineFactory, HeartbeatConfig, InstanceStore, ServerContext, SessionEngine,
     UiBackend,
@@ -59,7 +63,6 @@ impl Default for ListenOptions {
 }
 
 /// A running listener (`server/server.ts:20-25`).
-#[derive(Debug)]
 pub struct Listener {
     pub hostname: String,
     pub port: u16,
@@ -67,6 +70,18 @@ pub struct Listener {
     websockets: state::WebSocketTracker,
     shutdown: tokio::sync::watch::Sender<bool>,
     task: tokio::task::JoinHandle<io::Result<()>>,
+    ctx: Arc<ServerContext>,
+}
+
+impl std::fmt::Debug for Listener {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Listener")
+            .field("hostname", &self.hostname)
+            .field("port", &self.port)
+            .field("url", &self.url)
+            .field("websockets", &self.websockets)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Listener {
@@ -80,6 +95,49 @@ impl Listener {
             .map_err(|_| io::Error::other("server task already stopped"))?;
         let _ = self.task.await;
         Ok(())
+    }
+
+    /// The shutdown the host config asks for (`server.shutdown`).
+    pub fn shutdown_options(&self) -> ShutdownOptions {
+        self.ctx.policy.shutdown
+    }
+
+    /// Stop for good, within `options.timeout` (see [`shutdown`]): unlike
+    /// [`Listener::stop`] this settles the running turns, kills what they
+    /// started, does not wait for event streams that never end, and leaves
+    /// the database checkpointed.
+    pub async fn shutdown(mut self, options: ShutdownOptions) -> ShutdownReport {
+        let started = std::time::Instant::now();
+        let deadline = started + options.timeout;
+        // Closing connections and checkpointing come out of the same budget.
+        let reserve = std::time::Duration::from_millis(500).min(options.timeout / 4);
+        let mut report = ShutdownReport::default();
+
+        // Stop accepting. In-flight requests keep running for now.
+        let _ = self.shutdown.send(true);
+        shutdown::settle_sessions(
+            &self.ctx,
+            options,
+            deadline.checked_sub(reserve).unwrap_or(deadline),
+            &mut report,
+        )
+        .await;
+        shutdown::kill_processes(&self.ctx, &mut report);
+
+        // Whatever is still connected now is a stream: close the websockets
+        // with 1001, give in-flight responses the rest of the budget, then
+        // drop the event streams.
+        self.websockets.close_all();
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if tokio::time::timeout(remaining.min(reserve), &mut self.task)
+            .await
+            .is_err()
+        {
+            self.task.abort();
+            let _ = (&mut self.task).await;
+        }
+        shutdown::checkpoint(&self.ctx, &mut report);
+        report
     }
 }
 
@@ -97,6 +155,11 @@ async fn bind_with_port_fallback(opts: &ListenOptions) -> io::Result<tokio::net:
 
 /// Bind the server and spawn it on the current tokio runtime.
 pub async fn listen_with(opts: &ListenOptions, ctx: Arc<ServerContext>) -> io::Result<Listener> {
+    if let Some(error) = &ctx.policy.config_error {
+        return Err(io::Error::other(format!(
+            "refusing to listen: the host config could not be applied ({error})"
+        )));
+    }
     let listener = bind_with_port_fallback(opts).await?;
     let port = listener.local_addr()?.port();
     let url = format!("http://{}:{}", opts.hostname, port);
@@ -116,6 +179,7 @@ pub async fn listen_with(opts: &ListenOptions, ctx: Arc<ServerContext>) -> io::R
         websockets: ctx.websockets.clone(),
         shutdown,
         task,
+        ctx,
     })
 }
 
@@ -202,6 +266,7 @@ pub fn production_context(
         opts.cors.clone(),
         ui_backend(),
     );
+    ctx.policy = Arc::new(ServerPolicy::load(&paths));
     ctx.hosts = middleware::host::HostAllowlist::new(&opts.hostname, &opts.hosts, &opts.cors);
     ctx.engine_factory = engines.factory();
     ctx.tools = engines.tools();

@@ -45,9 +45,16 @@ pre-1.0, so minor releases may include breaking changes.
 - Remote MCP servers stay signed in: OAuth tokens refresh before they expire
   and on a 401.
 - ACP clients are told when a turn is waiting on a provider retry.
+- `alforria serve` and `alforria web` shut down cleanly on SIGTERM and SIGINT:
+  they stop accepting, cancel the running turns (or let them finish, with
+  `server.shutdown.sessions: "drain"`), kill the terminals and tool processes,
+  checkpoint the database and exit 0, all within `server.shutdown.timeout`
+  (default 10 s). See `docs/unattended-server.md`.
 
 ### Fixed
 
+- Stopping a session `shell` command (`POST /session/{id}/shell`) did not
+  kill it: the command was never given the process group the stop signals.
 - A file path containing `..` could write, search or read outside the project
   without the `external_directory` prompt, through `apply_patch`, `grep`,
   `glob` and `lsp`.
@@ -93,6 +100,9 @@ pre-1.0, so minor releases may include breaking changes.
 
 ### Changed
 
+- A global config file that does not parse now stops `alforria serve` and
+  `alforria web` from listening, instead of serving with the defaults: the
+  host config carries the server's access policy.
 - alforria keeps its global config, data, cache and state in `alforria`
   directories (`~/.config/alforria`, `~/.local/share/alforria`, …) instead of
   sharing upstream's `opencode` ones. opencode v2 migrates a shared database

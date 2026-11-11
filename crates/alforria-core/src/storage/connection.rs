@@ -92,6 +92,18 @@ impl Storage {
         Ok(())
     }
 
+    /// Move the whole write-ahead log into the database file and empty it
+    /// (`PRAGMA wal_checkpoint(TRUNCATE)`). A server about to exit calls
+    /// this so the database is one self-contained file; `false` means a
+    /// reader held the log and some frames stay in it (still durable).
+    pub fn checkpoint_truncate(&self) -> Result<bool, CoreError> {
+        self.with_connection(|conn| {
+            let busy: i64 =
+                conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+            Ok(busy == 0)
+        })
+    }
+
     /// Runs `PRAGMA wal_checkpoint(PASSIVE)` on close (spec §7.5).
     fn checkpoint(&self) -> Result<(), CoreError> {
         self.with_connection(|conn| {

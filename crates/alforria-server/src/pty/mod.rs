@@ -235,6 +235,21 @@ impl PtyService {
         Ok(())
     }
 
+    /// Kill every running terminal (server shutdown). Returns how many
+    /// were still running.
+    pub fn kill_all(&self) -> usize {
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let running: Vec<&Session> = inner
+            .sessions
+            .values()
+            .filter(|session| matches!(session.info.status, PtyStatus::Running))
+            .collect();
+        for session in &running {
+            session.proc.kill();
+        }
+        running.len()
+    }
+
     /// `write` (`pty.ts:254-257`).
     pub fn write(&self, id: &str, data: &str) -> Result<(), PtyError> {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -608,6 +623,20 @@ impl PtyRegistry {
         });
         entries.insert(key, Arc::clone(&service));
         service
+    }
+}
+
+impl PtyRegistry {
+    /// Kill every running terminal in every location (server shutdown).
+    pub fn kill_all(&self) -> usize {
+        let services: Vec<Arc<PtyService>> = self
+            .entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        services.iter().map(|service| service.kill_all()).sum()
     }
 }
 

@@ -486,6 +486,19 @@ impl ConfigLoader {
         Ok((config, directories))
     }
 
+    /// Fail when a global config file does not load. [`ConfigLoader::load`]
+    /// degrades that to an empty config; the host config
+    /// (`config::host::load_host_config`) must not.
+    pub fn check_global(&self, params: &LoadParams) -> Result<(), CoreError> {
+        let auth_env: HashMap<String, String> = params
+            .auth
+            .all()
+            .iter()
+            .map(|p| (p.key.clone(), p.token.clone()))
+            .collect();
+        self.load_global(params, &auth_env).map(|_| ())
+    }
+
     /// The global config dir: seed + merge `config.json`, `opencode.json`,
     /// `opencode.jsonc` (`config.ts:260-293`). Any failure propagates to the
     /// caller, which degrades the whole thing to `{}`.

@@ -588,6 +588,18 @@ pub struct SessionRunState {
     cancels: Mutex<HashMap<String, u64>>,
     /// Told of every cancel, whichever route it came through.
     cancel_listeners: Mutex<Vec<CancelListener>>,
+    /// Work futures started and not yet finished or dropped. A cancelled
+    /// turn leaves the runner at once and winds down afterwards; shutdown
+    /// waits on this, not on the runners.
+    in_flight: Arc<AtomicU64>,
+}
+
+struct InFlight(Arc<AtomicU64>);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 type CancelListener = Arc<dyn Fn(&str) + Send + Sync>;
@@ -603,6 +615,26 @@ impl SessionRunState {
             runners: Mutex::new(HashMap::new()),
             cancels: Mutex::new(HashMap::new()),
             cancel_listeners: Mutex::new(Vec::new()),
+            in_flight: Arc::new(AtomicU64::new(0)),
+        })
+    }
+
+    /// How many turns and shell commands are still executing, including
+    /// cancelled ones that have not finished winding down.
+    pub fn in_flight(&self) -> u64 {
+        self.in_flight.load(Ordering::SeqCst)
+    }
+
+    fn tracked(&self, work: Work<WithParts, SessionError>) -> Work<WithParts, SessionError> {
+        let in_flight = self.in_flight.clone();
+        Arc::new(move || {
+            in_flight.fetch_add(1, Ordering::SeqCst);
+            let guard = InFlight(in_flight.clone());
+            let future = (work)();
+            Box::pin(async move {
+                let _guard = guard;
+                future.await
+            })
         })
     }
 
@@ -667,6 +699,15 @@ impl SessionRunState {
             });
         }
         Ok(())
+    }
+
+    /// The sessions with a turn or shell command running right now.
+    pub fn busy_sessions(&self) -> Vec<String> {
+        self.lock_runners()
+            .iter()
+            .filter(|(_, runner)| runner.busy())
+            .map(|(session_id, _)| session_id.clone())
+            .collect()
     }
 
     /// `cancel` (run-state.ts:60-70).
@@ -741,7 +782,7 @@ impl SessionRunState {
         work: Work<WithParts, SessionError>,
     ) -> Result<WithParts, RunnerError<SessionError>> {
         let runner = self.runner(session_id, on_interrupt);
-        runner.ensure_running(cancel, work).await
+        runner.ensure_running(cancel, self.tracked(work)).await
     }
 
     /// `startShell` (run-state.ts:78-92) — `RunnerBusy` maps to
@@ -755,7 +796,7 @@ impl SessionRunState {
     ) -> Result<WithParts, SessionError> {
         let runner = self.runner(session_id, on_interrupt);
         runner
-            .start_shell(work, ready)
+            .start_shell(self.tracked(work), ready)
             .await
             .map_err(|err| match err {
                 ShellError::Busy(_) => SessionError::Busy(BusyError {

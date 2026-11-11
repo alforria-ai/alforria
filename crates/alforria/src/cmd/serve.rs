@@ -96,9 +96,58 @@ pub fn run(matches: &ArgMatches, ui: &mut Ui, raw: &[OsString]) -> Result<(), Ty
         let username = alforria_server::AuthConfig::from_env().username;
         ui.write_stdout(&credentials_lines(&username, password));
     }
-    // serve.ts:22 `Effect.never` — run until interrupted.
-    runtime.block_on(tokio::signal::ctrl_c()).ok();
+    // serve.ts:22 `Effect.never` — run until told to stop.
+    run_until_stopped(runtime, listener);
     Ok(())
+}
+
+/// Resolves on the first request to stop: SIGTERM (a supervisor) or SIGINT
+/// (ctrl-c) on unix, ctrl-c elsewhere.
+pub async fn stop_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let (Ok(mut terminate), Ok(mut interrupt)) = (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::interrupt()),
+        ) else {
+            let _ = tokio::signal::ctrl_c().await;
+            return "SIGINT";
+        };
+        tokio::select! {
+            _ = terminate.recv() => "SIGTERM",
+            _ = interrupt.recv() => "SIGINT",
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        "ctrl-c"
+    }
+}
+
+/// Serve until a stop signal, then shut down the way the host config asks
+/// (`server.shutdown`): running turns are settled, their processes killed
+/// and the database checkpointed before the process exits 0. A second
+/// signal skips the wait.
+pub fn run_until_stopped(runtime: tokio::runtime::Runtime, listener: alforria_server::Listener) {
+    runtime.block_on(async {
+        let signal = stop_signal().await;
+        let options = listener.shutdown_options();
+        tracing::info!(signal, timeout = ?options.timeout, "shutting down");
+        tokio::select! {
+            report = listener.shutdown(options) => {
+                tracing::info!(?report, "shutdown complete");
+            }
+            signal = stop_signal() => {
+                tracing::warn!(signal, "second signal: exiting without waiting");
+                alforria_core::process_group::kill_all();
+            }
+        }
+    });
+    // Whatever is still blocked on a thread (a tool's file read, a pipe
+    // reader) must not hold the exit.
+    runtime.shutdown_timeout(std::time::Duration::from_secs(1));
 }
 
 #[cfg(test)]
