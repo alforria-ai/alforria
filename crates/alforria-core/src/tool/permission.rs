@@ -193,6 +193,22 @@ impl Policy {
         answer
     }
 
+    /// Whether every reading holds a rule written for exactly `permission`
+    /// (not a wildcard that happens to cover it) that allows `pattern`: an
+    /// explicit grant, for the permissions that must be opted into.
+    pub fn explicitly_allows(&self, permission: &str, pattern: &str) -> bool {
+        let granted = |rules: &Ruleset| {
+            rules
+                .iter()
+                .rev()
+                .find(|rule| {
+                    rule.permission == permission && wildcard_match(pattern, &rule.pattern)
+                })
+                .is_some_and(|rule| rule.action == PermissionV1Action::Allow)
+        };
+        granted(&self.written) && self.ceilings.iter().all(|ceiling| granted(&ceiling.rules))
+    }
+
     /// `disabled` (permission/index.ts:204-211) over every reading: a tool
     /// one of them denies outright is not offered.
     pub fn disabled(&self, tools: &[&str]) -> std::collections::HashSet<String> {

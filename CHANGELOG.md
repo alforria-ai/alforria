@@ -318,6 +318,24 @@ pre-1.0, so minor releases may include breaking changes.
 
 ### Changed
 
+- A host or managed `permission` rule is a ceiling: a project's
+  `permission` or `agent.<name>.permission` can narrow it and no longer
+  widens it (upstream's last-match-wins let a project file overrule a host
+  `deny`). Installs whose own config sets no `ask`/`deny` see no difference.
+- On a server with `server.auth.bearer` configured, a project's or a remote
+  config keeps only keys that cannot carry a capability; `permission`, `mcp`,
+  `plugin`, `lsp`, `formatter`, `instructions`, provider options and the like
+  are dropped with a warning unless the host lists them in
+  `server.trust.project_keys`. Standalone installs are unchanged. See
+  `docs/unattended-server.md`.
+- A restricted session, or one that has read outside content, cannot write
+  `opencode.json`, `.opencode/`, `AGENTS.md` and the other loader files with
+  its edit tools (`permission.edit_loader: "allow"` in the host config hands
+  it back).
+- When the global config does not load, a project's capability-bearing keys
+  are not applied until it does (the load itself still degrades to defaults,
+  as before).
+
 - `{env:NAME}` and `{file:path}` in a **project's** `opencode.json` /
   `.opencode/` (and in a remote config) are confined. `{env:}` no longer
   reads a variable the shell environment policy withholds — the server

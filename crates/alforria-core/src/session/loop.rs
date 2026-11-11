@@ -661,6 +661,9 @@ pub async fn run_loop(
                     bypass_agent_check,
                     prompt_ops: deps.prompt_ops.clone(),
                     cancel: cancel.clone(),
+                    // A restriction that cannot be read counts as one.
+                    guard_loader_paths: crate::session::store::carries_untrusted_input(&session)
+                        || deps.sessions.is_restricted(&session.id).unwrap_or(true),
                 },
             )
             .await?;

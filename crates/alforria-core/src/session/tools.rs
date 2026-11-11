@@ -46,6 +46,9 @@ pub struct ResolveInput<'a> {
     pub prompt_ops: Arc<dyn TaskOps>,
     /// The loop's abort signal (TS `options.abortSignal`).
     pub cancel: CancellationToken,
+    /// The session is restricted or has seen outside content: its edit
+    /// tools refuse loader paths (`PermissionAdapter::loader_guard`).
+    pub guard_loader_paths: bool,
 }
 
 pub struct ResolveDeps {
@@ -126,6 +129,7 @@ pub async fn resolve(
         Some(permission) => input.agent.permission.extended(permission),
         None => input.agent.permission.clone(),
     };
+    let loader_guard = input.guard_loader_paths.then(|| deps.instance.clone());
     // Shared by every tool's closure: one copy of the history, not one per
     // tool.
     let messages: Arc<Vec<Value>> = Arc::new(
@@ -156,6 +160,7 @@ pub async fn resolve(
         let bypass_agent_check = input.bypass_agent_check;
         let messages = messages.clone();
         let ruleset = ruleset.clone();
+        let loader_guard = loader_guard.clone();
         let model_value = model_value.clone();
         let session_id = session_id.clone();
         let message_id = message_id.clone();
@@ -177,6 +182,7 @@ pub async fn resolve(
                 let bypass_agent_check = bypass_agent_check;
                 let messages = messages.clone();
                 let ruleset = ruleset.clone();
+                let loader_guard = loader_guard.clone();
                 let model_value = model_value.clone();
                 let session_id = session_id.clone();
                 let message_id = message_id.clone();
@@ -187,6 +193,7 @@ pub async fn resolve(
                         message_id: message_id.clone(),
                         call_id: call_id.clone(),
                         ruleset: ruleset.clone(),
+                        loader_guard: loader_guard.clone(),
                     };
                     let sink = MetadataAdapter {
                         processor: processor.clone(),
@@ -323,6 +330,9 @@ pub async fn resolve(
                             message_id: message_id.clone(),
                             call_id: call_id.clone(),
                             ruleset: ruleset.clone(),
+                            // An MCP tool asks under its own key, never
+                            // `edit`.
+                            loader_guard: None,
                         };
                         ask.ask(AskRequest {
                             permission: key.clone(),
@@ -522,6 +532,13 @@ struct PermissionAdapter {
     message_id: String,
     call_id: String,
     ruleset: crate::tool::permission::Policy,
+    /// Set for a session that is restricted or has seen outside content:
+    /// its edit tools do not write the files the loaders act on — config,
+    /// instructions, agents, commands, skills, workflows, git hooks
+    /// (`project_files`, the names the upload route refuses too) — unless
+    /// the operator's policy grants `edit_loader`. Otherwise an `edit`
+    /// allow is enough to rewrite the policy the next instance loads.
+    loader_guard: Option<InstanceContext>,
 }
 
 impl Ask for PermissionAdapter {
@@ -530,6 +547,29 @@ impl Ask for PermissionAdapter {
         request: AskRequest,
     ) -> crate::tool::def::BoxFuture<'a, Result<(), crate::tool::error::ToolError>> {
         Box::pin(async move {
+            if let (Some(instance), "edit") = (&self.loader_guard, request.permission.as_str()) {
+                use crate::project_files::{edit_targets_loader_path, EDIT_LOADER_PERMISSION};
+                for pattern in &request.patterns {
+                    let loader = edit_targets_loader_path(
+                        &instance.directory,
+                        &instance.worktree,
+                        std::path::Path::new(pattern),
+                    );
+                    if loader
+                        && !self
+                            .ruleset
+                            .explicitly_allows(EDIT_LOADER_PERMISSION, pattern)
+                    {
+                        return Err(crate::tool::error::ToolError::Permission(format!(
+                            "{pattern} is a file the agent's own configuration is loaded from \
+                             (config, instructions, agents, commands, skills, workflows, git \
+                             hooks). This session is restricted or has read outside content, so \
+                             it may not write it; the operator can allow it with the \
+                             `{EDIT_LOADER_PERMISSION}` permission in the host config."
+                        )));
+                    }
+                }
+            }
             self.permission
                 .ask(PermissionAsk {
                     session_id: self.session_id.clone(),
@@ -942,6 +982,7 @@ mod mcp_tests {
             bypass_agent_check: false,
             prompt_ops: Arc::new(NoTaskOps),
             cancel: CancellationToken::new(),
+            guard_loader_paths: false,
         };
         let tools = resolve(&deps, input).await.expect("resolve succeeds");
         let tool = tools

@@ -22,7 +22,9 @@ must not be one of the things it can edit.
 
 Unlike the per-project config, a host config file that does not parse is an
 error: `alforria serve` and `alforria web` refuse to listen rather than run
-with a policy other than the one written down.
+with a policy other than the one written down. Project config is treated as
+restricted (see `server.trust`) for as long as the host config does not
+load.
 
 Which key is read from where is one table for every alforria key,
 `EXTENSION_KEYS` in `crates/alforria-core/src/config/precedence.rs`; the
@@ -449,23 +451,81 @@ which of the three it is, or it does not compile.
   unattended agent that is usually the point; when it is not, set `bash`
   (and `edit`, `webfetch`, …) to `ask` or `deny` and decide who holds tokens
   that can answer.
-- **`edit` / `write` permission on the project includes the project's own
-  config and instructions.** The model can write `opencode.json`,
-  `.opencode/` (agents, commands with inline shell), `AGENTS.md`,
-  `.claude/` skills and workflows or `.git/hooks` with its ordinary tools
-  whenever the policy lets it edit files there, and the next instance of that
-  project loads them. The upload route refuses these names to tokens below
-  `admin`; the agent's tools are governed by the `permission` config, which
-  is the operator's to write. To keep project files from carrying policy at
-  all:
-  - put the policy in the managed config directory (`/etc/opencode`), which
-    is merged last and wins over anything in the project, and which the
-    agent's user should not be able to write;
-  - or set `OPENCODE_DISABLE_PROJECT_CONFIG=1`, so project `opencode.json`
-    files and `.opencode/` directories are not loaded at all;
-  - and deny `edit` on those paths in the `permission` config.
+- **The host's `permission` is a ceiling, not an earlier entry in a list.**
+  Upstream evaluates one last-match-wins list in which a project's
+  `agent.<name>.permission` comes after the host's rules — so a file in the
+  project overruled a host or managed `deny`. alforria evaluates an agent's
+  rules twice, as every config wrote them and as the host's own config alone
+  has them (the managed directory, the global config directory, `~/.opencode`
+  and `OPENCODE_CONFIG*`), and answers with the stricter: deny over ask over
+  allow. A project's or a remote config can narrow a permission; it cannot
+  widen one. (The managed directory is still merged last, which decides
+  between two *host* files; it was never what stopped a project.) Rule lists
+  the API shows are a flat rendering of this, never more permissive than it;
+  the server decides by the policy (`tool::permission::Policy`).
+- **On a server with bearer auth, project config is restricted.** The
+  project directory is the agent's workspace: it can write `opencode.json`
+  and `.opencode/`, and a clone brings its own. When `server.auth.bearer` is
+  configured (or `server.trust.project` is `"restricted"`, or the host config
+  cannot be read) a project's or a remote config keeps only keys that cannot
+  carry a capability — see `server.trust` below. Everything else is dropped
+  with a warning naming the file.
+- **A restricted session, or one that has read outside content, does not
+  write loader files.** `opencode.json`, `.opencode/`, `AGENTS.md`,
+  `CLAUDE.md`, `.claude/`, `.agents/`, `.git/` — the names the upload route
+  refuses, from the same constants — are refused to its `edit`, `write` and
+  `apply_patch` tools whatever the `edit` permission says, judged on where
+  the path really leads. `"permission": { "edit_loader": "allow" }` in the
+  host config hands it back. The operator's own sessions write them as
+  before, and `bash`, where it is allowed, writes anything the server's user
+  can: deny or ask about `bash` if that matters.
 - The host config (`server.*`, `shell_env`, `hook.*`) is never read from the
   project, whatever the agent writes there.
+
+#### `server.trust` (host)
+
+```jsonc
+{
+  "server": {
+    "trust": {
+      // "restricted" | "full". Default: "restricted" when server.auth.bearer
+      // is configured, "full" otherwise.
+      "project": "restricted",
+      // Keys a restricted project config may set after all: dotted paths,
+      // `*` for any one name.
+      "project_keys": ["mcp", "agent.*.permission"],
+      // Environment variables {env:NAME} (and ${NAME} in a base URL) may
+      // read from a project config.
+      "project_env": ["MY_PROJECT_REGION"],
+      // "managed": host keys are read from the managed directory only.
+      // Honoured only when the managed directory itself says it.
+      "host": "managed"
+    }
+  }
+}
+```
+
+| | Full (standalone default) | Restricted (bearer default) |
+| --- | --- | --- |
+| Open keys — `model`, `small_model`, `default_agent`, `username`, `logLevel`, `layout`, `snapshot`, `watcher`, `attachment`, `tool_output`, `disabled_providers`, `enabled_providers`, `command.*` (template without inline shell, description, agent, model, variant, subtask), `agent.*` (name, model, variant, temperature, top_p, prompt, description, mode, hidden, color, steps, maxSteps, disable), `provider.*` (name, id, whitelist, blacklist) and `provider.*.models.*` (id, name, family, release_date, attachment, reasoning, temperature, tool_call, interleaved, cost, limit, modalities, experimental, status), `compaction` (tail_turns, preserve_recent_tokens, reserved, default_context), `prompt`, `tool` | kept | kept |
+| Capability keys — `permission`, `tools`, `agent.*.permission` / `.tools` / `.options`, `mode` rules, `mcp`, `lsp`, `formatter`, `plugin`, `shell`, `instructions`, `skills`, `workflows`, `references`, `provider.*.api` / `.npm` / `.env` / `.options`, `provider.*.models.*.provider` / `.options` / `.headers` / `.variants`, `enterprise`, `share`, `autoshare`, `autoupdate`, `subagent_depth`, `compaction.auto` / `.prune`, `experimental`, upstream `server.*`, a `command` with inline shell | kept (permission rules under the host's ceiling) | dropped unless listed in `project_keys` |
+| A key no table names | kept | dropped |
+| `{env:NAME}` in a project or remote config | refused for names the shell environment policy withholds and for `auth.json` credentials, unless in `project_env` | only names in `project_env` |
+| `{file:path}` in a project config | a relative path that stays inside the project, opened beneath it in one resolution; anything else is a config error. Never in a remote config | same |
+| `${NAME}` in a provider base URL | expanded once at load under the `{env:}` rule; a refused name is a config error. At request time only a URL the host's config or the model catalog wrote is expanded | same |
+
+The classification is `UPSTREAM_KEYS` (beside `EXTENSION_KEYS`) in
+`crates/alforria-core/src/config/precedence.rs`; a schema key in neither
+table fails `every_schema_key_is_classified`. Markdown agents, commands and
+modes under a project's `.opencode/` go through the same tables as its JSON.
+
+**Where the host config itself lives matters.** `~/.config/alforria`,
+`~/.opencode` and the data directory are host locations; if a directory the
+agent may write contains one (a project at `$HOME`, or `bash` allowed there),
+the agent can write host config. For an unattended deployment put the policy
+in the managed directory (`/etc/opencode`), owned by another user, and set
+`"server": { "trust": { "host": "managed" } }` there: the user's files then
+carry no host key at all.
 
 ### Turns nobody requests, and callers that are not people
 

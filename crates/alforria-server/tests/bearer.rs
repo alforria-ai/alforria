@@ -2250,3 +2250,78 @@ async fn an_inner_id_from_another_session_is_never_acted_on() {
         StatusCode::OK
     );
 }
+
+/// The `write` tool, asked to create one file.
+fn write_turn(path: &str) -> support::Script {
+    support::tool_turn(
+        "call_w",
+        "write",
+        json!({ "filePath": path, "content": "{ \"permission\": { \"bash\": \"allow\" } }\n" }),
+    )
+}
+
+/// The agent's own edit tools do not write the files its configuration is
+/// loaded from when the session is restricted: an `edit` allow used to be
+/// enough for a chat token's session to rewrite `opencode.json`, an agent
+/// or `AGENTS.md`, and the next instance of the project loaded it. The
+/// operator's own session writes them as before, and `edit_loader` in the
+/// host config hands the write back.
+#[tokio::test]
+async fn a_restricted_sessions_edit_tools_refuse_loader_paths() {
+    let signer = Signer::new();
+    let targets = [
+        "opencode.json",
+        ".opencode/agent/sneaky.md",
+        "AGENTS.md",
+        "notes.txt",
+    ];
+    let scripts = || -> Vec<support::Script> {
+        targets
+            .iter()
+            .flat_map(|target| [write_turn(target), support::text_turn("done")])
+            .collect()
+    };
+    let drive = |f: Fixture, auth: String| async move {
+        for target in targets {
+            let session = create_session(&f, &f.dirs.repo, &auth).await;
+            let response = call(
+                &f.router,
+                "POST",
+                &format!("/session/{session}/prompt_async"),
+                Some(&auth),
+                Some(json!({ "parts": [{ "type": "text", "text": format!("write {target}") }] })),
+            )
+            .await;
+            assert!(response.status().is_success(), "{}", response.status());
+            wait_idle(&f, &session).await;
+        }
+        let written: Vec<bool> = targets
+            .iter()
+            .map(|target| f.dirs.repo.join(target).exists())
+            .collect();
+        (f, written)
+    };
+
+    // A chat token's session is restricted.
+    let f = fixture_with(host_config(&signer), Some(PASSWORD), scripts());
+    let chat = bearer(&signer.token(AUDIENCE, "chat"));
+    let (f, written) = drive(f, chat.clone()).await;
+    assert_eq!(written, [false, false, false, true], "{targets:?}");
+    drop(f);
+
+    // The operator's session is not.
+    let f = fixture_with(host_config(&signer), Some(PASSWORD), scripts());
+    let (f, written) = drive(f, basic()).await;
+    assert_eq!(written, [true, true, true, true], "{targets:?}");
+    drop(f);
+
+    // The operator's policy can grant it to restricted sessions.
+    let granting = |dirs: &Dirs| {
+        let mut config = host_config(&signer)(dirs);
+        config["permission"] = json!({ "edit_loader": "allow" });
+        config
+    };
+    let f = fixture_with(granting, Some(PASSWORD), scripts());
+    let (_f, written) = drive(f, chat).await;
+    assert_eq!(written, [true, true, true, true], "{targets:?}");
+}

@@ -72,9 +72,80 @@ pub fn is_loader_path(relative: &Path) -> bool {
     })
 }
 
+/// The permission an operator grants to let a restricted or
+/// outside-input session edit loader paths after all
+/// (`"permission": { "edit_loader": "allow" }` in the host config).
+pub const EDIT_LOADER_PERMISSION: &str = "edit_loader";
+
+/// Whether `target` — a path an edit tool is about to write, absolute or
+/// relative to `worktree` — is a loader path of the project at `directory`
+/// / `worktree`. Judged on where the path really leads (every existing
+/// symlink followed), and on its spelling too: `link/agent/x.md` with
+/// `link -> .opencode` is one, and so is `.opencode/x` through any alias of
+/// the project. A path that leaves the project is not this check's
+/// business (`external_directory` asks about it).
+pub fn edit_targets_loader_path(directory: &Path, worktree: &Path, target: &Path) -> bool {
+    use crate::tool::external_directory::real_path;
+    let base = if worktree.as_os_str().is_empty() || worktree == Path::new("/") {
+        directory
+    } else {
+        worktree
+    };
+    let absolute = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        base.join(target)
+    };
+    let lexical = crate::git::lexical_normalize(&absolute);
+    let real = real_path(&absolute);
+    [directory, base].iter().any(|root| {
+        let spelled = lexical
+            .strip_prefix(crate::git::lexical_normalize(root))
+            .is_ok_and(is_loader_path);
+        let resolved = real.strip_prefix(real_path(root)).is_ok_and(is_loader_path);
+        spelled || resolved
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_edit_target_is_judged_on_where_it_leads() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap().join("project");
+        std::fs::create_dir_all(root.join(".opencode/agent")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let loader = |target: &str| edit_targets_loader_path(&root, &root, Path::new(target));
+        for target in [
+            "opencode.json",
+            ".opencode/agent/new.md",
+            "src/../AGENTS.md",
+            "docs/CLAUDE.md",
+            ".git/hooks/pre-commit",
+            root.join(".opencode/command/x.md").to_str().unwrap(),
+        ] {
+            assert!(loader(target), "{target}");
+        }
+        for target in [
+            "src/main.rs",
+            "notes.md",
+            "/etc/passwd",
+            "../other/opencode.json",
+        ] {
+            assert!(!loader(target), "{target}");
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.join(".opencode"), root.join("link")).unwrap();
+            assert!(loader("link/agent/x.md"));
+            // The project reached through an alias of its own directory.
+            std::os::unix::fs::symlink(&root, dir.path().join("alias")).unwrap();
+            let alias = std::fs::canonicalize(dir.path()).unwrap().join("alias");
+            assert!(loader(alias.join("opencode.json").to_str().unwrap()));
+        }
+    }
 
     #[test]
     fn loader_paths_match_at_any_depth_and_in_any_case() {
