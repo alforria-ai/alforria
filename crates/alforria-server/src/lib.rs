@@ -87,6 +87,9 @@ pub struct Listener {
     pub hostname: String,
     pub port: u16,
     pub url: String,
+    /// What the operator should know about this configuration
+    /// ([`startup_warnings`]); `serve` prints them.
+    pub warnings: Vec<String>,
     websockets: state::WebSocketTracker,
     shutdown: tokio::sync::watch::Sender<bool>,
     task: tokio::task::JoinHandle<io::Result<()>>,
@@ -206,16 +209,45 @@ pub async fn listen_with(opts: &ListenOptions, ctx: Arc<ServerContext>) -> io::R
     // Webhook deliveries, including whatever an earlier process left.
     tokio::spawn(ctx.outbox.clone().run());
 
+    let warnings = startup_warnings(&ctx);
+    for warning in &warnings {
+        tracing::warn!("{warning}");
+    }
     let hostname = opts.hostname.clone();
     Ok(Listener {
         hostname,
         port,
         url,
+        warnings,
         websockets: ctx.websockets.clone(),
         shutdown,
         task,
         ctx,
     })
+}
+
+/// Configurations that work but probably do not mean what the operator
+/// thinks.
+///
+/// Bearer authentication with a working directory outside
+/// `server.directories`: alforria's own routes (`/trigger`, `/memory`,
+/// `/workflow`, `/file/*`) fall back to the working directory when a request
+/// names none, and a credential below `admin` is refused there — every such
+/// request must name an allowed directory. The server still starts: the
+/// working directory is simply not available to those credentials.
+pub fn startup_warnings(ctx: &ServerContext) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let cwd = state::resolve_directory(&state::cwd());
+    if ctx.policy.bearer.is_some() && !ctx.policy.directories.allows(&cwd) {
+        warnings.push(format!(
+            "bearer authentication is configured and the working directory ({}) is not in \
+             server.directories: tokens below `admin` cannot use it, and requests to /trigger, \
+             /memory, /workflow and /file/* that name no directory are refused for them. Start \
+             the server in an allowed directory or have clients pass ?directory=.",
+            cwd.display()
+        ));
+    }
+    warnings
 }
 
 /// Bind a server with a fresh environment-derived context.

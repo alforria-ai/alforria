@@ -7,6 +7,7 @@
 pub mod auth;
 pub mod compression;
 pub mod cors;
+pub mod directory;
 pub mod fence;
 pub mod host;
 pub mod location;

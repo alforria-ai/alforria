@@ -30,6 +30,7 @@ use axum::response::{IntoResponse, Response};
 use tower::Service;
 
 use crate::middleware::auth::{query_param, route_matches, routes};
+use crate::middleware::directory;
 use crate::routes::{v1, v2};
 use crate::state::ServerContext;
 
@@ -154,44 +155,6 @@ fn is_workspace_id(value: &str) -> bool {
 /// (`packages/schema/src/session-id.ts:4`).
 fn is_session_id(value: &str) -> bool {
     value.starts_with("ses")
-}
-
-/// `decodeURIComponent` — `None` on malformed percent escapes or invalid
-/// UTF-8.
-fn decode_uri_component(input: &str) -> Result<String, ()> {
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' {
-            if i + 2 >= bytes.len() {
-                return Err(());
-            }
-            let (Some(hi), Some(lo)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) else {
-                return Err(());
-            };
-            out.push(hi * 16 + lo);
-            i += 3;
-        } else {
-            out.push(bytes[i]);
-            i += 1;
-        }
-    }
-    String::from_utf8(out).map_err(|_| ())
-}
-
-fn hex(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
-}
-
-/// Best-effort `decode()` (`instance-context.ts:15-21`, `location.ts:41-47`).
-fn decode_best_effort(input: &str) -> String {
-    decode_uri_component(input).unwrap_or_else(|_| input.to_string())
 }
 
 /// `missingWorkspaceResponse` (`workspace-routing.ts:102-107`).
@@ -451,13 +414,13 @@ impl<S> LocationService<S> {
         }
 
         // Local plan (`:181-184`): the route session's directory wins.
-        let directory = session
-            .filter(|session| !session.directory.is_empty())
-            .map(|session| session.directory)
-            .unwrap_or_else(|| default_directory(query, req.headers()));
         // `provideInstanceContext` decodes the resolved directory
-        // (`instance-context.ts:15-21`).
-        let directory = decode_best_effort(&directory);
+        // (`instance-context.ts:15-21`). A request-named one comes from the
+        // single resolver the allowlist gate validated.
+        let directory = match session.filter(|session| !session.directory.is_empty()) {
+            Some(session) => directory::decode(&session.directory),
+            None => directory::resolve(directory::Family::V1, query, req.headers()).raw,
+        };
         let services = self.load(req, &directory)?;
         Ok(LocationContext {
             directory: crate::state::resolve_directory(Path::new(&directory)),
@@ -495,14 +458,9 @@ impl<S> LocationService<S> {
             Some(_) => return Err(Rejection::Defect),
             None => None,
         };
-        let directory = match non_empty(query_param(query, "location[directory]")) {
-            Some(directory) => directory,
-            None => match non_empty(header_value(req.headers(), "x-opencode-directory")) {
-                // An empty header is falsy — cwd applies (`:33`).
-                Some(directory) => decode_best_effort(&directory),
-                None => crate::state::cwd().display().to_string(),
-            },
-        };
+        // `location[directory]`, else the header, else cwd (`:33`): the
+        // single resolver the allowlist gate validated.
+        let directory = directory::resolve(directory::Family::V2, query, req.headers()).raw;
         let services = self.load(req, &directory)?;
         Ok(LocationContext {
             directory: crate::state::resolve_directory(Path::new(&directory)),
@@ -542,47 +500,9 @@ impl<S> LocationService<S> {
     }
 }
 
-/// `defaultDirectory` (`workspace-routing.ts:86-88`).
-/// The directory a request names, resolved the way the v1 location
-/// resolves it when no session routes the request: `?directory=`, else the
-/// `x-opencode-directory` header, else the working directory. alforria's own
-/// routes outside the frozen tables resolve their project through this.
-pub(crate) fn request_directory(query: Option<&str>, headers: &HeaderMap) -> PathBuf {
-    let directory = decode_best_effort(&default_directory(query, headers));
-    crate::state::resolve_directory(Path::new(&directory))
-}
-
-fn default_directory(query: Option<&str>, headers: &HeaderMap) -> String {
-    non_empty(query_param(query, "directory"))
-        .or_else(|| header_value(headers, "x-opencode-directory"))
-        .unwrap_or_else(|| crate::state::cwd().display().to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn decode_uri_component_matrix() {
-        assert_eq!(decode_uri_component("/a%20b").as_deref(), Ok("/a b"));
-        assert_eq!(
-            decode_uri_component("%2Frepo%2Fx").as_deref(),
-            Ok("/repo/x")
-        );
-        assert!(decode_uri_component("%").is_err());
-        assert!(decode_uri_component("%zz").is_err());
-        assert!(decode_uri_component("%2").is_err());
-        // Invalid UTF-8.
-        assert!(decode_uri_component("%ff%fe").is_err());
-        // `+` is *not* decoded to space (decodeURIComponent, not form).
-        assert_eq!(decode_uri_component("a+b").as_deref(), Ok("a+b"));
-    }
-
-    #[test]
-    fn decode_best_effort_keeps_malformed_input() {
-        assert_eq!(decode_best_effort("/a%20b"), "/a b");
-        assert_eq!(decode_best_effort("/a%"), "/a%");
-    }
 
     #[test]
     fn workspace_route_session_id_matrix() {

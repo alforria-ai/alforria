@@ -39,7 +39,6 @@
 //! whoever sends it: the run is read-only and marked, whatever credential
 //! called.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::body::Bytes;
@@ -56,8 +55,9 @@ use alforria_core::CoreError;
 
 use crate::bearer::Principal;
 use crate::error::{ApiError, ServerError};
+use crate::middleware::directory::RequestDirectory;
 use crate::middleware::location::LocationContext;
-use crate::state::{resolve_directory, ServerContext};
+use crate::state::ServerContext;
 
 pub fn register(router: Router<Arc<ServerContext>>) -> Router<Arc<ServerContext>> {
     router
@@ -68,11 +68,13 @@ pub fn register(router: Router<Arc<ServerContext>>) -> Router<Arc<ServerContext>
         .route("/trigger/{id}/runs", get(runs))
 }
 
-fn triggers(ctx: &ServerContext, uri: &Uri) -> Result<Arc<TriggerService>, ServerError> {
-    let directory = crate::middleware::auth::query_param(uri.query(), "directory")
-        .map(PathBuf::from)
-        .unwrap_or_else(crate::state::cwd);
-    let directory = resolve_directory(&directory);
+fn triggers(
+    ctx: &ServerContext,
+    directory: &RequestDirectory,
+) -> Result<Arc<TriggerService>, ServerError> {
+    // The directory the auth layer resolved and the allowlist admitted
+    // (`middleware::directory`): a handler never reads it off the request.
+    let directory = directory.0.clone();
     let services = ctx.instances.load(&directory)?;
     let location = LocationContext {
         directory,
@@ -134,20 +136,20 @@ fn check_fields(restricted: bool, body: &Value) -> Result<(), ServerError> {
 
 async fn list(
     State(ctx): State<Arc<ServerContext>>,
-    uri: Uri,
+    axum::Extension(directory): axum::Extension<RequestDirectory>,
 ) -> Result<Json<Vec<TriggerRecord>>, ServerError> {
-    Ok(Json(triggers(&ctx, &uri)?.list()))
+    Ok(Json(triggers(&ctx, &directory)?.list()))
 }
 
 async fn create(
     State(ctx): State<Arc<ServerContext>>,
     principal: Option<axum::Extension<Principal>>,
-    uri: Uri,
+    axum::Extension(directory): axum::Extension<RequestDirectory>,
     Json(mut body): Json<Value>,
 ) -> Result<Json<TriggerRecord>, ServerError> {
     let restricted = crate::confine::restricted(&principal);
     check_fields(restricted, &body)?;
-    let service = triggers(&ctx, &uri)?;
+    let service = triggers(&ctx, &directory)?;
     let id = match body.as_object_mut().and_then(|object| object.remove("id")) {
         None | Some(Value::Null) => None,
         Some(Value::String(id)) => Some(id),
@@ -171,10 +173,10 @@ async fn create(
 
 async fn read(
     State(ctx): State<Arc<ServerContext>>,
-    uri: Uri,
+    axum::Extension(directory): axum::Extension<RequestDirectory>,
     Path(id): Path<String>,
 ) -> Result<Json<TriggerRecord>, ServerError> {
-    triggers(&ctx, &uri)?
+    triggers(&ctx, &directory)?
         .get(&id)
         .map(Json)
         .ok_or_else(|| trigger_error(TriggerError::NotFound(format!("trigger not found: {id}"))))
@@ -183,13 +185,13 @@ async fn read(
 async fn update(
     State(ctx): State<Arc<ServerContext>>,
     principal: Option<axum::Extension<Principal>>,
-    uri: Uri,
+    axum::Extension(directory): axum::Extension<RequestDirectory>,
     Path(id): Path<String>,
     Json(patch): Json<Value>,
 ) -> Result<Json<TriggerRecord>, ServerError> {
     let restricted = crate::confine::restricted(&principal);
     check_fields(restricted, &patch)?;
-    let service = triggers(&ctx, &uri)?;
+    let service = triggers(&ctx, &directory)?;
     service
         .check_actor(&id, restricted)
         .map_err(trigger_error)?;
@@ -199,10 +201,10 @@ async fn update(
 async fn remove(
     State(ctx): State<Arc<ServerContext>>,
     principal: Option<axum::Extension<Principal>>,
-    uri: Uri,
+    axum::Extension(directory): axum::Extension<RequestDirectory>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ServerError> {
-    let service = triggers(&ctx, &uri)?;
+    let service = triggers(&ctx, &directory)?;
     service
         .check_actor(&id, crate::confine::restricted(&principal))
         .map_err(trigger_error)?;
@@ -213,10 +215,10 @@ async fn remove(
 async fn run(
     State(ctx): State<Arc<ServerContext>>,
     principal: Option<axum::Extension<Principal>>,
-    uri: Uri,
+    axum::Extension(directory): axum::Extension<RequestDirectory>,
     Path(id): Path<String>,
 ) -> Result<Json<TriggerRun>, ServerError> {
-    let service = triggers(&ctx, &uri)?;
+    let service = triggers(&ctx, &directory)?;
     // Firing a trigger starts a turn with the rights of whoever created
     // it: a caller below `admin` fires its own kind only.
     service
@@ -227,11 +229,11 @@ async fn run(
 
 async fn hook(
     State(ctx): State<Arc<ServerContext>>,
-    uri: Uri,
+    axum::Extension(directory): axum::Extension<RequestDirectory>,
     Path(id): Path<String>,
     body: Bytes,
 ) -> Result<Json<TriggerRun>, ServerError> {
-    triggers(&ctx, &uri)?
+    triggers(&ctx, &directory)?
         .hook(&id, &body)
         .map(Json)
         .map_err(trigger_error)
@@ -240,12 +242,13 @@ async fn hook(
 async fn runs(
     State(ctx): State<Arc<ServerContext>>,
     uri: Uri,
+    axum::Extension(directory): axum::Extension<RequestDirectory>,
     Path(id): Path<String>,
 ) -> Result<Json<Vec<TriggerRun>>, ServerError> {
     let limit = crate::middleware::auth::query_param(uri.query(), "limit")
         .and_then(|limit| limit.parse::<usize>().ok())
         .unwrap_or(50);
-    triggers(&ctx, &uri)?
+    triggers(&ctx, &directory)?
         .runs(&id, limit)
         .map(Json)
         .map_err(trigger_error)

@@ -13,11 +13,9 @@
 //! - `POST   /workflow/run/{runID}/wait`      wait for completion
 //! - `POST   /workflow/run/{runID}/abort`     stop a run
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
-use axum::http::Uri;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
@@ -27,8 +25,9 @@ use alforria_schema::workflow::{
 };
 
 use crate::error::ServerError;
+use crate::middleware::directory::RequestDirectory;
 use crate::middleware::location::LocationContext;
-use crate::state::{resolve_directory, ServerContext, SessionEngine};
+use crate::state::{ServerContext, SessionEngine};
 
 pub fn register(router: Router<Arc<ServerContext>>) -> Router<Arc<ServerContext>> {
     router
@@ -40,11 +39,13 @@ pub fn register(router: Router<Arc<ServerContext>>) -> Router<Arc<ServerContext>
         .route("/workflow/{name}", delete(remove))
 }
 
-fn engine(ctx: &ServerContext, uri: &Uri) -> Result<Arc<dyn SessionEngine>, ServerError> {
-    let directory = crate::middleware::auth::query_param(uri.query(), "directory")
-        .map(PathBuf::from)
-        .unwrap_or_else(crate::state::cwd);
-    let directory = resolve_directory(&directory);
+fn engine(
+    ctx: &ServerContext,
+    directory: &RequestDirectory,
+) -> Result<Arc<dyn SessionEngine>, ServerError> {
+    // The directory the auth layer resolved and the allowlist admitted
+    // (`middleware::directory`): a handler never reads it off the request.
+    let directory = directory.0.clone();
     let services = ctx.instances.load(&directory)?;
     let location = LocationContext {
         directory,
@@ -56,27 +57,27 @@ fn engine(ctx: &ServerContext, uri: &Uri) -> Result<Arc<dyn SessionEngine>, Serv
 
 async fn list(
     State(ctx): State<Arc<ServerContext>>,
-    uri: Uri,
+    axum::Extension(directory): axum::Extension<RequestDirectory>,
 ) -> Result<Json<Vec<WorkflowDefinition>>, ServerError> {
-    let engine = engine(&ctx, &uri)?;
+    let engine = engine(&ctx, &directory)?;
     Ok(Json(engine.workflow_list().await?))
 }
 
 async fn save(
     State(ctx): State<Arc<ServerContext>>,
-    uri: Uri,
+    axum::Extension(directory): axum::Extension<RequestDirectory>,
     Json(request): Json<WorkflowSaveRequest>,
 ) -> Result<Json<WorkflowDefinition>, ServerError> {
-    let engine = engine(&ctx, &uri)?;
+    let engine = engine(&ctx, &directory)?;
     Ok(Json(engine.workflow_save(request)?))
 }
 
 async fn remove(
     State(ctx): State<Arc<ServerContext>>,
-    uri: Uri,
+    axum::Extension(directory): axum::Extension<RequestDirectory>,
     Path(name): Path<String>,
 ) -> Result<Json<Value>, ServerError> {
-    let engine = engine(&ctx, &uri)?;
+    let engine = engine(&ctx, &directory)?;
     Ok(Json(json!({ "deleted": engine.workflow_delete(name)? })))
 }
 
@@ -84,9 +85,9 @@ async fn remove(
 /// `/workflow/run` route wins over the parameter one.
 async fn remove_run(
     State(ctx): State<Arc<ServerContext>>,
-    uri: Uri,
+    axum::Extension(directory): axum::Extension<RequestDirectory>,
 ) -> Result<Json<Value>, ServerError> {
-    let engine = engine(&ctx, &uri)?;
+    let engine = engine(&ctx, &directory)?;
     Ok(Json(
         json!({ "deleted": engine.workflow_delete("run".to_string())? }),
     ))
@@ -94,45 +95,45 @@ async fn remove_run(
 
 async fn runs(
     State(ctx): State<Arc<ServerContext>>,
-    uri: Uri,
+    axum::Extension(directory): axum::Extension<RequestDirectory>,
 ) -> Result<Json<Vec<WorkflowRun>>, ServerError> {
-    let engine = engine(&ctx, &uri)?;
+    let engine = engine(&ctx, &directory)?;
     Ok(Json(engine.workflow_runs().await?))
 }
 
 async fn start(
     State(ctx): State<Arc<ServerContext>>,
-    uri: Uri,
+    axum::Extension(directory): axum::Extension<RequestDirectory>,
     Json(request): Json<WorkflowStartRequest>,
 ) -> Result<Json<WorkflowRun>, ServerError> {
-    let engine = engine(&ctx, &uri)?;
+    let engine = engine(&ctx, &directory)?;
     let run = engine.workflow_start(request).await?;
     Ok(Json(run))
 }
 
 async fn run(
     State(ctx): State<Arc<ServerContext>>,
-    uri: Uri,
+    axum::Extension(directory): axum::Extension<RequestDirectory>,
     Path(run_id): Path<String>,
 ) -> Result<Json<Option<WorkflowRun>>, ServerError> {
-    let engine = engine(&ctx, &uri)?;
+    let engine = engine(&ctx, &directory)?;
     Ok(Json(engine.workflow_get(run_id).await?))
 }
 
 async fn wait(
     State(ctx): State<Arc<ServerContext>>,
-    uri: Uri,
+    axum::Extension(directory): axum::Extension<RequestDirectory>,
     Path(run_id): Path<String>,
 ) -> Result<Json<WorkflowRun>, ServerError> {
-    let engine = engine(&ctx, &uri)?;
+    let engine = engine(&ctx, &directory)?;
     Ok(Json(engine.workflow_wait(run_id).await?))
 }
 
 async fn abort(
     State(ctx): State<Arc<ServerContext>>,
-    uri: Uri,
+    axum::Extension(directory): axum::Extension<RequestDirectory>,
     Path(run_id): Path<String>,
 ) -> Result<Json<WorkflowRun>, ServerError> {
-    let engine = engine(&ctx, &uri)?;
+    let engine = engine(&ctx, &directory)?;
     Ok(Json(engine.workflow_abort(run_id).await?))
 }

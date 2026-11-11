@@ -37,7 +37,8 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use crate::bearer::{Principal, Via};
 use crate::error::{ApiError, ServerError};
 use crate::middleware::auth::query_param;
-use crate::middleware::location::{request_directory, LocationContext};
+use crate::middleware::directory::RequestDirectory;
+use crate::middleware::location::LocationContext;
 use crate::state::ServerContext;
 use crate::ticket::{FileScope, FILE_TICKET_MAX_TTL, FILE_TICKET_TTL};
 
@@ -99,13 +100,13 @@ fn too_large(limit: u64) -> FileError {
     )
 }
 
-/// The project a request addresses.
+/// The project a request addresses: the directory the auth layer resolved
+/// and the allowlist admitted (`middleware::directory`).
 fn location(
     ctx: &ServerContext,
-    uri: &Uri,
-    headers: &HeaderMap,
+    directory: &RequestDirectory,
 ) -> Result<LocationContext, ServerError> {
-    let directory = request_directory(uri.query(), headers);
+    let directory = directory.0.clone();
     let services = ctx.instances.load(&directory)?;
     Ok(LocationContext {
         directory,
@@ -194,11 +195,10 @@ struct TicketRequest {
 /// `POST /file/ticket` — mint a read ticket for one existing file.
 async fn ticket(
     State(ctx): State<Arc<ServerContext>>,
-    uri: Uri,
-    headers: HeaderMap,
+    axum::Extension(directory): axum::Extension<RequestDirectory>,
     Json(request): Json<TicketRequest>,
 ) -> Result<Json<serde_json::Value>, FileError> {
-    let location = location(&ctx, &uri, &headers)?;
+    let location = location(&ctx, &directory)?;
     let file = project_file(&location, &request.path)?;
     match std::fs::metadata(&file) {
         Ok(metadata) if metadata.is_file() => {}
@@ -324,9 +324,10 @@ async fn raw(
     State(ctx): State<Arc<ServerContext>>,
     principal: Option<Extension<Principal>>,
     uri: Uri,
+    axum::Extension(directory): axum::Extension<RequestDirectory>,
     headers: HeaderMap,
 ) -> Result<Response, FileError> {
-    let location = location(&ctx, &uri, &headers)?;
+    let location = location(&ctx, &directory)?;
     let file = project_file(&location, &required_path(&uri)?)?;
     check_ticket(&ctx, &principal, &uri, &location, &file)?;
     let metadata = tokio::fs::metadata(&file)
@@ -453,6 +454,7 @@ async fn upload(
     State(ctx): State<Arc<ServerContext>>,
     principal: Option<Extension<Principal>>,
     uri: Uri,
+    axum::Extension(directory): axum::Extension<RequestDirectory>,
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, FileError> {
@@ -464,7 +466,7 @@ async fn upload(
     if declared.is_some_and(|declared| declared > limit) {
         return Err(too_large(limit));
     }
-    let location = location(&ctx, &uri, &headers)?;
+    let location = location(&ctx, &directory)?;
     let path = required_path(&uri)?;
     let target = project_file(&location, &path)?;
     if target.is_dir() {

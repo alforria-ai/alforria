@@ -39,7 +39,6 @@
 //! A record id is looked up within the instance's memory (its project, or
 //! the global one): an id from elsewhere is a 404.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
@@ -57,8 +56,9 @@ use alforria_core::CoreError;
 use crate::bearer::Principal;
 use crate::error::{ApiError, ServerError};
 use crate::middleware::auth::query_param;
+use crate::middleware::directory::RequestDirectory;
 use crate::middleware::location::LocationContext;
-use crate::state::{resolve_directory, ServerContext};
+use crate::state::ServerContext;
 
 pub fn register(router: Router<Arc<ServerContext>>) -> Router<Arc<ServerContext>> {
     router
@@ -68,13 +68,16 @@ pub fn register(router: Router<Arc<ServerContext>>) -> Router<Arc<ServerContext>
         .route("/memory/{id}", get(read).patch(update).delete(remove))
 }
 
-fn memory(ctx: &ServerContext, uri: &Uri) -> Result<(Arc<MemoryService>, String), ServerError> {
-    located(ctx, uri).map(|(memory, project_id, _)| (memory, project_id))
+fn memory(
+    ctx: &ServerContext,
+    directory: &RequestDirectory,
+) -> Result<(Arc<MemoryService>, String), ServerError> {
+    located(ctx, directory).map(|(memory, project_id, _)| (memory, project_id))
 }
 
 fn located(
     ctx: &ServerContext,
-    uri: &Uri,
+    directory: &RequestDirectory,
 ) -> Result<
     (
         Arc<MemoryService>,
@@ -83,10 +86,9 @@ fn located(
     ),
     ServerError,
 > {
-    let directory = query_param(uri.query(), "directory")
-        .map(PathBuf::from)
-        .unwrap_or_else(crate::state::cwd);
-    let directory = resolve_directory(&directory);
+    // The directory the auth layer resolved and the allowlist admitted
+    // (`middleware::directory`): a handler never reads it off the request.
+    let directory = directory.0.clone();
     let services = ctx.instances.load(&directory)?;
     let location = LocationContext {
         directory,
@@ -106,12 +108,12 @@ fn located(
 /// `pattern` outright (see the module docs).
 fn writer(
     ctx: &ServerContext,
-    uri: &Uri,
+    directory: &RequestDirectory,
     principal: &Option<axum::Extension<Principal>>,
     permission: &str,
     pattern: &str,
 ) -> Result<(Arc<MemoryService>, String, Provenance), ServerError> {
-    let (memory, project_id, services) = located(ctx, uri)?;
+    let (memory, project_id, services) = located(ctx, directory)?;
     if !crate::confine::restricted(principal) {
         return Ok((memory, project_id, Provenance::api()));
     }
@@ -167,8 +169,9 @@ fn query_text(uri: &Uri) -> Result<String, ServerError> {
 async fn list(
     State(ctx): State<Arc<ServerContext>>,
     uri: Uri,
+    axum::Extension(directory): axum::Extension<RequestDirectory>,
 ) -> Result<Json<Vec<MemoryRecord>>, ServerError> {
-    let (memory, _) = memory(&ctx, &uri)?;
+    let (memory, _) = memory(&ctx, &directory)?;
     memory
         .list(&ListQuery {
             kind: query_param(uri.query(), "kind"),
@@ -193,10 +196,10 @@ struct CreateBody {
 async fn create(
     State(ctx): State<Arc<ServerContext>>,
     principal: Option<axum::Extension<Principal>>,
-    uri: Uri,
+    axum::Extension(directory): axum::Extension<RequestDirectory>,
     Json(body): Json<CreateBody>,
 ) -> Result<Json<MemoryRecord>, ServerError> {
-    let (memory, _, by) = writer(&ctx, &uri, &principal, "memory", "remember")?;
+    let (memory, _, by) = writer(&ctx, &directory, &principal, "memory", "remember")?;
     memory
         .remember_from(body.kind.as_deref(), &body.content, body.metadata, by)
         .map(Json)
@@ -206,8 +209,9 @@ async fn create(
 async fn search(
     State(ctx): State<Arc<ServerContext>>,
     uri: Uri,
+    axum::Extension(directory): axum::Extension<RequestDirectory>,
 ) -> Result<Json<Vec<MemoryHit>>, ServerError> {
-    let (memory, _) = memory(&ctx, &uri)?;
+    let (memory, _) = memory(&ctx, &directory)?;
     let query = query_text(&uri)?;
     memory
         .search(
@@ -224,9 +228,10 @@ async fn search_sessions(
     State(ctx): State<Arc<ServerContext>>,
     principal: Option<axum::Extension<Principal>>,
     uri: Uri,
+    axum::Extension(directory): axum::Extension<RequestDirectory>,
 ) -> Result<Json<Value>, ServerError> {
     // The tool asks for `session_search` before it reads other sessions.
-    let (memory, project_id, _) = writer(&ctx, &uri, &principal, "session_search", "*")?;
+    let (memory, project_id, _) = writer(&ctx, &directory, &principal, "session_search", "*")?;
     let query = query_text(&uri)?;
     let limit = number(&uri, "limit").unwrap_or(20);
     // The search may index a backlog first: keep it off the runtime.
@@ -241,10 +246,10 @@ async fn search_sessions(
 
 async fn read(
     State(ctx): State<Arc<ServerContext>>,
-    uri: Uri,
+    axum::Extension(directory): axum::Extension<RequestDirectory>,
     Path(id): Path<String>,
 ) -> Result<Json<MemoryRecord>, ServerError> {
-    let (memory, _) = memory(&ctx, &uri)?;
+    let (memory, _) = memory(&ctx, &directory)?;
     memory
         .get(&id)
         .map_err(memory_error)?
@@ -255,11 +260,11 @@ async fn read(
 async fn update(
     State(ctx): State<Arc<ServerContext>>,
     principal: Option<axum::Extension<Principal>>,
-    uri: Uri,
+    axum::Extension(directory): axum::Extension<RequestDirectory>,
     Path(id): Path<String>,
     Json(patch): Json<MemoryPatch>,
 ) -> Result<Json<MemoryRecord>, ServerError> {
-    let (memory, _, by) = writer(&ctx, &uri, &principal, "memory", "update")?;
+    let (memory, _, by) = writer(&ctx, &directory, &principal, "memory", "update")?;
     memory
         .update_by(&id, &patch, &by)
         .map(Json)
@@ -269,10 +274,10 @@ async fn update(
 async fn remove(
     State(ctx): State<Arc<ServerContext>>,
     principal: Option<axum::Extension<Principal>>,
-    uri: Uri,
+    axum::Extension(directory): axum::Extension<RequestDirectory>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ServerError> {
-    let (memory, _, by) = writer(&ctx, &uri, &principal, "memory", "forget")?;
+    let (memory, _, by) = writer(&ctx, &directory, &principal, "memory", "forget")?;
     let deleted = memory.forget_by(&id, &by).map_err(memory_error)?;
     Ok(Json(json!({ "deleted": deleted })))
 }

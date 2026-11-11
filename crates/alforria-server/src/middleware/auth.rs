@@ -28,6 +28,7 @@ use base64::Engine;
 use tower::Service;
 
 use crate::bearer::{BearerError, Principal, Via};
+use crate::middleware::directory;
 use crate::middleware::scope;
 use crate::policy::DirectoryAllowlist;
 use crate::pty::ticket::TicketCache;
@@ -293,37 +294,41 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
 }
 
 /// The directory allowlist for a credential narrower than `admin`
-/// (`server.directories`): a directory the request names, and the working
-/// directory an alforria route would fall back to, must be allowed, and
-/// workspaces are not selectable at all. A session-derived directory is
-/// checked where it is resolved (`middleware::location`).
+/// (`server.directories`).
+///
+/// The directory asked about is the one [`directory::resolve`] returns for
+/// this route — the same value the location layer or the route's handler
+/// then acts in, decoded the same way; there is no second reading of the
+/// request. It must be allowed when the request names it, and for one of
+/// alforria's own routes also when it does not (they fall back to the
+/// working directory by themselves). Besides, a directory spelled under any
+/// of the three spellings must be allowed even where this route ignores
+/// that spelling, and workspaces are not selectable at all. A
+/// session-derived directory is checked where it is resolved
+/// (`middleware::location`).
 fn check_directories(
     directories: &DirectoryAllowlist,
     uri: &Uri,
     headers: &HeaderMap,
 ) -> Result<(), Rejection> {
     let query = uri.query();
+    let outside = |directory: &str| {
+        Rejection::Forbidden(format!(
+            "this token may not open {directory}: it is outside server.directories"
+        ))
+    };
+    for directory in directory::spelled(query, headers) {
+        if !directories.allows(std::path::Path::new(&directory)) {
+            return Err(outside(&directory));
+        }
+    }
     let header_text = |name: &str| {
         headers
             .get(name)
             .and_then(|value| value.to_str().ok())
             .filter(|value| !value.is_empty())
-            .map(url_decode_strict)
+            .map(str::to_string)
     };
-    let named = [
-        query_param(query, "directory").filter(|value| !value.is_empty()),
-        query_param(query, "location[directory]").filter(|value| !value.is_empty()),
-        header_text("x-opencode-directory"),
-    ];
-    let mut any = false;
-    for directory in named.into_iter().flatten() {
-        any = true;
-        if !directories.allows(std::path::Path::new(&directory)) {
-            return Err(Rejection::Forbidden(format!(
-                "this token may not open {directory}: it is outside server.directories"
-            )));
-        }
-    }
     let workspace = query_param(query, "workspace")
         .or_else(|| query_param(query, "location[workspace]"))
         .filter(|value| !value.is_empty())
@@ -333,7 +338,13 @@ fn check_directories(
             "selecting a workspace needs the admin scope".to_string(),
         ));
     }
-    if !any && scope::defaults_to_cwd(uri.path()) && !directories.allows(&crate::state::cwd()) {
+    let family = directory::Family::of(uri.path());
+    let resolved = directory::resolve(family, query, headers);
+    if resolved.named {
+        if !directories.allows(&resolved.directory) {
+            return Err(outside(&resolved.raw));
+        }
+    } else if family == directory::Family::Own && !directories.allows(&resolved.directory) {
         return Err(Rejection::Forbidden(
             "this token may not open the server's working directory: pass ?directory= with one \
              of server.directories"
@@ -341,12 +352,6 @@ fn check_directories(
         ));
     }
     Ok(())
-}
-
-/// `decodeURIComponent`, best effort (`instance-context.ts:15-21`): the
-/// header is percent-encoded by clients; `+` is literal, unlike in a query.
-fn url_decode_strict(input: &str) -> String {
-    url_decode(&input.replace('+', "%2B"))
 }
 
 fn check_bearer(
@@ -398,7 +403,8 @@ fn file_ticketed(file_tickets: &FileTickets, uri: &Uri, headers: &HeaderMap) -> 
     let Some(path) = query_param(uri.query(), "path").filter(|path| !path.is_empty()) else {
         return false;
     };
-    let directory = crate::middleware::location::request_directory(uri.query(), headers);
+    let directory =
+        directory::resolve(directory::Family::of(uri.path()), uri.query(), headers).directory;
     let file = if std::path::Path::new(&path).is_absolute() {
         std::path::PathBuf::from(&path)
     } else {
@@ -601,6 +607,14 @@ where
 
     fn call(&mut self, mut req: axum::http::Request<Body>) -> Self::Future {
         let mut inner = self.inner.clone();
+        // An own route learns its directory here and nowhere else: the
+        // value the allowlist is about to be asked about (`directory`).
+        if directory::Family::of(req.uri().path()) == directory::Family::Own {
+            let resolved =
+                directory::resolve(directory::Family::Own, req.uri().query(), req.headers());
+            req.extensions_mut()
+                .insert(directory::RequestDirectory(resolved.directory));
+        }
         if !self.auth.required() {
             return Box::pin(async move { inner.call(req).await });
         }

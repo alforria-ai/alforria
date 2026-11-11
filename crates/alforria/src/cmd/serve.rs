@@ -110,6 +110,9 @@ pub fn run(matches: &ArgMatches, ui: &mut Ui, raw: &[OsString]) -> Result<(), Ty
         "{}\n",
         handshake(&listener.hostname, listener.port)
     ));
+    for warning in &listener.warnings {
+        ui.error(&format!("Warning: {warning}"));
+    }
     if let Some(password) = &generated {
         let username = alforria_server::AuthConfig::from_env().username;
         ui.write_stdout(&credentials_lines(&username, password));

@@ -452,3 +452,11 @@ pub async fn body_json(response: Response<Body>) -> Value {
 pub fn bearer(token: &str) -> String {
     format!("Bearer {token}")
 }
+
+/// The `Authorization` value for Basic credentials (the operator).
+pub fn basic(username: &str, password: &str) -> String {
+    format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"))
+    )
+}

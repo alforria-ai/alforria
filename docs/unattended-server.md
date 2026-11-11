@@ -380,7 +380,7 @@ outer scope, then act.
 
 | Request | Field | What the engine derives from it | Where it is judged |
 | --- | --- | --- | --- |
-| any | `?directory=`, `x-opencode-directory` | the project instance | auth layer and location layer: must equal a `server.directories` entry |
+| any | `?directory=`, `?location[directory]=`, `x-opencode-directory` | the project instance | one resolver (`middleware::directory`): the auth layer asks the allowlist about the value the route then acts in; every spelled directory must be a `server.directories` entry |
 | any | `?workspace=` | a workspace | refused (auth layer) |
 | any `/session/{id}/…` | the session id | the project (the session's own directory) | location layer, same allowlist |
 | any `/session/{id}/…` except `GET` and `fork` | the session id | whose rights later engine turns run with | location layer (403 early) and core (`Caller::may_act_on`): the session must be restricted |
@@ -507,12 +507,28 @@ as its own does not exist for it.
 ### What a token narrower than `admin` is confined to
 
 - **Directories.** The directory a request resolves to must be exactly one
-  of `server.directories`, however it is named: `?directory=`, the
-  `x-opencode-directory` header, the directory of the session in the path,
-  or the server's working directory when nothing is named. Symlinks and
-  `..` are resolved first. A directory *below* a listed one is not allowed:
-  opened as a project of its own it would load config from inside the
-  project. Selecting a workspace is refused.
+  of `server.directories`. There is one resolver for it
+  (`middleware::directory`), and the allowlist is asked about the value it
+  returns — the same value, decoded the same way, that the route then acts
+  in:
+  - a v1 route reads `?directory=`, else the `x-opencode-directory` header;
+  - a v2 route (`/api/…`) reads `?location[directory]=`, else the header;
+  - alforria's own routes (`/trigger`, `/memory`, `/workflow`, `/file/*`,
+    `/session/{id}/goal`) read `?directory=`, else `?location[directory]=`,
+    else the header — and fall back to the server's working directory when
+    none is given, which must then be an allowed directory itself;
+  - a session in the path decides for its own routes, and is checked where
+    it is resolved.
+
+  Besides, a directory spelled under *any* of the three spellings must be
+  allowed, also where the route does not read that spelling: an allowed
+  directory under one never covers for another. Symlinks and `..` are
+  resolved first. A directory *below* a listed one is not allowed: opened
+  as a project of its own it would load config from inside the project.
+  Selecting a workspace is refused. When bearer authentication is
+  configured and the server's working directory is not in
+  `server.directories`, `serve` says so at startup: tokens below `admin`
+  cannot use that directory, and must name one.
 - **Files.** Reads and listings stay inside the project; uploads go to the
   upload area (see "Files for a browser").
 - **Schedules.** It sets what the `schedule` tool can set: never a trigger's
