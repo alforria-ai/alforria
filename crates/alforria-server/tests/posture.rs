@@ -30,6 +30,7 @@ async fn a_local_server_reports_the_standalone_posture() {
         json!({
             "unattendedOrRemote": false,
             "reasons": [],
+            "tightened": [],
             "shellEnv": { "posture": "standalone", "inherit": "default" }
         })
     );
@@ -64,6 +65,7 @@ async fn an_unattended_server_reports_why_to_admin_only() {
     let expected: Value = json!({
         "unattendedOrRemote": true,
         "reasons": ["bearer-auth", "webhook-or-watch-trigger"],
+        "tightened": [],
         "shellEnv": { "posture": "restricted", "inherit": "configured" }
     });
     for auth in [basic(), bearer(&signer.token(AUDIENCE, "admin"))] {

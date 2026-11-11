@@ -259,6 +259,16 @@ impl TriggerService {
         if let Err(error) = store.fail_unfinished(now) {
             tracing::warn!("failed to close unfinished trigger runs: {error}");
         }
+        // A config read after startup (an instance boot) can declare a
+        // trigger that outside input starts: the posture follows.
+        if settings.enabled
+            && settings
+                .config
+                .values()
+                .any(|spec| spec.starts_from_outside())
+        {
+            crate::shell_env::tighten(crate::trigger::store::OUTSIDE_TRIGGER_REASON);
+        }
         let mut entries = BTreeMap::new();
         for (id, spec) in &settings.config {
             if !valid_id(id) {

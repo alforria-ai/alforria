@@ -598,6 +598,10 @@ pub struct ShellSpawn {
     pub shell: String,
     pub command: String,
     pub cwd: PathBuf,
+    /// The session is restricted or was started by outside input: the
+    /// process gets the restricted environment whatever the server's
+    /// posture (`shell_env::apply_shell_for`).
+    pub outside_run: bool,
 }
 
 pub type KillFn = Arc<dyn Fn(Duration) -> BoxFuture<'static, ()> + Send + Sync>;
@@ -628,7 +632,7 @@ impl ShellSpawner for TokioSpawner {
             let mut cmd = tokio::process::Command::new(&request.shell);
             cmd.arg("-c").arg(&request.command);
             cmd.current_dir(&request.cwd);
-            crate::shell_env::apply_shell(cmd.as_std_mut());
+            crate::shell_env::apply_shell_for(cmd.as_std_mut(), request.outside_run);
             cmd.stdin(std::process::Stdio::null());
             cmd.stdout(std::process::Stdio::piped());
             cmd.stderr(std::process::Stdio::piped());
@@ -789,6 +793,10 @@ async fn run(
             shell: input.shell.clone(),
             command: input.command.clone(),
             cwd: input.cwd.clone(),
+            // The write guard is there exactly for a session that is
+            // restricted or that outside input started
+            // (`SessionMark::OutsideStart`, `session::tools::resolve`).
+            outside_run: ctx.instance.write_guard.is_some(),
         })
         .await?;
     let SpawnedProcess {
@@ -1968,6 +1976,68 @@ mod tests {
         )
         .await;
         assert_eq!(result.output.trim(), "[][][visible]0", "{}", result.output);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The per-run floor, through the tool itself: a bash call of a
+    /// session that outside input started (it carries the write guard,
+    /// set for `SessionMark::OutsideStart` and restricted sessions) gets
+    /// the restricted environment although the server's posture is
+    /// standalone — the user's `GITHUB_TOKEN`-shaped variable and an
+    /// unlisted one stay behind — while a session of the user's own, on
+    /// the same server, keeps both.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_outside_started_sessions_bash_call_gets_the_restricted_environment() {
+        std::env::set_var("FLOORTEST_GITHUB_TOKEN", "ghp-floor-leak");
+        std::env::set_var("FLOORTEST_PLAIN", "plain-floor-leak");
+        assert!(
+            !crate::shell_env::current().is_restricted(),
+            "the server's own posture is standalone in this test"
+        );
+        let command = json!({
+            "command": "printf '[%s][%s][%s]' \"$FLOORTEST_GITHUB_TOKEN\" \"$FLOORTEST_PLAIN\" \"${PATH:+path}\""
+        });
+        let spawner: Arc<dyn ShellSpawner> = Arc::new(TokioSpawner);
+        let dir = temp("run-real-floor");
+        let tool = shell_tool(spawner, TRUNC_MAX_BYTES, &dir);
+
+        let (own, _, _, _) = execute(&tool, command.clone()).await;
+        assert_eq!(
+            own.output.trim(),
+            "[ghp-floor-leak][plain-floor-leak][path]"
+        );
+
+        let ask = RecordingAsk::new();
+        let instance = InstanceContext {
+            directory: dir.clone(),
+            worktree: Path::new("/").to_path_buf(),
+            write_guard: Some(Arc::new(crate::protect::WriteGuard {
+                protected: Default::default(),
+                policy: Default::default(),
+                worktree: dir.clone(),
+            })),
+        };
+        let extra = Extra::default();
+        let def = tool.def(Arc::new(FixedAgents)).await;
+        let ctx = ToolCtxRef {
+            session_id: "ses_1",
+            message_id: "msg_1",
+            agent: "build",
+            call_id: None,
+            abort: tokio_util::sync::CancellationToken::new(),
+            messages: &[],
+            extra: &extra,
+            instance: &instance,
+            ask: &ask,
+            metadata: &ask,
+        };
+        let outside = (def.execute)(command, ctx).await.expect("execute succeeds");
+        assert_eq!(outside.output.trim(), "[][][path]", "{}", outside.output);
+        assert!(
+            !crate::shell_env::current().is_restricted(),
+            "the floor did not go through the server's posture"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

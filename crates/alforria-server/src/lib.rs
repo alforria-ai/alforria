@@ -199,6 +199,11 @@ pub async fn listen_with(opts: &ListenOptions, ctx: Arc<ServerContext>) -> io::R
     if let Some(reason) = startup_refusal(&ctx) {
         return Err(io::Error::other(format!("refusing to listen: {reason}")));
     }
+    // A context built for one address and listened on at another: the
+    // shell environment's posture follows the address actually bound.
+    if !policy::is_loopback_bind(&opts.hostname) {
+        alforria_core::shell_env::tighten(policy::PostureReason::RemoteBind.as_str());
+    }
     let listener = bind_with_port_fallback(opts).await?;
     let port = listener.local_addr()?.port();
     let url = format!("http://{}:{}", opts.hostname, port);

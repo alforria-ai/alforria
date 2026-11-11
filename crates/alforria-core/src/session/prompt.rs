@@ -351,7 +351,14 @@ impl SessionPrompt {
             return Err(PromptError::Forbidden { message });
         }
         let sh = preferred(deps.config.shell.as_deref());
-        let template = expand_command_template(&cmd.template, &input.arguments, &sh).await;
+        // Inline shell of a session that outside input started runs in the
+        // restricted environment, whatever the server's posture.
+        let outside_run = deps
+            .services
+            .sessions
+            .started_by_outside_input(&input.session_id);
+        let template =
+            expand_command_template(&cmd.template, &input.arguments, &sh, outside_run).await;
         let template = template.trim().to_string();
 
         // Task model resolution (prompt.ts:1423-1433).
@@ -831,7 +838,12 @@ impl ArgumentPlan {
 /// Only shell the *template* contains ever runs, exactly as the template
 /// has it. Arguments reach it as shell parameters, and neither they nor a
 /// command's output are scanned for `` !`…` `` or placeholders afterwards.
-async fn expand_command_template(template: &str, arguments: &str, shell: &str) -> String {
+async fn expand_command_template(
+    template: &str,
+    arguments: &str,
+    shell: &str,
+    outside_run: bool,
+) -> String {
     let plan = ArgumentPlan::new(template, arguments);
     let spans: Vec<(std::ops::Range<usize>, &str)> = bash_regex()
         .captures_iter(template)
@@ -845,7 +857,7 @@ async fn expand_command_template(template: &str, arguments: &str, shell: &str) -
     let mut offset = 0;
     for (range, command) in spans {
         out.push_str(&plan.fill(&template[offset..range.start]));
-        out.push_str(&run_shell_text(shell, command, &plan).await);
+        out.push_str(&run_shell_text(shell, command, &plan, outside_run).await);
         offset = range.end;
     }
     out.push_str(&plan.fill(&template[offset..]));
@@ -906,9 +918,14 @@ fn preferred(config_shell: Option<&str>) -> String {
 /// `sh -c cmd`, the command exactly as the template has it. The command's
 /// arguments reach it as shell parameters (`$1`…, and `ARGUMENTS` in the
 /// environment), never as shell source.
-async fn run_shell_text(shell: &str, command: &str, plan: &ArgumentPlan) -> String {
+async fn run_shell_text(
+    shell: &str,
+    command: &str,
+    plan: &ArgumentPlan,
+    outside_run: bool,
+) -> String {
     let mut process = tokio::process::Command::new(shell);
-    crate::shell_env::apply_shell(process.as_std_mut());
+    crate::shell_env::apply_shell_for(process.as_std_mut(), outside_run);
     process
         .arg("-c")
         .arg(command)
@@ -1100,7 +1117,14 @@ pub async fn shell_impl(
     let sh = preferred(deps.config.shell.as_deref());
     let cwd = deps.instance.directory.clone();
     let mut command = tokio::process::Command::new(&sh);
-    crate::shell_env::apply_shell(command.as_std_mut());
+    // The operator's own command, but in a session a webhook or a watch
+    // trigger started it still gets the restricted environment.
+    crate::shell_env::apply_shell_for(
+        command.as_std_mut(),
+        deps.services
+            .sessions
+            .started_by_outside_input(&input.session_id),
+    );
     command
         .arg("-c")
         .arg(&input.command)
@@ -1326,15 +1350,20 @@ mod substitution_tests {
         let touch = format!("touch {}", pwned.display());
 
         // An argument that is itself an inline command.
-        let out =
-            expand_command_template("Review this: $ARGUMENTS", &format!("!`{touch}`"), "sh").await;
+        let out = expand_command_template(
+            "Review this: $ARGUMENTS",
+            &format!("!`{touch}`"),
+            "sh",
+            false,
+        )
+        .await;
         assert_eq!(out, format!("Review this: !`{touch}`"));
         assert!(!pwned.exists(), "the argument was executed");
 
         // The same through `$1`, and appended to a template without
         // placeholders.
         for template in ["Look at $1", "No placeholders here"] {
-            let out = expand_command_template(template, &format!("!`{touch}`"), "sh").await;
+            let out = expand_command_template(template, &format!("!`{touch}`"), "sh", false).await;
             assert!(out.contains(&format!("!`{touch}`")), "{out}");
             assert!(!pwned.exists(), "{template}: the argument was executed");
         }
@@ -1353,7 +1382,7 @@ mod substitution_tests {
                 "out: !`echo $ARGUMENTS`",
                 "out: !`echo \"$1\"`",
             ] {
-                let out = expand_command_template(template, &payload, "sh").await;
+                let out = expand_command_template(template, &payload, "sh", false).await;
                 assert!(!pwned.exists(), "{template} ran {payload:?}: {out}");
             }
         }
@@ -1363,6 +1392,7 @@ mod substitution_tests {
             "branch: !`printf '%s|%s' \"$1\" \"$ARGUMENTS\"` end $2",
             "main 'two words'",
             "sh",
+            false,
         )
         .await;
         assert_eq!(out, "branch: main|main 'two words' end two words");
@@ -1370,7 +1400,9 @@ mod substitution_tests {
         // A command's output is not scanned again either.
         let note = dir.path().join("note.txt");
         std::fs::write(&note, format!("!`{touch}` $1 $ARGUMENTS")).unwrap();
-        let out = expand_command_template(&format!("!`cat {}`", note.display()), "arg", "sh").await;
+        let out =
+            expand_command_template(&format!("!`cat {}`", note.display()), "arg", "sh", false)
+                .await;
         assert_eq!(out, format!("!`{touch}` $1 $ARGUMENTS\n\narg"));
         assert!(!pwned.exists(), "a command's output was executed");
     }
@@ -1382,14 +1414,21 @@ mod substitution_tests {
     async fn an_argument_reaches_inline_shell_as_a_single_literal() {
         use super::expand_command_template;
         let nasty = "a;b|c&d$(e)`f`>g<h*?~'i'\\j";
-        let out = expand_command_template("!`printf '%s' \"$ARGUMENTS\"`", nasty, "sh").await;
+        let out =
+            expand_command_template("!`printf '%s' \"$ARGUMENTS\"`", nasty, "sh", false).await;
         assert_eq!(out, nasty);
         // As `$1`, the split-and-unquoted first argument, still literal.
-        let out = expand_command_template("!`printf '[%s]' \"$1\"`", "'x;y $(z)' tail", "sh").await;
-        assert_eq!(out, "[x;y $(z) tail]");
         let out =
-            expand_command_template("!`printf '[%s][%s]' \"$1\" \"$2\"`", "'x;y $(z)' `w`", "sh")
+            expand_command_template("!`printf '[%s]' \"$1\"`", "'x;y $(z)' tail", "sh", false)
                 .await;
+        assert_eq!(out, "[x;y $(z) tail]");
+        let out = expand_command_template(
+            "!`printf '[%s][%s]' \"$1\" \"$2\"`",
+            "'x;y $(z)' `w`",
+            "sh",
+            false,
+        )
+        .await;
         assert_eq!(out, "[x;y $(z)][`w`]");
     }
 

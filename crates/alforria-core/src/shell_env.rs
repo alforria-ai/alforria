@@ -397,6 +397,22 @@ impl ShellEnvPolicy {
             .collect()
     }
 
+    /// [`ShellEnvPolicy::shell_env_from`] for a process started on behalf
+    /// of a session: with `outside_run` (the session is restricted, or
+    /// outside input started a run in it) the restricted posture's
+    /// selection, whatever this policy's own posture is.
+    pub fn shell_env_for_from(
+        &self,
+        outside_run: bool,
+        base: impl IntoIterator<Item = (OsString, OsString)>,
+    ) -> Vec<(OsString, OsString)> {
+        if outside_run && !self.restricted {
+            self.clone().restricted(true).shell_env_from(base)
+        } else {
+            self.shell_env_from(base)
+        }
+    }
+
     /// [`ShellEnvPolicy::shell_env_from`] the server's environment.
     pub fn shell_env(&self) -> Vec<(OsString, OsString)> {
         self.shell_env_from(std::env::vars_os())
@@ -410,14 +426,57 @@ impl ShellEnvPolicy {
 
 static CURRENT: RwLock<Option<Arc<ShellEnvPolicy>>> = RwLock::new(None);
 
+/// Why the process-wide policy was put in the restricted posture after
+/// it was installed ([`tighten`]); empty when it was not.
+static TIGHTENED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
 /// Make `policy` the process-wide policy. Names the process has already
-/// learned stay learned.
+/// learned stay learned, and a posture that was tightened stays
+/// restricted.
 pub fn install(mut policy: ShellEnvPolicy) {
     let mut current = CURRENT.write().unwrap_or_else(|p| p.into_inner());
     if let Some(previous) = current.as_deref() {
         policy.named.extend(previous.named.iter().cloned());
     }
+    if !TIGHTENED
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .is_empty()
+    {
+        policy.restricted = true;
+    }
     *current = Some(Arc::new(policy));
+}
+
+/// Put the process-wide policy in the restricted posture, for `reason`,
+/// from the next spawn on: something that makes the server unattended or
+/// reachable appeared after it started (a `webhook` or `watch` trigger
+/// was created, a listener was bound beyond loopback). A ratchet — the
+/// posture only tightens while the process lives, and deleting the
+/// trigger does not relax it. Each reason is logged once.
+pub fn tighten(reason: &str) {
+    let mut current = CURRENT.write().unwrap_or_else(|p| p.into_inner());
+    let mut reasons = TIGHTENED.lock().unwrap_or_else(|p| p.into_inner());
+    if reasons.iter().any(|known| known == reason) {
+        return;
+    }
+    reasons.push(reason.to_string());
+    let policy = current.as_deref().cloned().unwrap_or_default();
+    if policy.restricted {
+        return;
+    }
+    tracing::warn!(
+        "shell environment: now restricted ({reason}): from here on the agent's processes \
+         start from the allowlist and credential-like variables are withheld, until the \
+         server restarts"
+    );
+    *current = Some(Arc::new(policy.restricted(true)));
+}
+
+/// The reasons the posture was tightened for since the process started
+/// ([`tighten`]).
+pub fn tightened() -> Vec<String> {
+    TIGHTENED.lock().unwrap_or_else(|p| p.into_inner()).clone()
 }
 
 /// [`ShellEnvPolicy::deny_names`] on the process-wide policy: called at
@@ -445,6 +504,18 @@ pub fn current() -> Arc<ShellEnvPolicy> {
 /// Give `command` the shell environment of the current policy.
 pub fn apply_shell(command: &mut std::process::Command) {
     command.env_clear().envs(current().shell_env());
+}
+
+/// [`apply_shell`] for a process started on behalf of a session.
+/// `outside_run`: the session is restricted or a run in it was started by
+/// outside input (`SessionMark::OutsideStart` — a webhook or watch
+/// trigger's run, its subagents and forks). Such a process gets the
+/// restricted posture's environment whatever the server's own posture is:
+/// the floor does not depend on the process-wide policy being current.
+pub fn apply_shell_for(command: &mut std::process::Command, outside_run: bool) {
+    command
+        .env_clear()
+        .envs(current().shell_env_for_from(outside_run, std::env::vars_os()));
 }
 
 /// Give `command` the helper environment of the current policy
@@ -856,6 +927,41 @@ mod tests {
             assert!(!kept.contains(&"github_token".to_string()), "{kept:?}");
             assert!(!kept.contains(&"EDITOR".to_string()), "{kept:?}");
         }
+    }
+
+    /// The per-run floor: a process started for a session that outside
+    /// input started (a webhook or watch trigger's run, its subagents and
+    /// forks) gets the restricted environment on a server whose own
+    /// posture is standalone — it does not wait for the server's posture
+    /// to be current.
+    #[test]
+    fn an_outside_started_run_gets_the_restricted_environment_on_a_standalone_server() {
+        let policy = with_names(ShellEnvPolicy::default());
+        assert!(!policy.is_restricted());
+        // Any other session on that server: the user's environment.
+        let own = names(&policy.shell_env_for_from(false, credentials()));
+        assert!(own.contains(&"GITHUB_TOKEN".to_string()), "{own:?}");
+        assert!(own.contains(&"AWS_PROFILE".to_string()), "{own:?}");
+        // The outside-started one: the allowlist.
+        assert_eq!(
+            names(&policy.shell_env_for_from(true, credentials())),
+            ["HOME", "PATH"]
+        );
+        // The host's `allow` and `set` still apply to it.
+        let policy = with_names(policy_of(
+            serde_json::json!({ "allow": ["CARGO_HOME"], "set": { "CI": "1" } }),
+            false,
+        ));
+        assert_eq!(
+            names(&policy.shell_env_for_from(true, credentials())),
+            ["CARGO_HOME", "CI", "HOME", "PATH"]
+        );
+        // On a restricted server it changes nothing.
+        let policy = with_names(ShellEnvPolicy::default().restricted(true));
+        assert_eq!(
+            policy.shell_env_for_from(true, credentials()),
+            policy.shell_env_for_from(false, credentials())
+        );
     }
 
     /// Learned names only accumulate: a later reading that no longer

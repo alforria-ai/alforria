@@ -61,6 +61,10 @@ pub struct TriggerState {
     pub time_seen: u64,
 }
 
+/// The reason `shell_env::tighten` is given when a `webhook` or `watch`
+/// trigger appears after startup.
+pub const OUTSIDE_TRIGGER_REASON: &str = "webhook-or-watch-trigger";
+
 /// Whether any stored trigger, of any directory, is started from outside
 /// the server: a `webhook` or a `watch` trigger that is not disabled. Part
 /// of what makes a server unattended (`ServerPolicy::unattended_or_remote`
@@ -132,6 +136,13 @@ impl TriggerStore {
     }
 
     pub fn put(&self, trigger: &StoredTrigger) -> Result<(), CoreError> {
+        // A trigger that something outside the server starts makes the
+        // server unattended from now on, however it came to be stored (the
+        // HTTP route, the `schedule` tool): the shell environment's
+        // posture tightens before the trigger can fire.
+        if trigger.stored.spec.starts_from_outside() {
+            crate::shell_env::tighten(OUTSIDE_TRIGGER_REASON);
+        }
         let spec = serde_json::to_string(&trigger.stored)
             .map_err(|error| CoreError::Storage(error.to_string()))?;
         self.storage.with_connection(|conn| {
