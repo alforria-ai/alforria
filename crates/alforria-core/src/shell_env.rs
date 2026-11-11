@@ -19,8 +19,9 @@
 //!
 //! * **standalone** (the default) — a child inherits everything except
 //!   what is alforria's own to protect: the host's `deny`; the server's
-//!   secrets and the provider key variables of [`BUILTIN_DENY`]; and the
-//!   names the server learns it reads a key or a secret from
+//!   secrets and the provider key variables of [`BUILTIN_DENY`]; names
+//!   shaped like an API key ([`API_KEY_PATTERNS`]); and the names the
+//!   server learns it reads a key or a secret from
 //!   ([`ShellEnvPolicy::learn`]: every `provider.*.env[]` of the model
 //!   catalog and of the loaded configs, every `{env:NAME}` the host config
 //!   refers to). `GH_TOKEN`, `AWS_*`, `NPM_TOKEN`, `PGPASSWORD` and the
@@ -101,6 +102,14 @@ pub const BUILTIN_DENY: &[&str] = &[
     "EXA_API_KEY",
     "PARALLEL_API_KEY",
 ];
+
+/// Names shaped like an API key, denied in either posture like
+/// [`BUILTIN_DENY`]: no list of model providers is complete, and keeping a
+/// provider's key from the agent is alforria's own concern on a
+/// developer's machine too. Narrow on purpose — `GITHUB_TOKEN`, `AWS_*`,
+/// `NPM_TOKEN` and `PGPASSWORD` are not of this shape and pass on a
+/// standalone install. `shell_env.allow` hands a named one over.
+pub const API_KEY_PATTERNS: &[&str] = &["*_API_KEY", "*_API_TOKEN"];
 
 /// Names that look like a credential, denied like [`BUILTIN_DENY`] on a
 /// restricted server only ([`ShellEnvPolicy::restricted`]): the usual
@@ -314,7 +323,8 @@ impl ShellEnvPolicy {
 
     /// Whether `name` is withheld from every child: the host's `deny`,
     /// alforria's own secrets and the provider key variables
-    /// ([`BUILTIN_DENY`], the learned names), and on a restricted server
+    /// ([`BUILTIN_DENY`], [`API_KEY_PATTERNS`], the learned names), and on a
+    /// restricted server
     /// whatever looks like a credential ([`CREDENTIAL_PATTERNS`]). Deny
     /// patterns match without regard to case (`github_token` is
     /// `GITHUB_TOKEN`); `allow` names a variable exactly.
@@ -325,6 +335,7 @@ impl ShellEnvPolicy {
         }
         !self.allowed(name)
             && (matches_any(&upper, BUILTIN_DENY)
+                || matches_any(&upper, API_KEY_PATTERNS)
                 || self.learned(&upper)
                 || (self.restricted && matches_any(&upper, CREDENTIAL_PATTERNS)))
     }
@@ -738,6 +749,10 @@ mod tests {
             // Provider keys: built in, learned, referred to.
             ("ANTHROPIC_API_KEY", "builtin-leak"),
             ("openai_api_key", "builtin-lower-leak"),
+            // Shaped like an API key, of a provider no list knows.
+            ("MY_CORP_API_KEY", "shape-leak"),
+            ("my_corp_api_key", "shape-lower-leak"),
+            ("SERVICE_API_TOKEN", "shape-token-leak"),
             ("ACME_GATEWAY_AUTH", "provider-leak"),
             ("acme_gateway_auth", "provider-lower-leak"),
             ("ACME_REFERENCED", "referenced-leak"),
@@ -762,7 +777,17 @@ mod tests {
         ];
         assert_eq!(names(&policy.shell_env_from(base.clone())), passed);
         // A helper (an MCP server, a language server, git) gets the same.
-        assert_eq!(names(&policy.scrubbed_env_from(base)), passed);
+        assert_eq!(names(&policy.scrubbed_env_from(base.clone())), passed);
+
+        // `allow` is how a host passes a key through: the name written,
+        // not its other spelling.
+        let info =
+            serde_json::from_value(serde_json::json!({ "allow": ["MY_CORP_API_KEY"] })).unwrap();
+        let policy = with_names(ShellEnvPolicy::from_config(Some(&info)));
+        let mut expected = passed.to_vec();
+        expected.push("MY_CORP_API_KEY");
+        expected.sort();
+        assert_eq!(names(&policy.shell_env_from(base)), expected);
     }
 
     /// A host chooses its posture whatever the mode: a standalone one can
