@@ -1413,3 +1413,63 @@ async fn a_tick_interrupted_by_a_crash_is_closed_and_never_fired_twice() {
     );
     assert!(service.tick(f.clock.now_ms()).is_empty());
 }
+
+/// Changing a reuse trigger's kind lets go of the session it kept (H7): the
+/// next run starts a session of its own, so a session with a trusted run's
+/// rules never receives a webhook body, and a session holding one is never
+/// continued as a trusted run. A change within the kind keeps the session.
+#[tokio::test]
+async fn changing_a_reuse_triggers_kind_drops_its_session() {
+    let f = Fixture::new(
+        "trigger-kind-change",
+        "2027-01-01T00:00:00Z",
+        FakeOps::answering("ok"),
+    );
+    let service = f.service(json!({}));
+    let created = service
+        .create(
+            Some("feed".to_string()),
+            spec(json!({ "on": { "interval": "30m" }, "prompt": "Check", "session": "reuse" })),
+            None,
+            None,
+        )
+        .unwrap();
+    let first = fire_next(&f, &service, &created.id).await;
+    let kept = first.session_id.clone().expect("a session");
+    assert_eq!(service.get("feed").unwrap().session_id, Some(kept.clone()));
+
+    // The same kind, another period: the conversation goes on.
+    service
+        .update("feed", &json!({ "on": { "interval": "1h" } }))
+        .unwrap();
+    assert_eq!(service.get("feed").unwrap().session_id, Some(kept.clone()));
+
+    // Another kind: the session is let go, and the delivery lands in a new
+    // one, marked as carrying outside input.
+    service
+        .update("feed", &json!({ "on": { "webhook": true } }))
+        .unwrap();
+    assert_eq!(service.get("feed").unwrap().session_id, None);
+    let run = service.hook("feed", b"outside text").unwrap();
+    let run = settle(&service, &[run]).await.remove(0);
+    assert_ne!(run.session_id, Some(kept));
+    let delivered = f.ops.turns().pop().unwrap();
+    assert_eq!(
+        delivered.session_id, None,
+        "the kept session was not offered"
+    );
+    assert!(delivered.untrusted);
+
+    // And back: the session that holds the body is not continued as a
+    // trusted interval run.
+    let holding = service.get("feed").unwrap().session_id;
+    assert!(holding.is_some());
+    service
+        .update("feed", &json!({ "on": { "interval": "30m" } }))
+        .unwrap();
+    assert_eq!(service.get("feed").unwrap().session_id, None);
+    fire_next(&f, &service, "feed").await;
+    let trusted = f.ops.turns().pop().unwrap();
+    assert_eq!(trusted.session_id, None);
+    assert!(!trusted.untrusted);
+}

@@ -294,3 +294,6 @@ fn instance_error(err: RegistryError) -> SessionError {
         other => crate::CoreError::Storage(other.to_string()).into(),
     }
 }
+
+#[cfg(test)]
+mod trigger_reuse_tests;

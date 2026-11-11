@@ -173,8 +173,25 @@ impl ProductionTriggerOps {
                     });
                 match kept {
                     Some(session) => {
+                        // Whether the run is bound as one carrying outside
+                        // input does not rest on the trigger's kind as it
+                        // is now alone: a session that already carries the
+                        // mark keeps its ceiling, and a payload arriving
+                        // marks the session it lands in. (The service also
+                        // lets a kept session go when the kind changes;
+                        // this holds if that is ever bypassed.)
+                        let carried = crate::session::store::carries_untrusted_input(&session);
+                        let mut bound = turn.clone();
+                        bound.untrusted = turn.untrusted || carried;
+                        if bound.untrusted && !carried {
+                            let mut metadata = session.metadata.clone().unwrap_or_default();
+                            metadata.insert(crate::trigger::UNTRUSTED_KEY.to_string(), json!(true));
+                            self.sessions
+                                .set_metadata(&session.id, metadata)
+                                .map_err(|error| error.to_string())?;
+                        }
                         // The rules may have changed since the session was made.
-                        let permission = self.rules(turn);
+                        let permission = self.rules(&bound);
                         if session.permission.clone().unwrap_or_default() != permission {
                             self.sessions
                                 .set_permission(&session.id, permission)

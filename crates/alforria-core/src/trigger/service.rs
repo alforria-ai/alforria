@@ -661,6 +661,20 @@ impl TriggerService {
                 }
                 let was = entry.enabled();
                 let rescheduled = entry.spec.on != spec.on;
+                // A different kind of trigger is not the same conversation:
+                // the session a reuse trigger kept is let go, and the next
+                // run starts one of its own. Otherwise a webhook trigger
+                // turned into a cron one went on, trusted, in the session
+                // that holds the outside text — and a cron trigger turned
+                // into a webhook one fed outside text to a session with the
+                // trusted run's rules.
+                let kind_changed = entry
+                    .schedule
+                    .as_ref()
+                    .map_or(true, |before| before.kind() != schedule.kind());
+                if kind_changed {
+                    entry.state.session_id = None;
+                }
                 entry.spec = spec;
                 entry.schedule = Ok(schedule);
                 // Resuming through `enabled: true` also lifts a pause.
