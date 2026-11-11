@@ -348,18 +348,18 @@ pre-1.0, so minor releases may include breaking changes.
   are not applied until it does (the load itself still degrades to defaults,
   as before).
 
-- `{env:NAME}` and `{file:path}` in a **project's** `opencode.json` /
-  `.opencode/` (and in a remote config) are confined. `{env:}` no longer
-  reads a variable the shell environment policy withholds — the server
-  password, provider keys such as `ANTHROPIC_API_KEY`, credentials from
-  `auth.json` — and substitutes the empty string instead; `{file:}` reads
-  only a relative path that stays inside the project (no absolute path, `~`,
-  `..` or symlink out), anything else is a config error. Your own config (the
-  global config directory, `~/.opencode`, the managed directory,
-  `OPENCODE_CONFIG*`) is unchanged. If a project config of yours relied on
-  `{env:OPENAI_API_KEY}` and the like, move that line to your global config,
-  or list the names in `server.trust.project_env` there. `${VAR}` in a
-  provider base URL follows the same rule.
+- On a server where project config is restricted (`server.auth.bearer`
+  configured, or `server.trust.project: "restricted"`), `{env:NAME}` and
+  `{file:path}` in a **project's** `opencode.json` / `.opencode/` and in a
+  remote config are confined: `{env:}` reads only the names in
+  `server.trust.project_env` (anything else is the empty string), and
+  `{file:}` only a relative path that stays inside the project (anything
+  else is a config error; a remote config reads no file). `${VAR}` in a
+  provider base URL follows the `{env:}` rule, and a refused name there is a
+  config error. **A standalone install is unchanged**: a project config's
+  `{env:OPENAI_API_KEY}` or `{file:~/.secrets/key}` works as upstream, and a
+  warning is logged once per file and reference naming what a restricted
+  server would refuse. Your own config is never confined.
 
 - `server.resume` and `storage` (`retention`, `synchronous`) are read from
   the host config only (the global config directory, `~/.opencode`, the

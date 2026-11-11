@@ -737,15 +737,12 @@ impl HostMode {
             ConfigOrigin::Outside if self.restricted => {
                 self.project_env.iter().any(|allowed| allowed == name)
             }
-            // The shell environment policy says which of the server's
-            // variables its children may see; a config the agent can write
-            // gets no more. Provider credentials from `auth.json` are
-            // never a project's to read either.
-            // unless the host config names the variable for them
-            // (`server.trust.project_env`).
+            // A standalone install: upstream's behaviour, every name
+            // (`load_config` warns about the ones a restricted server
+            // would refuse).
             ConfigOrigin::Outside => {
-                self.project_env.iter().any(|allowed| allowed == name)
-                    || (!crate::shell_env::current().denied(name) && !credentials.contains(&name))
+                let _ = credentials;
+                true
             }
         }
     }
@@ -1351,21 +1348,34 @@ impl ConfigLoader {
                     .mode
                     .env_allowed(rules.origin, name, rules.credentials)
         };
-        let confinement = matches!(rules.origin, ConfigOrigin::Outside).then(|| Confinement {
+        // The strict rule is the restricted mode's (bearer auth, or the
+        // host's switch). A standalone install keeps upstream's behaviour —
+        // a project `opencode.json` with `{env:OPENAI_API_KEY}` is a common
+        // and documented pattern, and so is `{file:~/.secrets/key}` — and
+        // is told, once per file and reference, what a restricted server
+        // would refuse.
+        let outside = matches!(rules.origin, ConfigOrigin::Outside);
+        let confinement = (outside && rules.mode.restricted).then(|| Confinement {
             root: rules.root.map(Path::to_path_buf),
             env_allowed: &env_allowed,
         });
+        if outside && !rules.mode.restricted {
+            warn_unconfined_references(text, &source_name(&source), rules.credentials);
+        }
         let expanded =
             substitute_confined(text, &source, env, Missing::Error, confinement.as_ref())?;
         let source_path = source_name(&source);
         let mut value = parse_jsonc(&expanded, &source_path)?;
         // `${VAR}` in a base URL is the same read as `{env:VAR}` and is
-        // under the same rule: for a project's or a remote config it is
-        // expanded here, by this source's rule, so nothing is left for the
-        // provider runtime to expand without knowing where the URL came
-        // from.
-        // The expansion is final (`interpolate_dollar_final`), and a name
-        // the source may not read is a config error.
+        // under the same rule. For a project's or a remote config it is
+        // expanded here, once and finally (`interpolate_dollar_final`) —
+        // the provider runtime expands only what the host wrote — under
+        // this source's rule: in restricted mode a name it may not read is
+        // a config error; in a standalone install every name expands, as
+        // it always did.
+        if outside && !rules.mode.restricted {
+            let _ = expand_base_urls(&mut value, &|_| true, env);
+        }
         if confinement.is_some() {
             expand_base_urls(&mut value, &env_allowed, env).map_err(|(key, name)| {
                 CoreError::invalid(
@@ -1430,6 +1440,54 @@ impl ConfigLoader {
             return Ok(Value::Object(Map::new()));
         }
         self.load_config(&text, Source::Path(path.to_path_buf()), env, rules)
+    }
+}
+
+/// Tell a standalone user, once per file and reference, which `{env:}` and
+/// `{file:}` references of a project's or a remote config a restricted
+/// server (bearer auth, or `server.trust.project: "restricted"`) refuses:
+/// a variable the shell environment policy withholds or an `auth.json`
+/// credential, and a file that is not a relative path inside the project.
+fn warn_unconfined_references(text: &str, source: &Path, credentials: &[&str]) {
+    static SEEN: std::sync::Mutex<Option<std::collections::HashSet<(PathBuf, String)>>> =
+        std::sync::Mutex::new(None);
+    let policy = crate::shell_env::current();
+    let mut flagged = Vec::new();
+    for (start, kind) in [("{env:", "env"), ("{file:", "file")] {
+        let mut rest = text;
+        while let Some(at) = rest.find(start) {
+            rest = &rest[at + start.len()..];
+            let Some(end) = rest.find('}') else {
+                break;
+            };
+            let name = &rest[..end];
+            let strict = match kind {
+                "env" => policy.denied(name) || credentials.contains(&name),
+                _ => {
+                    name.starts_with('~')
+                        || Path::new(name).is_absolute()
+                        || name.split('/').any(|part| part == "..")
+                }
+            };
+            if strict {
+                flagged.push(format!("{start}{name}}}"));
+            }
+        }
+    }
+    let Ok(mut seen) = SEEN.lock() else {
+        return;
+    };
+    let seen = seen.get_or_insert_with(Default::default);
+    for reference in flagged {
+        if seen.insert((source.to_path_buf(), reference.clone())) {
+            tracing::warn!(
+                "{}: {reference} is read from a project config. This works on a standalone \
+                 install; a server with bearer auth (or `server.trust.project: \"restricted\"`) \
+                 refuses it — move the line to your global config, or list the variable in \
+                 `server.trust.project_env` there.",
+                source.display()
+            );
+        }
     }
 }
 
@@ -2342,19 +2400,20 @@ mod tests {
         }
     }
 
-    /// A project config cannot read the server's secrets or a file outside
+    /// On a restricted server — bearer auth, or the host's switch — a
+    /// project config cannot read the server's secrets or a file outside
     /// the project through `{env:}` / `{file:}` (it put the server password,
-    /// a provider key and `auth.json` into an agent prompt). The user's own
-    /// config still substitutes freely.
+    /// a provider key and `auth.json` into an agent prompt). A standalone
+    /// install keeps upstream's behaviour: `{env:OPENAI_API_KEY}` and
+    /// `{file:~/.secrets/key}` in a project `opencode.json` are common and
+    /// documented. The user's own config substitutes freely everywhere.
     #[test]
-    fn a_project_config_cannot_substitute_secrets_or_outside_files() {
+    fn a_restricted_project_config_cannot_substitute_secrets_or_outside_files() {
         let f = Fixture::new();
         let work = f.root.join("work");
         let outside = f.root.join("outside").join("auth.json");
         write(&outside, r#"{"anthropic":{"key":"sk-file-secret"}}"#);
         write(&work.join("notes.txt"), "project notes");
-        // Deny-listed names, set in this process only under names no other
-        // test reads.
         std::env::set_var("ALFORRIA_H3TEST_SECRET", "hunter2-env-secret");
         std::env::set_var("ALFORRIA_H3TEST_PLAIN", "plain-value");
         let prompt = |text: &str| json!({ "agent": { "build": { "prompt": text } } }).to_string();
@@ -2362,19 +2421,35 @@ mod tests {
             let (config, _) = f.load().unwrap();
             config.agent.unwrap()["build"].prompt.clone().unwrap()
         };
+        let host = |trust: Value| {
+            write(
+                &f.root.join("config").join("opencode.json"),
+                &json!({ "server": { "trust": trust } }).to_string(),
+            );
+        };
+        let references = format!(
+            "pw={{env:ALFORRIA_H3TEST_SECRET}} plain={{env:ALFORRIA_H3TEST_PLAIN}} \
+             notes={{file:notes.txt}} file={{file:{}}}",
+            outside.display()
+        );
 
-        // `{env:}`: a withheld name is empty, an ordinary one substitutes,
-        // and a file inside the project is read.
+        // Standalone: as upstream, everything substitutes.
+        write(&work.join("opencode.json"), &prompt(&references));
+        let standalone = loaded_prompt(&f);
+        assert!(standalone.contains("pw=hunter2-env-secret"), "{standalone}");
+        assert!(standalone.contains("sk-file-secret"), "{standalone}");
+
+        // Restricted: only the names the host lists, an outside file is a
+        // config error, a file inside the project is read.
+        host(json!({ "project": "restricted", "project_env": ["ALFORRIA_H3TEST_PLAIN"] }));
         write(
             &work.join("opencode.json"),
-            &prompt("pw={env:ALFORRIA_H3TEST_SECRET} plain={env:ALFORRIA_H3TEST_PLAIN} notes={file:notes.txt}"),
+            &prompt("pw={env:ALFORRIA_H3TEST_SECRET} path={env:PATH} plain={env:ALFORRIA_H3TEST_PLAIN} notes={file:notes.txt}"),
         );
         assert_eq!(
             loaded_prompt(&f),
-            "pw= plain=plain-value notes=project notes"
+            "pw= path= plain=plain-value notes=project notes"
         );
-
-        // `{file:}` outside the project is a config error, not content.
         for reference in [
             format!("{{file:{}}}", outside.display()),
             "{file:../outside/auth.json}".to_string(),
@@ -2385,59 +2460,42 @@ mod tests {
             assert!(error.contains("bad file reference"), "{reference}: {error}");
             assert!(!error.contains("sk-file-secret"), "{error}");
         }
-
-        // The same text in the user's own (global) config substitutes.
-        fs::remove_file(work.join("opencode.json")).unwrap();
+        // Bearer auth alone makes the server restricted.
         write(
             &f.root.join("config").join("opencode.json"),
-            &prompt(&format!(
-                "pw={{env:ALFORRIA_H3TEST_SECRET}} file={{file:{}}}",
-                outside.display()
-            )),
-        );
-        let own = loaded_prompt(&f);
-        assert!(own.contains("hunter2-env-secret"), "{own}");
-        assert!(own.contains("sk-file-secret"), "{own}");
-
-        // The host config can name a variable for project configs.
-        write(
-            &f.root.join("config").join("opencode.json"),
-            &json!({ "server": { "trust": { "project_env": ["ALFORRIA_H3TEST_SECRET"] } } })
-                .to_string(),
+            &json!({ "server": { "auth": { "bearer": { "tokens_sha256": ["00"] } } } }).to_string(),
         );
         write(
             &work.join("opencode.json"),
             &prompt("pw={env:ALFORRIA_H3TEST_SECRET}"),
         );
-        assert_eq!(loaded_prompt(&f), "pw=hunter2-env-secret");
+        assert_eq!(loaded_prompt(&f), "pw=");
 
-        // On an unattended server (`server.auth.bearer`), a project config
-        // reads only the names the host config lists: an ordinary variable
-        // is withheld too.
+        // The user's own (global) config substitutes, restricted or not.
+        fs::remove_file(work.join("opencode.json")).unwrap();
+        let mut own: Value = serde_json::from_str(&prompt(&references)).unwrap();
+        own["server"] = json!({ "trust": { "project": "restricted" } });
         write(
             &f.root.join("config").join("opencode.json"),
-            &json!({ "server": {
-                "auth": { "bearer": { "tokens_sha256": ["00"] } },
-                "trust": { "project_keys": ["agent.*.prompt"], "project_env": ["ALFORRIA_H3TEST_PLAIN"] },
-            } })
-            .to_string(),
+            &own.to_string(),
         );
-        write(
-            &work.join("opencode.json"),
-            &prompt(
-                "pw={env:ALFORRIA_H3TEST_SECRET} path={env:PATH} plain={env:ALFORRIA_H3TEST_PLAIN}",
-            ),
+        // (`notes.txt` is relative to the global config directory here.)
+        write(&f.root.join("config").join("notes.txt"), "own notes");
+        let own = loaded_prompt(&f);
+        assert!(
+            own.contains("hunter2-env-secret") && own.contains("sk-file-secret"),
+            "{own}"
         );
-        assert_eq!(loaded_prompt(&f), "pw= path= plain=plain-value");
         std::env::remove_var("ALFORRIA_H3TEST_SECRET");
         std::env::remove_var("ALFORRIA_H3TEST_PLAIN");
     }
 
     /// `${VAR}` in a base URL from a project config is the same read as
-    /// `{env:VAR}`, under the same rule, and it is settled at load, once: a
-    /// name the source may not read is a config error naming the file and
-    /// the variable, and what the result holds is final — the provider
-    /// runtime finds nothing left to expand under its own, wider rule.
+    /// `{env:VAR}`, under the same rule, and it is settled at load, once.
+    /// Restricted: a name the source may not read is a config error naming
+    /// the file and the variable. Standalone: every name expands, as it
+    /// always did. Either way what the result holds is final — the provider
+    /// runtime finds nothing left to expand.
     #[test]
     fn a_project_base_url_is_expanded_once_under_its_sources_rule() {
         let f = Fixture::new();
@@ -2464,10 +2522,53 @@ mod tests {
                 text(&acme["models"]["m"]["provider"]["api"]),
             )
         };
-
-        // Refused, in each of the three places: an error, no URL.
         let secret = "https://x.example/${ALFORRIA_URLTEST_SECRET}";
         let plain = "https://x.example";
+        let mixed = provider(
+            "https://${ALFORRIA_URLTEST_REGION}.a.example/${ALFORRIA_URLTEST_NESTED}",
+            "https://b.example/${ALFORRIA_URLTEST_UNSET}",
+            "https://c.example/$${ALFORRIA_URLTEST_REGION}",
+        );
+        let settled = (
+            "https://eu.a.example/%24{ALFORRIA_URLTEST_SECRET}".to_string(),
+            "https://b.example/%24{ALFORRIA_URLTEST_UNSET}".to_string(),
+            "https://c.example/$eu".to_string(),
+        );
+        let final_form = |urls: &(String, String, String)| {
+            for url in [&urls.0, &urls.1, &urls.2] {
+                let lookup = |name: &str| std::env::var(name).ok();
+                let again = super::super::variable::interpolate_dollar(url, &|_| true, &lookup);
+                assert_eq!(again.as_ref(), Ok(url));
+            }
+        };
+
+        // Standalone: every name expands, once; a value holding a
+        // reference, an unset name and a `$${…}` construction are literal
+        // text afterwards.
+        write(&work.join("opencode.json"), &provider(secret, plain, plain));
+        assert_eq!(urls(&f).0, "https://x.example/hunter2");
+        write(&work.join("opencode.json"), &mixed);
+        assert_eq!(urls(&f), settled);
+        final_form(&urls(&f));
+
+        // Restricted, with the provider keys handed back.
+        let host = |env: Value| {
+            write(
+                &f.root.join("config").join("opencode.json"),
+                &json!({ "server": { "trust": {
+                    "project": "restricted",
+                    "project_keys": ["provider"],
+                    "project_env": env,
+                } } })
+                .to_string(),
+            );
+        };
+        host(json!([
+            "ALFORRIA_URLTEST_REGION",
+            "ALFORRIA_URLTEST_NESTED",
+            "ALFORRIA_URLTEST_UNSET"
+        ]));
+        // Refused, in each of the three places: an error, no URL.
         for (config, key) in [
             (provider(secret, plain, plain), "provider.acme.api"),
             (
@@ -2486,39 +2587,12 @@ mod tests {
             assert!(error.contains("opencode.json"), "{error}");
             assert!(!error.contains("hunter2"), "{error}");
         }
-
-        // Allowed: expanded; a value holding a reference, an unset name and
-        // a `$${…}` construction are literal text afterwards.
-        write(
-            &work.join("opencode.json"),
-            &provider(
-                "https://${ALFORRIA_URLTEST_REGION}.a.example/${ALFORRIA_URLTEST_NESTED}",
-                "https://b.example/${ALFORRIA_URLTEST_UNSET}",
-                "https://c.example/$${ALFORRIA_URLTEST_REGION}",
-            ),
-        );
-        let (api, base, model) = urls(&f);
-        assert_eq!(api, "https://eu.a.example/%24{ALFORRIA_URLTEST_SECRET}");
-        assert_eq!(base, "https://b.example/%24{ALFORRIA_URLTEST_UNSET}");
-        assert_eq!(model, "https://c.example/$eu");
-        // A second expansion — the runtime's, under any rule — changes
-        // nothing and reveals nothing.
-        for url in [&api, &base, &model] {
-            let lookup = |name: &str| std::env::var(name).ok();
-            let again = super::super::variable::interpolate_dollar(url, &|_| true, &lookup);
-            assert_eq!(again.as_ref(), Ok(url));
-        }
-
-        // Restricted, with the provider keys handed back: only the names
-        // on `project_env` — the ordinary variable is refused as well.
-        write(
-            &f.root.join("config").join("opencode.json"),
-            &json!({ "server": { "trust": {
-                "project": "restricted",
-                "project_keys": ["provider"],
-            } } })
-            .to_string(),
-        );
+        // Allowed names expand, to the same final form.
+        write(&work.join("opencode.json"), &mixed);
+        assert_eq!(urls(&f), settled);
+        final_form(&urls(&f));
+        // Without the allowlist, an ordinary variable is refused as well.
+        host(json!([]));
         write(
             &work.join("opencode.json"),
             &provider("https://${ALFORRIA_URLTEST_REGION}.a.example", plain, plain),
@@ -2542,8 +2616,8 @@ mod tests {
 
     /// By generation, not by a list of keys: a reference to a secret —
     /// `{env:…}` and `${…}` — is put into every string of a project config
-    /// that uses the whole schema, one string at a time, in a full-trust
-    /// and in a restricted install. Whatever the load does with it (drop
+    /// that uses the whole schema, one string at a time, on a restricted
+    /// server (a standalone install reads them, as upstream does). Whatever the load does with it (drop
     /// the key, empty the reference, refuse the file), the secret's value
     /// is in nothing it produces, and in nothing the runtime's one
     /// expansion makes of any string of the result.
@@ -2685,11 +2759,6 @@ mod tests {
         let host_provider =
             json!({ "hostco": { "api": "https://${ALFORRIA_GENTEST_PLAIN}.host.example" } });
         for (host, variable) in [
-            // Full trust: only a withheld name is a secret to a project.
-            (
-                json!({ "provider": host_provider }),
-                "ALFORRIA_GENTEST_SECRET",
-            ),
             // Restricted, with everything handed back so that the keys
             // survive: any name is.
             (
