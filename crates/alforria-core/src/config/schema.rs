@@ -1280,6 +1280,9 @@ pub struct Config {
     pub compaction: Option<CompactionInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub experimental: Option<ExperimentalInfo>,
+    // --- alforria extensions (`config::host`), read from the host config ---
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell_env: Option<super::host::ShellEnvInfo>,
 }
 
 /// Decode + validate a raw config value against the full wire schema.
@@ -1380,6 +1383,7 @@ fn collect_issues(value: &serde_json::Value) -> Vec<crate::SchemaIssue> {
             "tool_output" => check!(issues, key, ToolOutputInfo),
             "compaction" => check!(issues, key, CompactionInfo),
             "experimental" => check!(issues, key, ExperimentalInfo),
+            "shell_env" => check!(issues, key, super::host::ShellEnvInfo),
             _ => {}
         }
     }

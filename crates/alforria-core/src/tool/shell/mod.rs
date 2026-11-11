@@ -616,8 +616,9 @@ pub trait ShellSpawner: Send + Sync {
 }
 
 /// Production spawner: `shell -c command`, stdin ignored, detached process
-/// group on Unix (`detached: platform !== "win32"`), child environment =
-/// process environment (the plugin `shell.env` seam is a no-op in M4).
+/// group on Unix (`detached: platform !== "win32"`). The child environment
+/// is what the host's `shell_env` policy lets through (`crate::shell_env`);
+/// TS passes the process environment whole.
 #[derive(Debug, Default)]
 pub struct TokioSpawner;
 
@@ -627,6 +628,7 @@ impl ShellSpawner for TokioSpawner {
             let mut cmd = tokio::process::Command::new(&request.shell);
             cmd.arg("-c").arg(&request.command);
             cmd.current_dir(&request.cwd);
+            crate::shell_env::apply_shell(cmd.as_std_mut());
             cmd.stdin(std::process::Stdio::null());
             cmd.stdout(std::process::Stdio::piped());
             cmd.stderr(std::process::Stdio::piped());
@@ -1935,6 +1937,29 @@ mod tests {
             execute(&tool, json!({ "command": "echo opencode-real-echo-test" })).await;
         assert_eq!(result.output.trim(), "opencode-real-echo-test");
         assert_eq!(result.metadata["exit"], json!(0));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A bash call sees the server's environment minus the denied names:
+    /// the built-in list (here `ALFORRIA_*_SECRET` and a provider key) is
+    /// withheld, everything else passes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_real_spawner_withholds_denied_variables() {
+        std::env::set_var("ALFORRIA_SHELLENVTEST_SECRET", "s3cret");
+        std::env::set_var("OPENROUTER_API_KEY", "sk-or-leak");
+        std::env::set_var("SHELLENVTEST_PLAIN", "visible");
+        let spawner: Arc<dyn ShellSpawner> = Arc::new(TokioSpawner);
+        let dir = temp("run-real-env");
+        let tool = shell_tool(spawner, TRUNC_MAX_BYTES, &dir);
+        let (result, _, _, _) = execute(
+            &tool,
+            json!({
+                "command": "printf '[%s][%s][%s]' \"$ALFORRIA_SHELLENVTEST_SECRET\" \"$OPENROUTER_API_KEY\" \"$SHELLENVTEST_PLAIN\"; env | grep -c -e s3cret -e sk-or-leak; true"
+            }),
+        )
+        .await;
+        assert_eq!(result.output.trim(), "[][][visible]0", "{}", result.output);
         std::fs::remove_dir_all(&dir).ok();
     }
 

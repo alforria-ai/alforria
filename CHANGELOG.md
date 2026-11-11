@@ -50,6 +50,9 @@ pre-1.0, so minor releases may include breaking changes.
   `server.shutdown.sessions: "drain"`), kill the terminals and tool processes,
   checkpoint the database and exit 0, all within `server.shutdown.timeout`
   (default 10 s). See `docs/unattended-server.md`.
+- `shell_env` (global config) controls what the agent's shells inherit from
+  the server's environment: `inherit` (`"all"`, `"none"` or a list), `allow`,
+  `set` and `deny`.
 
 ### Fixed
 
@@ -100,6 +103,13 @@ pre-1.0, so minor releases may include breaking changes.
 
 ### Changed
 
+- The agent's shells no longer inherit the server's secrets. The `bash` tool,
+  the session `shell` command, command-template `` !`cmd` `` substitutions,
+  terminals, worktree start scripts, MCP stdio servers and language servers
+  start without the server password and auth variables and without provider
+  API keys (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `LIBERTAI_API_KEY`, …; the
+  list is in `docs/unattended-server.md`). To pass one through, name it in
+  `shell_env.allow`, or in an MCP server's own `environment`.
 - A global config file that does not parse now stops `alforria serve` and
   `alforria web` from listening, instead of serving with the defaults: the
   host config carries the server's access policy.

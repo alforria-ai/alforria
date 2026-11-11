@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 
 /// `Opts` (`pty.ts:10-16`) — the overrides the caller needs; the backend
-/// layers them over its inherited process environment.
+/// layers them over the environment the host's `shell_env` policy allows.
 pub struct SpawnOpts {
     pub cwd: PathBuf,
     pub env: BTreeMap<String, String>,
@@ -62,6 +62,12 @@ impl SpawnBackend for PortableBackend {
             cmd.arg(arg);
         }
         cmd.cwd(&opts.cwd);
+        // A terminal is a shell the agent's user drives: it starts from the
+        // host's `shell_env` policy, not the server's whole environment.
+        cmd.env_clear();
+        for (key, value) in alforria_core::shell_env::current().shell_env() {
+            cmd.env(key, value);
+        }
         for (key, value) in &opts.env {
             cmd.env(key, value);
         }

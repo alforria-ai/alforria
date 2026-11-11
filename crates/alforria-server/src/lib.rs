@@ -267,6 +267,7 @@ pub fn production_context(
         ui_backend(),
     );
     ctx.policy = Arc::new(ServerPolicy::load(&paths));
+    alforria_core::shell_env::install(ctx.policy.shell_env.clone());
     ctx.hosts = middleware::host::HostAllowlist::new(&opts.hostname, &opts.hosts, &opts.cors);
     ctx.engine_factory = engines.factory();
     ctx.tools = engines.tools();

@@ -30,6 +30,7 @@ pub mod provider;
 pub mod repository;
 pub mod session;
 pub mod share;
+pub mod shell_env;
 pub mod skill;
 pub mod storage;
 pub mod tool;

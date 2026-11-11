@@ -693,7 +693,9 @@ fn run_start_script(directory: &Path, cmd: &str, kind: &str) -> bool {
     if text.is_empty() {
         return true;
     }
-    let code = match Command::new("bash")
+    let mut command = Command::new("bash");
+    crate::shell_env::apply_shell(&mut command);
+    let code = match command
         .args(["-lc", text])
         .current_dir(directory)
         .stdin(Stdio::null())

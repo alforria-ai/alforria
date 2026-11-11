@@ -104,6 +104,65 @@ pub struct ShutdownInfo {
 }
 
 // ---------------------------------------------------------------------------
+// shell_env
+// ---------------------------------------------------------------------------
+
+/// `shell_env.inherit` — `"all"`, `"none"`, or a list of names / patterns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShellEnvInherit {
+    All,
+    None,
+    Names(Vec<String>),
+}
+
+impl Serialize for ShellEnvInherit {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            ShellEnvInherit::All => serializer.serialize_str("all"),
+            ShellEnvInherit::None => serializer.serialize_str("none"),
+            ShellEnvInherit::Names(names) => names.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ShellEnvInherit {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match &value {
+            serde_json::Value::String(mode) if mode == "all" => Ok(ShellEnvInherit::All),
+            serde_json::Value::String(mode) if mode == "none" => Ok(ShellEnvInherit::None),
+            serde_json::Value::Array(_) => serde_json::from_value(value)
+                .map(ShellEnvInherit::Names)
+                .map_err(serde::de::Error::custom),
+            _ => Err(serde::de::Error::custom(
+                "expected \"all\", \"none\" or a list of variable names",
+            )),
+        }
+    }
+}
+
+/// `shell_env` — what the agent's shells see of the server's environment
+/// (`crate::shell_env`). Upstream's `shell` key is a string (the shell to
+/// run), so this cannot live under it.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct ShellEnvInfo {
+    /// Which of the server's variables a shell starts with (default
+    /// `"all"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherit: Option<ShellEnvInherit>,
+    /// Exact names exempt from the built-in deny list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow: Option<Vec<String>>,
+    /// Variables set in every shell, over anything inherited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub set: Option<std::collections::BTreeMap<String, String>>,
+    /// Names or `*` / `?` patterns never inherited, on top of the built-in
+    /// list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deny: Option<Vec<String>>,
+}
+
+// ---------------------------------------------------------------------------
 // Loading
 // ---------------------------------------------------------------------------
 

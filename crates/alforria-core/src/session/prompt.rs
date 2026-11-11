@@ -821,7 +821,9 @@ fn preferred(config_shell: Option<&str>) -> String {
 /// `Process.text([cmd], { shell: sh, nothrow: true }).text` — stdout of
 /// `sh -c cmd`.
 async fn run_shell_text(shell: &str, command: &str) -> String {
-    tokio::process::Command::new(shell)
+    let mut process = tokio::process::Command::new(shell);
+    crate::shell_env::apply_shell(process.as_std_mut());
+    process
         .arg("-c")
         .arg(command)
         .output()
@@ -1003,6 +1005,7 @@ pub async fn shell_impl(
     let sh = preferred(deps.config.shell.as_deref());
     let cwd = deps.instance.directory.clone();
     let mut command = tokio::process::Command::new(&sh);
+    crate::shell_env::apply_shell(command.as_std_mut());
     command
         .arg("-c")
         .arg(&input.command)

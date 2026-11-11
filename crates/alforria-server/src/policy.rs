@@ -32,6 +32,8 @@ impl Default for ShutdownOptions {
 #[derive(Debug, Clone, Default)]
 pub struct ServerPolicy {
     pub shutdown: ShutdownOptions,
+    /// What the agent's shells see of the server's environment.
+    pub shell_env: alforria_core::shell_env::ShellEnvPolicy,
     /// Why the host config could not be used, if it could not. A listener
     /// refuses to bind with this set ([`crate::listen_with`]): the policy
     /// in force would not be the one written down.
@@ -53,6 +55,9 @@ impl ServerPolicy {
         }
         Ok(ServerPolicy {
             shutdown,
+            shell_env: alforria_core::shell_env::ShellEnvPolicy::from_config(
+                config.shell_env.as_ref(),
+            ),
             config_error: None,
         })
     }

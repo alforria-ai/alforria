@@ -91,8 +91,16 @@ struct Running {
 }
 
 async fn start(backend: &MockBackend, env: Env) -> Running {
+    start_with(backend, env, |_| {}).await
+}
+
+async fn start_with(
+    backend: &MockBackend,
+    env: Env,
+    configure: impl FnOnce(&mut std::process::Command),
+) -> Running {
     let project = env.project_dir();
-    let serve = Serve::spawn(&env);
+    let serve = Serve::spawn_with(&env, configure);
     let directory = project.display().to_string();
     let api = Api::new(serve.port, &directory);
     let log = EventLog::subscribe(&serve, &directory);
@@ -270,4 +278,83 @@ fn serve_refuses_a_broken_host_config() {
         stderr.contains("host config could not be applied"),
         "stderr={stderr}"
     );
+}
+
+fn read_env_dump(path: &Path) -> String {
+    wait_for(&format!("{}", path.display()), || {
+        std::fs::read_to_string(path)
+            .ok()
+            .filter(|text| text.contains("PATH="))
+    })
+}
+
+/// The agent's shells do not see the server's secrets: the bash tool, the
+/// session `shell` command and a terminal all start from the `shell_env`
+/// policy, which withholds the built-in deny list (provider keys, the
+/// server's own secrets) and whatever the host config denies.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_agents_shells_cannot_read_denied_variables() {
+    let backend = MockBackend::new("u3_shell_env");
+    let env = env_for(&backend, "u3");
+    write_host_config(
+        &env,
+        json!({ "shell_env": { "deny": ["U3_DENIED_*"], "set": { "U3_FROM_CONFIG": "yes" } } }),
+    );
+    let run = start_with(&backend, env, |command| {
+        command
+            .env("LIBERTAI_API_KEY", "sk-libertai-leak")
+            .env("OPENCODE_AUTH_CONTENT", "{\"leak\":\"auth-content-leak\"}")
+            .env("U3_DENIED_TOKEN", "denied-leak")
+            .env("U3_VISIBLE", "visible");
+    })
+    .await;
+
+    let check = |dump: &str, what: &str| {
+        for leak in ["sk-libertai-leak", "auth-content-leak", "denied-leak"] {
+            assert!(!dump.contains(leak), "{what} leaked {leak}:\n{dump}");
+        }
+        assert!(dump.contains("U3_VISIBLE=visible"), "{what}:\n{dump}");
+        assert!(dump.contains("U3_FROM_CONFIG=yes"), "{what}:\n{dump}");
+    };
+
+    // The bash tool, driven by the model.
+    check(
+        &read_env_dump(&run.project.join("bash-env.txt")),
+        "bash tool",
+    );
+
+    // The session shell command.
+    let session_id = run.session_id.clone();
+    let _ = pump_until(&run.log, BUDGET, |events| {
+        events.iter().any(|event| {
+            event["type"] == json!("session.idle")
+                && event["properties"]["sessionID"] == json!(session_id)
+        })
+    })
+    .await;
+    let response = run
+        .api
+        .request(
+            reqwest::Method::POST,
+            &format!("/session/{}/shell", run.session_id),
+            Some(json!({ "agent": "build", "command": "env > shell-env.txt" })),
+        )
+        .await;
+    assert!(response.status().is_success(), "{}", response.status());
+    check(
+        &read_env_dump(&run.project.join("shell-env.txt")),
+        "session shell",
+    );
+
+    // A terminal.
+    let response = run
+        .api
+        .request(
+            reqwest::Method::POST,
+            "/pty",
+            Some(json!({ "command": "sh", "args": ["-c", "env > pty-env.txt"] })),
+        )
+        .await;
+    assert!(response.status().is_success(), "{}", response.status());
+    check(&read_env_dump(&run.project.join("pty-env.txt")), "terminal");
 }

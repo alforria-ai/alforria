@@ -64,6 +64,11 @@ same care as any other tool that can execute code on your machine.
   every possible secret.
 - `alforria export --sanitize` redacts sensitive transcript and file data.
   Plain `alforria export` does not sanitize anything.
+- The agent's shells (the `bash` tool, terminals, MCP stdio servers) do not
+  inherit the server password or provider API keys from the server's
+  environment; `shell_env` in the global config adjusts what they do inherit.
+  This is not a sandbox: a shell running as the same user can still read the
+  server's files and `/proc/<pid>/environ`. See `docs/unattended-server.md`.
 
 ### Plugins and MCP servers
 
