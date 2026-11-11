@@ -144,11 +144,19 @@ pub fn substitute_confined(
         }
 
         let file_path = &token["{file:".len()..token.len() - 1];
-        let resolved = match confinement {
-            None => resolve_file_path(&config_dir, file_path),
+        // The user's own config reads the path as written. A confined
+        // source is opened beneath its root in one resolution and read from
+        // that descriptor (`crate::beneath`): there is no check on one path
+        // and read of another.
+        let (resolved, read) = match confinement {
+            None => {
+                let resolved = resolve_file_path(&config_dir, file_path);
+                let read = fs::read_to_string(&resolved);
+                (resolved, read)
+            }
             Some(confinement) => {
-                match confined_file_path(&config_dir, file_path, confinement.root.as_deref()) {
-                    Ok(resolved) => resolved,
+                match confined_read(&config_dir, file_path, confinement.root.as_deref()) {
+                    Ok(found) => found,
                     // Refused whatever `missing` says: this is not a file
                     // that happens to be absent.
                     Err(reason) => {
@@ -161,7 +169,7 @@ pub fn substitute_confined(
             }
         };
 
-        match fs::read_to_string(&resolved) {
+        match read {
             Ok(content) => {
                 out.push_str(&json_escape(content.trim()));
             }
@@ -215,13 +223,50 @@ fn resolve_file_path(config_dir: &Path, file_path: &str) -> PathBuf {
     }
 }
 
-/// The file a confined `{file:path}` denotes, or why it is refused: the path
-/// must be relative, and — with every symlink resolved — inside `root`.
-fn confined_file_path(
+/// `${VAR}` expansion in a provider base URL (provider.ts:1734-1741) — the
+/// one implementation, for the loader and the provider runtime.
+///
+/// `allowed` is the same decision `{env:NAME}` is under for the source the
+/// text came from: a name it refuses expands to nothing (and is logged), so
+/// a URL never carries a variable its author was not entitled to read. An
+/// allowed name that is unset is left as written, as upstream does.
+pub fn interpolate_dollar(
+    text: &str,
+    allowed: &dyn Fn(&str) -> bool,
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        rest = &rest[start..];
+        let Some(end) = rest.find('}') else {
+            break;
+        };
+        let key = &rest[2..end];
+        if !allowed(key) {
+            tracing::warn!("not expanding ${{{key}}} in a base URL: its source may not read it");
+        } else if let Some(value) = lookup(key) {
+            out.push_str(&value);
+        } else {
+            out.push_str(&rest[..end + 1]);
+        }
+        rest = &rest[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Read a confined `{file:path}`: the path must be relative and is opened
+/// beneath `root` (`crate::beneath::open_beneath`), so no `..`, absolute
+/// path or symlink leads out — and a path that cannot be resolved is
+/// refused, never accepted on how it is spelled. `Err` is why it is
+/// refused; a file that is merely absent is `Ok` with the read error.
+fn confined_read(
     config_dir: &Path,
     file_path: &str,
     root: Option<&Path>,
-) -> Result<PathBuf, String> {
+) -> Result<(PathBuf, std::io::Result<String>), String> {
     let Some(root) = root else {
         return Err("is not allowed in a remote config".to_string());
     };
@@ -235,20 +280,18 @@ fn confined_file_path(
     if file_path.starts_with('~') || path.is_absolute() || path.has_root() {
         return Err(outside());
     }
+    // Where the reference points, relative to the root: the config file
+    // sits lexically inside it.
     let resolved = resolve_file_path(config_dir, file_path);
-    // Both ends real: `..` is already folded, and a link that points out of
-    // the project resolves to where it points. A file that does not exist
-    // has nothing to resolve; its lexical path must be inside, and reading
-    // it fails as a missing file.
-    let real_root = fs::canonicalize(root).unwrap_or_else(|_| normalize(root));
-    let inside = match fs::canonicalize(&resolved) {
-        Ok(real) => real.starts_with(&real_root),
-        Err(_) => resolved.starts_with(&real_root) || resolved.starts_with(normalize(root)),
-    };
-    if inside {
-        Ok(resolved)
-    } else {
-        Err(outside())
+    let lexical_root = resolve_file_path(root, ".");
+    let relative = resolved
+        .strip_prefix(&lexical_root)
+        .map_err(|_| outside())?;
+    match crate::beneath::read_to_string_beneath(root, relative) {
+        Ok(text) => Ok((resolved, Ok(text))),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok((resolved, Err(error))),
+        Err(error) if error.kind() == ErrorKind::PermissionDenied => Err(outside()),
+        Err(error) => Ok((resolved, Err(error))),
     }
 }
 

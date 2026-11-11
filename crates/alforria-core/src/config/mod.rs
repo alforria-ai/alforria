@@ -20,4 +20,4 @@ pub use precedence::{
     NoopDiscovery,
 };
 pub use schema::Config;
-pub use variable::{substitute, Missing, Source};
+pub use variable::{interpolate_dollar, substitute, Missing, Source};
