@@ -451,6 +451,96 @@ fn session_list_json_after_run() {
 }
 
 // -----------------------------------------------------------------------
+// db prune
+// -----------------------------------------------------------------------
+
+#[test]
+fn db_prune_drops_events_on_demand_and_from_config() {
+    let env = env_with_llm("db-prune", "Hello from the mock");
+    let output = env.run(&["run", "--model", "mock/mock-model", "Say hi"]);
+    assert_eq!(output.code, Some(0), "stderr={}", output.stderr);
+    let count = |env: &Env| -> u64 {
+        let rows = env.run(&["db", "SELECT COUNT(*) AS n FROM event", "--format", "json"]);
+        assert_eq!(rows.code, Some(0), "stderr={}", rows.stderr);
+        let rows: serde_json::Value = serde_json::from_str(&rows.stdout).unwrap();
+        rows[0]["n"].as_u64().unwrap()
+    };
+    let before = count(&env);
+    assert!(before > 5, "{before}");
+
+    // No policy anywhere: nothing goes.
+    let none = env.run(&["db", "prune"]);
+    assert_eq!(none.code, Some(0), "stderr={}", none.stderr);
+    assert!(
+        none.stdout.contains("No retention is configured"),
+        "{}",
+        none.stdout
+    );
+    assert_eq!(count(&env), before);
+
+    // Everything is younger than a day.
+    let young = env.run(&["db", "prune", "--max-age", "1d"]);
+    assert_eq!(young.code, Some(0), "stderr={}", young.stderr);
+    assert!(
+        young.stdout.contains("Dropped 0 events"),
+        "{}",
+        young.stdout
+    );
+
+    let bad = env.run(&["db", "prune", "--max-age", "soon"]);
+    assert_ne!(bad.code, Some(0));
+    assert!(
+        bad.stderr.contains("--max-age takes a duration"),
+        "{}",
+        bad.stderr
+    );
+
+    // The configured policy applies when no flag overrides it.
+    let config_dir = env.home.join(".config").join("alforria");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("opencode.json"),
+        r#"{"storage": {"retention": {"events": {"keep_last": 5}}}}"#,
+    )
+    .unwrap();
+    let configured = env.run(&["db", "prune"]);
+    assert_eq!(configured.code, Some(0), "stderr={}", configured.stderr);
+    assert!(
+        configured
+            .stdout
+            .contains(&format!("Dropped {} events from 1 sessions.", before - 5)),
+        "{}",
+        configured.stdout
+    );
+    assert_eq!(count(&env), 5);
+
+    let pruned = env.run(&["db", "prune", "--keep-last", "3", "--vacuum"]);
+    assert_eq!(pruned.code, Some(0), "stderr={}", pruned.stderr);
+    assert!(
+        pruned.stdout.contains("Dropped 2 events from 1 sessions."),
+        "{}",
+        pruned.stdout
+    );
+    assert!(
+        pruned.stdout.contains("The database file is now"),
+        "{}",
+        pruned.stdout
+    );
+    assert_eq!(count(&env), 3);
+
+    // The session itself is intact.
+    let list = env.run(&["session", "list", "--format", "json"]);
+    assert_eq!(list.code, Some(0), "stderr={}", list.stderr);
+    let sessions: serde_json::Value = serde_json::from_str(&list.stdout).unwrap();
+    assert_eq!(
+        sessions.as_array().map(Vec::len),
+        Some(1),
+        "{}",
+        list.stdout
+    );
+}
+
+// -----------------------------------------------------------------------
 // providers login/logout round-trip
 // -----------------------------------------------------------------------
 

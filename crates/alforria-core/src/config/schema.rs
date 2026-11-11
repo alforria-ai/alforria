@@ -271,6 +271,93 @@ pub struct WorkflowsInfo {
 }
 
 // ---------------------------------------------------------------------------
+// storage (alforria extension)
+// ---------------------------------------------------------------------------
+
+/// A length of time written as a number and a unit: `45s`, `90m`, `12h`,
+/// `30d`, `2w`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfigDuration(pub std::time::Duration);
+
+impl ConfigDuration {
+    pub fn parse(text: &str) -> Option<ConfigDuration> {
+        let text = text.trim();
+        let digits = text.bytes().take_while(u8::is_ascii_digit).count();
+        let amount: u64 = text[..digits].parse().ok()?;
+        let unit = match text[digits..].trim() {
+            "s" => 1,
+            "m" => 60,
+            "h" => 60 * 60,
+            "d" => 24 * 60 * 60,
+            "w" => 7 * 24 * 60 * 60,
+            _ => return None,
+        };
+        Some(ConfigDuration(std::time::Duration::from_secs(
+            amount.checked_mul(unit)?,
+        )))
+    }
+
+    pub fn as_millis(self) -> u64 {
+        self.0.as_millis() as u64
+    }
+}
+
+impl Serialize for ConfigDuration {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let seconds = self.0.as_secs();
+        let text = [
+            (7 * 24 * 60 * 60, "w"),
+            (24 * 60 * 60, "d"),
+            (60 * 60, "h"),
+            (60, "m"),
+        ]
+        .iter()
+        .find(|(unit, _)| seconds > 0 && seconds.checked_rem(*unit) == Some(0))
+        .map(|(unit, name)| format!("{}{name}", seconds / unit))
+        .unwrap_or_else(|| format!("{seconds}s"));
+        serializer.serialize_str(&text)
+    }
+}
+
+impl<'de> Deserialize<'de> for ConfigDuration {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        ConfigDuration::parse(&text).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "expected a duration such as \"30d\", \"12h\" or \"90m\", got {text:?}"
+            ))
+        })
+    }
+}
+
+/// `storage.retention.events` — which durable events the log may drop.
+/// Unset, nothing is dropped. An event is kept when either rule keeps it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct EventRetentionInfo {
+    /// Drop events older than this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_age: Option<ConfigDuration>,
+    /// Keep this many of each session's newest events whatever their age;
+    /// on its own, keep only these.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_last: Option<PositiveInt>,
+}
+
+/// `storage.retention` — what the database sheds as it ages.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RetentionInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub events: Option<EventRetentionInfo>,
+}
+
+/// `storage` — how the database is kept.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct StorageInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention: Option<RetentionInfo>,
+}
+
+// ---------------------------------------------------------------------------
 // config/reference.ts
 // ---------------------------------------------------------------------------
 
@@ -1222,6 +1309,8 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflows: Option<WorkflowsInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage: Option<StorageInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub references: Option<ReferenceInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reference: Option<ReferenceInfo>,
@@ -1351,6 +1440,7 @@ fn collect_issues(value: &serde_json::Value) -> Vec<crate::SchemaIssue> {
             "command" => check!(issues, key, BTreeMap<String, CommandInfo>),
             "skills" => check!(issues, key, SkillsInfo),
             "workflows" => check!(issues, key, WorkflowsInfo),
+            "storage" => check!(issues, key, StorageInfo),
             "references" => check!(issues, key, ReferenceInfo),
             "reference" => check!(issues, key, ReferenceInfo),
             "watcher" => check!(issues, key, WatcherInfo),

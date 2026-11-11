@@ -592,9 +592,18 @@ pub async fn api_session_event(
             .into_response()
         }
     };
+    // Retention may have dropped the events the client wants to resume
+    // from: say so first, so it reloads instead of silently missing them.
+    let gap = ctx.bus.durable_gap(&session_id, after).ok().flatten();
     let mut events = ctx.bus.durable_stream(&session_id, after);
     let (tx, rx) = mpsc::channel(64);
     tokio::spawn(async move {
+        if let Some(gap) = gap {
+            let frame = sse_frame(&serde_json::to_string(&gap.marker(&session_id)).unwrap());
+            if tx.send(frame.into()).await.is_err() {
+                return;
+            }
+        }
         loop {
             match events.next().await {
                 Ok(Some(event)) => {

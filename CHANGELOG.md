@@ -47,6 +47,18 @@ pre-1.0, so minor releases may include breaking changes.
 - ACP clients are told when a turn is waiting on a provider retry.
 - `compaction.default_context`: the context window, in tokens, assumed for a
   model that declares none (128,000 when unset).
+- `storage.retention.events` bounds the event log, which until now only
+  shrank when a session was deleted: `max_age` (`"30d"`, `"12h"`, …) drops
+  older events, `keep_last` keeps each session's newest N whatever their age
+  (on its own, only those). The server applies it at startup and daily.
+  Unset, nothing is dropped. Messages and sessions are never touched.
+- `alforria db prune [--max-age <duration>] [--keep-last <n>] [--vacuum]`
+  applies that policy on demand.
+- `GET /api/session/{id}/event` starts with an `event.reset` frame when the
+  events after `after` have been pruned, so a client reloads the session
+  instead of silently missing them. Without retention it never appears.
+- The server folds the write-ahead log back into the database every five
+  minutes, so the `-wal` file no longer sits at its high-water mark.
 
 ### Fixed
 
@@ -74,6 +86,9 @@ pre-1.0, so minor releases may include breaking changes.
   age. The per-turn diff summary, pruning, goal review and subagent reports
   got the same treatment, and a turn's tools share one copy of the history
   instead of holding one each.
+- A reader of `GET /api/session/{id}/event` that was far behind got the
+  session's whole event log loaded into memory at once. It now arrives in
+  pages.
 - `GET /session/{id}/message` without `limit` built the whole history in
   memory before answering. A history of 100 messages or more is now written
   out a page at a time. Clients that can should still pass `limit` and page

@@ -903,4 +903,88 @@ mod tests {
         // history.
         assert!(long < 200, "{long}");
     }
+
+    /// The event log after a turn of `steps` file writes: rows and bytes
+    /// by event type, largest first.
+    async fn event_log_after_writes(name: &str, steps: usize) -> Vec<(String, u64, u64, u64)> {
+        use crate::session::test_support::{engine, text_stream};
+        let mut script: Vec<_> = (0..steps)
+            .map(|step| {
+                vec![
+                    Ok(LlmEvent::StepStart { index: 0.0 }),
+                    Ok(LlmEvent::ToolCall {
+                        id: format!("call_{step}"),
+                        name: "write".to_string(),
+                        input: json!({
+                            "filePath": format!("src/file_{}.ts", step % 12),
+                            "content": filler(step, 2_000),
+                        }),
+                        provider_executed: None,
+                        provider_metadata: None,
+                    }),
+                    Ok(LlmEvent::StepFinish {
+                        index: 0.0,
+                        reason: FinishReason::ToolCalls,
+                        usage: None,
+                        provider_metadata: None,
+                    }),
+                    Ok(LlmEvent::Finish {
+                        reason: FinishReason::ToolCalls,
+                        usage: None,
+                        provider_metadata: None,
+                    }),
+                ]
+            })
+            .collect();
+        script.push(text_stream("done"));
+        let e = engine(name, script);
+        std::fs::create_dir_all(e.worktree.join("src")).unwrap();
+        let session = create_engine_session(&e);
+        let answer = prompt_again(&e, &session.id, "write the files").await;
+        assert_eq!(text_of(&answer), "done");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        e.services.storage.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT type, COUNT(*), SUM(LENGTH(data)), MAX(LENGTH(data)) FROM event
+                     WHERE aggregate_id = ?1 GROUP BY type ORDER BY 3 DESC",
+                )
+                .unwrap();
+            let rows = stmt
+                .query_map([&session.id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, u64>(1)?,
+                        row.get::<_, u64>(2)?,
+                        row.get::<_, u64>(3)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            rows
+        })
+    }
+
+    #[tokio::test]
+    async fn a_long_tool_turn_keeps_the_event_log_small() {
+        let log = event_log_after_writes("event-diet", 36).await;
+        let rows: u64 = log.iter().map(|row| row.1).sum();
+        let bytes: u64 = log.iter().map(|row| row.2).sum();
+        eprintln!("36-step turn: {rows} event rows, {bytes} bytes");
+        for (kind, count, total, largest) in &log {
+            eprintln!("  {kind}: {count} rows, {total} bytes, largest {largest}");
+        }
+        // v0.3.0 logged the turn's whole diff, patches included, with the
+        // user message after every step: `message.updated` rows of 30 KB
+        // and a megabyte for a turn like this. The log keeps the files and
+        // their counts and leaves the patches to the message row.
+        let updated = log
+            .iter()
+            .find(|row| row.0.starts_with("message.updated"))
+            .expect("message.updated events");
+        assert!(updated.3 < 4_000, "largest message.updated: {}", updated.3);
+        // Twelve 2 KB files written three times each, plus bookkeeping.
+        assert!(bytes < 500_000, "{bytes}");
+    }
 }

@@ -99,6 +99,9 @@ pub fn run(matches: &ArgMatches, ui: &mut Ui) -> Result<(), TypedError> {
     if let Some(trim) = matches.subcommand_matches("trim-diffs") {
         return trim_diffs(&paths, trim.get_flag("vacuum"), ui);
     }
+    if let Some(prune) = matches.subcommand_matches("prune") {
+        return prune_events(&paths, prune, ui);
+    }
     if matches.subcommand_name().is_some() {
         let path = database_path(&paths);
         ui.write_stdout(&format!("{}\n", path.display()));
@@ -183,6 +186,85 @@ fn trim_diffs(
             size / (1024 * 1024)
         ));
     } else {
+        ui.write_stdout(
+            "The file keeps its size and reuses that space. Stop alforria and add --vacuum to shrink it.\n",
+        );
+    }
+    Ok(())
+}
+
+/// The retention `db prune` applies: the flags, over `storage.retention.events`
+/// from the global config.
+fn prune_retention(
+    paths: &alforria_core::GlobalPaths,
+    matches: &ArgMatches,
+) -> Result<alforria_core::event::sql::EventRetention, String> {
+    let params = alforria_core::LoadParams::new(paths.config.clone()).paths(paths.clone());
+    let mut retention = alforria_core::ConfigLoader::new()
+        .load(&params)
+        .map(|(config, _)| alforria_core::storage::maintenance::event_retention(&config))
+        .unwrap_or_default();
+    if let Some(age) = matches.get_one::<String>("max-age") {
+        let age = alforria_core::config::schema::ConfigDuration::parse(age).ok_or_else(|| {
+            format!("--max-age takes a duration such as 30d, 12h or 90m, got {age:?}")
+        })?;
+        retention.max_age_ms = Some(age.as_millis());
+    }
+    if let Some(keep) = matches.get_one::<u64>("keep-last") {
+        retention.keep_last = Some(*keep);
+    }
+    Ok(retention)
+}
+
+/// `db prune`: apply the event retention now, checkpoint the write-ahead
+/// log, then optionally `VACUUM`.
+fn prune_events(
+    paths: &alforria_core::GlobalPaths,
+    matches: &ArgMatches,
+    ui: &mut Ui,
+) -> Result<(), TypedError> {
+    use alforria_core::storage::maintenance;
+    let cli_error = |err: String| TypedError::Cli(CliError::new(err));
+    let retention = prune_retention(paths, matches).map_err(cli_error)?;
+    let vacuum = matches.get_flag("vacuum");
+    let path = database_path(paths);
+    if vacuum {
+        // `VACUUM` builds its copy in the temp dir, which can be RAM-backed.
+        if let Some(parent) = path.parent() {
+            std::env::set_var("SQLITE_TMPDIR", parent);
+        }
+    }
+    let storage = alforria_core::Storage::open_default(&paths.data)
+        .map_err(|err| cli_error(err.to_string()))?;
+    if retention.is_set() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis() as u64)
+            .unwrap_or(0);
+        let report = maintenance::prune_events(&storage, &retention, now)
+            .map_err(|err| cli_error(err.to_string()))?;
+        ui.write_stdout(&format!(
+            "Dropped {} events from {} sessions.\n",
+            report.events, report.aggregates
+        ));
+    } else {
+        ui.write_stdout(
+            "No retention is configured, so no events were dropped. Pass --max-age or --keep-last, or set storage.retention.events in the config.\n",
+        );
+    }
+    if vacuum {
+        maintenance::vacuum(&storage).map_err(|err| {
+            cli_error(format!(
+                "Vacuum failed, so the file keeps its size: {err}. Is alforria still running?"
+            ))
+        })?;
+        let size = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+        ui.write_stdout(&format!(
+            "The database file is now {} MB.\n",
+            size / (1024 * 1024)
+        ));
+    } else {
+        maintenance::checkpoint(&storage).map_err(|err| cli_error(err.to_string()))?;
         ui.write_stdout(
             "The file keeps its size and reuses that space. Stop alforria and add --vacuum to shrink it.\n",
         );

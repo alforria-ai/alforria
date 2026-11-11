@@ -167,6 +167,7 @@ pub fn production_context(
     let storage = Storage::open_default(&paths.data)
         .map_err(|err| io::Error::other(format!("storage open failed: {err}")))?;
     let storage = Arc::new(storage);
+    start_maintenance(&storage, &global_config(&paths));
     // The session durable manifest — required by the durable streams
     // (`/api/session/:id/event`, `/api/session/:id/history`).
     let manifest = Arc::new(alforria_core::session::event_definitions::SessionManifest::new());
@@ -211,6 +212,34 @@ pub fn production_context(
     ctx.catalog = runtime.catalog;
     ctx.auth_store = runtime.auth;
     Ok(Arc::new(ctx))
+}
+
+/// The merged global config, for what the server decides once rather than
+/// per directory. A config that does not load counts as empty here: the
+/// directory that needs it reports the error.
+pub(crate) fn global_config(
+    paths: &alforria_core::GlobalPaths,
+) -> alforria_core::config::schema::Config {
+    let params = alforria_core::LoadParams::new(paths.config.clone()).paths(paths.clone());
+    alforria_core::ConfigLoader::new()
+        .load(&params)
+        .map(|(config, _)| config)
+        .unwrap_or_else(|_| serde_json::from_str("{}").expect("an empty config decodes"))
+}
+
+/// Event-log retention (`storage.retention`) and write-ahead-log
+/// checkpoints: now, then periodically for as long as the server runs.
+/// Without a runtime to run on (the in-process server is built before the
+/// TUI starts one) the startup pass still happens.
+fn start_maintenance(storage: &Arc<Storage>, config: &alforria_core::config::schema::Config) {
+    use alforria_core::storage::maintenance;
+    let retention = maintenance::event_retention(config);
+    match tokio::runtime::Handle::try_current() {
+        Ok(_) => {
+            maintenance::spawn(storage, retention);
+        }
+        Err(_) => maintenance::run_once(storage, &retention),
+    }
 }
 
 /// The per-directory instance factory (TS `InstanceStore.boot` +
