@@ -58,6 +58,15 @@ pre-1.0, so minor releases may include breaking changes.
   declared context limit is held to a default ceiling instead of none.
 - A request that still does not fit after three compactions in a row ends the
   turn with a `ContextOverflowError` instead of compacting forever.
+- Compaction sent the whole history to be summarised in one request, so a
+  history larger than the context window could never be compacted and every
+  later prompt failed with "Conversation history too large to compact". The
+  history is now summarised in pieces that each fit, every piece building on
+  the summary of the ones before it, and is read from the database a page at
+  a time: a turn holds at most 8 MiB of history in memory, whatever the
+  session's size. A session already stuck in that state compacts on its next
+  prompt. When a provider refuses a summary request as too large (its real
+  limit is below the declared one), the pieces are halved and tried again.
 - A file path containing `..` could write, search or read outside the project
   without the `external_directory` prompt, through `apply_patch`, `grep`,
   `glob` and `lsp`.

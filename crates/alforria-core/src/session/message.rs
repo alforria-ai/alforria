@@ -188,6 +188,29 @@ pub struct MessagePage {
     pub cursor: Option<String>,
 }
 
+/// A [`MessageStore::window`] result.
+#[derive(Debug, Clone, Default)]
+pub struct Window {
+    /// What [`filter_compacted`] returns, as far back as was read.
+    pub messages: Vec<WithParts>,
+    /// Whether that reaches the last compaction, or the start of the
+    /// session. When not, older messages were left in the database.
+    pub complete: bool,
+}
+
+/// A [`MessageStore::last_compaction`] result.
+#[derive(Debug, Clone)]
+pub struct Compacted {
+    /// The compaction marker: the user message the summary answers.
+    pub user_id: String,
+    pub summary: WithParts,
+    /// Where the history the summary does not cover starts, for
+    /// [`MessageStore::page_after`].
+    pub from: Cursor,
+    /// Whether the message at `from` is itself part of that history.
+    pub inclusive: bool,
+}
+
 /// The message store (`MessageV2` store side).
 #[derive(Debug, Clone)]
 pub struct MessageStore {
@@ -374,6 +397,154 @@ impl MessageStore {
         Ok(result)
     }
 
+    /// The history a turn works from: [`filter_compacted`] over
+    /// [`Self::stream_without_diffs`], read page by page and no further
+    /// than the last compaction. A history with more than `max_bytes` of
+    /// parts since then is cut off there (`complete: false`): it cannot be
+    /// sent, only compacted, and holding all of it would cost memory in
+    /// proportion to the session.
+    pub fn window(&self, session_id: &str, max_bytes: usize) -> Result<Window, SessionError> {
+        const SIZE: usize = 50;
+        let mut walk = CompactedWalk::default();
+        let mut before: Option<String> = None;
+        let mut bytes = 0usize;
+        let mut complete = true;
+        'pages: loop {
+            let page =
+                match self.page_of(COLUMNS_WITHOUT_DIFFS, session_id, SIZE, before.as_deref()) {
+                    Ok(page) => page,
+                    Err(SessionError::NotFound(_)) => break,
+                    Err(err) => return Err(err),
+                };
+            if page.items.is_empty() {
+                break;
+            }
+            let ids: Vec<&str> = page.items.iter().map(|msg| message_id(&msg.info)).collect();
+            bytes += self.part_bytes(&ids)?;
+            for msg in page.items.into_iter().rev() {
+                if walk.push(msg) {
+                    break 'pages;
+                }
+            }
+            if !page.more || page.cursor.is_none() {
+                break;
+            }
+            if bytes > max_bytes {
+                complete = false;
+                break;
+            }
+            before = page.cursor;
+        }
+        Ok(Window {
+            messages: walk.finish(),
+            complete,
+        })
+    }
+
+    /// The stored size of these messages' parts.
+    fn part_bytes(&self, message_ids: &[&str]) -> Result<usize, CoreError> {
+        if message_ids.is_empty() {
+            return Ok(0);
+        }
+        let placeholders = vec!["?"; message_ids.len()].join(", ");
+        let sql = format!(
+            "SELECT COALESCE(SUM(LENGTH(data)), 0) FROM part WHERE message_id IN ({placeholders})"
+        );
+        self.storage.with_connection(|conn| {
+            let bytes: i64 = conn.query_row(
+                &sql,
+                rusqlite::params_from_iter(message_ids.iter()),
+                |row| row.get(0),
+            )?;
+            Ok(bytes.max(0) as usize)
+        })
+    }
+
+    /// Up to `limit` messages after `after` (or from it, when `inclusive`),
+    /// oldest first: the forward counterpart of [`Self::page`], for reading
+    /// a long history in order without holding it. `summary.diffs` come back
+    /// empty.
+    pub fn page_after(
+        &self,
+        session_id: &str,
+        after: Option<&Cursor>,
+        inclusive: bool,
+        limit: usize,
+    ) -> Result<Vec<WithParts>, SessionError> {
+        let sql = if after.is_some() {
+            let id = if inclusive { ">=" } else { ">" };
+            format!("SELECT {COLUMNS_WITHOUT_DIFFS} FROM message WHERE session_id = ?1 AND (time_created > ?2 OR (time_created = ?2 AND id {id} ?3)) ORDER BY time_created ASC, id ASC LIMIT ?4")
+        } else {
+            format!("SELECT {COLUMNS_WITHOUT_DIFFS} FROM message WHERE session_id = ?1 ORDER BY time_created ASC, id ASC LIMIT ?4")
+        };
+        let (time, id) = match after {
+            Some(cursor) => (cursor.time as i64, cursor.id.clone()),
+            None => (0, String::new()),
+        };
+        let rows = self.storage.with_connection(|conn| {
+            query_messages(
+                conn,
+                &sql,
+                rusqlite::params![session_id, time, id, limit as i64],
+            )
+        })?;
+        Ok(self.hydrate(&rows)?)
+    }
+
+    /// Where the newest completed compaction left the history: its summary
+    /// and the first message still standing in full (the tail it kept, or
+    /// the message after the summary). `None` for a session never
+    /// compacted.
+    pub fn last_compaction(&self, session_id: &str) -> Result<Option<Compacted>, SessionError> {
+        // Summaries are few; their rows are found without reading parts.
+        let rows = self.storage.with_connection(|conn| {
+            query_messages(
+                conn,
+                "SELECT id, session_id, time_created, time_updated, data FROM message
+                 WHERE session_id = ?1
+                   AND json_extract(data, '$.role') = 'assistant'
+                   AND json_extract(data, '$.summary') = 1
+                   AND json_extract(data, '$.finish') IS NOT NULL
+                   AND json_extract(data, '$.error') IS NULL
+                 ORDER BY time_created DESC, id DESC",
+                rusqlite::params![session_id],
+            )
+        })?;
+        for row in rows {
+            let V1Message::Assistant { parent_id, .. } = info_from_row(&row)? else {
+                continue;
+            };
+            let Ok(parent) = self.get(session_id, &parent_id) else {
+                continue;
+            };
+            let Some(part) = parent.parts.iter().find(|part| is_compaction(part)) else {
+                continue;
+            };
+            let summary = self.get(session_id, &row.id)?;
+            let tail = match compaction_tail(part).and_then(|tail| tail.clone()) {
+                Some(tail) => self.get(session_id, &tail).ok(),
+                None => None,
+            };
+            let from = match &tail {
+                Some(tail) => Cursor {
+                    id: message_id(&tail.info).to_string(),
+                    time: message_time_created(&tail.info),
+                },
+                None => Cursor {
+                    id: row.id.clone(),
+                    time: row.time_created as f64,
+                },
+            };
+            return Ok(Some(Compacted {
+                user_id: parent_id,
+                summary,
+                from,
+                inclusive: tail.is_some(),
+            }));
+        }
+        Ok(None)
+    }
+
     /// `MessageV2.parts` (message-v2.ts:492-504) — parts ordered by id.
     pub fn parts(&self, message_id: &str) -> Result<Vec<V1Part>, SessionError> {
         let rows = self.storage.with_connection(|conn| {
@@ -452,41 +623,36 @@ fn is_compaction(part: &V1Part) -> bool {
     matches!(part, V1Part::Compaction { .. })
 }
 
-/// `filterCompacted` (message-v2.ts:521-572 — binding): retain-walk over the
-/// newest-first stream, reverse, then reorder around the last compaction
-/// into `[compaction-user, summary, tail, remainder]`.
-pub fn filter_compacted(msgs: Vec<WithParts>) -> Vec<WithParts> {
-    let mut result: Vec<WithParts> = Vec::new();
-    let mut completed: HashSet<String> = HashSet::new();
-    let mut retain: Option<String> = None;
-    for msg in msgs {
+/// The retain-walk of `filterCompacted` (message-v2.ts:521-553), fed one
+/// message at a time, newest first, so a caller reading pages from SQLite
+/// can stop reading as soon as the walk does.
+#[derive(Default)]
+struct CompactedWalk {
+    result: Vec<WithParts>,
+    completed: HashSet<String>,
+    retain: Option<String>,
+}
+
+impl CompactedWalk {
+    /// Take the next older message. Returns `true` once nothing older is
+    /// needed.
+    fn push(&mut self, msg: WithParts) -> bool {
         let id = message_id(&msg.info).to_string();
-        result.push(msg);
-        let msg = result.last().expect("just pushed");
-        if let Some(retained) = retain.as_deref() {
-            if id == retained {
-                break;
-            }
-            continue;
+        self.result.push(msg);
+        let msg = self.result.last().expect("just pushed");
+        if let Some(retained) = self.retain.as_deref() {
+            return id == retained;
         }
-        if message_role(&msg.info) == "user" && completed.contains(&id) {
+        if message_role(&msg.info) == "user" && self.completed.contains(&id) {
             let Some(part) = msg.parts.iter().find(|part| is_compaction(part)) else {
-                continue;
+                return false;
             };
             let Some(tail) = compaction_tail(part).and_then(|tail| tail.clone()) else {
-                break;
+                return true;
             };
-            retain = Some(tail.clone());
-            if id == tail {
-                break;
-            }
-            continue;
-        }
-        if message_role(&msg.info) == "user"
-            && completed.contains(&id)
-            && msg.parts.iter().any(is_compaction)
-        {
-            break;
+            let done = id == tail;
+            self.retain = Some(tail);
+            return done;
         }
         if let V1Message::Assistant {
             summary: Some(true),
@@ -496,9 +662,32 @@ pub fn filter_compacted(msgs: Vec<WithParts>) -> Vec<WithParts> {
             ..
         } = &msg.info
         {
-            completed.insert(parent_id.clone());
+            self.completed.insert(parent_id.clone());
+        }
+        false
+    }
+
+    /// Chronological order, reordered around the last compaction.
+    fn finish(self) -> Vec<WithParts> {
+        reorder_compacted(self.result)
+    }
+}
+
+/// `filterCompacted` (message-v2.ts:521-572 — binding): retain-walk over the
+/// newest-first stream, reverse, then reorder around the last compaction
+/// into `[compaction-user, summary, tail, remainder]`.
+pub fn filter_compacted(msgs: Vec<WithParts>) -> Vec<WithParts> {
+    let mut walk = CompactedWalk::default();
+    for msg in msgs {
+        if walk.push(msg) {
+            break;
         }
     }
+    walk.finish()
+}
+
+/// The second half of `filterCompacted` (message-v2.ts:554-572).
+fn reorder_compacted(mut result: Vec<WithParts>) -> Vec<WithParts> {
     result.reverse();
 
     let compaction_index = result.iter().rposition(|msg| {

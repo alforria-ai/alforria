@@ -27,6 +27,8 @@ pub(crate) struct SeenRequest {
     pub(crate) agent: String,
     pub(crate) bytes: usize,
     pub(crate) rejected: bool,
+    /// Whether the request carried an earlier summary to build on.
+    pub(crate) prior_summary: bool,
 }
 
 /// A provider with a context limit: a request whose size, at four bytes a
@@ -135,6 +137,15 @@ impl LlmStream for LimitedLlm {
             agent: agent.clone(),
             bytes,
             rejected,
+            prior_summary: input.messages.iter().any(|message| {
+                message.content.iter().any(|part| {
+                    matches!(
+                        part,
+                        alforria_llm::schema::messages::ContentPart::Text { text, .. }
+                            if text.contains("<prior-summary>")
+                    )
+                })
+            }),
         });
         if rejected {
             return futures::stream::iter(vec![Err(context_overflow_error(
@@ -194,6 +205,29 @@ pub(crate) struct LongSession {
     pub(crate) tool_output: (usize, usize),
 }
 
+impl LongSession {
+    /// A third of the messages call a tool, with 2–8 KB outputs: 3,000
+    /// messages make the session the v0.3.0 experiments could not continue.
+    pub(crate) fn of(messages: usize) -> LongSession {
+        LongSession {
+            messages,
+            tool_output: (2_000, 8_000),
+        }
+    }
+}
+
+/// The most memory this process has held at once, in bytes (Linux; 0
+/// elsewhere).
+pub(crate) fn peak_resident_bytes() -> usize {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            let line = status.lines().find(|line| line.starts_with("VmHWM:"))?;
+            line.split_whitespace().nth(1)?.parse::<usize>().ok()
+        })
+        .map_or(0, |kib| kib * 1024)
+}
+
 /// What [`write_long_session`] wrote.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct Written {
@@ -245,6 +279,17 @@ pub(crate) fn write_long_session(
     session_id: &str,
     shape: LongSession,
 ) -> Written {
+    write_long_session_from(storage, session_id, shape, 0)
+}
+
+/// [`write_long_session`], numbering messages from `first`: more history
+/// for a session that already has some.
+pub(crate) fn write_long_session_from(
+    storage: &Storage,
+    session_id: &str,
+    shape: LongSession,
+    first: usize,
+) -> Written {
     let mut written = Written::default();
     let (low, high) = shape.tool_output;
     storage
@@ -260,11 +305,11 @@ pub(crate) fn write_long_session(
                      VALUES (?1, ?2, ?3, ?4, ?4, ?5)",
                 )?;
                 let mut user_id = String::new();
-                for index in 0..shape.messages {
+                for index in first..first + shape.messages {
                     let created = index as i64 + 1;
                     let id = format!("msg_{index:026}");
                     let part_id = |n: usize| format!("prt_{:026}", index * 4 + n);
-                    let (info, parts): (V1Message, Vec<V1Part>) = match index % 3 {
+                    let (info, parts): (V1Message, Vec<V1Part>) = match (index - first) % 3 {
                         0 => {
                             user_id = id.clone();
                             (
@@ -397,18 +442,26 @@ mod tests {
 
     const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
-    /// The `n`th prompt after a generated history. The harness clock never
+    /// The first prompt after a generated history. The harness clock never
     /// moves, so ids alone order what follows: this one sorts after
     /// everything the generator wrote and before the ids the engine makes.
-    async fn prompt(e: &Engine, session_id: &str, n: usize, text: &str) -> WithParts {
-        let id = format!("msg_{:026}", 9_000_000 + n);
-        tokio::time::timeout(
-            TIMEOUT,
-            e.prompt.prompt(prompt_input_for(&id, session_id, text)),
-        )
-        .await
-        .expect("the turn ends")
-        .expect("the turn succeeds")
+    async fn prompt(e: &Engine, session_id: &str, text: &str) -> WithParts {
+        let id = format!("msg_{:026}", 9_000_000);
+        run(e, prompt_input_for(&id, session_id, text)).await
+    }
+
+    /// A later prompt, with an id of the engine's own making.
+    async fn prompt_again(e: &Engine, session_id: &str, text: &str) -> WithParts {
+        let mut input = prompt_input_for("msg_x", session_id, text);
+        input.message_id = None;
+        run(e, input).await
+    }
+
+    async fn run(e: &Engine, input: crate::session::prompt_input::PromptInput) -> WithParts {
+        tokio::time::timeout(TIMEOUT, e.prompt.prompt(input))
+            .await
+            .expect("the turn ends")
+            .expect("the turn succeeds")
     }
 
     fn text_of(message: &WithParts) -> String {
@@ -444,7 +497,7 @@ mod tests {
         let session = create_engine_session(&e);
         write_long_session(&e.services.storage, &session.id, heavy());
 
-        let answer = prompt(&e, &session.id, 1, "what did module 4 export?").await;
+        let answer = prompt(&e, &session.id, "what did module 4 export?").await;
 
         let requests = llm.requests();
         assert_eq!(
@@ -469,7 +522,7 @@ mod tests {
         );
         let session = create_engine_session(&e);
         write_long_session(&e.services.storage, &session.id, heavy());
-        prompt(&e, &session.id, 1, "go on").await;
+        prompt(&e, &session.id, "go on").await;
         let requests = llm.requests();
         assert_eq!(requests[0].agent, "compaction", "{requests:?}");
 
@@ -483,7 +536,7 @@ mod tests {
         );
         let session = create_engine_session(&e);
         write_long_session(&e.services.storage, &session.id, heavy());
-        prompt(&e, &session.id, 1, "go on").await;
+        prompt(&e, &session.id, "go on").await;
         let requests = llm.requests();
         assert_eq!(requests.len(), 1, "{requests:?}");
         assert_eq!(requests[0].agent, "build");
@@ -511,7 +564,7 @@ mod tests {
         );
         let errors = e.services.events.subscribe("session.error");
 
-        prompt(&e, &session.id, 1, "go on").await;
+        prompt(&e, &session.id, "go on").await;
 
         let requests = llm.requests();
         let turns = requests.iter().filter(|r| r.agent == "build").count();
@@ -533,5 +586,210 @@ mod tests {
                 .contains("after 3 compactions"),
             "{last}"
         );
+    }
+
+    /// Prompt a generated session of `messages` against a provider with a
+    /// 100k window, twice, and check that nothing oversized was ever sent.
+    async fn compacts_and_continues(name: &str, shape: LongSession, paged: bool) {
+        let messages = shape.messages;
+        let before = peak_resident_bytes();
+        let llm = LimitedLlm::new(100_000);
+        let e = engine_with_provider(
+            name,
+            llm.clone(),
+            test_model_with_context(100_000.0, 8_192.0),
+            json!({}),
+        );
+        let session = create_engine_session(&e);
+        let written = write_long_session(&e.services.storage, &session.id, shape);
+        assert_eq!(written.messages, messages);
+        // Whether the history is more than a turn will hold, and so is
+        // summarised straight from the database.
+        let window = e
+            .services
+            .messages
+            .window(&session.id, crate::session::r#loop::HISTORY_WINDOW_BYTES)
+            .unwrap();
+        assert_eq!(!window.complete, paged, "{} loaded", window.messages.len());
+        drop(window);
+
+        let answer = prompt(&e, &session.id, "what did module 4 export?").await;
+        assert_eq!(text_of(&answer), "answer");
+
+        let requests = llm.requests();
+        let summaries: Vec<&SeenRequest> = requests
+            .iter()
+            .filter(|request| request.agent == "compaction")
+            .collect();
+        let peak = peak_resident_bytes();
+        eprintln!(
+            "{messages} messages, {} bytes stored: {} summary requests, largest request {} bytes, peak RSS {} MB (was {} MB)",
+            written.bytes,
+            summaries.len(),
+            llm.largest(),
+            peak >> 20,
+            before >> 20,
+        );
+        assert_eq!(llm.rejected(), 0, "nothing oversized was sent");
+        assert!(llm.largest() / 4 <= 100_000);
+        // The history is several times the window, so it took several
+        // requests, each building on the summary before it.
+        assert!(summaries.len() > 2, "{}", summaries.len());
+        assert!(!summaries[0].prior_summary);
+        assert!(summaries[1..].iter().all(|request| request.prior_summary));
+        assert_eq!(requests.last().unwrap().agent, "build");
+        if peak > 0 {
+            assert!(peak < 2 << 30, "peak RSS {} MB", peak >> 20);
+        }
+
+        // The session carries on from the summary: one small request.
+        let sent = llm.requests().len();
+        let answer = prompt_again(&e, &session.id, "and module 7?").await;
+        assert_eq!(text_of(&answer), "answer");
+        let requests = llm.requests();
+        assert_eq!(requests.len(), sent + 1, "{:?}", &requests[sent..]);
+        assert!(requests[sent].bytes < 200_000, "{:?}", requests[sent]);
+    }
+
+    #[tokio::test]
+    async fn a_3000_message_session_compacts_and_continues() {
+        compacts_and_continues("long-3000", LongSession::of(3_000), false).await;
+    }
+
+    /// The same number of messages with outputs large enough that the
+    /// history is not read into memory at all.
+    #[tokio::test]
+    async fn a_history_too_large_to_hold_is_compacted_from_the_database() {
+        compacts_and_continues(
+            "long-paged",
+            LongSession {
+                messages: 3_000,
+                tool_output: (6_000, 14_000),
+            },
+            true,
+        )
+        .await;
+    }
+
+    /// The session that was OOM-killed at 2 GB before any request went out.
+    /// Slow in a debug build: `cargo nextest run --run-ignored all`.
+    #[tokio::test]
+    #[ignore = "slow: 12,000 messages"]
+    async fn a_12000_message_session_compacts_and_continues() {
+        compacts_and_continues("long-12000", LongSession::of(12_000), true).await;
+    }
+
+    /// The state v0.3.0 left such a session in: the turn's request refused,
+    /// then a compaction whose own request was refused, on every prompt.
+    #[tokio::test]
+    async fn a_session_stuck_too_large_to_compact_works_again() {
+        let llm = LimitedLlm::new(100_000);
+        let e = engine_with_provider(
+            "long-stuck",
+            llm.clone(),
+            test_model_with_context(100_000.0, 8_192.0),
+            json!({}),
+        );
+        let session = create_engine_session(&e);
+        write_long_session(&e.services.storage, &session.id, LongSession::of(3_000));
+        let sessions = &e.services.sessions;
+        let user = "msg_00000000000000000000005000";
+        let marker = "msg_00000000000000000000005002";
+        sessions
+            .update_message(&user_message(&session.id, user, 5_000.0))
+            .unwrap();
+        sessions
+            .update_part(&text_part(
+                &session.id,
+                user,
+                "prt_00000000000000000000050000",
+                "continue",
+            ))
+            .unwrap();
+        // The refused turn: no finish, no error.
+        sessions
+            .update_message(&assistant_message(
+                &session.id,
+                "msg_00000000000000000000005001",
+                user,
+                5_001,
+                None,
+                None,
+            ))
+            .unwrap();
+        sessions
+            .update_message(&user_message(&session.id, marker, 5_002.0))
+            .unwrap();
+        sessions
+            .update_part(&crate::session::test_support::compaction_part(
+                &session.id,
+                marker,
+                "prt_00000000000000000000050001",
+                true,
+                Some(true),
+                None,
+            ))
+            .unwrap();
+        let mut failed = assistant_message(
+            &session.id,
+            "msg_00000000000000000000005003",
+            marker,
+            5_003,
+            Some(true),
+            Some("error".to_string()),
+        );
+        if let V1Message::Assistant { error, .. } = &mut failed {
+            *error = Some(
+                alforria_schema::session_v1::AssistantError::ContextOverflow {
+                    message:
+                        "Conversation history too large to compact - exceeds model context limit"
+                            .to_string(),
+                    response_body: None,
+                },
+            );
+        }
+        sessions.update_message(&failed).unwrap();
+
+        let answer = prompt(&e, &session.id, "are you there?").await;
+
+        assert_eq!(text_of(&answer), "answer");
+        assert_eq!(llm.rejected(), 0, "{:?}", llm.requests());
+        let V1Message::Assistant { error, .. } = &answer.info else {
+            panic!("an assistant message");
+        };
+        assert!(error.is_none(), "{error:?}");
+    }
+
+    /// A model that declares no limit is sized against the default ceiling,
+    /// which this provider is well under: its refusals shrink the requests
+    /// until they fit.
+    #[tokio::test]
+    async fn summary_requests_shrink_until_the_provider_takes_them() {
+        let llm = LimitedLlm::new(20_000);
+        let e = engine_with_provider(
+            "long-shrink",
+            llm.clone(),
+            test_model_with_context(0.0, 4_096.0),
+            json!({}),
+        );
+        let session = create_engine_session(&e);
+        write_long_session(&e.services.storage, &session.id, LongSession::of(600));
+
+        let answer = prompt(&e, &session.id, "go on").await;
+
+        assert_eq!(text_of(&answer), "answer");
+        let requests = llm.requests();
+        let refused = requests.iter().filter(|request| request.rejected).count();
+        assert!((1..=4).contains(&refused), "{requests:?}");
+        assert!(!requests.last().unwrap().rejected);
+
+        // The size that worked is remembered for the next compaction.
+        let other = create_engine_session(&e);
+        write_long_session_from(&e.services.storage, &other.id, LongSession::of(600), 10_000);
+        let sent = requests.len();
+        prompt_again(&e, &other.id, "go on").await;
+        let later = &llm.requests()[sent..];
+        assert!(later.iter().any(|request| request.agent == "compaction"));
+        assert!(later.iter().all(|request| !request.rejected), "{later:?}");
     }
 }

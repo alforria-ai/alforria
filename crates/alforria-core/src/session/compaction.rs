@@ -27,8 +27,10 @@ use crate::session::error::SessionError;
 use crate::session::event_definitions::SESSION_COMPACTED;
 use crate::session::ids::{MessageId, PartId};
 use crate::session::llm::{LlmStream, StreamInput};
-use crate::session::message::{message_id, MessageStore, WithParts};
-use crate::session::overflow::{is_overflow, usable, IsOverflowInput, ModelLimits, UsableInput};
+use crate::session::message::{message_id, Cursor, MessageStore, WithParts};
+use crate::session::overflow::{
+    is_overflow, request_budget, usable, IsOverflowInput, ModelLimits, UsableInput,
+};
 use crate::session::processor::{
     AskPermission, ProcessResult, Processor, ProcessorDeps, ProcessorInput, SummarySummarize,
 };
@@ -42,6 +44,7 @@ use crate::session::status::SessionStatusService;
 use crate::session::store::SessionStore;
 use crate::tool::def::InstanceContext;
 
+use alforria_llm::schema::errors::ProviderFailureClassification;
 use alforria_llm::schema::messages::Message;
 
 // ---------------------------------------------------------------------------
@@ -518,11 +521,115 @@ pub struct CompactionDeps {
 /// `SessionCompaction.Service` (compaction.ts:165-191).
 pub struct SessionCompaction {
     deps: CompactionDeps,
+    /// See [`SessionCompaction::scale`], by `provider/model`.
+    scales: std::sync::Mutex<std::collections::HashMap<String, f64>>,
+}
+
+/// The error a compaction ends with when no request small enough to send
+/// can carry its history (compaction.ts:497).
+const TOO_LARGE_TO_COMPACT: &str =
+    "Conversation history too large to compact - exceeds model context limit";
+
+/// The smallest a summary request is made before giving up, in bytes of
+/// conversation: below this a chunk no longer holds a whole exchange.
+const MIN_CHUNK_BYTES: usize = 8_000;
+
+/// How far [`SessionCompaction::shrink`] goes: a sixteenth of the budget.
+const MIN_CHUNK_SCALE: f64 = 1.0 / 16.0;
+
+/// Retries of one intermediate summary request on a transient failure, on
+/// top of the HTTP client's own.
+const SUMMARY_RETRIES: u32 = 3;
+
+/// History the loop did not load, to be read from the database.
+struct Older {
+    /// The summary covering everything before `from`.
+    summary: Option<String>,
+    /// Where to start reading, and whether that message is included.
+    /// `None` reads from the start of the session.
+    from: Option<(Cursor, bool)>,
+    /// The first message the loop did load: reading stops before it.
+    until: Cursor,
+}
+
+/// What [`SessionCompaction::fold`] works from.
+struct Fold<'a> {
+    session_id: &'a str,
+    older: Option<&'a Older>,
+    /// The loaded history to summarise, serialized, oldest first.
+    head: &'a [String],
+    previous_summary: Option<&'a str>,
+    model: &'a ResolvedModel,
+    agent: &'a crate::session::agents::AgentInfo,
+    user: &'a V1Message,
+    cancel: &'a CancellationToken,
+}
+
+/// What is left for the final summary request.
+struct Folded {
+    conversation: String,
+    previous_summary: Option<String>,
+}
+
+enum FoldStop {
+    /// The provider refused a request as too large.
+    Overflow,
+    Cancelled,
+    Failed(Box<AssistantError>),
+}
+
+fn failed(message: String) -> FoldStop {
+    FoldStop::Failed(Box::new(AssistantError::Unknown {
+        message,
+        r#ref: None,
+    }))
+}
+
+fn cursor_before(a: &Cursor, b: &Cursor) -> bool {
+    a.time < b.time || (a.time == b.time && a.id < b.id)
+}
+
+fn is_compaction_message(message: &WithParts) -> bool {
+    matches!(
+        message.info,
+        V1Message::Assistant {
+            summary: Some(true),
+            ..
+        }
+    ) || message
+        .parts
+        .iter()
+        .any(|part| matches!(part, V1Part::Compaction { .. }))
+}
+
+/// Cut `text` to about `max` bytes, keeping its start and its end.
+fn clip(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let keep = max / 2;
+    let mut start = keep;
+    while !text.is_char_boundary(start) {
+        start -= 1;
+    }
+    let mut end = text.len() - keep;
+    while !text.is_char_boundary(end) {
+        end += 1;
+    }
+    format!(
+        "{}\n[... {} bytes omitted ...]\n{}",
+        &text[..start],
+        end - start,
+        &text[end..]
+    )
 }
 
 impl SessionCompaction {
     pub fn new(deps: CompactionDeps) -> SessionCompaction {
-        SessionCompaction { deps }
+        SessionCompaction {
+            deps,
+            scales: Default::default(),
+        }
     }
 
     fn storage_error(message: impl Into<String>) -> SessionError {
@@ -763,33 +870,25 @@ impl SessionCompaction {
         });
         // Plugin seam: `experimental.session.compacting` — a no-op
         // returning `{ context: [], prompt: undefined }`.
-        let compacting_prompt: Option<String> = None;
-        let compacting_context: Vec<String> = Vec::new();
-        let msgs = selected.head.clone();
         // Plugin seam: `experimental.chat.messages.transform` — no-op.
-        let conversation = msgs
+        let head: Vec<String> = selected
+            .head
             .iter()
             .map(serialize)
             .filter(|text| !text.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        let next_prompt = match compacting_prompt {
-            Some(prompt) => [
-                prompt,
-                "The following is the conversation history:".to_string(),
-                conversation.clone(),
-            ]
-            .join("\n\n"),
-            None => [build_prompt(&BuildPrompt {
-                previous_summary: previous_summary.as_deref(),
-                context: vec![conversation.clone()],
-            })]
-            .into_iter()
-            .chain(compacting_context)
-            .filter(|text| !text.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n\n"),
+            .collect();
+        // History the loop left in the database because it was too large
+        // to hold: everything since the last compaction that is older than
+        // the window.
+        let older = if input.complete {
+            None
+        } else {
+            self.older_history(&input.session_id, input.messages.first())?
         };
+        let previous_summary = older
+            .as_ref()
+            .and_then(|older| older.summary.clone())
+            .or(previous_summary);
 
         let msg = V1Message::Assistant {
             id: MessageId::ascending(None)?,
@@ -826,57 +925,106 @@ impl SessionCompaction {
         };
         self.deps.sessions.update_message(&msg)?;
 
-        let handle = Processor::create(
-            ProcessorDeps {
-                sessions: self.deps.sessions.clone(),
-                messages: self.deps.messages.clone(),
-                status: self.deps.status.clone(),
-                events: self.deps.events.clone(),
-                snapshot: self.deps.snapshot.clone(),
-                agents: self.deps.agents.clone(),
-                config: self.deps.config.clone(),
-                llm: self.deps.llm.clone(),
-                permission: self.deps.permission.clone(),
-                summary: self.deps.summary.clone(),
-                clock: self.deps.clock.clone(),
-            },
-            ProcessorInput {
-                assistant_message: msg,
-                session_id: input.session_id.clone(),
-                model: model.processor_model(),
-            },
-        )
-        .await;
+        let fold = Fold {
+            session_id: &input.session_id,
+            older: older.as_ref(),
+            head: &head,
+            previous_summary: previous_summary.as_deref(),
+            model: &model,
+            agent: &agent,
+            user: &user_message,
+            cancel: &input.cancel,
+        };
+        let scale_key = format!("{}/{}", model.llm.provider_id, model.llm.id);
+        let mut scale = self.scale(&scale_key);
+        let (handle, result) = loop {
+            // Everything but the last request's worth is summarised here,
+            // a chunk at a time; the last goes through the processor below
+            // and becomes the stored summary.
+            let folded = match self.fold(&fold, scale).await {
+                Ok(folded) => folded,
+                Err(FoldStop::Overflow) if scale > MIN_CHUNK_SCALE => {
+                    scale = self.shrink(&scale_key, scale);
+                    continue;
+                }
+                Err(stop) => {
+                    let error = match stop {
+                        FoldStop::Overflow => AssistantError::ContextOverflow {
+                            message: TOO_LARGE_TO_COMPACT.to_string(),
+                            response_body: None,
+                        },
+                        FoldStop::Cancelled => AssistantError::Aborted {
+                            message: "Aborted".to_string(),
+                        },
+                        FoldStop::Failed(error) => *error,
+                    };
+                    return self.fail(msg, error);
+                }
+            };
+            let next_prompt = build_prompt(&BuildPrompt {
+                previous_summary: folded.previous_summary.as_deref(),
+                context: vec![folded.conversation],
+            });
 
-        let result = handle
-            .process(
-                StreamInput {
-                    user: user_message.clone(),
-                    session_id: input.session_id.clone(),
-                    parent_session_id: None,
-                    project_id: self.deps.project_id.clone(),
-                    client: self.deps.client.clone(),
-                    model: model.llm.clone(),
-                    agent: agent.clone(),
-                    permission: None,
-                    system: Vec::new(),
-                    messages: vec![Message::user(next_prompt)],
-                    small: false,
-                    tools: Vec::new(),
-                    retries: None,
-                    tool_choice: None,
+            let handle = Processor::create(
+                ProcessorDeps {
+                    sessions: self.deps.sessions.clone(),
+                    messages: self.deps.messages.clone(),
+                    status: self.deps.status.clone(),
+                    events: self.deps.events.clone(),
+                    snapshot: self.deps.snapshot.clone(),
+                    agents: self.deps.agents.clone(),
+                    config: self.deps.config.clone(),
+                    llm: self.deps.llm.clone(),
+                    permission: self.deps.permission.clone(),
+                    summary: self.deps.summary.clone(),
+                    clock: self.deps.clock.clone(),
                 },
-                CancellationToken::new(),
+                ProcessorInput {
+                    assistant_message: msg.clone(),
+                    session_id: input.session_id.clone(),
+                    model: model.processor_model(),
+                },
             )
-            .await
-            .map_err(|error| Self::storage_error(error.to_string()))?;
+            .await;
+
+            let result = handle
+                .process(
+                    StreamInput {
+                        user: user_message.clone(),
+                        session_id: input.session_id.clone(),
+                        parent_session_id: None,
+                        project_id: self.deps.project_id.clone(),
+                        client: self.deps.client.clone(),
+                        model: model.llm.clone(),
+                        agent: agent.clone(),
+                        permission: None,
+                        system: Vec::new(),
+                        messages: vec![Message::user(next_prompt)],
+                        small: false,
+                        tools: Vec::new(),
+                        retries: None,
+                        tool_choice: None,
+                    },
+                    CancellationToken::new(),
+                )
+                .await
+                .map_err(|error| Self::storage_error(error.to_string()))?;
+            // The provider's real limit is below the declared one (or the
+            // model declares none): summarise in smaller pieces.
+            if result == ProcessResult::Compact && scale > MIN_CHUNK_SCALE {
+                scale = self.shrink(&scale_key, scale);
+                continue;
+            }
+            break (handle, result);
+        };
 
         if result == ProcessResult::Compact {
             let mut message = handle.message();
             if let V1Message::Assistant { error, finish, .. } = &mut message {
                 *error = Some(AssistantError::ContextOverflow {
                     message: if replay.is_some() {
-                        "Conversation history too large to compact - exceeds model context limit"
+                        TOO_LARGE_TO_COMPACT
                     } else {
                         "Session too large to compact - context exceeds model limit even after stripping media"
                     }
@@ -1020,6 +1168,271 @@ impl SessionCompaction {
             ProcessResult::Continue => CompactionOutcome::Continue,
             ProcessResult::Stop | ProcessResult::Compact => CompactionOutcome::Stop,
         })
+    }
+
+    /// The share of the model's budget a summary request may fill, as
+    /// learned from the provider refusing larger ones.
+    fn scale(&self, key: &str) -> f64 {
+        self.scales
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(key)
+            .copied()
+            .unwrap_or(1.0)
+    }
+
+    fn shrink(&self, key: &str, scale: f64) -> f64 {
+        let next = scale / 2.0;
+        tracing::info!(
+            scale = next,
+            "summary request refused as too large, shrinking"
+        );
+        self.scales
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key.to_string(), next);
+        next
+    }
+
+    /// End a compaction that could not produce its summary.
+    fn fail(
+        &self,
+        mut message: V1Message,
+        failure: AssistantError,
+    ) -> Result<CompactionOutcome, SessionError> {
+        let session_id = match &mut message {
+            V1Message::Assistant {
+                error,
+                finish,
+                time,
+                session_id,
+                ..
+            } => {
+                *error = Some(failure.clone());
+                *finish = Some("error".to_string());
+                time.completed = Some(self.deps.clock.now_ms());
+                session_id.clone()
+            }
+            V1Message::User { session_id, .. } => session_id.clone(),
+        };
+        self.deps.sessions.update_message(&message)?;
+        self.deps.events.publish(
+            &crate::session::event_definitions::SESSION_ERROR,
+            serde_json::json!({ "sessionID": session_id, "error": failure }),
+            PublishOptions::default(),
+        )?;
+        Ok(CompactionOutcome::Stop)
+    }
+
+    /// The history older than the window the loop read: where it starts,
+    /// where it ends, and the summary that already covers what came before.
+    fn older_history(
+        &self,
+        session_id: &str,
+        window_first: Option<&WithParts>,
+    ) -> Result<Option<Older>, SessionError> {
+        let Some(first) = window_first else {
+            return Ok(None);
+        };
+        let compacted = self.deps.messages.last_compaction(session_id)?;
+        Ok(Some(Older {
+            summary: compacted
+                .as_ref()
+                .and_then(|compacted| summary_text(&compacted.summary)),
+            from: compacted
+                .as_ref()
+                .map(|compacted| (compacted.from.clone(), compacted.inclusive)),
+            until: Cursor {
+                id: message_id(&first.info).to_string(),
+                time: crate::session::message::message_time_created(&first.info),
+            },
+        }))
+    }
+
+    /// Reduce the history to be summarised to what one request can carry:
+    /// read it oldest first, a page at a time, and whenever the next
+    /// message would not fit, summarise what has been gathered (together
+    /// with the summary so far) and carry on from that summary. What is left
+    /// at the end goes into the final request. A history that fits in one
+    /// request is returned untouched and costs no extra request.
+    async fn fold(&self, fold: &Fold<'_>, scale: f64) -> Result<Folded, FoldStop> {
+        const PAGE: usize = 50;
+        let budget = request_budget(
+            &self.deps.config,
+            &fold.model.limits,
+            self.deps.output_token_max,
+        );
+        // Three bytes a token, as the request is sized everywhere else.
+        let limit = ((budget * 3.0 * scale) as usize).max(MIN_CHUNK_BYTES);
+        let fixed = SUMMARY_TEMPLATE.len() + SUMMARY_UPDATE_INSTRUCTIONS.len() + 512;
+        let piece = (limit / 4).max(MIN_CHUNK_BYTES / 4);
+        let capacity = |rolling: &Option<String>| {
+            limit
+                .saturating_sub(fixed + rolling.as_ref().map_or(0, String::len))
+                .max(MIN_CHUNK_BYTES / 2)
+        };
+
+        let mut rolling = fold.previous_summary.map(|summary| clip(summary, piece));
+        let mut chunk: Vec<String> = Vec::new();
+        let mut size = 0usize;
+        let mut pending: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+        let mut after = fold.older.and_then(|older| older.from.clone());
+        let mut older_left = fold.older.is_some();
+        let mut head = fold.head.iter();
+        loop {
+            let text = match pending.pop_front() {
+                Some(text) => text,
+                None if older_left => {
+                    let older = fold.older.expect("older_left implies older");
+                    let page = self
+                        .deps
+                        .messages
+                        .page_after(
+                            fold.session_id,
+                            after.as_ref().map(|(cursor, _)| cursor),
+                            after.as_ref().is_some_and(|(_, inclusive)| *inclusive),
+                            PAGE,
+                        )
+                        .map_err(|error| failed(error.to_string()))?;
+                    older_left = page.len() == PAGE;
+                    for message in &page {
+                        let at = Cursor {
+                            id: message_id(&message.info).to_string(),
+                            time: crate::session::message::message_time_created(&message.info),
+                        };
+                        if !cursor_before(&at, &older.until) {
+                            older_left = false;
+                            break;
+                        }
+                        after = Some((at, false));
+                        // Earlier compactions' markers and summaries are
+                        // not conversation.
+                        if is_compaction_message(message) {
+                            continue;
+                        }
+                        let text = serialize(message);
+                        if !text.is_empty() {
+                            pending.push_back(text);
+                        }
+                    }
+                    continue;
+                }
+                None => match head.next() {
+                    Some(text) => text.clone(),
+                    None => break,
+                },
+            };
+            let text = clip(&text, piece);
+            if !chunk.is_empty() && size + text.len() + 2 > capacity(&rolling) {
+                if fold.cancel.is_cancelled() {
+                    return Err(FoldStop::Cancelled);
+                }
+                let prompt = build_prompt(&BuildPrompt {
+                    previous_summary: rolling.as_deref(),
+                    context: vec![chunk.join("\n\n")],
+                });
+                rolling = Some(clip(&self.summarise(fold, prompt).await?, piece));
+                chunk.clear();
+                size = 0;
+            }
+            size += text.len() + 2;
+            chunk.push(text);
+        }
+        Ok(Folded {
+            conversation: chunk.join("\n\n"),
+            previous_summary: rolling,
+        })
+    }
+
+    /// One intermediate summary request. Its text is carried into the next
+    /// request and never stored.
+    async fn summarise(&self, fold: &Fold<'_>, prompt: String) -> Result<String, FoldStop> {
+        use alforria_llm::schema::events::LlmEvent;
+        use futures::StreamExt;
+
+        let mut attempt: u32 = 0;
+        loop {
+            let mut stream = self.deps.llm.stream_with_cancel(
+                StreamInput {
+                    user: fold.user.clone(),
+                    session_id: fold.session_id.to_string(),
+                    parent_session_id: None,
+                    project_id: self.deps.project_id.clone(),
+                    client: self.deps.client.clone(),
+                    model: fold.model.llm.clone(),
+                    agent: fold.agent.clone(),
+                    permission: None,
+                    system: Vec::new(),
+                    messages: vec![Message::user(prompt.clone())],
+                    small: false,
+                    tools: Vec::new(),
+                    retries: None,
+                    tool_choice: None,
+                },
+                fold.cancel.clone(),
+            );
+            let mut text = String::new();
+            let mut failure: Option<alforria_llm::schema::errors::LlmError> = None;
+            let mut reported: Option<(String, bool)> = None;
+            loop {
+                let item = tokio::select! {
+                    biased;
+                    _ = fold.cancel.cancelled() => return Err(FoldStop::Cancelled),
+                    item = stream.next() => item,
+                };
+                match item {
+                    None => break,
+                    Some(Ok(LlmEvent::TextDelta { text: delta, .. })) => text.push_str(&delta),
+                    Some(Ok(LlmEvent::ProviderError {
+                        message,
+                        classification,
+                        ..
+                    })) => {
+                        reported = Some((
+                            message,
+                            classification == Some(ProviderFailureClassification::ContextOverflow),
+                        ));
+                        break;
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => {
+                        failure = Some(error);
+                        break;
+                    }
+                }
+            }
+            drop(stream);
+            if let Some((message, overflow)) = reported {
+                return Err(if overflow {
+                    FoldStop::Overflow
+                } else {
+                    failed(message)
+                });
+            }
+            let Some(error) = failure else {
+                let text = text.trim();
+                if text.is_empty() {
+                    return Err(failed("The model returned an empty summary".to_string()));
+                }
+                return Ok(text.to_string());
+            };
+            let parsed =
+                crate::session::processor::assistant_error(&error, &fold.model.llm.provider_id);
+            if matches!(parsed, AssistantError::ContextOverflow { .. }) {
+                return Err(FoldStop::Overflow);
+            }
+            if !error.retryable() || attempt >= SUMMARY_RETRIES {
+                return Err(FoldStop::Failed(Box::new(parsed)));
+            }
+            let wait = std::time::Duration::from_millis(
+                (crate::session::retry::RETRY_INITIAL_DELAY as u64) << attempt,
+            );
+            attempt += 1;
+            tokio::select! {
+                _ = tokio::time::sleep(wait) => {}
+                _ = fold.cancel.cancelled() => return Err(FoldStop::Cancelled),
+            }
+        }
     }
 
     /// `create` (compaction.ts:559-582).
@@ -1616,6 +2029,8 @@ mod tests {
         let mut events = h.services.events.subscribe("session.compacted");
         let outcome = compaction_service(&h)
             .process(crate::session::r#loop::CompactionProcess {
+                complete: true,
+                cancel: CancellationToken::new(),
                 messages: msgs,
                 parent_id,
                 session_id: session.id.clone(),
@@ -1703,6 +2118,8 @@ mod tests {
 
         compaction_service(&h)
             .process(crate::session::r#loop::CompactionProcess {
+                complete: true,
+                cancel: CancellationToken::new(),
                 messages: msgs,
                 parent_id,
                 session_id: session.id.clone(),
@@ -1742,17 +2159,21 @@ mod tests {
 
         let h = harness_with_config(
             "compaction-overflow-outcome",
-            vec![vec![Err(LlmError {
-                module: "ProviderShared".to_string(),
-                method: "request".to_string(),
-                reason: LlmErrorReason::InvalidRequest {
-                    message: "prompt is too long".to_string(),
-                    parameter: None,
-                    classification: Some(ProviderFailureClassification::ContextOverflow),
-                    provider_metadata: None,
-                    http: None,
-                },
-            })]],
+            // Refused at every size the request is shrunk to.
+            vec![
+                vec![Err(LlmError {
+                    module: "ProviderShared".to_string(),
+                    method: "request".to_string(),
+                    reason: LlmErrorReason::InvalidRequest {
+                        message: "prompt is too long".to_string(),
+                        parameter: None,
+                        classification: Some(ProviderFailureClassification::ContextOverflow),
+                        provider_metadata: None,
+                        http: None,
+                    },
+                })];
+                5
+            ],
             serde_json::json!({}),
         );
         let session = create_session(&h.services.sessions, &h.worktree);
@@ -1767,6 +2188,8 @@ mod tests {
 
         let outcome = compaction_service(&h)
             .process(crate::session::r#loop::CompactionProcess {
+                complete: true,
+                cancel: CancellationToken::new(),
                 messages: msgs,
                 parent_id,
                 session_id: session.id.clone(),
@@ -1820,6 +2243,8 @@ mod tests {
         let msgs = h.services.messages.stream(&session.id).unwrap();
         let error = compaction_service(&h)
             .process(crate::session::r#loop::CompactionProcess {
+                complete: true,
+                cancel: CancellationToken::new(),
                 messages: msgs,
                 parent_id: "msg_a1".to_string(),
                 session_id: session.id.clone(),

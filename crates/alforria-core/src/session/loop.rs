@@ -33,7 +33,7 @@ use crate::session::error::SessionError;
 use crate::session::event_definitions::SESSION_ERROR;
 use crate::session::instruction::Instruction;
 use crate::session::llm::{LlmModel, LlmStream, LlmTool, LlmToolOutput, StreamInput, ToolFailure};
-use crate::session::message::{filter_compacted, latest, MessageStore, WithParts};
+use crate::session::message::{latest, MessageStore, WithParts};
 use crate::session::overflow::{
     estimate_overhead, estimate_request, is_overflow, recorded_tokens, request_budget,
     IsOverflowInput, ModelLimits, RequestSize,
@@ -92,6 +92,12 @@ const MAX_UNFINISHED_RESPONSES: u32 = 3;
 /// shrink (the system prompt, the tools, one enormous message), and trying
 /// again would loop forever.
 const MAX_COMPACTIONS_WITHOUT_PROGRESS: u32 = 3;
+
+/// The stored size of message parts a turn reads back before it stops and
+/// compacts instead. At four bytes a token this is twice the largest context
+/// window any model offers, so a history cut off here could not have been
+/// sent; it bounds what one step holds in memory whatever the session's size.
+pub const HISTORY_WINDOW_BYTES: usize = 8 * 1024 * 1024;
 
 const STRUCTURED_OUTPUT_DESCRIPTION: &str =
     "Use this tool to return your final response in the requested structured format.
@@ -177,6 +183,12 @@ pub struct CompactionCreate {
 #[derive(Debug, Clone)]
 pub struct CompactionProcess {
     pub messages: Vec<WithParts>,
+    /// Whether `messages` reaches back to the last compaction (or the start
+    /// of the session). When not, the older history is still in the
+    /// database and the service reads it from there, a page at a time.
+    pub complete: bool,
+    /// Stops a compaction that takes several requests between them.
+    pub cancel: CancellationToken,
     pub parent_id: String,
     pub session_id: String,
     pub auto: bool,
@@ -330,7 +342,18 @@ pub async fn run_loop(
             alforria_schema::session_status::SessionStatusInfo::Busy,
         )?;
 
-        let msgs = filter_compacted(deps.messages.stream_without_diffs(session_id)?);
+        // With auto-compaction off nothing may be left out of the request,
+        // so the whole history is read.
+        let window = deps.messages.window(
+            session_id,
+            if auto_compaction_disabled(&deps.config) {
+                usize::MAX
+            } else {
+                HISTORY_WINDOW_BYTES
+            },
+        )?;
+        let complete = window.complete;
+        let msgs = window.messages;
         let latest = latest(&msgs);
         let last_user = latest.user.clone().ok_or_else(|| {
             LoopError::Unknown(
@@ -437,6 +460,8 @@ pub async fn run_loop(
                     .compaction
                     .process(CompactionProcess {
                         messages: msgs.clone(),
+                        complete,
+                        cancel: cancel.clone(),
                         parent_id: last_user_id.clone(),
                         session_id: session_id.to_string(),
                         auto: *auto,
@@ -448,6 +473,21 @@ pub async fn run_loop(
                 }
                 continue;
             }
+        }
+
+        // More history than can be held, let alone sent: compact it from
+        // the database before anything else.
+        if !complete {
+            if compactions >= MAX_COMPACTIONS_WITHOUT_PROGRESS {
+                fail_context_overflow(deps, session_id)?;
+                break last_assistant(deps, session_id).await;
+            }
+            compactions += 1;
+            tracing::info!("history exceeds the window, compacting first");
+            deps.compaction
+                .create(compaction_create(session_id, &last_user, true, None))
+                .await?;
+            continue;
         }
 
         // Overflow → auto-compaction (prompt.ts:1165-1170).
@@ -861,7 +901,7 @@ fn request_overflows(
     system: &[String],
     tools: &[LlmTool],
 ) -> bool {
-    if deps.config.compaction.as_ref().and_then(|c| c.auto) == Some(false) {
+    if auto_compaction_disabled(&deps.config) {
         return false;
     }
     let budget = request_budget(&deps.config, &model.limits, model.output_token_max);
@@ -910,6 +950,10 @@ fn request_overflows(
     }
     tracing::info!(estimate, budget, "request would not fit, compacting first");
     true
+}
+
+fn auto_compaction_disabled(config: &crate::config::schema::Config) -> bool {
+    config.compaction.as_ref().and_then(|c| c.auto) == Some(false)
 }
 
 /// End the turn when compacting keeps not making the request fit.
