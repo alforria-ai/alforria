@@ -116,6 +116,23 @@ pub fn find_up(target: &str, start: &Path, stop: Option<&Path>) -> Vec<PathBuf> 
     result
 }
 
+/// The matcher of `fs.glob` for `pattern`: one engine and one set of
+/// options, for finding the files ([`glob_files`]) and for asking whether a
+/// path would be found ([`EntrySearch::would_read`]). `None`: the pattern
+/// does not parse, and matches nothing.
+fn glob_matcher(pattern: &str) -> Option<globset::GlobSet> {
+    let glob = globset::GlobBuilder::new(pattern)
+        .literal_separator(true)
+        .build()
+        .ok()?;
+    globset::GlobSetBuilder::new().add(glob).build().ok()
+}
+
+fn glob_matches(globs: &globset::GlobSet, dir: &Path, path: &Path) -> bool {
+    path.strip_prefix(dir)
+        .is_ok_and(|relative| globs.is_match(relative.to_string_lossy().replace('\\', "/")))
+}
+
 /// `fs.glob` (fs-util.ts:126-151): files below `dir` matching `pattern`,
 /// absolute paths, hidden files included (`dot: true`).
 pub fn glob_files(dir: &Path, pattern: &str) -> Vec<PathBuf> {
@@ -129,13 +146,7 @@ pub fn glob_files(dir: &Path, pattern: &str) -> Vec<PathBuf> {
         .ignore(false)
         .parents(false)
         .require_git(false);
-    let Ok(glob) = globset::GlobBuilder::new(pattern)
-        .literal_separator(true)
-        .build()
-    else {
-        return Vec::new();
-    };
-    let Ok(globs) = globset::GlobSetBuilder::new().add(glob).build() else {
+    let Some(globs) = glob_matcher(pattern) else {
         return Vec::new();
     };
     let mut found = Vec::new();
@@ -146,10 +157,7 @@ pub fn glob_files(dir: &Path, pattern: &str) -> Vec<PathBuf> {
         if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
         }
-        let Ok(relative) = entry.path().strip_prefix(dir) else {
-            continue;
-        };
-        if globs.is_match(relative.to_string_lossy().replace('\\', "/")) {
+        if glob_matches(&globs, dir, entry.path()) {
             found.push(lexical_absolute(entry.path()));
         }
     }
@@ -157,14 +165,14 @@ pub fn glob_files(dir: &Path, pattern: &str) -> Vec<PathBuf> {
     found
 }
 
-/// `FSUtil.globUp` (fs-util.ts:184-201): glob in each directory from
-/// `start` up to (and including) `stop`.
-fn glob_up(pattern: &str, start: &Path, stop: Option<&Path>) -> Vec<PathBuf> {
+/// The directories `FSUtil.globUp` / `findUp` visit: `start`, then each
+/// parent, up to and including `stop` (the filesystem root without one).
+fn dirs_up(start: &Path, stop: Option<&Path>) -> Vec<PathBuf> {
     let stop = stop.map(lexical_absolute);
     let mut current = lexical_absolute(start);
-    let mut result = Vec::new();
+    let mut dirs = Vec::new();
     loop {
-        result.extend(glob_files(&current, pattern));
+        dirs.push(current.clone());
         if stop.as_ref() == Some(&current) {
             break;
         }
@@ -174,7 +182,79 @@ fn glob_up(pattern: &str, start: &Path, stop: Option<&Path>) -> Vec<PathBuf> {
         }
         current = parent;
     }
-    result
+    dirs
+}
+
+/// How one `instructions` entry of the config is looked for. **The one
+/// description of it**: the loader finds its files through
+/// [`EntrySearch::files`], and the write guard (`crate::protect`) asks
+/// [`EntrySearch::would_read`] — the same pattern through the same matcher
+/// over the same directories — so the guard cannot disagree with the loader
+/// about which files an entry names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EntrySearch {
+    /// An `http(s)://` entry: no file.
+    Remote,
+    /// `pattern` matched below each of `dirs` (an absolute or `~/` entry
+    /// has one directory; a relative one every directory from the instance
+    /// directory up to the worktree).
+    Glob { pattern: String, dirs: Vec<PathBuf> },
+}
+
+impl EntrySearch {
+    /// The search for `raw`, as `systemPaths` performs it
+    /// (instruction.ts:139-150).
+    pub fn new(raw: &str, paths: &InstructionPaths, flags: InstructionFlags) -> EntrySearch {
+        if raw.starts_with("https://") || raw.starts_with("http://") {
+            return EntrySearch::Remote;
+        }
+        let instruction = match raw.strip_prefix("~/") {
+            Some(rest) => paths.home.join(rest),
+            None => PathBuf::from(raw),
+        };
+        if instruction.is_absolute() {
+            return EntrySearch::Glob {
+                pattern: basename(&instruction),
+                dirs: vec![dirname(&instruction)],
+            };
+        }
+        let dirs = if flags.disable_project_config {
+            dirs_up(&paths.config, Some(&paths.config))
+        } else {
+            dirs_up(&paths.directory, Some(&paths.worktree))
+        };
+        EntrySearch::Glob {
+            pattern: instruction.to_string_lossy().into_owned(),
+            dirs,
+        }
+    }
+
+    /// The files the entry names now.
+    pub fn files(&self) -> Vec<PathBuf> {
+        match self {
+            EntrySearch::Remote => Vec::new(),
+            EntrySearch::Glob { pattern, dirs } => dirs
+                .iter()
+                .flat_map(|dir| glob_files(dir, pattern))
+                .collect(),
+        }
+    }
+
+    /// Whether a file at `path` would be one of [`EntrySearch::files`]:
+    /// asked of the path as given and against each directory both as the
+    /// loader spells it and resolved, since the walk follows links.
+    pub fn would_read(&self, path: &Path) -> bool {
+        let EntrySearch::Glob { pattern, dirs } = self else {
+            return false;
+        };
+        let Some(globs) = glob_matcher(pattern) else {
+            return false;
+        };
+        dirs.iter().any(|dir| {
+            glob_matches(&globs, dir, path)
+                || std::fs::canonicalize(dir).is_ok_and(|real| glob_matches(&globs, &real, path))
+        })
+    }
 }
 
 /// Remote instruction fetching — `https://` config instruction entries
@@ -254,17 +334,6 @@ impl Instruction {
         instruction_files(self.flags.disable_claude_code_prompt)
     }
 
-    fn relative(&self, instruction: &str) -> Vec<PathBuf> {
-        if !self.flags.disable_project_config {
-            return glob_up(
-                instruction,
-                &self.paths.directory,
-                Some(&self.paths.worktree),
-            );
-        }
-        glob_up(instruction, &self.paths.config, Some(&self.paths.config))
-    }
-
     /// `read` (instruction.ts:91-93): read a file, `""` on failure.
     fn read(&self, filepath: &Path) -> String {
         std::fs::read_to_string(filepath).unwrap_or_default()
@@ -314,19 +383,7 @@ impl Instruction {
         }
 
         for raw in &self.config_instructions {
-            if raw.starts_with("https://") || raw.starts_with("http://") {
-                continue;
-            }
-            let instruction = match raw.strip_prefix("~/") {
-                Some(rest) => self.paths.home.join(rest),
-                None => PathBuf::from(raw),
-            };
-            let matches = if instruction.is_absolute() {
-                glob_files(&dirname(&instruction), &basename(&instruction))
-            } else {
-                self.relative(&instruction.to_string_lossy())
-            };
-            for m in matches {
+            for m in EntrySearch::new(raw, &self.paths, self.flags).files() {
                 add(lexical_absolute(&m), &mut seen, &mut paths);
             }
         }

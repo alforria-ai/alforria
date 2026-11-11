@@ -52,9 +52,11 @@
 //!    between the check and the write; it is not done here, and a session
 //!    that can swap links has `bash` and needs no such trick.)
 //! 2. **the protected set is incomplete** — a place a loader reads is not
-//!    in it. The set is built from the loaders' own answers, an entry is
-//!    never dropped (a glob is kept and matched; one that cannot be read
-//!    protects its base directory), and a loader name is refused anywhere.
+//!    in it. The set is built from the loaders' own answers, a loader name
+//!    is refused anywhere, and for the config's `instructions` — globs,
+//!    matched in every directory up to the worktree — the guard holds no
+//!    matching logic at all: it asks the instruction loader's own search
+//!    (`session::instruction::EntrySearch`) whether it would read the path.
 //! 3. **the grant is too broad** — `edit_loader` lifts more than it names.
 //!    The guard is always on; a grant is looked up per write, for the
 //!    resolved path, in the host's reading of the policy only, and lifts
@@ -173,8 +175,11 @@ pub struct Protected {
     host: Vec<(String, PathBuf)>,
     /// Loader locations of the instance: liftable by a grant.
     loader: Vec<(String, PathBuf)>,
-    /// Loader globs — `(what, pattern on the resolved path)`.
-    globs: Vec<(String, String)>,
+    /// The config's `instructions` entries, as the instruction loader
+    /// itself searches for them (`session::instruction::EntrySearch`). The
+    /// guard holds no glob or directory-walk logic of its own: it asks the
+    /// loader's description whether it would read the path.
+    instructions: Vec<crate::session::instruction::EntrySearch>,
 }
 
 impl Protected {
@@ -226,6 +231,7 @@ impl Protected {
         flags: &crate::config::ConfigFlags,
         config: &crate::config::schema::Config,
         directory: &Path,
+        worktree: &Path,
     ) -> Protected {
         let mut out = Protected::host(paths, managed_dir, true);
         for dir in [
@@ -252,6 +258,7 @@ impl Protected {
                 Self::add(&mut out.host, what, Path::new(path));
             }
         }
+        // Directories the config names: protected whole.
         let named = [
             (
                 "skills.paths",
@@ -261,73 +268,49 @@ impl Protected {
                 "workflows.paths",
                 config.workflows.as_ref().and_then(|w| w.paths.clone()),
             ),
-            ("instructions", config.instructions.clone()),
         ];
         for (what, entries) in named {
             for entry in entries.into_iter().flatten() {
-                out.add_entry(what, &entry, &paths.home, directory);
+                if entry.starts_with("http://") || entry.starts_with("https://") {
+                    continue;
+                }
+                let path = match entry.strip_prefix("~/") {
+                    Some(rest) => paths.home.join(rest),
+                    None if entry == "~" => paths.home.clone(),
+                    None => directory.join(&entry),
+                };
+                Self::add(&mut out.loader, what, &path);
             }
         }
+        // Instruction entries: the loader's own search, not a copy of it.
+        let instruction_paths = crate::session::instruction::InstructionPaths {
+            config: paths.config.clone(),
+            home: paths.home.clone(),
+            directory: directory.to_path_buf(),
+            worktree: worktree.to_path_buf(),
+        };
+        let instruction_flags = crate::session::instruction::InstructionFlags {
+            disable_claude_code_prompt: false,
+            disable_project_config: flags.disable_project_config,
+        };
+        out.instructions = config
+            .instructions
+            .iter()
+            .flatten()
+            .map(|raw| {
+                crate::session::instruction::EntrySearch::new(
+                    raw,
+                    &instruction_paths,
+                    instruction_flags,
+                )
+            })
+            .collect();
         out
-    }
-
-    /// One path or glob a loader was configured with. A URL names no file.
-    /// A glob is kept and matched against where a write lands; an entry
-    /// that makes no sense as either protects its base directory.
-    fn add_entry(&mut self, what: &str, entry: &str, home: &Path, directory: &Path) {
-        if entry.starts_with("http://") || entry.starts_with("https://") {
-            return;
-        }
-        let (base, rest) = match entry {
-            "~" => (home, ""),
-            _ => match entry.strip_prefix("~/") {
-                Some(rest) => (home, rest),
-                None => (directory, entry),
-            },
-        };
-        if rest.trim().is_empty() || rest.contains('\0') {
-            if entry != "~" {
-                tracing::warn!(
-                    "{what}: cannot read the entry {entry:?}; protecting {}",
-                    base.display()
-                );
-            }
-            Self::add(&mut self.loader, what, base);
-            return;
-        }
-        let path = if Path::new(rest).is_absolute() {
-            PathBuf::from(rest)
-        } else {
-            base.join(rest)
-        };
-        if rest.contains(['*', '?', '[', '{']) {
-            // Matched on the resolved landing: resolve the fixed directory
-            // part of the pattern the same way.
-            let text = path.to_string_lossy().into_owned();
-            let fixed = text[..text.find(['*', '?', '[', '{']).unwrap_or(text.len())]
-                .rsplit_once('/')
-                .map(|(dir, _)| dir.to_string())
-                .unwrap_or_default();
-            let pattern = format!(
-                "{}{}",
-                resolve(Path::new(if fixed.is_empty() { "/" } else { &fixed }))
-                    .to_string_lossy()
-                    .trim_end_matches('/'),
-                &text[fixed.len()..]
-            );
-            self.globs.push((what.to_string(), pattern));
-        } else {
-            Self::add(&mut self.loader, what, &path);
-        }
     }
 
     /// Every protected location, host and loader.
     pub fn locations(&self) -> Vec<(String, PathBuf)> {
         self.host.iter().chain(&self.loader).cloned().collect()
-    }
-
-    pub fn globs(&self) -> &[(String, String)] {
-        &self.globs
     }
 
     /// Why a write to `target` is refused, if it is.
@@ -376,16 +359,22 @@ impl Protected {
         if let Some(reason) = inside(&self.loader) {
             return refusal(Class::Loader, reason);
         }
-        let text = landing.to_string_lossy();
-        self.globs
+        // Asked of the loader's own description of each entry, for the
+        // landing and for the path as the tool spelled it.
+        if self
+            .instructions
             .iter()
-            .find(|(_, pattern)| crate::tool::permission::wildcard_match(&text, pattern))
-            .and_then(|(what, pattern)| {
-                refusal(
-                    Class::Loader,
-                    format!("{} matches {what} ({pattern})", target.display()),
-                )
-            })
+            .any(|entry| entry.would_read(&landing) || entry.would_read(target))
+        {
+            return refusal(
+                Class::Loader,
+                format!(
+                    "{} is a file the config's `instructions` load",
+                    target.display()
+                ),
+            );
+        }
+        None
     }
 
     /// The protected location `directory` overlaps — one contains the
@@ -487,6 +476,7 @@ mod tests {
             &crate::config::ConfigFlags::default(),
             &config,
             &project,
+            &root.join("outer"),
         );
         Tree {
             _dir: dir,
@@ -501,7 +491,7 @@ mod tests {
         serde_json::json!({
             "skills": { "paths": ["~/skills-elsewhere", "vendor/skills"] },
             "instructions": [
-                "docs/rules/*.md", "*.rules", "RULES*.txt", "~/notes/*.md", "~",
+                "docs/rules/*.md", "*.rules", "RULES*.txt", "~/notes/*.md",
                 "https://x.example/rules.md", "/abs/rules.md", "plain/file.md",
             ],
         })
@@ -535,7 +525,6 @@ mod tests {
             project.join("team.rules"),
             project.join("RULES-2027.txt"),
             home.join("notes/todo.md"),
-            home.join("anything-at-all.txt"),
             PathBuf::from("/abs/rules.md"),
             project.join("plain/file.md"),
         ] {
@@ -569,8 +558,101 @@ mod tests {
         ] {
             assert_eq!(refused(target.clone()), None, "{}", target.display());
         }
-        // Each non-URL entry produced a location or a glob.
-        assert_eq!(t.protected.globs().len(), 4, "{:?}", t.protected.globs());
+    }
+
+    /// The guard and the loader are one question: for a tree of files and
+    /// entries using `**`, braces, character classes, patterns that match in
+    /// an ancestor up to the worktree, and `~/` ones, every file the real
+    /// instruction loader reads is refused by the guard (guard ⊇ loader) —
+    /// and files it does not read, in the same directories, are not swept
+    /// up with them.
+    #[test]
+    fn every_file_the_instruction_loader_reads_is_refused() {
+        use crate::session::instruction::{
+            Instruction, InstructionFlags, InstructionPaths, NoRemoteInstructions,
+        };
+        let entries = [
+            "docs/**/*.md",
+            "rules/{security,style}.txt",
+            "notes/[a-c]*.rst",
+            "*.guide",
+            "conf/*/policy.md",
+            "~/global-rules/**/*.md",
+            "~/single.md",
+            "plain/file.md",
+        ];
+        let t = tree(serde_json::json!({ "instructions": entries }));
+        let (project, outer, home) = (&t.project, t.root.join("outer"), &t.home);
+        let files = [
+            // In the instance directory…
+            project.join("docs/a.md"),
+            project.join("docs/deep/er/b.md"),
+            project.join("rules/security.txt"),
+            project.join("rules/style.txt"),
+            project.join("rules/other.txt"),
+            project.join("notes/apple.rst"),
+            project.join("notes/zebra.rst"),
+            project.join("top.guide"),
+            project.join("conf/x/policy.md"),
+            project.join("plain/file.md"),
+            project.join("src/main.rs"),
+            project.join("docs/a.txt"),
+            // …in its parent, up to the worktree (the walk up)…
+            outer.join("docs/parent.md"),
+            outer.join("rules/style.txt"),
+            outer.join("parent.guide"),
+            outer.join("notes/beta.rst"),
+            outer.join("readme.txt"),
+            // …above the worktree (not searched)…
+            t.root.join("docs/above.md"),
+            // …and in the home.
+            home.join("global-rules/a/b/c.md"),
+            home.join("single.md"),
+            home.join("other.md"),
+        ];
+        for file in &files {
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, "x").unwrap();
+        }
+        let loader = Instruction::new(
+            InstructionFlags::default(),
+            InstructionPaths {
+                config: paths(home).config,
+                home: home.clone(),
+                directory: project.clone(),
+                worktree: outer.clone(),
+            },
+            entries.iter().map(|entry| entry.to_string()).collect(),
+            std::sync::Arc::new(NoRemoteInstructions),
+        );
+        let read = loader.system_paths();
+        assert!(
+            read.len() >= 13,
+            "the loader found {}: {read:?}",
+            read.len()
+        );
+        for file in &read {
+            assert!(
+                t.protected.guards(file).is_some(),
+                "the loader reads {} and the guard lets it be written",
+                file.display()
+            );
+        }
+        // Not read, not refused.
+        for file in &files {
+            if !read.contains(file) {
+                assert_eq!(t.protected.guards(file), None, "{}", file.display());
+            }
+        }
+        // Files that do not exist yet but would be read once written.
+        assert!(t
+            .protected
+            .guards(&project.join("docs/new/later.md"))
+            .is_some());
+        assert!(t
+            .protected
+            .guards(&outer.join("rules/security.txt"))
+            .is_some());
     }
 
     /// Failure 1, the wrong path judged. Over generated spellings of paths

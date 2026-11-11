@@ -691,6 +691,7 @@ fn instance_for_directory(
             &params.flags,
             &config,
             directory,
+            &worktree,
         ))),
     };
     // M7.2: the background-job service backs the run-state cancel seam.
