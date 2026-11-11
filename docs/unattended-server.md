@@ -41,7 +41,11 @@ database is.
 alforria's own tables (`session_restriction`, `session_mark`, `session_ceiling`, `outbox`, and the trigger and
 memory tables) are created by one set of migrations
 (`crates/alforria-core/src/storage/alforria_migration.rs`), beside the
-upstream schema and journal, which stay byte-compatible.
+upstream schema and journal, which stay byte-compatible. A migration that
+has shipped is never edited (the tests pin each body's hash); what one got
+wrong is repaired by a later one, as `0008_session_mark_backfill` does for
+databases written by earlier builds of this branch (see "Upgrading a
+database" in `docs/assistant.md`).
 
 Durations are strings with a unit (`"500ms"`, `"30s"`, `"5m"`, `"2h"`,
 `"1d"`) or a bare number of milliseconds.

@@ -456,6 +456,32 @@ Records written by an earlier build of this branch are classified by the
 `memory_0002_provenance` migration; any whose origin cannot be told become
 unverified.
 
+**Upgrading a database from an earlier build of this branch.** Two things
+those builds got wrong are repaired on first open by the
+`0008_session_mark_backfill` migration, which fails closed:
+
+- A session a trigger started (`metadata.triggerID`) gets both marks and the
+  read-only `outside-input` ceiling, unless its trigger is still stored in
+  the database and is plainly started by the clock (`cron`, `interval` or
+  `at`, with no `watch` and no `webhook: true`). A trigger that has been
+  deleted, that only the config declares (those have no row), whose stored
+  spec does not parse, or that belongs to another directory proves nothing.
+  Every descendant of a session with the ceiling mark is marked too, and
+  any session with that mark and no `outside-input` ceiling gets the
+  read-only one (without the trigger's own `permission` grants; a trigger's
+  next run in a session it reuses writes its own ceiling again).
+- A memory record whose writing session carries the provenance mark, or no
+  longer exists, becomes unverified. It stays searchable; the operator
+  vouches for it again by rewriting it through `/memory`.
+
+This is deliberately wider than what went wrong. After the upgrade, the
+earlier runs of a *scheduled* trigger declared in the config are read-only
+sessions, and so is the session such a trigger keeps with
+`session: "reuse"`: archive that session and the trigger starts a new,
+unmarked one. Records the `memory` tool wrote in sessions that were deleted
+since are no longer injected. The migration runs once per database and
+changes nothing on one with no sessions.
+
 A record that does not fit the character budget whole is cut. Records are
 ordered by recency; there is no relevance ranking against the current
 prompt. Record content was written by a model that may have been reading an

@@ -333,6 +333,22 @@ pre-1.0, so minor releases may include breaking changes.
   at most 4 MB of patches, with line counts for every file, the event log no
   longer stores patches, and agent steps no longer reload them.
 
+- Databases written by earlier builds of this branch are repaired on first
+  open (migration `0008_session_mark_backfill`). `memory_0002_provenance`
+  had been edited in place under the same id, and builds from before the
+  session marks tagged a trigger's session with `metadata.triggerID` only: a
+  database that ran one of them kept webhook and watch sessions, or their
+  subagents, unmarked, and what they had saved to memory verified. Now a
+  session a trigger started carries both marks and the read-only ceiling
+  unless its trigger is still stored and is a `cron`, `interval` or `at`
+  trigger (a deleted trigger, one only the config declares, or a spec that
+  does not parse proves nothing); descendants of a marked session are
+  marked; and a memory record whose writing session is marked or gone is
+  unverified. A scheduled trigger declared in the config whose `reuse`
+  session is caught by this starts a fresh one once that session is
+  archived. Migration bodies are now pinned by hash in the tests, so an
+  edit to a shipped migration fails CI.
+
 ### Changed
 
 - A `hook` bearer credential must be bound to one trigger (`trg` claim, or
