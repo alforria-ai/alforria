@@ -31,6 +31,36 @@
 //! carrying policy on an unattended server is the host's permission ceiling
 //! and restricted project config (`docs/unattended-server.md`).
 
+//!
+//! # The invariant, and the three ways it fails
+//!
+//! *A guarded session's tools never modify a file that a loader or the
+//! server reads, unless the host's own policy grants that very path — and
+//! never a host location at all.* It has failed in three ways, each of
+//! which has a property test below:
+//!
+//! 1. **the wrong path is judged** — the guard's idea of where a write
+//!    lands differs from the kernel's. The guard does not try to be clever
+//!    about it: a target with a `..` in it, a final component that is a
+//!    symlink, and a dangling symlink on the way are *refused* outright in
+//!    a guarded session ([`landing`]). What is left resolves the same way
+//!    for the guard and the kernel — links in existing directories followed
+//!    by `canonicalize`, the rest created as spelled. (This is the
+//!    conservative version. Judging and writing through one directory
+//!    handle — `openat` the parent, create the last component with
+//!    `O_NOFOLLOW` — would also close the window in which a link is swapped
+//!    between the check and the write; it is not done here, and a session
+//!    that can swap links has `bash` and needs no such trick.)
+//! 2. **the protected set is incomplete** — a place a loader reads is not
+//!    in it. The set is built from the loaders' own answers, an entry is
+//!    never dropped (a glob is kept and matched; one that cannot be read
+//!    protects its base directory), and a loader name is refused anywhere.
+//! 3. **the grant is too broad** — `edit_loader` lifts more than it names.
+//!    The guard is always on; a grant is looked up per write, for the
+//!    resolved path, in the host's reading of the policy only, and lifts
+//!    project-level loader files alone. Host locations — the data, state,
+//!    cache, global and managed config directories, the binary's
+//!    directory — are lifted by nothing.
 use std::path::{Path, PathBuf};
 
 use crate::project_files::is_loader_path;
@@ -65,21 +95,96 @@ fn within(inner: &Path, outer: &Path) -> bool {
     key(inner).starts_with(key(outer))
 }
 
+/// Whether a grant can lift the protection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Class {
+    /// A project-level loader file or location: an explicit `edit_loader`
+    /// grant for the path, in the host's policy, lifts it.
+    Loader,
+    /// A host location, or a target that cannot be judged: nothing lifts it.
+    Host,
+}
+
+/// Why a write is refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    pub class: Class,
+    pub reason: String,
+    /// Where the write would land ([`landing`]), when that could be told.
+    pub landing: Option<PathBuf>,
+}
+
+/// Where a write to `target` lands — the one resolver for that question —
+/// or why it cannot be said. `target` is taken as spelled, never normalised:
+/// a `..` component, a final component that is a symlink, and a dangling
+/// symlink where the path stops existing are refused; for anything else the
+/// deepest existing directory resolves as the kernel resolves it and the
+/// remainder is created as spelled.
+pub fn landing(target: &Path) -> Result<PathBuf, String> {
+    let absolute = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(target)
+    };
+    if absolute
+        .components()
+        .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return Err(format!(
+            "{} has a `..` in it: where it leads cannot be judged safely",
+            target.display()
+        ));
+    }
+    if std::fs::symlink_metadata(&absolute).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return Err(format!("{} is a symbolic link", target.display()));
+    }
+    // The deepest ancestor that exists, and what is yet to be created.
+    let mut existing = absolute.as_path();
+    let mut rest: Vec<&std::ffi::OsStr> = Vec::new();
+    let real = loop {
+        match std::fs::canonicalize(existing) {
+            Ok(real) => break real,
+            Err(_) => {
+                // Not there — or a link to nowhere, which a write through
+                // it would follow.
+                if std::fs::symlink_metadata(existing).is_ok() {
+                    return Err(format!(
+                        "{} goes through a dangling symbolic link",
+                        target.display()
+                    ));
+                }
+                match (existing.parent(), existing.file_name()) {
+                    (Some(parent), Some(name)) => {
+                        rest.push(name);
+                        existing = parent;
+                    }
+                    _ => return Err(format!("{} cannot be resolved", target.display())),
+                }
+            }
+        }
+    };
+    Ok(rest.iter().rev().fold(real, |path, part| path.join(part)))
+}
+
 /// See the module docs.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Protected {
-    /// `(what it is, resolved path)`.
-    locations: Vec<(String, PathBuf)>,
+    /// Host locations — `(what it is, resolved path)`: never liftable.
+    host: Vec<(String, PathBuf)>,
+    /// Loader locations of the instance: liftable by a grant.
+    loader: Vec<(String, PathBuf)>,
+    /// Loader globs — `(what, pattern on the resolved path)`.
+    globs: Vec<(String, String)>,
 }
 
 impl Protected {
-    fn add(&mut self, what: &str, path: &Path) {
+    fn add(list: &mut Vec<(String, PathBuf)>, what: &str, path: &Path) {
         if path.as_os_str().is_empty() {
             return;
         }
         let resolved = resolve(path);
-        if !self.locations.iter().any(|(_, known)| *known == resolved) {
-            self.locations.push((what.to_string(), resolved));
+        if !list.iter().any(|(_, known)| *known == resolved) {
+            list.push((what.to_string(), resolved));
         }
     }
 
@@ -89,13 +194,15 @@ impl Protected {
     /// locations for an instance, [`Protected::for_instance`]).
     pub fn host(paths: &crate::GlobalPaths, managed_dir: &Path, user_config: bool) -> Protected {
         let mut out = Protected::default();
-        out.add("the data directory", &paths.data);
-        out.add("the state directory", &paths.state);
-        out.add("the cache directory", &paths.cache);
-        out.add("the managed config directory", managed_dir);
+        let host = &mut out.host;
+        Self::add(host, "the data directory", &paths.data);
+        Self::add(host, "the state directory", &paths.state);
+        Self::add(host, "the cache directory", &paths.cache);
+        Self::add(host, "the managed config directory", managed_dir);
         if user_config {
-            out.add("the global config directory", &paths.config);
-            out.add(
+            Self::add(host, "the global config directory", &paths.config);
+            Self::add(
+                host,
                 "~/.opencode",
                 &paths.home.join(crate::project_files::CONFIG_DIR),
             );
@@ -104,14 +211,14 @@ impl Protected {
             .ok()
             .and_then(|exe| exe.parent().map(Path::to_path_buf))
         {
-            out.add("the directory of the alforria binary", &dir);
+            Self::add(host, "the directory of the alforria binary", &dir);
         }
         out
     }
 
     /// Everything the loaders consult for one instance: the host's
     /// locations, every config directory the config loader searches, and
-    /// the paths the loaded config names.
+    /// the paths and globs the loaded config names. No entry is dropped.
     pub fn for_instance(
         paths: &crate::GlobalPaths,
         managed_dir: &Path,
@@ -122,42 +229,29 @@ impl Protected {
     ) -> Protected {
         let mut out = Protected::host(paths, managed_dir, true);
         for dir in [
-            crate::project_files::CONFIG_DIR,
             crate::project_files::CLAUDE_DIR,
             crate::project_files::AGENTS_DIR,
         ] {
-            out.add("a home loader directory", &paths.home.join(dir));
+            Self::add(
+                &mut out.loader,
+                "a home loader directory",
+                &paths.home.join(dir),
+            );
         }
         for dir in search_dirs {
-            out.add("a config directory", dir);
+            // The host's own are already there, and stay unliftable.
+            if out.host.iter().all(|(_, known)| *known != resolve(dir)) {
+                Self::add(&mut out.loader, "a config directory", dir);
+            }
         }
         for (what, value) in [
             ("OPENCODE_CONFIG", &flags.config),
             ("OPENCODE_CONFIG_DIR", &flags.config_dir),
         ] {
             if let Some(path) = value.as_deref().filter(|path| !path.is_empty()) {
-                out.add(what, Path::new(path));
+                Self::add(&mut out.host, what, Path::new(path));
             }
         }
-        let local = |entry: &str| -> Option<PathBuf> {
-            if entry.starts_with("http://") || entry.starts_with("https://") {
-                return None;
-            }
-            // A glob protects the directory its fixed prefix names.
-            let fixed = match entry.find(['*', '?', '[', '{']) {
-                Some(at) => entry[..at].rsplit_once('/')?.0.to_string(),
-                None => entry.to_string(),
-            };
-            let path = match fixed.strip_prefix("~/") {
-                Some(rest) => paths.home.join(rest),
-                None => PathBuf::from(&fixed),
-            };
-            Some(if path.is_absolute() {
-                path
-            } else {
-                directory.join(path)
-            })
-        };
         let named = [
             (
                 "skills.paths",
@@ -171,45 +265,126 @@ impl Protected {
         ];
         for (what, entries) in named {
             for entry in entries.into_iter().flatten() {
-                if let Some(path) = local(&entry) {
-                    out.add(what, &path);
-                }
+                out.add_entry(what, &entry, &paths.home, directory);
             }
         }
         out
     }
 
-    pub fn locations(&self) -> &[(String, PathBuf)] {
-        &self.locations
+    /// One path or glob a loader was configured with. A URL names no file.
+    /// A glob is kept and matched against where a write lands; an entry
+    /// that makes no sense as either protects its base directory.
+    fn add_entry(&mut self, what: &str, entry: &str, home: &Path, directory: &Path) {
+        if entry.starts_with("http://") || entry.starts_with("https://") {
+            return;
+        }
+        let (base, rest) = match entry {
+            "~" => (home, ""),
+            _ => match entry.strip_prefix("~/") {
+                Some(rest) => (home, rest),
+                None => (directory, entry),
+            },
+        };
+        if rest.trim().is_empty() || rest.contains('\0') {
+            if entry != "~" {
+                tracing::warn!(
+                    "{what}: cannot read the entry {entry:?}; protecting {}",
+                    base.display()
+                );
+            }
+            Self::add(&mut self.loader, what, base);
+            return;
+        }
+        let path = if Path::new(rest).is_absolute() {
+            PathBuf::from(rest)
+        } else {
+            base.join(rest)
+        };
+        if rest.contains(['*', '?', '[', '{']) {
+            // Matched on the resolved landing: resolve the fixed directory
+            // part of the pattern the same way.
+            let text = path.to_string_lossy().into_owned();
+            let fixed = text[..text.find(['*', '?', '[', '{']).unwrap_or(text.len())]
+                .rsplit_once('/')
+                .map(|(dir, _)| dir.to_string())
+                .unwrap_or_default();
+            let pattern = format!(
+                "{}{}",
+                resolve(Path::new(if fixed.is_empty() { "/" } else { &fixed }))
+                    .to_string_lossy()
+                    .trim_end_matches('/'),
+                &text[fixed.len()..]
+            );
+            self.globs.push((what.to_string(), pattern));
+        } else {
+            Self::add(&mut self.loader, what, &path);
+        }
     }
 
-    /// Why a write to `target` is refused, if it is: the path, on its
-    /// spelling or where it really leads, has a loader name in it or lies
-    /// in a protected location.
-    pub fn guards(&self, target: &Path) -> Option<String> {
-        let resolved = resolve(target);
-        let lexical = crate::git::lexical_normalize(&if target.is_absolute() {
-            target.to_path_buf()
-        } else {
-            std::env::current_dir().unwrap_or_default().join(target)
-        });
-        let relative = |path: &Path| -> PathBuf {
-            path.components()
-                .filter(|part| matches!(part, std::path::Component::Normal(_)))
-                .collect()
+    /// Every protected location, host and loader.
+    pub fn locations(&self) -> Vec<(String, PathBuf)> {
+        self.host.iter().chain(&self.loader).cloned().collect()
+    }
+
+    pub fn globs(&self) -> &[(String, String)] {
+        &self.globs
+    }
+
+    /// Why a write to `target` is refused, if it is.
+    pub fn guards(&self, target: &Path) -> Option<Refusal> {
+        let landing = match landing(target) {
+            Ok(landing) => landing,
+            Err(reason) => {
+                return Some(Refusal {
+                    class: Class::Host,
+                    reason,
+                    landing: None,
+                })
+            }
         };
-        if is_loader_path(&relative(&resolved)) || is_loader_path(&relative(&lexical)) {
-            return Some(format!(
-                "{} is a file the agent's configuration is loaded from (config, \
-                 instructions, agents, commands, skills, workflows, git hooks)",
-                target.display()
-            ));
+        let refusal = |class, reason: String| {
+            Some(Refusal {
+                class,
+                reason,
+                landing: Some(landing.clone()),
+            })
+        };
+        let inside = |list: &[(String, PathBuf)]| {
+            list.iter()
+                .find(|(_, location)| within(&landing, location))
+                .map(|(what, location)| {
+                    format!("{} is in {what} ({})", target.display(), location.display())
+                })
+        };
+        if let Some(reason) = inside(&self.host) {
+            return refusal(Class::Host, reason);
         }
-        self.locations
+        let names: PathBuf = landing
+            .components()
+            .filter(|part| matches!(part, std::path::Component::Normal(_)))
+            .collect();
+        if is_loader_path(&names) {
+            return refusal(
+                Class::Loader,
+                format!(
+                    "{} is a file the agent's configuration is loaded from (config, \
+                     instructions, agents, commands, skills, workflows, git hooks)",
+                    target.display()
+                ),
+            );
+        }
+        if let Some(reason) = inside(&self.loader) {
+            return refusal(Class::Loader, reason);
+        }
+        let text = landing.to_string_lossy();
+        self.globs
             .iter()
-            .find(|(_, location)| within(&resolved, location))
-            .map(|(what, location)| {
-                format!("{} is in {what} ({})", target.display(), location.display())
+            .find(|(_, pattern)| crate::tool::permission::wildcard_match(&text, pattern))
+            .and_then(|(what, pattern)| {
+                refusal(
+                    Class::Loader,
+                    format!("{} matches {what} ({pattern})", target.display()),
+                )
             })
     }
 
@@ -217,35 +392,94 @@ impl Protected {
     /// other, or they are the same — if any: `(what, location)`.
     pub fn overlap(&self, directory: &Path) -> Option<(String, PathBuf)> {
         let directory = resolve(directory);
-        self.locations
+        self.host
             .iter()
+            .chain(&self.loader)
             .find(|(_, location)| within(location, &directory) || within(&directory, location))
             .cloned()
+    }
+}
+
+/// The write guard of a guarded session: the protected set, and the policy
+/// a grant is looked up in.
+#[derive(Debug, Clone)]
+pub struct WriteGuard {
+    pub protected: std::sync::Arc<Protected>,
+    /// The session's policy. A grant counts only when *every* reading has
+    /// it ([`Policy::explicitly_allows`]) — so one a project wrote, which
+    /// the host's reading lacks, lifts nothing.
+    ///
+    /// [`Policy::explicitly_allows`]: crate::tool::permission::Policy::explicitly_allows
+    pub policy: crate::tool::permission::Policy,
+    /// The project a relative grant pattern is relative to.
+    pub worktree: PathBuf,
+}
+
+impl WriteGuard {
+    /// Whether the write to `target` may go ahead; `Err` is why not.
+    pub fn check(&self, target: &Path) -> Result<(), String> {
+        let Some(refusal) = self.protected.guards(target) else {
+            return Ok(());
+        };
+        let grant = crate::project_files::EDIT_LOADER_PERMISSION;
+        let lifted = refusal.class == Class::Loader
+            && refusal.landing.as_ref().is_some_and(|landing| {
+                let absolute = landing.to_string_lossy();
+                let relative = landing
+                    .strip_prefix(resolve(&self.worktree))
+                    .map(|path| path.to_string_lossy().into_owned());
+                self.policy.explicitly_allows(grant, &absolute)
+                    || relative.is_ok_and(|path| self.policy.explicitly_allows(grant, &path))
+            });
+        if lifted {
+            return Ok(());
+        }
+        Err(match refusal.class {
+            Class::Loader => format!(
+                "{}. This session is restricted or has read outside content, so it may not \
+                 write there; the operator can allow that path with the `{grant}` permission \
+                 in the host config.",
+                refusal.reason
+            ),
+            Class::Host => format!(
+                "{}. This session is restricted or has read outside content, so it may not \
+                 write there.",
+                refusal.reason
+            ),
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tool::permission::Policy;
+    use alforria_schema::permission_v1::{PermissionV1Action, PermissionV1Rule};
 
     fn paths(home: &Path) -> crate::GlobalPaths {
         crate::GlobalPaths::resolve_with(home.to_path_buf(), |_| None)
     }
 
-    #[test]
-    fn a_write_is_judged_on_names_anywhere_and_on_locations() {
+    struct Tree {
+        _dir: tempfile::TempDir,
+        root: PathBuf,
+        home: PathBuf,
+        project: PathBuf,
+        protected: Protected,
+    }
+
+    fn tree(config: serde_json::Value) -> Tree {
         let dir = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
         let home = root.join("home");
         let project = root.join("outer/project");
         std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::create_dir_all(project.join("docs/rules")).unwrap();
         std::fs::create_dir_all(home.join("skills-elsewhere")).unwrap();
         let p = paths(&home);
-        let config: crate::config::schema::Config = serde_json::from_value(serde_json::json!({
-            "skills": { "paths": ["~/skills-elsewhere", "vendor/skills"] },
-            "instructions": ["docs/rules/*.md", "https://x.example/rules.md", "/abs/rules.md"],
-        }))
-        .unwrap();
+        std::fs::create_dir_all(&p.data).unwrap();
+        std::fs::create_dir_all(&p.config).unwrap();
+        let config: crate::config::schema::Config = serde_json::from_value(config).unwrap();
         let protected = Protected::for_instance(
             &p,
             &root.join("managed"),
@@ -254,6 +488,33 @@ mod tests {
             &config,
             &project,
         );
+        Tree {
+            _dir: dir,
+            root,
+            home,
+            project,
+            protected,
+        }
+    }
+
+    fn default_config() -> serde_json::Value {
+        serde_json::json!({
+            "skills": { "paths": ["~/skills-elsewhere", "vendor/skills"] },
+            "instructions": [
+                "docs/rules/*.md", "*.rules", "RULES*.txt", "~/notes/*.md", "~",
+                "https://x.example/rules.md", "/abs/rules.md", "plain/file.md",
+            ],
+        })
+    }
+
+    /// Failure 2, the protected set: every place a loader reads is in it,
+    /// by name anywhere or by location, and no configured entry is dropped.
+    #[test]
+    fn every_loader_location_is_protected() {
+        let t = tree(default_config());
+        let p = paths(&t.home);
+        let (project, root, home) = (&t.project, &t.root, &t.home);
+        let refused = |target: PathBuf| t.protected.guards(&target).map(|refusal| refusal.class);
         for target in [
             // The project's own loader files…
             project.join("opencode.json"),
@@ -263,40 +524,247 @@ mod tests {
             root.join("outer/AGENTS.md"),
             root.join("CLAUDE.md"),
             root.join("outer/.opencode/command/c.md"),
-            // …the home's and the global ones…
+            // …the home's…
             home.join(".claude/skills/s/SKILL.md"),
             home.join(".agents/skills/s/SKILL.md"),
-            p.config.join("agent/mine.md"),
-            p.config.join("themes/x.json"),
-            p.data.join("auth.json"),
-            p.state.join("anything"),
-            root.join("managed/opencode.json"),
-            // …and what the config names.
+            // …and every configured entry: paths, globs with and without a
+            // directory part, `~`-relative ones, a bare `~`.
             home.join("skills-elsewhere/s/SKILL.md"),
             project.join("vendor/skills/s/SKILL.md"),
             project.join("docs/rules/security.md"),
+            project.join("team.rules"),
+            project.join("RULES-2027.txt"),
+            home.join("notes/todo.md"),
+            home.join("anything-at-all.txt"),
             PathBuf::from("/abs/rules.md"),
+            project.join("plain/file.md"),
         ] {
-            assert!(protected.guards(&target).is_some(), "{}", target.display());
+            assert_eq!(
+                refused(target.clone()),
+                Some(Class::Loader),
+                "{}",
+                target.display()
+            );
+        }
+        for target in [
+            p.config.join("agent/mine.md"),
+            p.config.join("opencode.json"),
+            p.data.join("auth.json"),
+            p.state.join("anything"),
+            p.cache.join("x/y"),
+            root.join("managed/opencode.json"),
+            home.join(".opencode/agent/x.md"),
+        ] {
+            assert_eq!(
+                refused(target.clone()),
+                Some(Class::Host),
+                "{}",
+                target.display()
+            );
         }
         for target in [
             project.join("src/main.rs"),
             project.join("docs/readme.md"),
             root.join("outer/notes.txt"),
-            home.join("documents/x.txt"),
         ] {
-            assert_eq!(protected.guards(&target), None, "{}", target.display());
+            assert_eq!(refused(target.clone()), None, "{}", target.display());
         }
-        #[cfg(unix)]
-        {
-            // Reached through a link to a location, and to a loader directory.
-            std::fs::create_dir_all(&p.data).unwrap();
-            std::os::unix::fs::symlink(&p.data, project.join("d")).unwrap();
-            assert!(protected.guards(&project.join("d/auth.json")).is_some());
-            std::fs::create_dir_all(project.join(".opencode")).unwrap();
-            std::os::unix::fs::symlink(project.join(".opencode"), project.join("cfg")).unwrap();
-            assert!(protected.guards(&project.join("cfg/agent/x.md")).is_some());
+        // Each non-URL entry produced a location or a glob.
+        assert_eq!(t.protected.globs().len(), 4, "{:?}", t.protected.globs());
+    }
+
+    /// Failure 1, the wrong path judged. Over generated spellings of paths
+    /// in a tree with symlinks — to protected and to ordinary places,
+    /// dangling ones, `..` in every position — whenever the guard lets a
+    /// write through, the write is made for real and the file it produced
+    /// is looked up: it is never in a protected place.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_the_guard_allows_never_lands_somewhere_protected() {
+        use std::os::unix::fs::symlink;
+        let t = tree(default_config());
+        let p = paths(&t.home);
+        let project = &t.project;
+        std::fs::create_dir_all(project.join(".opencode/agent")).unwrap();
+        std::fs::write(project.join("AGENTS.md"), "operator's").unwrap();
+        std::fs::create_dir_all(t.root.join("elsewhere/dir")).unwrap();
+        symlink(&p.data, project.join("to-data")).unwrap();
+        symlink(project.join(".opencode"), project.join("to-cfg")).unwrap();
+        symlink(project.join("AGENTS.md"), project.join("to-agents")).unwrap();
+        symlink(t.root.join("elsewhere/dir"), project.join("to-elsewhere")).unwrap();
+        symlink(p.config.join("not-yet"), project.join("dangling")).unwrap();
+        symlink(project.join("src"), project.join("to-src")).unwrap();
+        // `to-elsewhere/..` is `elsewhere`, where a loader name waits.
+        std::fs::create_dir_all(t.root.join("elsewhere/.opencode")).unwrap();
+
+        let parts = [
+            "src",
+            "docs",
+            "to-data",
+            "to-cfg",
+            "to-agents",
+            "to-elsewhere",
+            "dangling",
+            "to-src",
+            "..",
+            ".",
+            ".opencode",
+            "agent",
+            "x.md",
+            "new.txt",
+            "AGENTS.md",
+            "deep",
+            "auth.json",
+        ];
+        let mut seed = 0x9e3779b97f4a7c15u64;
+        let mut next = move |bound: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % bound as u64) as usize
+        };
+        let (mut allowed, mut refused) = (0, 0);
+        for _ in 0..3000 {
+            let depth = 1 + next(4);
+            let mut target = project.clone();
+            for _ in 0..depth {
+                target.push(parts[next(parts.len())]);
+            }
+            if t.protected.guards(&target).is_some() {
+                refused += 1;
+                continue;
+            }
+            // Allowed: write as the tools do, and see where it went.
+            if let Some(parent) = target.parent() {
+                if std::fs::create_dir_all(parent).is_err() {
+                    continue;
+                }
+            }
+            if std::fs::write(&target, "probe").is_err() {
+                continue;
+            }
+            allowed += 1;
+            let landed = std::fs::canonicalize(&target).unwrap();
+            let names: PathBuf = landed
+                .components()
+                .filter(|part| matches!(part, std::path::Component::Normal(_)))
+                .collect();
+            assert!(
+                !is_loader_path(&names),
+                "{} was allowed and landed on {}",
+                target.display(),
+                landed.display()
+            );
+            for (what, location) in t.protected.locations() {
+                assert!(
+                    !landed.starts_with(&location),
+                    "{} was allowed and landed in {what}: {}",
+                    target.display(),
+                    landed.display()
+                );
+            }
+            // Where the guard said it would land is where it landed.
+            assert_eq!(
+                landing(&target).ok(),
+                Some(landed.clone()),
+                "{}",
+                target.display()
+            );
+            let _ = std::fs::remove_file(&landed);
         }
+        assert!(
+            allowed > 50 && refused > 500,
+            "allowed {allowed}, refused {refused}"
+        );
+        // The shapes by name.
+        for (target, why) in [
+            ("to-elsewhere/../.opencode/x.md", ".."),
+            ("src/../AGENTS.md", ".."),
+            ("to-agents", "symbolic link"),
+            ("dangling", "symbolic link"),
+            ("dangling/x.md", "dangling"),
+        ] {
+            let refusal = t.protected.guards(&project.join(target)).expect(target);
+            assert!(refusal.reason.contains(why), "{target}: {}", refusal.reason);
+            assert_eq!(refusal.class, Class::Host, "{target}: not liftable");
+        }
+        // A link to an ordinary directory is followed, like the kernel does.
+        assert_eq!(t.protected.guards(&project.join("to-src/new.rs")), None);
+        assert!(t
+            .protected
+            .guards(&project.join("to-cfg/agent/x.md"))
+            .is_some());
+        assert!(t
+            .protected
+            .guards(&project.join("to-data/auth.json"))
+            .is_some());
+    }
+
+    /// Failure 3, the grant: looked up per write and for that path; only an
+    /// explicit `edit_loader` rule that every reading holds counts; and it
+    /// lifts loader files, never a host location or an unjudgeable target.
+    #[test]
+    fn a_grant_lifts_the_path_it_names_and_no_host_location() {
+        let t = tree(default_config());
+        let p = paths(&t.home);
+        let rule = |permission: &str, pattern: &str, action| PermissionV1Rule {
+            permission: permission.to_string(),
+            pattern: pattern.to_string(),
+            action,
+        };
+        use PermissionV1Action::Allow;
+        let guard = |policy: Policy| WriteGuard {
+            protected: std::sync::Arc::new(t.protected.clone()),
+            policy,
+            worktree: t.project.clone(),
+        };
+        let agents = t.project.join("docs/AGENTS.md");
+        let config = t.project.join("opencode.json");
+        let host_file = p.data.join("auth.json");
+        let global = p.config.join("opencode.json");
+
+        // No grant: both loader files refused. `* allow` is not a grant.
+        let none = guard(Policy::plain(vec![
+            rule("*", "*", Allow),
+            rule("edit", "*", Allow),
+        ]));
+        assert!(none.check(&agents).is_err());
+        assert!(none.check(&config).is_err());
+        assert!(none.check(&t.project.join("src/main.rs")).is_ok());
+
+        // A grant for one path lifts that path — relative to the project or
+        // absolute — and nothing else.
+        let one = guard(Policy::plain(vec![
+            rule("*", "*", Allow),
+            rule("edit_loader", "docs/AGENTS.md", Allow),
+        ]));
+        assert!(one.check(&agents).is_ok());
+        assert!(one.check(&config).is_err());
+        let absolute = guard(Policy::plain(vec![rule(
+            "edit_loader",
+            &config.to_string_lossy(),
+            Allow,
+        )]));
+        assert!(absolute.check(&config).is_ok());
+        assert!(absolute.check(&agents).is_err());
+
+        // The widest grant lifts every loader file and still no host
+        // location, and no target that cannot be judged.
+        let all = guard(Policy::plain(vec![rule("edit_loader", "*", Allow)]));
+        assert!(all.check(&agents).is_ok());
+        assert!(all.check(&config).is_ok());
+        for target in [host_file, global, t.project.join("src/../opencode.json")] {
+            let error = all.check(&target).unwrap_err();
+            assert!(!error.contains("edit_loader"), "{error}");
+        }
+
+        // A grant only the project wrote — absent from the host's reading —
+        // lifts nothing.
+        let projects = guard(
+            Policy::plain(vec![rule("*", "*", Allow), rule("edit_loader", "*", Allow)])
+                .with_ceiling("host", vec![rule("*", "*", Allow)]),
+        );
+        assert!(projects.check(&agents).is_err());
     }
 
     #[test]

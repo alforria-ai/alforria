@@ -485,9 +485,15 @@ which of the three it is, or it does not compile.
   the global config directory, the managed directory, the data, state and
   cache directories, the binary's directory, and what the config names
   (`OPENCODE_CONFIG*`, `skills.paths`, `workflows.paths`, local
-  `instructions`). `"permission": { "edit_loader": "allow" }` in the host
-  config (all or nothing) hands it back; the operator's own sessions are not
-  guarded.
+  `instructions`, globs included). A path with a `..` in it, one whose last
+  component is a symlink, and one through a dangling link are refused
+  outright in such a session: the guard does not guess where they lead.
+  The `edit_loader` permission in the host config hands back *project-level
+  loader files*, per path (`"edit_loader": { "docs/AGENTS.md": "allow" }`, or
+  `"allow"` for all of them) — a grant only a project wrote counts for
+  nothing, and no rule lifts a host location (the data, state, cache, global
+  and managed config directories, the binary's directory). The operator's
+  own sessions are not guarded.
 
   **This is not the control.** A session that may run `bash` writes any
   file the server's user can, and the guard does not see it; session

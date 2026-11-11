@@ -90,27 +90,21 @@ pub struct InstanceContext {
     pub directory: PathBuf,
     pub worktree: PathBuf,
     /// Set for a session that is restricted or has seen outside content:
-    /// what its tools may not write (`protect::Protected`). `None`: no
-    /// guard.
-    pub write_guard: Option<std::sync::Arc<crate::protect::Protected>>,
+    /// the guard its tools' writes go through (`protect::WriteGuard`).
+    /// `None`: no guard.
+    pub write_guard: Option<std::sync::Arc<crate::protect::WriteGuard>>,
 }
 
 impl InstanceContext {
     /// **Every mutating file operation of a tool calls this with the path
-    /// it is about to create, overwrite, rename onto or delete**, before it
-    /// does. Enforcement lives here, at the write, and does not depend on
-    /// what the tool put in a permission ask.
+    /// it is about to create, overwrite, rename onto or delete**, as it
+    /// will pass it to the filesystem, before it does. Enforcement lives
+    /// here, at the write, and does not depend on what the tool put in a
+    /// permission ask; a grant is looked up here too, for this path.
     pub fn about_to_modify(&self, path: &Path) -> Result<(), ToolError> {
-        let Some(guard) = &self.write_guard else {
-            return Ok(());
-        };
-        match guard.guards(path) {
+        match &self.write_guard {
             None => Ok(()),
-            Some(reason) => Err(ToolError::Permission(format!(
-                "{reason}. This session is restricted or has read outside content, so it may \
-                 not write there; the operator can allow it with `\"edit_loader\": \"allow\"` \
-                 in the host config's `permission`."
-            ))),
+            Some(guard) => guard.check(path).map_err(ToolError::Permission),
         }
     }
 }

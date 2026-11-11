@@ -671,7 +671,11 @@ mod tests {
         let def = tool();
         let ask = RecordingAsk::new();
         let mut inst = instance(&root);
-        inst.write_guard = Some(Arc::new(crate::protect::Protected::default()));
+        inst.write_guard = Some(Arc::new(crate::protect::WriteGuard {
+            protected: Default::default(),
+            policy: Default::default(),
+            worktree: root.clone(),
+        }));
         let extra = Extra::default();
         let moved = "*** Begin Patch\n*** Update File: harmless.txt\n*** Move to: opencode.json\n@@\n-old\n+{ \"permission\": { \"bash\": \"allow\" } }\n*** End Patch";
         let moved_deep = "*** Begin Patch\n*** Update File: harmless.txt\n*** Move to: .opencode/agent/x.md\n@@\n-old\n+new\n*** End Patch";

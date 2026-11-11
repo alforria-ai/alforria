@@ -133,12 +133,16 @@ pub async fn resolve(
         None => input.agent.permission.clone(),
     };
     // A restricted or outside-input session's tools do not write what the
-    // loaders (or the server) read, unless the operator's policy grants
-    // `edit_loader` outright. Enforced at each write
-    // (`InstanceContext::about_to_modify`), not from an ask's patterns.
-    let write_guard = (input.guard_loader_paths
-        && !ruleset.explicitly_allows(crate::project_files::EDIT_LOADER_PERMISSION, "*"))
-    .then(|| deps.protected.clone());
+    // loaders (or the server) read. The guard is always on for such a
+    // session and decides at each write, for the path being written
+    // (`InstanceContext::about_to_modify`); a grant is looked up there.
+    let write_guard = input.guard_loader_paths.then(|| {
+        Arc::new(crate::protect::WriteGuard {
+            protected: deps.protected.clone(),
+            policy: ruleset.clone(),
+            worktree: deps.instance.worktree.clone(),
+        })
+    });
     // Shared by every tool's closure: one copy of the history, not one per
     // tool.
     let messages: Arc<Vec<Value>> = Arc::new(

@@ -429,7 +429,18 @@ fn restricted_upload_allowed(
     // The same guard the edit tools' writes go through
     // (`alforria_core::protect`): loader names anywhere on the resolved
     // path, and every location the loaders consult for this instance.
-    if let Some(reason) = location.services.agents.protected().guards(target) {
+    // (A target the guard cannot judge — a link as the last component — is
+    // this route's own business: it has been resolved and confined to the
+    // upload area above, and the upload replaces a link by renaming over
+    // it instead of writing through it.)
+    let refusal = location
+        .services
+        .agents
+        .protected()
+        .guards(target)
+        .filter(|refusal| refusal.landing.is_some());
+    if let Some(refusal) = refusal {
+        let reason = refusal.reason;
         return Err(format!(
             "{reason}: this token may not write config, instruction, agent, command, skill, \
              workflow or git files"
