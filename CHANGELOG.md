@@ -65,8 +65,14 @@ pre-1.0, so minor releases may include breaking changes.
   `GET /memory/session`. The transcript index is built in the background and
   costs nothing when a message is written. Records carry where they came
   from, and those written by a flush or by a run that carried outside text
-  are searched but not injected. `memory` and `trigger` settings are read
-  from your own config only; a project may at most switch memory off. See
+  are searched but not injected. A session counts as having seen outside
+  content once a web, MCP or plugin tool answers in it, or it reads a file
+  from the upload area (`grep` and `glob`: when a file they returned is one
+  of the uploads, not because an `uploads/` directory exists); such a
+  session may change only unverified records it saved itself. No tool's
+  permission depends on that mark, and with memory and triggers off (the
+  default) nothing reads it. `memory` and `trigger` settings are read from
+  your own config only; a project may at most switch memory off. See
   `docs/assistant.md`.
 - `alforria import --format openai-chat <file|->` imports a chat transcript
   from another tool: a JSON or JSONL list of `{role, content, tool_calls,
@@ -351,8 +357,9 @@ pre-1.0, so minor releases may include breaking changes.
   are dropped with a warning unless the host lists them in
   `server.trust.project_keys`. Standalone installs are unchanged. See
   `docs/unattended-server.md`.
-- A restricted session, or one that has read outside content, cannot write
-  `opencode.json`, `.opencode/`, `AGENTS.md` and the other loader files with
+- A restricted session, or one that outside input started (a webhook or
+  watch run), cannot write `opencode.json`, `.opencode/`, `AGENTS.md` and
+  the other loader files with
   its edit tools (`permission.edit_loader: "allow"` in the host config hands
   it back).
 - When the global config does not load, a project's capability-bearing keys

@@ -397,10 +397,52 @@ and `outsideStart`.
 | | **Outside content** (provenance) | **Outside start** (ceiling) |
 | --- | --- | --- |
 | Means | The session has seen content somebody else wrote. | A run in the session was started by outside input. |
-| Set when | A tool that returns outside content answers in it — `webfetch`, `websearch`, every MCP or plugin tool, code mode (`execute`); `memory` when it returns an unverified record; `session_search` when a hit comes from a marked session; `read` of a file in the upload area (`server.upload.directories`), and a `grep` or `glob` whose search tree is inside, is, or contains that area (decided from the call's input and the resolved paths, never from what the tool printed — so a project-wide search marks the session once an upload directory exists); `task`, `subagents` and `workflow` when a child session is marked. Also: a prompt from a caller below `admin` that brings a file part; a run of a trigger that a marked session created or changed. And always together with the other mark. | A `webhook` or `watch` trigger starts a run in it, or any trigger run delivers a payload. |
+| Set when | A tool that returns outside content answers in it — `webfetch`, `websearch`, every MCP or plugin tool, code mode (`execute`); `memory` when it returns an unverified record; `session_search` when a hit comes from a marked session; `read` of a file in the upload area (`server.upload.directories`); a `grep` or `glob` that returned a line or the name of a file in that area (see [Searches and the upload area](#searches-and-the-upload-area)); `task`, `subagents` and `workflow` when a child session is marked. Also: a prompt from a caller below `admin` that brings a file part; a run of a trigger that a marked session created or changed. And always together with the other mark. | A `webhook` or `watch` trigger starts a run in it, or any trigger run delivers a payload. |
 | Where it is set | At the one place a tool's result is appended to the session (the processor), from a table that classifies every built-in tool (`tool::outside::BUILTIN`); a tool that is not in the table is treated as returning outside content. A test walks the server's registry and fails on an unclassified tool. | Where a trigger's run gets its session (`session::trigger_ops`). |
 | Effect | Memory the session writes — with the `memory` tool or by the flush before a compaction — is recorded `untrusted`, is unverified and is not injected; of existing records it may change or delete only unverified ones it saved itself. A trigger it creates or changes with `schedule` carries the mark into its runs' sessions. Its `session_search` excerpts are fenced and labelled `trust="untrusted"`. | The read-only ceiling of [Declaring triggers](#declaring-triggers): the stricter of the run's rules and read-only, standing `always` approvals ignored, an `ask` denied at once, `permission.unattended` never answering. Existing memory records cannot be changed. Loader files cannot be written. |
 | Does not | Change the permission of any tool. An interactive session works as before after its first web search: asks are asked, approvals apply, tools are offered. The one thing it loses is the integrity-sensitive part of `memory` above. | — |
+
+#### Searches and the upload area
+
+`uploads/` is the default upload area, and plenty of projects have a
+directory of that name. A search marks its session for what it *returned*,
+not for where it looked:
+
+- `grep` and `glob` hand the server the list of files their result holds a
+  line or a name of — the list the tool computed, not the text it printed.
+  Each path is resolved (links followed, as the kernel would) and compared
+  with the resolved upload directories. A file of the upload area in the
+  list marks the session; a list with none does not, whatever tree was
+  searched. A path that cannot be resolved counts as an upload.
+- The text of a result decides nothing. A matched line that spells an
+  upload's path, a project file under some other `uploads` directory, or an
+  upload whose name is written to read like a project file's heading do not
+  change the answer.
+- When there is no complete list — the result was cut at the tool's limit
+  (250 matches for `grep`, 100 files for `glob`), or the call failed — the
+  session is marked if the tree the call's input names is inside, is, or
+  contains an upload directory that holds at least one entry. An upload
+  directory that is merely there, empty, marks nothing.
+- An upload directory that exists but cannot be listed, or cannot be
+  resolved, counts as holding uploads.
+
+#### What the mark costs when nothing reads it
+
+Memory and triggers are off by default, and then nothing reads the
+outside-content mark: no tool's output, title or metadata depends on it, the
+permission policy of a session is built from its rules and its ceilings and
+never from this mark (`SessionStore::policy`; the outside-*start* mark is
+what brings a ceiling), and the loader-file write guard follows restriction
+and the outside-start mark only. The only place it shows is
+`GET /session/{id}/restriction`.
+
+The mark is still recorded, so that a session which read outside content
+before memory was switched on counts as having read it afterwards. It is
+one row per session in `session_mark`, written the first time such a result
+arrives. Every later result in that session costs one indexed read and
+nothing else: no filesystem lookup, and no write — it does not wait for the
+database's write lock. Tools that never return outside content (`bash`,
+`edit`, `write`, …) cost nothing at all.
 
 What is *not* a cause, on purpose: `bash` (a shell can fetch anything, and
 marking it would mark every coding session and leave memory unusable), and

@@ -633,8 +633,8 @@ which of the three it is, or it does not compile.
   cannot be read) a project's or a remote config keeps only keys that cannot
   carry a capability — see `server.trust` below. Everything else is dropped
   with a warning naming the file.
-- **A restricted session, or one that has read outside content, does not
-  write what the loaders read** — as defence in depth. Every file operation
+- **A restricted session, or one that outside input started (the *outside
+  start* mark), does not write what the loaders read** — as defence in depth. Every file operation
   of `edit`, `write` and `apply_patch` (a patch's adds, updates, deletes,
   and both ends of a move), and the upload route, put the path they are
   about to modify to one guard (`alforria_core::protect`), at the write and
@@ -745,7 +745,7 @@ which a client can write:
 | --- | --- | --- |
 | **restricted** | A caller below `admin` created the session (this page). | Who may drive it, and what its turns may do. |
 | **outside start** | A `webhook` or `watch` trigger started a run in it, or a trigger run delivered a payload. | The read-only ceiling: the rules the run was given are a ceiling nothing widens. The project's standing `always` approvals do not apply, an `ask` is a deny at once, and `permission.unattended` never answers for it — `on_timeout: "allow"` included. It cannot change existing memory records or write loader files. A fork keeps its rules along with its text. |
-| **outside content** | A tool that returns somebody else's content answered in the session (`webfetch`, `websearch`, any MCP tool, a read from the upload area, an unverified memory record, an excerpt of a marked session, a marked subagent's result), a caller below `admin` attached a file to a prompt, or the run belongs to a trigger a marked session wrote. Always set together with *outside start*. | Provenance: memory it writes is unverified and not injected into later sessions; of existing memory it may change or delete only unverified records it saved itself; triggers it schedules carry the mark; its transcript excerpts are fenced. **No tool's permission changes**: an operator's interactive session keeps working as before after a web search. |
+| **outside content** | A tool that returns somebody else's content answered in the session (`webfetch`, `websearch`, any MCP tool, a read from the upload area or a search that returned a file of it, an unverified memory record, an excerpt of a marked session, a marked subagent's result), a caller below `admin` attached a file to a prompt, or the run belongs to a trigger a marked session wrote. Always set together with *outside start*. | Provenance: memory it writes is unverified and not injected into later sessions; of existing memory it may change or delete only unverified records it saved itself; triggers it schedules carry the mark; its transcript excerpts are fenced. **No tool's permission changes**: an operator's interactive session keeps working as before after a web search. |
 
 The full list of causes, and the test that keeps the tool list complete, is
 in [assistant.md](assistant.md#two-session-marks-what-causes-each-and-what-each-does).
