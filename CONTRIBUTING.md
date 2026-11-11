@@ -70,6 +70,35 @@ cargo clippy --all-targets -- -D warnings
 cargo nextest run
 ```
 
+### Tests never touch your own files
+
+No test may read or write your real config, data, state or cache directory —
+in particular it must never open your database (opening migrates it). Two
+things enforce that:
+
+- **A guard in the code.** In a test run, `GlobalPaths::from_env()`,
+  `production_context`, `Storage::open` and the e2e harness panic when the
+  directory they are about to use is not under a sandbox root (the system
+  temporary directory, or `ALFORRIA_TEST_SANDBOX`). The message names the
+  call. See `alforria_core::paths::sandbox`. The fix is always the same:
+  build the context over a temporary home (`GlobalPaths::resolve_with(tmp, |_|
+  None)`, `ServerContext::with_paths`, `ListenOptions::paths`,
+  `TuiBoot::isolated`) and take paths from the context — nothing a request
+  handler or a fixture reaches may call `GlobalPaths::from_env()`. Each
+  remaining call is a process entry point and says so in a comment.
+- **An isolation run.** `scripts/test-isolated.sh` runs the whole suite with
+  `HOME` and every `XDG_*` directory pointing at an empty, read-only
+  directory, and fails if anything appears there:
+
+  ```sh
+  scripts/test-isolated.sh
+  ```
+
+  CI runs it on every pull request (the `isolation` job).
+
+If you are working on a machine whose real database matters, run the ordinary
+suite the same way — a sandboxed `HOME` costs nothing.
+
 For web changes, also run `bun run check` and `bun run e2e` from `web/`.
 CI runs the Rust gates on Linux, macOS, and Windows; a few POSIX-specific
 core and PTY tests are deferred on Windows.

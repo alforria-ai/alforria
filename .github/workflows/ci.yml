@@ -27,3 +27,17 @@ jobs:
         run: cargo install cargo-nextest --locked || true
       - name: Test
         run: cargo nextest run || cargo test --all
+
+  # The suite must not touch the runner's own config, data, state or cache
+  # directories: HOME and XDG_* point at an empty read-only directory and the
+  # job fails if anything appears there (see CONTRIBUTING.md).
+  isolation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install nextest
+        run: cargo install cargo-nextest --locked
+      - name: Test with an empty read-only HOME
+        run: scripts/test-isolated.sh
