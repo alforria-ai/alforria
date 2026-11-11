@@ -1,9 +1,10 @@
 //! MCP OAuth credential store — port of `mcp/auth.ts`.
 //!
 //! `<Global.Path.data>/mcp-auth.json` (auth.ts:37), written with `0o600`
-//! (`auth.ts:80`). The flock-based inter-process lock is reduced to an
-//! in-process mutex — the Rust port holds one store per service and the
-//! file writes are atomic enough for the single-process CLI/server paths.
+//! (`auth.ts:80`). Like the TS, every access reads the file: logins must
+//! survive a restart, and another alforria process may have refreshed a
+//! token since. The flock-based inter-process lock is reduced to an
+//! in-process mutex around read-modify-write.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -64,24 +65,28 @@ impl McpAuthEntry {
 #[derive(Clone)]
 pub struct McpAuth {
     path: PathBuf,
-    data: Arc<Mutex<BTreeMap<String, McpAuthEntry>>>,
+    write: Arc<Mutex<()>>,
 }
 
 impl McpAuth {
     pub fn new(path: PathBuf) -> McpAuth {
         McpAuth {
             path,
-            data: Arc::new(Mutex::new(BTreeMap::new())),
+            write: Arc::new(Mutex::new(())),
         }
     }
 
+    /// `read` (auth.ts:65-70): missing/invalid files decode as empty.
     fn entries(&self) -> BTreeMap<String, McpAuthEntry> {
-        self.data.lock().unwrap_or_else(|p| p.into_inner()).clone()
+        std::fs::read_to_string(&self.path)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default()
     }
 
-    /// `read` (auth.ts:65-70): missing/invalid files decode as empty.
     fn mutate(&self, update: impl FnOnce(&mut BTreeMap<String, McpAuthEntry>) -> bool) {
-        let mut data = self.data.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = self.write.lock().unwrap_or_else(|p| p.into_inner());
+        let mut data = self.entries();
         if update(&mut data) {
             let map: BTreeMap<&str, Value> = data
                 .iter()
@@ -273,6 +278,27 @@ mod tests {
         let entry = auth.get("srv").unwrap();
         assert_eq!(entry.code_verifier, None);
         assert_eq!(entry.oauth_state, None);
+    }
+
+    #[test]
+    fn logins_survive_a_new_store_and_other_servers_are_kept() {
+        let (auth, path) = store();
+        let tokens = |token: &str| McpTokens {
+            access_token: token.into(),
+            ..Default::default()
+        };
+        auth.update_tokens("one", tokens("a"), Some("https://one.test"));
+        // A fresh store (a restart, or another process) sees the login…
+        let restarted = McpAuth::new(path.clone());
+        assert_eq!(
+            restarted.get("one").unwrap().tokens.unwrap().access_token,
+            "a"
+        );
+        // …and saving a second server does not wipe the first.
+        restarted.update_tokens("two", tokens("b"), Some("https://two.test"));
+        let again = McpAuth::new(path);
+        assert!(again.get("one").is_some());
+        assert!(again.get("two").is_some());
     }
 
     #[test]

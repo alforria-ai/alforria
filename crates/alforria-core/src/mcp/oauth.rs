@@ -631,6 +631,164 @@ pub async fn exchange_code(
     Ok(tokens)
 }
 
+/// Refresh this long before expiry, so a request never leaves with a token
+/// that dies in flight.
+const REFRESH_SKEW_SECONDS: f64 = 60.0;
+
+/// One refresh at a time per process. Servers that rotate refresh tokens
+/// invalidate the old one on use, so two concurrent refreshes would leave the
+/// loser holding a dead token.
+static REFRESH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn needs_refresh(tokens: &crate::mcp::auth::McpTokens) -> bool {
+    tokens
+        .expires_at
+        .is_some_and(|expires_at| expires_at - REFRESH_SKEW_SECONDS < now_seconds())
+}
+
+/// How a refresh attempt ended when it did not produce tokens.
+#[derive(Debug, PartialEq)]
+pub enum RefreshFailure {
+    /// Nothing to refresh with (no stored login or no refresh token).
+    Unavailable,
+    /// The authorization server refused the refresh token: sign in again.
+    Rejected(String),
+    /// Network or server trouble. The stored login is kept and may still work.
+    Transient(String),
+}
+
+/// The `refresh_token` grant against a known token endpoint.
+async fn request_refresh(
+    token_endpoint: &str,
+    refresh_token: &str,
+    client: Option<&McpClientInfo>,
+    previous: &crate::mcp::auth::McpTokens,
+) -> Result<crate::mcp::auth::McpTokens, RefreshFailure> {
+    let mut form = vec![
+        ("grant_type", "refresh_token".to_string()),
+        ("refresh_token", refresh_token.to_string()),
+    ];
+    if let Some(client) = client {
+        form.push(("client_id", client.client_id.clone()));
+        if let Some(secret) = &client.client_secret {
+            form.push(("client_secret", secret.clone()));
+        }
+    }
+    let response = reqwest::Client::new()
+        .post(token_endpoint)
+        .header("Accept", "application/json")
+        .timeout(Duration::from_secs(30))
+        .form(&form)
+        .send()
+        .await
+        .map_err(|err| RefreshFailure::Transient(format!("{err}")))?;
+    let status = response.status();
+    if !status.is_success() {
+        let text = response.text().await.unwrap_or_default();
+        let message = format!("Token refresh failed: HTTP {status} {text}");
+        // 400/401 mean the grant itself is bad (`invalid_grant`). Anything
+        // else, a 5xx or a 429, is the server having a moment.
+        return Err(if matches!(status.as_u16(), 400 | 401) {
+            RefreshFailure::Rejected(message)
+        } else {
+            RefreshFailure::Transient(message)
+        });
+    }
+    let value = response
+        .json::<Value>()
+        .await
+        .map_err(|err| RefreshFailure::Transient(format!("{err}")))?;
+    let Some(access_token) = value
+        .get("access_token")
+        .and_then(Value::as_str)
+        .filter(|token| !token.is_empty())
+    else {
+        return Err(RefreshFailure::Transient(
+            "Token refresh response has no access_token".to_string(),
+        ));
+    };
+    Ok(crate::mcp::auth::McpTokens {
+        access_token: access_token.to_string(),
+        // Rotation is optional: a server that omits the field keeps the
+        // current refresh token valid.
+        refresh_token: value
+            .get("refresh_token")
+            .and_then(Value::as_str)
+            .map(String::from)
+            .or_else(|| previous.refresh_token.clone()),
+        expires_at: value
+            .get("expires_in")
+            .and_then(Value::as_f64)
+            .map(|expires| now_seconds() + expires),
+        scope: value
+            .get("scope")
+            .and_then(Value::as_str)
+            .map(String::from)
+            .or_else(|| previous.scope.clone()),
+    })
+}
+
+/// Refresh the stored login for `mcp_name` and persist the result.
+///
+/// `stale` is the access token the caller found wanting. If the store holds a
+/// different one by the time the lock is acquired, another task or process
+/// already refreshed, and that token is returned without a second request.
+pub async fn refresh_tokens(
+    mcp_name: &str,
+    server_url: &str,
+    auth: &McpAuth,
+    stale: Option<&str>,
+) -> Result<crate::mcp::auth::McpTokens, RefreshFailure> {
+    let _guard = REFRESH_LOCK.lock().await;
+    let entry = auth
+        .get_for_url(mcp_name, server_url)
+        .ok_or(RefreshFailure::Unavailable)?;
+    let tokens = entry.tokens.clone().ok_or(RefreshFailure::Unavailable)?;
+    if stale.is_some_and(|stale| stale != tokens.access_token) && !needs_refresh(&tokens) {
+        return Ok(tokens);
+    }
+    let refresh_token = tokens
+        .refresh_token
+        .clone()
+        .filter(|token| !token.is_empty())
+        .ok_or(RefreshFailure::Unavailable)?;
+    let metadata = discover_metadata(server_url)
+        .await
+        .map_err(|err| RefreshFailure::Transient(err.message))?;
+    let refreshed = request_refresh(
+        &metadata.token_endpoint,
+        &refresh_token,
+        entry.client_info.as_ref(),
+        &tokens,
+    )
+    .await?;
+    auth.update_tokens(mcp_name, refreshed.clone(), Some(server_url));
+    Ok(refreshed)
+}
+
+/// The access token to connect with: the stored one, refreshed first when it
+/// is at or near expiry. A failed refresh falls back to the stored token —
+/// expiry times are advisory and the server has the final say with a 401.
+pub async fn fresh_access_token(
+    mcp_name: &str,
+    server_url: &str,
+    auth: &McpAuth,
+) -> Option<String> {
+    let tokens = auth.get_for_url(mcp_name, server_url)?.tokens?;
+    if !needs_refresh(&tokens) {
+        return Some(tokens.access_token);
+    }
+    match refresh_tokens(mcp_name, server_url, auth, None).await {
+        Ok(refreshed) => Some(refreshed.access_token),
+        Err(failure) => {
+            if failure != RefreshFailure::Unavailable {
+                tracing::warn!("mcp {mcp_name}: {failure:?}");
+            }
+            Some(tokens.access_token)
+        }
+    }
+}
+
 fn now_seconds() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -694,6 +852,130 @@ mod tests {
         assert_eq!(params.get("code").map(String::as_str), Some("abc"));
         assert_eq!(params.get("state").map(String::as_str), Some("x y"));
         assert_eq!(params.get("error").map(String::as_str), Some("a b"));
+    }
+
+    /// A one-shot token endpoint: answers the next request with `status` and
+    /// `body`, and hands back the form it received.
+    async fn token_endpoint(
+        status: u16,
+        body: &'static str,
+    ) -> (String, tokio::sync::oneshot::Receiver<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/token", listener.local_addr().unwrap());
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 4096];
+            loop {
+                let read = socket.read(&mut buffer).await.unwrap();
+                request.extend_from_slice(&buffer[..read]);
+                let text = String::from_utf8_lossy(&request);
+                if let Some((head, sent)) = text.split_once("\r\n\r\n") {
+                    let length = head
+                        .lines()
+                        .find_map(|line| {
+                            line.to_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|value| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if sent.len() >= length {
+                        let _ = tx.send(sent.to_string());
+                        break;
+                    }
+                }
+                if read == 0 {
+                    break;
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        (url, rx)
+    }
+
+    fn stored() -> crate::mcp::auth::McpTokens {
+        crate::mcp::auth::McpTokens {
+            access_token: "old-access".into(),
+            refresh_token: Some("old-refresh".into()),
+            expires_at: Some(1.0),
+            scope: Some("read".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_sends_the_grant_and_takes_rotated_tokens() {
+        let (url, form) = token_endpoint(
+            200,
+            r#"{"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600}"#,
+        )
+        .await;
+        let client = McpClientInfo {
+            client_id: "cid".into(),
+            ..Default::default()
+        };
+        let tokens = request_refresh(&url, "old-refresh", Some(&client), &stored())
+            .await
+            .unwrap();
+        let form = form.await.unwrap();
+        assert!(form.contains("grant_type=refresh_token"), "{form}");
+        assert!(form.contains("refresh_token=old-refresh"), "{form}");
+        assert!(form.contains("client_id=cid"), "{form}");
+        assert_eq!(tokens.access_token, "new-access");
+        assert_eq!(tokens.refresh_token.as_deref(), Some("new-refresh"));
+        assert!(tokens.expires_at.unwrap() > now_seconds() + 3000.0);
+        assert!(!needs_refresh(&tokens));
+        assert_eq!(tokens.scope.as_deref(), Some("read"));
+    }
+
+    #[tokio::test]
+    async fn refresh_keeps_the_refresh_token_when_the_server_does_not_rotate() {
+        let (url, _form) = token_endpoint(200, r#"{"access_token":"new-access"}"#).await;
+        let tokens = request_refresh(&url, "old-refresh", None, &stored())
+            .await
+            .unwrap();
+        assert_eq!(tokens.refresh_token.as_deref(), Some("old-refresh"));
+    }
+
+    #[tokio::test]
+    async fn refresh_tells_a_dead_grant_from_a_bad_moment() {
+        let (url, _form) = token_endpoint(400, r#"{"error":"invalid_grant"}"#).await;
+        assert!(matches!(
+            request_refresh(&url, "old-refresh", None, &stored()).await,
+            Err(RefreshFailure::Rejected(_))
+        ));
+        let (url, _form) = token_endpoint(503, "{}").await;
+        assert!(matches!(
+            request_refresh(&url, "old-refresh", None, &stored()).await,
+            Err(RefreshFailure::Transient(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_token_another_process_refreshed_is_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = McpAuth::new(dir.path().join("mcp-auth.json"));
+        let fresh = crate::mcp::auth::McpTokens {
+            access_token: "already-new".into(),
+            refresh_token: Some("r".into()),
+            expires_at: Some(now_seconds() + 3600.0),
+            scope: None,
+        };
+        auth.update_tokens("srv", fresh, Some("https://mcp.test"));
+        // No network is reachable for this URL: success proves no request.
+        let tokens = refresh_tokens("srv", "https://mcp.test", &auth, Some("old-access"))
+            .await
+            .unwrap();
+        assert_eq!(tokens.access_token, "already-new");
+        assert_eq!(
+            refresh_tokens("missing", "https://mcp.test", &auth, None).await,
+            Err(RefreshFailure::Unavailable)
+        );
     }
 
     #[test]

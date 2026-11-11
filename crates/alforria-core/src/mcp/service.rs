@@ -18,7 +18,7 @@ use alforria_schema::mcp::McpStatus;
 use serde_json::{json, Value};
 
 use crate::config::schema::{McpEntry, McpInfo, McpLocal, McpOAuthSetting, McpRemote};
-use crate::mcp::auth::{McpAuth, McpTokens};
+use crate::mcp::auth::McpAuth;
 use crate::mcp::catalog::{self, McpToolDef};
 use crate::mcp::client::{HttpHandle, McpClient, Transport};
 use crate::mcp::oauth::{
@@ -533,8 +533,14 @@ impl McpService {
         let Some(tokens) = entry.tokens else {
             return AuthStatus::NotAuthenticated;
         };
+        // An expired access token with a refresh token is renewed on the
+        // next request; only a login that cannot renew itself is expired.
+        let renewable = tokens
+            .refresh_token
+            .as_deref()
+            .is_some_and(|token| !token.is_empty());
         match tokens.expires_at {
-            Some(expires_at) if expires_at < now_seconds() => AuthStatus::Expired,
+            Some(expires_at) if expires_at < now_seconds() && !renewable => AuthStatus::Expired,
             _ => AuthStatus::Authenticated,
         }
     }
@@ -836,12 +842,18 @@ async fn create_remote(
         .unwrap_or_default();
     let mut transport = HttpTransport::new(url.as_str(), headers);
     if remote.oauth != Some(McpOAuthSetting::Disabled(false)) {
-        let bearer = service
-            .auth
-            .get_for_url(key, &remote.url)
-            .and_then(|entry| entry.tokens)
-            .map(|tokens: McpTokens| tokens.access_token);
+        let bearer = crate::mcp::oauth::fresh_access_token(key, &remote.url, &service.auth).await;
         transport.set_bearer(bearer);
+        let (auth, name, server_url) = (service.auth.clone(), key.to_string(), remote.url.clone());
+        transport.set_refresher(Some(Arc::new(move |stale: Option<String>| {
+            let (auth, name, server_url) = (auth.clone(), name.clone(), server_url.clone());
+            Box::pin(async move {
+                crate::mcp::oauth::refresh_tokens(&name, &server_url, &auth, stale.as_deref())
+                    .await
+                    .ok()
+                    .map(|tokens| tokens.access_token)
+            })
+        })));
     }
     let handle = HttpHandle::new(url.as_str(), transport);
     let client = McpClient::connect(Transport::Http(handle), timeout).await;
@@ -872,6 +884,16 @@ async fn finish_create(client: Result<McpClient, McpError>) -> Result<CreateResu
 
 /// `path.resolve(base, value)` (index.ts:346).
 fn absolute(base: &std::path::Path, value: &str) -> PathBuf {
+    // `~` is what people write in config; the OS will not expand it.
+    let home = match value {
+        "~" => dirs::home_dir(),
+        _ => value
+            .strip_prefix("~/")
+            .and_then(|rest| dirs::home_dir().map(|home| home.join(rest))),
+    };
+    if let Some(home) = home {
+        return home;
+    }
     if std::path::Path::new(value).is_absolute() {
         PathBuf::from(value)
     } else {

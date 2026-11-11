@@ -231,7 +231,14 @@ pub struct HttpTransport {
     pub session_id: Option<String>,
     pub protocol_version: Option<String>,
     bearer: Option<String>,
+    refresh: Option<TokenRefresher>,
 }
+
+/// Called with the access token a server just rejected; returns a
+/// replacement, or `None` when the login cannot be renewed.
+pub type TokenRefresher = std::sync::Arc<
+    dyn Fn(Option<String>) -> crate::tool::def::BoxFuture<'static, Option<String>> + Send + Sync,
+>;
 
 fn reqwest_error(err: reqwest::Error) -> McpError {
     McpError::failed(format!("{err}"))
@@ -245,7 +252,14 @@ impl HttpTransport {
             session_id: None,
             protocol_version: None,
             bearer: None,
+            refresh: None,
         }
+    }
+
+    /// Renew the access token when the server answers 401 mid-session
+    /// (a connection outlives the token it was opened with).
+    pub fn set_refresher(&mut self, refresh: Option<TokenRefresher>) {
+        self.refresh = refresh;
     }
 
     /// Use stored access tokens for the `Authorization: Bearer` header
@@ -281,7 +295,18 @@ impl HttpTransport {
     /// POST one message. Returns `None` for 202 Accepted (no body) and
     /// `Some(response)` otherwise (`_send`, streamableHttp.js:288-431).
     pub async fn send(&mut self, message: &Value) -> Result<Option<Value>, McpError> {
-        let response = self.post(message).await?;
+        let mut response = self.post(message).await?;
+        if response.status().as_u16() == 401 {
+            if let Some(refresh) = self.refresh.clone() {
+                // One retry with a renewed token; a second 401 is final.
+                if let Some(token) = refresh(self.bearer.clone()).await {
+                    if self.bearer.as_deref() != Some(token.as_str()) {
+                        self.bearer = Some(token);
+                        response = self.post(message).await?;
+                    }
+                }
+            }
+        }
         let session_id = response
             .headers()
             .get("mcp-session-id")
