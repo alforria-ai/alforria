@@ -326,19 +326,42 @@ async fn the_agents_shells_cannot_read_denied_variables() {
     let env = env_for(&backend, "u3");
     write_host_config(
         &env,
-        json!({ "shell_env": { "deny": ["U3_DENIED_*"], "set": { "U3_FROM_CONFIG": "yes" } } }),
+        json!({
+            "shell_env": { "deny": ["U3_DENIED_*"], "set": { "U3_FROM_CONFIG": "yes" } },
+            // A variable the host config reads, and one a provider of its
+            // own reads its key from: neither has a telling name.
+            "username": "{env:U3_REFERENCED}",
+            "provider": { "u3-acme": { "env": ["U3_ACME_AUTH"] } }
+        }),
     );
     let run = start_with(&backend, env, |command| {
         command
             .env("LIBERTAI_API_KEY", "sk-libertai-leak")
             .env("OPENCODE_AUTH_CONTENT", "{\"leak\":\"auth-content-leak\"}")
             .env("U3_DENIED_TOKEN", "denied-leak")
+            // General-purpose credentials (M3), in either case.
+            .env("GITHUB_TOKEN", "github-leak")
+            .env("github_token", "github-lower-leak")
+            .env("AWS_SECRET_ACCESS_KEY", "aws-leak")
+            .env("HF_TOKEN", "hf-leak")
+            .env("U3_REFERENCED", "referenced-leak")
+            .env("U3_ACME_AUTH", "provider-leak")
             .env("U3_VISIBLE", "visible");
     })
     .await;
 
     let check = |dump: &str, what: &str| {
-        for leak in ["sk-libertai-leak", "auth-content-leak", "denied-leak"] {
+        for leak in [
+            "sk-libertai-leak",
+            "auth-content-leak",
+            "denied-leak",
+            "github-leak",
+            "github-lower-leak",
+            "aws-leak",
+            "hf-leak",
+            "referenced-leak",
+            "provider-leak",
+        ] {
             // The dump itself is never printed: it is an environment.
             assert!(!dump.contains(leak), "{what} leaked {leak}");
         }

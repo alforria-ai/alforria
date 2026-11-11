@@ -96,8 +96,8 @@ repairs and resumes nothing on its account.
 ```jsonc
 {
   "shell_env": {
-    "inherit": "all",                  // "all" (default), "none", or ["PATH", "HOME", "LC_*"]
-    "allow":   ["OPENAI_API_KEY"],     // exact names exempt from the built-in deny list
+    "inherit": "all",                  // "all", "none", or ["PATH", "HOME", "LC_*"]; the default depends on the mode, below
+    "allow":   ["GITHUB_TOKEN"],       // exact names released from the built-in denials (and added to the allowlist)
     "set":     { "TERM": "dumb" },     // set in every shell, over anything inherited
     "deny":    ["MY_SECRET_*"]         // never inherited; names or * / ? patterns
   }
@@ -116,36 +116,89 @@ A variable reaches a shell when, in order:
 
 1. `set` names it (the configured value wins over everything); otherwise
 2. no `deny` pattern matches it, and
-3. it is not on the built-in deny list, unless `allow` names it or `inherit`
-   is a list that names it exactly (a pattern such as `"*"` does not release a
-   built-in denied name), and
-4. `inherit` selects it.
+3. it is not denied by default (below), unless `allow` names it or `inherit`
+   is a list that names it exactly (a pattern such as `"*"` does not release
+   a denied name), and
+4. it is inherited: `inherit` selects it, or, when `inherit` is not set, the
+   mode's default does.
 
-The built-in deny list (`BUILTIN_DENY` in
-`crates/alforria-core/src/shell_env.rs`) holds the server's own secrets
-(`OPENCODE_SERVER_PASSWORD`, `OPENCODE_SERVER_USERNAME`,
-`OPENCODE_AUTH_CONTENT`, `OPENCODE_CONFIG_CONTENT`, `OPENCODE_API_KEY`,
-`ALFORRIA_*_SECRET`, `ALFORRIA_*_TOKEN`, `ALFORRIA_*_KEY`,
-`ALFORRIA_*_PASSWORD`) and the variables model providers and search backends
-read their keys from (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
-`GEMINI_API_KEY`, `OPENROUTER_API_KEY`, `LIBERTAI_API_KEY`, `EXA_API_KEY`, …).
-General-purpose credentials such as `AWS_*` or `GITHUB_TOKEN` are not on it:
-the agent's own tools need them, and whether it should have them is yours to
-decide with `deny`.
+### What is inherited by default
 
-MCP stdio servers and language servers are started with everything except
-the denied names, then their own configured `environment`. An MCP server
-therefore gets a provider key only when its `environment` names it, for
-example `"environment": { "OPENAI_API_KEY": "{env:OPENAI_API_KEY}" }`.
+| Server | `inherit` not set |
+| --- | --- |
+| standalone (no `server.auth.bearer`) | every variable that is not denied — a deny list |
+| with `server.auth.bearer` (`keys` or `tokens_sha256`) | only `PATH`, `HOME`, `LANG`, `LC_*`, `TERM`, `TZ`, `USER`, `LOGNAME`, `SHELL`, `TMPDIR`, and the names in `allow` — an allowlist |
 
-With `"inherit": "none"` a shell has no `PATH` or `HOME` unless `set`
-provides them; a list such as `["PATH", "HOME", "LANG", "LC_*", "TERM",
-"USER", "SHELL", "TMPDIR"]` is usually what is wanted.
+On a server with bearer auth nobody is at the terminal, and no list of
+secret-looking names is complete; so the shell gets a fixed, small
+environment and the host adds to it by name. `allow` takes exact names, not
+patterns: `"allow": ["HTTPS_PROXY", "NO_PROXY", "CARGO_HOME"]`. A host that
+sets `inherit` itself (`"all"`, `"none"` or a list) gets exactly that in
+either mode, still minus the denied names. The mode follows bearer auth
+alone, not `server.trust.project`.
 
-This is not a sandbox. A shell running as the server's user can still read
-`/proc/<server pid>/environ` and the server's files (`auth.json`, the
-database). Keeping those from the agent takes a separate user for its shell,
-or secrets that never enter the server's environment.
+### What is denied by default
+
+In both modes, and matched without regard to case (`github_token` is
+`GITHUB_TOKEN`; so are the patterns in `deny`):
+
+- the server's own secrets and the model providers' and search backends' key
+  variables (`BUILTIN_DENY` in `crates/alforria-core/src/shell_env.rs`):
+  `OPENCODE_SERVER_PASSWORD`, `OPENCODE_SERVER_USERNAME`,
+  `OPENCODE_AUTH_CONTENT`, `OPENCODE_CONFIG_CONTENT`, `OPENCODE_API_KEY`,
+  `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`,
+  `OPENROUTER_API_KEY`, `LIBERTAI_API_KEY`, `EXA_API_KEY`, …;
+- names that look like a credential (`CREDENTIAL_PATTERNS`, same file):
+  `*_TOKEN`, `*_KEY`, `*_SECRET`, `*_PASSWORD`, `*_PASSWD`, `*_PASSPHRASE`,
+  `*_CREDENTIALS`, `*_CREDENTIAL`, `*_PAT`, `*_ACCESS_KEY_ID`,
+  `*_CONNECTION_STRING`, `AWS_*`, `AZURE_*`,
+  `GOOGLE_APPLICATION_CREDENTIALS`, `GOOGLE_CLOUD_KEYFILE_JSON`,
+  `CLOUDSDK_AUTH_*`, `PGPASSWORD`, `MYSQL_PWD` — so `GITHUB_TOKEN`,
+  `GH_TOKEN`, `HF_TOKEN`, `NPM_TOKEN`, `AWS_SECRET_ACCESS_KEY` and
+  `AWS_PROFILE` alike;
+- every name in a provider's `env` list, from the model catalog as it is
+  when the server starts and from `provider.*.env` in the host config,
+  whatever it is called and whether or not it holds a secret (a provider
+  that lists an account id or a region there has it withheld too);
+- every variable the host config reads through `{env:NAME}` (the managed
+  directory, the global config directory, `~/.opencode`).
+
+`PATH`, `HOME` and the rest of the allowlist above are never denied on
+account of the last two.
+
+The agent's own tools (`gh`, `aws`, `gcloud`, `npm publish`) read some of
+these. Whether the agent should have one is yours to decide, and `allow` is
+how you say so: `"allow": ["GITHUB_TOKEN", "AWS_PROFILE"]`. `allow` names a
+variable exactly, in the case it has, and does not override `deny`.
+
+### Processes that are not shells
+
+MCP stdio servers, language servers, the commands that look for a language
+server (`oxlint --help`, `java -version`, `xcrun --find`) and the server's
+own `git` calls are started with everything except the denied names — in
+both modes: the allowlist is for shells — then their own configured
+`environment`. An MCP server therefore gets a credential only when its
+`environment` names it, for example
+`"environment": { "GITHUB_TOKEN": "{env:GITHUB_TOKEN}" }`, or when `allow`
+releases it to everything.
+
+### Limits
+
+- The denials go by name. A secret in a variable with an unremarkable name
+  that no provider and no `{env:}` refers to — `DATABASE_URL`,
+  `SSH_AUTH_SOCK`, `KUBECONFIG`, `MY_SERVICE_AUTH` — is not recognised: on a
+  standalone server it reaches the shell, and in either mode it reaches the
+  processes above. Add it to `deny`, or use a list for `inherit`.
+- The provider and `{env:}` names are collected once, at startup, from the
+  host config and the catalog on disk. A provider that a later catalog
+  refresh or a project's config introduces is covered by the patterns or not
+  at all.
+- With `"inherit": "none"` a shell has no `PATH` or `HOME` unless `set`
+  provides them.
+- This is not a sandbox. A shell running as the server's user can still read
+  `/proc/<server pid>/environ` and the server's files (`auth.json`, the
+  database). Keeping those from the agent takes a separate user for its
+  shell, or secrets that never enter the server's environment.
 
 ## Who may connect: `server.auth.bearer` and `server.directories` (host)
 

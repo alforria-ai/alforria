@@ -403,11 +403,13 @@ impl<'de> Deserialize<'de> for ShellEnvInherit {
 /// run), so this cannot live under it.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ShellEnvInfo {
-    /// Which of the server's variables a shell starts with (default
-    /// `"all"`).
+    /// Which of the server's variables a shell starts with. Unset: all of
+    /// them on a standalone server, a short allowlist on one with bearer
+    /// auth (`shell_env::RESTRICTED_INHERIT`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inherit: Option<ShellEnvInherit>,
-    /// Exact names exempt from the built-in deny list.
+    /// Exact names exempt from the built-in deny list, and inherited on a
+    /// server with bearer auth.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow: Option<Vec<String>>,
     /// Variables set in every shell, over anything inherited.

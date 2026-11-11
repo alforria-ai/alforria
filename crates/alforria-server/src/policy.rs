@@ -216,6 +216,20 @@ impl ServerPolicy {
                 }
             },
         };
+        // With bearer auth a shell starts from an allowlist, and in either
+        // mode the variables the host's providers read their keys from are
+        // withheld (`ServerPolicy::load` adds the `{env:}` references, the
+        // server the model catalog's).
+        let mut shell_env =
+            alforria_core::shell_env::ShellEnvPolicy::from_config(config.shell_env.as_ref())
+                .restricted(bearer.is_some());
+        shell_env.deny_names(
+            config
+                .provider
+                .iter()
+                .flatten()
+                .flat_map(|(_, provider)| provider.env.iter().flatten()),
+        );
         Ok(ServerPolicy {
             shutdown,
             unattended_permission,
@@ -239,9 +253,7 @@ impl ServerPolicy {
                 .and_then(|server| server.upload.as_ref())
                 .and_then(|upload| upload.directories.clone())
                 .unwrap_or_else(|| vec![DEFAULT_UPLOAD_DIRECTORY.to_string()]),
-            shell_env: alforria_core::shell_env::ShellEnvPolicy::from_config(
-                config.shell_env.as_ref(),
-            ),
+            shell_env,
             config_error: None,
         })
     }
@@ -255,12 +267,14 @@ impl ServerPolicy {
             .and_then(|config| ServerPolicy::from_config_in(&config, &paths.home));
         match resolved {
             Ok(mut policy) => {
-                policy.managed_only = alforria_core::ConfigLoader::new()
-                    .host_mode(&alforria_core::LoadParams::new(
-                        paths.home.clone(),
-                        paths.clone(),
-                    ))
-                    .managed_only;
+                let loader = alforria_core::ConfigLoader::new();
+                let params = alforria_core::LoadParams::new(paths.home.clone(), paths.clone());
+                policy.managed_only = loader.host_mode(&params).managed_only;
+                // What the host config reads through `{env:NAME}` stays
+                // out of the agent's shells.
+                policy
+                    .shell_env
+                    .deny_names(loader.host_env_references(&params));
                 policy
             }
             Err(error) => {
@@ -303,5 +317,131 @@ mod tests {
         .unwrap();
         assert_eq!(policy.shutdown.timeout, Duration::from_secs(45));
         assert_eq!(policy.shutdown.sessions, ShutdownSessions::Drain);
+    }
+
+    fn names(env: &[(std::ffi::OsString, std::ffi::OsString)]) -> Vec<String> {
+        let mut names: Vec<String> = env
+            .iter()
+            .map(|(name, _)| name.to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The server's environment in these tests: made up, and passed in.
+    fn server_env() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+        [
+            ("PATH", "/usr/bin"),
+            ("HOME", "/home/agent"),
+            ("TERM", "xterm"),
+            ("EDITOR", "vi"),
+            ("GITHUB_TOKEN", "ghp-leak"),
+            ("github_token", "ghp-lower-leak"),
+            ("AWS_SECRET_ACCESS_KEY", "aws-leak"),
+            ("HF_TOKEN", "hf-leak"),
+            ("ACME_GATEWAY_AUTH", "provider-leak"),
+            ("acme_gateway_auth", "provider-lower-leak"),
+            ("ACME_REFERENCED", "referenced-leak"),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.into(), value.into()))
+        .collect()
+    }
+
+    // sha256("operator-token")
+    const DIGEST: &str = "0850123315d21ab90f4f7236408a52ef6dbd6a02a6550e5c10dc73f4d993680e";
+
+    /// M3: a provider the host configures reads its key from a variable of
+    /// any name; a standalone server's shells get neither it nor the
+    /// general-purpose credentials beside it.
+    #[test]
+    fn a_standalone_shell_gets_no_credentials_or_provider_key_variables() {
+        let policy = ServerPolicy::from_config_in(
+            &config(serde_json::json!({
+                "provider": { "acme": { "env": ["ACME_GATEWAY_AUTH"] } }
+            })),
+            Path::new("/home/test"),
+        )
+        .unwrap();
+        assert_eq!(
+            names(&policy.shell_env.shell_env_from(server_env())),
+            ["ACME_REFERENCED", "EDITOR", "HOME", "PATH", "TERM"]
+        );
+
+        // `shell_env.allow` is how the host hands one over.
+        let policy = ServerPolicy::from_config_in(
+            &config(serde_json::json!({
+                "provider": { "acme": { "env": ["ACME_GATEWAY_AUTH"] } },
+                "shell_env": { "allow": ["GITHUB_TOKEN"] }
+            })),
+            Path::new("/home/test"),
+        )
+        .unwrap();
+        assert_eq!(
+            names(&policy.shell_env.shell_env_from(server_env())),
+            [
+                "ACME_REFERENCED",
+                "EDITOR",
+                "GITHUB_TOKEN",
+                "HOME",
+                "PATH",
+                "TERM"
+            ]
+        );
+    }
+
+    /// With bearer auth the shell starts from the allowlist and what the
+    /// host adds to it.
+    #[test]
+    fn a_bearer_server_shell_starts_from_the_allowlist() {
+        let bearer = serde_json::json!({ "auth": { "bearer": { "tokens_sha256": [DIGEST] } } });
+        let policy = ServerPolicy::from_config_in(
+            &config(serde_json::json!({ "server": bearer })),
+            Path::new("/home/test"),
+        )
+        .unwrap();
+        assert!(policy.bearer.is_some());
+        assert_eq!(
+            names(&policy.shell_env.shell_env_from(server_env())),
+            ["HOME", "PATH", "TERM"]
+        );
+
+        let policy = ServerPolicy::from_config_in(
+            &config(serde_json::json!({
+                "server": bearer,
+                "shell_env": { "allow": ["EDITOR", "HF_TOKEN"] }
+            })),
+            Path::new("/home/test"),
+        )
+        .unwrap();
+        assert_eq!(
+            names(&policy.shell_env.shell_env_from(server_env())),
+            ["EDITOR", "HF_TOKEN", "HOME", "PATH", "TERM"]
+        );
+    }
+
+    /// A variable the host config reads through `{env:NAME}` is one the
+    /// host keeps a secret in: the loaded policy withholds it.
+    #[test]
+    fn a_variable_the_host_config_refers_to_is_withheld() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = alforria_core::GlobalPaths::resolve_with(dir.path().join("home"), |_| None);
+        std::fs::create_dir_all(&paths.config).unwrap();
+        std::fs::create_dir_all(&paths.home).unwrap();
+        std::fs::write(
+            paths.config.join("opencode.json"),
+            r#"{
+                "username": "{env:ACME_REFERENCED}",
+                "provider": { "acme": { "env": ["ACME_GATEWAY_AUTH"] } }
+            }"#,
+        )
+        .unwrap();
+        let policy = ServerPolicy::load(&paths);
+        assert_eq!(policy.config_error, None);
+        assert_eq!(
+            names(&policy.shell_env.shell_env_from(server_env())),
+            ["EDITOR", "HOME", "PATH", "TERM"]
+        );
+        assert!(policy.shell_env.denied("acme_referenced"));
     }
 }

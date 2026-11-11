@@ -21,5 +21,6 @@ pub use precedence::{
 };
 pub use schema::Config;
 pub use variable::{
-    interpolate_dollar, interpolate_dollar_final, substitute, HostStrings, Missing, Source,
+    env_references, interpolate_dollar, interpolate_dollar_final, substitute, HostStrings, Missing,
+    Source,
 };

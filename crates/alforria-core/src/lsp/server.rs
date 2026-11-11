@@ -292,7 +292,22 @@ fn spawn_with(
 /// Run a short command and capture its stdout (the TS `text()` /
 /// `output()` helpers).
 async fn run_capture(cmd: &str, args: &[&str]) -> Option<String> {
+    let env = crate::shell_env::current().scrubbed_env();
+    run_capture_in(cmd, args, env).await
+}
+
+/// [`run_capture`] with the environment `env` and nothing else. A probe
+/// runs a binary found on `PATH` or in the project (`oxlint --help`,
+/// `java -version`), so like the language server itself (`launch::spawn`)
+/// it gets the policy's scrubbed environment, not the server's.
+async fn run_capture_in(
+    cmd: &str,
+    args: &[&str],
+    env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+) -> Option<String> {
     let output = tokio::process::Command::new(cmd)
+        .env_clear()
+        .envs(env)
         .args(args)
         .stdin(std::process::Stdio::null())
         .output()
@@ -1457,4 +1472,48 @@ fn java_major_version(output: &str) -> Option<u32> {
     let re = regex::Regex::new(r#""(\d+)\.\d+\.\d+""#).ok()?;
     let captures = re.captures(output)?;
     captures[1].parse().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+
+    use super::run_capture_in;
+    use crate::shell_env::ShellEnvPolicy;
+
+    /// M3: the commands that probe for a language server (`oxlint --help`,
+    /// `java -version`, `xcrun --find`) ran with the server's whole
+    /// environment. They start from the policy, like the server they
+    /// probe for.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_probe_runs_under_the_shell_env_policy() {
+        let base: Vec<(OsString, OsString)> = [
+            ("PATH", "/usr/bin:/bin"),
+            ("PROBE_VISIBLE", "visible"),
+            ("GITHUB_TOKEN", "ghp-leak"),
+            ("github_token", "ghp-lower-leak"),
+            ("OPENAI_API_KEY", "sk-leak"),
+            ("ACME_GATEWAY_AUTH", "provider-leak"),
+            ("PROBE_DENIED", "denied-leak"),
+        ]
+        .into_iter()
+        .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+        .collect();
+        let info = serde_json::from_value(serde_json::json!({ "deny": ["PROBE_DENIED"] })).unwrap();
+        let mut policy = ShellEnvPolicy::from_config(Some(&info));
+        policy.deny_names(["ACME_GATEWAY_AUTH"]);
+
+        let dump = run_capture_in("env", &[], policy.scrubbed_env_from(base))
+            .await
+            .expect("env runs");
+        let mut names: Vec<&str> = dump
+            .lines()
+            .filter_map(|line| line.split_once('=').map(|(name, _)| name))
+            .collect();
+        names.sort();
+        // Nothing of this process's own environment either: the probe
+        // starts from `base` alone.
+        assert_eq!(names, ["PATH", "PROBE_VISIBLE"]);
+    }
 }

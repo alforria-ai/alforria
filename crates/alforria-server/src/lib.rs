@@ -449,6 +449,13 @@ pub fn production_context(
             outbox::Outbox::new(storage.clone(), None).map_err(io::Error::other)?
         }
     };
+    // The variables the catalog's providers read their keys from are kept
+    // from the agent's processes, whatever they are called.
+    if let Ok(providers) = (runtime.catalog)() {
+        policy
+            .shell_env
+            .deny_names(providers.values().flat_map(|provider| provider.env.iter()));
+    }
     let policy = Arc::new(policy);
     // The unattended policy sits on each instance's ask services.
     instances.set_on_boot({

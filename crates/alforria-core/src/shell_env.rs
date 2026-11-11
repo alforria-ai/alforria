@@ -9,22 +9,37 @@
 //!   in command templates, terminals and worktree start scripts — get
 //!   [`ShellEnvPolicy::shell_env`]: the `inherit` selection, minus the denied
 //!   names, plus `set`;
-//! * helpers the config names — MCP stdio servers, language servers — get
+//! * helpers the server starts — MCP stdio servers, language servers and
+//!   the commands that probe for them, git — get
 //!   [`ShellEnvPolicy::scrubbed_env`]: everything minus the denied names, then
 //!   their own configured environment on top. A project config can name a
 //!   command, so it must not be a way around the deny list either.
 //!
+//! What is denied, matched without regard to case: the host's `deny`; the
+//! built-in names and patterns ([`BUILTIN_DENY`], [`CREDENTIAL_PATTERNS`]);
+//! and the names the server learns at startup that it reads a secret from
+//! ([`ShellEnvPolicy::deny_names`]: every `provider.*.env[]` of the model
+//! catalog and of the host config, every `{env:NAME}` the host config
+//! refers to). `allow` releases a name from all but the host's own `deny`.
+//!
+//! What a shell inherits by default depends on the server:
+//!
+//! * standalone — everything that is not denied;
+//! * with bearer auth ([`ShellEnvPolicy::restricted`]) — only
+//!   [`RESTRICTED_INHERIT`] and what `allow` names. Nobody is at the
+//!   terminal of such a server, and no list of secret-looking names is
+//!   ever complete.
+//!
 //! The policy comes from `shell_env` in the host config
 //! (`config::host::load_host_config`) and is process-wide: [`install`] it
-//! once at startup; until then [`current`] is the default, which inherits
-//! everything except [`BUILTIN_DENY`].
+//! once at startup; until then [`current`] is the standalone default.
 //!
 //! This is not a sandbox. A child running as the server's user can still
 //! read `/proc/<server pid>/environ` and the server's files; keeping those
 //! from it takes a different user (`shell_run_as`) or keeping secrets out of
 //! the server's environment in the first place.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::sync::{Arc, RwLock};
 
@@ -32,10 +47,6 @@ use crate::config::host::{ShellEnvInfo, ShellEnvInherit};
 
 /// Names denied to every child unless explicitly allowed: the server's own
 /// secrets and the variables model providers read their keys from.
-///
-/// General-purpose credentials (`AWS_*`, `GITHUB_TOKEN`, `GOOGLE_*`, …) are
-/// deliberately absent: the agent's own tools (`aws`, `gh`, `gcloud`) need
-/// them, and whether the agent should have them is the operator's call.
 pub const BUILTIN_DENY: &[&str] = &[
     // The server's own.
     "OPENCODE_SERVER_PASSWORD",
@@ -80,6 +91,44 @@ pub const BUILTIN_DENY: &[&str] = &[
     "PARALLEL_API_KEY",
 ];
 
+/// Names that look like a credential, denied like [`BUILTIN_DENY`]: the
+/// usual suffixes, and the variables the cloud SDKs and database clients
+/// read theirs from. The agent's own tools (`aws`, `gh`, `gcloud`) read
+/// these too; a host that wants the agent to have one names it in `allow`.
+///
+/// A guess by name, and so incomplete by nature: a secret called
+/// `DATABASE_URL` or `SSH_AUTH_SOCK` is not on it.
+pub const CREDENTIAL_PATTERNS: &[&str] = &[
+    "*_TOKEN",
+    "*_KEY",
+    "*_SECRET",
+    "*_PASSWORD",
+    "*_PASSWD",
+    "*_PASSPHRASE",
+    "*_CREDENTIALS",
+    "*_CREDENTIAL",
+    "*_PAT",
+    "*_ACCESS_KEY_ID",
+    "*_CONNECTION_STRING",
+    // Cloud SDKs.
+    "AWS_*",
+    "AZURE_*",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "GOOGLE_CLOUD_KEYFILE_JSON",
+    "CLOUDSDK_AUTH_*",
+    // Database clients.
+    "PGPASSWORD",
+    "MYSQL_PWD",
+];
+
+/// What a shell inherits by default on a server with bearer auth
+/// ([`ShellEnvPolicy::restricted`]), `allow` aside. Never denied on
+/// account of a `{env:}` reference or a provider's `env` either: a shell
+/// without `PATH` is no shell.
+pub const RESTRICTED_INHERIT: &[&str] = &[
+    "PATH", "HOME", "LANG", "LC_*", "TERM", "TZ", "USER", "LOGNAME", "SHELL", "TMPDIR",
+];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Inherit {
     All,
@@ -89,24 +138,22 @@ enum Inherit {
 }
 
 /// What a child process may see of the server's environment.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ShellEnvPolicy {
-    inherit: Inherit,
-    /// Names exempt from [`BUILTIN_DENY`] (never from `deny`).
+    /// `shell_env.inherit`; `None` when the host did not say, and the
+    /// default depends on `restricted`.
+    inherit: Option<Inherit>,
+    /// Bearer auth is configured: a shell inherits [`RESTRICTED_INHERIT`]
+    /// and `allow` unless the host set `inherit`.
+    restricted: bool,
+    /// Exact names exempt from every deny but the host's own `deny`.
     allow: Vec<String>,
     set: BTreeMap<String, String>,
+    /// The host's `deny` patterns, upper-cased.
     deny: Vec<String>,
-}
-
-impl Default for ShellEnvPolicy {
-    fn default() -> Self {
-        ShellEnvPolicy {
-            inherit: Inherit::All,
-            allow: Vec::new(),
-            set: BTreeMap::new(),
-            deny: Vec::new(),
-        }
-    }
+    /// Names learned at startup ([`ShellEnvPolicy::deny_names`]),
+    /// upper-cased.
+    named: BTreeSet<String>,
 }
 
 fn is_literal(name: &str) -> bool {
@@ -145,43 +192,94 @@ fn matches_any(name: &str, patterns: &[impl AsRef<str>]) -> bool {
 }
 
 impl ShellEnvPolicy {
-    /// The policy for a `shell_env` config value (`None`: the default).
+    /// The policy for a `shell_env` config value (`None`: the default) on
+    /// a standalone server.
     pub fn from_config(info: Option<&ShellEnvInfo>) -> ShellEnvPolicy {
         let Some(info) = info else {
             return ShellEnvPolicy::default();
         };
-        let inherit = match &info.inherit {
-            None | Some(ShellEnvInherit::All) => Inherit::All,
-            Some(ShellEnvInherit::None) => Inherit::None,
-            Some(ShellEnvInherit::Names(names)) => Inherit::List(names.clone()),
-        };
+        let inherit = info.inherit.as_ref().map(|inherit| match inherit {
+            ShellEnvInherit::All => Inherit::All,
+            ShellEnvInherit::None => Inherit::None,
+            ShellEnvInherit::Names(names) => Inherit::List(names.clone()),
+        });
         // A name spelled out in `inherit` was asked for on purpose: it is
         // exempt from the built-in deny list, like one in `allow`.
         let mut allow = info.allow.clone().unwrap_or_default();
-        if let Inherit::List(names) = &inherit {
+        if let Some(Inherit::List(names)) = &inherit {
             allow.extend(names.iter().filter(|name| is_literal(name)).cloned());
         }
         ShellEnvPolicy {
             inherit,
+            restricted: false,
             allow,
             set: info.set.clone().unwrap_or_default(),
-            deny: info.deny.clone().unwrap_or_default(),
+            deny: info
+                .deny
+                .iter()
+                .flatten()
+                .map(|pattern| pattern.to_ascii_uppercase())
+                .collect(),
+            named: BTreeSet::new(),
         }
     }
 
-    /// Whether `name` is withheld from every child.
+    /// The same policy on a server with bearer auth (`restricted`): a
+    /// shell inherits [`RESTRICTED_INHERIT`] and `allow` instead of
+    /// everything, unless the host set `inherit` itself.
+    pub fn restricted(mut self, restricted: bool) -> ShellEnvPolicy {
+        self.restricted = restricted;
+        self
+    }
+
+    /// Deny `names` too, whatever their case: the variables the server
+    /// reads a secret from (a provider's `env`, a `{env:NAME}` in the host
+    /// config). [`RESTRICTED_INHERIT`] is left alone.
+    pub fn deny_names<S: AsRef<str>>(&mut self, names: impl IntoIterator<Item = S>) {
+        for name in names {
+            let name = name.as_ref();
+            if !name.is_empty() && !matches_any(name, RESTRICTED_INHERIT) {
+                self.named.insert(name.to_ascii_uppercase());
+            }
+        }
+    }
+
+    fn allowed(&self, name: &str) -> bool {
+        self.allow.iter().any(|allowed| allowed == name)
+    }
+
+    /// Whether `name` is withheld from every child. Deny patterns match
+    /// without regard to case (`github_token` is `GITHUB_TOKEN`); `allow`
+    /// names a variable exactly.
     pub fn denied(&self, name: &str) -> bool {
-        if matches_any(name, &self.deny) {
+        let upper = name.to_ascii_uppercase();
+        if matches_any(&upper, &self.deny) {
             return true;
         }
-        matches_any(name, BUILTIN_DENY) && !self.allow.iter().any(|allowed| allowed == name)
+        !self.allowed(name)
+            && (matches_any(&upper, BUILTIN_DENY)
+                || matches_any(&upper, CREDENTIAL_PATTERNS)
+                || self.named.contains(&upper))
+    }
+
+    /// Whether `${name}` in a base URL the host wrote stays unexpanded:
+    /// the host's `deny` and [`BUILTIN_DENY`] only. A catalog URL is built
+    /// from the very variables [`ShellEnvPolicy::denied`] keeps from a
+    /// shell (`${AZURE_RESOURCE_NAME}`, `${AWS_REGION}`), so this is the
+    /// narrower question.
+    pub fn withheld_from_urls(&self, name: &str) -> bool {
+        let upper = name.to_ascii_uppercase();
+        matches_any(&upper, &self.deny)
+            || (matches_any(&upper, BUILTIN_DENY) && !self.allowed(name))
     }
 
     fn inherited(&self, name: &str) -> bool {
         match &self.inherit {
-            Inherit::All => true,
-            Inherit::None => false,
-            Inherit::List(names) => matches_any(name, names),
+            Some(Inherit::All) => true,
+            Some(Inherit::None) => false,
+            Some(Inherit::List(names)) => matches_any(name, names),
+            None if self.restricted => matches_any(name, RESTRICTED_INHERIT) || self.allowed(name),
+            None => true,
         }
     }
 
@@ -268,6 +366,7 @@ mod tests {
             ("ALFORRIA_WEBHOOK_SECRET", "whsec"),
             ("AWS_ACCESS_KEY_ID", "AKIA"),
             ("MY_APP_TOKEN", "t0k"),
+            ("EDITOR", "vi"),
         ]
         .into_iter()
         .map(|(name, value)| (OsString::from(name), OsString::from(value)))
@@ -275,8 +374,12 @@ mod tests {
     }
 
     fn policy(value: serde_json::Value) -> ShellEnvPolicy {
+        policy_of(value, false)
+    }
+
+    fn policy_of(value: serde_json::Value, restricted: bool) -> ShellEnvPolicy {
         let info: ShellEnvInfo = serde_json::from_value(value).unwrap();
-        ShellEnvPolicy::from_config(Some(&info))
+        ShellEnvPolicy::from_config(Some(&info)).restricted(restricted)
     }
 
     fn names(env: &[(OsString, OsString)]) -> Vec<String> {
@@ -341,16 +444,7 @@ mod tests {
     #[test]
     fn the_default_inherits_everything_but_the_builtin_deny_list() {
         let env = ShellEnvPolicy::default().shell_env_from(base());
-        assert_eq!(
-            names(&env),
-            [
-                "AWS_ACCESS_KEY_ID",
-                "HOME",
-                "LC_ALL",
-                "MY_APP_TOKEN",
-                "PATH"
-            ]
-        );
+        assert_eq!(names(&env), ["EDITOR", "HOME", "LC_ALL", "PATH"]);
         assert_eq!(ShellEnvPolicy::from_config(None), ShellEnvPolicy::default());
     }
 
@@ -405,7 +499,7 @@ mod tests {
     fn helpers_keep_everything_but_the_denied_names() {
         let policy = policy(serde_json::json!({ "inherit": "none", "deny": ["MY_*"] }));
         let env = policy.scrubbed_env_from(base());
-        assert_eq!(names(&env), ["AWS_ACCESS_KEY_ID", "HOME", "LC_ALL", "PATH"]);
+        assert_eq!(names(&env), ["EDITOR", "HOME", "LC_ALL", "PATH"]);
     }
 
     #[test]
@@ -424,8 +518,196 @@ mod tests {
         ] {
             assert!(policy.denied(name), "{name} must be denied");
         }
-        for name in ["PATH", "HOME", "GITHUB_TOKEN", "AWS_SECRET_ACCESS_KEY"] {
+        for name in [
+            "PATH",
+            "HOME",
+            "EDITOR",
+            "SSH_AUTH_SOCK",
+            "KEYBOARD",
+            "MONKEY",
+        ] {
             assert!(!policy.denied(name), "{name} must pass");
+        }
+    }
+
+    fn env(pairs: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
+        pairs
+            .iter()
+            .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+            .collect()
+    }
+
+    /// What a server holds besides its model keys: none of it is the
+    /// agent's by default. `ACME_GATEWAY_AUTH` stands for a provider's
+    /// `env` name and `ACME_REFERENCED` for a `{env:}` in the host config —
+    /// names no pattern would catch.
+    fn credentials() -> Vec<(OsString, OsString)> {
+        env(&[
+            ("PATH", "/usr/bin"),
+            ("HOME", "/home/agent"),
+            ("EDITOR", "vi"),
+            ("CARGO_HOME", "/home/agent/.cargo"),
+            ("GITHUB_TOKEN", "ghp-leak"),
+            ("github_token", "ghp-lower-leak"),
+            ("AWS_SECRET_ACCESS_KEY", "aws-leak"),
+            ("aws_secret_access_key", "aws-lower-leak"),
+            ("AWS_PROFILE", "prod"),
+            ("HF_TOKEN", "hf-leak"),
+            ("Hf_Token", "hf-mixed-leak"),
+            ("GOOGLE_APPLICATION_CREDENTIALS", "/secrets/gcp.json"),
+            ("AZURE_CLIENT_ID", "azure-leak"),
+            ("DB_PASSWORD", "db-leak"),
+            ("PGPASSWORD", "pg-leak"),
+            ("ACME_GATEWAY_AUTH", "provider-leak"),
+            ("acme_gateway_auth", "provider-lower-leak"),
+            ("ACME_REFERENCED", "referenced-leak"),
+            ("acme_referenced", "referenced-lower-leak"),
+        ])
+    }
+
+    fn with_names(mut policy: ShellEnvPolicy) -> ShellEnvPolicy {
+        policy.deny_names(["ACME_GATEWAY_AUTH", "acme_referenced"]);
+        policy
+    }
+
+    /// M3: `GITHUB_TOKEN`, `AWS_SECRET_ACCESS_KEY`, `HF_TOKEN`, a custom
+    /// provider's key variable, a variable the host config reads through
+    /// `{env:}` and their lower-case spellings all reached the agent's
+    /// shell.
+    #[test]
+    fn credentials_do_not_reach_a_standalone_shell() {
+        let policy = with_names(ShellEnvPolicy::default());
+        let passed = ["CARGO_HOME", "EDITOR", "HOME", "PATH"];
+        assert_eq!(names(&policy.shell_env_from(credentials())), passed);
+        // Nor a helper a config names (an MCP server, a language server).
+        assert_eq!(names(&policy.scrubbed_env_from(credentials())), passed);
+    }
+
+    #[test]
+    fn allow_lets_a_named_credential_through() {
+        let policy = with_names(policy(serde_json::json!({
+            "allow": ["GITHUB_TOKEN", "ACME_GATEWAY_AUTH", "ACME_REFERENCED", "AWS_PROFILE"]
+        })));
+        // Exactly the names written: not their other spellings, and not
+        // the rest of a pattern's family.
+        assert_eq!(
+            names(&policy.shell_env_from(credentials())),
+            [
+                "ACME_GATEWAY_AUTH",
+                "ACME_REFERENCED",
+                "AWS_PROFILE",
+                "CARGO_HOME",
+                "EDITOR",
+                "GITHUB_TOKEN",
+                "HOME",
+                "PATH"
+            ]
+        );
+        // The host's own `deny` is the one thing `allow` does not lift,
+        // and it too matches whatever the case.
+        let policy = with_names(policy_of(
+            serde_json::json!({ "allow": ["GITHUB_TOKEN"], "deny": ["github_*", "editor"] }),
+            false,
+        ));
+        assert_eq!(
+            names(&policy.shell_env_from(credentials())),
+            ["CARGO_HOME", "HOME", "PATH"]
+        );
+    }
+
+    /// With bearer auth the default is an allowlist: what is not on it
+    /// does not pass, whatever it is called.
+    #[test]
+    fn a_restricted_server_passes_only_the_allowlist() {
+        let mut base = credentials();
+        base.extend(env(&[
+            ("LANG", "C.UTF-8"),
+            ("LC_ALL", "C"),
+            ("TERM", "xterm"),
+            ("TZ", "UTC"),
+            ("USER", "agent"),
+            ("LOGNAME", "agent"),
+            ("SHELL", "/bin/sh"),
+            ("TMPDIR", "/tmp"),
+            ("SSH_AUTH_SOCK", "/run/agent.sock"),
+            ("DATABASE_URL", "postgres://user:url-leak@db/app"),
+            ("INNOCUOUS", "but-not-listed"),
+        ]));
+        let basics = [
+            "HOME", "LANG", "LC_ALL", "LOGNAME", "PATH", "SHELL", "TERM", "TMPDIR", "TZ", "USER",
+        ];
+        let policy = with_names(ShellEnvPolicy::default().restricted(true));
+        assert_eq!(names(&policy.shell_env_from(base.clone())), basics);
+        assert_eq!(
+            with_names(ShellEnvPolicy::from_config(None).restricted(true)),
+            policy
+        );
+
+        // The host adds to it with `allow` — a credential too — and `set`
+        // and `deny` work as they do anywhere.
+        let policy = with_names(policy_of(
+            serde_json::json!({
+                "allow": ["EDITOR", "GITHUB_TOKEN"],
+                "deny": ["TZ"],
+                "set": { "TERM": "dumb" }
+            }),
+            true,
+        ));
+        let env = policy.shell_env_from(base.clone());
+        let mut expected: Vec<&str> = basics
+            .iter()
+            .copied()
+            .filter(|name| *name != "TZ")
+            .collect();
+        expected.extend(["EDITOR", "GITHUB_TOKEN"]);
+        expected.sort();
+        assert_eq!(names(&env), expected);
+        assert_eq!(value(&env, "TERM").as_deref(), Some("dumb"));
+
+        // A host that sets `inherit` has said what it wants; the deny list
+        // still holds.
+        let policy = with_names(policy_of(serde_json::json!({ "inherit": "all" }), true));
+        assert_eq!(
+            names(&policy.shell_env_from(credentials())),
+            ["CARGO_HOME", "EDITOR", "HOME", "PATH"]
+        );
+        let policy = policy_of(
+            serde_json::json!({ "inherit": ["PATH", "INNOCUOUS"] }),
+            true,
+        );
+        assert_eq!(names(&policy.shell_env_from(base)), ["INNOCUOUS", "PATH"]);
+    }
+
+    /// A host config that reads `{env:HOME}` must not cost the shell its
+    /// `HOME`.
+    #[test]
+    fn a_learned_name_never_denies_the_basics() {
+        let mut policy = ShellEnvPolicy::default();
+        policy.deny_names(["HOME", "PATH", "LC_ALL", "TMPDIR", "", "OTHER"]);
+        for name in ["HOME", "PATH", "LC_ALL", "TMPDIR"] {
+            assert!(!policy.denied(name), "{name} must pass");
+        }
+        assert!(policy.denied("OTHER"));
+        assert!(policy.denied("other"));
+    }
+
+    /// A catalog base URL is built from variables a shell does not get;
+    /// only the secrets themselves stay out of a URL.
+    #[test]
+    fn a_base_url_is_refused_secrets_only() {
+        let mut policy = policy(serde_json::json!({ "deny": ["MY_*"] }));
+        policy.deny_names(["AZURE_RESOURCE_NAME", "CLOUDFLARE_ACCOUNT_ID"]);
+        for name in ["AZURE_RESOURCE_NAME", "CLOUDFLARE_ACCOUNT_ID", "AWS_REGION"] {
+            assert!(policy.denied(name), "{name} is kept from a shell");
+            assert!(!policy.withheld_from_urls(name), "{name} expands");
+        }
+        for name in [
+            "OPENAI_API_KEY",
+            "openai_api_key",
+            "MY_HOST",
+            "OPENCODE_SERVER_PASSWORD",
+        ] {
+            assert!(policy.withheld_from_urls(name), "{name} must not expand");
         }
     }
 }

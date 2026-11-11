@@ -857,6 +857,49 @@ impl ConfigLoader {
         }
     }
 
+    /// Every variable the host's own config files refer to through
+    /// `{env:NAME}`: the managed directory, the global config directory,
+    /// `~/.opencode` and the `OPENCODE_CONFIG*` environment, read as text.
+    /// The host put a secret in each of them more often than not, so the
+    /// shell environment policy keeps them from the agent's processes
+    /// (`ShellEnvPolicy::deny_names`). A file that cannot be read adds
+    /// nothing here; loading it is where that is an error.
+    pub fn host_env_references(&self, params: &LoadParams) -> Vec<String> {
+        let mut files = Vec::new();
+        let managed_dir = managed_config_dir(params);
+        for name in ["opencode.json", "opencode.jsonc"] {
+            files.push(managed_dir.join(name));
+        }
+        for name in crate::project_files::CONFIG_DIR_FILES {
+            files.push(params.paths.config.join(name));
+        }
+        let mut dirs = up(
+            &[crate::project_files::CONFIG_DIR],
+            &params.paths.home,
+            Some(params.paths.home.as_path()),
+        );
+        dirs.extend(flags_value(&params.flags.config_dir).map(PathBuf::from));
+        for dir in dirs {
+            for name in ["opencode.json", "opencode.jsonc"] {
+                files.push(dir.join(name));
+            }
+        }
+        files.extend(flags_value(&params.flags.config).map(PathBuf::from));
+        let mut texts: Vec<String> = files
+            .iter()
+            .filter_map(|file| fs::read_to_string(file).ok())
+            .collect();
+        texts.extend(flags_value(&params.flags.config_content).map(str::to_string));
+        let mut names: Vec<String> = texts
+            .iter()
+            .flat_map(|text| super::variable::env_references(text))
+            .map(str::to_string)
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
     /// Load and merge everything; returns the validated config plus the
     /// `.opencode` directory list (for later plugin/skill features).
     pub fn load(&self, params: &LoadParams) -> Result<(Config, Vec<PathBuf>), CoreError> {

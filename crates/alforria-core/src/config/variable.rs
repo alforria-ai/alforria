@@ -48,6 +48,14 @@ pub enum Missing {
 static ENV_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\{env:([^}]+)\}").unwrap());
 static FILE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\{file:[^}]+\}").unwrap());
 
+/// The names `text` refers to through `{env:NAME}`.
+pub fn env_references(text: &str) -> impl Iterator<Item = &str> {
+    ENV_RE
+        .captures_iter(text)
+        .filter_map(|captures| captures.get(1))
+        .map(|name| name.as_str())
+}
+
 /// What a config that is *not the user's own* may substitute.
 ///
 /// `{env:NAME}` and `{file:path}` are upstream features written for the

@@ -1018,11 +1018,12 @@ impl LlmRequestSender for RouteLlmSender {
 /// strings of the host's own config and of the model catalog
 /// (`alforria_core::config::HostStrings`), and a URL that is not one of
 /// them is used as it stands, whatever key of whatever source carried it.
-/// Even the host's own URL never carries a variable the shell environment
-/// policy withholds from the agent's processes.
+/// Even the host's own URL never carries one of the server's or a
+/// provider's secrets, or a variable the host's `shell_env.deny` names
+/// (`ShellEnvPolicy::withheld_from_urls`).
 fn interpolate_env(url: &str, origins: &alforria_core::config::HostStrings) -> String {
     let policy = alforria_core::shell_env::current();
-    origins.expand(url, &|key| !policy.denied(key), &|key| {
+    origins.expand(url, &|key| !policy.withheld_from_urls(key), &|key| {
         std::env::var(key).ok()
     })
 }
