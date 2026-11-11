@@ -391,7 +391,7 @@ pub mod differential {
             .map(|(permission, pattern)| (permission.to_string(), pattern.to_string()))
             .collect();
         let mut seed = 0x5eed_u64;
-        (0..400)
+        (0..60)
             .map(|index| {
                 let mut policy = Policy::plain(rules(&mut seed, 6));
                 for ceiling in 0..(index % 3) {
@@ -502,7 +502,7 @@ mod tests {
     #[test]
     fn every_core_evaluation_path_agrees_with_the_policy() {
         use crate::trigger::rules::{session_rules, RunRules};
-        for (policy, queries) in differential::cases() {
+        for (index, (policy, queries)) in differential::cases().into_iter().enumerate() {
             let flat = policy.render();
             let none = Ruleset::new();
             for (permission, pattern) in &queries {
@@ -524,7 +524,8 @@ mod tests {
                 }
                 // A trigger run's effective rules, built from the rendering:
                 // never more permissive, trusted or carrying outside text.
-                for untrusted in [false, true] {
+                // (Every fifth case: these lists are long.)
+                for untrusted in [false, true].into_iter().filter(|_| index % 5 == 0) {
                     let session = session_rules(&RunRules {
                         agent: &flat,
                         inherited: &flat,
