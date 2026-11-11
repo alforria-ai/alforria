@@ -12,6 +12,7 @@ pub mod ids;
 pub mod instruction;
 pub mod llm;
 pub mod r#loop;
+pub mod media;
 pub mod message;
 pub mod overflow;
 pub mod permission;

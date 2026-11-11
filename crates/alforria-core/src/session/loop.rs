@@ -128,6 +128,8 @@ pub struct ResolvedModel {
     pub cost: ModelCost,
     pub limits: ModelLimits,
     pub output_token_max: Option<f64>,
+    /// The media the model takes as input.
+    pub media: crate::session::media::MediaSupport,
 }
 
 impl ResolvedModel {
@@ -681,6 +683,23 @@ pub async fn run_loop(
             }
 
             let mut model_messages = to_model_messages(&msgs, &model.render(), None);
+            // An image the model cannot read would be dropped by the
+            // provider without a word: say so in its place, and tell the
+            // client.
+            let omitted =
+                crate::session::media::omit_unreadable_media(&mut model_messages, &model.media);
+            crate::session::media::surface_omitted_media(
+                &deps.sessions,
+                &deps.events,
+                &crate::session::media::MediaRequest {
+                    session_id,
+                    provider_id: &model.llm.provider_id,
+                    model_id: &model.llm.id,
+                    history: &msgs,
+                    support: &model.media,
+                },
+                &omitted,
+            )?;
             if is_last_step {
                 model_messages.push(Message::assistant(MAX_STEPS_PROMPT));
             }
@@ -1356,7 +1375,9 @@ async fn generate_title(deps: &TitleDeps, input: TitleInput) {
             .join("\n");
         vec![Message::user(prompts)]
     } else {
-        to_model_messages(context, &model.render(), None)
+        let mut msgs = to_model_messages(context, &model.render(), None);
+        crate::session::media::omit_unreadable_media(&mut msgs, &model.media);
+        msgs
     };
 
     let mut stream = deps.llm.stream(StreamInput {
@@ -1762,6 +1783,7 @@ mod tests {
                 output: 100.0,
             },
             output_token_max: None,
+            media: Default::default(),
         }
     }
 

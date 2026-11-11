@@ -129,6 +129,7 @@ pub(crate) fn test_model() -> ResolvedModel {
             output: 100.0,
         },
         output_token_max: None,
+        media: Default::default(),
     }
 }
 
@@ -676,6 +677,22 @@ pub(crate) fn engine_with_provider(
         EngineOverrides {
             model: Some(model),
             llm: Some(llm),
+        },
+    )
+}
+
+/// A scripted engine whose every model lookup resolves to `model`.
+pub(crate) fn engine_with_model(name: &str, script: MockScript, model: ResolvedModel) -> Engine {
+    engine_build_with(
+        name,
+        script.clone(),
+        script,
+        serde_json::json!({}),
+        None,
+        EngineDefs::Real,
+        EngineOverrides {
+            model: Some(model),
+            llm: None,
         },
     )
 }

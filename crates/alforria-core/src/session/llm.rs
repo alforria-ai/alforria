@@ -468,6 +468,21 @@ pub trait LlmRequestSender: Send + Sync {
         let _ = cancel;
         self.send(request)
     }
+
+    /// [`Self::send_with_cancel`], with the number of times the transport
+    /// itself may retry a failed request. The session's retry policy
+    /// ([`crate::session::retry::Policy`]) sits above this and counts
+    /// attempts, not requests: a transport that retries on its own turns
+    /// each of the policy's attempts into several requests.
+    fn send_with_retries(
+        &self,
+        request: LlmRequest,
+        cancel: tokio_util::sync::CancellationToken,
+        retries: u32,
+    ) -> BoxFuture<'static, Result<LlmEventStream, LlmError>> {
+        let _ = retries;
+        self.send_with_cancel(request, cancel)
+    }
 }
 
 /// The production [`LlmStream`]: prepare the request, stream it through
@@ -488,8 +503,13 @@ impl LlmStreamImpl {
     fn stream_with_sender(&self, input: StreamInput) -> LlmEventStream {
         let sender = self.sender.clone();
         let request = build_request(sender.as_ref(), &input);
+        // `maxRetries: input.retries ?? 0` (llm.ts:330).
+        let retries = input.retries.unwrap_or(0);
         futures::stream::once(async move {
-            match sender.send(request).await {
+            match sender
+                .send_with_retries(request, tokio_util::sync::CancellationToken::new(), retries)
+                .await
+            {
                 Ok(stream) => dispatch_tool_calls(stream, input.tools),
                 Err(error) => futures::stream::once(async move { Err(error) }).boxed(),
             }
@@ -511,8 +531,10 @@ impl LlmStream for LlmStreamImpl {
     ) -> LlmEventStream {
         let sender = self.sender.clone();
         let request = build_request(sender.as_ref(), &input);
+        // `maxRetries: input.retries ?? 0` (llm.ts:330).
+        let retries = input.retries.unwrap_or(0);
         futures::stream::once(async move {
-            match sender.send_with_cancel(request, cancel).await {
+            match sender.send_with_retries(request, cancel, retries).await {
                 Ok(stream) => dispatch_tool_calls(stream, input.tools),
                 Err(error) => futures::stream::once(async move { Err(error) }).boxed(),
             }

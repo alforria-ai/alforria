@@ -1551,6 +1551,7 @@ mod generate_name_tests {
                 output: 1000.0,
             },
             output_token_max: None,
+            media: Default::default(),
         }
     }
 

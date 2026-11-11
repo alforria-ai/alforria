@@ -759,6 +759,7 @@ impl SessionPrompt {
             }
         };
         let mut messages = to_model_messages(&history, &model.render(), None);
+        crate::session::media::omit_unreadable_media(&mut messages, &model.media);
         messages.push(alforria_llm::schema::messages::Message::user(judge_text(
             &goal.objective,
         )));

@@ -79,6 +79,24 @@ pre-1.0, so minor releases may include breaking changes.
 
 ### Fixed
 
+- A model that stayed unavailable (a 503 on every request) was asked three
+  times for each of the retry policy's attempts, because the HTTP client
+  retried twice by itself underneath it: eighteen requests where the policy
+  says one attempt and five retries. A turn's requests are now retried by
+  the policy alone, and the turn ends with the provider's error after the
+  fifth retry. Title generation keeps its own two HTTP retries.
+- An image sent to a model that takes no image input was dropped by the
+  provider without a word, and the model answered that nothing was attached.
+  The request now carries `[image omitted: the current model cannot read
+  images]` in its place, the message gets a note saying so (shown to the
+  person, never sent to the model), and a `session.media.omitted` event is
+  published. The stored message keeps its image for a model that can read
+  it. A custom model reads images when its config lists the `image` input
+  modality or sets `attachment: true`; one that declares neither is treated
+  as text-only, as upstream does.
+- Whole numbers in provider requests (`max_tokens`, `temperature`,
+  `budget_tokens`, …) are written as integers, `4096` rather than `4096.0`,
+  which some OpenAI-compatible servers refuse.
 - A goal armed before a reboot could stay "active" with nothing driving it
   when the new server got the process id the old one had.
 - A session whose history no provider had counted (imported, or long and
