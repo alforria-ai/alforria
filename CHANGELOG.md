@@ -266,6 +266,14 @@ pre-1.0, so minor releases may include breaking changes.
   every route that names a session, applied after routing; only `fork` is
   exempt, by name. `GET /permission` and `GET /question` list such a token
   the asks it may answer, as `GET /attention` does, in the same shape.
+- A background subagent's result reached its parent session as a message
+  without the subagent's outside-content mark: a subagent that fetched a
+  page in the background handed its findings to a parent that still
+  counted as having seen nothing from outside, so memory the parent then
+  wrote was verified. The parent is now marked before the result is
+  delivered, as it is when the `task` tool returns the same result. The
+  same holds for a subagent the user continued directly. The mark is
+  provenance: no permission changes.
 - A trigger could be pointed at an existing session in ways that left its
   run without the bounds it needed: one the `schedule` tool made, moved to
   another conversation by an update, ran there without its creator's

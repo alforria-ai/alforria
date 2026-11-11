@@ -1906,6 +1906,7 @@ mod tests {
         fn inject_background_result<'a>(
             &'a self,
             _parent_session_id: &'a str,
+            _child_session_id: &'a str,
             _variant: Option<&'a str>,
             _text: &'a str,
         ) -> BoxFuture<'a, ()> {

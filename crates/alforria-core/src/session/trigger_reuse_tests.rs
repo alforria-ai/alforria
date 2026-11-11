@@ -464,7 +464,7 @@ async fn a_bounded_run_is_bounded_in_everything_it_leaves_behind() {
         .unwrap();
     assert_eq!(rm(&live(&child.id)), Deny);
     e.ops
-        .inject_background_result(&run.session_id, None, "the background result")
+        .inject_background_result(&run.session_id, &child.id, None, "the background result")
         .await;
     let delivered = e.llm.input(1);
     assert_eq!(delivered.session_id, run.session_id);
