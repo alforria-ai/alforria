@@ -1068,6 +1068,10 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
     let runtime_models = crate::provider_runtime::RuntimeModels::new(
         crate::provider::load_catalog(&input.runtime.catalog)?,
         &input.config,
+        &alforria_core::ConfigLoader::new().load_trusted(&alforria_core::LoadParams::new(
+            input.directory.clone(),
+            input.paths.clone(),
+        ))?,
         input.runtime.auth.clone(),
         &input.paths,
     )?;

@@ -2518,6 +2518,220 @@ mod tests {
         }
     }
 
+    /// By generation, not by a list of keys: a reference to a secret —
+    /// `{env:…}` and `${…}` — is put into every string of a project config
+    /// that uses the whole schema, one string at a time, in a full-trust
+    /// and in a restricted install. Whatever the load does with it (drop
+    /// the key, empty the reference, refuse the file), the secret's value
+    /// is in nothing it produces, and in nothing the runtime's one
+    /// expansion makes of any string of the result.
+    #[test]
+    fn no_string_of_a_project_config_can_carry_a_secret_out() {
+        const SECRET: &str = "s3cr3t-value-7f3a";
+        // Withheld by the shell environment policy (`ALFORRIA_*_SECRET`).
+        std::env::set_var("ALFORRIA_GENTEST_SECRET", SECRET);
+        // An ordinary variable: a restricted project may not read it either.
+        std::env::set_var("ALFORRIA_GENTEST_PLAIN", SECRET);
+        let document: Value = serde_json::from_str(
+            r##"{
+            "$schema": "https://example/config.json",
+            "shell": "/bin/sh",
+            "logLevel": "INFO",
+            "server": { "hostname": "h", "mdnsDomain": "d", "cors": ["https://c.example"] },
+            "command": { "c": { "template": "t", "description": "d", "agent": "build",
+                                "model": "a/b", "variant": "v" } },
+            "skills": { "paths": ["skills"], "urls": ["https://s.example/skills"] },
+            "workflows": { "paths": ["workflows"] },
+            "references": { "r": { "type": "git", "repository": "https://g.example/r.git", "branch": "main" },
+                            "l": { "type": "local", "path": "refs" } },
+            "watcher": { "ignore": ["target"] },
+            "plugin": ["some-plugin"],
+            "share": "manual",
+            "disabled_providers": ["x"],
+            "enabled_providers": ["acme"],
+            "model": "acme/m",
+            "small_model": "acme/s",
+            "default_agent": "build",
+            "username": "u",
+            "mode": { "loud": { "prompt": "p", "model": "a/b" } },
+            "agent": { "build": { "prompt": "p", "description": "d", "model": "a/b", "variant": "v",
+                                  "color": "#ffffff", "options": { "baseURL": "https://o.example", "x": "y" },
+                                  "permission": { "bash": { "git *": "allow" } } } },
+            "provider": { "acme": {
+                "api": "https://api.acme.example/v1", "name": "Acme", "env": ["ACME_KEY"],
+                "id": "acme", "npm": "@ai-sdk/openai-compatible",
+                "whitelist": ["m"], "blacklist": ["z"],
+                "options": { "apiKey": "k", "baseURL": "https://base.acme.example",
+                             "enterpriseUrl": "https://e.example", "headers": { "x-h": "v" } },
+                "models": { "m": {
+                    "id": "m", "name": "M", "family": "f", "release_date": "2026-01-01",
+                    "provider": { "npm": "n", "api": "https://model.acme.example" },
+                    "options": { "baseURL": "https://model-options.acme.example", "o": "v" },
+                    "headers": { "x-m": "v" },
+                    "variants": { "high": { "reasoningEffort": "high" } }
+                } }
+            } },
+            "mcp": {
+                "local": { "type": "local", "command": ["mcp-server", "--flag"],
+                           "environment": { "MCP_KEY": "v" } },
+                "remote": { "type": "remote", "url": "https://mcp.example/sse",
+                            "headers": { "authorization": "Bearer t" } }
+            },
+            "formatter": { "f": { "command": ["fmt", "$FILE"], "environment": { "F": "v" },
+                                  "extensions": [".x"] } },
+            "lsp": { "l": { "command": ["lsp", "--stdio"], "extensions": [".x"],
+                            "env": { "L": "v" } } },
+            "instructions": ["https://i.example/rules.md", "docs/rules.md"],
+            "layout": "auto",
+            "enterprise": { "url": "https://ent.example" },
+            "websearch": { "provider": "http", "url": "https://search.example",
+                           "headers": { "authorization": "Bearer t" } },
+            "hook": { "webhook": [{ "url": "https://hook.example", "events": ["*"], "secret": "s" }] },
+            "trigger": { "t": { "on": { "interval": "1h" }, "prompt": "p" } },
+            "prompt": { "append": "more" }}"##,
+        )
+        .unwrap();
+        // The sample uses every top-level key that can hold a string: a key
+        // added to the schema must be added here (or to the list of those
+        // that hold none).
+        let stringless = [
+            "snapshot",
+            "autoshare",
+            "autoupdate",
+            "subagent_depth",
+            "tools",
+            "attachment",
+            "tool_output",
+            "compaction",
+            "experimental",
+            "storage",
+            "shell_env",
+            "question",
+            "triggers",
+            "memory",
+            "tool",
+            "permission",
+            "reference",
+        ];
+        for field in serde_fields::<Config>() {
+            assert!(
+                document.get(field).is_some() || stringless.contains(&field),
+                "`{field}` is not in the generated document"
+            );
+        }
+
+        fn leaves(value: &Value, path: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
+            match value {
+                Value::String(_) => out.push(path.clone()),
+                Value::Array(items) => {
+                    for (index, item) in items.iter().enumerate() {
+                        path.push(index.to_string());
+                        leaves(item, path, out);
+                        path.pop();
+                    }
+                }
+                Value::Object(fields) => {
+                    for (key, item) in fields {
+                        path.push(key.clone());
+                        leaves(item, path, out);
+                        path.pop();
+                    }
+                }
+                _ => {}
+            }
+        }
+        fn strings(value: &Value, out: &mut Vec<String>) {
+            match value {
+                Value::String(text) => out.push(text.clone()),
+                Value::Array(items) => items.iter().for_each(|item| strings(item, out)),
+                Value::Object(fields) => {
+                    for (key, item) in fields {
+                        out.push(key.clone());
+                        strings(item, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut paths = Vec::new();
+        leaves(&document, &mut Vec::new(), &mut paths);
+        assert!(paths.len() > 60, "{}", paths.len());
+
+        let f = Fixture::new();
+        let work = f.root.join("work");
+        // The host has a URL of its own with a reference in it.
+        let host_provider =
+            json!({ "hostco": { "api": "https://${ALFORRIA_GENTEST_PLAIN}.host.example" } });
+        for (host, variable) in [
+            // Full trust: only a withheld name is a secret to a project.
+            (
+                json!({ "provider": host_provider }),
+                "ALFORRIA_GENTEST_SECRET",
+            ),
+            // Restricted, with everything handed back so that the keys
+            // survive: any name is.
+            (
+                json!({ "provider": host_provider, "server": { "trust": {
+                    "project": "restricted",
+                    "project_keys": serde_fields::<Config>(),
+                } } }),
+                "ALFORRIA_GENTEST_PLAIN",
+            ),
+        ] {
+            write(
+                &f.root.join("config").join("opencode.json"),
+                &host.to_string(),
+            );
+            let trusted = ConfigLoader.load_trusted(&f.params).unwrap();
+            let origins = super::super::variable::HostStrings::collect([&serde_json::to_value(
+                &trusted.provider,
+            )
+            .unwrap()]);
+            for path in &paths {
+                for reference in [format!("{{env:{variable}}}"), format!("${{{variable}}}")] {
+                    let mut planted = document.clone();
+                    let pointer = format!("/{}", path.join("/"));
+                    let leaf = planted.pointer_mut(&pointer).unwrap();
+                    *leaf = Value::String(format!("{}/{reference}", leaf.as_str().unwrap()));
+                    write(&work.join("opencode.json"), &planted.to_string());
+                    let where_ = format!("{reference} at {pointer}");
+                    match f.load() {
+                        // Refused (or no longer valid for its key): fine, as
+                        // long as the refusal does not print the value.
+                        Err(error) => assert!(!error.to_string().contains(SECRET), "{where_}"),
+                        Ok((config, _)) => {
+                            let mut found = Vec::new();
+                            strings(&serde_json::to_value(&config).unwrap(), &mut found);
+                            for text in found {
+                                assert!(!text.contains(SECRET), "{where_}: loaded as {text}");
+                                // The host's own URL is in the merged
+                                // config too, and is the host's to expand.
+                                if origins.contains(&text) {
+                                    continue;
+                                }
+                                // The runtime's one expansion, with the
+                                // host's own (widest) rule.
+                                let expanded = origins
+                                    .expand(&text, &|_| true, &|name| std::env::var(name).ok());
+                                assert!(
+                                    !expanded.contains(SECRET),
+                                    "{where_}: the runtime expands {text}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            // The host's own reference still expands at runtime.
+            let own = "https://${ALFORRIA_GENTEST_PLAIN}.host.example";
+            assert!(origins
+                .expand(own, &|_| true, &|name| std::env::var(name).ok())
+                .contains(SECRET));
+        }
+        std::env::remove_var("ALFORRIA_GENTEST_SECRET");
+        std::env::remove_var("ALFORRIA_GENTEST_PLAIN");
+    }
+
     /// `server.trust.host: "managed"` (in the managed directory): the
     /// global config and `~/.opencode` carry no host key any more — one
     /// from each host group is dropped — while the managed directory's are

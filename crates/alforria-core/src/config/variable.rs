@@ -272,6 +272,77 @@ pub fn interpolate_dollar_final(
     interpolate_dollar(text, allowed, lookup).map(|expanded| expanded.replace("${", "%24{"))
 }
 
+/// Which strings the *host* wrote: the only ones a `${VAR}` is ever
+/// expanded in after load.
+///
+/// The provider runtime expands `${VAR}` in a base URL when it builds a
+/// request. By then the config is one merged document, and a URL can have
+/// reached it through any key of any source. Rather than list the keys a
+/// project's config might carry a URL in, the runtime asks where the
+/// *value* came from: it is the host's when the host's own config
+/// (`ConfigLoader::load_trusted`) or the model catalog holds that exact
+/// string. A value from anywhere else is never expanded at runtime,
+/// whatever key carried it — at worst it is a string the host wrote too,
+/// and then it expands to what the host's would.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HostStrings(std::collections::HashSet<String>);
+
+impl HostStrings {
+    /// Every string holding a `${` anywhere in `documents` (the host's
+    /// config, the catalog).
+    pub fn collect<'a>(documents: impl IntoIterator<Item = &'a serde_json::Value>) -> HostStrings {
+        fn walk(value: &serde_json::Value, out: &mut std::collections::HashSet<String>) {
+            match value {
+                serde_json::Value::String(text) if text.contains("${") => {
+                    out.insert(text.clone());
+                }
+                serde_json::Value::Array(items) => items.iter().for_each(|item| walk(item, out)),
+                serde_json::Value::Object(fields) => {
+                    fields.values().for_each(|item| walk(item, out))
+                }
+                _ => {}
+            }
+        }
+        let mut out = std::collections::HashSet::new();
+        for document in documents {
+            walk(document, &mut out);
+        }
+        HostStrings(out)
+    }
+
+    pub fn contains(&self, text: &str) -> bool {
+        self.0.contains(text)
+    }
+
+    /// Expand `${VAR}` in `text` if the host wrote it, under `allowed` (the
+    /// host's own rule). A string of any other origin is returned as it is:
+    /// nothing in it is expanded. So is the host's own when it names a
+    /// variable `allowed` refuses.
+    pub fn expand(
+        &self,
+        text: &str,
+        allowed: &dyn Fn(&str) -> bool,
+        lookup: &dyn Fn(&str) -> Option<String>,
+    ) -> String {
+        if !text.contains("${") {
+            return text.to_string();
+        }
+        if !self.contains(text) {
+            tracing::warn!(
+                "not expanding ${{…}} in {text}: the value does not come from the host config"
+            );
+            return text.to_string();
+        }
+        match interpolate_dollar(text, allowed, lookup) {
+            Ok(expanded) => expanded,
+            Err(name) => {
+                tracing::warn!("not expanding {text}: ${{{name}}} is withheld from URLs");
+                text.to_string()
+            }
+        }
+    }
+}
+
 /// Read a confined `{file:path}`: the path must be relative and is opened
 /// beneath `root` (`crate::beneath::open_beneath`), so no `..`, absolute
 /// path or symlink leads out — and a path that cannot be resolved is

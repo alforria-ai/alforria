@@ -169,6 +169,8 @@ struct Inner {
     /// change.
     catalog: alforria_core::catalog::Providers,
     config: alforria_core::config::schema::Config,
+    /// The strings the host wrote: see [`interpolate_env`].
+    host_strings: alforria_core::config::HostStrings,
     auth: Arc<dyn AuthStore>,
     /// The provider state and the auth generation it was built against.
     state: RwLock<(u64, Arc<ProviderState>)>,
@@ -202,15 +204,24 @@ impl RuntimeModels {
     pub fn new(
         catalog: alforria_core::catalog::Providers,
         config: &alforria_core::config::schema::Config,
+        // The config as the host's own sources alone have it
+        // (`ConfigLoader::load_trusted`): with the catalog, the only origin
+        // of a base URL that `${VAR}` is expanded in.
+        host_config: &alforria_core::config::schema::Config,
         auth: Arc<dyn AuthStore>,
         paths: &alforria_core::GlobalPaths,
     ) -> Result<RuntimeModels, ServerError> {
+        let host_strings = alforria_core::config::HostStrings::collect([
+            &serde_json::to_value(&host_config.provider).unwrap_or_default(),
+            &serde_json::to_value(&catalog).unwrap_or_default(),
+        ]);
         // Read the generation first: a change racing the build moves it
         // past the recorded one, and the next lookup rebuilds.
         let generation = auth.generation();
         let state = build_state(&catalog, config, auth.as_ref())?;
         Ok(RuntimeModels(Arc::new(Inner {
             catalog,
+            host_strings,
             config: config.clone(),
             auth,
             state: RwLock::new((generation, Arc::new(state))),
@@ -294,7 +305,11 @@ impl RuntimeModels {
     /// `getLanguage` (provider.ts:1898-1929) — the merged
     /// `provider.options` ← `model.options` record with the `apiKey` and
     /// `baseURL` legs the SDK factory consumes.
-    fn llm_options(provider: &Value, model: &Value) -> BTreeMap<String, Value> {
+    fn llm_options(
+        provider: &Value,
+        model: &Value,
+        origins: &alforria_core::config::HostStrings,
+    ) -> BTreeMap<String, Value> {
         let mut options = BTreeMap::new();
         for source in [provider, model] {
             if let Some(map) = source["options"].as_object() {
@@ -333,7 +348,7 @@ impl RuntimeModels {
             });
         match url {
             Some(base) => {
-                let base = interpolate_env(&base);
+                let base = interpolate_env(&base, origins);
                 options.insert("baseURL".to_string(), json!(base));
             }
             None => {
@@ -370,7 +385,7 @@ impl RuntimeModels {
                             .collect()
                     })
                     .unwrap_or_default(),
-                options: RuntimeModels::llm_options(provider, &model),
+                options: RuntimeModels::llm_options(provider, &model, &self.0.host_strings),
                 context_limit: model["limit"]["context"].as_f64().unwrap_or(0.0),
                 output_limit: model["limit"]["output"].as_f64().unwrap_or(0.0),
                 output_token_max: self.0.output_token_max,
@@ -996,39 +1011,20 @@ impl LlmRequestSender for RouteLlmSender {
     }
 }
 
-/// `${VAR}` interpolation over the env (provider.ts:1734-1741), through the
-/// one implementation (`alforria_core::config::interpolate_dollar`).
+/// `${VAR}` interpolation of a base URL over the env (provider.ts:1734-1741)
+/// — the only place anything is expanded after the config is loaded.
 ///
-/// What reaches here with a `${…}` in it is the host's: a base URL from the
-/// user's own config or the model catalog. A project's or a remote config
-/// had its URLs expanded at load, once, under the rule of its origin, and
-/// in a form that holds no `${` any more
-/// (`config::interpolate_dollar_final`): for those this pass finds nothing
-/// to do, so no URL is expanded twice or under a rule that is not its
-/// source's. Even the host's own URL never carries a variable the shell
-/// environment policy withholds from the agent's processes: such a
-/// reference is left as written (a URL that will not resolve) and logged.
-fn interpolate_env(url: &str) -> String {
+/// It expands a value the *host* wrote and no other: `origins` holds the
+/// strings of the host's own config and of the model catalog
+/// (`alforria_core::config::HostStrings`), and a URL that is not one of
+/// them is used as it stands, whatever key of whatever source carried it.
+/// Even the host's own URL never carries a variable the shell environment
+/// policy withholds from the agent's processes.
+fn interpolate_env(url: &str, origins: &alforria_core::config::HostStrings) -> String {
     let policy = alforria_core::shell_env::current();
-    interpolate_env_with(url, &|key| !policy.denied(key), &|key| {
+    origins.expand(url, &|key| !policy.denied(key), &|key| {
         std::env::var(key).ok()
     })
-}
-
-fn interpolate_env_with(
-    url: &str,
-    allowed: &dyn Fn(&str) -> bool,
-    lookup: &dyn Fn(&str) -> Option<String>,
-) -> String {
-    match alforria_core::config::interpolate_dollar(url, allowed, lookup) {
-        Ok(expanded) => expanded,
-        Err(name) => {
-            tracing::warn!(
-                "not expanding the base URL {url}: ${{{name}}} is withheld from URLs (shell_env)"
-            );
-            url.to_string()
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1107,11 +1103,12 @@ mod tests {
         assert_eq!(parse_release_date("bogus"), None);
     }
 
-    /// A base URL never carries a variable the shell environment policy
-    /// withholds, a substituted value is not expanded again, and a URL a
-    /// project config already settled is left alone.
+    /// Only a value the host wrote is expanded — whatever key carried the
+    /// URL here — in one pass, and never with a variable the shell
+    /// environment policy withholds.
     #[test]
-    fn interpolate_env_is_one_pass_and_never_substitutes_a_withheld_secret() {
+    fn a_base_url_is_expanded_only_when_the_host_wrote_it() {
+        use alforria_core::config::HostStrings;
         let lookup = |key: &str| match key {
             "SERVER_SECRET" => Some("hunter2".to_string()),
             "REGION" => Some("eu".to_string()),
@@ -1119,8 +1116,14 @@ mod tests {
             _ => None,
         };
         let allowed = |key: &str| key != "SERVER_SECRET";
-        let expand = |url: &str| interpolate_env_with(url, &allowed, &lookup);
-        // The host's own URL: today's behaviour.
+        let host = HostStrings::collect([&json!({ "acme": {
+            "api": "https://${REGION}.x.example/v1",
+            "options": { "baseURL": "https://x.example/${UNSET}" },
+            "models": { "m": { "options": { "baseURL": "https://x.example/${NESTED}" } } },
+            "secret": "https://${REGION}.x.example/${SERVER_SECRET}",
+        } })]);
+        let expand = |url: &str| host.expand(url, &allowed, &lookup);
+        // The host's own URLs: today's behaviour.
         assert_eq!(
             expand("https://${REGION}.x.example/v1"),
             "https://eu.x.example/v1"
@@ -1129,35 +1132,54 @@ mod tests {
             expand("https://x.example/${UNSET}"),
             "https://x.example/${UNSET}"
         );
+        // A value holding a reference stays that text: one pass.
+        assert_eq!(
+            expand("https://x.example/${NESTED}"),
+            "https://x.example/${SERVER_SECRET}"
+        );
         // Withheld: nothing of the URL is expanded.
         assert_eq!(
             expand("https://${REGION}.x.example/${SERVER_SECRET}"),
             "https://${REGION}.x.example/${SERVER_SECRET}"
         );
-        // A value holding a reference stays that text.
-        assert_eq!(
-            expand("https://x.example/${NESTED}"),
-            "https://x.example/${SERVER_SECRET}"
-        );
-        // What the loader settled for a project config has no reference.
-        assert_eq!(
-            expand("https://x.example/%24{SERVER_SECRET}"),
-            "https://x.example/%24{SERVER_SECRET}"
-        );
-    }
+        // Not the host's: never expanded, though every name in it is one
+        // the host's rule would allow.
+        for url in [
+            "https://attacker.example/${REGION}",
+            "https://${REGION}.x.example/v2",
+            "${REGION}",
+        ] {
+            assert_eq!(expand(url), url);
+        }
 
-    #[test]
-    fn interpolate_env_replaces_vars() {
-        std::env::set_var("OPencode_RUNTIME_TEST", "value");
+        // The whole path: a model-level `options.baseURL` — a key no list
+        // of URL keys had — set by a project, with the host's provider
+        // beside it.
+        std::env::set_var("ALFORRIA_RUNTIME_TEST_REGION", "eu");
+        let host = HostStrings::collect([&json!({ "acme": {
+            "options": { "baseURL": "https://${ALFORRIA_RUNTIME_TEST_REGION}.host.example" },
+        } })]);
+        let provider = json!({ "options": {
+            "baseURL": "https://${ALFORRIA_RUNTIME_TEST_REGION}.host.example",
+        } });
+        let hosts = RuntimeModels::llm_options(&provider, &json!({}), &host);
+        assert_eq!(hosts["baseURL"], "https://eu.host.example");
+        let project_model = json!({ "options": {
+            "baseURL": "https://attacker.example/${ALFORRIA_RUNTIME_TEST_REGION}",
+        } });
+        let projects = RuntimeModels::llm_options(&provider, &project_model, &host);
         assert_eq!(
-            interpolate_env("https://api.example.com/${OPencode_RUNTIME_TEST}/v1"),
-            "https://api.example.com/value/v1"
+            projects["baseURL"],
+            "https://attacker.example/${ALFORRIA_RUNTIME_TEST_REGION}"
         );
+        let api_url =
+            json!({ "api": { "url": "https://attacker.example/${ALFORRIA_RUNTIME_TEST_REGION}" } });
+        let lowered = RuntimeModels::llm_options(&json!({}), &api_url, &host);
         assert_eq!(
-            interpolate_env("https://api.example.com/${MISSING_OPencode_VAR}/v1"),
-            "https://api.example.com/${MISSING_OPencode_VAR}/v1"
+            lowered["baseURL"],
+            "https://attacker.example/${ALFORRIA_RUNTIME_TEST_REGION}"
         );
-        std::env::remove_var("OPencode_RUNTIME_TEST");
+        std::env::remove_var("ALFORRIA_RUNTIME_TEST_REGION");
     }
 
     #[test]
@@ -1169,16 +1191,16 @@ mod tests {
             "options": {"apiKey": "", "baseURL": "https://api.example"},
             "models": {},
         });
-        let options = RuntimeModels::llm_options(&provider, &json!({}));
+        let options = RuntimeModels::llm_options(&provider, &json!({}), &Default::default());
         assert_eq!(options["apiKey"], json!("stored-key"));
 
         let provider = json!({"key": "stored-key", "options": {"apiKey": "config-key"}});
-        let options = RuntimeModels::llm_options(&provider, &json!({}));
+        let options = RuntimeModels::llm_options(&provider, &json!({}), &Default::default());
         assert_eq!(options["apiKey"], json!("config-key"));
 
         // No options at all — the stored credential applies (provider.ts:1781).
         let provider = json!({"key": "stored-key"});
-        let options = RuntimeModels::llm_options(&provider, &json!({}));
+        let options = RuntimeModels::llm_options(&provider, &json!({}), &Default::default());
         assert_eq!(options["apiKey"], json!("stored-key"));
     }
 
