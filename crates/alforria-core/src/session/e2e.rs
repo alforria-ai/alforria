@@ -2604,6 +2604,110 @@ mod tests {
         assert!(!marked, "a truncated glob of a tree without the area");
     }
 
+    /// H6. With memory off (the default) nothing reads the provenance
+    /// mark, and carrying it must cost and change nothing: the same tool
+    /// calls return the same results in a marked and an unmarked session,
+    /// both are held to the same policy with no ceiling, and once a
+    /// session is marked a further result writes nothing — it does not
+    /// even wait for the database's write lock.
+    #[tokio::test]
+    async fn with_memory_off_the_provenance_mark_changes_no_result_no_permission_and_is_written_once(
+    ) {
+        let calls = || {
+            [
+                ("grep", json!({ "pattern": "needle", "path": "src" })),
+                ("glob", json!({ "pattern": "src/**/*.rs" })),
+                ("read", json!({ "filePath": "src/lib.rs" })),
+            ]
+        };
+        let runs = SearchRuns::new(
+            "e2e-mark-invisible",
+            [("read", json!({ "filePath": "uploads/drop.txt" }))]
+                .into_iter()
+                .chain(calls())
+                .chain(calls())
+                .collect(),
+        );
+        runs.write("src/lib.rs", "a needle in src\n");
+        runs.write("uploads/drop.txt", "a needle from outside\n");
+        let sessions = runs.e.services.sessions.clone();
+
+        let marked = runs.session();
+        runs.step_in(&marked).await;
+        assert!(sessions.seen_outside_content(&marked));
+        let plain = runs.session();
+        let mut results = Vec::new();
+        for session in [&marked, &plain] {
+            let mut of_session = Vec::new();
+            for _ in calls() {
+                of_session.push(runs.step_in(session).await);
+            }
+            results.push(of_session);
+        }
+        assert_eq!(results[0], results[1], "the same calls, the same results");
+        assert_eq!(results[0].len(), 3);
+        assert!(sessions.seen_outside_content(&marked));
+        assert!(!sessions.seen_outside_content(&plain));
+
+        // No permission effect: the same policy, no ceiling, no write
+        // guard's cause.
+        let unmarked = plain;
+        let agent = crate::tool::permission::Policy::default();
+        assert_eq!(
+            sessions.policy(&marked, &agent),
+            sessions.policy(&unmarked, &agent)
+        );
+        assert!(sessions.ceilings(&marked).unwrap().is_empty());
+        assert!(!sessions.started_by_outside_input(&marked));
+        assert!(!sessions.is_restricted(&marked).unwrap());
+
+        // Written once, however many outside results followed.
+        let rows = |session: &str| -> i64 {
+            runs.e.services.storage.with_connection(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM session_mark WHERE session_id = ?1",
+                    [session],
+                    |row| row.get(0),
+                )
+                .unwrap()
+            })
+        };
+        assert_eq!(rows(&marked), 1);
+        assert_eq!(rows(&unmarked), 0);
+        // And a result in a marked session needs no write at all: another
+        // connection holds the write lock, and the result goes through at
+        // once instead of waiting for it.
+        let other = rusqlite::Connection::open(runs.e.temp.path().join("db.sqlite")).unwrap();
+        other.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let started = std::time::Instant::now();
+        for (tool, input) in [
+            ("webfetch", json!({ "url": "https://example.com" })),
+            ("github_search_issues", json!({})),
+            ("read", json!({ "filePath": "uploads/drop.txt" })),
+            ("grep", json!({ "pattern": "needle" })),
+        ] {
+            sessions
+                .note_tool_result(
+                    &marked,
+                    &crate::tool::outside::ToolResult {
+                        call_id: None,
+                        tool,
+                        input: &input,
+                        metadata: None,
+                        output: "more from outside",
+                    },
+                )
+                .unwrap_or_else(|error| panic!("{tool}: {error}"));
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "no wait for the write lock: {:?}",
+            started.elapsed()
+        );
+        other.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(rows(&marked), 1);
+    }
+
     /// H6. Outside text that an ordinary tool reads into a session marks
     /// it — at the one place tool results are appended — and what the
     /// session then saves is unverified and not injected into later

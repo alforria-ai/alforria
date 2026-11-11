@@ -691,6 +691,18 @@ impl SessionStore {
     /// ([`crate::tool::outside`]) sets [`SessionMark::OutsideContent`], for
     /// life. An error here is an error for the result: content is not
     /// appended to a session that could not be marked for it.
+    ///
+    /// What it costs: nothing for a tool that never returns outside
+    /// content; otherwise one indexed read of `session_mark`, and for a
+    /// session that already has the mark nothing more — no filesystem
+    /// lookup and no write, so no wait for the database's write lock. The
+    /// row is written once per session. The read is of the table, not of a
+    /// cache in this process: a session id can be chosen by its creator and
+    /// used again after a delete, and other processes write the same
+    /// database. The row is written whether or not anything reads it yet
+    /// (memory and triggers are off by default): a session that read
+    /// outside content before memory was switched on must still count as
+    /// having read it afterwards.
     pub fn note_tool_result(
         &self,
         session_id: &str,
@@ -706,6 +718,9 @@ impl SessionStore {
             Outside::SearchesPath(_) => self.take_returned_paths(session_id, result),
             _ => None,
         };
+        if self.has_mark(session_id, SessionMark::OutsideContent)? {
+            return Ok(());
+        }
         let uploads = self
             .uploads
             .read()
