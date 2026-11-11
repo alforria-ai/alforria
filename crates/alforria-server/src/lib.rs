@@ -406,10 +406,9 @@ fn apply_synchronous(storage: &Storage, config: &alforria_core::config::schema::
 pub(crate) fn global_config(
     paths: &alforria_core::GlobalPaths,
 ) -> alforria_core::config::schema::Config {
-    let params = alforria_core::LoadParams::new(paths.config.clone()).paths(paths.clone());
-    alforria_core::ConfigLoader::new()
-        .load(&params)
-        .map(|(config, _)| config)
+    // `server.resume` and `storage` are host keys (`EXTENSION_KEYS`): read
+    // through the host loader, which consults no project file.
+    alforria_core::config::host::load_host_config(paths)
         .unwrap_or_else(|_| serde_json::from_str("{}").expect("an empty config decodes"))
 }
 

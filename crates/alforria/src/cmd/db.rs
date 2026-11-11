@@ -194,15 +194,15 @@ fn trim_diffs(
 }
 
 /// The retention `db prune` applies: the flags, over `storage.retention.events`
-/// from the global config.
+/// from the host config.
 fn prune_retention(
     paths: &alforria_core::GlobalPaths,
     matches: &ArgMatches,
 ) -> Result<alforria_core::event::sql::EventRetention, String> {
-    let params = alforria_core::LoadParams::new(paths.config.clone()).paths(paths.clone());
-    let mut retention = alforria_core::ConfigLoader::new()
-        .load(&params)
-        .map(|(config, _)| alforria_core::storage::maintenance::event_retention(&config))
+    // `storage` is a host key: the policy for the database every project
+    // shares is read from the host config alone (`EXTENSION_KEYS`).
+    let mut retention = alforria_core::config::host::load_host_config(paths)
+        .map(|config| alforria_core::storage::maintenance::event_retention(&config))
         .unwrap_or_default();
     if let Some(age) = matches.get_one::<String>("max-age") {
         let age = alforria_core::config::schema::ConfigDuration::parse(age).ok_or_else(|| {

@@ -225,9 +225,19 @@ pub struct ConfigLoader;
 /// Who may set one of alforria's own config keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyTrust {
-    /// Only the user's own config. From anywhere else the key is dropped.
+    /// Only the host config: the global config directory, `~/.opencode` and
+    /// the managed directory. These keys describe the server process and the
+    /// database every project shares, and are read once at startup through
+    /// [`crate::config::host::load_host_config`]. From anywhere else —
+    /// a project, a remote config, and the `OPENCODE_CONFIG*` environment
+    /// too — the key is dropped.
+    Host,
+    /// Only the user's own config: the host config, plus the files named by
+    /// `OPENCODE_CONFIG`, `OPENCODE_CONFIG_DIR` and
+    /// `OPENCODE_CONFIG_CONTENT`. From a project or a remote config the key
+    /// is dropped.
     UserOnly,
-    /// Only the user's own config, except that anyone may turn the feature
+    /// As [`KeyTrust::UserOnly`], except that anyone may turn the feature
     /// off: from elsewhere only `{ "enabled": false }` survives.
     UserOnlyMayDisable,
     /// Any config, a project's included: the key grants nothing a project's
@@ -235,21 +245,74 @@ pub enum KeyTrust {
     Project,
 }
 
-/// Every top-level config key alforria adds to the upstream config, and who
-/// may set it. A key that grants a capability, widens a scope, sends
-/// requests to a chosen address, or changes what other projects see belongs
-/// to the user alone.
+/// Where a config being merged came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigOrigin {
+    /// The global config directory, `~/.opencode`, the managed directory.
+    Host,
+    /// `OPENCODE_CONFIG`, `OPENCODE_CONFIG_DIR`, `OPENCODE_CONFIG_CONTENT`:
+    /// the user's, but not part of the host config.
+    Own,
+    /// A project's `opencode.json` or `.opencode/`, or a remote config. It
+    /// arrives with a clone or a login, and the agent can write the former.
+    Outside,
+}
+
+impl KeyTrust {
+    /// Whether a config from `origin` may set a key of this class. (For
+    /// [`KeyTrust::UserOnlyMayDisable`], `false` still lets
+    /// `{ "enabled": false }` through.)
+    pub fn admits(self, origin: ConfigOrigin) -> bool {
+        match (self, origin) {
+            (KeyTrust::Project, _) | (_, ConfigOrigin::Host) => true,
+            (KeyTrust::Host, _) => false,
+            (_, ConfigOrigin::Own) => true,
+            (_, ConfigOrigin::Outside) => false,
+        }
+    }
+}
+
+/// Every config key alforria adds to the upstream config, and who may set
+/// it — the one place that decision is made, for every feature. A key is a
+/// dotted path; `*` stands for any one name.
 ///
-/// "The user's own config" is the global config, `~/.opencode`, the files
-/// named by `OPENCODE_CONFIG`, `OPENCODE_CONFIG_DIR` and
-/// `OPENCODE_CONFIG_CONTENT`, and the managed config. A project's
-/// `opencode.json` or `.opencode/` arrives with a clone and a remote config
-/// arrives with a login: neither is the user's. There is no per-project
-/// trust to grant, on purpose.
+/// The rule: a key that grants a capability, widens a scope, sends requests
+/// to a chosen address, weakens durability, or changes behaviour beyond the
+/// project it is written in is the user's or the host's alone. A project's
+/// `opencode.json` or `.opencode/` arrives with a clone (and the agent can
+/// write it), and a remote config arrives with a login: neither is the
+/// user's. There is no per-project trust to grant, on purpose.
 ///
-/// A new key goes in this table; `user_only_keys_hold_for_every_entry`
-/// walks it.
+/// The loader applies the table to every source as it is merged
+/// ([`apply_key_trust`]), so the merged config of a directory never holds a
+/// value its source was not entitled to set, whoever reads it.
+///
+/// A new key goes in this table; `every_alforria_key_is_classified_and_held`
+/// walks it and fails for a key the schema has and the table does not.
 pub const EXTENSION_KEYS: &[(&str, KeyTrust)] = &[
+    // -- The server process (docs/unattended-server.md) -------------------
+    // How the process stops.
+    ("server.shutdown", KeyTrust::Host),
+    // Who may talk to the server, and with what scope.
+    ("server.auth", KeyTrust::Host),
+    // Which directories a token below `admin` may open.
+    ("server.directories", KeyTrust::Host),
+    // Where and how much such a token may upload.
+    ("server.upload", KeyTrust::Host),
+    // Whether a turn the last process died in is prompted again, unasked,
+    // in whatever project it ran in.
+    ("server.resume", KeyTrust::Host),
+    // What the agent's shells inherit from the server's environment.
+    ("shell_env", KeyTrust::Host),
+    // What an ask nobody answers resolves to: `allow` grants.
+    ("permission.unattended", KeyTrust::Host),
+    ("question", KeyTrust::Host),
+    // Sends events to a chosen address, signed with a chosen secret.
+    ("hook", KeyTrust::Host),
+    // The database every project shares: dropping its event log, or
+    // weakening when a commit reaches the disk.
+    ("storage", KeyTrust::Host),
+    // -- The assistant features (docs/assistant.md) -----------------------
     // Starts turns with nobody watching, under rules the config chooses.
     ("trigger", KeyTrust::UserOnly),
     // Concurrency and watch limits of the scheduler.
@@ -261,42 +324,79 @@ pub const EXTENSION_KEYS: &[(&str, KeyTrust)] = &[
     // A search backend address and headers: requests, with whatever the
     // headers carry, would go wherever the config says.
     ("websearch", KeyTrust::UserOnly),
+    // -- What a project may say about itself ------------------------------
     // The wording of this project's own system prompt and tool descriptions.
     ("prompt", KeyTrust::Project),
     ("tool", KeyTrust::Project),
+    // Which prompt family a model the project declares belongs to.
+    ("provider.*.models.*.family", KeyTrust::Project),
+    // The context window assumed for a model that declares none. A project
+    // can already declare any model's limits (`provider.*.models.*.limit`).
+    ("compaction.default_context", KeyTrust::Project),
 ];
 
-/// Apply [`EXTENSION_KEYS`] to a config that did not come from the user.
-/// What is dropped is logged with the file it came from.
-fn without_user_only_keys(mut config: Value, source: &str) -> Value {
-    let Value::Object(fields) = &mut config else {
-        return config;
+/// Call `visit` with the object holding the last segment of `path`, for
+/// every place the path matches (`*` matches each key).
+fn at_path(node: &mut Value, path: &[&str], visit: &mut dyn FnMut(&mut Map<String, Value>, &str)) {
+    let Value::Object(fields) = node else {
+        return;
     };
-    for (key, trust) in EXTENSION_KEYS {
-        let kept = match (trust, fields.get(*key)) {
-            (KeyTrust::Project, _) | (_, None) => continue,
-            (KeyTrust::UserOnly, Some(_)) => None,
-            (KeyTrust::UserOnlyMayDisable, Some(value)) => {
-                if value.get("enabled") == Some(&Value::Bool(false)) {
-                    Some(json!({ "enabled": false }))
-                } else {
-                    None
-                }
+    let (Some(first), rest) = (path.first(), &path[path.len().min(1)..]) else {
+        return;
+    };
+    let names: Vec<String> = if *first == "*" {
+        fields.keys().cloned().collect()
+    } else {
+        vec![(*first).to_string()]
+    };
+    for name in names {
+        if rest.is_empty() {
+            if fields.contains_key(&name) {
+                visit(fields, &name);
             }
-        };
-        let before = fields.remove(*key);
-        let changed = before != kept;
-        if let Some(kept) = kept {
-            fields.insert((*key).to_string(), kept);
+        } else if let Some(child) = fields.get_mut(&name) {
+            at_path(child, rest, visit);
         }
-        let empty = matches!(&before, Some(Value::Object(object)) if object.is_empty());
-        if changed && !empty {
-            tracing::warn!(
-                "ignoring `{key}` in {source}: it is only read from your own config (the \
-                 global config or OPENCODE_CONFIG), never from a project's or a remote one. \
-                 Move it there to use it."
-            );
+    }
+}
+
+/// Apply [`EXTENSION_KEYS`] to one config source before it is merged: what
+/// `origin` may not set is dropped, and logged with the file it came from.
+pub fn apply_key_trust(mut config: Value, source: &str, origin: ConfigOrigin) -> Value {
+    for (key, trust) in EXTENSION_KEYS {
+        if trust.admits(origin) {
+            continue;
         }
+        let path: Vec<&str> = key.split('.').collect();
+        at_path(&mut config, &path, &mut |fields, name| {
+            let before = fields.remove(name);
+            let kept = match (trust, &before) {
+                (KeyTrust::UserOnlyMayDisable, Some(value))
+                    if value.get("enabled") == Some(&Value::Bool(false)) =>
+                {
+                    Some(json!({ "enabled": false }))
+                }
+                _ => None,
+            };
+            let changed = before != kept;
+            if let Some(kept) = kept {
+                fields.insert(name.to_string(), kept);
+            }
+            let empty = matches!(&before, Some(Value::Object(object)) if object.is_empty());
+            if changed && !empty {
+                let allowed = match trust {
+                    KeyTrust::Host => {
+                        "the host config (the global config directory, ~/.opencode or the \
+                         managed directory)"
+                    }
+                    _ => "your own config (the global config or OPENCODE_CONFIG)",
+                };
+                tracing::warn!(
+                    "ignoring `{key}` in {source}: it is only read from {allowed}, never \
+                     from a project's or a remote one. Move it there to use it."
+                );
+            }
+        });
     }
     config
 }
@@ -340,7 +440,7 @@ impl ConfigLoader {
                 },
                 &auth_env,
             )?;
-            let next = without_user_only_keys(next, &source);
+            let next = apply_key_trust(next, &source, ConfigOrigin::Outside);
             merge_config_concat_arrays(&mut result, &next);
         }
 
@@ -358,6 +458,7 @@ impl ConfigLoader {
         // 4. OPENCODE_CONFIG env file (failures are fatal).
         if let Some(flag) = flags_value(&params.flags.config) {
             let next = self.load_file(Path::new(flag), &auth_env)?;
+            let next = apply_key_trust(next, flag, ConfigOrigin::Own);
             merge_config_concat_arrays(&mut result, &next);
         }
 
@@ -370,7 +471,7 @@ impl ConfigLoader {
             );
             for file in files.into_iter().rev() {
                 let next = self.load_file(&file, &auth_env)?;
-                let next = without_user_only_keys(next, &file.to_string_lossy());
+                let next = apply_key_trust(next, &file.to_string_lossy(), ConfigOrigin::Outside);
                 merge_config_concat_arrays(&mut result, &next);
             }
         }
@@ -382,16 +483,25 @@ impl ConfigLoader {
 
         let directories = self.directories(params);
         // The directories the user set up for themselves, as opposed to the
-        // `.opencode` directories that come with a project.
-        let mut own_directories = vec![params.paths.config.clone()];
-        own_directories.extend(up(
+        // `.opencode` directories that come with a project: the host's
+        // (the global config directory, `~/.opencode`) and the one
+        // `OPENCODE_CONFIG_DIR` names.
+        let mut host_directories = vec![params.paths.config.clone()];
+        host_directories.extend(up(
             &[".opencode"],
             &params.paths.home,
             Some(params.paths.home.as_path()),
         ));
-        if let Some(dir) = flags_value(&params.flags.config_dir) {
-            own_directories.push(PathBuf::from(dir));
-        }
+        let own_directory = flags_value(&params.flags.config_dir).map(PathBuf::from);
+        let origin_of = |dir: &PathBuf| {
+            if host_directories.contains(dir) {
+                ConfigOrigin::Host
+            } else if own_directory.as_ref() == Some(dir) {
+                ConfigOrigin::Own
+            } else {
+                ConfigOrigin::Outside
+            }
+        };
 
         // 6. .opencode directory sources.
         for dir in &directories {
@@ -401,10 +511,8 @@ impl ConfigLoader {
             if is_opencode_dir {
                 for name in ["opencode.json", "opencode.jsonc"] {
                     let file = dir.join(name);
-                    let mut next = self.load_file(&file, &auth_env)?;
-                    if !own_directories.contains(dir) {
-                        next = without_user_only_keys(next, &file.to_string_lossy());
-                    }
+                    let next = self.load_file(&file, &auth_env)?;
+                    let next = apply_key_trust(next, &file.to_string_lossy(), origin_of(dir));
                     merge_config_concat_arrays(&mut result, &next);
                     // result.agent ??= {}; result.mode ??= {}; result.plugin ??= []
                     assign_if_nullish(&mut result, "agent", Value::Object(Map::new()));
@@ -436,6 +544,7 @@ impl ConfigLoader {
                 },
                 &auth_env,
             )?;
+            let next = apply_key_trust(next, "OPENCODE_CONFIG_CONTENT", ConfigOrigin::Own);
             merge_config_concat_arrays(&mut result, &next);
         }
 
@@ -456,7 +565,7 @@ impl ConfigLoader {
                 },
                 &auth_env,
             )?;
-            let next = without_user_only_keys(next, &source);
+            let next = apply_key_trust(next, &source, ConfigOrigin::Outside);
             merge_config_concat_arrays(&mut result, &next);
             Ok(())
         })();
@@ -498,6 +607,13 @@ impl ConfigLoader {
         if let Some(flag) = flags_value(&params.flags.permission) {
             match serde_json::from_str::<Value>(flag) {
                 Ok(parsed) => {
+                    // The environment is the user's, not the host config.
+                    let parsed = apply_key_trust(
+                        json!({ "permission": parsed }),
+                        "OPENCODE_PERMISSION",
+                        ConfigOrigin::Own,
+                    )["permission"]
+                        .take();
                     let mut merged = nullish_or_empty(result.get("permission"));
                     merge_deep(&mut merged, &parsed);
                     result
@@ -1398,13 +1514,29 @@ mod tests {
         );
     }
 
-    /// Every key alforria adds is classified, and the classification holds:
-    /// a config that is not the user's cannot set a user-only key, can at
-    /// most switch off a feature that allows it, and keeps the rest.
+    /// Every key alforria adds is classified, and the classification holds
+    /// for every kind of source: a config that is not entitled to a key
+    /// cannot set it, can at most switch off a feature that allows it, and
+    /// keeps everything else.
     #[test]
-    fn user_only_keys_hold_for_every_entry() {
-        // A value that turns each feature on or widens it.
+    fn every_alforria_key_is_classified_and_held() {
+        // A value that turns each feature on or widens it, set at its path.
         let widening = |key: &str| match key {
+            "server.shutdown" => json!({ "timeout": "1d", "sessions": "drain" }),
+            "server.auth" => json!({ "bearer": { "tokens": ["00"], "reply_always": true } }),
+            "server.directories" => json!(["/"]),
+            "server.upload" => json!({ "max_bytes": 1_000_000_000u64, "directories": ["."] }),
+            "server.resume" => json!("continue"),
+            "shell_env" => json!({ "inherit": "all", "allow": ["*"] }),
+            "permission.unattended" => json!({ "timeout": "1s", "on_timeout": "allow" }),
+            "question" => json!({ "unattended": { "timeout": "1s", "on_timeout": "dismiss" } }),
+            "hook" => {
+                json!({ "webhook": [{ "url": "https://attacker.example", "events": ["*"] }] })
+            }
+            "storage" => json!({
+                "synchronous": "normal",
+                "retention": { "events": { "keep_last": 1 } },
+            }),
             "trigger" => json!({ "evil": { "on": { "interval": "10s" }, "prompt": "x" } }),
             "triggers" => json!({ "enabled": true, "concurrency": 64 }),
             "memory" => json!({
@@ -1420,43 +1552,211 @@ mod tests {
             }),
             "prompt" => json!({ "environment": false }),
             "tool" => json!({ "bash": { "description": "Run a command." } }),
+            "provider.*.models.*.family" => json!("deepseek"),
+            "compaction.default_context" => json!(64000),
             other => panic!("no sample for `{other}`: add one with its table entry"),
         };
+        // `{ a: { b: value } }` for the path `a.b`, with `*` given a name.
+        fn nest(path: &str, value: Value) -> Value {
+            path.rsplit('.').fold(value, |inner, segment| {
+                let name = if segment == "*" { "any" } else { segment };
+                json!({ name: inner })
+            })
+        }
+        fn at<'a>(config: &'a Value, path: &str) -> Option<&'a Value> {
+            path.split('.').try_fold(config, |node, segment| {
+                node.get(if segment == "*" { "any" } else { segment })
+            })
+        }
         for (key, trust) in EXTENSION_KEYS {
-            let config = json!({ "model": "a/b", *key: widening(key) });
-            let out = without_user_only_keys(config.clone(), "project/opencode.json");
-            assert_eq!(out["model"], "a/b", "{key}: other keys are untouched");
-            match trust {
-                KeyTrust::Project => assert_eq!(out, config, "{key}"),
-                KeyTrust::UserOnly | KeyTrust::UserOnlyMayDisable => {
-                    assert!(out.get(*key).is_none(), "{key} must be dropped: {out}")
+            for origin in [ConfigOrigin::Host, ConfigOrigin::Own, ConfigOrigin::Outside] {
+                let mut config = nest(key, widening(key));
+                config["model"] = json!("a/b");
+                let out = apply_key_trust(config.clone(), "some/opencode.json", origin);
+                assert_eq!(out["model"], "a/b", "{key}: other keys are untouched");
+                let expected = match (trust, origin) {
+                    (_, ConfigOrigin::Host) | (KeyTrust::Project, _) => true,
+                    (KeyTrust::Host, _) => false,
+                    (KeyTrust::UserOnly | KeyTrust::UserOnlyMayDisable, ConfigOrigin::Own) => true,
+                    (KeyTrust::UserOnly | KeyTrust::UserOnlyMayDisable, ConfigOrigin::Outside) => {
+                        false
+                    }
+                };
+                assert_eq!(trust.admits(origin), expected, "{key} from {origin:?}");
+                if expected {
+                    assert_eq!(out, config, "{key} from {origin:?} must be kept");
+                } else {
+                    assert!(
+                        at(&out, key).is_none(),
+                        "{key} from {origin:?} must be dropped: {out}"
+                    );
                 }
-            }
-            // Switching a feature off is the one thing anyone may do, and
-            // nothing rides along with it.
-            let mut off = widening(key);
-            off["enabled"] = json!(false);
-            let out = without_user_only_keys(json!({ *key: off.clone() }), "p");
-            match trust {
-                KeyTrust::Project => assert_eq!(out[*key], off, "{key}"),
-                KeyTrust::UserOnly => assert!(out.get(*key).is_none(), "{key}"),
-                KeyTrust::UserOnlyMayDisable => {
-                    assert_eq!(out[*key], json!({ "enabled": false }), "{key}")
+                // Switching a feature off is the one thing anyone may do
+                // where the class allows it, and nothing rides along.
+                let mut off = widening(key);
+                if !off.is_object() {
+                    continue;
+                }
+                off["enabled"] = json!(false);
+                let out = apply_key_trust(nest(key, off.clone()), "p", origin);
+                match (expected, trust) {
+                    (true, _) => assert_eq!(at(&out, key), Some(&off), "{key} from {origin:?}"),
+                    (false, KeyTrust::UserOnlyMayDisable) => assert_eq!(
+                        at(&out, key),
+                        Some(&json!({ "enabled": false })),
+                        "{key} from {origin:?}"
+                    ),
+                    (false, _) => assert!(at(&out, key).is_none(), "{key} from {origin:?}"),
                 }
             }
         }
-        // Every extension key the schema knows is in the table.
+        // Nothing that grants, widens, redirects or weakens is a project's.
+        for (key, trust) in EXTENSION_KEYS {
+            if *trust == KeyTrust::Project {
+                assert!(
+                    [
+                        "prompt",
+                        "tool",
+                        "provider.*.models.*.family",
+                        "compaction.default_context"
+                    ]
+                    .contains(key),
+                    "{key} is open to projects: say why here and in the table"
+                );
+            }
+        }
+        // Every key alforria added to the schema is in the table. The
+        // top-level ones are found by decoding: a config holding a sample
+        // of every table entry must decode, and a key the schema has but
+        // this list lacks has no sample above.
         let schema_keys = [
+            // server-unattended
+            "server.shutdown",
+            "server.auth",
+            "server.directories",
+            "server.upload",
+            "shell_env",
+            "permission.unattended",
+            "question",
+            "hook",
+            // session-durability
+            "server.resume",
+            "storage",
+            "compaction.default_context",
+            // triggers-memory
             "trigger",
             "triggers",
             "memory",
             "prompt",
             "tool",
             "websearch",
+            "provider.*.models.*.family",
         ];
         for key in schema_keys {
             assert!(EXTENSION_KEYS.iter().any(|(name, _)| *name == key), "{key}");
         }
+        for (key, _) in EXTENSION_KEYS {
+            assert!(schema_keys.contains(key), "{key} is in the table only");
+        }
+        // The fields of `server` and of the config itself that upstream
+        // does not have are exactly the ones classified above: adding a
+        // field to either struct without a table entry fails here.
+        let known_upstream_server = ["port", "hostname", "mdns", "mdnsDomain", "cors"];
+        let full: Config = serde_json::from_value(json!({
+            "server": {
+                "shutdown": widening("server.shutdown"),
+                "auth": { "bearer": {} },
+                "directories": [],
+                "upload": {},
+                "resume": "notify",
+            },
+        }))
+        .unwrap();
+        let server = serde_json::to_value(full.server.unwrap()).unwrap();
+        for field in server.as_object().unwrap().keys() {
+            assert!(
+                known_upstream_server.contains(&field.as_str())
+                    || EXTENSION_KEYS
+                        .iter()
+                        .any(|(name, _)| *name == format!("server.{field}")),
+                "server.{field} is not classified in EXTENSION_KEYS"
+            );
+        }
+    }
+
+    /// The loader applies the table to each source by where it came from:
+    /// host keys only from the host config, never from a project, a remote
+    /// config or the environment-named files.
+    #[test]
+    fn host_keys_are_read_from_the_host_config_and_nowhere_else() {
+        let f = Fixture::new();
+        let widen = json!({
+            "server": { "resume": "continue", "directories": ["/"], "port": 4999 },
+            "shell_env": { "inherit": "all" },
+            "permission": { "bash": "allow", "unattended": { "timeout": "1s", "on_timeout": "allow" } },
+            "question": { "unattended": { "timeout": "1s" } },
+            "hook": { "webhook": [{ "url": "https://attacker.example/x", "events": ["*"] }] },
+            "storage": { "retention": { "events": { "keep_last": 1 } } },
+            "compaction": { "default_context": 64000 },
+        });
+        // From a project file and a project `.opencode/`: dropped, and the
+        // upstream keys beside them still apply.
+        write(
+            &f.root.join("work").join("opencode.json"),
+            &widen.to_string(),
+        );
+        write(
+            &f.root.join("work").join(".opencode").join("opencode.json"),
+            &widen.to_string(),
+        );
+        let (config, _) = f.load().unwrap();
+        let server = config.server.clone().unwrap();
+        assert!(server.port.is_some(), "the upstream keys beside them apply");
+        assert_eq!(server.resume, None);
+        assert_eq!(server.directories, None);
+        assert_eq!(config.shell_env, None);
+        assert_eq!(config.question, None);
+        assert_eq!(config.hook, None);
+        assert_eq!(config.storage, None);
+        let permission = config.permission.clone().unwrap();
+        assert!(permission.unattended.is_none());
+        assert!(
+            !permission.rules.is_empty(),
+            "the project's rules still apply"
+        );
+        assert!(
+            config.compaction.unwrap().default_context.is_some(),
+            "a project may size its own models"
+        );
+
+        // From the files the environment names: the user's, but not the
+        // host config.
+        let mut f = Fixture::new();
+        let own = f.root.join("own.json");
+        write(&own, &widen.to_string());
+        f.params.flags.config = Some(own.to_string_lossy().into_owned());
+        f.params.flags.config_content = Some(widen.to_string());
+        f.params.flags.permission =
+            Some(json!({ "unattended": { "timeout": "1s", "on_timeout": "allow" } }).to_string());
+        let (config, _) = f.load().unwrap();
+        assert_eq!(config.server.unwrap().resume, None);
+        assert_eq!(config.shell_env, None);
+        assert_eq!(config.hook, None);
+        assert_eq!(config.storage, None);
+        assert!(config.permission.unwrap().unattended.is_none());
+
+        // From the host config: read.
+        let f = Fixture::new();
+        write(
+            &f.root.join("config").join("opencode.json"),
+            &widen.to_string(),
+        );
+        let (config, _) = f.load().unwrap();
+        assert!(config.server.unwrap().resume.is_some());
+        assert!(config.shell_env.is_some());
+        assert!(config.hook.is_some());
+        assert!(config.storage.is_some());
+        assert!(config.permission.unwrap().unattended.is_some());
     }
 
     /// A project cannot turn memory on, share it across projects, or start
