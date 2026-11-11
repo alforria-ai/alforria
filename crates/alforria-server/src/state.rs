@@ -480,6 +480,9 @@ pub trait AuthStore: Send + Sync {
     fn generation(&self) -> u64 {
         0
     }
+    /// Record who asked for a credential change (no secrets). The file
+    /// store appends it to its write log; other stores ignore it.
+    fn audit(&self, _note: &str) {}
 }
 
 /// In-memory default [`AuthStore`].
@@ -624,30 +627,112 @@ impl FileAuthStore {
         Ok(out)
     }
 
-    fn write(&self, data: &serde_json::Value) -> Result<(), ServerError> {
-        if let Some(parent) = self.file.parent() {
-            std::fs::create_dir_all(parent).map_err(|err| {
-                ServerError::Core(alforria_core::CoreError::Storage(format!(
-                    "Failed to write auth data: {err}"
-                )))
-            })?;
+    /// The file's entries for a read-modify-write. Unlike a plain read, a
+    /// file that exists but cannot be read or parsed is an error: treating
+    /// it as empty would make the write that follows erase every stored
+    /// credential.
+    fn entries_for_update(
+        &self,
+    ) -> Result<serde_json::Map<String, serde_json::Value>, ServerError> {
+        let refuse = |why: String| {
+            ServerError::Core(alforria_core::CoreError::Storage(format!(
+                "Refusing to rewrite {}: {why}",
+                self.file.display()
+            )))
+        };
+        let text = match std::fs::read_to_string(&self.file) {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(serde_json::Map::new())
+            }
+            Err(err) => return Err(refuse(format!("it could not be read ({err})"))),
+        };
+        if text.trim().is_empty() {
+            return Ok(serde_json::Map::new());
         }
-        let text = serde_json::to_string(data).map_err(|err| {
+        match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(serde_json::Value::Object(object)) => Ok(object),
+            Ok(_) => Err(refuse("it is not a JSON object".to_string())),
+            Err(err) => Err(refuse(format!("it is not valid JSON ({err})"))),
+        }
+    }
+
+    /// Replace the file in one step (temp file + rename), so another
+    /// process never reads a half-written or empty file.
+    fn write(&self, data: &serde_json::Value) -> Result<(), ServerError> {
+        let failed = |err: String| {
             ServerError::Core(alforria_core::CoreError::Storage(format!(
                 "Failed to write auth data: {err}"
             )))
-        })?;
-        std::fs::write(&self.file, text).map_err(|err| {
-            ServerError::Core(alforria_core::CoreError::Storage(format!(
-                "Failed to write auth data: {err}"
-            )))
-        })?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&self.file, std::fs::Permissions::from_mode(0o600));
+        };
+        if let Some(parent) = self.file.parent() {
+            std::fs::create_dir_all(parent).map_err(|err| failed(err.to_string()))?;
+        }
+        let text = serde_json::to_string(data).map_err(|err| failed(err.to_string()))?;
+        let mut staged = self.file.clone().into_os_string();
+        staged.push(format!(".{}.tmp", std::process::id()));
+        let staged = PathBuf::from(staged);
+        let result = (|| -> std::io::Result<()> {
+            use std::io::Write as _;
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&staged)?;
+            file.write_all(text.as_bytes())?;
+            file.sync_all()?;
+            std::fs::rename(&staged, &self.file)
+        })();
+        if let Err(err) = result {
+            let _ = std::fs::remove_file(&staged);
+            return Err(failed(err.to_string()));
         }
         Ok(())
+    }
+
+    /// `auth-audit.log` beside auth.json: one line per credential change
+    /// with the time, this process, the operation and the provider ids
+    /// before and after — never a secret. Best-effort.
+    fn log_line(&self, line: &str) {
+        use std::io::Write as _;
+        let Some(dir) = self.file.parent() else {
+            return;
+        };
+        let millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis())
+            .unwrap_or_default();
+        let exe = std::env::args().collect::<Vec<_>>().join(" ");
+        let mut options = std::fs::OpenOptions::new();
+        options.append(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        if let Ok(mut file) = options.open(dir.join("auth-audit.log")) {
+            let _ = writeln!(
+                file,
+                "{millis} pid={} cmd={exe:?} {line}",
+                std::process::id()
+            );
+        }
+    }
+
+    fn log_change(
+        &self,
+        operation: &str,
+        provider_id: &str,
+        before: &[String],
+        after: &serde_json::Map<String, serde_json::Value>,
+    ) {
+        let after: Vec<&String> = after.keys().collect();
+        self.log_line(&format!(
+            "{operation} provider={provider_id:?} before={before:?} after={after:?}"
+        ));
     }
 }
 
@@ -655,21 +740,18 @@ impl AuthStore for FileAuthStore {
     fn set(&self, provider_id: &str, info: serde_json::Value) -> Result<(), ServerError> {
         let _guard = self.lock.lock().unwrap_or_else(|p| p.into_inner());
         let norm = provider_id.trim_end_matches('/');
-        let mut data = serde_json::Value::Object(
-            self.all_unlocked()?
-                .into_iter()
-                .collect::<serde_json::Map<String, serde_json::Value>>(),
-        );
-        let object = data
-            .as_object_mut()
-            .expect("auth entries are always an object");
+        let mut object = self.entries_for_update().inspect_err(|err| {
+            self.log_line(&format!("set provider={provider_id:?} REFUSED {err:?}"));
+        })?;
+        let before: Vec<String> = object.keys().cloned().collect();
         if norm != provider_id {
             object.remove(provider_id);
         }
         let slash_key = format!("{norm}/");
         object.remove(&slash_key);
         object.insert(norm.to_string(), info);
-        self.write(&data)?;
+        self.write(&serde_json::Value::Object(object.clone()))?;
+        self.log_change("set", provider_id, &before, &object);
         self.bump();
         Ok(())
     }
@@ -677,19 +759,20 @@ impl AuthStore for FileAuthStore {
     fn remove(&self, provider_id: &str) -> Result<(), ServerError> {
         let _guard = self.lock.lock().unwrap_or_else(|p| p.into_inner());
         let norm = provider_id.trim_end_matches('/');
-        let mut data = serde_json::Value::Object(
-            self.all_unlocked()?
-                .into_iter()
-                .collect::<serde_json::Map<String, serde_json::Value>>(),
-        );
-        let object = data
-            .as_object_mut()
-            .expect("auth entries are always an object");
+        let mut object = self.entries_for_update().inspect_err(|err| {
+            self.log_line(&format!("remove provider={provider_id:?} REFUSED {err:?}"));
+        })?;
+        let before: Vec<String> = object.keys().cloned().collect();
         object.remove(provider_id);
         object.remove(norm);
-        self.write(&data)?;
+        self.write(&serde_json::Value::Object(object.clone()))?;
+        self.log_change("remove", provider_id, &before, &object);
         self.bump();
         Ok(())
+    }
+
+    fn audit(&self, note: &str) {
+        self.log_line(note);
     }
 
     fn has(&self, provider_id: &str) -> bool {

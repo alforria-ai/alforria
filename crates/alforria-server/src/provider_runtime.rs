@@ -993,6 +993,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn auth_store_never_erases_a_file_it_cannot_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("auth.json");
+        // A half-written file: another process is mid-save.
+        std::fs::write(&file, r#"{"libertai":{"type":"api","key":"LT"#).unwrap();
+        let auth = crate::state::FileAuthStore::new(file.clone());
+        assert!(auth.remove("other").is_err());
+        assert!(auth
+            .set("other", json!({"type": "api", "key": "k"}))
+            .is_err());
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            r#"{"libertai":{"type":"api","key":"LT"#
+        );
+
+        // A good file: other providers survive, and every change is logged
+        // without the key.
+        std::fs::write(&file, r#"{"libertai":{"type":"api","key":"LTAI_secret"}}"#).unwrap();
+        auth.set("other", json!({"type": "api", "key": "sk-secret"}))
+            .unwrap();
+        auth.remove("other").unwrap();
+        let ids = auth.ids();
+        assert_eq!(ids, vec!["libertai".to_string()]);
+        let log = std::fs::read_to_string(dir.path().join("auth-audit.log")).unwrap();
+        assert!(log.contains("REFUSED"), "{log}");
+        assert!(log.contains(r#"set provider="other""#), "{log}");
+        assert!(log.contains(r#"remove provider="other""#), "{log}");
+        assert!(!log.contains("secret"), "{log}");
+        // No temp file is left behind.
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert!(
+            names.iter().all(|name| !name.ends_with(".tmp")),
+            "{names:?}"
+        );
+    }
+
+    #[test]
     fn parse_model_splits_at_first_slash() {
         assert_eq!(parse_model("a/b/c"), ("a".to_string(), "b/c".to_string()));
         assert_eq!(parse_model("a"), ("a".to_string(), String::new()));

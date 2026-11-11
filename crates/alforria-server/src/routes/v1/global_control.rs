@@ -237,11 +237,30 @@ fn auth_info_valid(value: &Value) -> bool {
 }
 
 /// `authSet` (`handlers/control.ts:7-13`).
+/// Which client sent a credential change, for the auth write log.
+fn client_of(headers: &axum::http::HeaderMap) -> String {
+    let text = |name: header::HeaderName| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("-")
+            .to_string()
+    };
+    format!(
+        "user-agent={:?} referer={:?}",
+        text(header::USER_AGENT),
+        text(header::REFERER)
+    )
+}
+
 pub async fn auth_set(
     State(ctx): State<Arc<ServerContext>>,
     PathParam(provider_id): PathParam<String>,
+    headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Result<Response, ServerError> {
+    ctx.auth_store
+        .audit(&format!("PUT /auth/{provider_id} {}", client_of(&headers)));
     let payload: Value = serde_json::from_slice(&body)
         .map_err(|err| payload_error(format!("Invalid JSON payload: {err}")))?;
     if !auth_info_valid(&payload) {
@@ -256,7 +275,12 @@ pub async fn auth_set(
 pub async fn auth_remove(
     State(ctx): State<Arc<ServerContext>>,
     PathParam(provider_id): PathParam<String>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Response, ServerError> {
+    ctx.auth_store.audit(&format!(
+        "DELETE /auth/{provider_id} {}",
+        client_of(&headers)
+    ));
     let service = ctx.provider_auth.clone();
     let id = provider_id.clone();
     let _ = tokio::task::spawn_blocking(move || service.logout(&id)).await;
