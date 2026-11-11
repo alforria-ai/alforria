@@ -631,6 +631,112 @@ impl MemoryService {
         })
     }
 
+    /// The records to inject into a session, newest first: at most `limit`.
+    ///
+    /// Who may be shown what is decided **in the query, before the limit**
+    /// — it used to be applied to the newest `limit` rows afterwards, so
+    /// twenty records from a chat token emptied the operator's block. And
+    /// the limit is shared out between writer classes (the operator's and
+    /// restricted writers', verified and not): each class present gets an
+    /// equal share of the slots first, and only the slots a class leaves
+    /// unused go to the others by recency. No class crowds out another.
+    fn injectable(
+        &self,
+        restricted_session: bool,
+        limit: usize,
+    ) -> Result<Vec<MemoryRecord>, MemoryError> {
+        // One definition of "a restricted writer saved it", matching
+        // `Provenance::restricted` as `row_to_record` reads it.
+        // (`CASE`, not `AND`: SQLite may evaluate both sides, and
+        // `json_extract` raises on a malformed origin.)
+        const RESTRICTED: &str = "(CASE WHEN json_valid(memory.provenance) \
+             THEN json_extract(memory.provenance, '$.restricted') IS NOT NULL \
+              AND json_extract(memory.provenance, '$.restricted') IS NOT 0 \
+             ELSE 0 END)";
+        let class = format!(
+            "(CASE WHEN {RESTRICTED} THEN 2 ELSE 0 END \
+              + CASE WHEN memory.trust = 'verified' THEN 0 ELSE 1 END)"
+        );
+        let limit = limit.max(1);
+        let rows: Vec<(MemoryRecord, i64)> = self.storage.with_connection(|conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {COLUMNS}, m.writer_class FROM (
+                     SELECT memory.*, {class} AS writer_class,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY {class}
+                                ORDER BY memory.time_updated DESC, memory.id DESC
+                            ) AS writer_rank
+                     FROM memory
+                     WHERE memory.project_id = ?1 AND memory.archived = 0
+                       AND (?2 OR memory.trust = 'verified')
+                       AND (?2 OR ?3 OR NOT COALESCE({RESTRICTED}, 0))
+                 ) m
+                 WHERE m.writer_rank <= ?4
+                 ORDER BY m.time_updated DESC, m.id DESC"
+            ))?;
+            let rows = stmt
+                .query_map(
+                    params![
+                        self.settings.project_id,
+                        self.settings.inject_unverified,
+                        restricted_session,
+                        limit as i64
+                    ],
+                    |row| Ok((row_to_record(row)?, row.get::<_, i64>("writer_class")?)),
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok::<_, MemoryError>(rows)
+        })?;
+        // Fail closed, as before: a row whose column says verified but
+        // whose origin cannot be read or disagrees is not injected
+        // (`row_to_record`), and neither is a restricted writer's record
+        // outside its own kind of session, whatever the query let through.
+        let rows: Vec<(MemoryRecord, i64)> = rows
+            .into_iter()
+            .filter(|(record, _)| self.settings.inject_unverified || record.verified)
+            .filter(|(record, _)| {
+                self.settings.inject_unverified
+                    || restricted_session
+                    || !record
+                        .provenance
+                        .as_ref()
+                        .is_some_and(|provenance| provenance.restricted)
+            })
+            .collect();
+        let mut classes: Vec<i64> = rows.iter().map(|(_, class)| *class).collect();
+        classes.sort_unstable();
+        classes.dedup();
+        let share = (limit / classes.len().max(1)).max(1);
+        let mut taken: std::collections::HashMap<i64, usize> = Default::default();
+        let mut chosen = vec![false; rows.len()];
+        let mut count = 0;
+        // Each class's share first, newest first within it…
+        for (index, (_, class)) in rows.iter().enumerate() {
+            let used = taken.entry(*class).or_default();
+            if *used < share && count < limit {
+                *used += 1;
+                chosen[index] = true;
+                count += 1;
+            }
+        }
+        // …then what is left over, by recency.
+        for slot in chosen.iter_mut() {
+            if count >= limit {
+                break;
+            }
+            if !*slot {
+                *slot = true;
+                count += 1;
+            }
+        }
+        Ok(rows
+            .into_iter()
+            .zip(chosen)
+            .filter(|(_, chosen)| *chosen)
+            .map(|((record, _), _)| record)
+            .collect())
+    }
+
     /// Change a record on the user's behalf (a client, through `/memory`).
     pub fn update(&self, id: &str, patch: &MemoryPatch) -> Result<MemoryRecord, MemoryError> {
         self.update_by(id, patch, &Provenance::api())
@@ -968,23 +1074,8 @@ impl MemoryService {
             return None;
         }
         let records = self
-            .list(&ListQuery {
-                limit: Some(self.settings.inject_recent.min(500)),
-                verified_only: !self.settings.inject_unverified,
-                ..Default::default()
-            })
-            .ok()?
-            .into_iter()
-            .filter(|record| self.settings.inject_unverified || record.verified)
-            .filter(|record| {
-                self.settings.inject_unverified
-                    || restricted_session
-                    || !record
-                        .provenance
-                        .as_ref()
-                        .is_some_and(|provenance| provenance.restricted)
-            })
-            .collect::<Vec<_>>();
+            .injectable(restricted_session, self.settings.inject_recent.min(500))
+            .ok()?;
         if records.is_empty() {
             return None;
         }
@@ -1703,6 +1794,70 @@ mod tests {
         assert!(grand);
         assert!(metadata.unwrap().contains("\"note\":1"));
         assert!(!marked("ses_ok").0 && !marked("ses_orphan").0);
+    }
+
+    /// M6. Who may be shown a record is decided before the limit, and the
+    /// limit is shared between writer classes: twenty records from a chat
+    /// token do not empty the operator's `<memory>` block, and the
+    /// operator's notes do not push a chat client's own out of its
+    /// sessions' block.
+    #[test]
+    fn no_writer_class_crowds_another_out_of_the_injected_block() {
+        let (_dir, store) = storage("mem-quota-a");
+        let memory = service(store, settings("proj"));
+        for i in 0..3 {
+            memory
+                .remember(Some("fact"), &format!("Operator fact {i}."), None)
+                .unwrap();
+        }
+        for i in 0..20 {
+            memory
+                .remember_from(
+                    None,
+                    &format!("chat filler {i}"),
+                    None,
+                    Provenance::client(),
+                )
+                .unwrap();
+        }
+        // The operator's session: its own records, none of the client's.
+        let block = memory
+            .injection_for(false)
+            .expect("the operator's block is not empty");
+        for i in 0..3 {
+            assert!(block.contains(&format!("Operator fact {i}.")), "{block}");
+        }
+        assert!(!block.contains("chat filler"), "{block}");
+        // A restricted session sees both kinds, each with its share.
+        let block = memory.injection_for(true).unwrap();
+        for i in 0..3 {
+            assert!(block.contains(&format!("Operator fact {i}.")), "{block}");
+        }
+        assert_eq!(block.matches("chat filler").count(), 17, "{block}");
+        assert!(block.contains("chat filler 19"), "{block}");
+        // The other way round: many operator notes, a few of the client's.
+        let (_dir, store) = storage("mem-quota-b");
+        let memory = service(store, settings("proj"));
+        for i in 0..3 {
+            memory
+                .remember_from(
+                    None,
+                    &format!("client note {i}"),
+                    None,
+                    Provenance::client(),
+                )
+                .unwrap();
+        }
+        for i in 0..30 {
+            memory
+                .remember(Some("fact"), &format!("Operator fact {i}."), None)
+                .unwrap();
+        }
+        let block = memory.injection_for(true).unwrap();
+        for i in 0..3 {
+            assert!(block.contains(&format!("client note {i}")), "{block}");
+        }
+        assert_eq!(block.matches("<record ").count(), 20, "{block}");
     }
 
     #[test]
