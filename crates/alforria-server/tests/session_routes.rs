@@ -644,6 +644,71 @@ async fn messages_paging_link_headers() {
     assert_eq!(all.as_array().map(Vec::len), Some(5));
 }
 
+/// A long history is written out a page at a time, and reads the same as
+/// the buffered and the paginated responses.
+#[tokio::test]
+async fn a_long_unpaginated_history_is_streamed() {
+    use futures::StreamExt;
+
+    let f = fixture();
+    let router = routes::build_router(f.ctx.clone());
+    let session = create_session(&router).await;
+    let session_id = session["id"].as_str().unwrap().to_string();
+    let base = format!("/session/{session_id}/message");
+
+    let ids: Vec<String> = (0..250)
+        .map(|i| seed_message(&f.services, &session_id, &format!("m{i}")))
+        .collect();
+
+    let response = send(&router, "GET", &base, "").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "application/json"
+    );
+    // No length up front: the body is not built before it is sent.
+    assert!(response.headers().get("content-length").is_none());
+    let mut body = response.into_body().into_data_stream();
+    let mut frames = 0;
+    let mut bytes = Vec::new();
+    while let Some(data) = body.next().await {
+        frames += 1;
+        bytes.extend_from_slice(&data.unwrap());
+    }
+    assert!(frames >= 3, "250 messages in pages of 100: {frames} frames");
+    let streamed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let listed: Vec<&str> = streamed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|message| message["info"]["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(listed, ids.iter().map(String::as_str).collect::<Vec<_>>());
+
+    // The same bytes the buffered path writes for the same messages.
+    let expected = serde_json::to_string(
+        &f.services
+            .sessions
+            .messages(&session_id, None)
+            .unwrap()
+            .iter()
+            .map(|message| serde_json::json!({ "info": message.info, "parts": message.parts }))
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    assert_eq!(String::from_utf8(bytes).unwrap(), expected);
+
+    // An exact multiple of the page size ends cleanly.
+    let other = create_session(&router).await;
+    let other_id = other["id"].as_str().unwrap().to_string();
+    for i in 0..200 {
+        seed_message(&f.services, &other_id, &format!("m{i}"));
+    }
+    let response = send(&router, "GET", &format!("/session/{other_id}/message"), "").await;
+    let all: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+    assert_eq!(all.as_array().map(Vec::len), Some(200));
+}
+
 #[tokio::test]
 async fn message_get_and_delete() {
     let f = fixture();

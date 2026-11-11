@@ -189,12 +189,7 @@ impl SessionPrompt {
     /// the model waits for results that never arrive or redoes the work.
     /// The note is for the model only and starts no turn.
     pub async fn fork_notice(&self, session_id: &str) -> Result<(), PromptError> {
-        let has_history = !self
-            .deps
-            .services
-            .messages
-            .stream_without_diffs(session_id)?
-            .is_empty();
+        let has_history = self.deps.services.messages.newest(session_id)?.is_some();
         if !has_history {
             return Ok(());
         }
@@ -286,10 +281,7 @@ impl SessionPrompt {
                 Ok(None) => deps
                     .services
                     .messages
-                    .stream_without_diffs(&input.session_id)?
-                    // Newest first.
-                    .into_iter()
-                    .next()
+                    .newest(&input.session_id)?
                     .ok_or_else(|| PromptError::Unknown {
                         message: "The session has no messages.".to_string(),
                     }),

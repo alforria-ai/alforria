@@ -663,57 +663,71 @@ impl SessionCompaction {
         }
         tracing::info!("pruning");
 
-        let msgs = match self.deps.sessions.messages_without_diffs(session_id) {
-            Ok(msgs) => msgs,
-            // catchIf(NotFoundError, () => undefined)
-            Err(SessionError::NotFound(_)) => return Ok(()),
-            Err(error) => return Err(error),
-        };
-
         let mut total = 0.0;
         let mut pruned = 0.0;
         let mut to_prune: Vec<V1Part> = Vec::new();
         let mut count: u64 = 0;
 
-        'walk: for msg in msgs.iter().rev() {
-            if matches!(msg.info, V1Message::User { .. }) {
-                count += 1;
-            }
-            if count < 2 {
-                continue;
-            }
-            if matches!(
-                &msg.info,
-                V1Message::Assistant {
-                    summary: Some(true),
-                    ..
+        // Newest first, a page at a time, and no further than the walk
+        // goes: it ends at the last summary or the last pruned output.
+        let mut before: Option<String> = None;
+        'walk: loop {
+            let page =
+                match self
+                    .deps
+                    .messages
+                    .page_without_diffs(session_id, 50, before.as_deref())
+                {
+                    Ok(page) => page,
+                    // catchIf(NotFoundError, () => undefined)
+                    Err(SessionError::NotFound(_)) => return Ok(()),
+                    Err(error) => return Err(error),
+                };
+            for msg in page.items.iter().rev() {
+                if matches!(msg.info, V1Message::User { .. }) {
+                    count += 1;
                 }
-            ) {
-                break;
-            }
-            for part in msg.parts.iter().rev() {
-                let V1Part::Tool { state, tool, .. } = part else {
-                    continue;
-                };
-                let alforria_schema::session_v1::V1ToolState::Completed { output, time, .. } =
-                    state
-                else {
-                    continue;
-                };
-                if PRUNE_PROTECTED_TOOLS.contains(&tool.as_str()) {
+                if count < 2 {
                     continue;
                 }
-                if time.compacted.is_some() {
+                if matches!(
+                    &msg.info,
+                    V1Message::Assistant {
+                        summary: Some(true),
+                        ..
+                    }
+                ) {
                     break 'walk;
                 }
-                let estimate = token_estimate(output);
-                total += estimate;
-                if total <= PRUNE_PROTECT {
-                    continue;
+                for part in msg.parts.iter().rev() {
+                    let V1Part::Tool { state, tool, .. } = part else {
+                        continue;
+                    };
+                    let alforria_schema::session_v1::V1ToolState::Completed {
+                        output, time, ..
+                    } = state
+                    else {
+                        continue;
+                    };
+                    if PRUNE_PROTECTED_TOOLS.contains(&tool.as_str()) {
+                        continue;
+                    }
+                    if time.compacted.is_some() {
+                        break 'walk;
+                    }
+                    let estimate = token_estimate(output);
+                    total += estimate;
+                    if total <= PRUNE_PROTECT {
+                        continue;
+                    }
+                    pruned += estimate;
+                    to_prune.push(part.clone());
                 }
-                pruned += estimate;
-                to_prune.push(part.clone());
             }
+            if !page.more || page.cursor.is_none() {
+                break;
+            }
+            before = page.cursor;
         }
 
         tracing::info!(pruned, total, "found");

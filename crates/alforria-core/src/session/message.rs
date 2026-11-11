@@ -66,6 +66,10 @@ pub fn message_role(info: &V1Message) -> &'static str {
     }
 }
 
+fn message_id_of(info: &V1Message) -> String {
+    message_id(info).to_string()
+}
+
 /// `info.sessionID` for any message.
 pub(crate) fn message_session_id(info: &V1Message) -> &str {
     match info {
@@ -327,6 +331,7 @@ impl MessageStore {
     /// `hydrate` (message-v2.ts:98-122): batch part lookup per message,
     /// ordered by (message_id, id).
     fn hydrate(&self, rows: &[Message]) -> Result<Vec<WithParts>, CoreError> {
+        self.storage.count_message_rows(rows.len());
         let ids: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
         let mut part_lists: HashMap<String, Vec<V1Part>> = HashMap::new();
         if !ids.is_empty() {
@@ -404,14 +409,17 @@ impl MessageStore {
     /// sent, only compacted, and holding all of it would cost memory in
     /// proportion to the session.
     pub fn window(&self, session_id: &str, max_bytes: usize) -> Result<Window, SessionError> {
-        const SIZE: usize = 50;
+        // Most windows end within a few messages of the newest: start with
+        // a small page and grow it, so a short window is not paid for at
+        // the full page size on every step.
+        let mut size: usize = 16;
         let mut walk = CompactedWalk::default();
         let mut before: Option<String> = None;
         let mut bytes = 0usize;
         let mut complete = true;
         'pages: loop {
             let page =
-                match self.page_of(COLUMNS_WITHOUT_DIFFS, session_id, SIZE, before.as_deref()) {
+                match self.page_of(COLUMNS_WITHOUT_DIFFS, session_id, size, before.as_deref()) {
                     Ok(page) => page,
                     Err(SessionError::NotFound(_)) => break,
                     Err(err) => return Err(err),
@@ -434,11 +442,65 @@ impl MessageStore {
                 break;
             }
             before = page.cursor;
+            size = (size * 2).min(64);
         }
         Ok(Window {
             messages: walk.finish(),
             complete,
         })
+    }
+
+    /// The newest message, if the session has any.
+    pub fn newest(&self, session_id: &str) -> Result<Option<WithParts>, SessionError> {
+        match self.page_of(COLUMNS_WITHOUT_DIFFS, session_id, 1, None) {
+            Ok(page) => Ok(page.items.into_iter().next()),
+            Err(SessionError::NotFound(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// `message_id` and every message after it, oldest first, without
+    /// reading anything older. Empty when the session has no such message.
+    /// `summary.diffs` come back empty.
+    pub fn since(
+        &self,
+        session_id: &str,
+        message_id: &str,
+    ) -> Result<Vec<WithParts>, SessionError> {
+        let row = self.storage.with_connection(|conn| {
+            conn.query_row(
+                "SELECT time_created FROM message WHERE id = ?1 AND session_id = ?2",
+                [message_id, session_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .ok()
+        });
+        let Some(time) = row else {
+            return Ok(Vec::new());
+        };
+        const SIZE: usize = 50;
+        let mut result = Vec::new();
+        let mut after = Cursor {
+            id: message_id.to_string(),
+            time: time as f64,
+        };
+        let mut inclusive = true;
+        loop {
+            let page = self.page_after(session_id, Some(&after), inclusive, SIZE)?;
+            let full = page.len() == SIZE;
+            if let Some(last) = page.last() {
+                after = Cursor {
+                    id: message_id_of(&last.info),
+                    time: message_time_created(&last.info),
+                };
+                inclusive = false;
+            }
+            result.extend(page);
+            if !full {
+                break;
+            }
+        }
+        Ok(result)
     }
 
     /// The stored size of these messages' parts.
@@ -471,11 +533,32 @@ impl MessageStore {
         inclusive: bool,
         limit: usize,
     ) -> Result<Vec<WithParts>, SessionError> {
+        self.page_after_of(COLUMNS_WITHOUT_DIFFS, session_id, after, inclusive, limit)
+    }
+
+    /// [`Self::page_after`] with `summary.diffs` as stored.
+    pub fn page_after_with_diffs(
+        &self,
+        session_id: &str,
+        after: Option<&Cursor>,
+        limit: usize,
+    ) -> Result<Vec<WithParts>, SessionError> {
+        self.page_after_of(ALL_COLUMNS, session_id, after, false, limit)
+    }
+
+    fn page_after_of(
+        &self,
+        columns: &str,
+        session_id: &str,
+        after: Option<&Cursor>,
+        inclusive: bool,
+        limit: usize,
+    ) -> Result<Vec<WithParts>, SessionError> {
         let sql = if after.is_some() {
             let id = if inclusive { ">=" } else { ">" };
-            format!("SELECT {COLUMNS_WITHOUT_DIFFS} FROM message WHERE session_id = ?1 AND (time_created > ?2 OR (time_created = ?2 AND id {id} ?3)) ORDER BY time_created ASC, id ASC LIMIT ?4")
+            format!("SELECT {columns} FROM message WHERE session_id = ?1 AND (time_created > ?2 OR (time_created = ?2 AND id {id} ?3)) ORDER BY time_created ASC, id ASC LIMIT ?4")
         } else {
-            format!("SELECT {COLUMNS_WITHOUT_DIFFS} FROM message WHERE session_id = ?1 ORDER BY time_created ASC, id ASC LIMIT ?4")
+            format!("SELECT {columns} FROM message WHERE session_id = ?1 ORDER BY time_created ASC, id ASC LIMIT ?4")
         };
         let (time, id) = match after {
             Some(cursor) => (cursor.time as i64, cursor.id.clone()),

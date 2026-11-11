@@ -130,16 +130,20 @@ pub async fn resolve(
         }
         crate::tool::permission::merge(&merged)
     };
-    let messages: Vec<Value> = input
-        .messages
-        .iter()
-        .map(|msg| {
-            serde_json::json!({
-                "info": msg.info,
-                "parts": msg.parts,
+    // Shared by every tool's closure: one copy of the history, not one per
+    // tool.
+    let messages: Arc<Vec<Value>> = Arc::new(
+        input
+            .messages
+            .iter()
+            .map(|msg| {
+                serde_json::json!({
+                    "info": msg.info,
+                    "parts": msg.parts,
+                })
             })
-        })
-        .collect();
+            .collect(),
+    );
     let model_value = serde_json::to_value(input.model.clone()).unwrap_or(Value::Null);
 
     let mut tools: ResolvedTools = Vec::new();

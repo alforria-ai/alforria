@@ -411,7 +411,11 @@ pub async fn run_loop(
 
         step += 1;
         if step == 1 {
-            fork_title(deps, session.clone(), msgs.clone(), &last_user);
+            // Only an untitled top-level session gets a title: do not copy
+            // the history for the others.
+            if session.parent_id.is_none() && is_default_title(&session.title) {
+                fork_title(deps, session.clone(), msgs.clone(), &last_user);
+            }
             // TS forks `summary.summarize` at the same step
             // (prompt.ts:1253, after the title fork at :1133), and
             // Effect's cooperative scheduler runs it as soon as the

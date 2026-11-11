@@ -792,4 +792,115 @@ mod tests {
         assert!(later.iter().any(|request| request.agent == "compaction"));
         assert!(later.iter().all(|request| !request.rejected), "{later:?}");
     }
+
+    /// `messages` of history that a completed compaction has put behind a
+    /// summary, keeping the last two turns in full.
+    fn write_compacted(e: &Engine, session_id: &str, messages: usize) {
+        write_long_session(
+            &e.services.storage,
+            session_id,
+            LongSession {
+                messages,
+                tool_output: (200, 400),
+            },
+        );
+        let sessions = &e.services.sessions;
+        let marker = format!("msg_{:026}", messages);
+        let summary = format!("msg_{:026}", messages + 1);
+        let tail = format!("msg_{:026}", messages - 6);
+        sessions
+            .update_message(&user_message(session_id, &marker, messages as f64 + 1.0))
+            .unwrap();
+        sessions
+            .update_part(&crate::session::test_support::compaction_part(
+                session_id,
+                &marker,
+                &format!("prt_{:026}", messages * 4),
+                true,
+                None,
+                Some(&tail),
+            ))
+            .unwrap();
+        sessions
+            .update_message(&assistant_message(
+                session_id,
+                &summary,
+                &marker,
+                messages as u64 + 2,
+                Some(true),
+                Some("stop".to_string()),
+            ))
+            .unwrap();
+        sessions
+            .update_part(&text_part(
+                session_id,
+                &summary,
+                &format!("prt_{:026}", messages * 4 + 1),
+                "## Goal\nThe earlier modules were read and reported on.",
+            ))
+            .unwrap();
+    }
+
+    /// Message rows read by a three-step turn (two tool calls, then the
+    /// answer) on a session with `messages` of compacted history.
+    async fn rows_read_by_a_turn(name: &str, messages: usize) -> u64 {
+        use crate::session::test_support::{engine, text_stream};
+        let call = |id: &str| {
+            let mut events = vec![
+                Ok(LlmEvent::StepStart { index: 0.0 }),
+                Ok(LlmEvent::ToolCall {
+                    id: id.to_string(),
+                    name: "read".to_string(),
+                    input: json!({ "filePath": "a.txt" }),
+                    provider_executed: None,
+                    provider_metadata: None,
+                }),
+            ];
+            events.extend([
+                Ok(LlmEvent::StepFinish {
+                    index: 0.0,
+                    reason: FinishReason::ToolCalls,
+                    usage: None,
+                    provider_metadata: None,
+                }),
+                Ok(LlmEvent::Finish {
+                    reason: FinishReason::ToolCalls,
+                    usage: None,
+                    provider_metadata: None,
+                }),
+            ]);
+            events
+        };
+        let e = engine(
+            name,
+            vec![call("call_a"), call("call_b"), text_stream("done")],
+        );
+        std::fs::write(e.worktree.join("a.txt"), "x\n").unwrap();
+        let session = create_engine_session(&e);
+        write_compacted(&e, &session.id, messages);
+
+        let before = e.services.storage.message_rows_read();
+        let answer = prompt_again(&e, &session.id, "read a.txt twice").await;
+        assert_eq!(text_of(&answer), "done");
+        assert_eq!(e.llm.calls(), 3);
+        // The summary and the kept turns are what the model is sent.
+        let sent = serde_json::to_string(&e.llm.input(0).messages).unwrap();
+        assert!(sent.contains("The earlier modules were read"), "{sent}");
+        assert!(!sent.contains("Request 0:"), "{sent}");
+        // Let the forked diff summary and prune finish reading.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        e.services.storage.message_rows_read() - before
+    }
+
+    #[tokio::test]
+    async fn a_step_reads_the_same_rows_however_long_the_history_is() {
+        let short = rows_read_by_a_turn("rows-short", 300).await;
+        let long = rows_read_by_a_turn("rows-long", 3_000).await;
+        eprintln!("rows read by a three-step turn: {short} with 300 messages of history, {long} with 3,000");
+        assert_eq!(short, long);
+        // Four passes over a window of about a dozen messages, read a page
+        // at a time, plus the turn's own bookkeeping: nowhere near the
+        // history.
+        assert!(long < 200, "{long}");
+    }
 }

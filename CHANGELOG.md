@@ -67,6 +67,17 @@ pre-1.0, so minor releases may include breaking changes.
   session's size. A session already stuck in that state compacts on its next
   prompt. When a provider refuses a summary request as too large (its real
   limit is below the declared one), the pieces are halved and tried again.
+- Every step of a turn re-read the session's whole history from the
+  database, several times over, however much of it a compaction had already
+  put behind a summary. A step now reads back to the last compaction and no
+  further, so its cost follows the conversation since then, not the session's
+  age. The per-turn diff summary, pruning, goal review and subagent reports
+  got the same treatment, and a turn's tools share one copy of the history
+  instead of holding one each.
+- `GET /session/{id}/message` without `limit` built the whole history in
+  memory before answering. A history of 100 messages or more is now written
+  out a page at a time. Clients that can should still pass `limit` and page
+  with `before`.
 - A file path containing `..` could write, search or read outside the project
   without the `external_directory` prompt, through `apply_patch`, `grep`,
   `glob` and `lsp`.
