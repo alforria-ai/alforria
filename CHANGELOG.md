@@ -224,6 +224,17 @@ pre-1.0, so minor releases may include breaking changes.
 
 ### Fixed
 
+- Two servers on one data directory no longer do the same work twice.
+  A turn interrupted by a kill was resumed by every server that started
+  afterwards (the marker was a liveness check, not a claim); a starting
+  server closed the unfinished trigger runs of a server that was still
+  running them; and a webhook call, a watched change or a manual run that
+  reached both ran on both. Restart markers are now claimed with an atomic
+  rename, trigger runs record their owner process and only an orphan's are
+  closed, every fire is claimed in the database, and one process per
+  directory schedules. See "Two servers on one data directory" in
+  `docs/unattended-server.md`.
+
 - Routes naming a session and a message, part or permission request inside
   it acted on the inner id without checking it belonged to that session:
   `POST /session/{id}/permissions/{permissionID}` could answer another
@@ -350,6 +361,20 @@ pre-1.0, so minor releases may include breaking changes.
   edit to a shipped migration fails CI.
 
 ### Changed
+
+- A `lock/` directory appears in the data directory, holding empty lock
+  files (`scheduler-<hash>.lock` per project directory, `maintenance.lock`),
+  and a restart marker that is being dealt with is briefly renamed to
+  `running/<session>.….claim`. A process alone on its data directory always
+  holds the locks and wins every claim, and behaves as before. With several
+  processes on one data directory (a TUI beside `alforria serve`), one of
+  them now schedules each directory's triggers and maintains the database
+  and the others are followers, where each used to do both on its own; a
+  follower takes over within seconds of the leader's exit. Migration
+  `0010_trigger_run_owner` adds two columns and an index to `trigger_run`.
+- On macOS and other non-Linux Unix systems the owner of a restart marker is
+  now checked with a signal-0 probe, so a turn a killed server left mid-way
+  is repaired at the next start there too (it was only on Linux).
 
 - A `hook` bearer credential must be bound to one trigger (`trg` claim, or
   `trigger` on a static token) and delivers only to it; an unbound `hook`

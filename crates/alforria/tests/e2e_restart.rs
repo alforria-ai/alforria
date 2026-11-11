@@ -553,6 +553,62 @@ fn a_resumed_turn_that_is_killed_again_is_not_resumed_twice() {
     assert_eq!(world.turns(), 2);
 }
 
+/// M9. Two servers share one data directory and start at the same moment
+/// after a hard kill (`alforria serve` beside `alforria web`, or a
+/// supervisor that starts a second instance). Both see the dead process's
+/// marker; that used to be all it took, and the turn was resumed by both in
+/// most attempts. One of them claims it, and the turn is resumed once.
+#[test]
+fn two_servers_starting_together_resume_the_turn_once() {
+    for attempt in 0..6 {
+        let world = World::new(
+            &format!("restart-two-servers-{attempt}"),
+            First::SlowTool,
+            Later::Answer,
+            Some("continue"),
+        );
+        let serve = Serve::spawn(&world.env);
+        let session = world.start_turn(&serve);
+        world.wait_for(&serve, &session, "a running tool", tool_running);
+        drop(serve); // SIGKILL
+
+        // Both have swept before either is listening: by the time the two
+        // are up, which of them resumes the turn is decided.
+        let (a, b) = std::thread::scope(|scope| {
+            let a = scope.spawn(|| Serve::spawn(&world.env));
+            let b = scope.spawn(|| Serve::spawn(&world.env));
+            (a.join().unwrap(), b.join().unwrap())
+        });
+        world.wait_for(&a, &session, "a resumed answer", |messages| {
+            parts(messages, "text")
+                .iter()
+                .any(|part| part["text"] == "recovered")
+        });
+        // The winner lets go of its claim when the resumed turn is over:
+        // from then on nothing about the interruption is left to act on.
+        let running = world.marker(&session);
+        let running = running.parent().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while std::fs::read_dir(running).unwrap().next().is_some() {
+            assert!(Instant::now() < deadline, "the claim was never released");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        for server in [&a, &b] {
+            let messages = world.messages(server, &session);
+            assert_eq!(
+                restart_parts(&messages, "resume").len(),
+                1,
+                "attempt {attempt}: resumed once"
+            );
+        }
+        assert_eq!(
+            world.turns(),
+            2,
+            "attempt {attempt}: the original turn and one resumption"
+        );
+    }
+}
+
 impl World {
     fn post_json(&self, serve: &Serve, path: &str, body: Value) -> (reqwest::StatusCode, Value) {
         self.runtime.block_on(async {

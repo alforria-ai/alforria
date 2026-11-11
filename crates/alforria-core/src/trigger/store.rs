@@ -6,6 +6,7 @@ use std::sync::Arc;
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
+use crate::owner::{Liveness, ProcessOwner};
 use crate::storage::Storage;
 use crate::trigger::{RunStatus, TriggerRun, TriggerSpec, MAX_RUNS_KEPT};
 use crate::CoreError;
@@ -88,6 +89,27 @@ pub struct TriggerStore {
     storage: Arc<Storage>,
     directory: String,
     project_id: String,
+    /// The process the runs written through this store belong to.
+    owner: ProcessOwner,
+}
+
+/// What became of a scheduled tick ([`TriggerStore::claim_tick`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TickClaim {
+    /// Another process sharing the database took the tick: it is theirs.
+    Lost,
+    /// The tick is this process's and so is the run, which is stored.
+    Run,
+    /// The tick is this process's, but the trigger has a run going (here or
+    /// in another process): nothing is stored, and the tick is skipped.
+    Busy,
+}
+
+/// Mark `run` as one that will never finish.
+fn interrupt(run: &mut TriggerRun, now_ms: u64) {
+    run.status = RunStatus::Failed;
+    run.error = Some(crate::trigger::INTERRUPTED.to_string());
+    run.time.ended = Some(now_ms);
 }
 
 impl TriggerStore {
@@ -96,7 +118,14 @@ impl TriggerStore {
             storage,
             directory: directory.to_string_lossy().into_owned(),
             project_id: project_id.to_string(),
+            owner: ProcessOwner::current().clone(),
         }
+    }
+
+    /// The same slice, written as `owner` (a test's second process).
+    pub fn with_owner(mut self, owner: ProcessOwner) -> Self {
+        self.owner = owner;
+        self
     }
 
     pub fn list(&self) -> Result<Vec<StoredTrigger>, CoreError> {
@@ -237,12 +266,145 @@ impl TriggerStore {
         })
     }
 
-    /// Take a scheduled tick for this process: move `last_scheduled` from
-    /// what this process last saw to `now`, atomically. `false` means another
-    /// process sharing the database got there first, and the tick is theirs.
-    pub fn claim_tick(&self, id: &str, expected: Option<u64>, now: u64) -> Result<bool, CoreError> {
+    /// What every trigger of the directory has stored about it, by id.
+    pub fn states(&self) -> Result<Vec<(String, TriggerState)>, CoreError> {
         self.storage.with_connection(|conn| {
-            let changed = conn.execute(
+            let mut stmt = conn.prepare(
+                "SELECT trigger_id, session_id, paused, last_scheduled, last_fired, time_seen
+                 FROM trigger_state WHERE directory = ?1",
+            )?;
+            let rows = stmt
+                .query_map([&self.directory], |row| {
+                    let stamp = |value: Option<i64>| value.map(|value| value.max(0) as u64);
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        TriggerState {
+                            session_id: row.get(1)?,
+                            paused: row.get::<_, Option<i64>>(2)?.map(|value| value != 0),
+                            last_scheduled: stamp(row.get(3)?),
+                            last_fired: stamp(row.get(4)?),
+                            time_seen: row.get::<_, i64>(5)?.max(0) as u64,
+                        },
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
+    /// A run ended: remember when, and the session a `reuse` trigger keeps.
+    /// Only these two columns are written, so a process that did not
+    /// schedule the trigger does not put back the `last_scheduled` it
+    /// happens to remember over the scheduler's.
+    pub fn finish(
+        &self,
+        id: &str,
+        last_fired: u64,
+        session_id: Option<&str>,
+    ) -> Result<(), CoreError> {
+        self.storage.with_connection(|conn| {
+            conn.execute(
+                "UPDATE trigger_state SET last_fired = ?1, session_id = COALESCE(?2, session_id)
+                 WHERE directory = ?3 AND trigger_id = ?4",
+                params![last_fired as i64, session_id, self.directory, id],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Insert `run` as its trigger's one unsettled run. `false` when the
+    /// trigger already has one that a live process owns. One that a
+    /// process which is gone left behind is closed, and the place taken.
+    fn insert_active(
+        &self,
+        conn: &rusqlite::Connection,
+        run: &TriggerRun,
+    ) -> Result<bool, CoreError> {
+        let data =
+            serde_json::to_string(run).map_err(|error| CoreError::Storage(error.to_string()))?;
+        let owner = serde_json::to_string(&self.owner)
+            .map_err(|error| CoreError::Storage(error.to_string()))?;
+        let insert = |conn: &rusqlite::Connection| {
+            conn.execute(
+                "INSERT OR IGNORE INTO trigger_run
+                    (id, directory, trigger_id, data, time_started, owner, active)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)",
+                params![
+                    run.id,
+                    self.directory,
+                    run.trigger_id,
+                    data,
+                    run.time.started as i64,
+                    owner
+                ],
+            )
+        };
+        if insert(conn)? > 0 {
+            return Ok(true);
+        }
+        let holder = conn
+            .query_row(
+                "SELECT data, owner FROM trigger_run
+                 WHERE directory = ?1 AND trigger_id = ?2 AND active = 1",
+                params![self.directory, run.trigger_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?;
+        let Some((held, holder)) = holder else {
+            return Ok(insert(conn)? > 0);
+        };
+        let gone = holder
+            .and_then(|owner| serde_json::from_str::<ProcessOwner>(&owner).ok())
+            .is_none_or(|owner| owner.gone());
+        if !gone {
+            return Ok(false);
+        }
+        match serde_json::from_str::<TriggerRun>(&held) {
+            Ok(mut held) => {
+                interrupt(&mut held, run.time.started);
+                let data = serde_json::to_string(&held)
+                    .map_err(|error| CoreError::Storage(error.to_string()))?;
+                conn.execute(
+                    "UPDATE trigger_run SET data = ?1, active = NULL WHERE id = ?2",
+                    params![data, held.id],
+                )?;
+            }
+            // A row this build cannot read no longer holds the trigger.
+            Err(_) => {
+                conn.execute(
+                    "UPDATE trigger_run SET active = NULL
+                     WHERE directory = ?1 AND trigger_id = ?2 AND active = 1",
+                    params![self.directory, run.trigger_id],
+                )?;
+            }
+        }
+        Ok(insert(conn)? > 0)
+    }
+
+    /// Take a fire for this process — a webhook call, a watch, a manual
+    /// run: store `run` as the trigger's one unsettled run. `false` means
+    /// the trigger has a run going in another process sharing the
+    /// database, and this fire does not run.
+    pub fn claim_run(&self, run: &TriggerRun) -> Result<bool, CoreError> {
+        self.storage
+            .with_connection(|conn| self.insert_active(conn, run))
+    }
+
+    /// Take a scheduled tick for this process: move `last_scheduled` from
+    /// what this process last saw to `now`, and store `run` for it, in one
+    /// transaction. A process that dies right after has left the run to
+    /// say that the tick was taken and never answered
+    /// ([`Self::fail_orphaned`]).
+    pub fn claim_tick(
+        &self,
+        id: &str,
+        expected: Option<u64>,
+        now: u64,
+        run: &TriggerRun,
+    ) -> Result<TickClaim, CoreError> {
+        self.storage.with_connection(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let changed = tx.execute(
                 "UPDATE trigger_state SET last_scheduled = ?1
                  WHERE directory = ?2 AND trigger_id = ?3 AND last_scheduled IS ?4",
                 params![
@@ -252,25 +414,41 @@ impl TriggerStore {
                     expected.map(|value| value as i64)
                 ],
             )?;
-            Ok(changed > 0)
+            if changed == 0 {
+                return Ok(TickClaim::Lost);
+            }
+            let claim = if self.insert_active(&tx, run)? {
+                TickClaim::Run
+            } else {
+                TickClaim::Busy
+            };
+            tx.commit()?;
+            Ok(claim)
         })
     }
 
-    /// Insert or replace a run, then drop the oldest beyond the cap.
+    /// Insert or replace a run, then drop the oldest beyond the cap. A run
+    /// that is settled no longer holds its trigger.
     pub fn put_run(&self, run: &TriggerRun) -> Result<(), CoreError> {
         let data =
             serde_json::to_string(run).map_err(|error| CoreError::Storage(error.to_string()))?;
+        let owner = serde_json::to_string(&self.owner)
+            .map_err(|error| CoreError::Storage(error.to_string()))?;
         self.storage.with_connection(|conn| {
             conn.execute(
-                "INSERT INTO trigger_run (id, directory, trigger_id, data, time_started)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT (id) DO UPDATE SET data = excluded.data",
+                "INSERT INTO trigger_run (id, directory, trigger_id, data, time_started, owner)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT (id) DO UPDATE SET
+                    data = excluded.data,
+                    active = CASE WHEN ?7 THEN NULL ELSE active END",
                 params![
                     run.id,
                     self.directory,
                     run.trigger_id,
                     data,
-                    run.time.started as i64
+                    run.time.started as i64,
+                    owner,
+                    run.status.settled(),
                 ],
             )?;
             conn.execute(
@@ -315,24 +493,38 @@ impl TriggerStore {
         })
     }
 
-    /// Runs a previous process left unfinished can never finish: mark them.
-    pub fn fail_unfinished(&self, now_ms: u64) -> Result<usize, CoreError> {
+    /// Runs that can never finish: close them. Those are the unsettled runs
+    /// of processes that are gone (and of builds that recorded no owner).
+    /// A run another live process owns is that process's, and is left
+    /// alone. Where a platform cannot tell whether a process is alive (not
+    /// a Unix), every other process's run counts as abandoned.
+    pub fn fail_orphaned(&self, now_ms: u64) -> Result<usize, CoreError> {
         let unfinished: Vec<TriggerRun> = self.storage.with_connection(|conn| {
-            let mut stmt = conn.prepare("SELECT data FROM trigger_run WHERE directory = ?1")?;
+            let mut stmt =
+                conn.prepare("SELECT data, owner FROM trigger_run WHERE directory = ?1")?;
             let rows = stmt
-                .query_map([&self.directory], |row| row.get::<_, String>(0))?
+                .query_map([&self.directory], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                })?
                 .collect::<Result<Vec<_>, _>>()?;
             Ok::<_, CoreError>(
-                rows.iter()
-                    .filter_map(|data| serde_json::from_str::<TriggerRun>(data).ok())
-                    .filter(|run| !run.status.settled())
+                rows.into_iter()
+                    .filter_map(|(data, owner)| {
+                        Some((serde_json::from_str::<TriggerRun>(&data).ok()?, owner))
+                    })
+                    .filter(|(run, _)| !run.status.settled())
+                    .filter(|(_, owner)| {
+                        owner
+                            .as_deref()
+                            .and_then(|owner| serde_json::from_str::<ProcessOwner>(owner).ok())
+                            .is_none_or(|owner| owner.liveness() != Liveness::Alive)
+                    })
+                    .map(|(run, _)| run)
                     .collect(),
             )
         })?;
         for mut run in unfinished.iter().cloned() {
-            run.status = RunStatus::Failed;
-            run.error = Some(crate::trigger::INTERRUPTED.to_string());
-            run.time.ended = Some(now_ms);
+            interrupt(&mut run, now_ms);
             self.put_run(&run)?;
         }
         Ok(unfinished.len())

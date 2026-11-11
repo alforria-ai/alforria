@@ -690,6 +690,7 @@ mod tests {
                 }))
                 .unwrap(),
                 webhook_min_interval_ms: 0,
+                lock_dir: None,
             },
         );
         let rules = Arc::new(FakeSessions::default());

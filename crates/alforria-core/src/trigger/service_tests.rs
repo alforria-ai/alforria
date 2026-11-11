@@ -143,6 +143,7 @@ impl Fixture {
             ignore: Vec::new(),
             config: serde_json::from_value(config).unwrap(),
             webhook_min_interval_ms: 0,
+            lock_dir: None,
         }
     }
 
@@ -717,6 +718,7 @@ async fn a_run_cut_short_by_a_restart_is_closed_as_failed() {
         assert_eq!(service.run(&run.id).unwrap().status, RunStatus::Running);
         run
     };
+    f.the_process_died();
     let service = f.service(config);
     let closed = service.run(&run.id).unwrap();
     assert_eq!(closed.status, RunStatus::Failed);
@@ -1379,6 +1381,7 @@ async fn a_tick_interrupted_by_a_crash_is_closed_and_never_fired_twice() {
         runs
         // The process dies here: the runs never finish.
     };
+    f.the_process_died();
     f.ops.release(8);
 
     // Five minutes later the server is back.
@@ -1472,4 +1475,422 @@ async fn changing_a_reuse_triggers_kind_drops_its_session() {
     let trusted = f.ops.turns().pop().unwrap();
     assert_eq!(trusted.session_id, None);
     assert!(!trusted.untrusted);
+}
+
+// -- Two servers on one data directory (M9) ---------------------------------
+
+/// A second server process over the fixture's data directory: its own
+/// database connection, event bus and session engine, the same clock.
+struct Peer {
+    ops: Arc<FakeOps>,
+    service: Arc<TriggerService>,
+}
+
+impl Fixture {
+    /// The settings of a server that shares its data directory: the
+    /// scheduler's place is decided by the lock under it.
+    fn shared(&self, config: Value) -> TriggerSettings {
+        TriggerSettings {
+            lock_dir: Some(self.temp.path().join("lock")),
+            ..self.settings(config)
+        }
+    }
+
+    fn peer(&self, ops: Arc<FakeOps>, config: Value) -> Peer {
+        let storage = Arc::new(Storage::open(self.temp.path().join("db.sqlite")).unwrap());
+        let events = Arc::new(EventBus::new_shared(storage.clone(), None));
+        let service = TriggerService::new(
+            ops.clone(),
+            events,
+            storage,
+            self.clock.clone(),
+            self.shared(config),
+        );
+        Peer { ops, service }
+    }
+
+    /// What a restart looks like from the database: the runs this process
+    /// wrote belong to a process that no longer exists. (A test's "next
+    /// server" is the same process, whose runs would count as live.)
+    fn the_process_died(&self) {
+        let owner = serde_json::to_string(&dead_owner()).unwrap();
+        self.storage.with_connection(|conn| {
+            conn.execute("UPDATE trigger_run SET owner = ?1", [owner])
+                .unwrap();
+        });
+    }
+
+    fn store(&self) -> TriggerStore {
+        TriggerStore::new(self.storage.clone(), &self.directory(), "global")
+    }
+}
+
+/// Wait for something another task does, without guessing how long it
+/// takes: the tasks run whenever this one yields.
+async fn until(what: &str, done: impl Fn() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !done() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "never happened: {what}"
+        );
+        tokio::task::yield_now().await;
+    }
+}
+
+fn turns_of(ops: &FakeOps, trigger: &str) -> usize {
+    ops.turns()
+        .iter()
+        .filter(|turn| turn.trigger_id == trigger)
+        .count()
+}
+
+fn two_hooks() -> Value {
+    json!({
+        "a": { "on": { "webhook": true }, "prompt": "A" },
+        "b": { "on": { "webhook": true }, "prompt": "B" },
+        "c": { "on": { "webhook": true }, "prompt": "C" },
+    })
+}
+
+/// A process that no longer exists: another instance under this one's id.
+fn dead_owner() -> crate::owner::ProcessOwner {
+    crate::owner::ProcessOwner {
+        instance: "gone".to_string(),
+        ..crate::owner::ProcessOwner::current().clone()
+    }
+}
+
+/// M9. A server that starts beside a running one closed every unsettled
+/// run in the directory, the live server's included, and the two then ran
+/// the same trigger side by side. Only an orphan's run is closed.
+#[tokio::test]
+async fn a_starting_server_closes_an_orphans_run_and_leaves_a_live_owners() {
+    let f = Fixture::new(
+        "trigger-two-owners",
+        "2027-01-01T00:00:00Z",
+        FakeOps::gated("ok"),
+    );
+    let one = f.service_with(f.shared(two_hooks()));
+    let live = one.hook("a", b"x").unwrap();
+    until("a's turn starts", || turns_of(&f.ops, "a") == 1).await;
+    assert_eq!(one.run(&live.id).unwrap().status, RunStatus::Running);
+
+    // What a server that was killed left behind, and what a live process
+    // that is not this one is running.
+    let now = f.clock.now_ms();
+    let orphan = TriggerService::new_run("b", "webhook", None, now);
+    assert!(f
+        .store()
+        .with_owner(dead_owner())
+        .claim_run(&orphan)
+        .unwrap());
+    let theirs = TriggerService::new_run("c", "webhook", None, now);
+    let init = crate::owner::ProcessOwner {
+        instance: "other".to_string(),
+        pid: 1,
+        started: None,
+        ..crate::owner::ProcessOwner::current().clone()
+    };
+    if cfg!(unix) {
+        assert!(f.store().with_owner(init).claim_run(&theirs).unwrap());
+    }
+
+    let two = f.peer(FakeOps::gated("ok"), two_hooks());
+    assert_eq!(one.run(&live.id).unwrap().status, RunStatus::Running);
+    let closed = two.service.run(&orphan.id).unwrap();
+    assert_eq!(closed.status, RunStatus::Failed);
+    assert_eq!(closed.error.as_deref(), Some(crate::trigger::INTERRUPTED));
+    if cfg!(unix) {
+        assert_eq!(
+            two.service.run(&theirs.id).unwrap().status,
+            RunStatus::Queued
+        );
+        // And the trigger a live process is running is not run again.
+        let again = two.service.hook("c", b"x").unwrap();
+        assert_eq!(again.status, RunStatus::Skipped);
+    }
+    // The orphan's trigger is free again; the live server's is not.
+    let busy = two.service.hook("a", b"x").unwrap();
+    assert_eq!(busy.status, RunStatus::Skipped, "{busy:?}");
+    assert!(busy.cause.unwrap().contains("another server"));
+    let free = two.service.hook("b", b"x").unwrap();
+    assert_eq!(free.status, RunStatus::Queued);
+    until("b's turn starts", || turns_of(&two.ops, "b") == 1).await;
+    assert_eq!(turns_of(&two.ops, "a"), 0);
+
+    f.ops.release(1);
+    two.ops.release(1);
+    assert_eq!(settle(&one, &[live]).await[0].status, RunStatus::Completed);
+    settle(&two.service, &[free]).await;
+}
+
+/// M9. A fire that is not a scheduled tick was not claimed: a webhook
+/// call, a manual run and a watched change that reached both servers ran
+/// on both. Each is one run now, whichever server it reaches first, and a
+/// follower runs what it is asked to itself.
+#[tokio::test]
+async fn a_webhook_a_manual_and_a_watch_fire_delivered_to_two_servers_run_once_each() {
+    let f = Fixture::new(
+        "trigger-two-fires",
+        "2027-01-01T00:00:00Z",
+        FakeOps::gated("ok"),
+    );
+    let inbox = f.directory().join("inbox");
+    std::fs::create_dir_all(&inbox).unwrap();
+    let config = json!({
+        "hook": { "on": { "webhook": true }, "prompt": "Hook" },
+        "daily": { "on": { "cron": "@daily" }, "prompt": "Daily" },
+        "inbox": { "on": { "watch": { "path": "inbox/", "debounce": "1s" } }, "prompt": "Inbox" },
+    });
+    // Room for the scheduler's two runs to go side by side.
+    let one = f.service_with(TriggerSettings {
+        concurrency: 2,
+        ..f.shared(config.clone())
+    });
+    let two = f.peer(FakeOps::gated("ok"), config);
+    assert!(one.tick(f.clock.now_ms()).is_empty());
+    assert!(two.service.tick(f.clock.now_ms()).is_empty());
+    assert!(!one.is_follower());
+    assert!(two.service.is_follower());
+
+    // A webhook call to each: the scheduler's first.
+    let first = one.hook("hook", b"payload").unwrap();
+    let second = two.service.hook("hook", b"payload").unwrap();
+    assert_eq!(first.status, RunStatus::Queued);
+    assert_eq!(second.status, RunStatus::Skipped);
+    // A manual run on each: the follower's first, which runs it itself.
+    let manual = two.service.run_now("daily").unwrap();
+    let refused = one.run_now("daily").unwrap();
+    assert_eq!(manual.status, RunStatus::Queued);
+    assert_eq!(refused.status, RunStatus::Skipped);
+    assert!(refused.cause.unwrap().contains("another server"));
+    // A change both were told of: only the scheduler watches.
+    one.path_changed("inbox", &[inbox.join("a.txt")]);
+    two.service.path_changed("inbox", &[inbox.join("a.txt")]);
+    let later = f.clock.advance(2_000);
+    let watched = one.tick(later);
+    assert!(two.service.tick(later).is_empty());
+    assert_eq!(watched.len(), 1);
+    assert_eq!(watched[0].reason, "watch");
+
+    until("the three turns start", || {
+        f.ops.turns().len() + two.ops.turns().len() == 3
+    })
+    .await;
+    f.ops.release(2);
+    two.ops.release(1);
+    settle(&one, &[first, watched[0].clone()]).await;
+    settle(&two.service, &[manual]).await;
+    for trigger in ["hook", "daily", "inbox"] {
+        assert_eq!(
+            turns_of(&f.ops, trigger) + turns_of(&two.ops, trigger),
+            1,
+            "{trigger} ran once"
+        );
+    }
+    assert_eq!(turns_of(&two.ops, "daily"), 1, "the follower ran it itself");
+}
+
+/// M9. The claim is one insert the database decides: of two servers that
+/// are handed the same call at the same moment, twenty times over, one
+/// runs it each time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_servers_handed_a_call_at_the_same_moment_run_it_once() {
+    let f = Fixture::new(
+        "trigger-two-race",
+        "2027-01-01T00:00:00Z",
+        FakeOps::gated("ok"),
+    );
+    let one = f.service_with(f.shared(two_hooks()));
+    let two = f.peer(FakeOps::gated("ok"), two_hooks());
+    for round in 1..=20usize {
+        let start = Arc::new(std::sync::Barrier::new(2));
+        let calls: Vec<_> = [one.clone(), two.service.clone()]
+            .into_iter()
+            .map(|service| {
+                let start = start.clone();
+                tokio::task::spawn_blocking(move || {
+                    start.wait();
+                    service.hook("a", b"x").unwrap()
+                })
+            })
+            .collect();
+        let mut runs = Vec::new();
+        for call in calls {
+            runs.push(call.await.unwrap());
+        }
+        let queued: Vec<&TriggerRun> = runs
+            .iter()
+            .filter(|run| run.status == RunStatus::Queued)
+            .collect();
+        assert_eq!(queued.len(), 1, "round {round}: {runs:?}");
+        until("the turn starts", || {
+            f.ops.turns().len() + two.ops.turns().len() == round
+        })
+        .await;
+        // Whichever server ran it, let it finish before the next round.
+        let (service, ops) = if runs[0].status == RunStatus::Queued {
+            (&one, &f.ops)
+        } else {
+            (&two.service, &two.ops)
+        };
+        ops.release(1);
+        settle(service, &[queued[0].clone()]).await;
+    }
+    assert_eq!(f.ops.turns().len() + two.ops.turns().len(), 20);
+}
+
+/// The messages logged while `work` runs on this thread.
+fn logged(work: impl FnOnce()) -> Vec<String> {
+    use tracing::span;
+    struct Capture(Arc<Mutex<Vec<String>>>);
+    struct Message(String);
+    impl tracing::field::Visit for Message {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = format!("{value:?}");
+            }
+        }
+    }
+    impl tracing::Subscriber for Capture {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+            span::Id::from_u64(1)
+        }
+        fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+        fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut message = Message(String::new());
+            event.record(&mut message);
+            self.0.lock().unwrap().push(message.0);
+        }
+        fn enter(&self, _: &span::Id) {}
+        fn exit(&self, _: &span::Id) {}
+    }
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    tracing::subscriber::with_default(Capture(lines.clone()), work);
+    let lines = lines.lock().unwrap().clone();
+    lines
+}
+
+/// M9. Of two servers on one data directory one schedules a directory's
+/// triggers. The other says once that it is a follower and fires no tick;
+/// what is created through it is the scheduler's to fire; and when the
+/// scheduler exits, the follower has its place the next time it looks.
+#[tokio::test]
+async fn the_second_server_is_a_follower_and_takes_over_when_the_scheduler_exits() {
+    let f = Fixture::new(
+        "trigger-follower",
+        "2027-01-01T00:00:00Z",
+        FakeOps::answering("ok"),
+    );
+    let config = json!({ "hourly": { "on": { "cron": "@hourly" }, "prompt": "Hourly" } });
+    let one = f.service_with(f.shared(config.clone()));
+    let two = f.peer(FakeOps::answering("ok"), config);
+    let start = f.clock.now_ms();
+    assert!(one.tick(start).is_empty());
+    let lines = logged(|| {
+        assert!(two.service.tick(start).is_empty());
+        assert!(two.service.tick(start).is_empty());
+    });
+    let said: Vec<&String> = lines
+        .iter()
+        .filter(|line| line.contains("this one is a follower"))
+        .collect();
+    assert_eq!(said.len(), 1, "said once: {lines:?}");
+    assert!(two.service.is_follower() && !one.is_follower());
+    // The lock is a file in the data directory, one per directory.
+    assert!(scheduler_lock(&f.temp.path().join("lock"), &f.directory()).is_file());
+
+    // The hour comes: the follower fires nothing, the scheduler fires once.
+    let hour = start + 3_600_000;
+    f.clock.set(hour);
+    assert!(two.service.tick(hour).is_empty());
+    let fired = settle(&one, &one.tick(hour)).await;
+    assert_eq!(fired.len(), 1);
+    assert_eq!(f.ops.turns().len(), 1);
+    assert!(two.ops.turns().is_empty());
+
+    // A reminder created through the follower is the scheduler's to fire.
+    two.service
+        .create(
+            Some("remind".to_string()),
+            spec(json!({ "on": { "at": "2027-01-01T01:30:00Z" }, "prompt": "Remind me" })),
+            None,
+            None,
+        )
+        .unwrap();
+    let half = hour + 1_800_000;
+    f.clock.set(half);
+    assert!(two.service.tick(half).is_empty());
+    let fired = settle(&one, &one.tick(half)).await;
+    assert_eq!(fired.len(), 1);
+    assert_eq!(fired[0].trigger_id, "remind");
+    // And one paused through the follower is not fired by the scheduler.
+    two.service
+        .update("hourly", &json!({ "enabled": false }))
+        .unwrap();
+    let second_hour = start + 2 * 3_600_000;
+    f.clock.set(second_hour);
+    assert!(one.tick(second_hour).is_empty());
+    two.service
+        .update("hourly", &json!({ "enabled": true }))
+        .unwrap();
+    assert!(one.tick(second_hour).is_empty(), "it resumes from now");
+
+    // The scheduler exits. The follower takes its place on its next look
+    // and fires the next hour, once.
+    one.stop();
+    let lines = logged(|| assert!(two.service.tick(f.clock.advance(60_000)).is_empty()));
+    assert!(
+        lines.iter().any(|line| line.contains("schedules them now")),
+        "{lines:?}"
+    );
+    assert!(!two.service.is_follower());
+    let third_hour = start + 3 * 3_600_000;
+    f.clock.set(third_hour);
+    assert!(one.tick(third_hour).is_empty());
+    let fired = settle(&two.service, &two.service.tick(third_hour)).await;
+    assert_eq!(fired.len(), 1);
+    assert_eq!(fired[0].trigger_id, "hourly");
+    assert_eq!(two.ops.turns().len(), 1);
+    assert_eq!(
+        f.ops.turns().len(),
+        2,
+        "the stopped scheduler fired nothing more"
+    );
+    // A process that is killed lets go the same way: the lock is the
+    // operating system's (`owner::tests::a_role_has_one_holder_until_it_lets_go`).
+}
+
+/// A service alone on its data directory always has the scheduler's place
+/// and wins every claim: nothing about it changes.
+#[tokio::test]
+async fn a_server_alone_on_its_data_directory_schedules_as_before() {
+    let f = Fixture::new(
+        "trigger-alone",
+        "2027-01-01T00:00:00Z",
+        FakeOps::answering("ok"),
+    );
+    let service = f.service_with(f.shared(json!({
+        "hourly": { "on": { "cron": "@hourly" }, "prompt": "Hourly" },
+        "hook": { "on": { "webhook": true }, "prompt": "Hook" },
+    })));
+    let lines = logged(|| assert!(service.tick(f.clock.now_ms()).is_empty()));
+    assert!(lines.is_empty(), "{lines:?}");
+    assert!(!service.is_follower());
+    let run = fire_next(&f, &service, "hourly").await;
+    assert_eq!(run.status, RunStatus::Completed);
+    let hook = service.hook("hook", b"x").unwrap();
+    assert_eq!(
+        settle(&service, &[hook]).await[0].status,
+        RunStatus::Completed
+    );
+    assert_eq!(
+        service.get("hourly").unwrap().last_fired,
+        Some(f.clock.now_ms())
+    );
 }

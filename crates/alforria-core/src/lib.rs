@@ -24,6 +24,7 @@ pub mod lsp;
 pub mod mcp;
 pub mod memory;
 pub mod merge;
+pub mod owner;
 pub mod paths;
 pub mod process_group;
 pub mod project;

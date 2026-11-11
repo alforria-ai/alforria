@@ -18,10 +18,11 @@ use alforria_schema::permission_v1::PermissionV1Ruleset;
 use serde_json::{json, Value};
 
 use crate::event::{EventBus, PublishOptions};
+use crate::owner::RoleLock;
 use crate::tool::external_directory::{contains_real, real_path};
 use crate::tool::permission::from_config;
 use crate::trigger::rules::CreatorBounds;
-use crate::trigger::store::{StoredSpec, StoredTrigger, TriggerState, TriggerStore};
+use crate::trigger::store::{StoredSpec, StoredTrigger, TickClaim, TriggerState, TriggerStore};
 use crate::trigger::watch::{self, WatchHandle, WatchIgnore};
 use crate::trigger::{
     format_duration, Creator, Report, RunStatus, RunTime, Schedule, SessionMode, SessionTarget,
@@ -49,6 +50,10 @@ pub struct TriggerSettings {
     /// The least time between two accepted deliveries to one webhook
     /// trigger (`triggers.webhook_min_interval`); 0 is no limit.
     pub webhook_min_interval_ms: u64,
+    /// Where the lock that says which process schedules this directory's
+    /// triggers lives (`<data>/lock`). `None` is a service alone on its
+    /// database (a test, an embedder): it schedules, and asks nobody.
+    pub lock_dir: Option<PathBuf>,
 }
 
 impl TriggerSettings {
@@ -70,6 +75,20 @@ const MAX_WATCH_PATHS: usize = 50;
 const MAX_RUN_TEXT: usize = 64 * 1024;
 /// Finished one-shot triggers are dropped after this long.
 const KEEP_FINISHED_MS: u64 = 24 * 60 * 60 * 1000;
+/// How often a follower asks whether the scheduler's place is free.
+pub const FOLLOWER_RETRY_MS: u64 = 5_000;
+/// Why a fire did not run when the trigger's run is another process's.
+const BUSY_ELSEWHERE: &str =
+    "the previous run has not finished (another server sharing this data directory is running it)";
+
+/// The file whose lock says which process schedules `directory`'s
+/// triggers: one per directory, since each process schedules the
+/// directories it has open.
+pub fn scheduler_lock(lock_dir: &std::path::Path, directory: &std::path::Path) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(directory.to_string_lossy().as_bytes());
+    lock_dir.join(format!("scheduler-{}.lock", &hex::encode(digest)[..16]))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Due {
@@ -242,6 +261,11 @@ pub struct TriggerService {
     stopped: AtomicBool,
     /// When each webhook trigger last accepted a delivery.
     hook_times: Mutex<BTreeMap<String, u64>>,
+    /// The scheduler's place for this directory, among the processes that
+    /// share the data directory. `None`: there is nobody to share with.
+    role: Option<RoleLock>,
+    /// This process asked for the place and another had it.
+    follower: AtomicBool,
 }
 
 impl TriggerService {
@@ -256,7 +280,8 @@ impl TriggerService {
     ) -> Arc<TriggerService> {
         let store = TriggerStore::new(storage, &settings.directory, &settings.project_id);
         let now = clock.now_ms();
-        if let Err(error) = store.fail_unfinished(now) {
+        // Only what a process that is gone left: a live one's runs are its.
+        if let Err(error) = store.fail_orphaned(now) {
             tracing::warn!("failed to close unfinished trigger runs: {error}");
         }
         // A config read after startup (an instance boot) can declare a
@@ -320,7 +345,13 @@ impl TriggerService {
         }
         let ignore = Arc::new(WatchIgnore::new(settings.ignore.clone()));
         let slots = Arc::new(tokio::sync::Semaphore::new(settings.concurrency.max(1)));
+        let role = settings
+            .lock_dir
+            .as_ref()
+            .map(|dir| RoleLock::new(scheduler_lock(dir, &settings.directory)));
         Arc::new(TriggerService {
+            role,
+            follower: AtomicBool::new(false),
             ops,
             events,
             store,
@@ -410,6 +441,180 @@ impl TriggerService {
             Ok(())
         } else {
             Err(TriggerError::Disabled)
+        }
+    }
+
+    // -- Leader and follower ---------------------------------------------
+
+    /// Whether this process holds the scheduler's place for the directory,
+    /// without asking for it.
+    fn scheduling(&self) -> bool {
+        self.role.as_ref().is_none_or(RoleLock::held)
+    }
+
+    /// Whether another process schedules this directory's triggers: this
+    /// one asked for the place and did not get it.
+    pub fn is_follower(&self) -> bool {
+        self.follower.load(Ordering::SeqCst) && !self.scheduling()
+    }
+
+    /// Whether this process is the directory's scheduler, taking the place
+    /// if it is free. A follower asks again on every pass of its loop, so
+    /// it takes over within [`FOLLOWER_RETRY_MS`] of the scheduler's exit.
+    fn leads(self: &Arc<Self>, now: u64) -> bool {
+        let Some(role) = &self.role else {
+            return true;
+        };
+        if role.held() {
+            return true;
+        }
+        if self.stopped() {
+            return false;
+        }
+        if !role.acquire() {
+            if !self.follower.swap(true, Ordering::SeqCst) {
+                tracing::info!(
+                    "another process schedules the triggers of {}: this one is a follower. It \
+                     runs what it is asked to (a webhook call, a manual run) and takes over \
+                     when that process exits",
+                    self.settings.directory.display()
+                );
+            }
+            return false;
+        }
+        if self.follower.load(Ordering::SeqCst) {
+            self.take_over(now);
+        }
+        true
+    }
+
+    /// The scheduler exited and this process has its place: close what it
+    /// left unfinished, and plan from what it wrote down, as at a start.
+    fn take_over(self: &Arc<Self>, now: u64) {
+        tracing::info!(
+            "the process that scheduled the triggers of {} is gone: this one schedules them now",
+            self.settings.directory.display()
+        );
+        if let Err(error) = self.store.fail_orphaned(now) {
+            tracing::warn!("failed to close unfinished trigger runs: {error}");
+        }
+        self.sync_stored(now);
+        let ids: Vec<String> = {
+            let mut entries = self.lock();
+            for (id, entry) in entries.iter_mut() {
+                if let Ok(Some(theirs)) = self.store.state(id) {
+                    entry.state = theirs;
+                }
+                entry.next = entry
+                    .schedule
+                    .as_ref()
+                    .ok()
+                    .and_then(|schedule| plan(schedule, &entry.spec, &entry.state, now, true));
+            }
+            entries.keys().cloned().collect()
+        };
+        for id in ids {
+            self.sync_watch(&id);
+        }
+    }
+
+    /// Bring this process's picture of the directory's triggers up to what
+    /// is stored: with several processes on one database, a trigger is
+    /// created, changed, paused or deleted through any of them, and the
+    /// scheduler is one of them. Nothing changes when this process wrote
+    /// everything itself.
+    fn sync_stored(self: &Arc<Self>, now: u64) {
+        if self.role.is_none() {
+            return;
+        }
+        let mut rewatch: Vec<String> = Vec::new();
+        {
+            // Read under the lock every write is made under, so a trigger
+            // this process is creating is not taken for one deleted.
+            let mut entries = self.lock();
+            let (Ok(stored), Ok(states)) = (self.store.list(), self.store.states()) else {
+                return;
+            };
+            let states: BTreeMap<String, TriggerState> = states.into_iter().collect();
+            let gone: Vec<String> = entries
+                .iter()
+                .filter(|(id, entry)| {
+                    entry.source == TriggerSource::Runtime
+                        && !entry.busy
+                        && !stored.iter().any(|trigger| trigger.id == **id)
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in gone {
+                entries.remove(&id);
+            }
+            for trigger in stored {
+                match entries.get_mut(&trigger.id) {
+                    None => {
+                        let entry = Self::load_entry(
+                            &self.store,
+                            &trigger.id,
+                            TriggerSource::Runtime,
+                            trigger.stored.spec,
+                            trigger.stored.inherited,
+                            trigger.origin_session_id,
+                            trigger.stored.restricted,
+                            trigger.stored.outside_content,
+                            trigger.time_created,
+                            trigger.time_updated,
+                            now,
+                        );
+                        rewatch.push(trigger.id.clone());
+                        entries.insert(trigger.id, entry);
+                    }
+                    Some(entry) if entry.source == TriggerSource::Runtime => {
+                        entry.outside_content |= trigger.stored.outside_content;
+                        if entry.time_updated == trigger.time_updated {
+                            continue;
+                        }
+                        let rescheduled = entry.spec.on != trigger.stored.spec.on;
+                        entry.schedule = trigger.stored.spec.schedule();
+                        entry.spec = trigger.stored.spec;
+                        entry.inherited = trigger.stored.inherited;
+                        entry.time_updated = trigger.time_updated;
+                        if rescheduled {
+                            entry.pending = None;
+                            if let Some(theirs) = states.get(&trigger.id) {
+                                entry.state = theirs.clone();
+                            }
+                            entry.next = entry.schedule.as_ref().ok().and_then(|schedule| {
+                                plan(schedule, &entry.spec, &entry.state, now, false)
+                            });
+                        }
+                        rewatch.push(trigger.id);
+                    }
+                    // The config's trigger of the same name shadows it.
+                    Some(_) => {}
+                }
+            }
+            for (id, entry) in entries.iter_mut() {
+                let Some(theirs) = states.get(id) else {
+                    continue;
+                };
+                let was = entry.enabled();
+                entry.state.paused = theirs.paused;
+                if !entry.busy {
+                    entry.state.session_id = theirs.session_id.clone();
+                    entry.state.last_fired = theirs.last_fired;
+                }
+                if entry.enabled() != was {
+                    if entry.enabled() {
+                        entry.state.last_scheduled = theirs.last_scheduled;
+                        entry.next = entry.schedule.as_ref().ok().and_then(|schedule| {
+                            plan(schedule, &entry.spec, &entry.state, now, false)
+                        });
+                    }
+                    rewatch.push(id.clone());
+                }
+            }
+        }
+        for id in rewatch {
+            self.sync_watch(&id);
         }
     }
 
@@ -847,7 +1052,9 @@ impl TriggerService {
 
     /// Make a trigger's watcher match its spec.
     fn sync_watch(self: &Arc<Self>, id: &str) {
-        if !self.started.load(Ordering::SeqCst) || self.stopped() {
+        // A follower watches nothing: the scheduler does, and a change
+        // would otherwise fire once in each process.
+        if !self.started.load(Ordering::SeqCst) || self.stopped() || !self.scheduling() {
             return;
         }
         let target = {
@@ -895,6 +1102,9 @@ impl TriggerService {
 
     /// Something under a watched path changed: (re)start the debounce.
     pub fn path_changed(&self, id: &str, paths: &[PathBuf]) {
+        if !self.scheduling() {
+            return;
+        }
         let now = self.clock.now_ms();
         {
             let mut entries = self.lock();
@@ -948,6 +1158,8 @@ impl TriggerService {
         if self.started.swap(true, Ordering::SeqCst) {
             return;
         }
+        // Before the watchers: only the directory's scheduler has any.
+        self.leads(self.clock.now_ms());
         let ids: Vec<String> = self.lock().keys().cloned().collect();
         for id in ids {
             self.sync_watch(&id);
@@ -963,7 +1175,11 @@ impl TriggerService {
                 }
                 let now = service.clock.now_ms();
                 service.tick(now);
-                let wait = service.until_next(service.clock.now_ms());
+                let wait = if service.scheduling() {
+                    service.until_next(service.clock.now_ms())
+                } else {
+                    FOLLOWER_RETRY_MS
+                };
                 tokio::select! {
                     _ = tokio::time::sleep(std::time::Duration::from_millis(wait)) => {}
                     _ = service.wake.notified() => {}
@@ -981,6 +1197,10 @@ impl TriggerService {
         for entry in self.lock().values_mut() {
             entry.watcher = None;
             entry.pending = None;
+        }
+        // The scheduler's place is free for a process that lives on.
+        if let Some(role) = &self.role {
+            role.release();
         }
         self.wake.notify_one();
     }
@@ -1015,7 +1235,14 @@ impl TriggerService {
         if !self.settings.enabled || self.stopped() {
             return Vec::new();
         }
-        let mut due: Vec<(String, &'static str, Option<u64>, Option<TriggerPayload>)> = Vec::new();
+        if !self.leads(now) {
+            // Still told of what the scheduler and the other followers
+            // stored, so a request that reaches this process finds it.
+            self.sync_stored(now);
+            return Vec::new();
+        }
+        self.sync_stored(now);
+        let mut due: Vec<(TriggerRun, Option<TickClaim>, Option<TriggerPayload>)> = Vec::new();
         {
             let mut entries = self.lock();
             for (id, entry) in entries.iter_mut() {
@@ -1026,18 +1253,24 @@ impl TriggerService {
                     continue;
                 };
                 if let Some(next) = entry.next.filter(|next| next.at <= now) {
-                    // Two servers on one database must not both run the tick.
-                    match self.store.claim_tick(id, entry.state.last_scheduled, now) {
-                        Ok(true) => {
-                            due.push((id.clone(), next.reason, Some(next.scheduled), None));
-                            entry.state.last_scheduled = Some(now);
-                        }
-                        Ok(false) => {
+                    // Two servers on one database must not both run the
+                    // tick, and a tick that is taken has its run on record
+                    // before anything else happens.
+                    let run = Self::new_run(id, next.reason, Some(next.scheduled), now);
+                    match self
+                        .store
+                        .claim_tick(id, entry.state.last_scheduled, now, &run)
+                    {
+                        Ok(TickClaim::Lost) => {
                             if let Ok(Some(theirs)) = self.store.state(id) {
                                 entry.state.last_scheduled = theirs.last_scheduled;
                                 entry.state.last_fired = theirs.last_fired;
                                 entry.state.session_id = theirs.session_id;
                             }
+                        }
+                        Ok(claim) => {
+                            due.push((run, Some(claim), None));
+                            entry.state.last_scheduled = Some(now);
                         }
                         Err(error) => {
                             tracing::warn!("trigger \"{id}\" could not claim its tick: {error}");
@@ -1057,8 +1290,7 @@ impl TriggerService {
                         text = "(no paths reported)".to_string();
                     }
                     due.push((
-                        id.clone(),
-                        "watch",
+                        Self::new_run(id, "watch", None, self.clock.now_ms()),
                         None,
                         Some(TriggerPayload {
                             label: "list of changed paths".to_string(),
@@ -1069,16 +1301,14 @@ impl TriggerService {
             }
         }
         due.into_iter()
-            .filter_map(|(id, reason, scheduled, payload)| {
-                self.fire(&id, reason, scheduled, payload).ok()
-            })
+            .filter_map(|(run, claim, payload)| self.launch(run, claim, payload).ok())
             .collect()
     }
 
     /// `POST /trigger/{id}/run` — fire now, whatever the trigger waits for.
     pub fn run_now(self: &Arc<Self>, id: &str) -> Result<TriggerRun, TriggerError> {
         self.require_enabled()?;
-        self.fire(id, "manual", None, None)
+        self.fire(id, "manual", None)
     }
 
     /// `POST /trigger/{id}/hook` — the webhook entry. The body reaches the
@@ -1127,23 +1357,11 @@ impl TriggerService {
             label: "webhook body".to_string(),
             text,
         });
-        self.fire(id, "webhook", None, payload)
+        self.fire(id, "webhook", payload)
     }
 
-    fn fire(
-        self: &Arc<Self>,
-        id: &str,
-        reason: &str,
-        scheduled: Option<u64>,
-        payload: Option<TriggerPayload>,
-    ) -> Result<TriggerRun, TriggerError> {
-        if self.stopped() {
-            return Err(TriggerError::Conflict(
-                "the server is shutting down: nothing is fired any more".to_string(),
-            ));
-        }
-        let now = self.clock.now_ms();
-        let mut run = TriggerRun {
+    fn new_run(id: &str, reason: &str, scheduled: Option<u64>, now: u64) -> TriggerRun {
+        TriggerRun {
             id: new_id("trr"),
             trigger_id: id.to_string(),
             status: RunStatus::Queued,
@@ -1159,7 +1377,45 @@ impl TriggerService {
             text: None,
             error: None,
             cause: None,
-        };
+        }
+    }
+
+    /// Fire outside the schedule: a webhook call, a watch, a manual run.
+    fn fire(
+        self: &Arc<Self>,
+        id: &str,
+        reason: &str,
+        payload: Option<TriggerPayload>,
+    ) -> Result<TriggerRun, TriggerError> {
+        self.launch(
+            Self::new_run(id, reason, None, self.clock.now_ms()),
+            None,
+            payload,
+        )
+    }
+
+    /// Start `run`'s turn, or record why it does not start.
+    ///
+    /// Every fire is claimed in the database before it runs: a trigger has
+    /// one unsettled run across all the processes that share the data
+    /// directory, and the insert that makes a run that one decides between
+    /// two of them. A scheduled tick's run was claimed with its tick
+    /// (`tick`); any other is claimed here. The fire that loses is recorded
+    /// as skipped, as it is when the run in the way is this process's own.
+    fn launch(
+        self: &Arc<Self>,
+        mut run: TriggerRun,
+        tick: Option<TickClaim>,
+        payload: Option<TriggerPayload>,
+    ) -> Result<TriggerRun, TriggerError> {
+        if self.stopped() {
+            return Err(TriggerError::Conflict(
+                "the server is shutting down: nothing is fired any more".to_string(),
+            ));
+        }
+        let (id, now) = (run.trigger_id.clone(), run.time.started);
+        let id = id.as_str();
+        let (reason, scheduled) = (run.reason.clone(), run.scheduled);
         let turn = {
             let mut entries = self.lock();
             let Some(entry) = entries.get_mut(id) else {
@@ -1170,67 +1426,90 @@ impl TriggerService {
                     "trigger \"{id}\" cannot run: {error}"
                 )));
             }
-            if entry.busy {
-                None
+            let claimed = if entry.busy {
+                Err("the previous run has not finished")
             } else {
-                entry.busy = true;
-                // Keyed on what the run carries, not only on the kind of
-                // trigger: any payload is outside text. The rules themselves
-                // are put together where the agent's are known
-                // (`trigger::rules`).
-                let untrusted = payload.is_some()
-                    || matches!(
-                        entry.schedule,
-                        Ok(Schedule::Webhook | Schedule::Watch { .. })
-                    );
-                Some(TriggerTurn {
-                    trigger_id: id.to_string(),
-                    run_id: run.id.clone(),
-                    title: entry
-                        .spec
-                        .title
-                        .clone()
-                        .filter(|title| !title.trim().is_empty())
-                        .unwrap_or_else(|| id.to_string()),
-                    agent: entry.spec.agent.clone(),
-                    model: entry.spec.model_ref(),
-                    mode: entry.spec.session_mode(),
-                    session_id: entry.state.session_id.clone(),
-                    inherited: entry.inherited.clone().unwrap_or_default(),
-                    own: entry
-                        .spec
-                        .permission
-                        .as_ref()
-                        .map(|own| from_config(own, &self.settings.home))
-                        .unwrap_or_default(),
-                    untrusted,
-                    restricted: entry.restricted,
-                    outside_content: entry.outside_content,
-                    operator_authored: entry.origin_session_id.is_none() && !entry.restricted,
-                    prompt: entry.spec.prompt.clone(),
-                    payload,
-                    now_ms: now,
-                })
+                match tick {
+                    Some(TickClaim::Run) => Ok(()),
+                    Some(_) => Err(BUSY_ELSEWHERE),
+                    None => match self.store.claim_run(&run) {
+                        Ok(true) => Ok(()),
+                        Ok(false) => Err(BUSY_ELSEWHERE),
+                        Err(error) => return Err(TriggerError::Failed(error.to_string())),
+                    },
+                }
+            };
+            match claimed {
+                Err(cause) => Err(cause),
+                Ok(()) => {
+                    entry.busy = true;
+                    // The session a `reuse` trigger keeps is whichever
+                    // process's run ended last.
+                    if self.role.is_some() {
+                        if let Ok(Some(theirs)) = self.store.state(id) {
+                            entry.state.session_id = theirs.session_id;
+                        }
+                    }
+                    // Keyed on what the run carries, not only on the kind
+                    // of trigger: any payload is outside text. The rules
+                    // themselves are put together where the agent's are
+                    // known (`trigger::rules`).
+                    let untrusted = payload.is_some()
+                        || matches!(
+                            entry.schedule,
+                            Ok(Schedule::Webhook | Schedule::Watch { .. })
+                        );
+                    Ok(TriggerTurn {
+                        trigger_id: id.to_string(),
+                        run_id: run.id.clone(),
+                        title: entry
+                            .spec
+                            .title
+                            .clone()
+                            .filter(|title| !title.trim().is_empty())
+                            .unwrap_or_else(|| id.to_string()),
+                        agent: entry.spec.agent.clone(),
+                        model: entry.spec.model_ref(),
+                        mode: entry.spec.session_mode(),
+                        session_id: entry.state.session_id.clone(),
+                        inherited: entry.inherited.clone().unwrap_or_default(),
+                        own: entry
+                            .spec
+                            .permission
+                            .as_ref()
+                            .map(|own| from_config(own, &self.settings.home))
+                            .unwrap_or_default(),
+                        untrusted,
+                        restricted: entry.restricted,
+                        outside_content: entry.outside_content,
+                        operator_authored: entry.origin_session_id.is_none() && !entry.restricted,
+                        prompt: entry.spec.prompt.clone(),
+                        payload,
+                        now_ms: now,
+                    })
+                }
             }
         };
-        let Some(turn) = turn else {
-            run.status = RunStatus::Skipped;
-            run.cause = Some("the previous run has not finished".to_string());
-            run.time.ended = Some(now);
-            let _ = self.store.put_run(&run);
-            let mut data = json!({
-                "triggerID": id,
-                "runID": run.id,
-                "reason": reason,
-                "cause": run.cause,
-            });
-            if let Some(scheduled) = scheduled {
-                data["scheduled"] = json!(scheduled);
+        let turn = match turn {
+            Ok(turn) => turn,
+            Err(cause) => {
+                run.status = RunStatus::Skipped;
+                run.cause = Some(cause.to_string());
+                run.time.ended = Some(now);
+                let _ = self.store.put_run(&run);
+                let mut data = json!({
+                    "triggerID": id,
+                    "runID": run.id,
+                    "reason": reason,
+                    "cause": run.cause,
+                });
+                if let Some(scheduled) = scheduled {
+                    data["scheduled"] = json!(scheduled);
+                }
+                self.publish(&TRIGGER_SKIPPED, data);
+                return Ok(run);
             }
-            self.publish(&TRIGGER_SKIPPED, data);
-            return Ok(run);
         };
-        let _ = self.store.put_run(&run);
         let mut data = json!({ "triggerID": id, "runID": run.id, "reason": reason });
         if let Some(scheduled) = scheduled {
             data["scheduled"] = json!(scheduled);
@@ -1316,12 +1595,11 @@ impl TriggerService {
             if let Some(entry) = entries.get_mut(&turn.trigger_id) {
                 entry.busy = false;
                 entry.state.last_fired = Some(now);
-                if turn.mode == SessionMode::Reuse {
-                    if let Some(session_id) = session_id {
-                        entry.state.session_id = Some(session_id);
-                    }
+                let kept = session_id.filter(|_| turn.mode == SessionMode::Reuse);
+                if let Some(session_id) = &kept {
+                    entry.state.session_id = Some(session_id.clone());
                 }
-                let _ = self.store.put_state(&turn.trigger_id, &entry.state);
+                let _ = self.store.finish(&turn.trigger_id, now, kept.as_deref());
             }
         }
         self.settled.notify_waiters();

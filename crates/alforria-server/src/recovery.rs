@@ -9,34 +9,41 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use alforria_core::session::recovery::{self, ResumePolicy, RunMarker, RunMarkers};
+use alforria_core::session::recovery::{self, Claimed, ResumePolicy, RunMarkers};
 
 use crate::middleware::location::LocationContext;
 use crate::state::ServerContext;
 
 /// Repair every session a dead process left mid-turn. Returns how many
-/// were found.
+/// this process took.
+///
+/// Several processes can start over one data directory at the same moment
+/// and all see the same orphaned markers. Each marker is claimed first
+/// (`RunMarkers::claim`, an atomic rename), so one process repairs and
+/// resumes a given turn and the others never see it.
 pub fn sweep(ctx: &Arc<ServerContext>, data_dir: &Path, policy: ResumePolicy) -> usize {
     let markers = RunMarkers::new(data_dir);
-    let orphans = markers.orphans();
-    for marker in &orphans {
-        if let Err(error) = recover(ctx, &markers, marker, policy) {
-            // The marker stays: the next start tries again.
+    let claimed = markers.claim();
+    for claim in &claimed {
+        if let Err(error) = recover(ctx, &markers, claim, policy) {
+            // The marker goes back: the next start tries again.
+            markers.give_back(claim);
             tracing::warn!(
-                session = %marker.session_id,
+                session = %claim.marker.session_id,
                 "could not repair a session interrupted by a restart: {error}"
             );
         }
     }
-    orphans.len()
+    claimed.len()
 }
 
 fn recover(
     ctx: &Arc<ServerContext>,
     markers: &RunMarkers,
-    marker: &RunMarker,
+    claim: &Claimed,
     policy: ResumePolicy,
 ) -> Result<(), String> {
+    let marker = &claim.marker;
     let services = ctx
         .instances
         .load(&marker.directory)
@@ -45,7 +52,7 @@ fn recover(
         recovery::repair(&services, &marker.session_id).map_err(|error| error.to_string())?
     else {
         // The session was deleted since.
-        markers.remove(&marker.session_id);
+        markers.release(claim);
         return Ok(());
     };
     let action = interrupted.action(policy);
@@ -67,7 +74,7 @@ fn recover(
             .map_err(|error| error.to_string())?;
     }
     let Some(input) = follow_up else {
-        markers.remove(&marker.session_id);
+        markers.release(claim);
         return Ok(());
     };
     let engine = (ctx.engine_factory)(&LocationContext {
@@ -78,35 +85,24 @@ fn recover(
     .map_err(|error| format!("{error:?}"))?;
     let Ok(runtime) = tokio::runtime::Handle::try_current() else {
         // Nothing to run a prompt on: the session is repaired, and the
-        // marker stays for a start that can do the rest.
+        // marker goes back for a start that can do the rest.
+        markers.give_back(claim);
         return Ok(());
     };
     let markers = markers.clone();
-    let session_id = marker.session_id.clone();
+    let claim = claim.clone();
     runtime.spawn(async move {
-        // A note is written and done. A resumed turn replaces the dead
-        // process's marker with its own as it starts, and clears that when
-        // it ends.
-        let resumed = action == ResumePolicy::Continue;
-        match engine.prompt(input).await {
-            Ok(_) if !resumed => markers.remove(&session_id),
-            Ok(_) => {}
-            Err(error) => {
-                tracing::warn!(
-                    session = %session_id,
-                    "the follow-up to an interrupted turn failed: {error:?}"
-                );
-                // A turn that could not even start is not tried again on
-                // every boot.
-                if markers
-                    .orphans()
-                    .iter()
-                    .any(|marker| marker.session_id == session_id)
-                {
-                    markers.remove(&session_id);
-                }
-            }
+        // The claim is held for as long as the follow-up runs: a resumed
+        // turn writes a marker of its own as it starts and clears it when
+        // it ends, and a process that starts meanwhile finds nothing to
+        // take. A follow-up that fails is not tried again on every boot.
+        if let Err(error) = engine.prompt(input).await {
+            tracing::warn!(
+                session = %claim.marker.session_id,
+                "the follow-up to an interrupted turn failed: {error:?}"
+            );
         }
+        markers.release(&claim);
     });
     Ok(())
 }

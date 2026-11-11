@@ -419,7 +419,7 @@ pub fn production_context(
     let storage = Arc::new(storage);
     let global = global_config(&paths);
     apply_synchronous(&storage, &global);
-    start_maintenance(&storage, &global);
+    start_maintenance(&storage, &global, &paths.data);
     // The session durable manifest — required by the durable streams
     // (`/api/session/:id/event`, `/api/session/:id/history`).
     let manifest = Arc::new(alforria_core::session::event_definitions::SessionManifest::new());
@@ -566,14 +566,22 @@ pub(crate) fn global_config(
 /// checkpoints: now, then periodically for as long as the server runs.
 /// Without a runtime to run on (the in-process server is built before the
 /// TUI starts one) the startup pass still happens.
-fn start_maintenance(storage: &Arc<Storage>, config: &alforria_core::config::schema::Config) {
+fn start_maintenance(
+    storage: &Arc<Storage>,
+    config: &alforria_core::config::schema::Config,
+    data_dir: &std::path::Path,
+) {
     use alforria_core::storage::maintenance;
     let retention = maintenance::event_retention(config);
+    // Of the processes that share the data directory, one maintains it.
+    let role = maintenance::maintenance_lock(data_dir);
     match tokio::runtime::Handle::try_current() {
         Ok(_) => {
-            maintenance::spawn(storage, retention);
+            maintenance::spawn(storage, retention, Some(role));
         }
-        Err(_) => maintenance::run_once(storage, &retention),
+        Err(_) => {
+            maintenance::run_once_as(storage, &retention, &role);
+        }
     }
 }
 

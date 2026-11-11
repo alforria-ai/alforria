@@ -70,6 +70,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "0009_memory_directory",
         include_str!("alforria_migrations/0009_memory_directory.sql"),
     ),
+    (
+        "0010_trigger_run_owner",
+        include_str!("alforria_migrations/0010_trigger_run_owner.sql"),
+    ),
 ];
 
 /// The journal table.
@@ -667,6 +671,10 @@ mod tests {
             (
                 "0009_memory_directory",
                 "f5847853d1bbd28fc38d587880aa0854edd1bd299097137a77a364b5b2ab80e9",
+            ),
+            (
+                "0010_trigger_run_owner",
+                "419cba696e7b4215b0fd9160e4a00d4779b3135573c8b8183bd9183d3a39fbb8",
             ),
         ];
         for (id, sql) in MIGRATIONS {

@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use crate::config::schema::Config;
 use crate::event::sql::{self, EventRetention};
+use crate::owner::RoleLock;
 use crate::storage::Storage;
 use crate::CoreError;
 
@@ -122,33 +123,84 @@ pub fn run_once(storage: &Storage, retention: &EventRetention) {
     }
 }
 
+/// The file whose lock says which of the processes sharing a data
+/// directory maintains its database.
+pub fn maintenance_lock(data_dir: &std::path::Path) -> RoleLock {
+    RoleLock::new(data_dir.join("lock").join("maintenance.lock"))
+}
+
+/// Whether this process is the one that maintains the database, taking
+/// the place if it is free. Said once when it is not.
+fn maintains(role: Option<&RoleLock>, told: &mut bool) -> bool {
+    let Some(role) = role else {
+        return true;
+    };
+    if role.acquire() {
+        return true;
+    }
+    if !std::mem::replace(told, true) {
+        tracing::info!(
+            "another process maintains this data directory (event retention, write-ahead-log \
+             checkpoints): this one is a follower and takes over when that process exits"
+        );
+    }
+    false
+}
+
 /// Run retention now and daily, and checkpoint the write-ahead log every
 /// few minutes, for as long as `storage` is in use. Must be called inside a
 /// tokio runtime.
-pub fn spawn(storage: &Arc<Storage>, retention: EventRetention) -> tokio::task::JoinHandle<()> {
+///
+/// With a `role`, only the process that holds it does either: of several
+/// servers on one data directory one prunes and checkpoints, and the others
+/// ask for the place again on every pass, so one of them has it within
+/// [`CHECKPOINT_INTERVAL`] of the holder's exit and starts with a
+/// retention pass.
+pub fn spawn(
+    storage: &Arc<Storage>,
+    retention: EventRetention,
+    role: Option<RoleLock>,
+) -> tokio::task::JoinHandle<()> {
     let storage: Weak<Storage> = Arc::downgrade(storage);
     tokio::spawn(async move {
         let mut since_prune = PRUNE_INTERVAL;
+        let mut told = false;
         loop {
             let Some(storage) = storage.upgrade() else {
                 return;
             };
-            let prune = since_prune >= PRUNE_INTERVAL;
-            if prune {
-                since_prune = Duration::ZERO;
-            }
-            let pass = tokio::task::spawn_blocking(move || {
+            if maintains(role.as_ref(), &mut told) {
+                let prune = since_prune >= PRUNE_INTERVAL;
                 if prune {
-                    run_once(&storage, &retention);
-                } else if let Err(error) = checkpoint(&storage) {
-                    tracing::warn!("checkpointing the write-ahead log failed: {error}");
+                    since_prune = Duration::ZERO;
                 }
-            });
-            let _ = pass.await;
+                let pass = tokio::task::spawn_blocking(move || {
+                    if prune {
+                        run_once(&storage, &retention);
+                    } else if let Err(error) = checkpoint(&storage) {
+                        tracing::warn!("checkpointing the write-ahead log failed: {error}");
+                    }
+                });
+                let _ = pass.await;
+            } else {
+                drop(storage);
+            }
             tokio::time::sleep(CHECKPOINT_INTERVAL).await;
-            since_prune += CHECKPOINT_INTERVAL;
+            since_prune = since_prune.saturating_add(CHECKPOINT_INTERVAL);
         }
     })
+}
+
+/// The startup pass of a process that has no runtime to keep going on:
+/// done when nobody else maintains the data directory. The place is given
+/// up again at once: this process does not go on maintaining.
+pub fn run_once_as(storage: &Storage, retention: &EventRetention, role: &RoleLock) -> bool {
+    if !maintains(Some(role), &mut false) {
+        return false;
+    }
+    run_once(storage, retention);
+    role.release();
+    true
 }
 
 #[cfg(test)]
@@ -339,6 +391,7 @@ mod tests {
                 max_age_ms: None,
                 keep_last: Some(3),
             },
+            None,
         );
         for _ in 0..100 {
             if seqs(&storage, "ses_a").len() == 3 {
@@ -348,5 +401,34 @@ mod tests {
         }
         assert_eq!(seqs(&storage, "ses_a"), vec![7, 8, 9]);
         job.abort();
+    }
+
+    /// M9. Of two servers on one data directory, one maintains the
+    /// database; the other does when the first lets go.
+    #[test]
+    fn only_the_holder_of_the_maintenance_role_prunes() {
+        let (storage, dir) = storage();
+        write_daily(&storage, "ses_a", 10);
+        let retention = EventRetention {
+            max_age_ms: None,
+            keep_last: Some(3),
+        };
+        let leader = maintenance_lock(dir.path());
+        assert!(maintains(Some(&leader), &mut false));
+
+        // A second process: it is told once, and prunes nothing.
+        let follower = maintenance_lock(dir.path());
+        let mut told = false;
+        assert!(!maintains(Some(&follower), &mut told));
+        assert!(told);
+        assert!(!run_once_as(&storage, &retention, &follower));
+        assert_eq!(seqs(&storage, "ses_a").len(), 10);
+
+        // The holder exits: the follower has the place on its next pass.
+        drop(leader);
+        assert!(run_once_as(&storage, &retention, &follower));
+        assert_eq!(seqs(&storage, "ses_a"), vec![7, 8, 9]);
+        // A process alone, with no role to ask for, always maintains.
+        assert!(maintains(None, &mut false));
     }
 }

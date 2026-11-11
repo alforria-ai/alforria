@@ -95,6 +95,75 @@ failed ("the turn was stopped before it finished") or completed. A turn
 that ended inside the process leaves no restart marker, so the next start
 repairs and resumes nothing on its account.
 
+### Two servers on one data directory: leader and follower
+
+Nothing stops two alforria processes from sharing a data directory: a TUI
+beside `alforria serve`, `serve` beside `web`, or a supervisor that starts a
+second instance before the first is gone. Both serve requests. What must
+happen once happens once, decided by three mechanisms, none of which a
+process alone on its data directory can lose:
+
+- **A lock per role.** For each project directory, one process is the
+  *scheduler* (the leader): it runs the ticks, watches the paths and plans
+  the next occurrence. The others are *followers* for that directory: they
+  watch nothing and fire no tick, and say so once in the log
+  (`another process schedules the triggers of …: this one is a follower`).
+  The role is an advisory lock (`flock`) on
+  `<data>/lock/scheduler-<hash of the directory>.lock`, taken by the first
+  process that opens the directory with its scheduler on (`serve`, `web`,
+  the TUI). The same goes for maintenance — event retention and write-ahead
+  log checkpoints — under `<data>/lock/maintenance.lock`.
+- **A claim per fire.** A trigger has one unsettled run across all the
+  processes, enforced by a unique index: the insert that records a run as
+  queued is the claim, and of two servers that fire the same trigger at the
+  same moment one insert succeeds. This covers every fire — a scheduled
+  tick (claimed together with its tick, in one transaction), a webhook
+  call, a watch and a manual run. The fire that loses does not run: it is
+  recorded as `skipped` ("the previous run has not finished"), exactly as
+  when the run in the way is the same server's.
+- **A claim per interrupted turn.** A restart marker whose process is gone
+  is taken with an atomic rename before anything is done about it
+  (`<data>/running/<session>.<pid>.<instance>.<boot>.claim`). Of the
+  processes that start together after a crash, the one whose rename
+  succeeds repairs the session and, under `server.resume: "continue"`,
+  resumes the turn; the others never see it. Every process sweeps at
+  startup, leader or not.
+
+Each run and each marker records its **owner**: a random id the process
+gave itself, its process id, the machine's boot id and, on Linux, the
+process's start time. A starting server closes as interrupted only the
+runs whose owner is provably gone — another boot of the machine, a process
+id that no longer exists, or one that now belongs to a process started at
+another moment — and leaves a live server's runs alone. (It used to close
+every unsettled run in the directory, the other server's included.)
+
+**A webhook call that reaches a follower** is run by the follower itself:
+the call is claimed like any other fire, so it runs once whichever server
+receives it, and nothing is forwarded between the processes. The same
+holds for `POST /trigger/{id}/run`. A trigger created, changed, paused or
+deleted through a follower is picked up by the scheduler on its next pass
+(within 15 s).
+
+**When the leader exits**, however it exits, the operating system drops its
+locks. A follower asks for the scheduler's place again every 5 s (and for
+the maintenance role every 5 minutes), so one of them takes over without a
+restart. Taking over is a start as far as the schedule goes: the runs the
+old leader left unfinished are closed as interrupted, and a tick that came
+due in the gap is fired only by a trigger with `catch_up`. A clean
+shutdown releases the scheduler's place as its first step.
+
+Limits:
+
+| | |
+| --- | --- |
+| The boot id | `/proc/sys/kernel/random/boot_id`, Linux only. Elsewhere there is none and a reboot is noticed by the process id being gone |
+| Process-id reuse | Detected on Linux by the start time. On other Unix systems a dead owner whose id was given to another process reads as alive: its run stays `running`, and its trigger is skipped, until that process exits |
+| Platforms that are not Unix | Whether a process is alive cannot be told: a starting server closes every unsettled run that is not its own (the old behaviour), and restart markers of other processes are left alone |
+| Filesystems without `flock` (some network mounts) | Every process takes itself for the leader: ticks and other fires are still claimed in the database and run once, but each process watches the paths, so a watched change can run once per process if the first run has ended before the second server's debounce does |
+| The webhook rate limit | `triggers.webhook_min_interval` is counted per process: two servers accept one delivery each per interval. Only one runs while the first is unfinished |
+| Different configs | Triggers declared in a config are scheduled by the leader from *its* config. Two servers meant to share a data directory should share the config |
+| A build older than this | Knows none of the above. Do not run it beside a newer one on the same data directory |
+
 ## What the agent's shell can see: `shell_env` (host)
 
 ```jsonc
@@ -736,7 +805,8 @@ set it up and the session it lands in.
 | A trigger the operator wrote (config, an `admin` request, the `schedule` tool in an unrestricted session) | `Caller::Session` | The session it lands in: unrestricted in a session of its own, restricted if it names a restricted session. |
 | A trigger a restricted caller created (a `chat`/`connector` request, or the `schedule` tool in a restricted session) | `Caller::Restricted` — that caller's request, replayed | Recorded on the trigger when it is created and never changed. Its runs happen in restricted sessions only: the sessions it creates are created restricted, a session it names must be this directory's and restricted, and the engine refuses the turn if the session's restriction has been lifted since. Its prompt is text: `@file` and `@agent` mentions are resolved only in a prompt the operator wrote. |
 | A webhook call (`POST /trigger/{id}/hook`) | The trigger's caller, above | What it delivers is outside text: the run's session carries the outside-start mark (and with it outside-content), its shells get the restricted environment (`shell_env`: the allowlist, no `GITHUB_TOKEN` or `AWS_*` unless `allow` names them) whatever the server's posture, and its rules are the read-only ceiling **plus whatever the trigger's own `permission` block grants** — a webhook trigger whose block allows `bash` runs `bash` on a body its caller wrote, so who may call it matters. A `hook` credential calls the one trigger it is bound to; the body is capped at 256 KiB before it is read, and a trigger accepts one delivery per `triggers.webhook_min_interval` (default 1 s; sooner is a 429 with `Retry-After`), whoever sends it. |
-| A restart follow-up (`server.resume: notify` / `continue`) | `Caller::Session` | The interrupted session's own restriction and rules. A trigger's interrupted turn is resumed like any other, once; its run is closed as interrupted and its tick is not fired again. |
+| A restart follow-up (`server.resume: notify` / `continue`) | `Caller::Session` | The interrupted session's own restriction and rules. A trigger's interrupted turn is resumed like any other, once; its run is closed as interrupted and its tick is not fired again. With several servers on the data directory, the one that claims the dead process's marker does this and no other (see "Two servers on one data directory"). |
+| The same fire reaching two servers on one data directory (a tick, a webhook call, a watch, a manual run) | The trigger's caller, above | One unsettled run per trigger across the processes, claimed in the database: one server runs it, the other records it as skipped. Only a run whose owner process is provably gone is closed by another server. |
 | The memory flush before a compaction | No turn: one model request with one tool | The session's own `memory` permission (an `ask` is a refusal), its outside-content mark and its restriction, all recorded on what it writes. |
 | A `/goal` round, a subagent's run, a subagent's result, an auto-resume | `Caller::Session` | The session, as before. |
 

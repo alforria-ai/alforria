@@ -1073,6 +1073,9 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
                 .unwrap_or(
                     alforria_core::trigger::TriggerSettings::DEFAULT_WEBHOOK_MIN_INTERVAL_MS,
                 ),
+            // One process schedules a directory's triggers, among those
+            // that share the data directory.
+            lock_dir: Some(input.paths.data.join("lock")),
         },
     );
 

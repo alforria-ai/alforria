@@ -25,7 +25,6 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 
 use alforria_schema::session_status::SessionStatusInfo;
 use alforria_schema::session_v1::{
@@ -37,6 +36,7 @@ use serde_json::{json, Value};
 use crate::config::schema::{Config, ResumeMode};
 use crate::event::bus::PublishOptions;
 use crate::event::definition::Definition;
+use crate::owner::ProcessOwner;
 use crate::session::caller::Caller;
 use crate::session::error::SessionError;
 use crate::session::message::{message_id, WithParts};
@@ -91,22 +91,8 @@ impl ResumePolicy {
 }
 
 // ---------------------------------------------------------------------------
-// Process identity
+// Run markers
 // ---------------------------------------------------------------------------
-
-/// Identifies this server process.
-fn boot() -> &'static str {
-    static BOOT: OnceLock<String> = OnceLock::new();
-    BOOT.get_or_init(|| ulid::Ulid::new().to_string())
-}
-
-/// Identifies this boot of the machine, where that can be told (Linux).
-fn machine_boot() -> Option<String> {
-    std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
-        .ok()
-        .map(|id| id.trim().to_string())
-        .filter(|id| !id.is_empty())
-}
 
 /// A running turn, as recorded on disk.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,49 +101,88 @@ pub struct RunMarker {
     pub session_id: String,
     /// The instance directory the session runs in.
     pub directory: PathBuf,
-    /// The server process running the turn.
+    /// The server process running the turn ([`ProcessOwner::instance`]).
     pub boot: String,
     pub pid: u32,
     /// The machine boot that process belonged to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine_boot: Option<String>,
+    /// When that process started ([`ProcessOwner::started`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_started: Option<u64>,
     pub started_at: u64,
 }
 
 impl RunMarker {
-    /// Whether the process running this turn is gone. Several alforria
-    /// processes can share a data directory (a TUI beside `alforria serve`):
-    /// a turn another live process is running is that process's.
-    ///
-    /// After a reboot a process id proves nothing: the new server is likely
-    /// to have the very id the old one had. A marker from another boot of
-    /// the machine, or carrying this process's id without being its own, is
-    /// from a process that no longer exists. Where liveness cannot be told
-    /// at all, the owner is taken to be alive.
-    pub fn orphaned(&self) -> bool {
-        if self.boot == boot() {
-            return false;
-        }
-        if self.pid == std::process::id() {
-            return true;
-        }
-        if let (Some(then), Some(now)) = (&self.machine_boot, machine_boot()) {
-            if *then != now {
-                return true;
-            }
-        }
-        if cfg!(target_os = "linux") {
-            !Path::new("/proc").join(self.pid.to_string()).exists()
-        } else {
-            false
+    fn owner(&self) -> ProcessOwner {
+        ProcessOwner {
+            instance: self.boot.clone(),
+            pid: self.pid,
+            boot: self.machine_boot.clone(),
+            started: self.process_started,
         }
     }
+
+    /// Whether the process running this turn is gone. Several alforria
+    /// processes can share a data directory (a TUI beside `alforria serve`):
+    /// a turn another live process is running is that process's. Where
+    /// liveness cannot be told at all, the owner is taken to be alive
+    /// ([`ProcessOwner::liveness`]).
+    pub fn orphaned(&self) -> bool {
+        self.owner().gone()
+    }
+}
+
+/// An orphaned marker this process took for itself ([`RunMarkers::claim`]):
+/// the interrupted turn is this process's to repair and resume, and nobody
+/// else's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Claimed {
+    pub marker: RunMarker,
+    path: PathBuf,
+}
+
+/// The extension of a claimed marker: `<session>.<pid>.<instance>.<machine
+/// boot>.claim`. The claimant is in the name because the name is what the
+/// rename sets atomically.
+const CLAIM: &str = "claim";
+/// Stands for "no machine boot known" in a claim's name.
+const NO_BOOT: &str = "none";
+
+/// The session and the claimant a claimed marker's file name carries.
+fn claim_name(path: &Path) -> Option<(String, ProcessOwner)> {
+    let name = path.file_name()?.to_str()?;
+    let mut fields = name.split('.');
+    let (session, pid, instance, boot, extension) = (
+        fields.next()?,
+        fields.next()?,
+        fields.next()?,
+        fields.next()?,
+        fields.next()?,
+    );
+    if extension != CLAIM || fields.next().is_some() {
+        return None;
+    }
+    Some((
+        session.to_string(),
+        ProcessOwner {
+            instance: instance.to_string(),
+            pid: pid.parse().ok()?,
+            boot: (boot != NO_BOOT).then(|| boot.to_string()),
+            started: None,
+        },
+    ))
 }
 
 /// The markers of running turns: `<data>/running/<session>.json`. Files, so
 /// they need no schema change, and written through to disk, so one exists
 /// for every turn that left anything behind even when the machine is killed
 /// the moment after.
+///
+/// Whether a marker's process is gone is only a liveness check, and two
+/// processes that start together both make it. What decides which of them
+/// deals with an orphaned marker is [`RunMarkers::claim`]: a rename, which
+/// one of them wins.
 #[derive(Debug, Clone)]
 pub struct RunMarkers {
     dir: PathBuf,
@@ -183,12 +208,14 @@ impl RunMarkers {
         let Some(path) = self.path(session_id) else {
             return;
         };
+        let me = ProcessOwner::current();
         let marker = RunMarker {
             session_id: session_id.to_string(),
             directory: directory.to_path_buf(),
-            boot: boot().to_string(),
-            pid: std::process::id(),
-            machine_boot: machine_boot(),
+            boot: me.instance.clone(),
+            pid: me.pid,
+            machine_boot: me.boot.clone(),
+            process_started: me.started,
             started_at: now_ms,
         };
         if let Err(error) = self.write(&path, &marker) {
@@ -206,12 +233,16 @@ impl RunMarkers {
             file.sync_all()?;
         }
         std::fs::rename(&staged, path)?;
-        // The rename is what must survive: sync the directory too, where a
-        // directory can be opened.
+        self.sync_dir();
+        Ok(())
+    }
+
+    /// A rename is what must survive: sync the directory too, where a
+    /// directory can be opened.
+    fn sync_dir(&self) {
         if let Ok(dir) = std::fs::File::open(&self.dir) {
             let _ = dir.sync_all();
         }
-        Ok(())
     }
 
     /// The turn of `session_id` ended. Only this process's own marker goes.
@@ -219,7 +250,10 @@ impl RunMarkers {
         let Some(path) = self.path(session_id) else {
             return;
         };
-        if self.read(&path).is_some_and(|marker| marker.boot != boot()) {
+        if self
+            .read(&path)
+            .is_some_and(|marker| marker.boot != ProcessOwner::current().instance)
+        {
             return;
         }
         let _ = std::fs::remove_file(path);
@@ -237,20 +271,126 @@ impl RunMarkers {
         serde_json::from_slice(&std::fs::read(path).ok()?).ok()
     }
 
-    /// The markers of turns whose process is gone.
-    pub fn orphans(&self) -> Vec<RunMarker> {
+    fn files(&self, extension: &str) -> Vec<PathBuf> {
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
             return Vec::new();
         };
-        let mut orphans: Vec<RunMarker> = entries
+        entries
             .flatten()
-            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
-            .filter_map(|entry| self.read(&entry.path()))
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == extension))
+            .collect()
+    }
+
+    /// The markers of turns whose process is gone. Looking claims nothing:
+    /// a process that means to act on one takes it with [`Self::claim`].
+    pub fn orphans(&self) -> Vec<RunMarker> {
+        let mut orphans: Vec<RunMarker> = self
+            .files("json")
+            .iter()
+            .filter_map(|path| self.read(path))
             .filter(RunMarker::orphaned)
             .collect();
         orphans.sort_by_key(|marker| marker.started_at);
         orphans
     }
+
+    /// Take every orphaned marker for this process, oldest turn first.
+    ///
+    /// Taking one is a rename of the marker to a name that carries this
+    /// process: of all the processes that saw the same orphan, the rename
+    /// succeeds for one, and the others find the file gone. A claim whose
+    /// claimant died before finishing is itself an orphan and is taken the
+    /// same way.
+    pub fn claim(&self) -> Vec<Claimed> {
+        let mut claimed: Vec<Claimed> = Vec::new();
+        for path in self.files("json") {
+            if self.read(&path).is_some_and(|marker| marker.orphaned()) {
+                claimed.extend(self.take(&path));
+            }
+        }
+        for path in self.files(CLAIM) {
+            let Some((session_id, claimant)) = claim_name(&path) else {
+                continue;
+            };
+            if !claimant.gone() {
+                continue;
+            }
+            // A dead claimant that got as far as resuming left a marker of
+            // its own, which is the newer word on that session.
+            if claimed.iter().any(|c| c.marker.session_id == session_id)
+                || self.path(&session_id).is_some_and(|path| path.exists())
+            {
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+            claimed.extend(self.take(&path));
+        }
+        claimed.sort_by_key(|claimed| claimed.marker.started_at);
+        claimed
+    }
+
+    /// Rename `from` (a marker, or a dead claimant's claim) to this
+    /// process's claim. `None` when another process got there first.
+    fn take(&self, from: &Path) -> Option<Claimed> {
+        let before = self.read(from)?;
+        let me = ProcessOwner::current();
+        let path = self.dir.join(format!(
+            "{}.{}.{}.{}.{CLAIM}",
+            before.session_id,
+            me.pid,
+            me.instance,
+            me.boot.as_deref().unwrap_or(NO_BOOT),
+        ));
+        if self.path(&before.session_id).is_none() || !claim_step(from, &path) {
+            return None;
+        }
+        self.sync_dir();
+        // The file was judged before it was taken, and a marker can be
+        // replaced in between: the winner of an earlier claim resumes the
+        // turn and writes a marker of its own under the same name. What was
+        // taken is then a live turn's, and goes back.
+        match self.read(&path) {
+            Some(marker) if marker.orphaned() => Some(Claimed { marker, path }),
+            Some(marker) => {
+                if let Some(original) = self.path(&marker.session_id) {
+                    let _ = std::fs::rename(&path, original);
+                }
+                None
+            }
+            None => {
+                let _ = std::fs::remove_file(&path);
+                None
+            }
+        }
+    }
+
+    /// What a claim pointed at is dealt with: the claim goes.
+    pub fn release(&self, claimed: &Claimed) {
+        let _ = std::fs::remove_file(&claimed.path);
+        self.sync_dir();
+    }
+
+    /// Put a claimed marker back for a later start (the repair failed, or
+    /// there was nothing to run the follow-up on).
+    pub fn give_back(&self, claimed: &Claimed) {
+        let Some(original) = self.path(&claimed.marker.session_id) else {
+            return;
+        };
+        // A marker written since is a turn running now: the claim just goes.
+        if original.exists() {
+            let _ = std::fs::remove_file(&claimed.path);
+        } else {
+            let _ = std::fs::rename(&claimed.path, original);
+        }
+        self.sync_dir();
+    }
+}
+
+/// The atomic step of a claim: `true` for the one process whose rename
+/// found the file still there.
+fn claim_step(from: &Path, to: &Path) -> bool {
+    std::fs::rename(from, to).is_ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -651,27 +791,144 @@ mod tests {
             boot: boot.to_string(),
             pid,
             machine_boot: machine_boot.map(str::to_string),
+            process_started: None,
             started_at: 1,
         }
     }
 
     #[test]
     fn a_marker_is_orphaned_only_when_its_process_is_gone() {
-        let here = machine_boot();
+        let me = ProcessOwner::current();
+        let here = me.boot.clone();
         // This process's own.
-        assert!(!marker(boot(), std::process::id(), here.as_deref()).orphaned());
+        assert!(!marker(&me.instance, me.pid, here.as_deref()).orphaned());
         // Another boot of the server under this process's id: after a
         // reboot the new server gets the id the old one had.
-        assert!(marker("other", std::process::id(), here.as_deref()).orphaned());
+        assert!(marker("other", me.pid, here.as_deref()).orphaned());
         if cfg!(target_os = "linux") {
             // A process that does not exist.
-            assert!(marker("other", u32::MAX - 7, here.as_deref()).orphaned());
+            assert!(marker("other", i32::MAX as u32 - 7, here.as_deref()).orphaned());
             // A live process on this boot of the machine: another server
             // sharing the data directory.
             assert!(!marker("other", 1, here.as_deref()).orphaned());
             // The same id, from before the machine restarted.
             assert!(marker("other", 1, Some("another-boot")).orphaned());
         }
+    }
+
+    /// A marker a process that no longer exists left for `session`.
+    fn dead_marker(markers: &RunMarkers, session: &str) -> RunMarker {
+        let dead = RunMarker {
+            session_id: session.to_string(),
+            ..marker("gone", std::process::id(), None)
+        };
+        std::fs::create_dir_all(&markers.dir).unwrap();
+        std::fs::write(
+            markers.path(session).unwrap(),
+            serde_json::to_vec(&dead).unwrap(),
+        )
+        .unwrap();
+        dead
+    }
+
+    /// M9. Two processes that start together both see the orphaned marker;
+    /// the liveness check is not a claim, and both resumed the turn. Taking
+    /// it is a rename, which one of them wins. Twenty rounds, the two
+    /// released together, so a claim that is not atomic shows.
+    #[test]
+    fn an_orphaned_marker_is_claimed_by_one_of_two_processes() {
+        let dir = crate::storage::test_support::TempDir::new("run-markers-claim");
+        for round in 0..20 {
+            let session = format!("ses_round{round}");
+            let dead = dead_marker(&RunMarkers::new(dir.path()), &session);
+            let start = std::sync::Barrier::new(2);
+            let claims: Vec<Vec<Claimed>> = std::thread::scope(|scope| {
+                let servers: Vec<_> = (0..2)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            // Each has seen the orphan before either acts.
+                            let markers = RunMarkers::new(dir.path());
+                            assert_eq!(markers.orphans(), vec![dead.clone()]);
+                            start.wait();
+                            markers.claim()
+                        })
+                    })
+                    .collect();
+                servers
+                    .into_iter()
+                    .map(|server| server.join().unwrap())
+                    .collect()
+            });
+            let won: Vec<&Claimed> = claims.iter().flatten().collect();
+            assert_eq!(won.len(), 1, "round {round}: {claims:?}");
+            assert_eq!(won[0].marker, dead);
+            // Claimed, it is no longer anybody's to find.
+            let markers = RunMarkers::new(dir.path());
+            assert!(markers.orphans().is_empty());
+            assert!(markers.claim().is_empty());
+            markers.release(won[0]);
+            assert!(std::fs::read_dir(dir.path().join("running"))
+                .unwrap()
+                .next()
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn a_claim_is_given_back_or_inherited_and_never_takes_a_live_turn() {
+        let dir = crate::storage::test_support::TempDir::new("run-markers-reclaim");
+        let markers = RunMarkers::new(dir.path());
+        let running = dir.path().join("running");
+
+        // Given back, the marker is there for the next start.
+        let dead = dead_marker(&markers, "ses_back");
+        let claimed = markers.claim();
+        assert_eq!(claimed.len(), 1);
+        markers.give_back(&claimed[0]);
+        assert_eq!(markers.orphans(), vec![dead.clone()]);
+
+        // A claimant that died before finishing: its claim is an orphan.
+        let theirs = running.join(format!(
+            "ses_back.{}.gone.{NO_BOOT}.{CLAIM}",
+            std::process::id()
+        ));
+        std::fs::rename(running.join("ses_back.json"), &theirs).unwrap();
+        assert!(markers.orphans().is_empty());
+        let inherited = markers.claim();
+        assert_eq!(inherited.len(), 1);
+        assert_eq!(inherited[0].marker, dead);
+        assert!(!theirs.exists());
+        markers.release(&inherited[0]);
+
+        // A dead claimant that had resumed the turn left a marker of its
+        // own: that one is dealt with, and the stale claim just goes.
+        let dead = dead_marker(&markers, "ses_twice");
+        std::fs::write(
+            running.join(format!(
+                "ses_twice.{}.gone.{NO_BOOT}.{CLAIM}",
+                std::process::id()
+            )),
+            serde_json::to_vec(&dead).unwrap(),
+        )
+        .unwrap();
+        let claimed = markers.claim();
+        assert_eq!(claimed.len(), 1);
+        markers.release(&claimed[0]);
+        assert!(std::fs::read_dir(&running).unwrap().next().is_none());
+
+        // A live process's claim, and a live turn's marker, are left alone.
+        let me = ProcessOwner::current();
+        markers.begin("ses_live", Path::new("/repo"), 5);
+        let live_claim = running.join(format!(
+            "ses_other.1.other.{}.{CLAIM}",
+            me.boot.as_deref().unwrap_or(NO_BOOT)
+        ));
+        std::fs::write(&live_claim, serde_json::to_vec(&dead).unwrap()).unwrap();
+        if cfg!(unix) {
+            assert!(markers.claim().is_empty());
+            assert!(live_claim.exists());
+        }
+        assert!(running.join("ses_live.json").exists());
     }
 
     #[test]
