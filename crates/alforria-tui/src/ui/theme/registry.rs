@@ -42,8 +42,8 @@ fn registry() -> &'static RwLock<Registry> {
     })
 }
 
-/// `Global.Path.config` (`$XDG_CONFIG_HOME/opencode`, else
-/// `~/.config/opencode`) then `.opencode` in the working directory and
+/// `Global.Path.config` (under `$XDG_CONFIG_HOME`, else `~/.config`) then
+/// `.opencode` in the working directory and
 /// each of its ancestors (`context/theme.tsx:40-46`).
 pub fn theme_directories() -> Vec<PathBuf> {
     let mut directories = Vec::new();
@@ -52,7 +52,15 @@ pub fn theme_directories() -> Vec<PathBuf> {
         .filter(|path| path.is_absolute())
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")));
     if let Some(config_home) = config_home {
-        directories.push(config_home.join("opencode"));
+        // Same rule as the server's `GlobalPaths`: alforria's own directory,
+        // or the shared `opencode` one on installs that predate the split.
+        let own = config_home.join("alforria");
+        let legacy = config_home.join("opencode");
+        directories.push(if !own.exists() && legacy.exists() {
+            legacy
+        } else {
+            own
+        });
     }
     if let Ok(cwd) = std::env::current_dir() {
         for ancestor in cwd.ancestors() {

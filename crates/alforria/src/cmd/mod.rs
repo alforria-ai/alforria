@@ -18,6 +18,7 @@ pub mod generate;
 pub mod import;
 pub mod libertai;
 pub mod mcp;
+pub mod migrate;
 pub mod models;
 pub mod pr;
 pub mod providers;
@@ -258,7 +259,8 @@ pub fn cli() -> Command {
             )
             .subcommand(session())
             .subcommand(plug())
-            .subcommand(db()),
+            .subcommand(db())
+            .subcommand(migrate()),
     )
 }
 
@@ -812,6 +814,34 @@ fn plug() -> Command {
         .arg(Arg::new("module").required(true))
 }
 
+fn migrate() -> Command {
+    let flag = |name: &'static str, help: &'static str| {
+        Arg::new(name)
+            .long(name)
+            .help(help)
+            .action(clap::ArgAction::SetTrue)
+    };
+    Command::new("migrate")
+        .about("move this install from the shared opencode directories to alforria's own")
+        .long_about(
+            "alforria used to share ~/.config/opencode, ~/.local/share/opencode and friends \
+             with upstream opencode. opencode v2 rewrites that database to a schema alforria \
+             cannot read, so alforria now keeps its own `alforria` directories.\n\n\
+             Config, cache and state are copied. Data is moved (instant on one filesystem); \
+             stop every running alforria and opencode first.",
+        )
+        .arg(flag("copy", "copy the data directory instead of moving it"))
+        .arg(
+            flag(
+                "fresh",
+                "start a new database, carrying over only saved logins",
+            )
+            .conflicts_with("copy"),
+        )
+        .arg(flag("dry-run", "show what would happen without doing it"))
+        .arg(flag("force", "move the data even if a process has it open"))
+}
+
 fn db() -> Command {
     Command::new("db")
         .about("database tools")
@@ -930,6 +960,7 @@ pub fn route(matches: &ArgMatches, ui: &mut Ui, raw: &[OsString]) -> Result<(), 
         "agent" => agent::run(matches.subcommand_matches("agent").expect("agent"), ui),
         "session" => session::run(matches.subcommand_matches("session").expect("session"), ui),
         "db" => db::run(matches.subcommand_matches("db").expect("db"), ui),
+        "migrate" => migrate::run(matches.subcommand_matches("migrate").expect("migrate"), ui),
         "debug" => debug::run(matches.subcommand_matches("debug").expect("debug"), ui),
         "mcp" => mcp::run(matches.subcommand_matches("mcp").expect("mcp"), ui),
         "tui" => tui::run(matches, ui, raw),

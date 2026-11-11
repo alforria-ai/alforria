@@ -951,7 +951,7 @@ mod tests {
                 reset = style::TEXT_NORMAL,
                 dim = style::TEXT_DIM,
                 normal = style::TEXT_NORMAL,
-                auth_file = "/.local/share/opencode/auth.json",
+                auth_file = "/.local/share/alforria/auth.json",
             )
         );
     }

@@ -34,8 +34,10 @@ impl Storage {
     /// (`database.ts` wires `DatabaseMigration.apply` right after the
     /// PRAGMAs, so opening an incompatible database fails here).
     pub fn open(path: impl AsRef<Path>) -> Result<Storage, CoreError> {
+        let path = path.as_ref();
         let mut conn = Connection::open(path)?;
         Self::configure(&conn)?;
+        refuse_foreign_schema(&conn, path)?;
         migration::apply(&mut conn)?;
         Ok(Storage {
             conn: Mutex::new(conn),
@@ -107,7 +109,28 @@ impl Drop for Storage {
     }
 }
 
-/// The default database path inside the opencode data directory
+/// opencode v2 migrates a shared `opencode.db` in place: it drops and
+/// reshapes tables alforria reads and empties the event log. Opening such a
+/// database would fail later in confusing ways, or write rows v2 then
+/// mishandles, so stop here with an explanation instead.
+fn refuse_foreign_schema(conn: &Connection, path: &Path) -> Result<(), CoreError> {
+    let migrated: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session_v2')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !migrated {
+        return Ok(());
+    }
+    Err(CoreError::Storage(format!(
+        "{} was migrated by opencode v2 and can no longer be read by alforria. \
+         alforria keeps its data in its own `alforria` directory: create it (or run \
+         `alforria migrate --fresh`) to start with a new database, leaving this one to opencode.",
+        path.display()
+    )))
+}
+
+/// The default database path inside the data directory
 /// (`database.ts:53`).
 pub fn db_path(data_dir: &Path) -> PathBuf {
     data_dir.join("opencode.db")
@@ -118,6 +141,29 @@ mod tests {
     use super::*;
 
     use crate::storage::test_support::TempDir;
+
+    #[test]
+    fn a_database_migrated_by_opencode_v2_is_refused_with_a_way_out() {
+        let dir = TempDir::new("foreign-schema");
+        let path = dir.path().join("opencode.db");
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("CREATE TABLE session_v2 (id TEXT PRIMARY KEY)")
+            .unwrap();
+        let error = Storage::open(&path).unwrap_err().to_string();
+        assert!(error.contains("migrated by opencode v2"), "{error}");
+        assert!(error.contains("alforria migrate --fresh"), "{error}");
+        // Nothing was added to the foreign database.
+        let tables: i64 = Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 1);
+    }
 
     #[test]
     fn open_applies_pragmas() {

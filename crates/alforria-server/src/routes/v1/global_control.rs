@@ -29,16 +29,9 @@ use crate::state::ServerContext;
 // shared helpers
 // ---------------------------------------------------------------------------
 
-/// `Global.Path.state` (`global.ts:14`) — XDG state home + `opencode`.
+/// `Global.Path.state` (`global.ts:14`).
 fn global_state_path() -> PathBuf {
-    let xdg = std::env::var_os("XDG_STATE_HOME").filter(|v| !v.is_empty());
-    match xdg {
-        Some(v) => PathBuf::from(v).join("opencode"),
-        None => {
-            let home = alforria_core::GlobalPaths::from_env().home;
-            home.join(".local").join("state").join("opencode")
-        }
-    }
+    alforria_core::GlobalPaths::from_env().state
 }
 
 /// `FSUtil.contains` — whether `path` stays inside `directory`.

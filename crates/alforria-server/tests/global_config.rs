@@ -33,7 +33,7 @@ async fn patch(router: &axum::Router, body: &str) -> (StatusCode, serde_json::Va
 async fn null_deletes_a_global_config_key() {
     let dir = tempfile::tempdir().unwrap();
     std::env::set_var("XDG_CONFIG_HOME", dir.path());
-    let file = dir.path().join("opencode/opencode.jsonc");
+    let file = dir.path().join("alforria/opencode.jsonc");
     let router = routes::build_router(Arc::new(ServerContext::for_tests()));
 
     let (status, _) = patch(

@@ -52,8 +52,13 @@ bun run build && bun run pack   # -> crates/alforria-ui/assets/ui.tar.zst (commi
 - Branding: user-facing surfaces say `alforria` (binary, crate names, CLI help,
   TUI wordmark, serve handshake, default auth username). Wire-compat surfaces
   keep the upstream `opencode` identity: `OPENCODE_*` env vars, `opencode.json`
-  config discovery, XDG paths (`~/.config/opencode`), `opencode.db`, HTTP
-  headers (`x-opencode-*`), provider ids (`opencode`, `opencode-go`), and the
-  `opencode` theme asset.
+  config discovery, project-level `.opencode/` directories, the `opencode.db`
+  file name, HTTP headers (`x-opencode-*`), provider ids (`opencode`,
+  `opencode-go`), and the `opencode` theme asset.
+- Global directories are alforria's own (`~/.config/alforria`,
+  `~/.local/share/alforria`, …), not upstream's: opencode v2 migrates a shared
+  database to a schema we cannot read. An existing `opencode` directory is
+  still used until its `alforria` counterpart exists; `alforria migrate` moves
+  an install over. See `crates/alforria-core/src/paths.rs`.
 - Chunks/commits follow the chunked-factory discipline: one commit per milestone,
   `fixup:` commits for review fixes, `steer:` commits from steering gates.

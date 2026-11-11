@@ -378,7 +378,7 @@ fn providers_login_logout_roundtrip() {
 
     let list = env.run(&["providers", "list"]);
     assert!(list.stderr.contains("Anthropic"), "stderr={}", list.stderr);
-    let auth = std::fs::read_to_string(env.home.join(".local/share/opencode/auth.json"))
+    let auth = std::fs::read_to_string(env.home.join(".local/share/alforria/auth.json"))
         .expect("auth.json");
     assert!(auth.contains("sk-test-key"), "{auth}");
 
