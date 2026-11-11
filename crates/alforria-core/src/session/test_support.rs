@@ -600,6 +600,8 @@ pub(crate) struct Engine {
 pub(crate) enum EngineDefs {
     /// The real M4 `read` tool.
     Real,
+    /// The real `read`, and the real `grep` and `glob` beside it.
+    Search,
     /// A `read` tool whose execution never resolves — the abort tests'
     /// cancellation seam.
     HangingRead,
@@ -632,6 +634,17 @@ pub(crate) fn engine_with_flags(
     session_permission: Option<Value>,
 ) -> Engine {
     engine_build(name, script, config, session_permission, EngineDefs::Real)
+}
+
+/// An engine whose registry also holds the real `grep` and `glob`.
+pub(crate) fn engine_with_search(name: &str, script: MockScript) -> Engine {
+    engine_build(
+        name,
+        script,
+        serde_json::json!({}),
+        None,
+        EngineDefs::Search,
+    )
 }
 
 /// An engine whose compaction summary turn runs its own script (the
@@ -825,14 +838,27 @@ fn engine_build_with(
         None,
     );
     let read = match defs {
-        EngineDefs::Real => crate::tool::read::read_tool(truncate.clone(), agents.clone(), None),
+        EngineDefs::Real | EngineDefs::Search => {
+            crate::tool::read::read_tool(truncate.clone(), agents.clone(), None)
+        }
         EngineDefs::HangingRead => hanging_def("read"),
+    };
+    let search = match defs {
+        EngineDefs::Search => {
+            let ripgrep: Arc<dyn crate::tool::ripgrep::Ripgrep> =
+                Arc::new(crate::tool::ripgrep::RipgrepService);
+            vec![
+                crate::tool::grep::grep_tool(truncate.clone(), agents.clone(), ripgrep.clone()),
+                crate::tool::glob::glob_tool(truncate.clone(), agents.clone(), ripgrep),
+            ]
+        }
+        EngineDefs::Real | EngineDefs::HangingRead => Vec::new(),
     };
     let subagents =
         crate::tool::subagents::subagents_tool(truncate.clone(), agents.clone(), ops.clone());
     let write = crate::tool::write::write_tool(truncate.clone(), agents, None, None, None);
     let registry = crate::tool::registry::ToolRegistry::new(
-        vec![task, subagents, read, write],
+        [vec![task, subagents, read, write], search].concat(),
         Vec::new(),
         crate::tool::registry::RuntimeFlags::default(),
         Arc::new(RegistryStubAgents),

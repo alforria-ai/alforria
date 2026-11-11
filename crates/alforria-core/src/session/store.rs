@@ -584,7 +584,24 @@ pub struct SessionStore {
     /// clone: files there were put by a client, and a tool that reads one
     /// brings outside content into the session (`tool::outside`).
     uploads: Arc<std::sync::RwLock<Vec<String>>>,
+    /// The files a search listed as returned, by `(session, call)`, from
+    /// the moment the tool finishes to the moment its result is appended
+    /// ([`SessionStore::report_returned_paths`]). In memory only.
+    returned_paths:
+        Arc<std::sync::Mutex<std::collections::HashMap<(String, String), ReturnedPathsReport>>>,
 }
+
+/// What a tool listed for one call, and the call it listed it for.
+struct ReturnedPathsReport {
+    tool: String,
+    input: Value,
+    /// `None`: two reports came in under one call id, and neither is used.
+    paths: Option<Vec<PathBuf>>,
+}
+
+/// More unclaimed reports than this and all are dropped: the calls they
+/// belong to are then judged without one, which is the marking side.
+const MAX_RETURNED_PATHS_REPORTS: usize = 1024;
 
 impl SessionStore {
     pub fn new(
@@ -601,6 +618,7 @@ impl SessionStore {
             clock,
             messages,
             uploads: Default::default(),
+            returned_paths: Default::default(),
         }
     }
 
@@ -611,6 +629,60 @@ impl SessionStore {
             .uploads
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = directories;
+    }
+
+    /// A tool's own list of the files it returned something of, for the
+    /// call `call_id` of `session_id` (alforria extension;
+    /// `tool::outside::ReturnedPaths`). Kept until the call's result is
+    /// appended, and used there only for a result of the same tool with the
+    /// same input.
+    pub fn report_returned_paths(
+        &self,
+        session_id: &str,
+        call_id: &str,
+        tool: &str,
+        input: &Value,
+        paths: Vec<PathBuf>,
+    ) {
+        let mut reports = self
+            .returned_paths
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if reports.len() >= MAX_RETURNED_PATHS_REPORTS {
+            reports.clear();
+        }
+        let key = (session_id.to_string(), call_id.to_string());
+        let paths = match reports.contains_key(&key) {
+            // A call id used twice: which result the list belongs to cannot
+            // be told.
+            true => None,
+            false => Some(paths),
+        };
+        reports.insert(
+            key,
+            ReturnedPathsReport {
+                tool: tool.to_string(),
+                input: input.clone(),
+                paths,
+            },
+        );
+    }
+
+    /// The list reported for this result's call, if there is one and it is
+    /// this call's. Taken: a list is used once.
+    fn take_returned_paths(
+        &self,
+        session_id: &str,
+        result: &crate::tool::outside::ToolResult<'_>,
+    ) -> Option<Vec<PathBuf>> {
+        let report = self
+            .returned_paths
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&(session_id.to_string(), result.call_id?.to_string()))?;
+        (report.tool == result.tool && &report.input == result.input)
+            .then_some(report.paths)
+            .flatten()
     }
 
     /// **The one place a tool's result marks its session** (alforria
@@ -625,15 +697,21 @@ impl SessionStore {
         result: &crate::tool::outside::ToolResult<'_>,
     ) -> Result<(), SessionError> {
         use crate::tool::outside::{carries_outside_content, classify, Outside, SessionFacts};
-        if classify(result.tool) == Outside::Never {
+        let class = classify(result.tool);
+        if class == Outside::Never {
             return Ok(());
         }
+        // Taken whatever follows, so that it does not stay behind.
+        let returned = match class {
+            Outside::SearchesPath(_) => self.take_returned_paths(session_id, result),
+            _ => None,
+        };
         let uploads = self
             .uploads
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        let directory = match classify(result.tool) {
+        let directory = match class {
             Outside::ReadsPath(_) | Outside::SearchesPath(_) if !uploads.is_empty() => {
                 PathBuf::from(self.get(session_id)?.directory)
             }
@@ -656,6 +734,7 @@ impl SessionStore {
             directory: &directory,
             uploads: &uploads,
             child_marked: &child_marked,
+            returned: returned.as_deref(),
         };
         if carries_outside_content(result, &facts) {
             self.mark(session_id, SessionMark::OutsideContent)?;

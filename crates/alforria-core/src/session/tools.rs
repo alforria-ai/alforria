@@ -215,6 +215,7 @@ pub async fn resolve(
                         bypass_cwd_check: false,
                         bypass_agent_check,
                         model: Some(model_value.clone()),
+                        returned_paths: Default::default(),
                     };
                     let ctx = ToolCtxRef {
                         session_id: &session_id,
@@ -228,8 +229,18 @@ pub async fn resolve(
                         ask: &ask,
                         metadata: &sink,
                     };
+                    let input = args.clone();
                     let result = match (tool.execute)(args, ctx).await {
-                        Ok(result) => result,
+                        Ok(result) => {
+                            // alforria extension: a search's own list of
+                            // the files it returned, kept for when the
+                            // processor appends the result
+                            // (`SessionStore::note_tool_result`).
+                            if let Some(paths) = extra.returned_paths.take() {
+                                processor.report_returned_paths(&call_id, tool.id, &input, paths);
+                            }
+                            result
+                        }
                         // TS: the native runtime surfaces tool failures as
                         // a ToolFailure value carrying the error class
                         // (native-runtime.ts:188).

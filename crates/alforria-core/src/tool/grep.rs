@@ -112,6 +112,7 @@ fn run(
             .grep(&cwd, &params.pattern, params.include.as_deref(), LIMIT)
             .map_err(ToolError::Failed)?;
         if result.is_empty() {
+            ctx.extra.returned_paths.set(Vec::new());
             return empty_result(&params.pattern);
         }
 
@@ -124,10 +125,19 @@ fn run(
             .map(|item| (ts_resolve(&base, &item.path), item.line, item.text.clone()))
             .collect();
         if rows.is_empty() {
+            ctx.extra.returned_paths.set(Vec::new());
             return empty_result(&params.pattern);
         }
 
         let truncated = rows.len() == LIMIT;
+        // alforria extension: the files a line of which is returned, for
+        // the session's provenance mark (`tool::outside`). A result cut at
+        // the limit is not a complete list, and leaves none.
+        if !truncated {
+            let mut files: Vec<PathBuf> = rows.iter().map(|(path, _, _)| path.clone()).collect();
+            files.dedup();
+            ctx.extra.returned_paths.set(files);
+        }
         let has_more = truncated || result.len() == LIMIT;
         let mut output = vec![format!(
             "Found {} matches{}",

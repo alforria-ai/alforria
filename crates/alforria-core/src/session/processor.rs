@@ -696,6 +696,25 @@ impl Handle {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// alforria extension: a tool's own list of the files it returned for
+    /// one call, handed to where the call's result will be judged
+    /// (`SessionStore::report_returned_paths`).
+    pub fn report_returned_paths(
+        &self,
+        call_id: &str,
+        tool: &str,
+        input: &Value,
+        paths: Vec<std::path::PathBuf>,
+    ) {
+        self.inner.deps.sessions.report_returned_paths(
+            &self.inner.session_id,
+            call_id,
+            tool,
+            input,
+            paths,
+        );
+    }
+
     /// The assistant message under construction (live: mutations of the
     /// returned clone are not reflected; [`Handle::process`] updates it).
     pub fn message(&self) -> V1Message {
@@ -795,6 +814,7 @@ impl Handle {
         inner.deps.sessions.note_tool_result(
             &call.session_id,
             &crate::tool::outside::ToolResult {
+                call_id: Some(tool_call_id),
                 tool: tool_name(&part),
                 input: &Value::Object(input.clone()),
                 metadata: Some(&output.metadata),
@@ -1861,6 +1881,7 @@ impl Handle {
                 .note_tool_result(
                     &call.session_id,
                     &crate::tool::outside::ToolResult {
+                        call_id: Some(tool_call_id),
                         tool: tool_name(&part),
                         input: &Value::Object(input.clone()),
                         metadata: None,

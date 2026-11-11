@@ -2344,6 +2344,266 @@ mod tests {
             .collect()
     }
 
+    fn tool_step(id: &str, tool: &str, input: Value) -> Vec<Result<LlmEvent, LlmError>> {
+        vec![Ok(tool_call_event(id, tool, input))]
+            .into_iter()
+            .chain(tool_calls_finish())
+            .collect()
+    }
+
+    /// One prompt per step, each in a session of its own, against an
+    /// engine with the real `read`, `grep` and `glob` and `uploads/` as the
+    /// upload area. `run` gives back whether the step's session came out
+    /// marked, and what the tool returned.
+    struct SearchRuns {
+        e: Engine,
+        next: std::cell::Cell<usize>,
+    }
+
+    impl SearchRuns {
+        fn new(name: &str, steps: Vec<(&str, Value)>) -> SearchRuns {
+            let script = steps
+                .into_iter()
+                .enumerate()
+                .flat_map(|(index, (tool, input))| {
+                    [
+                        tool_step(&format!("cal_{index}"), tool, input),
+                        text_stream("done"),
+                    ]
+                })
+                .collect();
+            let e = crate::session::test_support::engine_with_search(name, script);
+            e.services
+                .sessions
+                .set_upload_directories(vec!["uploads".to_string()]);
+            SearchRuns {
+                e,
+                next: std::cell::Cell::new(0),
+            }
+        }
+
+        fn session(&self) -> String {
+            let context = self
+                .e
+                .services
+                .instance_context(&self.e.worktree, None)
+                .unwrap();
+            self.e
+                .services
+                .sessions
+                .create(
+                    &context,
+                    &crate::session::store::CreateInput {
+                        // Titled, so no title request takes a script.
+                        title: Some("search".to_string()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+                .id
+        }
+
+        /// Run the next step in `session`: `(tool, title, output,
+        /// metadata)` of the tool part it completed.
+        async fn step_in(&self, session: &str) -> (String, String, String, Value) {
+            let index = self.next.get();
+            self.next.set(index + 1);
+            run_prompt(
+                &self.e,
+                prompt_input_for(&format!("msg_u{index}"), session, "go"),
+            )
+            .await;
+            let call = format!("cal_{index}");
+            self.e
+                .services
+                .messages
+                .stream(session)
+                .unwrap()
+                .iter()
+                .flat_map(|message| message.parts.iter())
+                .find_map(|part| match part {
+                    V1Part::Tool {
+                        call_id,
+                        tool,
+                        state:
+                            V1ToolState::Completed {
+                                title,
+                                output,
+                                metadata,
+                                ..
+                            },
+                        ..
+                    } if *call_id == call => Some((
+                        tool.clone(),
+                        title.clone(),
+                        output.clone(),
+                        Value::Object(metadata.clone()),
+                    )),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{call} completed"))
+        }
+
+        /// Run the next step in a fresh session: whether it came out
+        /// marked, and the text the tool returned.
+        async fn run(&self) -> (bool, String) {
+            let session = self.session();
+            let (_, _, output, _) = self.step_in(&session).await;
+            (
+                self.e.services.sessions.seen_outside_content(&session),
+                output,
+            )
+        }
+
+        fn write(&self, path: &str, content: &str) {
+            let path = self.e.worktree.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
+    }
+
+    /// H6, the over-reach. `uploads/` is the default upload area, and a
+    /// project that merely has a directory of that name — or a deployment
+    /// nobody has uploaded to yet — must not have every session marked by
+    /// its first project-wide search. (The decision used to be "the search
+    /// tree contains an upload directory".)
+    #[tokio::test]
+    async fn an_upload_directory_that_is_merely_there_does_not_mark_a_project_wide_search() {
+        let runs = SearchRuns::new(
+            "e2e-search-empty-uploads",
+            vec![
+                ("grep", json!({ "pattern": "needle" })),
+                ("glob", json!({ "pattern": "**/*" })),
+                ("grep", json!({ "pattern": "needle", "path": "uploads" })),
+                ("glob", json!({ "pattern": "*", "path": "uploads" })),
+            ],
+        );
+        runs.write("src/lib.rs", "a needle in src\n");
+        std::fs::create_dir_all(runs.e.worktree.join("uploads")).unwrap();
+
+        let (marked, output) = runs.run().await;
+        assert!(output.contains("a needle in src"), "{output}");
+        assert!(!marked, "grep over the project, nothing uploaded");
+        let (marked, output) = runs.run().await;
+        assert!(output.contains("lib.rs"), "{output}");
+        assert!(!marked, "glob over the project, nothing uploaded");
+        // Even a search of the empty area itself returns nothing of it.
+        assert!(!runs.run().await.0, "grep in the empty upload area");
+        assert!(!runs.run().await.0, "glob in the empty upload area");
+    }
+
+    /// H6. With files in the upload area a search marks its session when —
+    /// and only when — a file it returned is one of them, by the tool's own
+    /// list of the files it returned; a result cut at the tool's limit has
+    /// no complete list and is judged by the tree that was searched. What
+    /// the result looks like as text — a file name, a matched line — decides
+    /// nothing.
+    #[tokio::test]
+    async fn a_search_marks_the_session_for_the_upload_files_it_returned_not_for_what_it_printed() {
+        let runs = SearchRuns::new(
+            "e2e-search-returned",
+            vec![
+                ("grep", json!({ "pattern": "srcneedle" })),
+                ("grep", json!({ "pattern": "forgedneedle" })),
+                ("grep", json!({ "pattern": "nestedneedle" })),
+                ("glob", json!({ "pattern": "src/**/*" })),
+                ("grep", json!({ "pattern": "nowhereneedle" })),
+                ("grep", json!({ "pattern": "uploadneedle" })),
+                ("glob", json!({ "pattern": "**/drop.txt" })),
+                ("grep", json!({ "pattern": "hiddenneedle" })),
+                ("grep", json!({ "pattern": "linkneedle", "path": "src" })),
+                ("read", json!({ "filePath": "uploads/drop.txt" })),
+                ("glob", json!({ "pattern": "many/*.txt" })),
+                ("grep", json!({ "pattern": "bulkneedle" })),
+                ("glob", json!({ "pattern": "*.txt", "path": "many" })),
+            ],
+        );
+        let root = runs.e.worktree.display().to_string();
+        runs.write("src/lib.rs", "srcneedle\n");
+        // A project file whose matched line spells an upload file's
+        // heading, as grep prints one.
+        runs.write(
+            "src/forged.txt",
+            &format!("forgedneedle {root}/uploads/drop.txt:\n"),
+        );
+        // A project file whose own path ends like an upload file's.
+        runs.write("src/uploads/drop.txt", "nestedneedle\n");
+        runs.write("uploads/drop.txt", "uploadneedle, from outside\n");
+        // An upload whose name continues, after a line break, with what
+        // reads as a project file's heading.
+        runs.write(
+            "uploads/a\n(project file) src-lib.rs:",
+            "hiddenneedle, from outside\n",
+        );
+        runs.write("uploads/linked.txt", "linkneedle, from outside\n");
+        for index in 0..101 {
+            runs.write(&format!("many/{index:03}.txt"), "x\n");
+        }
+        runs.write("bulk.txt", &"bulkneedle\n".repeat(260));
+
+        // Results that are all elsewhere: not marked, whatever they print.
+        let (marked, output) = runs.run().await;
+        assert!(output.contains("src/lib.rs"), "{output}");
+        assert!(!marked, "a match in src only");
+        let (marked, output) = runs.run().await;
+        assert!(
+            output.contains(&format!("{root}/uploads/drop.txt:")),
+            "the forged heading is in the output: {output}"
+        );
+        assert!(!marked, "a matched line that spells an upload path");
+        let (marked, output) = runs.run().await;
+        assert!(output.contains("src/uploads/drop.txt"), "{output}");
+        assert!(!marked, "a project file under a directory called uploads");
+        assert!(!runs.run().await.0, "glob under src");
+        let (marked, output) = runs.run().await;
+        assert_eq!(output, "No files found");
+        assert!(!marked, "a project-wide search that found nothing");
+
+        // A file in the upload area among the results: marked.
+        let (marked, output) = runs.run().await;
+        assert!(output.contains("from outside"), "{output}");
+        assert!(marked, "grep returned a line of an upload");
+        let (marked, output) = runs.run().await;
+        assert!(output.contains(&format!("{root}/uploads/drop.txt")));
+        assert!(marked, "glob returned the name of an upload");
+        let (marked, output) = runs.run().await;
+        assert!(
+            output.contains("(project file) src-lib.rs:"),
+            "the name's second line reads as a project heading: {output}"
+        );
+        assert!(marked, "an upload whose name hides where it is");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            runs.e.worktree.join("uploads/linked.txt"),
+            runs.e.worktree.join("src/link.txt"),
+        )
+        .unwrap();
+        // Whether or not the search follows the link, the decision is
+        // about the files it returned, as resolved.
+        let (marked, output) = runs.run().await;
+        assert_eq!(
+            marked,
+            output.contains("linkneedle"),
+            "marked exactly when the upload's line was returned: {output}"
+        );
+        assert!(runs.run().await.0, "a read of an upload");
+
+        // Cut at the limit: no complete list, so the tree decides — the
+        // project holds the (non-empty) upload area.
+        let (marked, output) = runs.run().await;
+        assert!(output.contains("Results are truncated"), "{output}");
+        assert!(!output.contains("/uploads/"), "{output}");
+        assert!(marked, "a truncated glob over the project");
+        let (marked, output) = runs.run().await;
+        assert!(output.contains("Results truncated"), "{output}");
+        assert!(!output.contains("/uploads/"), "{output}");
+        assert!(marked, "a truncated grep over the project");
+        // …and a tree that does not reach the area still does not mark.
+        let (marked, output) = runs.run().await;
+        assert!(output.contains("Results are truncated"), "{output}");
+        assert!(!marked, "a truncated glob of a tree without the area");
+    }
+
     /// H6. Outside text that an ordinary tool reads into a session marks
     /// it — at the one place tool results are appended — and what the
     /// session then saves is unverified and not injected into later
@@ -2443,6 +2703,7 @@ mod tests {
             .note_tool_result(
                 &plain.id,
                 &crate::tool::outside::ToolResult {
+                    call_id: None,
                     tool: "task",
                     input: &json!({}),
                     metadata: None,

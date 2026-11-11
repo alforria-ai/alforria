@@ -185,6 +185,7 @@ impl SessionSubtask {
             bypass_cwd_check: false,
             bypass_agent_check: true,
             model: None,
+            returned_paths: Default::default(),
         };
         let messages: Vec<Value> = input
             .messages

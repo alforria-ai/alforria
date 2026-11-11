@@ -965,6 +965,7 @@ async fn exec_read(
         bypass_cwd_check: true,
         bypass_agent_check: false,
         model: extra_model,
+        returned_paths: Default::default(),
     };
     let ctx = ToolCtxRef {
         session_id,
