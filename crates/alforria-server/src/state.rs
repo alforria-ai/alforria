@@ -1633,11 +1633,10 @@ impl ServerContext {
             heartbeat: HeartbeatConfig::default(),
             engine_factory: Arc::new(unwired_engine_factory),
             installation: Arc::new(UnknownInstallation),
-            auth_store: Arc::new(FileAuthStore::new(
-                alforria_core::GlobalPaths::from_env()
-                    .data
-                    .join("auth.json"),
-            )),
+            // In memory until the caller installs a store: `serve` installs
+            // the file one. Defaulting to the user's real auth.json let any
+            // test that exercised `PUT`/`DELETE /auth` rewrite it.
+            auth_store: Arc::new(MemoryAuthStore::default()),
             vcs: Arc::new(NoVcs),
             worktree: alforria_core::worktree::Worktree::default(),
             worktree_deps: Arc::new(WorktreeDeps {

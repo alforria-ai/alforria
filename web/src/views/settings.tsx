@@ -164,7 +164,21 @@ function Providers() {
                   >
                     <span class="st settings-pair">
                       <span class="pill-state on">Connected</span>
-                      <Show when={p.source === "api"}>
+                      <Show
+                        when={p.source === "api"}
+                        fallback={
+                          // Connected through config or the environment, which can
+                          // point at a key that is not there. A stored credential
+                          // fills in for it, so signing in stays possible.
+                          <button
+                            class="link-btn"
+                            aria-label={`${signsIn(p.id) ? "Sign in to" : "Set a key for"} ${p.name}`}
+                            onClick={() => setConnecting({ id: p.id, name: p.name, env: p.env })}
+                          >
+                            {signsIn(p.id) ? "Sign in" : "Set key"}
+                          </button>
+                        }
+                      >
                         <button
                           class="link-btn"
                           aria-label={`${signsIn(p.id) ? "Sign out of" : "Remove the key for"} ${p.name}`}
