@@ -132,10 +132,11 @@ pub struct PromptInput {
     pub system: Option<String>,
     pub variant: Option<String>,
     pub parts: Vec<PromptPartInput>,
-    /// Who is asking (alforria extension, [`crate::session::caller`]). The
-    /// restrictions of a caller below `admin` are enforced where the
-    /// effective agent, tools and files are resolved, in
-    /// [`create_user_message`].
+    /// Where the prompt comes from (alforria extension,
+    /// [`crate::session::caller`]): a request from the operator, a request
+    /// from a caller below `admin`, or the engine itself. Combined with the
+    /// session's own restriction in [`create_user_message`], where the
+    /// effective agent, tools and files are resolved.
     pub caller: Caller,
 }
 
@@ -671,8 +672,14 @@ pub async fn create_user_message(
     // caller's choosing could name one that already exists and replace it —
     // a tool result, an earlier answer. A caller below `admin` does not
     // choose ids; the server assigns them.
+    //
+    // What binds this turn: the caller of the request, and the session's
+    // own restriction — which is what binds a turn nobody is requesting.
+    let bounds = input
+        .caller
+        .bounds(deps.sessions.is_restricted(&input.session_id)?);
     let assigned;
-    let input = if input.caller.is_restricted() {
+    let input = if bounds.restricted && bounds.from_request {
         assigned = without_caller_ids(input);
         &assigned
     } else {
@@ -710,44 +717,48 @@ pub async fn create_user_message(
             })?,
     };
 
-    // alforria extension: what a caller below `admin` may ask for, judged
-    // on the values this turn will actually use — the agent just resolved
-    // (whether the request, the session or the default named it), the
-    // session being prompted, the tools map and the parts as they will be
-    // stored — before anything is written.
-    if input.caller.is_restricted() {
+    // alforria extension: what a restricted turn may be, judged on the
+    // values it will actually use — the agent just resolved (whether the
+    // request, the session or the default named it), the session being
+    // prompted, the tools map and the parts as they will be stored —
+    // before anything is written.
+    if bounds.restricted {
         let forbid = |message: String| PromptError::Forbidden { message };
-        // A subagent's session is driven by its parent's turn.
-        if deps.sessions.get(&input.session_id)?.parent_id.is_some() {
+        let child = deps.sessions.get(&input.session_id)?.parent_id.is_some();
+        // A subagent's session is driven by its parent's turn (the task
+        // tool, under the parent's `task` permission), not by a request.
+        if child && bounds.from_request {
             return Err(forbid(
-                "this token may not prompt a subagent's session directly".to_string(),
+                "a subagent's session may not be prompted directly here".to_string(),
             ));
         }
-        input.caller.check_agent(&ag).map_err(forbid)?;
-        input
-            .caller
-            .check_tools(input.tools.as_ref())
-            .map_err(forbid)?;
+        // The agent of the turn. Only the engine's own run of a subagent
+        // in its child session is exempt: there the task tool chose it.
+        if !(child && !bounds.from_request) {
+            bounds.check_agent(&ag).map_err(forbid)?;
+        }
+        bounds.check_tools(input.tools.as_ref()).map_err(forbid)?;
         for part in &input.parts {
             match part {
                 // An agent part makes the turn skip the `task` permission
-                // ask for that agent (`bypass_agent_check`).
-                PromptPartInput::Agent { .. } => {
+                // ask for that agent (`bypass_agent_check`); a subtask part
+                // starts a subagent with an agent, model and command of
+                // the sender's choosing. From a request, neither. The
+                // engine's own (a command's configured subtask) pass.
+                PromptPartInput::Agent { .. } if bounds.from_request => {
                     return Err(forbid(
-                        "this token may not address an agent with an agent part".to_string(),
+                        "an agent part is not allowed in this session".to_string(),
                     ))
                 }
-                // A subtask part starts a subagent with an agent, model and
-                // command of the caller's choosing.
-                PromptPartInput::Subtask { .. } => {
+                PromptPartInput::Subtask { .. } if bounds.from_request => {
                     return Err(forbid(
-                        "this token may not start a subtask directly".to_string(),
+                        "a subtask may not be started directly in this session".to_string(),
                     ))
                 }
                 PromptPartInput::File { url, source, .. } => {
-                    check_restricted_file(deps, input.caller, url, source).map_err(forbid)?
+                    check_restricted_file(deps, bounds, url, source).map_err(forbid)?
                 }
-                PromptPartInput::Text { .. } => {}
+                _ => {}
             }
         }
     }
@@ -980,11 +991,11 @@ fn without_caller_ids(input: &PromptInput) -> PromptInput {
 /// choosing — an MCP resource, `http(s):`, any other scheme — is refused.
 fn check_restricted_file(
     deps: &PromptDeps<'_>,
-    caller: Caller,
+    bounds: crate::session::caller::Bounds,
     url: &str,
     source: &Option<V1FilePartSource>,
 ) -> Result<(), String> {
-    if !caller.is_restricted() {
+    if !bounds.restricted {
         return Ok(());
     }
     if matches!(source, Some(V1FilePartSource::Resource { .. })) {
@@ -995,7 +1006,7 @@ fn check_restricted_file(
     // caller gets to hand to the server or the provider.
     match url.split(':').next().unwrap_or_default() {
         "data" => Ok(()),
-        "file" => caller.check_read(&file_url_to_path(url), &deps.directory, &deps.worktree),
+        "file" => bounds.check_read(&file_url_to_path(url), &deps.directory, &deps.worktree),
         _ => Err("this token may only attach inline data or files inside the project".to_string()),
     }
 }
@@ -1214,6 +1225,7 @@ async fn resolve_file_part(
             // on the path about to be opened, whatever produced the part.
             input
                 .caller
+                .bounds(deps.sessions.is_restricted(session_id)?)
                 .check_read(&filepath, &deps.directory, &deps.worktree)
                 .map_err(|message| PromptError::Forbidden { message })?;
             let part_mime = if filepath.is_dir() {
@@ -1776,7 +1788,7 @@ mod tests {
 
     fn input(session_id: &str, parts: Vec<PromptPartInput>) -> PromptInput {
         PromptInput {
-            caller: Default::default(),
+            caller: Caller::Operator,
             session_id: session_id.to_string(),
             message_id: Some("msg_user".to_string()),
             model: Some(ModelRef {

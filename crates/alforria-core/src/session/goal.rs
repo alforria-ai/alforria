@@ -96,6 +96,12 @@ pub struct GoalState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
     pub updated_at: u64,
+    /// Who set the goal (alforria extension): `"restricted"` when a caller
+    /// below `admin` did, or the session is restricted. For the record:
+    /// what binds the goal's rounds is the session's restriction, read
+    /// when each round runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_by: Option<String>,
 }
 
 impl GoalState {
@@ -855,9 +861,12 @@ impl SessionPrompt {
                 system: None,
                 variant,
                 parts,
-                // Later rounds are the engine's own; the first one is
-                // whoever typed `/goal`.
-                caller: chosen.map(|input| input.caller).unwrap_or_default(),
+                // The round a `/goal` command starts is that caller's;
+                // every later one is the engine's own, bound by the
+                // session it runs in.
+                caller: chosen
+                    .map(|input| input.caller)
+                    .unwrap_or(crate::session::caller::Caller::Session),
             })
             .await,
         )
@@ -987,6 +996,19 @@ impl SessionPrompt {
             boot: boot().to_string(),
             pid: Some(std::process::id()),
             updated_at: self.now_ms(),
+            started_by: {
+                let restricted = input
+                    .caller
+                    .bounds(
+                        self.deps
+                            .services
+                            .sessions
+                            .is_restricted(session_id)
+                            .map_err(|error| error.to_string())?,
+                    )
+                    .restricted;
+                Some(if restricted { "restricted" } else { "operator" }.to_string())
+            },
         };
         goals.write(session_id, Some(&created));
         let turn = self

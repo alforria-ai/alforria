@@ -83,6 +83,21 @@ pub fn check_no_ruleset(supplied: bool) -> Result<(), ServerError> {
     }
 }
 
+/// Edge validation of an agent a caller below `admin` names on a new
+/// session: one a client's picker offers, not hidden and not subagent-only.
+/// The check that must be complete is the engine's, on the agent a turn
+/// actually runs as (`alforria_core::session::caller`); this one turns a
+/// request that could never run into an immediate 403.
+pub fn check_agent(location: &LocationContext, name: Option<&str>) -> Result<(), ServerError> {
+    let Some(agent) = name.and_then(|name| location.services.agents.get(name)) else {
+        return Ok(());
+    };
+    alforria_core::session::caller::Caller::Restricted
+        .bounds(true)
+        .check_agent(agent)
+        .map_err(forbid)
+}
+
 /// `always` on a permission reply adds allow rules that outlive the ask
 /// and apply to every session of the project. A credential below `admin`
 /// may answer `once` or `reject`; `always` only where the host config says

@@ -64,8 +64,11 @@ pre-1.0, so minor releases may include breaking changes.
   switch tools on, pick hidden agents, attach files from outside the project
   or answer a permission request `always`
   (`server.auth.bearer.reply_always` opts in). These limits are enforced in
-  the engine on the values it resolves, not on the request as written; the
-  threat model is in `docs/unattended-server.md`.
+  the engine on the values it resolves, not on the request as written, and
+  they stay with the session: one created by such a token is restricted for
+  life, with its subagent sessions and forks, so goal rounds and other turns
+  the engine starts are bound too. `DELETE /session/{id}/restriction`
+  (`admin`) lifts it. The threat model is in `docs/unattended-server.md`.
 - Files for browser clients: `POST /file/ticket` mints a short-lived read
   ticket for one project file, usable as `?ticket=` on the new
   `GET /file/raw` (the file's bytes, with ranges, served sandboxed) and on

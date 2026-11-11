@@ -204,6 +204,8 @@ pub fn tool_turn(id: &str, name: &str, input: Value) -> Script {
 pub struct QueueLlm {
     scripts: Mutex<VecDeque<Script>>,
     pub requests: Mutex<Vec<StreamInput>>,
+    /// What a tool-less request (a title, a goal review) is answered with.
+    toolless: Mutex<String>,
 }
 
 impl QueueLlm {
@@ -211,7 +213,13 @@ impl QueueLlm {
         QueueLlm {
             scripts: Mutex::new(scripts.into()),
             requests: Mutex::new(Vec::new()),
+            toolless: Mutex::new("title".to_string()),
         }
+    }
+
+    /// Answer tool-less requests with `text` from now on.
+    pub fn set_toolless(&self, text: &str) {
+        *self.toolless.lock().unwrap() = text.to_string();
     }
 
     /// The agent-loop requests seen so far.
@@ -223,7 +231,8 @@ impl QueueLlm {
 impl LlmStream for QueueLlm {
     fn stream(&self, input: StreamInput) -> LlmEventStream {
         if input.tools.is_empty() {
-            return Box::pin(futures::stream::iter(text_turn("title")));
+            let text = self.toolless.lock().unwrap().clone();
+            return Box::pin(futures::stream::iter(text_turn(&text)));
         }
         let input_tools = input.tools.clone();
         self.requests.lock().unwrap().push(input);

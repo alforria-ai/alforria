@@ -444,6 +444,11 @@ pub struct CreateInput {
     pub workspace_id: Option<String>,
     pub directory: Option<String>,
     pub path: Option<String>,
+    /// alforria extension: created by a caller below `admin`
+    /// (`session::caller`). The session is restricted for life. A child of
+    /// a restricted session and a fork of one are restricted whatever this
+    /// says.
+    pub restricted: bool,
 }
 
 /// `Session.Service` (session.ts:486-985).
@@ -537,7 +542,63 @@ impl SessionStore {
                 info: info.clone(),
             })?,
         )?;
+        // alforria extension: restriction is inherited. Every session is
+        // created here, so a child or fork of a restricted session cannot
+        // come out unrestricted because its creator did not think of it.
+        let inherited = match &input.parent_id {
+            Some(parent) => self.is_restricted(parent)?,
+            None => false,
+        };
+        if input.restricted || inherited {
+            self.restrict(&info.id)?;
+        }
         Ok(info)
+    }
+
+    /// Whether a session is restricted (alforria extension,
+    /// `session::caller`): created by a caller below `admin`, or descended
+    /// from such a session.
+    pub fn is_restricted(&self, session_id: &str) -> Result<bool, SessionError> {
+        self.storage
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM session_restriction WHERE session_id = ?1)",
+                    [session_id],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(CoreError::from)
+            })
+            .map_err(SessionError::from)
+    }
+
+    /// Restrict a session, for life.
+    pub fn restrict(&self, session_id: &str) -> Result<(), SessionError> {
+        let now = self.now() as i64;
+        self.storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "INSERT OR IGNORE INTO session_restriction (session_id, time_created) VALUES (?1, ?2)",
+                    rusqlite::params![session_id, now],
+                )
+                .map(|_| ())
+                .map_err(CoreError::from)
+            })
+            .map_err(SessionError::from)
+    }
+
+    /// Lift a session's restriction. The one way out, and an operator's
+    /// decision: nothing in the engine calls it.
+    pub fn lift_restriction(&self, session_id: &str) -> Result<bool, SessionError> {
+        self.storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "DELETE FROM session_restriction WHERE session_id = ?1",
+                    [session_id],
+                )
+                .map(|rows| rows > 0)
+                .map_err(CoreError::from)
+            })
+            .map_err(SessionError::from)
     }
 
     /// `create` (session.ts:667-689).
@@ -1215,6 +1276,8 @@ impl SessionStore {
                 workspace_id: original.workspace_id.clone(),
                 title: Some(title),
                 metadata: original.metadata.clone(),
+                // A fork of a restricted session is restricted.
+                restricted: self.is_restricted(session_id)?,
                 ..Default::default()
             },
         )?;

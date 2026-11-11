@@ -731,10 +731,12 @@ pub async fn create(
         }
     };
     // alforria extension: below `admin`, a session cannot be created with
-    // its own permission rules or a workspace. (The agent it names is
-    // judged when a turn is about to run as it, in core.)
+    // its own permission rules, a workspace, or an agent a client could not
+    // pick. The session is then restricted for life (`CreateInput::
+    // restricted`), which is what binds every later turn in it.
     if let (true, Some(payload)) = (crate::confine::restricted(&principal), &payload) {
         crate::confine::check_no_ruleset(payload.permission.is_some())?;
+        crate::confine::check_agent(&location, payload.agent.as_deref())?;
         if payload.workspace_id.is_some() {
             return Err(ServerError::Api(ApiError::Forbidden {
                 message: "selecting a workspace needs the admin scope".to_string(),
@@ -747,6 +749,10 @@ pub async fn create(
         None => None,
     }
     .unwrap_or_default();
+    let input = session::CreateInput {
+        restricted: crate::confine::restricted(&principal),
+        ..input
+    };
     let ctx = session_ctx(&location)?;
     let info = location
         .services

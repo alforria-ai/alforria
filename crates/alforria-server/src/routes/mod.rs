@@ -5,6 +5,7 @@
 pub mod doc;
 pub mod file_ext;
 pub mod goal;
+pub mod restriction;
 pub mod ui;
 pub mod v1;
 pub mod v2;
@@ -35,6 +36,7 @@ pub fn build_router(ctx: Arc<ServerContext>) -> Router {
     // v1/v2 tables so the TS OpenAPI surface stays byte-identical.
     router = workflow::register(router);
     router = goal::register(router);
+    router = restriction::register(router);
     router = file_ext::register(router);
 
     let router = router

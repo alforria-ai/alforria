@@ -204,14 +204,35 @@ operator's permission policy, and it can never change that policy.**
 `admin` (and Basic auth, which is the operator) executes directly or sets
 policy.
 
-How it is enforced: the scope table decides which routes a token reaches.
-What a prompt or command from it may *contain* is not checked in the routes
-at all. A route marks the request as coming from a caller below `admin`
-(`Caller::Restricted`, `crates/alforria-core/src/session/caller.rs`), and the
-engine judges the values it actually resolves, at the point it uses them:
-the agent the turn will run as, the parts as they will be stored, the file
-about to be read. There is no second spelling of a value for a check to look
-at.
+How it is enforced, in three layers:
+
+1. The scope table decides which routes a token reaches.
+2. A route says where a prompt or command comes from (`Caller`,
+   `crates/alforria-core/src/session/caller.rs`): the operator, a caller
+   below `admin`, or the engine itself. The engine then judges the values it
+   actually resolves, at the point it uses them: the agent the turn will run
+   as, the parts as they will be stored, the file about to be read. There is
+   no second spelling of a value for a check to look at. (Routes also refuse
+   early what could never run, such as a hidden agent named on a new
+   session; that is a courtesy, not the control.)
+3. **The restriction stays with the session.** A session created by a caller
+   below `admin` is restricted for its whole life, and so is every session
+   descended from it: the subagent sessions the task tool makes, forks,
+   workflow agents. A restricted session bounds *every* turn in it, whoever
+   or whatever starts it — a later request from the operator included, and
+   above all the turns nobody requests: a `/goal` round, a subagent's run, a
+   resume, a trigger. The restriction is read from the session at the one
+   place every turn passes through, so a turn source that knows nothing
+   about callers is still bound.
+
+An operator who wants to take a restricted session over lifts the
+restriction first, with an `admin` credential:
+`DELETE /session/{id}/restriction` (`GET` reports
+`{ "restricted": true|false }`). Until then the operator's own prompts to
+that session are refused the same things a `chat` token's are. That is
+deliberate: a session is a conversation someone else shaped, and running it
+with full rights should be a decision, not a side effect of who happened to
+send the next message.
 
 What a holder of a `chat` or `connector` token **can** cause:
 
@@ -248,7 +269,8 @@ What it **cannot** cause, and what stops it:
 | Read a file outside the project through a prompt | Every `file:` part, whatever produced it, is checked where it is read: the path, with `..` and symlinks resolved, must be inside the project. Other schemes (`http(s):`, anything but `data:` and `file:`), bare paths and MCP resource parts are refused, so the server and the provider are never told to fetch a URL of the caller's choosing |
 | Grant itself permissions | `permission` on session create and update is refused (403); a `tools` map with any `true` (which becomes an allow rule) is refused |
 | Make a standing allow rule | `always` on a permission reply is refused unless `server.auth.bearer.reply_always` is `true` |
-| Run as a hidden or subagent-only agent | The agent a turn resolves to — named in the request, configured on the command, or the default — is checked before the turn is stored. An omitted agent means the default agent, never the session's stored one |
+| Run as a hidden or subagent-only agent | The agent a turn resolves to — named in the request, stored on the session, configured on the command, or the default — is checked before the turn is stored, for requests and for the engine's own turns alike. Naming one on a new session is refused outright |
+| Outlive its limits through the engine | The session it created is restricted for life, with its children and forks; goal rounds, subagent runs and resumes in it are bound as its requests were |
 | Skip the `task` permission ask, or start a subagent directly | `agent` and `subtask` parts are refused. An `@agent` in a template does not become an agent part for such a caller |
 | Prompt a subagent's session | A session with a parent is driven by its parent's turn; prompting it directly is refused |
 | Rewrite what the model reads as its history | Message deletes and part edits and deletes are `admin`. Message and part ids on a prompt are ignored (the server assigns them), so a prompt cannot name an existing message or part and replace it |
@@ -270,7 +292,8 @@ arrives as a `session.error` event and nothing is stored or run.
 | any `/session/{id}/…` | the session id | the project (the session's own directory) | location layer, same allowlist |
 | `POST /session` | `title`, `metadata` | stored text | not restricted |
 | | `parentID` | a child session | allowed; the child cannot then be prompted by this token |
-| | `agent`, `model` | stored on the session | not at create: the agent is judged when a turn runs, and an omitted agent on a prompt never falls back to it |
+| | `agent`, `model` | stored on the session | route: a hidden or subagent-only agent is refused; core: whatever agent a later turn resolves to is judged when it runs |
+| | (the request itself) | the session's restriction | core: a session created below `admin` is restricted for life, with its children and forks |
 | | `permission` | the session's ruleset | refused (route) |
 | | `workspaceID` | a workspace | refused (route) |
 | `PATCH /session/{id}` | `title`, `metadata`, `time.archived` | stored | not restricted |
@@ -297,9 +320,31 @@ arrives as a `session.error` event and nothing is stored or run.
 | `PUT /file/content` | `path` | a file write | route: inside the upload area, not a loader name |
 | `GET /find*`, `/vcs*` | `query`, `pattern`, `mode`, … | a search or diff of the project | no caller-chosen path |
 
-The checks left in routes (`permission` and `workspaceID` on session create
-and update, `always` on a reply, file paths) are on requests that never
-become a prompt; each judges the very value the handler then uses.
+The checks in routes are of two kinds. Those on requests that never become
+a prompt (`permission` and `workspaceID` on session create and update,
+`always` on a reply, file paths) each judge the very value the handler then
+uses. The agent check on session create is early validation only; the
+engine's check on the agent a turn runs as is the one that counts.
+
+#### Turns the engine starts by itself
+
+No request is being made when these run, so there is no caller to check.
+Each is bound by the session it runs in (`Caller::Session`): restricted if
+the session is.
+
+| Turn source | Where its restriction comes from |
+| --- | --- |
+| `/goal` rounds after the first, and the goal reviewer's verdicts | the session. `GoalState.startedBy` records who set the goal; the first round is the caller's own request. The round cap and stall limit are unchanged |
+| A subagent run by the task tool | the child session, which inherits from its parent when it is created. Its agent is the one the model chose under the parent's `task` permission, so the "an agent a client could pick" rule does not apply to it; everything else does |
+| A subagent's result delivered into its parent | the parent session |
+| A command's configured subtask | the session; below `admin` a command configured to run as a subagent is refused |
+| Workflow agents started by the `workflow` tool | child sessions of the session that called the tool: inherited. (Starting a workflow over HTTP is `admin`.) |
+| A fork's notice to the model | the fork, which inherits from its source |
+| Compaction, titles and summaries | side calls to the model, not turns: no agent of anyone's choosing, no tools, no files |
+| Restart resume, triggers (other branches) | must pass `Caller::Session`, and create any session with `CreateInput::restricted` set from whoever the turn is for. A session created with a `parent_id` inherits without being asked |
+
+`Caller` has no default value: every place that builds a prompt has to say
+which of the three it is, or it does not compile.
 
 #### What stays with the operator
 

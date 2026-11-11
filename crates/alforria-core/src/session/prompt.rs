@@ -200,7 +200,7 @@ impl SessionPrompt {
         }
         let agent = self.deps.services.sessions.get(session_id)?.agent.clone();
         self.prompt(PromptInput {
-            caller: Default::default(),
+            caller: crate::session::caller::Caller::Session,
             session_id: session_id.to_string(),
             message_id: None,
             model: None,
@@ -340,9 +340,12 @@ impl SessionPrompt {
         // there is no reading of "the bash permission allows this" that
         // survives the arguments, so the command is refused whole, before
         // anything runs.
-        if input.caller.is_restricted() && bash_regex().is_match(&cmd.template) {
+        let bounds = input
+            .caller
+            .bounds(deps.services.sessions.is_restricted(&input.session_id)?);
+        if bounds.restricted && bash_regex().is_match(&cmd.template) {
             let message = format!(
-                "The /{} command runs inline shell: this token may not run it, only the admin scope can.",
+                "The /{} command runs inline shell, which is not allowed in this session: it needs the admin scope and an unrestricted session.",
                 input.command
             );
             publish_error(deps, &input.session_id, &message)?;
@@ -412,8 +415,7 @@ impl SessionPrompt {
 
         // The agent this command will run as — configured on the command,
         // named by the caller, or the default — is the one that is judged.
-        input
-            .caller
+        bounds
             .check_agent(&agent)
             .map_err(|message| PromptError::Forbidden { message })?;
 
@@ -422,7 +424,7 @@ impl SessionPrompt {
         // below `admin` only supplies text: mentions are resolved in the
         // operator's template alone, and an `@agent` there does not become
         // an agent part (which would skip the `task` permission ask).
-        let template_parts = if input.caller.is_restricted() {
+        let template_parts = if bounds.restricted {
             let mut parts = self.resolve_prompt_parts(&cmd.template);
             parts.retain(|part| !matches!(part, PromptPartInput::Agent { .. }));
             if let Some(PromptPartInput::Text { text, .. }) = parts.first_mut() {
@@ -936,7 +938,7 @@ pub struct ShellInput {
 }
 
 /// `CommandInput` (prompt.ts:1551-1581) — `parts` is the file-part array.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct CommandInput {
     pub session_id: String,
     pub message_id: Option<String>,
@@ -946,9 +948,10 @@ pub struct CommandInput {
     pub arguments: String,
     pub command: String,
     pub parts: Vec<CommandFilePart>,
-    /// Who is asking (alforria extension, [`crate::session::caller`]). A
-    /// caller below `admin` cannot run a command whose template has inline
-    /// shell, and its arguments are text only.
+    /// Where the command comes from (alforria extension,
+    /// [`crate::session::caller`]). In a restricted turn a command whose
+    /// template has inline shell is refused, and the arguments are text
+    /// only.
     pub caller: crate::session::caller::Caller,
 }
 

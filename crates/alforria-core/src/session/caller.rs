@@ -6,13 +6,16 @@
 //! must not execute anything except through the model under the operator's
 //! permission policy, nor change that policy.
 //!
-//! The distinction travels *with the request* ([`PromptInput::caller`],
-//! `CommandInput::caller`) and is enforced here in core, at the points
-//! where the effective values are resolved and used: the agent that will
-//! actually run, the parts that will actually be stored, the file that is
-//! actually about to be read. A route only says who is calling; it cannot
-//! forget a check, and a check cannot look at one spelling of a value while
-//! the engine uses another.
+//! The distinction travels with the request ([`PromptInput::caller`],
+//! `CommandInput::caller`) *and stays with the session*: a session a
+//! restricted caller created is restricted for life, with its children and
+//! forks, so the turns the engine starts by itself — goal rounds, subagent
+//! runs, resumes — are bound as well. It is enforced here in core, at the
+//! points where the effective values are resolved and used: the agent that
+//! will actually run, the parts that will actually be stored, the file that
+//! is actually about to be read. A check cannot look at one spelling of a
+//! value while the engine uses another, and a turn source that never heard
+//! of callers is bound by the session it runs in.
 //!
 //! [`PromptInput::caller`]: crate::session::prompt_input::PromptInput
 
@@ -22,15 +25,51 @@ use std::path::{Path, PathBuf};
 use crate::session::agents::AgentInfo;
 use crate::tool::def::AgentMode;
 
-/// The kind of caller a prompt or command comes from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Where a prompt or command comes from. There is deliberately no default:
+/// every place that builds a prompt says which of these it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Caller {
-    /// The operator: the TUI, the CLI, Basic auth, an `admin` token, the
-    /// engine's own synthetic prompts. Upstream behaviour, unrestricted.
-    #[default]
+    /// A request from the operator: the TUI, the CLI, Basic auth, an
+    /// `admin` token. Upstream behaviour — unless the session itself is
+    /// restricted, which bounds the operator's requests to it too.
     Operator,
-    /// A credential below `admin` (`chat`, `connector`).
+    /// A request from a credential below `admin` (`chat`, `connector`).
     Restricted,
+    /// A turn the engine starts by itself: a `/goal` round, a subagent the
+    /// task tool runs, a workflow agent, a resume, a trigger. It has no
+    /// caller of its own; it is bound by whoever the session belongs to.
+    Session,
+}
+
+/// What applies to one turn: the caller's kind combined with the
+/// session's own restriction.
+///
+/// A session created by a restricted caller is restricted for its whole
+/// life ([`SessionStore::restrict`]), and so are its children and forks.
+/// That is what binds the turns nobody is making a request for: the
+/// restriction is read from the session, at the one place every turn
+/// passes through, so a turn source that forgets about callers altogether
+/// is still bound.
+///
+/// [`SessionStore::restrict`]: crate::session::store::SessionStore::restrict
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Bounds {
+    /// The turn is bound by the restrictions of a caller below `admin`.
+    pub restricted: bool,
+    /// The turn comes from a request (as opposed to the engine itself):
+    /// its agent, parts and ids are of somebody's choosing.
+    pub from_request: bool,
+}
+
+impl Caller {
+    /// The bounds of a turn from this caller on a session that is, or is
+    /// not, itself restricted.
+    pub fn bounds(self, session_restricted: bool) -> Bounds {
+        Bounds {
+            restricted: session_restricted || self == Caller::Restricted,
+            from_request: self != Caller::Session,
+        }
+    }
 }
 
 /// Resolve `path` the way a symlink-following open would reach it: the
@@ -73,9 +112,9 @@ pub fn project_roots(directory: &Path, worktree: &Path) -> Vec<PathBuf> {
     roots
 }
 
-impl Caller {
+impl Bounds {
     pub fn is_restricted(self) -> bool {
-        self == Caller::Restricted
+        self.restricted
     }
 
     /// The agent a turn is about to run as, whatever named it: the request,
@@ -135,26 +174,45 @@ impl Caller {
 mod tests {
     use super::*;
 
+    const RESTRICTED: Bounds = Bounds {
+        restricted: true,
+        from_request: true,
+    };
+
+    #[test]
+    fn the_session_restriction_binds_every_kind_of_caller() {
+        for caller in [Caller::Operator, Caller::Restricted, Caller::Session] {
+            assert!(
+                caller.bounds(true).restricted,
+                "{caller:?} on a restricted session"
+            );
+        }
+        assert!(Caller::Restricted.bounds(false).restricted);
+        assert!(!Caller::Operator.bounds(false).restricted);
+        assert!(!Caller::Session.bounds(false).restricted);
+        assert!(Caller::Operator.bounds(false).from_request);
+        assert!(!Caller::Session.bounds(true).from_request);
+    }
+
     #[test]
     fn the_operator_is_never_confined() {
-        let caller = Caller::default();
-        assert_eq!(caller, Caller::Operator);
-        assert!(caller
+        let bounds = Caller::Operator.bounds(false);
+        assert!(bounds
             .check_read(Path::new("/etc/passwd"), Path::new("/repo"), Path::new("/"))
             .is_ok());
         let mut tools = BTreeMap::new();
         tools.insert("bash".to_string(), true);
-        assert!(caller.check_tools(Some(&tools)).is_ok());
+        assert!(bounds.check_tools(Some(&tools)).is_ok());
     }
 
     #[test]
     fn a_restricted_caller_switches_tools_off_only() {
         let mut tools = BTreeMap::new();
         tools.insert("webfetch".to_string(), false);
-        assert!(Caller::Restricted.check_tools(Some(&tools)).is_ok());
+        assert!(RESTRICTED.check_tools(Some(&tools)).is_ok());
         tools.insert("bash".to_string(), true);
-        assert!(Caller::Restricted.check_tools(Some(&tools)).is_err());
-        assert!(Caller::Restricted.check_tools(None).is_ok());
+        assert!(RESTRICTED.check_tools(Some(&tools)).is_err());
+        assert!(RESTRICTED.check_tools(None).is_ok());
     }
 
     #[test]
@@ -166,8 +224,7 @@ mod tests {
         std::fs::create_dir_all(root.join("outside")).unwrap();
         std::fs::write(root.join("outside/secret"), "s").unwrap();
         std::fs::write(project.join("src/a.rs"), "a").unwrap();
-        let check =
-            |path: &str| Caller::Restricted.check_read(Path::new(path), &project, Path::new("/"));
+        let check = |path: &str| RESTRICTED.check_read(Path::new(path), &project, Path::new("/"));
         assert!(check("src/a.rs").is_ok());
         assert!(check(&project.join("src/a.rs").display().to_string()).is_ok());
         assert!(check("src/../src/a.rs").is_ok());
@@ -185,7 +242,7 @@ mod tests {
             assert!(check("linkdir/new/file").is_err());
         }
         // A git worktree above the directory is part of the project.
-        assert!(Caller::Restricted
+        assert!(RESTRICTED
             .check_read(&root.join("outside/secret"), &project, &root)
             .is_ok());
     }

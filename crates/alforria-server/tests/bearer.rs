@@ -1376,6 +1376,357 @@ async fn narrow_tokens_cannot_overwrite_history_with_chosen_ids() {
     assert_ne!(after[2]["info"]["id"], json!(user_id));
 }
 
+async fn restricted(f: &Fixture, session: &str) -> bool {
+    let response = call(
+        &f.router,
+        "GET",
+        &format!("/session/{session}/restriction"),
+        Some(&basic()),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    body_json(response).await["restricted"].as_bool().unwrap()
+}
+
+async fn wait_idle(f: &Fixture, session: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut quiet = 0;
+    loop {
+        let status = body_json(
+            call(
+                &f.router,
+                "GET",
+                &format!("/session/status?{}", dir_query(&f.dirs.repo)),
+                Some(&basic()),
+                None,
+            )
+            .await,
+        )
+        .await;
+        if status.get(session).is_none() || status[session]["type"] == "idle" {
+            quiet += 1;
+            if quiet >= 10 {
+                return;
+            }
+        } else {
+            quiet = 0;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the session never settled"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    }
+}
+
+fn agents_run(f: &Fixture, from: usize) -> Vec<String> {
+    f.llm.requests.lock().unwrap()[from..]
+        .iter()
+        .map(|request| request.agent.name.clone())
+        .collect()
+}
+
+/// A session a narrow token creates is restricted for life, and so is
+/// everything descended from it — whoever prompts it later.
+#[tokio::test]
+async fn a_restricted_session_stays_restricted_for_every_caller() {
+    let signer = Signer::new();
+    let f = fixture_with(policy_config(&signer, false), Some(PASSWORD), Vec::new());
+    let chat = bearer(&signer.token(AUDIENCE, "chat"));
+    let dir = dir_query(&f.dirs.repo);
+    let post = |uri: String, auth: String, body: Value| {
+        let router = f.router.clone();
+        async move { call(&router, "POST", &uri, Some(&auth), Some(body)).await }
+    };
+
+    let session = create_session(&f, &f.dirs.repo, &chat).await;
+    assert!(restricted(&f, &session).await);
+    let operators = create_session(&f, &f.dirs.repo, &basic()).await;
+    assert!(!restricted(&f, &operators).await);
+
+    // Edge validation: an agent that could never run is refused at create.
+    for agent in ["ghost", "helper", "general", "title"] {
+        let response = post(
+            format!("/session?{dir}"),
+            chat.clone(),
+            json!({ "agent": agent }),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "create as {agent}"
+        );
+    }
+    // An update has no way to switch the agent: the field is not one.
+    let patched = call(
+        &f.router,
+        "PATCH",
+        &format!("/session/{session}"),
+        Some(&chat),
+        Some(json!({ "agent": "ghost", "title": "t" })),
+    )
+    .await;
+    assert_eq!(patched.status(), StatusCode::OK);
+    assert_ne!(body_json(patched).await["agent"], "ghost");
+
+    // Children and forks inherit it, including ones the operator makes.
+    let child = post(
+        format!("/session?{dir}"),
+        basic(),
+        json!({ "parentID": session }),
+    )
+    .await;
+    let child = body_json(child).await["id"].as_str().unwrap().to_string();
+    assert!(
+        restricted(&f, &child).await,
+        "a child of a restricted session"
+    );
+    let fork = post(format!("/session/{session}/fork"), basic(), json!({})).await;
+    assert_eq!(fork.status(), StatusCode::OK);
+    let fork = body_json(fork).await["id"].as_str().unwrap().to_string();
+    assert!(
+        restricted(&f, &fork).await,
+        "a fork of a restricted session"
+    );
+
+    // The operator's own requests to it are bound as well...
+    let message = format!("/session/{session}/message");
+    let text = json!({ "type": "text", "text": "hi" });
+    for (what, body) in [
+        (
+            "a hidden agent",
+            json!({ "agent": "ghost", "parts": [text] }),
+        ),
+        (
+            "tools switched on",
+            json!({ "noReply": true, "tools": { "bash": true }, "parts": [text] }),
+        ),
+        (
+            "a file outside the project",
+            json!({ "noReply": true, "parts": [text, {
+                "type": "file", "mime": "text/plain", "url": "file:///etc/hostname" }] }),
+        ),
+    ] {
+        let response = post(message.clone(), basic(), body).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "operator: {what}");
+    }
+    assert_eq!(
+        run_command(&f, &session, &basic(), "status", "").await,
+        StatusCode::FORBIDDEN,
+        "operator: a command with inline shell"
+    );
+    assert!(!f.dirs.repo.join("ask-marker").exists());
+    assert_eq!(f.llm.request_count(), 0);
+
+    // ...until an admin lifts the restriction, which a narrow token cannot.
+    let uri = format!("/session/{session}/restriction");
+    assert_eq!(status(&f, "GET", &uri, &chat).await, StatusCode::FORBIDDEN);
+    assert_eq!(
+        status(&f, "DELETE", &uri, &chat).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(status(&f, "DELETE", &uri, &basic()).await, StatusCode::OK);
+    assert!(!restricted(&f, &session).await);
+    let response = post(
+        message.clone(),
+        basic(),
+        json!({ "agent": "ghost", "parts": [text] }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(agents_run(&f, 0), ["ghost"]);
+    // The token that made the session is still what it is.
+    let response = post(
+        message,
+        chat.clone(),
+        json!({ "agent": "ghost", "parts": [text] }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+/// The turns the engine starts by itself are bound by the session: a goal a
+/// narrow token starts runs every round, reviewer included, as an agent the
+/// token could pick, and a stored agent it could not pick never runs.
+#[tokio::test]
+async fn engine_started_turns_are_bound_by_the_session() {
+    let signer = Signer::new();
+    let f = fixture_with(policy_config(&signer, false), Some(PASSWORD), Vec::new());
+    let chat = bearer(&signer.token(AUDIENCE, "chat"));
+
+    // A goal, started by the token, left to run its rounds: the reviewer
+    // keeps saying "continue" until the goal stalls out.
+    f.llm
+        .set_toolless(r#"{"verdict":"continue","reason":"not done yet","next_step":"keep going"}"#);
+    let session = create_session(&f, &f.dirs.repo, &chat).await;
+    assert_eq!(
+        run_command(&f, &session, &chat, "goal", "tidy the notes").await,
+        StatusCode::OK
+    );
+    wait_idle(&f, &session).await;
+    let ran = agents_run(&f, 0);
+    assert!(ran.len() >= 3, "the goal ran its rounds: {ran:?}");
+    assert!(ran.iter().all(|agent| agent == "build"), "{ran:?}");
+    let goal = body_json(
+        call(
+            &f.router,
+            "GET",
+            &format!("/session/{session}/goal?{}", dir_query(&f.dirs.repo)),
+            Some(&chat),
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(goal["startedBy"], "restricted", "{goal}");
+    assert!(goal["rounds"].as_u64().unwrap() >= 2, "{goal}");
+    assert!(restricted(&f, &session).await);
+
+    // A restricted session that somehow holds an agent the token could not
+    // pick (here: made by the operator, then restricted). A goal on it
+    // would run its rounds as the stored agent; no round does.
+    let response = call(
+        &f.router,
+        "POST",
+        &format!("/session?{}", dir_query(&f.dirs.repo)),
+        Some(&basic()),
+        Some(json!({ "agent": "ghost" })),
+    )
+    .await;
+    let stored = body_json(response).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    f.ctx.sessions.restrict(&stored).unwrap();
+    let before = f.llm.request_count();
+    for auth in [chat.clone(), basic()] {
+        let response = call(
+            &f.router,
+            "POST",
+            &format!("/session/{stored}/command"),
+            Some(&auth),
+            Some(json!({ "command": "goal", "arguments": "anything", "agent": "ghost" })),
+        )
+        .await;
+        assert_ne!(response.status(), StatusCode::OK);
+    }
+    wait_idle(&f, &stored).await;
+    assert!(
+        !agents_run(&f, before).contains(&"ghost".to_string()),
+        "the hidden agent ran in a restricted session"
+    );
+
+    // The engine's own prompt into a restricted session, with no caller at
+    // all (what a resume or a trigger is): bound by the session.
+    let directory = f.dirs.repo.clone();
+    let location = alforria_server::middleware::location::LocationContext {
+        services: f.ctx.instances.load(&directory).unwrap(),
+        directory,
+        workspace_id: None,
+    };
+    let engine = (f.ctx.engine_factory)(&location).unwrap();
+    let synthetic = |agent: Option<&str>, tools: Option<bool>| {
+        use alforria_core::session::prompt_input::{PromptInput, PromptPartInput};
+        PromptInput {
+            session_id: stored.clone(),
+            message_id: None,
+            model: None,
+            agent: agent.map(str::to_string),
+            no_reply: Some(true),
+            tools: tools.map(|on| [("bash".to_string(), on)].into_iter().collect()),
+            format: None,
+            system: None,
+            variant: None,
+            parts: vec![PromptPartInput::Text {
+                id: None,
+                text: "resume".to_string(),
+                synthetic: Some(true),
+                ignored: None,
+                time: None,
+                metadata: None,
+            }],
+            caller: alforria_core::session::caller::Caller::Session,
+        }
+    };
+    use alforria_core::session::prompt_input::PromptError;
+    assert!(matches!(
+        engine.prompt(synthetic(Some("ghost"), None)).await,
+        Err(PromptError::Forbidden { .. })
+    ));
+    assert!(matches!(
+        engine.prompt(synthetic(None, Some(true))).await,
+        Err(PromptError::Forbidden { .. })
+    ));
+    assert!(engine.prompt(synthetic(Some("build"), None)).await.is_ok());
+    // The same prompt in an unrestricted session is the operator's engine.
+    let free = create_session(&f, &f.dirs.repo, &basic()).await;
+    let mut input = synthetic(Some("ghost"), Some(true));
+    input.session_id = free;
+    assert!(engine.prompt(input).await.is_ok());
+}
+
+/// A subagent the model starts with the task tool runs in a restricted
+/// session: the engine's run of it is not a request, the child session
+/// inherits the restriction, and nobody below `admin` can prompt the child.
+#[tokio::test]
+async fn subagents_started_by_the_model_run_and_inherit_the_restriction() {
+    let signer = Signer::new();
+    let task = support::tool_turn(
+        "call_task",
+        "task",
+        json!({ "description": "help", "prompt": "do the thing", "subagent_type": "helper" }),
+    );
+    let f = fixture_with(policy_config(&signer, false), Some(PASSWORD), vec![task]);
+    let chat = bearer(&signer.token(AUDIENCE, "chat"));
+    let session = create_session(&f, &f.dirs.repo, &chat).await;
+    let response = call(
+        &f.router,
+        "POST",
+        &format!("/session/{session}/message"),
+        Some(&chat),
+        Some(json!({ "parts": [{ "type": "text", "text": "use the helper" }] })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    wait_idle(&f, &session).await;
+    let ran = agents_run(&f, 0);
+    assert!(
+        ran.contains(&"helper".to_string()),
+        "the subagent ran: {ran:?}"
+    );
+
+    let children = body_json(
+        call(
+            &f.router,
+            "GET",
+            &format!("/session/{session}/children"),
+            Some(&chat),
+            None,
+        )
+        .await,
+    )
+    .await;
+    let child = children[0]["id"]
+        .as_str()
+        .expect("a child session")
+        .to_string();
+    assert!(
+        restricted(&f, &child).await,
+        "the subagent's session inherits"
+    );
+    let direct = call(
+        &f.router,
+        "POST",
+        &format!("/session/{child}/message"),
+        Some(&chat),
+        Some(json!({ "parts": [{ "type": "text", "text": "hello helper" }] })),
+    )
+    .await;
+    assert_eq!(direct.status(), StatusCode::FORBIDDEN);
+}
+
 async fn pending_permission(f: &Fixture, directory: &std::path::Path, auth: &str) -> String {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
