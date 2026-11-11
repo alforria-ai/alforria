@@ -2,6 +2,7 @@
 //! `GET /openapi.json` and the UI catch-all, wrapped in the TS middleware
 //! stack (`httpapi/server.ts:276-297`).
 
+pub mod attention;
 pub mod doc;
 pub mod file_ext;
 pub mod goal;
@@ -38,6 +39,7 @@ pub fn build_router(ctx: Arc<ServerContext>) -> Router {
     router = goal::register(router);
     router = restriction::register(router);
     router = file_ext::register(router);
+    router = attention::register(router);
 
     let router = router
         .fallback(ui::serve_ui_handler)

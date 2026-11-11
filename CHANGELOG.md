@@ -78,6 +78,14 @@ pre-1.0, so minor releases may include breaking changes.
   uploads only into `server.upload.directories` (default `uploads/`) and
   never to a config, instruction, agent, command, skill, workflow or git
   file.
+- `permission.unattended` and `question.unattended` (global config) bound how
+  long a permission ask or a question waits for a person: after `timeout`, an
+  ask is denied or allowed once and a question is dismissed, the model is
+  told nobody was there, and the turn continues. The default, `wait`, is the
+  old behaviour. An automatic answer is marked `automatic: true` on
+  `permission.replied` and `question.rejected`.
+- `GET /attention` lists the permission asks and questions currently waiting
+  for a person, across projects, with their session, title and age.
 - `shell_env` (global config) controls what the agent's shells inherit from
   the server's environment: `inherit` (`"all"`, `"none"` or a list), `allow`,
   `set` and `deny`.

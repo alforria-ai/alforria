@@ -1,0 +1,122 @@
+//! `GET /attention` (alforria extension): everything that is waiting for a
+//! person, across every loaded project.
+//!
+//! `permission.asked` and `question.asked` are events: a client that was
+//! not connected when one fired never hears of it. This is the state behind
+//! them, for a control plane to poll as a safety net:
+//!
+//! ```jsonc
+//! {
+//!   "count": 1,
+//!   "items": [{
+//!     "kind": "permission",            // or "question"
+//!     "id": "per_…",                   // what a reply names
+//!     "sessionID": "ses_…",
+//!     "title": "Fix the login page",   // the session's title
+//!     "directory": "/home/agent/workspace",
+//!     "summary": "bash: git push",     // what is being asked, briefly
+//!     "asked": 1794408349584,          // ms since the epoch
+//!     "age": 5321,                     // ms
+//!     "expires": 1794408649584         // when the unattended policy answers, or null
+//!   }]
+//! }
+//! ```
+//!
+//! Oldest first. A credential below `admin` sees the projects it may open
+//! (`server.directories`). Outside the frozen v1/v2 tables.
+
+use std::sync::Arc;
+
+use axum::extract::State;
+use axum::routing::get;
+use axum::{Extension, Json, Router};
+use serde_json::{json, Value};
+
+use crate::bearer::Principal;
+use crate::state::ServerContext;
+
+pub fn register(router: Router<Arc<ServerContext>>) -> Router<Arc<ServerContext>> {
+    router.route("/attention", get(attention))
+}
+
+/// One line saying what a permission ask is for.
+fn permission_summary(request: &alforria_schema::permission_v1::PermissionV1Request) -> String {
+    let what = request
+        .metadata
+        .get("command")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| request.patterns.first().cloned())
+        .unwrap_or_default();
+    let what: String = what.chars().take(200).collect();
+    if what.is_empty() {
+        request.permission.clone()
+    } else {
+        format!("{}: {what}", request.permission)
+    }
+}
+
+async fn attention(
+    State(ctx): State<Arc<ServerContext>>,
+    principal: Option<Extension<Principal>>,
+) -> Json<Value> {
+    let restricted = crate::confine::restricted(&principal);
+    let now = alforria_core::session::permission::now_ms();
+    let mut items: Vec<(u64, Value)> = Vec::new();
+    for services in ctx.instances.cached() {
+        if restricted && !crate::confine::instance_allowed(&ctx, &services) {
+            continue;
+        }
+        let directory = services
+            .instance_location()
+            .map(|instance| instance.directory.display().to_string());
+        let title = |session_id: &str| {
+            services
+                .sessions
+                .get(session_id)
+                .ok()
+                .map(|session| session.title)
+        };
+        for pending in services.permission.pending() {
+            items.push((
+                pending.asked_at,
+                json!({
+                    "kind": "permission",
+                    "id": pending.request.id,
+                    "sessionID": pending.request.session_id,
+                    "title": title(&pending.request.session_id),
+                    "directory": directory,
+                    "summary": permission_summary(&pending.request),
+                    "asked": pending.asked_at,
+                    "age": now.saturating_sub(pending.asked_at),
+                    "expires": pending.expires_at,
+                }),
+            ));
+        }
+        for pending in services.question.pending_asks() {
+            let summary: String = pending
+                .request
+                .questions
+                .first()
+                .map(|question| question.question.chars().take(200).collect())
+                .unwrap_or_default();
+            items.push((
+                pending.asked_at,
+                json!({
+                    "kind": "question",
+                    "id": pending.request.id,
+                    "sessionID": pending.request.session_id,
+                    "title": title(&pending.request.session_id),
+                    "directory": directory,
+                    "summary": summary,
+                    "asked": pending.asked_at,
+                    "age": now.saturating_sub(pending.asked_at),
+                    "expires": pending.expires_at,
+                }),
+            ));
+        }
+    }
+    items.sort_by_key(|(asked, _)| *asked);
+    let items: Vec<Value> = items.into_iter().map(|(_, item)| item).collect();
+    Json(json!({ "count": items.len(), "items": items }))
+}

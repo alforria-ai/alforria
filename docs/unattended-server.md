@@ -191,7 +191,7 @@ listed needs `admin`**, so a route added later — a whole new family included
 
 | Scope | For | Routes |
 | --- | --- | --- |
-| `chat` | A person talking to the agent from a browser or a phone | `GET /global/health`, `GET /event`; sessions: `GET`/`POST /session`, `GET /session/status`, `GET`/`PATCH`/`DELETE /session/{id}`, `…/children`, `…/todo`, `…/diff`, `…/goal`, `GET`/`POST …/message`, `GET …/message/{id}`, `…/prompt_async`, `…/command`, `…/abort`, `…/fork`, `…/init`, `…/summarize`, `…/revert`, `…/unrevert`, `…/permissions/{id}`; replies: `GET /permission`, `POST /permission/{id}/reply`, `GET /question`, `POST /question/{id}/reply`, `…/reject`; files in the project: `GET /file`, `/file/content`, `/file/status`, `/find`, `/find/file`, `/find/symbol`, `POST /file/ticket`, `GET /file/raw`, `PUT /file/content`; and what a client draws itself with: `GET /agent`, `/command`, `/skill`, `/path`, `/project/current`, `/vcs`, `/vcs/status`, `/vcs/diff` |
+| `chat` | A person talking to the agent from a browser or a phone | `GET /global/health`, `GET /event`, `GET /attention`; sessions: `GET`/`POST /session`, `GET /session/status`, `GET`/`PATCH`/`DELETE /session/{id}`, `…/children`, `…/todo`, `…/diff`, `…/goal`, `GET`/`POST …/message`, `GET …/message/{id}`, `…/prompt_async`, `…/command`, `…/abort`, `…/fork`, `…/init`, `…/summarize`, `…/revert`, `…/unrevert`, `…/permissions/{id}`; replies: `GET /permission`, `POST /permission/{id}/reply`, `GET /question`, `POST /question/{id}/reply`, `…/reject`; files in the project: `GET /file`, `/file/content`, `/file/status`, `/find`, `/find/file`, `/find/symbol`, `POST /file/ticket`, `GET /file/raw`, `PUT /file/content`; and what a client draws itself with: `GET /agent`, `/command`, `/skill`, `/path`, `/project/current`, `/vcs`, `/vcs/status`, `/vcs/diff` |
 | `connector` | A trusted sidecar on the same machine (a messaging bridge, a scheduler) | everything in `chat`, plus `GET /global/event` (every directory's events on one stream), `POST /log`, status reads (`GET /mcp`, `/lsp`, `/formatter`, `/experimental/tool`, `/experimental/tool/ids`, `/experimental/resource`, `/project`, `/project/{id}/directories`), and watching and stopping workflow runs (`GET /workflow`, `GET /workflow/run`, `GET /workflow/run/{id}`, `POST …/wait`, `POST …/abort`) |
 | `admin` | The control plane, the operator | everything: config, provider credentials (`/auth`, `/provider`, `/config/providers`), MCP management and OAuth, terminals (`/pty`), the session `shell` command, saving and starting workflows, `/tui/*`, message and part edits and deletes, `/instance/dispose`, the `/global` routes, sync, sharing, `/experimental/*`, the v2 `/api` surface, the web UI |
 
@@ -386,6 +386,84 @@ which of the three it is, or it does not compile.
 
 Basic auth, `admin` tokens and a server with no authentication are not
 confined.
+
+## When nobody answers: `permission.unattended`, `question.unattended` (host)
+
+A permission ask and a question both wait for a person. With no client
+connected, a turn that asks waits forever. These settings bound the wait.
+They are read from the host config only: a project file cannot turn asks
+into allows.
+
+```jsonc
+{
+  "permission": {
+    "bash": "ask",
+    "unattended": {
+      "timeout": "5m",        // how long an ask waits for a person
+      "on_timeout": "deny"    // "wait" (default), "deny" or "allow"
+    }
+  },
+  "question": {
+    "unattended": {
+      "timeout": "5m",
+      "on_timeout": "reject"  // "wait" (default) or "reject"
+    }
+  }
+}
+```
+
+`timeout` is required unless `on_timeout` is `wait`. `wait` is today's
+behaviour and the default. (`permission.unattended` is this policy only when
+it is an object with `timeout` or `on_timeout`; an action such as
+`"unattended": "allow"` is still a rule for a permission of that name.)
+
+- **`deny`** resolves the ask exactly as a person's *reject with a message*
+  does: the tool call fails with "No one was available to answer this
+  permission request within 5m, so it was denied automatically…", the model
+  reads that and the turn continues. (A bare reject would stop the turn and
+  leave the session waiting for the person who is not there.)
+- **`allow`** resolves it as `once`: this call goes through, and nothing is
+  approved for next time.
+- A question that times out fails its tool call with "The user is not
+  available: nobody answered within 5m. Do not ask again. Proceed on your
+  best judgment where that is safe, and stop where the answer is needed."
+  The turn continues.
+
+Each ask has its own deadline. A timeout resolves that one ask; it does not
+sweep the session's other pending asks along the way a person's reject does.
+An answer that arrives in time wins as usual.
+
+The usual events are published, with one added property so a client can tell
+nobody answered: `permission.replied` carries `"automatic": true` (with
+`reply: "reject"` or `"once"`), and `question.rejected` carries
+`"automatic": true`. A person's reply is unchanged, byte for byte.
+
+### `GET /attention`
+
+Everything that is waiting for a person, across every loaded project —
+state, not events, so it is there for a client that was not connected when
+the ask was made. Scope `chat`; a token below `admin` sees the projects it
+may open.
+
+```jsonc
+{
+  "count": 1,
+  "items": [{
+    "kind": "permission",              // or "question"
+    "id": "per_…",                     // what POST /permission/{id}/reply names
+    "sessionID": "ses_…",
+    "title": "Deploy the site",        // the session's title
+    "directory": "/home/agent/workspace",
+    "summary": "bash: git push",       // the command or first pattern; a question's text
+    "asked": 1794408349584,            // ms since the epoch
+    "age": 5321,                       // ms
+    "expires": 1794408649584           // when the unattended policy answers; null if it waits
+  }]
+}
+```
+
+Oldest first. An item leaves the list when it is answered, times out, or
+its turn is aborted.
 
 ## Files for a browser: tickets, raw reads, uploads
 

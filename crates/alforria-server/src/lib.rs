@@ -258,6 +258,16 @@ pub fn production_context(
         seams,
     );
     let policy = Arc::new(ServerPolicy::load(&paths));
+    // The unattended policy sits on each instance's ask services.
+    instances.set_on_boot({
+        let policy = policy.clone();
+        move |services| {
+            services
+                .permission
+                .set_unattended(policy.unattended_permission);
+            services.question.set_unattended(policy.unattended_question);
+        }
+    });
     let mut auth = AuthConfig::from_env().with_bearer(policy.bearer.clone());
     if let Some(password) = &opts.password {
         auth.password = Some(password.clone());

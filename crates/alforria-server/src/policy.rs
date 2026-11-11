@@ -107,6 +107,12 @@ pub struct ServerPolicy {
     /// `server.upload.directories`: where, inside the project, a
     /// credential below `admin` may upload.
     pub upload_directories: Vec<String>,
+    /// `permission.unattended`: what an unanswered permission ask
+    /// resolves to, and when. `None`: it waits.
+    pub unattended_permission: Option<alforria_core::session::permission::Unattended>,
+    /// `question.unattended`: how long a question waits before it is
+    /// dismissed. `None`: it waits.
+    pub unattended_question: Option<Duration>,
     /// What the agent's shells see of the server's environment.
     pub shell_env: alforria_core::shell_env::ShellEnvPolicy,
     /// Why the host config could not be used, if it could not. A listener
@@ -124,6 +130,8 @@ impl Default for ServerPolicy {
             reply_always: false,
             upload_max_bytes: DEFAULT_UPLOAD_MAX_BYTES,
             upload_directories: vec![DEFAULT_UPLOAD_DIRECTORY.to_string()],
+            unattended_permission: None,
+            unattended_question: None,
             shell_env: alforria_core::shell_env::ShellEnvPolicy::default(),
             config_error: None,
         }
@@ -161,8 +169,54 @@ impl ServerPolicy {
                 shutdown.sessions = sessions;
             }
         }
+        use alforria_core::config::host::{PermissionOnTimeout, QuestionOnTimeout};
+        use alforria_core::session::permission::{OnTimeout, Unattended};
+        let unattended_permission = match config
+            .permission
+            .as_ref()
+            .and_then(|permission| permission.unattended.as_ref())
+        {
+            None => None,
+            Some(info) => {
+                let on_timeout = match info.on_timeout.unwrap_or_default() {
+                    PermissionOnTimeout::Wait => None,
+                    PermissionOnTimeout::Deny => Some(OnTimeout::Deny),
+                    PermissionOnTimeout::Allow => Some(OnTimeout::Allow),
+                };
+                match (on_timeout, info.timeout) {
+                    (None, _) => None,
+                    (Some(on_timeout), Some(timeout)) => Some(Unattended {
+                        timeout: timeout.get(),
+                        on_timeout,
+                    }),
+                    (Some(_), None) => return Err(
+                        "permission.unattended.timeout is required unless on_timeout is \"wait\""
+                            .to_string(),
+                    ),
+                }
+            }
+        };
+        let unattended_question = match config
+            .question
+            .as_ref()
+            .and_then(|question| question.unattended.as_ref())
+        {
+            None => None,
+            Some(info) => match (info.on_timeout.unwrap_or_default(), info.timeout) {
+                (QuestionOnTimeout::Wait, _) => None,
+                (QuestionOnTimeout::Reject, Some(timeout)) => Some(timeout.get()),
+                (QuestionOnTimeout::Reject, None) => {
+                    return Err(
+                        "question.unattended.timeout is required unless on_timeout is \"wait\""
+                            .to_string(),
+                    )
+                }
+            },
+        };
         Ok(ServerPolicy {
             shutdown,
+            unattended_permission,
+            unattended_question,
             bearer,
             directories,
             reply_always: server

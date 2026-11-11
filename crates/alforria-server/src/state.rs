@@ -250,7 +250,12 @@ pub struct InstanceStore {
     /// Disposal emissions feed the GlobalBus (`disposeContext`,
     /// `instance-store.ts:78-93`).
     global_bus: Arc<Mutex<Option<GlobalBus>>>,
+    /// Run on every instance right after it boots (alforria extension):
+    /// host policy that lives on per-instance services is applied here.
+    on_boot: Arc<Mutex<Option<BootHook>>>,
 }
+
+type BootHook = Arc<dyn Fn(&SessionServices) + Send + Sync>;
 
 impl InstanceStore {
     pub fn new(factory: InstanceFactory) -> InstanceStore {
@@ -258,7 +263,13 @@ impl InstanceStore {
             factory,
             entries: Arc::new(Mutex::new(HashMap::new())),
             global_bus: Arc::new(Mutex::new(None)),
+            on_boot: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Run `hook` on every instance booted from now on.
+    pub fn set_on_boot(&self, hook: impl Fn(&SessionServices) + Send + Sync + 'static) {
+        *self.on_boot.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(hook));
     }
 
     /// The GlobalBus to emit `server.instance.disposed` events into — wired
@@ -298,6 +309,14 @@ impl InstanceStore {
             return Ok(existing.clone());
         }
         let services = (self.factory)(&directory)?;
+        let on_boot = self
+            .on_boot
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        if let Some(on_boot) = on_boot {
+            on_boot(&services);
+        }
         // M7.1: the instance bus feeds the global bus so per-instance
         // events reach `/global/event` and `/event` with their location
         // (`event-v2-bridge.ts:26-62`).

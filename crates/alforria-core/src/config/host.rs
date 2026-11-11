@@ -188,6 +188,61 @@ pub struct UploadInfo {
 }
 
 // ---------------------------------------------------------------------------
+// permission.unattended, question.unattended
+// ---------------------------------------------------------------------------
+
+/// What a permission ask resolves to when nobody answers it in time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PermissionOnTimeout {
+    /// Keep waiting (upstream behaviour).
+    #[default]
+    Wait,
+    /// Deny, telling the model nobody was there to answer.
+    Deny,
+    /// Allow, once.
+    Allow,
+}
+
+/// `permission.unattended` — a bound on how long a permission ask waits for
+/// a person. Read from the host config only: a project file cannot turn
+/// asks into allows.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct PermissionUnattendedInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<DurationSetting>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_timeout: Option<PermissionOnTimeout>,
+}
+
+/// What a question resolves to when nobody answers it in time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum QuestionOnTimeout {
+    /// Keep waiting (upstream behaviour).
+    #[default]
+    Wait,
+    /// Dismiss it, telling the model the user is unavailable.
+    Reject,
+}
+
+/// `question.unattended`.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct QuestionUnattendedInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<DurationSetting>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_timeout: Option<QuestionOnTimeout>,
+}
+
+/// `question` — settings for the question tool's asks.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct QuestionInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unattended: Option<QuestionUnattendedInfo>,
+}
+
+// ---------------------------------------------------------------------------
 // shell_env
 // ---------------------------------------------------------------------------
 
