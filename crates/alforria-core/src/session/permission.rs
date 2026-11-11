@@ -424,7 +424,7 @@ impl PermissionService {
             for pattern in &input.patterns {
                 // A standing approval counts in every reading of the policy.
                 let rule = policy
-                    .extended(approved)
+                    .with_approvals(approved)
                     .evaluate(&input.permission, pattern);
                 match rule.action {
                     PermissionV1Action::Deny => {

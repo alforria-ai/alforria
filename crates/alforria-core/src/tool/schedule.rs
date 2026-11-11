@@ -83,10 +83,8 @@ impl ScheduleSessions for SessionTree {
         else {
             return deny_all();
         };
-        let policy = agent
-            .permission
-            .extended(&session.permission.unwrap_or_default());
-        crate::trigger::CreatorBounds::of(&self.sessions.bounded(session_id, policy))
+        drop(session);
+        crate::trigger::CreatorBounds::of(&self.sessions.policy(session_id, &agent.permission))
     }
 
     fn restricted(&self, session_id: &str) -> bool {

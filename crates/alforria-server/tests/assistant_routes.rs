@@ -516,12 +516,13 @@ async fn no_registered_tool_acts_on_an_untrusted_run_without_a_grant() {
                     .contains(prompt)
             })
             .expect("the run reached the model");
-        // What the engine evaluates: the agent's rules, then the session's.
-        let rules = input
-            .agent
-            .permission
-            .extended(&input.permission.clone().unwrap_or_default());
-        (input.agent.permission.clone(), rules)
+        // What the engine evaluates: the request carries the agent as the
+        // run's session is held to it (`SessionStore::policy`) — its
+        // rules, the session's own, and the stored ceilings.
+        (
+            input.agent.permission.clone(),
+            input.agent.permission.clone(),
+        )
     };
 
     let (agent, plain) = rules_of("Look");

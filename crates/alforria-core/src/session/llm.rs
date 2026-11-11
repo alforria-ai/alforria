@@ -298,12 +298,11 @@ pub struct PrepareInput<'a> {
 /// `resolveTools` (request.ts:208-214): drop tools denied by the merged
 /// ruleset and tools the user message turned off.
 pub fn resolve_tools(input: &PrepareInput<'_>) -> Vec<LlmTool> {
-    let policy = match input.permission {
-        Some(permission) => input.agent.permission.extended(permission),
-        None => input.agent.permission.clone(),
-    };
     let names: Vec<&str> = input.tools.iter().map(|tool| tool.name.as_str()).collect();
-    let disabled = policy.disabled(&names);
+    let disabled = input
+        .agent
+        .permission
+        .disabled_with(&names, input.permission);
     input
         .tools
         .iter()

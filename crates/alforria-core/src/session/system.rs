@@ -449,8 +449,6 @@ pub fn mcp(
     permission: Option<&PermissionV1Ruleset>,
     items: &[McpInstruction],
 ) -> Option<String> {
-    let empty = PermissionV1Ruleset::new();
-    let policy = agent.permission.extended(permission.unwrap_or(&empty));
     let instructions: Vec<&McpInstruction> = items
         .iter()
         .filter(|item| {
@@ -458,7 +456,7 @@ pub fn mcp(
                 return true;
             }
             let tools: Vec<&str> = item.tools.iter().map(|t| t.as_str()).collect();
-            policy.disabled(&tools).len() < item.tools.len()
+            agent.permission.disabled_with(&tools, permission).len() < item.tools.len()
         })
         .collect();
     if instructions.is_empty() {

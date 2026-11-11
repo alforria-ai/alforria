@@ -174,12 +174,55 @@ impl Policy {
         self.written.extend(rules);
     }
 
-    /// This policy followed by `later` rules that count in every reading:
-    /// a session's own rules, a standing approval. They are the operator's
-    /// (or an answer to an ask), so they override a ceiling's rule the way
-    /// they override a written one — except a sealed ceiling's
-    /// ([`Ceiling::sealed`]), which nothing later reaches.
-    pub fn extended(&self, later: &Ruleset) -> Policy {
+    /// **The policy a turn in a session is judged by**: this (an agent's)
+    /// policy, then the session's own rules, under the session's stored
+    /// ceilings. It takes the ceilings as [`StoredCeilings`], which only
+    /// the session store can produce — so the one way to get here is
+    /// [`SessionStore::policy`], and "the agent's rules extended by the
+    /// session's" cannot be put together by hand without them.
+    ///
+    /// [`StoredCeilings`]: crate::session::store::StoredCeilings
+    /// [`SessionStore::policy`]: crate::session::store::SessionStore::policy
+    pub fn for_session(
+        &self,
+        own: &Ruleset,
+        ceilings: &crate::session::store::StoredCeilings,
+    ) -> Policy {
+        ceilings
+            .readings()
+            .fold(self.extended(own), |policy, (name, reading)| {
+                policy.with_sealed_ceiling(name, reading.clone())
+            })
+    }
+
+    /// This policy followed by the project's standing approvals (answers
+    /// of "always" to earlier asks). They count in every reading but a
+    /// sealed ceiling's. Not for a session's rules: those go through
+    /// [`Policy::for_session`].
+    pub fn with_approvals(&self, approved: &Ruleset) -> Policy {
+        self.extended(approved)
+    }
+
+    /// The tools of `tools` that this policy, read with `session` rules
+    /// after it, denies outright — for filtering a tool list where no
+    /// store is at hand (the request builder, the MCP instructions). It
+    /// returns names, not a policy: nothing can be decided from it.
+    pub fn disabled_with(
+        &self,
+        tools: &[&str],
+        session: Option<&Ruleset>,
+    ) -> std::collections::HashSet<String> {
+        match session {
+            Some(session) => self.extended(session).disabled(tools),
+            None => self.disabled(tools),
+        }
+    }
+
+    /// This policy followed by `later` rules that count in every reading
+    /// but a sealed ceiling's ([`Ceiling::sealed`]). Private: outside this
+    /// module a policy is extended only through [`Policy::for_session`]
+    /// and [`Policy::with_approvals`].
+    fn extended(&self, later: &Ruleset) -> Policy {
         let mut policy = self.clone();
         policy.written.extend(later.iter().cloned());
         for ceiling in policy.ceilings.iter_mut().filter(|c| !c.sealed) {
@@ -285,6 +328,14 @@ impl Policy {
             flat.extend(of(&ceiling.rules, PermissionV1Action::Deny));
         }
         flat
+    }
+}
+
+#[cfg(test)]
+impl Policy {
+    /// [`Policy::extended`] for tests that build a policy by hand.
+    pub(crate) fn extended_for_test(&self, later: &Ruleset) -> Policy {
+        self.extended(later)
     }
 }
 

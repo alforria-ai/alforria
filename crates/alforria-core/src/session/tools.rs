@@ -128,10 +128,9 @@ pub async fn resolve(
         | alforria_schema::session_v1::V1Message::Assistant { id, .. } => id,
     }
     .to_string();
-    let ruleset = match input.session.permission.as_ref() {
-        Some(permission) => input.agent.permission.extended(permission),
-        None => input.agent.permission.clone(),
-    };
+    // The loop hands in the agent as this session is held to it
+    // (`SessionStore::policy`): its rules, the session's, the ceilings.
+    let ruleset = input.agent.permission.clone();
     // A restricted or outside-input session's tools do not write what the
     // loaders (or the server) read. The guard is always on for such a
     // session and decides at each write, for the path being written

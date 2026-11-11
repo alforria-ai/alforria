@@ -193,14 +193,18 @@ pub fn run_policy(input: &RunRules<'_>) -> RunPolicy {
     }
 }
 
+#[cfg(test)]
 impl RunPolicy {
     /// The policy a turn of the run is judged by, given the agent's policy
-    /// as it stands: what `SessionStore::bounded` assembles from what is
+    /// as it stands: what `SessionStore::policy` assembles from what is
     /// stored.
-    pub fn over(&self, agent: &crate::tool::permission::Policy) -> crate::tool::permission::Policy {
+    pub(crate) fn over(
+        &self,
+        agent: &crate::tool::permission::Policy,
+    ) -> crate::tool::permission::Policy {
         self.ceilings
             .iter()
-            .fold(agent.extended(&self.session), |policy, ceiling| {
+            .fold(agent.extended_for_test(&self.session), |policy, ceiling| {
                 ceiling.readings.iter().fold(policy, |policy, reading| {
                     policy.with_sealed_ceiling(&ceiling.name, reading.clone())
                 })
@@ -443,7 +447,7 @@ mod tests {
         assert_eq!(
             bound
                 .over(&Policy::plain(loosened.clone()))
-                .extended(&approved)
+                .with_approvals(&approved)
                 .evaluate("bash", "make deploy")
                 .action,
             Deny

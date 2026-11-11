@@ -558,12 +558,12 @@ pub async fn run_loop(
                 user_agent, hint
             )));
         };
-        // alforria extension: the agent's policy as this session is held
-        // to it — under the session's stored ceilings (a trigger creator's
-        // bounds, the outside-input ceiling; `SessionStore::bounded`).
+        // alforria extension: from here on `agent.permission` is the
+        // session's policy — the agent's, the session's own rules, and the
+        // session's stored ceilings (`SessionStore::policy`).
         // Everything below reads the agent's rules from here, so the tool
         // list, every ask and the system prompt agree.
-        agent.permission = deps.sessions.bounded(session_id, agent.permission);
+        agent.permission = deps.sessions.policy(session_id, &agent.permission);
         let max_steps = agent.steps.unwrap_or(f64::INFINITY);
         let is_last_step = step as f64 >= max_steps;
 

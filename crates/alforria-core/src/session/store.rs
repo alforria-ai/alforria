@@ -542,6 +542,22 @@ pub struct SessionCeiling {
     pub readings: Vec<PermissionV1Ruleset>,
 }
 
+/// A session's ceilings as read from the store: the argument
+/// `Policy::for_session` needs. Only [`SessionStore::policy`] makes one.
+pub struct StoredCeilings(Vec<SessionCeiling>);
+
+impl StoredCeilings {
+    /// `(name, reading)` for every reading of every ceiling.
+    pub(crate) fn readings(&self) -> impl Iterator<Item = (&str, &PermissionV1Ruleset)> {
+        self.0.iter().flat_map(|ceiling| {
+            ceiling
+                .readings
+                .iter()
+                .map(move |reading| (ceiling.name.as_str(), reading))
+        })
+    }
+}
+
 /// Session metadata keys the server keeps for itself. A client cannot set,
 /// change or remove them ([`SessionStore::set_client_metadata`],
 /// [`strip_reserved_metadata`]). `untrustedInput` is where the marks used
@@ -933,35 +949,35 @@ impl SessionStore {
             .map_err(SessionError::from)
     }
 
-    /// **The policy a turn in `session_id` is judged by**, given the policy
-    /// in force for its agent (and, already read into it, the session's own
-    /// rules): that policy under every ceiling stored for the session. The
-    /// one evaluation (`Policy::evaluate`) then gives the strictest of the
-    /// policy as it stands now, the host's ceiling it carries, a trigger
-    /// creator's bounds and the outside-input ceiling. Ceilings that cannot
-    /// be read are one that denies everything.
-    pub fn bounded(
+    /// **The policy a turn in `session_id` is judged by** — the one place
+    /// it is assembled, and the only way to combine an agent's policy with
+    /// a session's rules (`Policy::for_session` takes a value only this
+    /// store produces). The result, through the one `Policy::evaluate`, is
+    /// the strictest of: `agent`'s policy as it stands now (with the host's
+    /// ceiling it carries) read with the session's own rules, a trigger
+    /// creator's bounds, and the outside-input ceiling. A session or
+    /// ceilings that cannot be read give a policy that denies everything.
+    pub fn policy(
         &self,
         session_id: &str,
-        policy: crate::tool::permission::Policy,
+        agent: &crate::tool::permission::Policy,
     ) -> crate::tool::permission::Policy {
         use alforria_schema::permission_v1::{PermissionV1Action, PermissionV1Rule};
-        match self.ceilings(session_id) {
-            Ok(ceilings) => ceilings.into_iter().fold(policy, |policy, ceiling| {
-                ceiling
-                    .readings
-                    .into_iter()
-                    .fold(policy, |policy, reading| {
-                        policy.with_sealed_ceiling(&ceiling.name, reading)
-                    })
-            }),
-            Err(_) => policy.with_sealed_ceiling(
-                "unreadable",
-                vec![PermissionV1Rule {
-                    permission: "*".to_string(),
-                    pattern: "*".to_string(),
-                    action: PermissionV1Action::Deny,
-                }],
+        match (self.get(session_id), self.ceilings(session_id)) {
+            (Ok(session), Ok(ceilings)) => agent.for_session(
+                &session.permission.unwrap_or_default(),
+                &StoredCeilings(ceilings),
+            ),
+            _ => agent.for_session(
+                &Vec::new(),
+                &StoredCeilings(vec![SessionCeiling {
+                    name: "unreadable".to_string(),
+                    readings: vec![vec![PermissionV1Rule {
+                        permission: "*".to_string(),
+                        pattern: "*".to_string(),
+                        action: PermissionV1Action::Deny,
+                    }]],
+                }]),
             ),
         }
     }

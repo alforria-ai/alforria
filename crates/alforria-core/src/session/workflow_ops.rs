@@ -269,10 +269,14 @@ impl WorkflowOps for ProductionWorkflowOps {
                 .as_ref()
                 .and_then(|session| session.agent.as_deref())
                 .and_then(|name| self.agents.get(name));
-            let policy = parent_agent
-                .map(|agent| agent.permission.clone())
-                .unwrap_or_default()
-                .extended(&parent_permission);
+            // Judged as any turn of the parent session is: its agent's
+            // rules, its own, and its ceilings (`SessionStore::policy`).
+            let policy = self.sessions.policy(
+                &request.parent_session_id,
+                &parent_agent
+                    .map(|agent| agent.permission.clone())
+                    .unwrap_or_default(),
+            );
             if policy.evaluate("task", &request.agent).action == PermissionV1Action::Deny {
                 return Err(format!(
                     "permission denied: agent {} may not be run as a subagent here",

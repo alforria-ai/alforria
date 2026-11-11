@@ -54,7 +54,7 @@ fn has_ceiling(session: &V1SessionInfo) -> bool {
                     })
             })
             && sessions
-                .bounded(&session.id, crate::tool::permission::Policy::default())
+                .policy(&session.id, &crate::tool::permission::Policy::default())
                 .evaluate("bash", "ls")
                 .action
                 == PermissionV1Action::Deny
@@ -230,15 +230,8 @@ async fn a_scheduled_run_follows_the_policy_now_and_stays_within_its_creators_bo
         agents: e.services.agents.clone(),
     };
     let agent_now = e.services.agents.get("build").unwrap().permission.clone();
-    // What the loop judges a turn by (`SessionStore::bounded`).
-    let judged = |session_id: &str, agent: &Policy| {
-        let own = sessions
-            .get(session_id)
-            .unwrap()
-            .permission
-            .unwrap_or_default();
-        sessions.bounded(session_id, agent.extended(&own))
-    };
+    // What the loop judges a turn by (`SessionStore::policy`).
+    let judged = |session_id: &str, agent: &Policy| sessions.policy(session_id, agent);
 
     // The creating session could not run `rm` and was to be asked about
     // pushes; everything else its agent allowed it.
@@ -313,7 +306,7 @@ async fn a_scheduled_run_follows_the_policy_now_and_stays_within_its_creators_bo
     assert_eq!(after.evaluate("bash", "make test").action, Allow);
     assert_eq!(
         after
-            .extended(&vec![rule("bash", "*", Allow)])
+            .with_approvals(&vec![rule("bash", "*", Allow)])
             .evaluate("bash", "rm -rf /")
             .action,
         Deny
@@ -354,4 +347,211 @@ async fn a_scheduled_run_follows_the_policy_now_and_stays_within_its_creators_bo
             .action,
         Deny
     );
+}
+
+/// The session's policy has one assembly point (`SessionStore::policy`),
+/// and `Policy::extended` is private, so "agent rules + session rules"
+/// cannot be evaluated without the session's ceilings. This drives the
+/// entry points that reach a decision for a session — the loop's request
+/// (tool list, asks, system prompt), the doom-loop ask, the memory flush
+/// check, the workflow `task` check and the schedule tool's bounds — with a
+/// session under each kind of ceiling, and holds each to the bounded
+/// policy: never more permissive.
+#[tokio::test]
+async fn every_entry_point_judges_a_session_under_its_ceilings() {
+    use crate::session::store::SessionCeiling;
+    use crate::tool::permission::{strictness, Policy};
+    use crate::tool::schedule::{ScheduleSessions, SessionTree};
+    use alforria_schema::permission_v1::PermissionV1Rule;
+    use PermissionV1Action::{Allow, Deny};
+    let rule = |permission: &str, pattern: &str, action| PermissionV1Rule {
+        permission: permission.to_string(),
+        pattern: pattern.to_string(),
+        action,
+    };
+    let creator = SessionCeiling {
+        name: crate::trigger::CREATOR_CEILING.to_string(),
+        readings: vec![vec![
+            rule("*", "*", Allow),
+            rule("bash", "*", Deny),
+            rule("task", "*", Deny),
+            rule("memory", "*", Deny),
+        ]],
+    };
+    let outside = SessionCeiling {
+        name: crate::trigger::OUTSIDE_CEILING.to_string(),
+        readings: vec![crate::trigger::outside_ceiling(&Vec::new())],
+    };
+    let kinds: Vec<(&str, Vec<SessionCeiling>)> = vec![
+        ("none", vec![]),
+        ("creator", vec![creator.clone()]),
+        ("outside", vec![outside.clone()]),
+        ("both", vec![creator, outside]),
+    ];
+    let e = engine(
+        "policy-entry-points",
+        kinds.iter().map(|_| text_stream("ok")).collect(),
+    );
+    let sessions = e.services.sessions.clone();
+    let context = e.services.instance_context(&e.worktree, None).unwrap();
+    let agent = e.services.agents.get("build").unwrap().permission.clone();
+    let tree = SessionTree {
+        sessions: sessions.clone(),
+        agents: e.services.agents.clone(),
+    };
+    let flush = crate::memory::flush::MemoryFlush {
+        memory: crate::memory::test_support::service(
+            e.services.storage.clone(),
+            crate::memory::test_support::settings("global"),
+        ),
+        llm: e.llm.clone(),
+        sessions: sessions.clone(),
+        agents: e.services.agents.clone(),
+        client: "test".to_string(),
+    };
+    let workflows = crate::session::workflow_ops::ProductionWorkflowOps::new(
+        sessions.clone(),
+        e.services.messages.clone(),
+        context.clone(),
+        e.services.agents.clone(),
+        Vec::new(),
+    );
+    let wide_open = Policy::plain(vec![rule("*", "*", Allow)]);
+    const PROBES: [(&str, &str); 8] = [
+        ("bash", "ls"),
+        ("edit", "src/lib.rs"),
+        ("read", "src/lib.rs"),
+        ("read", ".env"),
+        ("task", "general"),
+        ("memory", "remember"),
+        ("webfetch", "https://x"),
+        ("doom_loop", "read"),
+    ];
+    for (index, (kind, ceilings)) in kinds.iter().enumerate() {
+        let session = sessions
+            .create(
+                &context,
+                &crate::session::store::CreateInput {
+                    title: Some(format!("entry points: {kind}")),
+                    agent: Some("build".to_string()),
+                    // The session's own rules try to hand everything back.
+                    permission: Some(vec![rule("*", "*", Allow)]),
+                    ceilings: ceilings.clone(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let bounded = sessions.policy(&session.id, &agent);
+        // The ceilings hold against the session's own allow-everything.
+        if ceilings
+            .iter()
+            .any(|c| c.name == crate::trigger::CREATOR_CEILING)
+        {
+            assert_eq!(bounded.evaluate("bash", "ls").action, Deny, "{kind}");
+        }
+        if ceilings
+            .iter()
+            .any(|c| c.name == crate::trigger::OUTSIDE_CEILING)
+        {
+            assert_eq!(
+                bounded.evaluate("edit", "src/lib.rs").action,
+                Deny,
+                "{kind}"
+            );
+        }
+
+        // The loop: the request is built from the bounded policy.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            e.prompt.prompt(crate::session::e2e::prompt_input_for(
+                &format!("msg_entry{index}"),
+                &session.id,
+                "hello",
+            )),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let request = e.llm.input(index);
+        // The schedule tool: bounds recorded for a trigger made here.
+        let recorded = tree.bounds(&session.id, "build").readings();
+        let scheduled = recorded.iter().fold(wide_open.clone(), |policy, reading| {
+            policy.with_sealed_ceiling("recorded", reading.clone())
+        });
+        // A child (a subagent, a workflow agent) and a fork.
+        let child = sessions
+            .create(
+                &context,
+                &crate::session::store::CreateInput {
+                    parent_id: Some(session.id.clone()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let fork = sessions.fork(&context, &session.id, None).unwrap();
+        for (permission, pattern) in PROBES {
+            let reference = strictness(bounded.evaluate(permission, pattern).action);
+            for (entry, decided) in [
+                (
+                    "loop request",
+                    request.agent.permission.evaluate(permission, pattern),
+                ),
+                ("schedule bounds", scheduled.evaluate(permission, pattern)),
+                (
+                    "child session",
+                    sessions
+                        .policy(&child.id, &wide_open)
+                        .evaluate(permission, pattern),
+                ),
+                (
+                    "fork",
+                    sessions
+                        .policy(&fork.id, &agent)
+                        .evaluate(permission, pattern),
+                ),
+            ] {
+                let ceiling_only = ceilings
+                    .iter()
+                    .flat_map(|ceiling| ceiling.readings.iter())
+                    .fold(wide_open.clone(), |policy, reading| {
+                        policy.with_sealed_ceiling("probe", reading.clone())
+                    });
+                // Children start from their own rules; the ceilings are
+                // what must carry over. Everything else is the full policy.
+                let floor = if entry == "child session" {
+                    strictness(ceiling_only.evaluate(permission, pattern).action)
+                } else {
+                    reference
+                };
+                assert!(
+                    strictness(decided.action) >= floor,
+                    "{kind}: {entry} decided {permission} {pattern} as {:?}",
+                    decided.action
+                );
+            }
+        }
+        // The memory flush check and the workflow `task` check.
+        let may_flush = flush.permitted(&session.id, "build");
+        assert_eq!(
+            may_flush,
+            bounded.evaluate("memory", "remember").action == Allow,
+            "{kind}: flush"
+        );
+        let launched = crate::workflow::WorkflowOps::create_agent_session(
+            workflows.as_ref(),
+            &crate::workflow::WorkflowAgentRequest {
+                run_id: "wfr_1".to_string(),
+                parent_session_id: session.id.clone(),
+                title: "t".to_string(),
+                agent: "general".to_string(),
+                prompt: "p".to_string(),
+            },
+        )
+        .await;
+        assert_eq!(
+            launched.is_ok(),
+            bounded.evaluate("task", "general").action != Deny,
+            "{kind}: workflow"
+        );
+    }
 }

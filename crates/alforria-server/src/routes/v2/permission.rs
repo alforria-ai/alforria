@@ -297,7 +297,7 @@ fn with_saved(
     policy: &alforria_core::tool::permission::Policy,
     saved: &[PermissionRule],
 ) -> alforria_core::tool::permission::Policy {
-    policy.extended(&saved.iter().map(core_rule).collect())
+    policy.with_approvals(&saved.iter().map(core_rule).collect())
 }
 
 fn evaluate_input(

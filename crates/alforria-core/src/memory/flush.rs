@@ -152,15 +152,11 @@ impl MemoryFlush {
     /// the same permission the `memory` tool's `remember` asks for, decided
     /// by the agent's rules and then the session's, as the engine does.
     pub fn permitted(&self, session_id: &str, agent: &str) -> bool {
-        let Ok(session) = self.sessions.get(session_id) else {
-            return false;
-        };
         let Some(agent) = self.agents.get(agent) else {
             return false;
         };
-        let own = session.permission.unwrap_or_default();
         self.sessions
-            .bounded(session_id, agent.permission.extended(&own))
+            .policy(session_id, &agent.permission)
             .evaluate(crate::tool::memory::MEMORY_TOOL, "remember")
             .action
             == PermissionV1Action::Allow

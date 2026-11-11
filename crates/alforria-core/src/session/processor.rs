@@ -1337,12 +1337,16 @@ impl Handle {
         if !identical {
             return Ok(());
         }
-        let ruleset = inner
-            .deps
-            .agents
-            .get(&agent_name)
-            .map(|agent| agent.permission.clone())
-            .unwrap_or_default();
+        // As the session is held to it (`SessionStore::policy`).
+        let ruleset = inner.deps.sessions.policy(
+            &session_id,
+            &inner
+                .deps
+                .agents
+                .get(&agent_name)
+                .map(|agent| agent.permission.clone())
+                .unwrap_or_default(),
+        );
         let ask = PermissionAsk {
             session_id: session_id.clone(),
             permission: "doom_loop".to_string(),
