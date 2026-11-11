@@ -276,6 +276,8 @@ fn prune_events(
 /// `spawn("sqlite3", [Database.path()], { stdio: "inherit" })` (db.ts:38-41).
 fn shell(paths: &alforria_core::GlobalPaths) -> Result<(), TypedError> {
     let path = database_path(paths);
+    // shell_env: not routed. `alforria db` is typed by the user at their own
+    // terminal and hands them an interactive sqlite3: their environment.
     let status = std::process::Command::new("sqlite3")
         .arg(&path)
         .status()

@@ -85,6 +85,8 @@ fn run_editor(editor: &str, file: &Path, cwd: Option<&Path>) -> Result<(), Strin
         return Err("empty editor".to_string());
     }
     let cwd = cwd.filter(|cwd| cwd.exists());
+    // shell_env: not routed. This runs the user's own $VISUAL / $EDITOR in the
+    // user's terminal — the user's environment is the point.
     let status = Command::new(program)
         .args(parts.collect::<Vec<_>>())
         .arg(file)

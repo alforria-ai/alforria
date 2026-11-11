@@ -33,6 +33,9 @@ impl Browser for SystemBrowser {
         } else {
             return;
         };
+        // shell_env: not routed. The TUI's user opens a link with their own
+        // desktop opener: a fixed program that needs the desktop session's
+        // variables (DISPLAY, DBUS_SESSION_BUS_ADDRESS), not one the agent names.
         let child = std::process::Command::new(program)
             .args(args)
             .stdin(std::process::Stdio::null())

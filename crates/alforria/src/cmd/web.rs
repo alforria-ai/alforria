@@ -125,6 +125,8 @@ fn open_browser(url: &str) {
     } else {
         "xdg-open"
     };
+    // shell_env: not routed. `alforria web` opens the user's own browser on
+    // the user's desktop: a fixed opener that needs the session's variables.
     let _ = ProcessCommand::new(program)
         .arg(url)
         .stdin(Stdio::null())

@@ -40,6 +40,9 @@ pub struct SystemClipboard;
 /// Run a tool, feeding `input` on stdin; its stdout on exit status 0
 /// (`command()`, clipboard.ts:9-21).
 fn run_command(args: &[&str], input: Option<&str>) -> anyhow::Result<Vec<u8>> {
+    // shell_env: not routed. The TUI runs in the user's own terminal and this
+    // is the user's clipboard tool (wl-copy, xclip, pbcopy): a fixed program
+    // that needs the desktop session's variables, and nothing the agent names.
     let mut child = std::process::Command::new(args[0])
         .args(&args[1..])
         .stdin(if input.is_some() {

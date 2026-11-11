@@ -1269,6 +1269,8 @@ fn kill_process_group(pid: u32, force_after: Duration) {
     #[cfg(not(unix))]
     {
         let _ = force_after;
+        // shell_env: not routed. A fixed Windows system tool that kills a process
+        // tree by pid; nothing the agent or a config names.
         let _ = std::process::Command::new("taskkill")
             .args(["/PID", &pid.to_string(), "/T", "/F"])
             .stdin(std::process::Stdio::null())

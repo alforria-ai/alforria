@@ -178,6 +178,11 @@ impl WellKnown for HttpWellKnown {
         let Some((head, args)) = command.split_first() else {
             return Err("empty command".to_string());
         };
+        // shell_env: not routed. `alforria providers login <url>` is typed by the
+        // user at their own terminal; the command comes from that URL's
+        // `.well-known/opencode` (upstream's well-known auth) and prints the token
+        // the user asked to store. It runs with the user's environment, as it
+        // does upstream — no agent and no project config is involved.
         let child = std::process::Command::new(head)
             .args(args)
             .stdout(std::process::Stdio::piped())

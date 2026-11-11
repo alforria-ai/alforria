@@ -60,6 +60,8 @@ fn kill_group(pgid: u32) {
 
 #[cfg(not(unix))]
 fn kill_group(pid: u32) {
+    // shell_env: not routed. A fixed Windows system tool that kills a process
+    // tree by pid; nothing the agent or a config names.
     let _ = std::process::Command::new("taskkill")
         .args(["/PID", &pid.to_string(), "/T", "/F"])
         .stdin(std::process::Stdio::null())
