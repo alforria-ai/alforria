@@ -258,6 +258,12 @@ pub(crate) fn truncate_utf16(text: &str, max: usize) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 /// `path.resolve(base, p)` — lexical normalization; absolute `p` wins.
+///
+/// This is how a tool turns its argument into the path it then opens, as
+/// upstream does; it decides nothing. The path it returns (no `..` left in
+/// it) is the one handed to the kernel, and the checks that confine a tool
+/// are made on that path with `protect::resolve_path` — the write guard at
+/// the write (`InstanceContext::about_to_modify`).
 pub(crate) fn ts_resolve(base: &Path, p: &str) -> PathBuf {
     let joined = if Path::new(p).is_absolute() {
         PathBuf::from(p)

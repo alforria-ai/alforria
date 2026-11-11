@@ -107,21 +107,49 @@ impl DirectoryAllowlist {
                 None if entry == "~" => home.to_path_buf(),
                 None => PathBuf::from(entry),
             })
-            .map(|path| crate::state::resolve_directory(&path))
+            .map(|path| Self::landing(&path))
             .collect();
         if roots.is_empty() {
-            roots.push(crate::state::resolve_directory(&crate::state::cwd()));
+            roots.push(Self::landing(&crate::state::cwd()));
         }
         DirectoryAllowlist { roots }
     }
 
-    /// Whether `directory` is one of the allowed directories. Both sides
-    /// are resolved (symlinks followed where the path exists), so another
-    /// spelling of an allowed directory is allowed and a link elsewhere is
-    /// not.
+    /// Where an operator's entry is: the directory an instance opened under
+    /// that spelling acts in ([`crate::state::resolve_directory`]), as the
+    /// kernel finds it (`protect::resolve` — an entry that cannot be
+    /// resolved keeps its spelling, which then matches nothing resolved).
+    fn landing(entry: &Path) -> PathBuf {
+        alforria_core::protect::resolve(&crate::state::resolve_directory(entry))
+    }
+
+    /// Whether `directory` — a spelling off a request, or a directory
+    /// already resolved — is one of the allowed directories.
+    ///
+    /// Two readings of it exist and both must be the same allowed place.
+    /// A handler acts in [`crate::state::resolve_directory`] of the
+    /// spelling, which is upstream's `FSUtil.resolve` and stays as it is
+    /// for every other caller: `..` is folded out of the spelling first,
+    /// and a directory that does not exist yet keeps its spelling, links in
+    /// it unread. The kernel reads the spelling its own way
+    /// (`protect::resolve_path`): `allowed/link/../x` is next to where
+    /// `link` leads, and `/a/link/new` is created where `link` leads. So
+    /// the directory the handler would act in is resolved as the kernel
+    /// will resolve it when the instance touches its files, the spelling
+    /// itself likewise, and a spelling the two readings disagree about —
+    /// or that cannot be resolved — is not allowed.
     pub fn allows(&self, directory: &Path) -> bool {
-        let directory = crate::state::resolve_directory(directory);
-        self.roots.contains(&directory)
+        use alforria_core::protect::resolve_path;
+        let spelled = if directory.is_absolute() {
+            directory.to_path_buf()
+        } else {
+            crate::state::cwd().join(directory)
+        };
+        let acted_in = crate::state::resolve_directory(directory);
+        match (resolve_path(&spelled), resolve_path(&acted_in)) {
+            (Ok(spelled), Ok(acted_in)) => spelled == acted_in && self.roots.contains(&acted_in),
+            _ => false,
+        }
     }
 
     pub fn roots(&self) -> &[PathBuf] {
@@ -458,6 +486,53 @@ mod tests {
 
     fn config(value: serde_json::Value) -> Config {
         serde_json::from_value(value).unwrap()
+    }
+
+    /// The allowlist is asked where the kernel lands a spelling, and where
+    /// the kernel finds the directory a handler would act in for it; a
+    /// spelling the two disagree about is not allowed.
+    #[cfg(unix)]
+    #[test]
+    fn the_allowlist_judges_a_directory_where_the_kernel_lands_it() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        for sub in ["repo", "b/deep", "c"] {
+            std::fs::create_dir_all(root.join(sub)).unwrap();
+        }
+        symlink(root.join("b/deep"), root.join("repo/out")).unwrap();
+        symlink(root.join("b"), root.join("link")).unwrap();
+        let text = |path: PathBuf| path.display().to_string();
+        let list = DirectoryAllowlist::new(
+            &[text(root.join("repo")), text(root.join("link/new"))],
+            Path::new(""),
+        );
+        // An allowed directory under its own and under an honest spelling.
+        assert!(list.allows(&root.join("repo")));
+        assert!(list.allows(&root.join("repo/../repo/.")));
+        // `repo/out/..` is `b` for the kernel and `repo` once `..` is
+        // folded out of the spelling: the two readings disagree.
+        assert!(!list.allows(&root.join("repo/out/..")));
+        assert!(!list.allows(&root.join("b")));
+        // What cannot be resolved is not allowed.
+        assert!(!list.allows(&root.join("nowhere/../repo")));
+
+        // A listed directory that does not exist yet, behind a symlinked
+        // parent, is where the link leads: under either name…
+        assert_eq!(list.roots()[1], root.join("b/new"));
+        assert!(list.allows(&root.join("link/new")));
+        assert!(list.allows(&root.join("b/new")));
+        // …and it is still allowed once it exists.
+        std::fs::create_dir_all(root.join("b/new")).unwrap();
+        assert!(list.allows(&root.join("link/new")));
+        assert!(list.allows(&root.join("b/new")));
+        std::fs::remove_dir(root.join("b/new")).unwrap();
+        // A link repointed after the list was built does not carry the
+        // entry with it: the spelling now leads somewhere never listed.
+        std::fs::remove_file(root.join("link")).unwrap();
+        symlink(root.join("c"), root.join("link")).unwrap();
+        assert!(!list.allows(&root.join("link/new")));
+        assert!(list.allows(&root.join("b/new")));
     }
 
     #[test]

@@ -38,6 +38,14 @@ fn fs_contains(parent: &Path, child: &Path) -> bool {
 /// The path is normalised lexically first: `strip_prefix` compares
 /// components literally, so `/project/../etc/passwd` would otherwise count
 /// as inside `/project`.
+///
+/// Lexical on purpose, and no confinement: this is upstream's
+/// `containsPath`, and all it decides is whether the `external_directory`
+/// *ask* is raised for a path a tool was given — a prompt to the user, with
+/// upstream's behaviour for links inside the project. What a guarded
+/// session may write is decided where the write lands
+/// (`crate::protect`), and what a restricted caller may read by
+/// `session::caller::Bounds::check_read`; both use `protect::resolve_path`.
 pub fn contains_path(filepath: &Path, ctx: &InstanceContext) -> bool {
     let filepath = &crate::git::lexical_normalize(filepath);
     if fs_contains(&ctx.directory, filepath) {
@@ -47,36 +55,6 @@ pub fn contains_path(filepath: &Path, ctx: &InstanceContext) -> bool {
         return false;
     }
     fs_contains(&ctx.worktree, filepath)
-}
-
-/// Where `path` really points: normalised lexically, then with symlinks
-/// resolved. A path that does not exist yet is resolved through its deepest
-/// existing ancestor, so `link/new-file` still lands where `link` leads.
-pub fn real_path(path: &Path) -> std::path::PathBuf {
-    let path = crate::git::lexical_normalize(path);
-    let mut existing = path.as_path();
-    let mut rest = Vec::new();
-    loop {
-        if let Ok(real) = std::fs::canonicalize(existing) {
-            let mut out = real;
-            out.extend(rest.iter().rev());
-            return out;
-        }
-        match (existing.parent(), existing.file_name()) {
-            (Some(parent), Some(name)) => {
-                rest.push(name.to_os_string());
-                existing = parent;
-            }
-            _ => return path,
-        }
-    }
-}
-
-/// Whether `child` really is `parent` or inside it, symlinks resolved on
-/// both sides. The lexical check alone lets `project/link`, a symlink to
-/// somewhere else, pass as inside `project`.
-pub fn contains_real(parent: &Path, child: &Path) -> bool {
-    fs_contains(&real_path(parent), &real_path(child))
 }
 
 /// `path.dirname` semantics: the parent of a bare filename is `"."`.

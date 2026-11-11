@@ -15,7 +15,6 @@ use axum::Extension;
 use crate::bearer::Principal;
 use crate::error::{ApiError, ServerError};
 use crate::middleware::location::LocationContext;
-use crate::state::resolve_directory;
 
 /// The caller a request's prompts and commands are run as. This is all a
 /// route does about restriction: what the caller may ask for is decided in
@@ -40,28 +39,31 @@ pub fn restricted(principal: &Option<Extension<Principal>>) -> bool {
 /// The project a location stands for: its directory, and its git worktree
 /// when it has one (`containsPath`, `instance-context.ts:18-24` — a non-git
 /// project's worktree is `/`, which is not a boundary).
+///
+/// The roots are where the kernel finds those directories
+/// (`protect::resolve`): a project that does not exist yet behind a
+/// symlinked parent is where the link leads, which is where its files will
+/// be created and where [`resolve_for_access`] reports them.
 pub fn project_roots(location: &LocationContext) -> Vec<PathBuf> {
-    let mut roots = vec![resolve_directory(&location.directory)];
-    if let Some(instance) = location.services.instance_location() {
-        if instance.worktree != Path::new("/") && !instance.worktree.as_os_str().is_empty() {
-            let worktree = resolve_directory(&instance.worktree);
-            if !roots.contains(&worktree) {
-                roots.push(worktree);
-            }
-        }
-    }
-    roots
+    let worktree = location
+        .services
+        .instance_location()
+        .map(|instance| instance.worktree.clone())
+        .unwrap_or_default();
+    alforria_core::session::caller::project_roots(&location.directory, &worktree)
 }
 
 pub use alforria_core::session::caller::resolve_for_access;
 
-/// Whether `path` (absolute) is inside the location's project once every
-/// existing symlink on the way is followed.
+/// Whether `path` (absolute), as the kernel would resolve that very
+/// spelling, is inside the location's project. A path that cannot be
+/// resolved is not.
 pub fn inside_project(location: &LocationContext, path: &Path) -> bool {
-    let resolved = resolve_for_access(path);
-    project_roots(location)
-        .iter()
-        .any(|root| resolved.starts_with(root))
+    resolve_for_access(path).is_ok_and(|resolved| {
+        project_roots(location)
+            .iter()
+            .any(|root| alforria_core::protect::within(&resolved, root))
+    })
 }
 
 fn forbid(message: impl Into<String>) -> ServerError {
@@ -231,28 +233,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolution_follows_existing_links_and_keeps_the_missing_tail() {
+    fn resolution_lands_where_the_kernel_does() {
         let dir = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
         std::fs::create_dir_all(root.join("project/src")).unwrap();
         std::fs::create_dir_all(root.join("outside")).unwrap();
 
+        let resolve_for_access = |path: &Path| resolve_for_access(path).ok();
         assert_eq!(
             resolve_for_access(&root.join("project/src/../new/file.txt")),
-            root.join("project/new/file.txt")
+            Some(root.join("project/new/file.txt"))
         );
         assert_eq!(
             resolve_for_access(&root.join("project/../outside/x")),
-            root.join("outside/x")
+            Some(root.join("outside/x"))
         );
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink(root.join("outside"), root.join("project/link")).unwrap();
             assert_eq!(
                 resolve_for_access(&root.join("project/link/new/file.txt")),
-                root.join("outside/new/file.txt"),
+                Some(root.join("outside/new/file.txt")),
                 "a link in the middle of the path is followed"
             );
+            // `..` after a link is taken from where the link led.
+            std::fs::create_dir_all(root.join("outside/deep")).unwrap();
+            std::os::unix::fs::symlink(root.join("outside/deep"), root.join("project/down"))
+                .unwrap();
+            assert_eq!(
+                resolve_for_access(&root.join("project/down/../x")),
+                Some(root.join("outside/x"))
+            );
+            // …and after something that does not exist it has no answer.
+            assert_eq!(resolve_for_access(&root.join("project/no/../x")), None);
         }
     }
 }

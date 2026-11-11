@@ -428,13 +428,13 @@ fn file_ticketed(file_tickets: &FileTickets, uri: &Uri, headers: &HeaderMap) -> 
     } else {
         directory.join(&path)
     };
-    file_tickets.admits(
-        &ticket,
-        &FileScope {
-            file: crate::confine::resolve_for_access(&file),
-            directory,
-        },
-    )
+    // The file as the kernel would resolve the request's spelling — the
+    // handler resolves the same way and reads what that names. A spelling
+    // with no answer matches no ticket.
+    let Ok(file) = crate::confine::resolve_for_access(&file) else {
+        return false;
+    };
+    file_tickets.admits(&ticket, &FileScope { file, directory })
 }
 
 #[allow(clippy::too_many_arguments)]

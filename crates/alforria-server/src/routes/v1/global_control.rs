@@ -35,10 +35,29 @@ fn global_state_path(ctx: &ServerContext) -> PathBuf {
 }
 
 /// `FSUtil.contains` — whether `path` stays inside `directory`.
+///
+/// The frozen surface's own check, kept as upstream has it for the
+/// operator's clients: `..` is folded out of the spelling before links are
+/// followed, so `link/../x` counts as `x` while the kernel, handed the
+/// spelling, goes where `link` leads. It is therefore not what confines a
+/// credential below `admin` or a file ticket: those are judged by
+/// [`confined_read`], on the kernel's reading (`protect::resolve_path`).
 fn path_contains(directory: &Path, path: &Path) -> bool {
     let dir = crate::state::resolve_directory(directory);
     let path = crate::state::resolve_directory(path);
     path.starts_with(dir)
+}
+
+/// alforria extension: where a read on behalf of a credential below `admin`
+/// or of a file ticket lands — `target` (the spelling about to be handed
+/// to the kernel) resolved as the kernel resolves it, and inside the
+/// project. `None` when it is outside or cannot be resolved.
+fn confined_read(location: &LocationContext, target: &Path) -> Option<PathBuf> {
+    let resolved = crate::confine::resolve_for_access(target).ok()?;
+    crate::confine::project_roots(location)
+        .iter()
+        .any(|root| alforria_core::protect::within(&resolved, root))
+        .then_some(resolved)
 }
 
 /// Semver validation for `GlobalUpgradeInput` (`groups/global.ts:24-28`) —
@@ -710,7 +729,9 @@ pub async fn file_list(
     // (the folder picker). A credential narrower than `admin` is confined
     // to the project, like `content` below.
     let restricted = principal.is_some_and(|principal| principal.0.restricted());
-    if restricted && !path_contains(directory, &target) {
+    if restricted
+        && !(path_contains(directory, &target) && confined_read(&location, &target).is_some())
+    {
         return Err(ServerError::Api(crate::error::ApiError::Forbidden {
             message: "this token may only list files inside the project".to_string(),
         }));
@@ -787,17 +808,28 @@ pub async fn file_content(
     if !path_contains(directory, &file) {
         return Err(defect("Path escapes the location"));
     }
-    // alforria extension: a request admitted on a file ticket reads that
-    // ticket's file only (`routes::file_ext`).
-    if let Err(refusal) = crate::routes::file_ext::check_ticket(
-        &ctx,
-        &principal,
-        &uri,
-        &location,
-        &crate::confine::resolve_for_access(&file),
-    ) {
-        return Ok(axum::response::IntoResponse::into_response(refusal));
-    }
+    // alforria extension: a credential below `admin` reads inside the
+    // project, and a request admitted on a file ticket reads that ticket's
+    // file only (`routes::file_ext`) — both judged where the kernel lands
+    // the spelling, and the read is then made on that resolved path.
+    let confined = principal.as_ref().is_some_and(|principal| {
+        principal.0.restricted() || principal.0.via == crate::bearer::Via::Ticket
+    });
+    let file = if confined {
+        let Some(resolved) = confined_read(&location, &file) else {
+            return Err(ServerError::Api(crate::error::ApiError::Forbidden {
+                message: "this token may only read files inside the project".to_string(),
+            }));
+        };
+        if let Err(refusal) =
+            crate::routes::file_ext::check_ticket(&ctx, &principal, &uri, &location, &resolved)
+        {
+            return Ok(axum::response::IntoResponse::into_response(refusal));
+        }
+        resolved
+    } else {
+        file
+    };
     if !file.exists() {
         return Ok(json_ok(json!({"type": "text", "content": ""})));
     }

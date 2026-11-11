@@ -93,29 +93,13 @@ impl Caller {
     }
 }
 
-/// Resolve `path` the way a symlink-following open would reach it: the
-/// deepest existing ancestor is canonicalized and the rest (which does not
-/// exist, so cannot be a link) is appended after lexical normalization.
-pub fn resolve_for_access(path: &Path) -> PathBuf {
-    let normalized = crate::git::lexical_normalize(path);
-    let mut existing = normalized.as_path();
-    let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
-    loop {
-        if let Ok(real) = std::fs::canonicalize(existing) {
-            let mut resolved = crate::filesystem::strip_verbatim(real);
-            for part in tail.iter().rev() {
-                resolved.push(part);
-            }
-            return resolved;
-        }
-        match (existing.parent(), existing.file_name()) {
-            (Some(parent), Some(name)) => {
-                tail.push(name);
-                existing = parent;
-            }
-            _ => return normalized,
-        }
-    }
+/// Where an open of `path`, as it is spelled, would land: the one resolver
+/// ([`crate::protect::resolve_path`]) — links read where they stand, `..`
+/// applied to the resolved path and never folded out of the spelling. An
+/// error (a `..` after a component that does not exist, a link loop, an
+/// unreadable directory) is for the caller to treat as "outside".
+pub fn resolve_for_access(path: &Path) -> std::io::Result<PathBuf> {
+    crate::protect::resolve_path(path)
 }
 
 /// The project a restricted caller is confined to: the instance directory,
@@ -123,9 +107,11 @@ pub fn resolve_for_access(path: &Path) -> PathBuf {
 /// `/`, which is not a boundary — `containsPath`,
 /// `instance-context.ts:18-24`).
 pub fn project_roots(directory: &Path, worktree: &Path) -> Vec<PathBuf> {
-    let mut roots = vec![resolve_for_access(directory)];
+    // The trusted side: a root that cannot be resolved keeps its spelling
+    // (`protect::resolve`), which nothing resolved will be found inside.
+    let mut roots = vec![crate::protect::resolve(directory)];
     if worktree != Path::new("/") && !worktree.as_os_str().is_empty() {
-        let worktree = resolve_for_access(worktree);
+        let worktree = crate::protect::resolve(worktree);
         if !roots.contains(&worktree) {
             roots.push(worktree);
         }
@@ -168,8 +154,9 @@ impl Bounds {
     }
 
     /// A file about to be read on the caller's behalf. For a restricted
-    /// caller it must be inside the project once `..` and every existing
-    /// symlink on the way are followed.
+    /// caller it must be inside the project where the kernel would land
+    /// the path as spelled — `..` and every symlink on the way followed in
+    /// the order they stand; a path that cannot be resolved is outside.
     pub fn check_read(self, path: &Path, directory: &Path, worktree: &Path) -> Result<(), String> {
         if !self.is_restricted() {
             return Ok(());
@@ -179,11 +166,12 @@ impl Bounds {
         } else {
             directory.join(path)
         };
-        let resolved = resolve_for_access(&path);
-        if project_roots(directory, worktree)
-            .iter()
-            .any(|root| resolved.starts_with(root))
-        {
+        let inside = resolve_for_access(&path).is_ok_and(|resolved| {
+            project_roots(directory, worktree)
+                .iter()
+                .any(|root| crate::protect::within(&resolved, root))
+        });
+        if inside {
             Ok(())
         } else {
             Err("this token may only attach files inside the project".to_string())
@@ -271,6 +259,14 @@ mod tests {
             assert!(check("link").is_err());
             assert!(check("linkdir/secret").is_err());
             assert!(check("linkdir/new/file").is_err());
+            // `..` is applied where the link led, not to the spelling:
+            // `linkdir/../outside/secret` is the secret, though folding the
+            // spelling first reads it as `project/outside/secret`.
+            std::fs::create_dir_all(project.join("outside")).unwrap();
+            std::fs::write(project.join("outside/secret"), "decoy").unwrap();
+            assert!(check("linkdir/../outside/secret").is_err());
+            // What cannot be resolved is outside.
+            assert!(check("nowhere/../src/a.rs").is_err());
         }
         // A git worktree above the directory is part of the project.
         assert!(RESTRICTED

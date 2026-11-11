@@ -307,6 +307,114 @@ async fn tickets_are_only_minted_for_project_files() {
     assert_eq!(elsewhere.status(), StatusCode::FORBIDDEN);
 }
 
+/// A path is judged where the kernel lands that spelling, not where the
+/// spelling reads once `..` is folded out of it: with `out -> other/deep`,
+/// `out/../notes.txt` is `other/notes.txt` for the kernel and
+/// `repo/notes.txt` for a lexical normaliser. A ticket for the project's
+/// `notes.txt` and a `chat` token used to read the other file through the
+/// frozen `GET /file/content`, which hands the spelling to the kernel.
+#[cfg(unix)]
+#[tokio::test]
+async fn file_routes_judge_a_path_where_the_kernel_lands_it() {
+    let signer = Signer::new();
+    let f = fixture(&signer);
+    let chat = bearer(&signer.token(AUDIENCE, "chat"));
+    std::fs::create_dir_all(f.dirs.other.join("deep")).unwrap();
+    std::fs::write(f.dirs.other.join("notes.txt"), "theirs").unwrap();
+    std::os::unix::fs::symlink(f.dirs.other.join("deep"), f.dirs.repo.join("out")).unwrap();
+    std::os::unix::fs::symlink(f.dirs.other.join("deep"), f.dirs.repo.join("uploads/out")).unwrap();
+    let spelled = urlencode("out/../notes.txt");
+
+    // A file ticket for the project's notes.txt does not open the other.
+    let ticket = ticket_for(&f, &chat, "notes.txt").await;
+    let id = ticket["ticket"].as_str().unwrap();
+    for route in ["/file/content", "/file/raw"] {
+        let uri = format!("{route}?path={spelled}&{}&ticket={id}", dir(&f));
+        let response = call(&f.router, "GET", &uri, None, None).await;
+        let status = response.status();
+        let body = body_string(response).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}: {body}");
+        assert!(!body.contains("theirs"), "{uri}: {body}");
+    }
+    // The ticket still opens its own file under an honest `..`.
+    let honest = format!(
+        "/file/content?path={}&{}&ticket={id}",
+        urlencode("img/../notes.txt"),
+        dir(&f)
+    );
+    let response = call(&f.router, "GET", &honest, None, None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(body_string(response).await.contains("0123456789"));
+
+    // Nor does a `chat` token read, list or mint a ticket through it.
+    for (method, uri, body) in [
+        (
+            "GET",
+            format!("/file/content?path={spelled}&{}", dir(&f)),
+            None,
+        ),
+        ("GET", format!("/file/raw?path={spelled}&{}", dir(&f)), None),
+        (
+            "GET",
+            format!("/file?path={}&{}", urlencode("out/.."), dir(&f)),
+            None,
+        ),
+        (
+            "POST",
+            format!("/file/ticket?{}", dir(&f)),
+            Some(json!({ "path": "out/../notes.txt" })),
+        ),
+    ] {
+        let response = call(&f.router, method, &uri, Some(&chat), body).await;
+        let status = response.status();
+        let body = body_string(response).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}: {body}");
+        assert!(!body.contains("theirs"), "{method} {uri}: {body}");
+    }
+
+    // The upload area: `uploads/out/../x.txt` is beside where `out` leads,
+    // outside the project — not `uploads/x.txt`. And below a link, a
+    // directory that does not exist yet is where the link leads.
+    for path in ["uploads/out/../x.txt", "uploads/out/new/dir/x.txt"] {
+        let response = put(&f, Some(&chat), path, "", b"x").await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+    }
+    assert!(!f.dirs.repo.join("uploads/x.txt").exists());
+    assert!(!f.dirs.other.join("x.txt").exists());
+    assert!(!f.dirs.other.join("deep/new").exists());
+    // What cannot be resolved — a `..` after a directory that does not
+    // exist — is refused, not guessed.
+    let response = put(&f, Some(&chat), "uploads/nowhere/../x.txt", "", b"x").await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    // An honest spelling still uploads.
+    let response = put(&f, Some(&chat), "uploads/../uploads/./x.txt", "", b"x").await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+}
+
+/// An upload area whose parent is a symlink and which does not exist yet is
+/// where the link leads: inside the project it is an area, outside it is
+/// none.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_upload_area_behind_a_link_is_where_the_link_leads() {
+    let signer = Signer::new();
+    let f = fixture_uploading_into(&signer, Some(json!(["inbox/new", "away/new"])));
+    let chat = bearer(&signer.token(AUDIENCE, "chat"));
+    std::fs::create_dir_all(f.dirs.repo.join("real-inbox")).unwrap();
+    std::os::unix::fs::symlink(f.dirs.repo.join("real-inbox"), f.dirs.repo.join("inbox")).unwrap();
+    std::os::unix::fs::symlink(&f.dirs.other, f.dirs.repo.join("away")).unwrap();
+
+    let inside = put(&f, Some(&chat), "inbox/new/a.txt", "", b"x").await;
+    assert_eq!(inside.status(), StatusCode::CREATED);
+    assert!(f.dirs.repo.join("real-inbox/new/a.txt").is_file());
+    // The same place under its real name is the same area.
+    let real = put(&f, Some(&chat), "real-inbox/new/b.txt", "", b"x").await;
+    assert_eq!(real.status(), StatusCode::CREATED);
+    let outside = put(&f, Some(&chat), "away/new/a.txt", "", b"x").await;
+    assert_eq!(outside.status(), StatusCode::FORBIDDEN);
+    assert!(!f.dirs.other.join("new").exists());
+}
+
 /// The raw route with a bearer header: ranges, media types, and the same
 /// project boundary.
 #[tokio::test]
@@ -411,7 +519,12 @@ async fn uploads_write_files_into_the_upload_area() {
     assert_eq!(kept.status(), StatusCode::CONFLICT);
     assert_eq!(std::fs::read_to_string(&old).unwrap(), "new");
 
-    // `..` that stays inside the area is just a path.
+    // `..` that stays inside the area is just a path — once what it
+    // climbs out of exists: a `..` after a directory that is not there has
+    // no kernel reading, and is refused instead of folded away.
+    let unresolved = put(&f, Some(&chat), "uploads/a/b/../c.txt", "", b"ok").await;
+    assert_eq!(unresolved.status(), StatusCode::FORBIDDEN);
+    std::fs::create_dir_all(f.dirs.repo.join("uploads/a/b")).unwrap();
     let inside = put(&f, Some(&chat), "uploads/a/b/../c.txt", "", b"ok").await;
     assert_eq!(inside.status(), StatusCode::CREATED);
     assert!(f.dirs.repo.join("uploads/a/c.txt").exists());

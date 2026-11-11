@@ -12,8 +12,10 @@
 //! and the frozen `GET /file/content?path=` accepts a ticket too. Like the
 //! workflow routes they take `?directory=` (or `x-opencode-directory`).
 //!
-//! Every path is resolved against the project directory, with `..` and
-//! existing symlinks followed, and must land inside the project — the
+//! Every path is resolved against the project directory the way the kernel
+//! resolves it (`alforria_core::protect::resolve_path`: links read where
+//! they stand, `..` applied to where the path has got to), and must land
+//! inside the project; a path that cannot be resolved is refused — the
 //! boundary the tools draw with `external_directory`
 //! (`alforria_core::tool::external_directory`). A tool can ask the user to
 //! cross it; an HTTP request cannot, so here it is refused.
@@ -116,30 +118,71 @@ fn location(
 }
 
 /// Resolve a request's `path` to the file it denotes inside the project:
-/// relative paths are relative to the project directory, `..` and existing
-/// symlinks are followed, and the result must be inside the project.
+/// relative paths are relative to the project directory, the path is
+/// resolved as the kernel would resolve that spelling
+/// (`protect::resolve_path`), and the result must be inside the project.
+/// Everything after this acts on the resolved path, never on the spelling.
 pub(crate) fn project_file(location: &LocationContext, path: &str) -> Result<PathBuf, FileError> {
+    let joined = spelled(location, path)?;
+    // Unresolvable (a `..` after something that does not exist, a link
+    // loop): no telling where it leads, so it is not inside.
+    let resolved = crate::confine::resolve_for_access(&joined).map_err(|_| outside(path))?;
+    inside_project(location, path, resolved)
+}
+
+fn outside(path: &str) -> FileError {
+    forbidden(format!("{path} is outside the project directory"))
+}
+
+/// A request's `path` as the kernel would be handed it: absolute as given,
+/// otherwise below the project directory.
+fn spelled(location: &LocationContext, path: &str) -> Result<PathBuf, FileError> {
     if path.is_empty() {
         return Err(bad_request("path is required"));
     }
     if path.contains('\0') {
         return Err(bad_request("path is not a valid file name"));
     }
-    let joined = if Path::new(path).is_absolute() {
+    Ok(if Path::new(path).is_absolute() {
         PathBuf::from(path)
     } else {
         location.directory.join(path)
-    };
-    let resolved = crate::confine::resolve_for_access(&joined);
+    })
+}
+
+fn inside_project(
+    location: &LocationContext,
+    path: &str,
+    resolved: PathBuf,
+) -> Result<PathBuf, FileError> {
     if !crate::confine::project_roots(location)
         .iter()
-        .any(|root| resolved.starts_with(root))
+        .any(|root| alforria_core::protect::within(&resolved, root))
     {
-        return Err(forbidden(format!(
-            "{path} is outside the project directory"
-        )));
+        return Err(outside(path));
     }
     Ok(resolved)
+}
+
+/// Where an upload to `path` lands. As [`project_file`], with the one
+/// difference the write itself makes: the upload renames a temporary file
+/// over its target, and a rename replaces the last component, it does not
+/// follow it. So a last component that is a link to nothing — which a
+/// write by name would create a file through, wherever it points — lands
+/// where the link stands: the resolved parent plus the name. (A link to
+/// something that exists is judged where it leads, and the file it leads to
+/// is what gets replaced.)
+fn upload_target(location: &LocationContext, path: &str) -> Result<PathBuf, FileError> {
+    let joined = spelled(location, path)?;
+    let dangling = std::fs::symlink_metadata(&joined).is_ok_and(|meta| meta.is_symlink())
+        && std::fs::metadata(&joined).is_err();
+    match (dangling, joined.parent(), joined.file_name()) {
+        (true, Some(parent), Some(name)) => {
+            let parent = crate::confine::resolve_for_access(parent).map_err(|_| outside(path))?;
+            inside_project(location, path, parent.join(name))
+        }
+        _ => project_file(location, path),
+    }
 }
 
 fn required_path(uri: &Uri) -> Result<String, FileError> {
@@ -151,6 +194,9 @@ fn required_path(uri: &Uri) -> Result<String, FileError> {
 /// The scope a ticket for `file` in `location` carries.
 pub(crate) fn file_scope(location: &LocationContext, file: &Path) -> FileScope {
     FileScope {
+        // An identity, not a confinement decision: the same function gives
+        // the same key when the ticket is minted, when the auth layer
+        // matches it and here. The file is the resolved one.
         directory: crate::state::resolve_directory(&location.directory),
         file: file.to_path_buf(),
     }
@@ -414,11 +460,15 @@ fn restricted_upload_allowed(
     location: &LocationContext,
     target: &Path,
 ) -> Result<(), String> {
-    let project = crate::state::resolve_directory(&location.directory);
+    use alforria_core::protect::{resolve, resolve_path, within};
+    // Where the project is for the kernel, like the target (`project_file`).
+    let project = resolve(&location.directory);
     let inside_upload_area = ctx.policy.upload_directories.iter().any(|directory| {
-        let root = crate::confine::resolve_for_access(&project.join(directory));
-        // The area itself must be inside the project too.
-        root.starts_with(&project) && target.starts_with(&root)
+        // The area as the kernel reaches it: a configured `uploads/../x`
+        // or a link is where it leads. One that cannot be resolved holds
+        // nothing. The area itself must be inside the project too.
+        resolve_path(&project.join(directory))
+            .is_ok_and(|root| within(&root, &project) && within(target, &root))
     });
     if !inside_upload_area {
         return Err(format!(
@@ -477,7 +527,7 @@ async fn upload(
     }
     let location = location(&ctx, &directory)?;
     let path = required_path(&uri)?;
-    let target = project_file(&location, &path)?;
+    let target = upload_target(&location, &path)?;
     if target.is_dir() {
         return Err(bad_request(format!("{path} is a directory")));
     }
@@ -501,7 +551,7 @@ async fn upload(
     tokio::fs::create_dir_all(&parent).await.map_err(io)?;
     // Creating the directories may have followed a link that did not exist
     // a moment ago; judge the final location again before writing to it.
-    let target = project_file(&location, &target.display().to_string())?;
+    let target = upload_target(&location, &target.display().to_string())?;
     if crate::confine::restricted(&principal) {
         restricted_upload_allowed(&ctx, &location, &target).map_err(forbidden)?;
     }
@@ -546,8 +596,9 @@ async fn upload(
         json!({ "file": target.display().to_string() }),
         alforria_core::event::bus::PublishOptions::default(),
     );
+    // Display only: the path the response names, relative when it can be.
     let relative = target
-        .strip_prefix(crate::state::resolve_directory(&location.directory))
+        .strip_prefix(alforria_core::protect::resolve(&location.directory))
         .map(|relative| relative.display().to_string())
         .unwrap_or_else(|_| target.display().to_string());
     let mut response = Json(json!({

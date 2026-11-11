@@ -19,7 +19,6 @@ use serde_json::{json, Value};
 
 use crate::event::{EventBus, PublishOptions};
 use crate::owner::RoleLock;
-use crate::tool::external_directory::{contains_real, real_path};
 use crate::tool::permission::from_config;
 use crate::trigger::rules::CreatorBounds;
 use crate::trigger::store::{StoredSpec, StoredTrigger, TickClaim, TriggerState, TriggerStore};
@@ -1075,15 +1074,25 @@ impl TriggerService {
             Some(rest) => self.settings.home.join(rest),
             None => PathBuf::from(path),
         };
-        // Symlinks are resolved before the check, through the deepest
-        // existing ancestor when the path is not there yet: `project/link`
-        // is wherever `link` leads, not inside the project.
-        let resolved = real_path(&self.settings.directory.join(expanded));
-        if source == TriggerSource::Runtime && !contains_real(&self.settings.directory, &resolved) {
-            return Err(format!(
+        // Resolved as the kernel resolves the spelling
+        // (`protect::resolve_path`): `project/link` is wherever `link`
+        // leads, and `project/link/../x` is beside that, not `project/x`.
+        let spelled = self.settings.directory.join(expanded);
+        if source != TriggerSource::Runtime {
+            // The operator's own config: no boundary to keep, so a path
+            // that cannot be resolved yet keeps its spelling.
+            return Ok(crate::protect::resolve(&spelled));
+        }
+        let outside = || {
+            format!(
                 "watch path \"{path}\" is outside {}; only your own config may watch other places",
                 self.settings.directory.display()
-            ));
+            )
+        };
+        let resolved = crate::protect::resolve_path(&spelled).map_err(|_| outside())?;
+        let root = crate::protect::resolve(&self.settings.directory);
+        if !crate::protect::within(&resolved, &root) {
+            return Err(outside());
         }
         Ok(resolved)
     }

@@ -137,7 +137,13 @@ pre-1.0, so minor releases may include breaking changes.
   `GET /file/raw` (the file's bytes, with ranges, served sandboxed) and on
   `GET /file/content`; `PUT /file/content?path=` uploads a file into the
   project, up to `server.upload.max_bytes` (default 32 MiB). Paths are
-  confined to the project, symlinks and `..` included; a token below `admin`
+  confined to the project where the kernel would land them: symlinks are
+  followed where they stand and `..` is applied to where the path has got
+  to (`link/../x` is beside where `link` leads), and a path with no such
+  reading — a `..` after a directory that does not exist — is refused. The
+  directory allowlist, the upload area, file tickets, a `chat` token's reads
+  on the frozen `GET /file` and `GET /file/content`, prompt attachments and
+  stored watch paths all use that one resolver. A token below `admin`
   uploads only into `server.upload.directories` (default `uploads/`) and
   never to a config, instruction, agent, command, skill, workflow or git
   file.

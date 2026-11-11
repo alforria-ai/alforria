@@ -63,6 +63,18 @@
 //!    project-level loader files alone. Host locations — the data, state,
 //!    cache, global and managed config directories, the binary's
 //!    directory — are lifted by nothing.
+//!
+//! # The resolver is shared
+//!
+//! [`resolve_path`] is also what every other "is this path inside that
+//! place" decision asks: a restricted caller's attachments
+//! (`session::caller`), the server's project boundary, upload area, file
+//! tickets and directory allowlist, a stored trigger's watch path
+//! ([`contains`], [`within`]). A function that folds `..` out of a spelling
+//! before reading links (`git::lexical_normalize`, upstream's
+//! `FSUtil.resolve`, `tool::ripgrep::ts_resolve`) names things the way
+//! upstream does and may decide nothing about confinement on its own; where
+//! one survives next to a check, a comment at the site says why.
 use std::path::{Path, PathBuf};
 
 use crate::project_files::is_loader_path;
@@ -190,9 +202,18 @@ fn key(path: &Path) -> PathBuf {
     }
 }
 
-/// Whether `inner` is `outer` or below it (component-wise).
-fn within(inner: &Path, outer: &Path) -> bool {
+/// Whether `inner` is `outer` or below it (component-wise). Both are
+/// expected resolved ([`resolve_path`]): this compares, it does not look.
+pub fn within(inner: &Path, outer: &Path) -> bool {
     key(inner).starts_with(key(outer))
+}
+
+/// Whether `child`, as the kernel would resolve that spelling, is `parent`
+/// or below it. `parent` is the trusted side (a project directory) and is
+/// resolved with [`resolve`]; a `child` that cannot be resolved is not
+/// inside anything.
+pub fn contains(parent: &Path, child: &Path) -> bool {
+    resolve_path(child).is_ok_and(|child| within(&child, &resolve(parent)))
 }
 
 /// Whether a grant can lift the protection.

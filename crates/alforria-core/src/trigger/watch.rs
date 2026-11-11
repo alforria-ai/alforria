@@ -18,6 +18,9 @@ impl WatchIgnore {
             roots: roots
                 .into_iter()
                 .filter(|root| !root.as_os_str().is_empty())
+                // Not a confinement: which change events are dropped as
+                // the server's own (its data directory). `canonicalize`
+                // because the watcher reports canonical paths.
                 .map(|root| root.canonicalize().unwrap_or(root))
                 .collect(),
         }
@@ -74,7 +77,7 @@ pub fn watch(
     // Checked here, on the path actually handed to the watcher, and not only
     // when the trigger was saved: the path may have become a symlink since.
     if let Some(within) = within {
-        if !crate::tool::external_directory::contains_real(within, &root) {
+        if !crate::protect::contains(within, &root) {
             return Err(format!(
                 "{} leads outside {} and cannot be watched",
                 path.display(),

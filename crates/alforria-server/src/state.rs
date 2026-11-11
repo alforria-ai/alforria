@@ -399,6 +399,17 @@ impl InstanceStore {
 /// `FSUtil.resolve` (`core/src/fs-util.ts:247-258`): `path.resolve` against
 /// the process cwd, then realpath normalization; a directory that does not
 /// exist keeps its lexically normalized form.
+///
+/// This names an instance — the cache key, the directory in events, what a
+/// handler acts in — exactly as upstream does, and every caller without a
+/// confined credential depends on that (a directory that does not exist
+/// yet opens under its spelling). It is *not* a statement of where the
+/// kernel lands a spelling: `..` is folded before links are read, and a
+/// path that does not canonicalise keeps the links in it. No confinement
+/// decision may rest on it alone; the directory allowlist
+/// (`policy::DirectoryAllowlist::allows`) and the project boundary
+/// (`confine::project_roots`) resolve its answer with
+/// `alforria_core::protect::resolve_path`.
 pub fn resolve_directory(p: &Path) -> PathBuf {
     let resolved = if p.is_absolute() {
         lexical_normalize(p)

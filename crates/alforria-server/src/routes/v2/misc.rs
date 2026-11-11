@@ -731,6 +731,12 @@ fn parse_markdown(content: &str) -> Option<(serde_json::Map<String, Value>, Stri
 // ---------------------------------------------------------------------------
 
 /// `FSUtil.contains` — a lexical child check.
+///
+/// Upstream's check for the frozen `/api/fs/*` routes, kept as it is: they
+/// are `admin`-only (`middleware::scope`), so no confined credential
+/// reaches them, and the operator's clients get upstream's behaviour. It
+/// is applied to the spelling and again to the `canonicalize`d path, which
+/// is the kernel's own answer for a path that exists.
 fn contains(root: &Path, target: &Path) -> bool {
     target.starts_with(root)
 }

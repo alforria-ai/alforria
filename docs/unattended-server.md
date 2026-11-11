@@ -676,7 +676,7 @@ outer scope, then act.
 | `POST /permission/{id}/reply`, `…/permissions/{id}` | `reply` / `response` | the answer to an ask | route: `always` refused; the ask must belong to a restricted session in an allowed project |
 | | `message` | feedback text for the model | not restricted |
 | `POST /question/{id}/reply`, `/reject` | `answers` | the answer | the question must belong to a restricted session in an allowed project |
-| `GET /file`, `/file/content`, `/file/raw`, `POST /file/ticket` | `path` | a file or directory read | route: inside the project, resolved |
+| `GET /file`, `/file/content`, `/file/raw`, `POST /file/ticket` | `path` | a file or directory read | route: inside the project, resolved as the kernel resolves the spelling (`protect::resolve_path`); the read is made on the resolved path |
 | `PUT /file/content` | `path` | a file write | route: inside the upload area, not a loader name |
 | `GET /find*`, `/vcs*` | `query`, `pattern`, `mode`, … | a search or diff of the project | no caller-chosen path |
 
@@ -890,8 +890,15 @@ as its own does not exist for it.
 
   Besides, a directory spelled under *any* of the three spellings must be
   allowed, also where the route does not read that spelling: an allowed
-  directory under one never covers for another. Symlinks and `..` are
-  resolved first. A directory *below* a listed one is not allowed: opened
+  directory under one never covers for another. A directory is judged
+  where the kernel would land it: symlinks are followed where they stand,
+  `..` is applied to where the path has got to, and a listed directory that
+  does not exist yet behind a symlinked parent is where the link leads (the
+  list is resolved when the server starts; a link repointed afterwards does
+  not carry its entry along). Upstream's own reading, which a handler still
+  uses to name the instance, folds `..` out of the spelling first; a
+  spelling the two readings disagree about (`allowed/link/..`), or that
+  cannot be resolved, is refused. A directory *below* a listed one is not allowed: opened
   as a project of its own it would load config from inside the project.
   Selecting a workspace is refused. When bearer authentication is
   configured and the server's working directory is not in
@@ -1176,8 +1183,11 @@ plus one addition to a frozen route. All take `?directory=` (or the
 `chat` scope.
 
 Every `path` is relative to the project directory (an absolute path is
-accepted when it is inside). `..` and existing symlinks are resolved first,
-and the result must be inside the project directory or its git worktree —
+accepted when it is inside). It is resolved the way the kernel resolves it
+— symlinks followed where they stand, `..` applied to where the path has
+got to, so `link/../x` is beside where `link` leads and not `x`; a path with
+no such reading (a `..` after a directory that does not exist, a link loop)
+is refused — and the result must be inside the project directory or its git worktree —
 the boundary the tools draw with `external_directory`. A tool can ask the
 user to cross it; an HTTP request cannot, so it gets `403`, whoever sends
 it.
