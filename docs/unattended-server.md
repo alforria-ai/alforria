@@ -24,9 +24,20 @@ Unlike the per-project config, a host config file that does not parse is an
 error: `alforria serve` and `alforria web` refuse to listen rather than run
 with a policy other than the one written down.
 
-alforria's own tables (`session_restriction`, `outbox`) are created by its
-own migrations (`crates/alforria-core/src/storage/alforria_migration.rs`),
-beside the upstream schema and journal, which stay byte-compatible.
+Which key is read from where is one table for every alforria key,
+`EXTENSION_KEYS` in `crates/alforria-core/src/config/precedence.rs`; the
+whole of it is in [assistant.md](assistant.md#which-config-may-set-what).
+The loader applies it to each file as it is merged, so a host key written in
+a project file, a remote config or one of the `OPENCODE_CONFIG*` environment
+sources is dropped with a warning naming the file. Besides the keys on this
+page, `server.resume` and `storage` (retention, `synchronous`) are host keys:
+they decide what a restart does in every project and how durable the shared
+database is.
+
+alforria's own tables (`session_restriction`, `outbox`, and the trigger and
+memory tables) are created by one set of migrations
+(`crates/alforria-core/src/storage/alforria_migration.rs`), beside the
+upstream schema and journal, which stay byte-compatible.
 
 Durations are strings with a unit (`"500ms"`, `"30s"`, `"5m"`, `"2h"`,
 `"1d"`) or a bare number of milliseconds.
@@ -67,6 +78,14 @@ longer than `timeout` (systemd `TimeoutStopSec=`, s6 `timeout-kill`).
 A hard kill (`SIGKILL`, power loss) is safe for the database: SQLite replays
 the write-ahead log on the next start. What a hard kill cannot do is stop the
 tool processes or record the interrupted turn.
+
+On the way down the trigger schedulers stop first — nothing fires any more,
+by the clock, a watch, a webhook call or a request — and the transcript
+indexers end. A trigger's turn that is already running is settled with the
+others, aborted or drained as `sessions` says, and its run is recorded as
+failed ("the turn was stopped before it finished") or completed. A turn
+that ended inside the process leaves no restart marker, so the next start
+repairs and resumes nothing on its account.
 
 ## What the agent's shell can see: `shell_env` (host)
 
@@ -188,15 +207,17 @@ and requests without a token get `401` with `WWW-Authenticate: Bearer`.
 
 ### Scopes
 
-Each scope includes the ones above it in this table. **A route that is not
-listed needs `admin`**, so a route added later — a whole new family included
+`chat`, `connector` and `admin` each include the ones above them in this
+table. `hook` stands apart: it opens one route, and `chat` does not include
+it. **A route that is not listed needs `admin`**, so a route added later — a whole new family included
 — is closed to narrower tokens until it is listed
 (`crates/alforria-server/src/middleware/scope.rs`).
 
 | Scope | For | Routes |
 | --- | --- | --- |
-| `chat` | A person talking to the agent from a browser or a phone | `GET /global/health`, `GET /event`, `GET /attention`; sessions: `GET`/`POST /session`, `GET /session/status`, `GET`/`PATCH`/`DELETE /session/{id}`, `…/children`, `…/todo`, `…/diff`, `…/goal`, `GET`/`POST …/message`, `GET …/message/{id}`, `…/prompt_async`, `…/command`, `…/abort`, `…/fork`, `…/init`, `…/summarize`, `…/revert`, `…/unrevert`, `…/permissions/{id}`; replies: `GET /permission`, `POST /permission/{id}/reply`, `GET /question`, `POST /question/{id}/reply`, `…/reject`; files in the project: `GET /file`, `/file/content`, `/file/status`, `/find`, `/find/file`, `/find/symbol`, `POST /file/ticket`, `GET /file/raw`, `PUT /file/content`; and what a client draws itself with: `GET /agent`, `/command`, `/skill`, `/path`, `/project/current`, `/vcs`, `/vcs/status`, `/vcs/diff` |
-| `connector` | A trusted sidecar on the same machine (a messaging bridge, a scheduler) | everything in `chat`, plus `GET /global/event` (every directory's events on one stream), `POST /log`, status reads (`GET /mcp`, `/lsp`, `/formatter`, `/experimental/tool`, `/experimental/tool/ids`, `/experimental/resource`, `/project`, `/project/{id}/directories`), and watching and stopping workflow runs (`GET /workflow`, `GET /workflow/run`, `GET /workflow/run/{id}`, `POST …/wait`, `POST …/abort`) |
+| `hook` | Whatever calls a webhook trigger from outside | `POST /trigger/{id}/hook` and nothing else — not even `GET /global/health`. `connector` and `admin` may call it too; `chat` may not. A credential has one role: `hook` beside `chat` in a token is `chat`. |
+| `chat` | A person talking to the agent from a browser or a phone | `GET /global/health`, `GET /event`, `GET /attention`; sessions: `GET`/`POST /session`, `GET /session/status`, `GET`/`PATCH`/`DELETE /session/{id}`, `…/children`, `…/todo`, `…/diff`, `…/goal`, `GET`/`POST …/message`, `GET …/message/{id}`, `…/prompt_async`, `…/command`, `…/abort`, `…/fork`, `…/init`, `…/summarize`, `…/revert`, `…/unrevert`, `…/permissions/{id}`; replies: `GET /permission`, `POST /permission/{id}/reply`, `GET /question`, `POST /question/{id}/reply`, `…/reject`; files in the project: `GET /file`, `/file/content`, `/file/status`, `/find`, `/find/file`, `/find/symbol`, `POST /file/ticket`, `GET /file/raw`, `PUT /file/content`; what a client draws itself with: `GET /agent`, `/command`, `/skill`, `/path`, `/project/current`, `/vcs`, `/vcs/status`, `/vcs/diff`; its own schedules: `GET`/`POST /trigger`, `GET`/`PATCH`/`DELETE /trigger/{id}`, `POST /trigger/{id}/run`, `GET /trigger/{id}/runs`; memory: `GET`/`POST /memory`, `GET /memory/search`, `GET /memory/session`, `GET`/`PATCH`/`DELETE /memory/{id}`; and the durable replay of one session's events, `GET /api/session/{id}/event` (the one `/api` route below `admin`) |
+| `connector` | A trusted sidecar on the same machine (a messaging bridge, an MCP host) | everything in `chat`, the webhook entry `POST /trigger/{id}/hook`, plus `GET /global/event` (every directory's events on one stream), `POST /log`, status reads (`GET /mcp`, `/lsp`, `/formatter`, `/experimental/tool`, `/experimental/tool/ids`, `/experimental/resource`, `/project`, `/project/{id}/directories`), and watching and stopping workflow runs (`GET /workflow`, `GET /workflow/run`, `GET /workflow/run/{id}`, `POST …/wait`, `POST …/abort`) |
 | `admin` | The control plane, the operator | everything: config, provider credentials (`/auth`, `/provider`, `/config/providers`), MCP management and OAuth, terminals (`/pty`), the session `shell` command, saving and starting workflows, `/tui/*`, message and part edits and deletes, `/instance/dispose`, the `/global` routes, sync, sharing, `/experimental/*`, the v2 `/api` surface, the web UI |
 
 ### Threat model: what each scope can cause
@@ -446,6 +467,43 @@ which of the three it is, or it does not compile.
 - The host config (`server.*`, `shell_env`, `hook.*`) is never read from the
   project, whatever the agent writes there.
 
+### Turns nobody requests, and callers that are not people
+
+Triggers, restart recovery and memory (see [assistant.md](assistant.md)) add
+turns that no request stands behind, and one caller that is not a person at
+all. Each has a defined caller; none runs with more than the stricter of who
+set it up and the session it lands in.
+
+| Source | Runs as | Bound by |
+| --- | --- | --- |
+| A trigger the operator wrote (config, an `admin` request, the `schedule` tool in an unrestricted session) | `Caller::Session` | The session it lands in: unrestricted in a session of its own, restricted if it names a restricted session. |
+| A trigger a restricted caller created (a `chat`/`connector` request, or the `schedule` tool in a restricted session) | `Caller::Restricted` — that caller's request, replayed | Recorded on the trigger when it is created and never changed. Its runs happen in restricted sessions only: the sessions it creates are created restricted, a session it names must be this directory's and restricted, and the engine refuses the turn if the session's restriction has been lifted since. Its prompt is text: `@file` and `@agent` mentions are resolved only in a prompt the operator wrote. |
+| A webhook call (`POST /trigger/{id}/hook`, any credential) | The trigger's caller, above | What it delivers is outside text: the run's session carries the untrusted-input mark and read-only rules, whoever called. The `hook` scope reaches this route and no other. |
+| A restart follow-up (`server.resume: notify` / `continue`) | `Caller::Session` | The interrupted session's own restriction and rules. A trigger's interrupted turn is resumed like any other, once; its run is closed as interrupted and its tick is not fired again. |
+| The memory flush before a compaction | No turn: one model request with one tool | The session's own `memory` permission (an `ask` is a refusal), its untrusted-input mark and its restriction, all recorded on what it writes. |
+| A `/goal` round, a subagent's run, a subagent's result, an auto-resume | `Caller::Session` | The session, as before. |
+
+Two marks can sit on a session, and they are independent:
+
+- **restricted** — who may drive it (this page; the `session_restriction`
+  table);
+- **untrusted input** — its context holds text from outside
+  (`metadata.untrustedInput`, [assistant.md](assistant.md)).
+
+Both are inherited by children and forks at any depth, neither is cleared
+below `admin` (lifting a restriction is `DELETE /session/{id}/restriction`;
+the untrusted mark is never removed), and a turn may do only what both
+allow. For a session that carries untrusted input the rules it was given
+are a ceiling nothing widens: the project's standing `always` approvals do
+not apply to it, an `ask` is a deny at once, and `permission.unattended`
+never answers for it — `on_timeout: "allow"` included. A fork of such a
+session keeps its rules along with its text.
+
+A lookup that fails never reads as the permissive answer: a session that
+cannot be read counts as carrying untrusted input, a restriction that cannot
+be read is an error or counts as one, and a session a trigger cannot verify
+as its own does not exist for it.
+
 ### What a token narrower than `admin` is confined to
 
 - **Directories.** The directory a request resolves to must be exactly one
@@ -457,6 +515,23 @@ which of the three it is, or it does not compile.
   project. Selecting a workspace is refused.
 - **Files.** Reads and listings stay inside the project; uploads go to the
   upload area (see "Files for a browser").
+- **Schedules.** It sets what the `schedule` tool can set: never a trigger's
+  `permission`, `agent` or `model`. It changes, fires and deletes only
+  triggers a restricted caller created; the config's and the operator's it
+  can read. A session it names must be this directory's and restricted; at
+  most 50 triggers exist that an agent or a restricted caller made.
+- **Memory.** A write needs the default agent's `memory` permission for the
+  action to be `allow` (an `ask` is a refusal: nobody can be asked for an
+  HTTP call), and `GET /memory/session` needs `session_search`. What it
+  writes is a client's record: shown to restricted sessions, never injected
+  into the operator's, and its rewrite never verifies a record. Memory is
+  kept per project, and every directory that is not a git repository
+  belongs to the one `global` project: a token confined to such a directory
+  shares memory with the others. Give the directory a repository of its own
+  to keep its memory apart.
+- **Event replay.** `GET /api/session/{id}/event` answers for sessions in an
+  allowed directory, the operator's included (as `GET
+  /session/{id}/message` does).
 
 Basic auth, `admin` tokens and a server with no authentication are not
 confined.
@@ -511,6 +586,15 @@ The usual events are published, with one added property so a client can tell
 nobody answered: `permission.replied` carries `"automatic": true` (with
 `reply: "reject"` or `"once"`), and `question.rejected` carries
 `"automatic": true`. A person's reply is unchanged, byte for byte.
+
+**Scheduled turns.** A trigger's run has nobody attached, so its asks and
+questions follow these two policies and nothing else. With the default,
+`wait`, a run that asks waits until someone answers (`GET /attention` lists
+it, a webhook on `permission.asked` announces it), and its trigger skips
+every tick until then: set a `timeout` on a server that runs triggers. A run
+that carries outside text (a webhook or watch trigger) never gets as far as
+the policy: for it an `ask` is a deny at once, so `on_timeout: "allow"`
+cannot answer for text that came from outside.
 
 ### `GET /attention`
 
@@ -609,9 +693,30 @@ key and can forge nothing.
 ```
 
 `properties` holds only identifiers (`id`, `…ID`), short labels
-(`permission`, `kind`, `name`, `status`, `reason`, `trigger`), numbers and
-booleans from the event, and for `session.error` the error's name. Message
-text, tool input and output, patterns and metadata never leave the machine.
+(`permission`, `kind`, `name`, `status`, `reason`, `trigger`, `report`,
+`action`), numbers and booleans from the event, and for `session.error` the
+error's name. Message text, tool input and output, patterns and metadata
+never leave the machine.
+
+Every event can be selected by name or pattern, the assistant features'
+included: `trigger.fired`, `trigger.completed`, `trigger.failed`,
+`trigger.skipped` (`"trigger.*"`), `session.interrupted`,
+`session.media.omitted` and `memory.updated`. A `permission.asked` raised
+inside a trigger's run is delivered like any other, which is how someone
+finds out a scheduled turn is waiting. `trigger.completed` carries the
+trigger, run and session ids, `duration`, `quiet` and `report`; a
+`trigger.failed` carries no error text. The one piece of content a delivery
+can carry is a run's final answer, and only when the hook asks for it by
+name:
+
+```jsonc
+{ "name": "bridge", "url": "…", "secret": "…",
+  "events": ["trigger.completed"], "trigger_text": true }
+```
+
+adds `properties.text` (cut to 16 KiB) to `trigger.completed` when the run's
+`report` is `"final"`. Without it the receiver reads the answer from
+`GET /trigger/{id}/runs` with a token.
 To act on a `permission.asked`, call `GET /attention` or `GET /permission`
 with a token.
 

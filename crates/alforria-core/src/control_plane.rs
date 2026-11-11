@@ -181,7 +181,10 @@ pub fn capture_changes(
 /// `Git.change.apply` (`git.ts:790-814`) — `git apply -` with the patch on
 /// stdin.
 pub fn apply_changes(path: &Path, changes: &str) -> Result<(), String> {
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    // See `git::SubprocessGit::run`.
+    crate::shell_env::apply_scrubbed(&mut command);
+    let output = command
         .args(["apply", "-"])
         .current_dir(path)
         .stdin(Stdio::piped())

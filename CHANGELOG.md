@@ -184,6 +184,26 @@ pre-1.0, so minor releases may include breaking changes.
   instead of silently missing them. Without retention it never appears.
 - The server folds the write-ahead log back into the database every five
   minutes, so the `-wal` file no longer sits at its high-water mark.
+- Scoped tokens reach the assistant features. A `chat` or `connector` token
+  manages its own schedules (`/trigger*`) under the `schedule` tool's rules —
+  it never sets a trigger's `permission`, `agent` or `model`, names only
+  sessions it may act in, and changes or fires only triggers a restricted
+  caller created — reads and writes memory (`/memory*`) under the `memory`
+  permission, and may replay a session's durable events
+  (`GET /api/session/{id}/event`). A new `hook` scope opens
+  `POST /trigger/{id}/hook` and nothing else, for whatever calls a webhook
+  from outside; `connector` and `admin` include it, `chat` does not.
+- A trigger records whether a restricted caller created it (`restricted` on
+  the record). Its runs happen in restricted sessions only, and every
+  engine-started turn has a defined caller: see "Turns nobody requests" in
+  `docs/unattended-server.md`.
+- `hook.webhook[].trigger_text: true` adds a trigger run's final answer to
+  its `trigger.completed` delivery. Without it a delivery carries ids only,
+  as before; the trigger, restart, media and memory events are all
+  selectable by name or pattern.
+- One table (`EXTENSION_KEYS`) says which config may set each alforria key:
+  host, user or project. See "Which config may set what" in
+  `docs/assistant.md`.
 
 ### Fixed
 
@@ -298,6 +318,31 @@ pre-1.0, so minor releases may include breaking changes.
 
 ### Changed
 
+- `server.resume` and `storage` (`retention`, `synchronous`) are read from
+  the host config only (the global config directory, `~/.opencode`, the
+  managed directory), like `server.auth` and `shell_env`. A host key written
+  in a project file, a remote config or an `OPENCODE_CONFIG*` source is
+  dropped with a warning naming the file.
+- A session that carries outside text (a webhook or watch run, its children
+  and forks) is held to its own rules: the project's standing `always`
+  approvals do not apply to it, an `ask` there is a deny at once, and
+  `permission.unattended` never answers for it. A fork of such a session
+  keeps its rules.
+- `@file` and `@agent` mentions in a trigger's prompt are resolved only when
+  the operator wrote the trigger (the config or an `admin` request). In a
+  trigger a model scheduled they are text.
+- A session a trigger names must belong to the trigger's own directory.
+- A trigger run whose turn is stopped is recorded as failed instead of
+  completed with a partial answer; a run the server died in is closed with
+  an `interrupted` error.
+- A memory record written by a `chat` or `connector` token, or by a session
+  one of them created, is injected into restricted sessions only.
+- `git` run by the server (status, diff, snapshots) no longer inherits the
+  server's secrets: a repository's own filters and hooks see the scrubbed
+  environment.
+- On SIGTERM the trigger schedulers stop firing and the transcript indexers
+  end before the running turns are settled, and a turn that ended inside the
+  process leaves no restart marker.
 - The agent's shells no longer inherit the server's secrets. The `bash` tool,
   the session `shell` command, command-template `` !`cmd` `` substitutions,
   terminals, worktree start scripts, MCP stdio servers and language servers

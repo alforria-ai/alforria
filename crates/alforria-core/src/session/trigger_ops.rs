@@ -282,10 +282,21 @@ impl TriggerOps for ProductionTriggerOps {
                     Caller::Session
                 },
             };
+            let cancels = facade.cancel_count(&session_id);
             let result = facade
                 .prompt(input)
                 .await
                 .map_err(|error| fail(Some(&session_id), error.to_string()))?;
+            // A cancelled turn hands back what it had so far, before its
+            // abort is recorded on the message: a stop (a person's, or the
+            // server shutting down) must not read as a finished run whose
+            // half answer is then reported.
+            if facade.cancel_count(&session_id) != cancels {
+                return Err(fail(
+                    Some(&session_id),
+                    "the turn was stopped before it finished".to_string(),
+                ));
+            }
             if let V1Message::Assistant {
                 error: Some(error), ..
             } = &result.info
@@ -610,6 +621,44 @@ mod tests {
             .unwrap();
         assert_eq!(ops.target(&elsewhere.id), SessionTarget::Missing);
         assert_eq!(ops.target("ses_no_such"), SessionTarget::Missing);
+
+        // A restriction that cannot be read is not one a restricted
+        // trigger can rely on: with the lookup failing, the session that
+        // was fine a moment ago is refused, and nothing is written to it.
+        let before = count(&moved.session_id);
+        e.services.storage.with_connection(|conn| {
+            conn.execute_batch("ALTER TABLE session_restriction RENAME TO restriction_gone;")
+                .unwrap()
+        });
+        assert!(sessions.is_restricted(&moved.session_id).is_err());
+        assert_eq!(
+            ops.target(&moved.session_id),
+            SessionTarget::Found { restricted: false }
+        );
+        let failure = ops
+            .run_turn(&restricted_turn(SessionMode::Existing(
+                moved.session_id.clone(),
+            )))
+            .await
+            .unwrap_err();
+        assert!(
+            failure.message.contains("restricted"),
+            "{}",
+            failure.message
+        );
+        // An operator's trigger does not get through on a failed lookup
+        // either: the engine cannot tell what binds the turn, and stops.
+        assert!(ops
+            .run_turn(&turn(SessionMode::Existing(moved.session_id.clone())))
+            .await
+            .is_err());
+        assert_eq!(count(&moved.session_id), before);
+        // With the session table unreadable too, no session is anyone's.
+        e.services.storage.with_connection(|conn| {
+            conn.execute_batch("ALTER TABLE session RENAME TO session_gone;")
+                .unwrap()
+        });
+        assert_eq!(ops.target(&moved.session_id), SessionTarget::Missing);
         let failure = ops
             .run_turn(&turn(SessionMode::Existing(elsewhere.id.clone())))
             .await

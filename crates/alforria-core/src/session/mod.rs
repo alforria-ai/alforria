@@ -171,12 +171,15 @@ impl SessionServices {
         permission.set_untrusted_lookup(Some({
             let sessions = sessions.clone();
             Arc::new(move |session_id: &str| {
-                // Unlike `trigger::session_untrusted`, a session that is
-                // not stored is not presumed marked here: asks are raised
-                // for ids that are no session's (a workflow run's).
-                sessions
-                    .get(session_id)
-                    .is_ok_and(|session| crate::session::store::carries_untrusted_input(&session))
+                // Fail closed: a session that cannot be read — the lookup
+                // failed, or the row is gone — counts as carrying outside
+                // text, so its asks are denied rather than asked or
+                // answered by the unattended policy. Every ask is raised
+                // under the session of the turn that raised it (the tool
+                // context's and the processor's: `SessionAsk`,
+                // `AskPermission`), so an id that does not resolve is never
+                // the ordinary case.
+                crate::trigger::session_untrusted(&sessions, session_id)
             })
         }));
         let question = Arc::new(QuestionService::new(events.clone()));

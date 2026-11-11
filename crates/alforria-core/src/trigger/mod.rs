@@ -530,9 +530,11 @@ pub struct Creator {
 
 /// The session-engine seam behind the scheduler.
 pub trait TriggerOps: Send + Sync {
-    /// The session a trigger wants to run in (`session: "ses_…"`).
+    /// The session a trigger wants to run in (`session: "ses_…"`). An
+    /// engine that cannot tell says there is none: a trigger is not
+    /// pointed at a session nobody vouched for.
     fn target(&self, _session_id: &str) -> SessionTarget {
-        SessionTarget::Found { restricted: false }
+        SessionTarget::Missing
     }
 
     /// Run one turn to completion and return its final answer.

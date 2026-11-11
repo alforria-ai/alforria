@@ -174,6 +174,8 @@ impl SnapshotRunner for SubprocessSnapshotRunner {
         stdin: Option<&str>,
     ) -> SnapshotOutput {
         let mut command = Command::new("git");
+        // See `git::SubprocessGit::run`.
+        crate::shell_env::apply_scrubbed(&mut command);
         command
             .args(args)
             .stdout(Stdio::piped())

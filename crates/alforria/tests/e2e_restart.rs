@@ -552,3 +552,177 @@ fn a_resumed_turn_that_is_killed_again_is_not_resumed_twice() {
     assert_eq!(restart_parts(&messages, "note").len(), 1);
     assert_eq!(world.turns(), 2);
 }
+
+impl World {
+    fn post_json(&self, serve: &Serve, path: &str, body: Value) -> (reqwest::StatusCode, Value) {
+        self.runtime.block_on(async {
+            let response = self
+                .client
+                .post(format!("http://127.0.0.1:{}{path}", serve.port))
+                .query(&[("directory", self.directory.as_str())])
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            (status, response.json().await.unwrap_or(Value::Null))
+        })
+    }
+
+    /// The sessions a trigger started.
+    fn trigger_sessions(&self, serve: &Serve, trigger: &str) -> Vec<String> {
+        self.get(serve, "/session")
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|session| session["metadata"]["triggerID"] == trigger)
+            .filter_map(|session| session["id"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    /// Schedule a one-shot trigger two seconds from now and wait for the
+    /// turn it starts to be streaming. Returns the turn's session.
+    fn start_trigger_turn(&self, serve: &Serve, id: &str) -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let (status, created) = self.post_json(
+            serve,
+            "/trigger",
+            json!({
+                "id": id,
+                "on": { "at": alforria_core::trigger::format_instant(now + 2_000) },
+                "prompt": "do the scheduled job",
+                "model": "mock/mock-model",
+                "catch_up": true,
+            }),
+        );
+        assert!(status.is_success(), "{status}: {created}");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let session = loop {
+            if let Some(session) = self.trigger_sessions(serve, id).into_iter().next() {
+                break session;
+            }
+            assert!(Instant::now() < deadline, "the trigger never fired");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        self.wait_for(serve, &session, "streamed text", streaming);
+        session
+    }
+
+    fn runs(&self, serve: &Serve, id: &str) -> Vec<Value> {
+        self.get(serve, &format!("/trigger/{id}/runs"))
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+/// A turn a trigger started is killed with the server, under `continue`
+/// and `catch_up`. It is repaired like any other turn and resumed once; its
+/// run is closed as interrupted instead of staying "running"; and the
+/// scheduler does not fire the same tick again beside the resumed turn.
+#[test]
+fn a_trigger_run_killed_mid_turn_is_closed_resumed_once_and_not_refired() {
+    let world = World::new(
+        "restart-trigger",
+        First::HangMidStream,
+        Later::Answer,
+        Some("continue"),
+    );
+    let serve = Serve::spawn(&world.env);
+    let session = world.start_trigger_turn(&serve, "job");
+    assert!(
+        world.marker(&session).exists(),
+        "a trigger's turn is marked"
+    );
+    let before = world.runs(&serve, "job");
+    assert_eq!(before.len(), 1, "{before:?}");
+    assert_eq!(before[0]["status"], "running");
+    drop(serve); // SIGKILL
+
+    let serve = Serve::spawn(&world.env);
+    let runs = world.runs(&serve, "job");
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    assert_eq!(runs[0]["status"], "failed", "{runs:?}");
+    assert!(
+        runs[0]["error"]
+            .as_str()
+            .is_some_and(|error| error.starts_with("interrupted")),
+        "{runs:?}"
+    );
+    assert!(runs[0]["time"]["ended"].is_u64(), "{runs:?}");
+
+    // Resumed in the same session, once.
+    let messages = world.wait_for(&serve, &session, "the resumed answer", |messages| {
+        parts(messages, "text")
+            .iter()
+            .any(|part| part["text"] == "recovered")
+    });
+    assert_eq!(restart_parts(&messages, "resume").len(), 1);
+
+    // Nothing fires the tick a second time: not the scheduler catching up,
+    // not another resume. Give both the time they would need.
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(world.turns(), 2, "the interrupted turn and its one resume");
+    assert_eq!(world.runs(&serve, "job").len(), 1);
+    assert_eq!(world.trigger_sessions(&serve, "job"), vec![session.clone()]);
+    let trigger = world.get(&serve, "/trigger/job");
+    assert_eq!(trigger["running"], false, "{trigger}");
+    assert!(trigger["time"].get("next").is_none(), "{trigger}");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while world.marker(&session).exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the resumed turn left its marker"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// SIGTERM with a trigger's turn running. The scheduler stops, the turn is
+/// aborted with the others, the server exits 0 — and because the turn ended
+/// inside the process, it leaves no marker: the next start finds nothing
+/// to repair and resumes nothing, whatever `server.resume` says.
+#[test]
+fn a_trigger_turn_stopped_by_sigterm_leaves_no_marker_and_is_not_resumed() {
+    let world = World::new(
+        "shutdown-trigger",
+        First::HangMidStream,
+        Later::Answer,
+        Some("continue"),
+    );
+    let mut serve = Serve::spawn(&world.env);
+    let session = world.start_trigger_turn(&serve, "job");
+    assert!(world.marker(&session).exists());
+    serve.signal(libc::SIGTERM);
+    let status = serve
+        .wait_exit(Duration::from_secs(20))
+        .expect("serve exits after SIGTERM");
+    assert_eq!(status.code(), Some(0), "{status:?}");
+    assert!(
+        !world.marker(&session).exists(),
+        "a turn that ended cleanly left its marker"
+    );
+    let running = world.env.home.join(".local/share/alforria/running");
+    let left: Vec<_> = std::fs::read_dir(&running)
+        .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
+        .unwrap_or_default();
+    assert!(left.is_empty(), "{left:?}");
+    drop(serve);
+
+    let serve = Serve::spawn(&world.env);
+    let runs = world.runs(&serve, "job");
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    assert_eq!(runs[0]["status"], "failed", "{runs:?}");
+    std::thread::sleep(Duration::from_secs(2));
+    let messages = world.messages(&serve, &session);
+    assert!(
+        restart_parts(&messages, "resume").is_empty(),
+        "{messages:?}"
+    );
+    assert!(restart_parts(&messages, "note").is_empty(), "{messages:?}");
+    assert_eq!(world.turns(), 1, "nothing was resumed or refired");
+    assert_eq!(world.runs(&serve, "job").len(), 1);
+}

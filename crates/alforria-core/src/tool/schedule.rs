@@ -559,6 +559,11 @@ mod tests {
     struct NoTurns;
 
     impl TriggerOps for NoTurns {
+        // The test's sessions are the caller's own.
+        fn target(&self, _session_id: &str) -> crate::trigger::SessionTarget {
+            crate::trigger::SessionTarget::Found { restricted: false }
+        }
+
         fn run_turn<'a>(
             &'a self,
             _turn: &'a TriggerTurn,
@@ -1059,5 +1064,27 @@ mod tests {
                 None,
             )
             .unwrap();
+    }
+
+    /// A session whose restriction cannot be read schedules as a
+    /// restricted one: the trigger it makes is bound, not free.
+    #[test]
+    fn an_unreadable_restriction_counts_as_one_when_scheduling() {
+        let h = crate::session::test_support::harness("schedule-fail-closed", Vec::new());
+        let session =
+            crate::session::test_support::create_session(&h.services.sessions, &h.worktree);
+        let tree = SessionTree {
+            sessions: h.services.sessions.clone(),
+            agents: h.services.agents.clone(),
+        };
+        assert!(!tree.restricted(&session.id));
+        h.services.sessions.restrict(&session.id).unwrap();
+        assert!(tree.restricted(&session.id));
+        h.services.storage.with_connection(|conn| {
+            conn.execute_batch("ALTER TABLE session_restriction RENAME TO restriction_gone;")
+                .unwrap()
+        });
+        assert!(tree.restricted(&session.id));
+        assert!(tree.restricted("ses_unknown"));
     }
 }

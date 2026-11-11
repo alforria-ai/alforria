@@ -527,6 +527,22 @@ mod tests {
             (alias.attachment, alias.reasoning, alias.tool_call),
             (target.attachment, target.reasoning, target.tool_call)
         );
+        // Image gating (`session::media`) reads these two: an alias takes
+        // images exactly when the model behind it does, whatever its name
+        // suggests.
+        assert_eq!(alias.modalities, target.modalities);
+        assert!(alias.attachment, "claw-flash is served by a vision model");
+        let deep = &models["claw-deep"];
+        assert_eq!(deep.modalities, models["deepseek-v4.1-flash"].modalities);
+        assert!(!deep.attachment, "claw-deep is served by a text-only model");
+        assert!(
+            !deep
+                .modalities
+                .as_ref()
+                .is_some_and(|modalities| modalities.input.contains(&Modality::Image)),
+            "{:?}",
+            deep.modalities
+        );
         assert!(!models.contains_key("claw-image") && !models.contains_key("claw-lost"));
         // A listed model is never replaced by an alias of the same name.
         assert_eq!(models["deepseek-v4.1-flash"].name, "DeepSeek V4.1 Flash");

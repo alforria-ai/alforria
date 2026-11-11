@@ -10,7 +10,11 @@ and the tables are created by alforria's own migrations
 unattended-server tables: one journal, one ordered list).
 
 This page is the reference for those features. The public docs at
-alforria.ai are written from it.
+alforria.ai are written from it. Running the server they need — tokens and
+scopes, shutdown, what happens when nobody answers, webhooks — is in
+[unattended-server.md](unattended-server.md); the two meet in its threat
+model ("Turns nobody requests, and callers that are not people"), which
+says who every trigger run, restart follow-up and memory flush runs as.
 
 ## Triggers
 
@@ -128,7 +132,32 @@ run time, but only the config changes or removes them.
   that slept through several ticks also fires once.
 - Two servers sharing a database run each scheduled tick once: the tick is
   claimed in the database before it fires.
-- A run cut short by a restart is closed as `failed`.
+- A run cut short by a restart is closed as `failed`, with an error that
+  starts with `interrupted`. Its turn is repaired like any interrupted turn
+  and, under `server.resume: "continue"`, resumed once in its session. The
+  tick it answered was claimed before it ran, so nothing fires it a second
+  time; `catch_up` still makes up for a later tick missed while the server
+  was down.
+- A run whose turn is stopped (an abort, or the server shutting down) is
+  `failed`, not completed with half an answer. A server that is shutting
+  down fires nothing.
+- Nobody is attached to a run. An ask or a question raised in one follows
+  `permission.unattended` / `question.unattended`
+  ([unattended-server.md](unattended-server.md)); with the default, `wait`,
+  it waits for an answer and the trigger skips its ticks meanwhile. On a
+  run that carries outside text an ask is a deny at once, whatever that
+  policy says, and the project's standing `always` approvals do not apply.
+- A trigger remembers whether a restricted caller created it (`restricted:
+  true` on the record: a `chat` or `connector` token, or the `schedule`
+  tool in a restricted session). Such a trigger runs only in restricted
+  sessions and creates its sessions restricted.
+- `@file` and `@agent` mentions in a prompt are resolved only when the
+  operator wrote the trigger (the config, or an `admin` request). In a
+  trigger a model scheduled or a restricted caller created they are text:
+  resolving one attaches a file or names a subagent with no permission
+  asked.
+- A session a trigger names (`session: "ses_…"`) must belong to the
+  trigger's own directory.
 - The scheduler runs in `alforria serve`, `alforria web` and the TUI. `serve`
   and `web` boot every directory that has triggers at startup. One-shot
   commands (`alforria run`, `acp`) never fire triggers.
@@ -164,11 +193,18 @@ time: { started, ended? }, quiet?, report?, text?, error?, cause? }`.
 `status` is `queued`, `running`, `completed`, `failed` or `skipped`;
 `reason` is `schedule`, `catch_up`, `watch`, `webhook` or `manual`.
 
-The webhook route is authenticated like every other route. It has no secret
-of its own, so put the server's credentials on the caller.
+With bearer tokens ([unattended-server.md](unattended-server.md)) the
+routes are open to `chat` and `connector` under the `schedule` tool's rules:
+such a token never sets `permission`, `agent` or `model`, names only
+sessions it may act in, and changes, fires or deletes only triggers a
+restricted caller created (it can read the others). The webhook route has a
+scope of its own, `hook`: give the outside caller a token with that scope,
+which opens `POST /trigger/{id}/hook` and nothing else. `connector` and
+`admin` tokens may call it too; a `chat` token may not.
 
-Errors: 400 for an invalid trigger, 403 when triggers are disabled, 404 for an
-unknown id, 409 for a conflict (a taken id, editing a config trigger, a hook on
+Errors: 400 for an invalid trigger (a session that is not this directory's
+included), 403 when triggers are disabled or the caller may not do this to
+this trigger, 404 for an unknown id, 409 for a conflict (a taken id, editing a config trigger, a hook on
 a trigger that is not a webhook trigger).
 
 ### Events
@@ -277,14 +313,23 @@ it came from, in `provenance` (and in the `trust` and `provenance` columns of
 the `memory` table, which every query can filter on):
 
 ```
-"provenance": { "source": "api" | "tool" | "flush", "sessionID": "…",
-                "untrusted": false, "history": [ … ] },
+"provenance": { "source": "api" | "client" | "tool" | "flush", "sessionID": "…",
+                "untrusted": false, "restricted": true, "history": [ … ] },
 "verified": true
 ```
 
-- `source` is `api` for a client using `/memory`, `tool` for a model calling
-  the `memory` tool, and `flush` for the flush before a compaction.
-  `untrusted` is true when the writing session carried text from outside. A
+- `source` is `api` for the operator using `/memory` (Basic auth, an `admin`
+  token, no authentication), `client` for a `chat` or `connector` token
+  using it, `tool` for a model calling the `memory` tool, and `flush` for
+  the flush before a compaction.
+- `restricted` is present and true when the writer was restricted
+  ([unattended-server.md](unattended-server.md)): a `chat` or `connector`
+  token, or a session one of them created. Such a record is injected into
+  restricted sessions only. What a chat client had saved is for its own
+  conversations; it is not put into the system context of the operator's
+  sessions (it is still listed and searched there, and
+  `memory.inject.unverified` opts in to injecting it).
+- `untrusted` is true when the writing session carried text from outside. A
   session carries it when a webhook or watch trigger started it, or when it
   was created as a child or a fork of a session that does, at any depth. This
   is stored once, as `metadata.untrustedInput` on the session when it is
@@ -300,9 +345,10 @@ the `memory` table, which every query can filter on):
   patch or tool argument sets it, over HTTP or through the tool.
 - The origin follows every change. An update that rewrites `content` or
   `kind` makes the record its new author's: rewritten through the tool it is
-  a tool record of that session; rewritten through `/memory` it is the
-  user's, and verified. A model rewriting an unverified record leaves it
-  unverified; only the user vouches for one. `history` keeps the last 10
+  a tool record of that session; rewritten through `/memory` by the operator
+  it is the user's, and verified. A model, or a token below `admin`,
+  rewriting an unverified record leaves it unverified; only the operator
+  vouches for one. `history` keeps the last 10
   changes (who, when, which fields).
 - A session that carried outside text may add records, if its trigger's
   `permission` block grants `memory`, and those are unverified. It may not
@@ -363,7 +409,17 @@ runs: it runs only if the session, as its agent, is allowed `memory` /
 answers a prompt during a compaction. A webhook or watch run is denied
 `memory` unless its trigger's own `permission` block grants it, so by default
 such a session is never flushed. Records saved by a flush carry
-`provenance.source = "flush"` and are not injected by default (see above).
+`provenance.source = "flush"` (and the session's `untrusted` and
+`restricted` marks) and are not injected by default (see above).
+
+A history larger than one request is summarised in pieces read from the
+database a page at a time. The flush still happens once per compaction, just
+before the final summary request, and reads what that request carries: the
+newest piece in full and, when older pieces were folded on the way, the
+summary that stands for them. It never loads the whole history, and it is
+never larger than one request. The `<memory>` block is counted when a
+request is sized before it is sent, and so is a trigger's payload, which is
+part of the user message.
 
 ### Routes
 
@@ -379,8 +435,15 @@ All take `?directory=` and return plain JSON. With memory off they answer 403.
 | `PATCH /memory/{id}` | `{ content?, kind?, metadata?, archived? }`; `metadata: null` clears it. |
 | `DELETE /memory/{id}` | `{ deleted }`. |
 
+With bearer tokens the routes are open to `chat` and `connector` under the
+tools' rules: a write needs the default agent's `memory` permission for the
+action (`remember`, `update`, `forget`) to be `allow`, `GET /memory/session`
+needs `session_search`, and an `ask` is a refusal. What such a token writes
+is a `client` record from a restricted writer. A record id belongs to the
+instance's memory: an id from another project is a 404.
+
 A record is `{ id, projectID, kind, content, metadata?, archived,
-time: { created, updated } }`. Changes are announced by `memory.updated`
+provenance?, verified, time: { created, updated } }`. Changes are announced by `memory.updated`
 (`{ id, action }`, `action` being `remembered`, `updated` or `forgotten`).
 
 ## Importing a transcript
@@ -562,23 +625,43 @@ that go with them, at an address of its choosing.
 
 ## Which config may set what
 
-Some of these settings decide what runs unattended, whose data is read, or
-where requests go. A project's `opencode.json` or `.opencode/` arrives with a
-clone, and a remote config arrives with a login, so those settings are read
-only from your own config: the global config, `~/.opencode`, the files named
-by `OPENCODE_CONFIG`, `OPENCODE_CONFIG_DIR` and `OPENCODE_CONFIG_CONTENT`, and
-the managed config. From anywhere else they are dropped, with a warning that
-names the file. There is no per-project trust setting.
+Some settings decide what runs unattended, whose data is read, where
+requests go, who may connect or how durable the database is. A project's
+`opencode.json` or `.opencode/` arrives with a clone (and the agent can
+write it), and a remote config arrives with a login, so those settings are
+not read from them. There is one table for every key alforria adds, in three
+classes; the loader applies it to each file as it is merged, and what a file
+may not set is dropped with a warning that names the file. There is no
+per-project trust setting.
 
-| Key | From a project or remote config |
-| --- | --- |
-| `trigger` | Ignored. |
-| `triggers` | Ignored, except `{ "enabled": false }`. |
-| `memory` | Ignored, except `{ "enabled": false }` (a project may switch memory off for itself; it cannot switch it on, share it across projects, start flushing, or resize injection). |
-| `websearch` | Ignored (a search backend address and headers). |
-| `prompt` | Applies (the wording of this project's own system prompt). |
-| `tool` | Applies (the wording of tool descriptions). |
+- **host** — only the host config: the global config directory,
+  `~/.opencode`, and the managed directory. Not a project, not a remote
+  config, and not the `OPENCODE_CONFIG`, `OPENCODE_CONFIG_DIR`,
+  `OPENCODE_CONFIG_CONTENT` or `OPENCODE_PERMISSION` environment either.
+  These describe the server process and the database every project shares
+  ([unattended-server.md](unattended-server.md)).
+- **user** — the host config, plus the files those environment variables
+  name.
+- **project** — any config.
+
+| Key | Class | From anywhere else |
+| --- | --- | --- |
+| `server.shutdown`, `server.auth`, `server.directories`, `server.upload` | host | Ignored. |
+| `server.resume` | host | Ignored (it prompts sessions again, unasked, in every project). |
+| `shell_env` | host | Ignored. |
+| `permission.unattended`, `question` | host | Ignored (`allow` on timeout grants). The rest of `permission` is unaffected. |
+| `hook` | host | Ignored (events sent to a chosen address). |
+| `storage` (`retention`, `synchronous`) | host | Ignored (the shared database's event log and durability). |
+| `trigger` | user | Ignored. |
+| `triggers` | user | Ignored, except `{ "enabled": false }`. |
+| `memory` | user | Ignored, except `{ "enabled": false }` (a project may switch memory off for itself; it cannot switch it on, share it across projects, start flushing, or resize injection). |
+| `websearch` | user | Ignored (a search backend address and headers). |
+| `prompt` | project | Applies (the wording of this project's own system prompt). |
+| `tool` | project | Applies (the wording of tool descriptions). |
+| `provider.*.models.*.family` | project | Applies (which prompt family a model the project declares belongs to). |
+| `compaction.default_context` | project | Applies (a project can already declare any model's limits). |
 
 The table lives in `EXTENSION_KEYS` in
 `crates/alforria-core/src/config/precedence.rs`; a new alforria config key is
-added there with its classification, and one test walks the table.
+added there with its classification, and one test walks the table for every
+kind of source and fails for a key the schema has and the table lacks.

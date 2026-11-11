@@ -850,3 +850,71 @@ stopped by being killed.
 - **`synchronous` stays `NORMAL`** (upstream's, `database.ts:27-32`) unless
   `storage.synchronous: "full"`. In WAL mode `NORMAL` cannot corrupt the
   database on a crash or power cut; it can lose the commits not yet synced.
+
+## Integration of the unattended server, session durability and assistant branches
+
+The three branches were built in parallel. What follows is what only shows
+once they are together, and how it was settled. Reference:
+`docs/unattended-server.md` and `docs/assistant.md`.
+
+- **One migration set.** Two branches each journaled their own tables in
+  `alforria_migration`. There is one list now
+  (`storage/alforria_migration.rs`); the five shipped ids are kept as
+  written so a database that ran either half is completed, not redone.
+- **One config trust table.** Host-only loading and `EXTENSION_KEYS` decided
+  the same question twice. `EXTENSION_KEYS` classifies every alforria key as
+  host, user or project, and the loader applies it to each source.
+  `server.resume` and `storage` were read from a load that walked up from
+  the config directory and could pick up project-style files; they are host
+  keys.
+- **Every engine-started turn has a caller.** A trigger run is
+  `Caller::Restricted` when a restricted caller created the trigger and
+  `Caller::Session` otherwise; a restart follow-up is `Caller::Session`.
+  The stricter of who scheduled the work and the session it lands in
+  applies, and the engine refuses at the point every turn passes through.
+- **A trigger's prompt was resolved with the operator's rights whoever wrote
+  it.** `@file` attached a file and `@agent` named a subagent with no
+  permission asked, for a prompt a model had written with the `schedule`
+  tool. Mentions are resolved only in a prompt the operator wrote.
+- **A trigger could name any session by id.** It must be the instance's own:
+  same project and same directory (every non-git directory shares the
+  `global` project, so the project alone was not a boundary).
+- **Standing approvals overrode the untrusted-run ceiling.** The permission
+  service evaluates the session's rules and then the project's `always`
+  approvals, last match wins, so an approval given in an ordinary session
+  handed an outside-text run what its ceiling withheld; and
+  `permission.unattended: allow` would have answered an ask raised there.
+  For a session carrying outside text approvals are ignored and an ask is a
+  deny at once. The lookup behind it fails closed.
+- **A fork dropped the rules that held outside text.** The mark was copied
+  with the metadata, the rules were not. A fork of a marked session keeps
+  them.
+- **A chat client's memory reached the operator's system prompt.** A record
+  written from a restricted session was verified and injected everywhere.
+  Records carry whether their writer was restricted and are injected into
+  restricted sessions only; `/memory` below `admin` writes `client` records
+  that never vouch for one.
+- **The new routes were admin-only or unconfined.** Scope rows were added for
+  `/trigger*`, `/memory*` and the durable event replay, with the handlers
+  holding a caller below `admin` to the tools' rules; the webhook entry has
+  a scope of its own, `hook`.
+- **A stopped trigger turn was recorded as completed** with the half answer
+  it had streamed. A cancelled turn is a failed run.
+- **`git` inherited the server's environment.** A repository's filters,
+  textconv and hooks are the agent's to write; git subprocesses get the
+  scrubbed environment.
+- **Tests could reach the developer's files.** `GlobalPaths::resolve` reads
+  `XDG_*`, so with `XDG_DATA_HOME` set several suites opened the real
+  database and `auth.json`; spawned binaries inherited the whole
+  environment. Tests resolve paths without the runner's variables and spawn
+  with a cleared environment.
+
+Known and left:
+
+- Restriction is a kind, not an identity: any `chat` token acts on any
+  restricted session or trigger in an allowed directory. Tokens of two
+  people on one server share them.
+- Memory is per project, and non-git directories share the `global` project.
+- Read-only config loads in a few v1/v2 routes (`/command`, `/skill`) still
+  resolve the global directories from the environment rather than from the
+  context they were built over.

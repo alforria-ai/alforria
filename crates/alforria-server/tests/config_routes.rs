@@ -282,6 +282,17 @@ async fn permission_reply_finds_the_request_in_another_instance() {
     // client that lost the request's directory), so the location instance
     // does not know the id and the route must find it in the other one.
     let other_services = f.ctx.instances.load(&other).unwrap();
+    // A real session: an ask under an id that is no session's is denied
+    // outright (a session that cannot be read counts as carrying outside
+    // text).
+    let session = other_services
+        .sessions
+        .create(
+            &other_services.instance_context(&other, None).unwrap(),
+            &Default::default(),
+        )
+        .unwrap()
+        .id;
     let mut asked = other_services.events.subscribe("permission.asked");
     let ask = {
         let services = other_services.clone();
@@ -290,7 +301,7 @@ async fn permission_reply_finds_the_request_in_another_instance() {
                 .permission
                 .ask(alforria_schema::permission_v1::PermissionV1AskInput {
                     id: Some("per_fb".to_string()),
-                    session_id: "ses_fb".to_string(),
+                    session_id: session,
                     permission: "bash".to_string(),
                     patterns: vec!["ls".to_string()],
                     metadata: Default::default(),

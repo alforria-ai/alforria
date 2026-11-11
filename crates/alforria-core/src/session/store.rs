@@ -982,10 +982,12 @@ impl SessionStore {
     pub fn set_metadata(&self, session_id: &str, metadata: JsonMap) -> Result<(), SessionError> {
         // alforria extension: the untrusted-input mark is sticky. Replacing
         // the metadata can set it, never clear it.
+        // A session that cannot be read counts as carrying it: a lookup
+        // that fails must not be the way the mark is lost.
         let mut metadata = metadata;
         if self
             .get(session_id)
-            .is_ok_and(|session| carries_untrusted_input(&session))
+            .map_or(true, |session| carries_untrusted_input(&session))
         {
             metadata.insert(
                 UNTRUSTED_INPUT_KEY.to_string(),
@@ -2533,5 +2535,101 @@ mod integration_tests {
             );
             assert_eq!(sessions.is_restricted(&child.id).unwrap(), restricted);
         }
+    }
+
+    /// A property a decision rests on is never derived from a lookup that
+    /// failed in the permissive direction. With the session table gone
+    /// (any storage error reads the same), and for a session that was
+    /// never there: asks are denied, the untrusted mark is presumed, and a
+    /// restriction that cannot be read is an error, not "unrestricted".
+    #[tokio::test]
+    async fn security_marks_fail_closed_when_a_lookup_fails() {
+        use alforria_schema::permission_v1::{
+            PermissionV1Action, PermissionV1AskInput, PermissionV1Rule,
+        };
+        let dir = crate::storage::test_support::TempDir::new("store-fail-closed");
+        let services = services(dir.path());
+        insert_project(&services, "proj_01");
+        let sessions = &services.sessions;
+        let context = ctx("proj_01");
+        let plain = sessions.create(&context, &Default::default()).unwrap();
+        let ask = |session: &str| PermissionV1AskInput {
+            id: None,
+            session_id: session.to_string(),
+            permission: "bash".to_string(),
+            patterns: vec!["ls".to_string()],
+            metadata: JsonMap::new(),
+            always: vec![],
+            tool: None,
+            ruleset: vec![PermissionV1Rule {
+                permission: "bash".to_string(),
+                pattern: "*".to_string(),
+                action: PermissionV1Action::Ask,
+            }],
+        };
+        // The widest unattended policy: were the ask raised, it would be
+        // allowed.
+        services
+            .permission
+            .set_unattended(Some(crate::session::permission::Unattended {
+                timeout: std::time::Duration::from_millis(10),
+                on_timeout: crate::session::permission::OnTimeout::Allow,
+            }));
+        // A readable, unmarked session is asked about (and allowed here).
+        services.permission.ask(ask(&plain.id)).await.unwrap();
+
+        // An id that is no session's.
+        assert!(crate::trigger::session_untrusted(sessions, "ses_never"));
+        assert!(matches!(
+            services.permission.ask(ask("ses_never")).await,
+            Err(crate::session::permission::PermissionError::Denied { .. })
+        ));
+        assert!(!sessions.is_restricted("ses_never").unwrap());
+
+        // The mark survives a metadata replace on a row that is there.
+        let mut metadata = JsonMap::new();
+        metadata.insert(UNTRUSTED_INPUT_KEY.to_string(), serde_json::json!(true));
+        let marked = sessions
+            .create(
+                &context,
+                &CreateInput {
+                    metadata: Some(metadata),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        sessions.set_metadata(&marked.id, JsonMap::new()).unwrap();
+        assert!(carries_untrusted_input(&sessions.get(&marked.id).unwrap()));
+
+        // Now every lookup fails.
+        services.storage.with_connection(|conn| {
+            conn.execute_batch(
+                "ALTER TABLE session RENAME TO session_gone;
+                 ALTER TABLE session_restriction RENAME TO session_restriction_gone;",
+            )
+            .unwrap()
+        });
+        assert!(sessions.get(&plain.id).is_err());
+        assert!(crate::trigger::session_untrusted(sessions, &plain.id));
+        assert!(matches!(
+            services.permission.ask(ask(&plain.id)).await,
+            Err(crate::session::permission::PermissionError::Denied { .. })
+        ));
+        assert!(services.permission.list().is_empty(), "nothing was asked");
+        assert!(
+            sessions.is_restricted(&plain.id).is_err(),
+            "an unreadable restriction is an error for the caller to refuse on"
+        );
+        // A child created now presumes the mark, and cannot be created
+        // unrestricted by default: its parent's restriction is unreadable.
+        assert!(sessions
+            .create(
+                &context,
+                &CreateInput {
+                    parent_id: Some(plain.id.clone()),
+                    ..Default::default()
+                },
+            )
+            .is_err());
     }
 }
