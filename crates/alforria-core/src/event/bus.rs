@@ -90,8 +90,9 @@ pub type Projector = Arc<dyn Fn(&Connection, &Payload) -> Result<(), CoreError> 
 /// A failure rolls the transaction back.
 ///
 /// Must not call back into the bus — `publish`/`replay` re-enter the
-/// durable-commit lock.
-pub type CommitHook = Box<dyn FnOnce(i64) -> Result<(), CoreError> + Send>;
+/// durable-commit lock — nor into `Storage`, whose mutex is held: like a
+/// projector, it gets the transaction's connection.
+pub type CommitHook = Box<dyn FnOnce(&Connection, i64) -> Result<(), CoreError> + Send>;
 
 /// [`EventBus::publish`] options (`event.ts:118-123`).
 #[derive(Default)]
@@ -622,7 +623,7 @@ impl EventBus {
                 projector(&tx, &committed)?;
             }
             if let Some(commit) = commit {
-                commit(seq)?;
+                commit(&tx, seq)?;
             }
             sql::upsert_event_sequence(
                 &tx,
@@ -1016,7 +1017,7 @@ mod tests {
                 &MODELS_DEV_REFRESHED,
                 serde_json::json!({}),
                 PublishOptions {
-                    commit: Some(Box::new(|_seq| Ok(()))),
+                    commit: Some(Box::new(|_conn, _seq| Ok(()))),
                     ..Default::default()
                 },
             )
@@ -1037,7 +1038,7 @@ mod tests {
             &durable_def(),
             durable_data("ses_1"),
             PublishOptions {
-                commit: Some(Box::new(move |seq| {
+                commit: Some(Box::new(move |_conn, seq| {
                     seen_hook.lock().unwrap().push(seq);
                     Ok(())
                 })),
@@ -1055,7 +1056,7 @@ mod tests {
             &durable_def(),
             durable_data("ses_1"),
             PublishOptions {
-                commit: Some(Box::new(|_seq| {
+                commit: Some(Box::new(|_conn, _seq| {
                     Err(CoreError::Storage("hook failed".to_string()))
                 })),
                 ..Default::default()

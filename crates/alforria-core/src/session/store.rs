@@ -817,50 +817,65 @@ impl SessionStore {
             },
             revert: None,
         };
-        // alforria extension: the marks are inherited, and written before
-        // the session exists so there is no moment at which a child of a
-        // marked session is unmarked. Every session is created here. A
-        // parent whose marks cannot be read counts as carrying both.
+        // alforria extension: marks, ceilings and restriction are inherited
+        // — every session is created here, so a child or fork cannot come
+        // out freer than its source because its creator did not think of
+        // it — and they are written in the transaction that inserts the
+        // session row (the event's commit hook): no reader, and no crash,
+        // finds the session without them. A parent whose marks cannot be
+        // read counts as carrying both; a source whose ceilings or
+        // restriction cannot be read fails the creation.
         let mut marks = input.marks;
         if let Some(parent_id) = &input.parent_id {
             let inherited = self.inherited_marks(parent_id);
             marks.outside_content |= inherited.outside_content;
             marks.outside_start |= inherited.outside_start;
         }
-        for mark in marks.list() {
-            self.mark(&info.id, mark)?;
-        }
-        // The same for the ceilings: a child or a fork is capped as its
-        // source is, from before it exists. An error here is an error for
-        // the creation.
+        let mut ceilings: Vec<(String, String)> = Vec::new();
         for source in [&input.parent_id, &input.ceilings_from]
             .into_iter()
             .flatten()
         {
             for ceiling in self.ceilings(source)? {
-                self.set_ceiling(&info.id, &ceiling)?;
+                ceilings.push((ceiling.name, serde_json::to_string(&ceiling.readings)?));
             }
         }
         for ceiling in &input.ceilings {
-            self.set_ceiling(&info.id, ceiling)?;
+            ceilings.push((
+                ceiling.name.clone(),
+                serde_json::to_string(&ceiling.readings)?,
+            ));
         }
-        self.publish(
+        let restricted = input.restricted
+            || match &input.parent_id {
+                Some(parent) => self.is_restricted(parent)?,
+                None => false,
+            };
+        let session_id = info.id.clone();
+        let stamp = now as i64;
+        let with_session: crate::event::CommitHook = Box::new(move |conn, _seq| {
+            for mark in marks.list() {
+                Self::mark_on(conn, &session_id, mark, stamp)?;
+            }
+            for (name, readings) in &ceilings {
+                Self::set_ceiling_on(conn, &session_id, name, readings, stamp)?;
+            }
+            if restricted {
+                Self::restrict_on(conn, &session_id, stamp)?;
+            }
+            Ok(())
+        });
+        self.events.publish(
             &event_definitions::SESSION_CREATED,
             serde_json::to_value(SessionCreatedData {
                 session_id: info.id.clone(),
                 info: info.clone(),
             })?,
+            PublishOptions {
+                commit: Some(with_session),
+                ..PublishOptions::default()
+            },
         )?;
-        // alforria extension: restriction is inherited. Every session is
-        // created here, so a child or fork of a restricted session cannot
-        // come out unrestricted because its creator did not think of it.
-        let inherited = match &input.parent_id {
-            Some(parent) => self.is_restricted(parent)?,
-            None => false,
-        };
-        if input.restricted || inherited {
-            self.restrict(&info.id)?;
-        }
         Ok(info)
     }
 
@@ -979,21 +994,29 @@ impl SessionStore {
     /// [`SessionMark::OutsideContent`] too.
     pub fn mark(&self, session_id: &str, mark: SessionMark) -> Result<(), SessionError> {
         let now = self.now() as i64;
+        self.storage
+            .with_connection(|conn| Self::mark_on(conn, session_id, mark, now))
+            .map_err(SessionError::from)
+    }
+
+    /// [`SessionStore::mark`] on a connection the caller holds.
+    fn mark_on(
+        conn: &rusqlite::Connection,
+        session_id: &str,
+        mark: SessionMark,
+        now: i64,
+    ) -> Result<(), CoreError> {
         let marks: &[SessionMark] = match mark {
             SessionMark::OutsideContent => &[SessionMark::OutsideContent],
             SessionMark::OutsideStart => &[SessionMark::OutsideContent, SessionMark::OutsideStart],
         };
-        self.storage
-            .with_connection(|conn| {
-                for mark in marks {
-                    conn.execute(
-                        "INSERT OR IGNORE INTO session_mark (session_id, mark, time_created) VALUES (?1, ?2, ?3)",
-                        rusqlite::params![session_id, mark.as_str(), now],
-                    )?;
-                }
-                Ok::<_, CoreError>(())
-            })
-            .map_err(SessionError::from)
+        for mark in marks {
+            conn.execute(
+                "INSERT OR IGNORE INTO session_mark (session_id, mark, time_created) VALUES (?1, ?2, ?3)",
+                rusqlite::params![session_id, mark.as_str(), now],
+            )?;
+        }
+        Ok(())
     }
 
     /// The ceilings stored for a session, by name.
@@ -1032,17 +1055,27 @@ impl SessionStore {
         let readings = serde_json::to_string(&ceiling.readings)?;
         self.storage
             .with_connection(|conn| {
-                conn.execute(
-                    "INSERT INTO session_ceiling (session_id, name, readings, time_updated)
-                     VALUES (?1, ?2, ?3, ?4)
-                     ON CONFLICT (session_id, name) DO UPDATE SET
-                        readings = excluded.readings, time_updated = excluded.time_updated",
-                    rusqlite::params![session_id, ceiling.name, readings, now],
-                )
-                .map(|_| ())
-                .map_err(CoreError::from)
+                Self::set_ceiling_on(conn, session_id, &ceiling.name, &readings, now)
             })
             .map_err(SessionError::from)
+    }
+
+    /// [`SessionStore::set_ceiling`] on a connection the caller holds.
+    fn set_ceiling_on(
+        conn: &rusqlite::Connection,
+        session_id: &str,
+        name: &str,
+        readings: &str,
+        now: i64,
+    ) -> Result<(), CoreError> {
+        conn.execute(
+            "INSERT INTO session_ceiling (session_id, name, readings, time_updated)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (session_id, name) DO UPDATE SET
+                readings = excluded.readings, time_updated = excluded.time_updated",
+            rusqlite::params![session_id, name, readings, now],
+        )?;
+        Ok(())
     }
 
     /// **The policy a turn in `session_id` is judged by** — the one place
@@ -1113,15 +1146,21 @@ impl SessionStore {
     pub fn restrict(&self, session_id: &str) -> Result<(), SessionError> {
         let now = self.now() as i64;
         self.storage
-            .with_connection(|conn| {
-                conn.execute(
-                    "INSERT OR IGNORE INTO session_restriction (session_id, time_created) VALUES (?1, ?2)",
-                    rusqlite::params![session_id, now],
-                )
-                .map(|_| ())
-                .map_err(CoreError::from)
-            })
+            .with_connection(|conn| Self::restrict_on(conn, session_id, now))
             .map_err(SessionError::from)
+    }
+
+    /// [`SessionStore::restrict`] on a connection the caller holds.
+    fn restrict_on(
+        conn: &rusqlite::Connection,
+        session_id: &str,
+        now: i64,
+    ) -> Result<(), CoreError> {
+        conn.execute(
+            "INSERT OR IGNORE INTO session_restriction (session_id, time_created) VALUES (?1, ?2)",
+            rusqlite::params![session_id, now],
+        )?;
+        Ok(())
     }
 
     /// Lift a session's restriction. The one way out, and an operator's
@@ -3014,6 +3053,78 @@ mod integration_tests {
             assert_eq!(sessions.started_by_outside_input(&root.id), untrusted);
             assert_eq!(sessions.is_restricted(&child.id).unwrap(), restricted);
         }
+    }
+
+    /// A session comes into being with its restriction, marks and ceilings
+    /// or not at all: whoever hears of it finds them set, and when one of
+    /// them cannot be written there is no session.
+    #[test]
+    fn a_session_is_created_with_its_restriction_marks_and_ceilings_or_not_at_all() {
+        let dir = crate::storage::test_support::TempDir::new("store-create-atomic");
+        let services = services(dir.path());
+        insert_project(&services, "proj_01");
+        let sessions = services.sessions.clone();
+        let context = ctx("proj_01");
+        let input = CreateInput {
+            restricted: true,
+            marks: SessionMarks::ALL,
+            ceilings: vec![SessionCeiling {
+                name: "test".to_string(),
+                readings: vec![vec![]],
+            }],
+            ..Default::default()
+        };
+
+        // What a reader sees at the moment the session is announced.
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let _subscription = services.events.listen({
+            let (sessions, seen) = (sessions.clone(), seen.clone());
+            Arc::new(move |event: &crate::event::Payload| {
+                if event.r#type != event_definitions::SESSION_CREATED.r#type {
+                    return;
+                }
+                let id = event.data["sessionID"].as_str().unwrap().to_string();
+                seen.lock().unwrap().push((
+                    sessions.is_restricted(&id).unwrap(),
+                    sessions.marks(&id).unwrap(),
+                    sessions.ceilings(&id).unwrap().len(),
+                ));
+            })
+        });
+        sessions.create(&context, &input).unwrap();
+        assert_eq!(*seen.lock().unwrap(), vec![(true, SessionMarks::ALL, 1)]);
+
+        // The restriction cannot be written: no session row is left behind,
+        // and nothing of it in the other tables.
+        let count = |table: &str| {
+            services.storage.with_connection(|conn| {
+                conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap()
+            })
+        };
+        let before = (
+            count("session"),
+            count("session_mark"),
+            count("session_ceiling"),
+        );
+        services.storage.with_connection(|conn| {
+            conn.execute_batch(
+                "ALTER TABLE session_restriction RENAME TO session_restriction_gone;
+                 CREATE TABLE session_restriction (elsewhere TEXT);",
+            )
+            .unwrap()
+        });
+        assert!(sessions.create(&context, &input).is_err());
+        assert_eq!(
+            (
+                count("session"),
+                count("session_mark"),
+                count("session_ceiling")
+            ),
+            before
+        );
     }
 
     /// A property a decision rests on is never derived from a lookup that

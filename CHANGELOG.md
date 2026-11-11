@@ -251,6 +251,9 @@ pre-1.0, so minor releases may include breaking changes.
 
 ### Fixed
 
+- A session is created together with its restriction, marks and ceilings,
+  in the transaction that inserts it: a crash or a concurrent read between
+  the two no longer finds a restricted caller's session unrestricted.
 - Two more places judged a session by its agent's policy alone, without the
   session's own rules and ceilings (a trigger creator's bounds, the
   outside-input ceiling): the v2 permission ask
