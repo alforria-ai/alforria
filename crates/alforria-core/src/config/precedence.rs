@@ -862,7 +862,7 @@ impl ConfigLoader {
     /// `~/.opencode` and the `OPENCODE_CONFIG*` environment, read as text.
     /// The host put a secret in each of them more often than not, so the
     /// shell environment policy keeps them from the agent's processes
-    /// (`ShellEnvPolicy::deny_names`). A file that cannot be read adds
+    /// (`ShellEnvPolicy::learn`). A file that cannot be read adds
     /// nothing here; loading it is where that is an error.
     pub fn host_env_references(&self, params: &LoadParams) -> Vec<String> {
         let mut files = Vec::new();

@@ -319,7 +319,10 @@ fn read_env_dump(path: &Path) -> String {
 /// The agent's shells do not see the server's secrets: the bash tool, the
 /// session `shell` command and a terminal all start from the `shell_env`
 /// policy, which withholds the built-in deny list (provider keys, the
-/// server's own secrets) and whatever the host config denies.
+/// server's own secrets), the variables the host's providers and config
+/// read theirs from, and whatever the host config denies. This server is
+/// standalone, so the user's own credentials (`GITHUB_TOKEN`, `AWS_*`)
+/// reach the shell as they do upstream.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_agents_shells_cannot_read_denied_variables() {
     let backend = MockBackend::new("u3_shell_env");
@@ -339,11 +342,12 @@ async fn the_agents_shells_cannot_read_denied_variables() {
             .env("LIBERTAI_API_KEY", "sk-libertai-leak")
             .env("OPENCODE_AUTH_CONTENT", "{\"leak\":\"auth-content-leak\"}")
             .env("U3_DENIED_TOKEN", "denied-leak")
-            // General-purpose credentials (M3), in either case.
-            .env("GITHUB_TOKEN", "github-leak")
-            .env("github_token", "github-lower-leak")
-            .env("AWS_SECRET_ACCESS_KEY", "aws-leak")
-            .env("HF_TOKEN", "hf-leak")
+            // The user's own credentials: a standalone server passes
+            // them on.
+            .env("GITHUB_TOKEN", "github-kept")
+            .env("AWS_SECRET_ACCESS_KEY", "aws-kept")
+            .env("NPM_TOKEN", "npm-kept")
+            .env("PGPASSWORD", "pg-kept")
             .env("U3_REFERENCED", "referenced-leak")
             .env("U3_ACME_AUTH", "provider-leak")
             .env("U3_VISIBLE", "visible");
@@ -355,20 +359,22 @@ async fn the_agents_shells_cannot_read_denied_variables() {
             "sk-libertai-leak",
             "auth-content-leak",
             "denied-leak",
-            "github-leak",
-            "github-lower-leak",
-            "aws-leak",
-            "hf-leak",
             "referenced-leak",
             "provider-leak",
         ] {
             // The dump itself is never printed: it is an environment.
             assert!(!dump.contains(leak), "{what} leaked {leak}");
         }
-        assert!(
-            dump.contains("U3_VISIBLE=visible"),
-            "{what}: U3_VISIBLE missing"
-        );
+        for kept in [
+            "U3_VISIBLE=visible",
+            "GITHUB_TOKEN=github-kept",
+            "AWS_SECRET_ACCESS_KEY=aws-kept",
+            "NPM_TOKEN=npm-kept",
+            "PGPASSWORD=pg-kept",
+        ] {
+            let name = kept.split('=').next().unwrap_or_default();
+            assert!(dump.contains(kept), "{what}: {name} missing");
+        }
         assert!(
             dump.contains("U3_FROM_CONFIG=yes"),
             "{what}: U3_FROM_CONFIG missing"

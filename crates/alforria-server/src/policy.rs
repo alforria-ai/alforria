@@ -145,6 +145,17 @@ impl Default for ServerPolicy {
     }
 }
 
+/// The variables the providers of `config` read their keys from
+/// (`provider.*.env[]`): withheld from the agent's processes whatever they
+/// are called (`alforria_core::shell_env::learn`).
+pub(crate) fn provider_env_names(config: &Config) -> impl Iterator<Item = &String> {
+    config
+        .provider
+        .iter()
+        .flatten()
+        .flat_map(|(_, provider)| provider.env.iter().flatten())
+}
+
 impl ServerPolicy {
     /// Resolve the policy from a loaded host config, expanding `~/`
     /// against `home` (the context's, never the process's).
@@ -216,19 +227,24 @@ impl ServerPolicy {
                 }
             },
         };
-        // With bearer auth a shell starts from an allowlist, and in either
-        // mode the variables the host's providers read their keys from are
-        // withheld (`ServerPolicy::load` adds the `{env:}` references, the
-        // server the model catalog's).
+        // The restricted posture — bearer auth, or the host's own switch
+        // (`server.trust.project: "restricted"`): credential-like names
+        // are denied and a child starts from an allowlist. A standalone
+        // install keeps the user's environment. In either one the
+        // variables the host's providers read their keys from are withheld
+        // (`ServerPolicy::load` adds the `{env:}` references, the server
+        // the model catalog's and each instance's).
+        let restricted = bearer.is_some()
+            || server
+                .and_then(|server| server.trust.as_ref())
+                .and_then(|trust| trust.project)
+                == Some(alforria_core::config::host::ProjectTrust::Restricted);
         let mut shell_env =
             alforria_core::shell_env::ShellEnvPolicy::from_config(config.shell_env.as_ref())
-                .restricted(bearer.is_some());
-        shell_env.deny_names(
-            config
-                .provider
-                .iter()
-                .flatten()
-                .flat_map(|(_, provider)| provider.env.iter().flatten()),
+                .restricted(restricted);
+        shell_env.learn(
+            alforria_core::shell_env::SOURCE_HOST_PROVIDERS,
+            provider_env_names(config),
         );
         Ok(ServerPolicy {
             shutdown,
@@ -272,9 +288,10 @@ impl ServerPolicy {
                 policy.managed_only = loader.host_mode(&params).managed_only;
                 // What the host config reads through `{env:NAME}` stays
                 // out of the agent's shells.
-                policy
-                    .shell_env
-                    .deny_names(loader.host_env_references(&params));
+                policy.shell_env.learn(
+                    alforria_core::shell_env::SOURCE_HOST_REFERENCES,
+                    loader.host_env_references(&params),
+                );
                 policy
             }
             Err(error) => {
@@ -339,6 +356,9 @@ mod tests {
             ("github_token", "ghp-lower-leak"),
             ("AWS_SECRET_ACCESS_KEY", "aws-leak"),
             ("HF_TOKEN", "hf-leak"),
+            ("OPENCODE_SERVER_PASSWORD", "password-leak"),
+            ("ALFORRIA_WEBHOOK_SECRET", "webhook-leak"),
+            ("LIBERTAI_API_KEY", "builtin-leak"),
             ("ACME_GATEWAY_AUTH", "provider-leak"),
             ("acme_gateway_auth", "provider-lower-leak"),
             ("ACME_REFERENCED", "referenced-leak"),
@@ -351,11 +371,13 @@ mod tests {
     // sha256("operator-token")
     const DIGEST: &str = "0850123315d21ab90f4f7236408a52ef6dbd6a02a6550e5c10dc73f4d993680e";
 
-    /// M3: a provider the host configures reads its key from a variable of
-    /// any name; a standalone server's shells get neither it nor the
-    /// general-purpose credentials beside it.
+    /// A standalone server — no bearer auth, no host switch — is the
+    /// user's own machine: its shells keep the user's credentials. What
+    /// they lose is alforria's own (the password, the webhook secret) and
+    /// the variables a provider's key is read from, built in or of any
+    /// name the host's config gives one.
     #[test]
-    fn a_standalone_shell_gets_no_credentials_or_provider_key_variables() {
+    fn a_standalone_shell_keeps_the_users_credentials_and_loses_provider_key_variables() {
         let policy = ServerPolicy::from_config_in(
             &config(serde_json::json!({
                 "provider": { "acme": { "env": ["ACME_GATEWAY_AUTH"] } }
@@ -363,16 +385,31 @@ mod tests {
             Path::new("/home/test"),
         )
         .unwrap();
+        assert!(!policy.shell_env.is_restricted());
+        let kept = [
+            "ACME_REFERENCED",
+            "AWS_SECRET_ACCESS_KEY",
+            "EDITOR",
+            "GITHUB_TOKEN",
+            "HF_TOKEN",
+            "HOME",
+            "PATH",
+            "TERM",
+            "github_token",
+        ];
+        assert_eq!(names(&policy.shell_env.shell_env_from(server_env())), kept);
+        // And so do the helpers the server starts.
         assert_eq!(
-            names(&policy.shell_env.shell_env_from(server_env())),
-            ["ACME_REFERENCED", "EDITOR", "HOME", "PATH", "TERM"]
+            names(&policy.shell_env.scrubbed_env_from(server_env())),
+            kept
         );
 
-        // `shell_env.allow` is how the host hands one over.
+        // `shell_env.allow` hands a provider's variable over, and
+        // `shell_env.deny` takes a credential away.
         let policy = ServerPolicy::from_config_in(
             &config(serde_json::json!({
                 "provider": { "acme": { "env": ["ACME_GATEWAY_AUTH"] } },
-                "shell_env": { "allow": ["GITHUB_TOKEN"] }
+                "shell_env": { "allow": ["ACME_GATEWAY_AUTH"], "deny": ["*_TOKEN", "AWS_*"] }
             })),
             Path::new("/home/test"),
         )
@@ -380,9 +417,9 @@ mod tests {
         assert_eq!(
             names(&policy.shell_env.shell_env_from(server_env())),
             [
+                "ACME_GATEWAY_AUTH",
                 "ACME_REFERENCED",
                 "EDITOR",
-                "GITHUB_TOKEN",
                 "HOME",
                 "PATH",
                 "TERM"
@@ -390,8 +427,47 @@ mod tests {
         );
     }
 
-    /// With bearer auth the shell starts from the allowlist and what the
-    /// host adds to it.
+    /// The host's own switch (`server.trust.project: "restricted"`) puts
+    /// the shell environment in the restricted posture without bearer
+    /// auth; `"full"` beside bearer auth does not take it out.
+    #[test]
+    fn the_host_switch_restricts_the_shell_environment() {
+        let policy = ServerPolicy::from_config_in(
+            &config(serde_json::json!({ "server": { "trust": { "project": "restricted" } } })),
+            Path::new("/home/test"),
+        )
+        .unwrap();
+        assert!(policy.bearer.is_none());
+        assert!(policy.shell_env.is_restricted());
+        assert_eq!(
+            names(&policy.shell_env.shell_env_from(server_env())),
+            ["HOME", "PATH", "TERM"]
+        );
+        assert_eq!(
+            names(&policy.shell_env.scrubbed_env_from(server_env())),
+            ["HOME", "PATH", "TERM"]
+        );
+
+        let policy = ServerPolicy::from_config_in(
+            &config(serde_json::json!({ "server": { "trust": { "project": "full" } } })),
+            Path::new("/home/test"),
+        )
+        .unwrap();
+        assert!(!policy.shell_env.is_restricted());
+
+        let policy = ServerPolicy::from_config_in(
+            &config(serde_json::json!({ "server": {
+                "auth": { "bearer": { "tokens_sha256": [DIGEST] } },
+                "trust": { "project": "full" }
+            } })),
+            Path::new("/home/test"),
+        )
+        .unwrap();
+        assert!(policy.shell_env.is_restricted());
+    }
+
+    /// With bearer auth the shell — and a helper — starts from the
+    /// allowlist and what the host adds to it.
     #[test]
     fn a_bearer_server_shell_starts_from_the_allowlist() {
         let bearer = serde_json::json!({ "auth": { "bearer": { "tokens_sha256": [DIGEST] } } });
@@ -401,8 +477,13 @@ mod tests {
         )
         .unwrap();
         assert!(policy.bearer.is_some());
+        assert!(policy.shell_env.is_restricted());
         assert_eq!(
             names(&policy.shell_env.shell_env_from(server_env())),
+            ["HOME", "PATH", "TERM"]
+        );
+        assert_eq!(
+            names(&policy.shell_env.scrubbed_env_from(server_env())),
             ["HOME", "PATH", "TERM"]
         );
 
@@ -440,7 +521,16 @@ mod tests {
         assert_eq!(policy.config_error, None);
         assert_eq!(
             names(&policy.shell_env.shell_env_from(server_env())),
-            ["EDITOR", "HOME", "PATH", "TERM"]
+            [
+                "AWS_SECRET_ACCESS_KEY",
+                "EDITOR",
+                "GITHUB_TOKEN",
+                "HF_TOKEN",
+                "HOME",
+                "PATH",
+                "TERM",
+                "github_token"
+            ]
         );
         assert!(policy.shell_env.denied("acme_referenced"));
     }

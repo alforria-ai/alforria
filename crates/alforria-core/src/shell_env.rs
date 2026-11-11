@@ -10,34 +10,44 @@
 //!   [`ShellEnvPolicy::shell_env`]: the `inherit` selection, minus the denied
 //!   names, plus `set`;
 //! * helpers the server starts — MCP stdio servers, language servers and
-//!   the commands that probe for them, git — get
-//!   [`ShellEnvPolicy::scrubbed_env`]: everything minus the denied names, then
-//!   their own configured environment on top. A project config can name a
-//!   command, so it must not be a way around the deny list either.
+//!   the commands that probe for them, git, the desktop's URL opener — get
+//!   [`ShellEnvPolicy::scrubbed_env`], then their own configured
+//!   environment on top. A project config can name a command, so it must
+//!   not be a way around the policy either.
 //!
-//! What is denied, matched without regard to case: the host's `deny`; the
-//! built-in names and patterns ([`BUILTIN_DENY`], [`CREDENTIAL_PATTERNS`]);
-//! and the names the server learns at startup that it reads a secret from
-//! ([`ShellEnvPolicy::deny_names`]: every `provider.*.env[]` of the model
-//! catalog and of the host config, every `{env:NAME}` the host config
-//! refers to). `allow` releases a name from all but the host's own `deny`.
+//! There are two postures, and the host config decides which:
 //!
-//! What a shell inherits by default depends on the server:
+//! * **standalone** (the default) — a child inherits everything except
+//!   what is alforria's own to protect: the host's `deny`; the server's
+//!   secrets and the provider key variables of [`BUILTIN_DENY`]; and the
+//!   names the server learns it reads a key or a secret from
+//!   ([`ShellEnvPolicy::learn`]: every `provider.*.env[]` of the model
+//!   catalog and of the loaded configs, every `{env:NAME}` the host config
+//!   refers to). `GH_TOKEN`, `AWS_*`, `NPM_TOKEN`, `PGPASSWORD` and the
+//!   like are the user's, for the user's tools, and pass as they do
+//!   upstream;
+//! * **restricted** ([`ShellEnvPolicy::restricted`]: bearer auth is
+//!   configured, or `server.trust.project` is `"restricted"`) — nobody is
+//!   at the terminal of such a server. Names that look like a credential
+//!   ([`CREDENTIAL_PATTERNS`]) are denied too, and a shell or a helper
+//!   starts from [`RESTRICTED_INHERIT`] plus what `allow` names instead of
+//!   from everything: no list of secret-looking names is ever complete.
 //!
-//! * standalone — everything that is not denied;
-//! * with bearer auth ([`ShellEnvPolicy::restricted`]) — only
-//!   [`RESTRICTED_INHERIT`] and what `allow` names. Nobody is at the
-//!   terminal of such a server, and no list of secret-looking names is
-//!   ever complete.
+//! Deny patterns match without regard to case. `allow` releases an exact
+//! name from all but the host's own `deny`; `deny` and `inherit` let a
+//! host choose either posture for itself, whatever the mode.
 //!
 //! The policy comes from `shell_env` in the host config
 //! (`config::host::load_host_config`) and is process-wide: [`install`] it
-//! once at startup; until then [`current`] is the standalone default.
+//! once at startup; until then [`current`] is the standalone default. The
+//! learned names are kept per source and replaced through [`learn`] each
+//! time that source is read again (a catalog read, an instance boot).
 //!
 //! This is not a sandbox. A child running as the server's user can still
 //! read `/proc/<server pid>/environ` and the server's files; keeping those
-//! from it takes a different user (`shell_run_as`) or keeping secrets out of
-//! the server's environment in the first place.
+//! from it takes running the server (or the child) as a different user,
+//! which alforria does not do for you, or keeping secrets out of the
+//! server's environment in the first place.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -45,8 +55,9 @@ use std::sync::{Arc, RwLock};
 
 use crate::config::host::{ShellEnvInfo, ShellEnvInherit};
 
-/// Names denied to every child unless explicitly allowed: the server's own
-/// secrets and the variables model providers read their keys from.
+/// Names denied to every child in either posture unless explicitly
+/// allowed: the server's own secrets and the variables model providers
+/// read their keys from.
 pub const BUILTIN_DENY: &[&str] = &[
     // The server's own.
     "OPENCODE_SERVER_PASSWORD",
@@ -91,10 +102,13 @@ pub const BUILTIN_DENY: &[&str] = &[
     "PARALLEL_API_KEY",
 ];
 
-/// Names that look like a credential, denied like [`BUILTIN_DENY`]: the
-/// usual suffixes, and the variables the cloud SDKs and database clients
-/// read theirs from. The agent's own tools (`aws`, `gh`, `gcloud`) read
-/// these too; a host that wants the agent to have one names it in `allow`.
+/// Names that look like a credential, denied like [`BUILTIN_DENY`] on a
+/// restricted server only ([`ShellEnvPolicy::restricted`]): the usual
+/// suffixes, and the variables the cloud SDKs and database clients read
+/// theirs from. The agent's own tools (`aws`, `gh`, `gcloud`) read these
+/// too, which is why a standalone install passes them; a restricted host
+/// that wants the agent to have one names it in `allow`, and a standalone
+/// host that does not writes the pattern in `deny`.
 ///
 /// A guess by name, and so incomplete by nature: a secret called
 /// `DATABASE_URL` or `SSH_AUTH_SOCK` is not on it.
@@ -121,7 +135,7 @@ pub const CREDENTIAL_PATTERNS: &[&str] = &[
     "MYSQL_PWD",
 ];
 
-/// What a shell inherits by default on a server with bearer auth
+/// What a shell or a helper inherits by default on a restricted server
 /// ([`ShellEnvPolicy::restricted`]), `allow` aside. Never denied on
 /// account of a `{env:}` reference or a provider's `env` either: a shell
 /// without `PATH` is no shell.
@@ -143,17 +157,19 @@ pub struct ShellEnvPolicy {
     /// `shell_env.inherit`; `None` when the host did not say, and the
     /// default depends on `restricted`.
     inherit: Option<Inherit>,
-    /// Bearer auth is configured: a shell inherits [`RESTRICTED_INHERIT`]
-    /// and `allow` unless the host set `inherit`.
+    /// The restricted posture (bearer auth, or `server.trust.project:
+    /// "restricted"`): [`CREDENTIAL_PATTERNS`] are denied, and a child
+    /// inherits [`RESTRICTED_INHERIT`] and `allow` unless the host set
+    /// `inherit`.
     restricted: bool,
     /// Exact names exempt from every deny but the host's own `deny`.
     allow: Vec<String>,
     set: BTreeMap<String, String>,
     /// The host's `deny` patterns, upper-cased.
     deny: Vec<String>,
-    /// Names learned at startup ([`ShellEnvPolicy::deny_names`]),
-    /// upper-cased.
-    named: BTreeSet<String>,
+    /// Names the server reads a key or a secret from, upper-cased, by the
+    /// source they were learned from ([`ShellEnvPolicy::learn`]).
+    named: BTreeMap<String, BTreeSet<String>>,
 }
 
 fn is_literal(name: &str) -> bool {
@@ -220,37 +236,88 @@ impl ShellEnvPolicy {
                 .flatten()
                 .map(|pattern| pattern.to_ascii_uppercase())
                 .collect(),
-            named: BTreeSet::new(),
+            named: BTreeMap::new(),
         }
     }
 
-    /// The same policy on a server with bearer auth (`restricted`): a
-    /// shell inherits [`RESTRICTED_INHERIT`] and `allow` instead of
-    /// everything, unless the host set `inherit` itself.
+    /// The same policy in the restricted posture (`restricted`: bearer
+    /// auth is configured, or `server.trust.project` is `"restricted"`):
+    /// credential-like names are denied, and a child inherits
+    /// [`RESTRICTED_INHERIT`] and `allow` instead of everything, unless the
+    /// host set `inherit` itself.
     pub fn restricted(mut self, restricted: bool) -> ShellEnvPolicy {
         self.restricted = restricted;
         self
     }
 
+    /// Whether this is the restricted posture.
+    pub fn is_restricted(&self) -> bool {
+        self.restricted
+    }
+
+    fn learnable<S: AsRef<str>>(names: impl IntoIterator<Item = S>) -> BTreeSet<String> {
+        names
+            .into_iter()
+            .filter(|name| {
+                let name = name.as_ref();
+                !name.is_empty() && !matches_any(name, RESTRICTED_INHERIT)
+            })
+            .map(|name| name.as_ref().to_ascii_uppercase())
+            .collect()
+    }
+
     /// Deny `names` too, whatever their case: the variables the server
     /// reads a secret from (a provider's `env`, a `{env:NAME}` in the host
-    /// config). [`RESTRICTED_INHERIT`] is left alone.
+    /// config). [`RESTRICTED_INHERIT`] is left alone. Added to what is
+    /// already denied; a source that is read more than once goes through
+    /// [`ShellEnvPolicy::learn`] instead.
     pub fn deny_names<S: AsRef<str>>(&mut self, names: impl IntoIterator<Item = S>) {
-        for name in names {
-            let name = name.as_ref();
-            if !name.is_empty() && !matches_any(name, RESTRICTED_INHERIT) {
-                self.named.insert(name.to_ascii_uppercase());
-            }
+        self.named
+            .entry(String::new())
+            .or_default()
+            .extend(Self::learnable(names));
+    }
+
+    /// Make `names` the whole of what `source` (a `SOURCE_*` name) has the
+    /// server deny, replacing what it said before: a name a reloaded config
+    /// or catalog no longer mentions is released, a new one is withheld.
+    /// Returns whether anything changed. Otherwise as
+    /// [`ShellEnvPolicy::deny_names`].
+    pub fn learn<S: AsRef<str>>(
+        &mut self,
+        source: &str,
+        names: impl IntoIterator<Item = S>,
+    ) -> bool {
+        let names = Self::learnable(names);
+        if self
+            .named
+            .get(source)
+            .map_or(names.is_empty(), |known| *known == names)
+        {
+            return false;
         }
+        if names.is_empty() {
+            self.named.remove(source);
+        } else {
+            self.named.insert(source.to_string(), names);
+        }
+        true
+    }
+
+    fn learned(&self, upper: &str) -> bool {
+        self.named.values().any(|names| names.contains(upper))
     }
 
     fn allowed(&self, name: &str) -> bool {
         self.allow.iter().any(|allowed| allowed == name)
     }
 
-    /// Whether `name` is withheld from every child. Deny patterns match
-    /// without regard to case (`github_token` is `GITHUB_TOKEN`); `allow`
-    /// names a variable exactly.
+    /// Whether `name` is withheld from every child: the host's `deny`,
+    /// alforria's own secrets and the provider key variables
+    /// ([`BUILTIN_DENY`], the learned names), and on a restricted server
+    /// whatever looks like a credential ([`CREDENTIAL_PATTERNS`]). Deny
+    /// patterns match without regard to case (`github_token` is
+    /// `GITHUB_TOKEN`); `allow` names a variable exactly.
     pub fn denied(&self, name: &str) -> bool {
         let upper = name.to_ascii_uppercase();
         if matches_any(&upper, &self.deny) {
@@ -258,15 +325,16 @@ impl ShellEnvPolicy {
         }
         !self.allowed(name)
             && (matches_any(&upper, BUILTIN_DENY)
-                || matches_any(&upper, CREDENTIAL_PATTERNS)
-                || self.named.contains(&upper))
+                || self.learned(&upper)
+                || (self.restricted && matches_any(&upper, CREDENTIAL_PATTERNS)))
     }
 
     /// Whether `${name}` in a base URL the host wrote stays unexpanded:
     /// the host's `deny` and [`BUILTIN_DENY`] only. A catalog URL is built
     /// from the very variables [`ShellEnvPolicy::denied`] keeps from a
-    /// shell (`${AZURE_RESOURCE_NAME}`, `${AWS_REGION}`), so this is the
-    /// narrower question.
+    /// shell (`${AZURE_RESOURCE_NAME}` is a provider `env` name,
+    /// `${AWS_REGION}` a credential pattern), so this is the narrower
+    /// question.
     pub fn withheld_from_urls(&self, name: &str) -> bool {
         let upper = name.to_ascii_uppercase();
         matches_any(&upper, &self.deny)
@@ -304,14 +372,38 @@ impl ShellEnvPolicy {
         env
     }
 
-    /// The environment of a config-named helper, computed from `base`:
-    /// everything except the denied names.
+    /// What a helper starts from before the deny list. Standalone:
+    /// everything, whatever `inherit` says of shells (git needs its
+    /// `HOME`). Restricted: [`RESTRICTED_INHERIT`], `allow`, and what the
+    /// host's own `inherit` adds — never less than the basics, without
+    /// which no helper starts.
+    fn helper_inherited(&self, name: &str) -> bool {
+        if !self.restricted {
+            return true;
+        }
+        matches_any(name, RESTRICTED_INHERIT)
+            || self.allowed(name)
+            || match &self.inherit {
+                Some(Inherit::All) => true,
+                Some(Inherit::List(names)) => matches_any(name, names),
+                Some(Inherit::None) | None => false,
+            }
+    }
+
+    /// The environment of a helper the server starts (an MCP stdio server,
+    /// a language server or its probe, git), computed from `base`:
+    /// everything except the denied names on a standalone server, the
+    /// allowlist on a restricted one. The caller adds the helper's own
+    /// configured environment on top.
     pub fn scrubbed_env_from(
         &self,
         base: impl IntoIterator<Item = (OsString, OsString)>,
     ) -> Vec<(OsString, OsString)> {
         base.into_iter()
-            .filter(|(name, _)| !self.denied(&name.to_string_lossy()))
+            .filter(|(name, _)| {
+                let name = name.to_string_lossy();
+                self.helper_inherited(&name) && !self.denied(&name)
+            })
             .collect()
     }
 
@@ -326,11 +418,37 @@ impl ShellEnvPolicy {
     }
 }
 
+/// [`learn`] source: the `provider.*.env[]` names of the model catalog.
+pub const SOURCE_CATALOG: &str = "catalog";
+/// [`learn`] source: the `provider.*.env[]` names of the host's own config.
+pub const SOURCE_HOST_PROVIDERS: &str = "host-providers";
+/// [`learn`] source: the `{env:NAME}` references of the host's own config
+/// files.
+pub const SOURCE_HOST_REFERENCES: &str = "host-references";
+
+/// [`learn`] source: the `provider.*.env[]` names of the merged config of
+/// the instance at `directory`.
+pub fn source_instance(directory: &std::path::Path) -> String {
+    format!("instance:{}", directory.display())
+}
+
 static CURRENT: RwLock<Option<Arc<ShellEnvPolicy>>> = RwLock::new(None);
 
-/// Make `policy` the process-wide policy.
+/// Make `policy` the process-wide policy, with the names it carries and
+/// no others.
 pub fn install(policy: ShellEnvPolicy) {
     *CURRENT.write().unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(policy));
+}
+
+/// [`ShellEnvPolicy::learn`] on the process-wide policy: called each time
+/// `source` is read again, so that the names follow a config or catalog
+/// reload instead of staying what they were at startup.
+pub fn learn<S: AsRef<str>>(source: &str, names: impl IntoIterator<Item = S>) {
+    let mut current = CURRENT.write().unwrap_or_else(|p| p.into_inner());
+    let mut policy = current.as_deref().cloned().unwrap_or_default();
+    if policy.learn(source, names) {
+        *current = Some(Arc::new(policy));
+    }
 }
 
 /// The process-wide policy: the installed one, else the default.
@@ -347,7 +465,8 @@ pub fn apply_shell(command: &mut std::process::Command) {
     command.env_clear().envs(current().shell_env());
 }
 
-/// Give `command` the scrubbed environment of the current policy.
+/// Give `command` the helper environment of the current policy
+/// ([`ShellEnvPolicy::scrubbed_env`]).
 pub fn apply_scrubbed(command: &mut std::process::Command) {
     command.env_clear().envs(current().scrubbed_env());
 }
@@ -444,7 +563,17 @@ mod tests {
     #[test]
     fn the_default_inherits_everything_but_the_builtin_deny_list() {
         let env = ShellEnvPolicy::default().shell_env_from(base());
-        assert_eq!(names(&env), ["EDITOR", "HOME", "LC_ALL", "PATH"]);
+        assert_eq!(
+            names(&env),
+            [
+                "AWS_ACCESS_KEY_ID",
+                "EDITOR",
+                "HOME",
+                "LC_ALL",
+                "MY_APP_TOKEN",
+                "PATH"
+            ]
+        );
         assert_eq!(ShellEnvPolicy::from_config(None), ShellEnvPolicy::default());
     }
 
@@ -499,7 +628,10 @@ mod tests {
     fn helpers_keep_everything_but_the_denied_names() {
         let policy = policy(serde_json::json!({ "inherit": "none", "deny": ["MY_*"] }));
         let env = policy.scrubbed_env_from(base());
-        assert_eq!(names(&env), ["EDITOR", "HOME", "LC_ALL", "PATH"]);
+        assert_eq!(
+            names(&env),
+            ["AWS_ACCESS_KEY_ID", "EDITOR", "HOME", "LC_ALL", "PATH"]
+        );
     }
 
     #[test]
@@ -537,10 +669,9 @@ mod tests {
             .collect()
     }
 
-    /// What a server holds besides its model keys: none of it is the
-    /// agent's by default. `ACME_GATEWAY_AUTH` stands for a provider's
-    /// `env` name and `ACME_REFERENCED` for a `{env:}` in the host config —
-    /// names no pattern would catch.
+    /// What a server holds besides its model keys. `ACME_GATEWAY_AUTH`
+    /// stands for a provider's `env` name and `ACME_REFERENCED` for a
+    /// `{env:}` in the host config — names no pattern would catch.
     fn credentials() -> Vec<(OsString, OsString)> {
         env(&[
             ("PATH", "/usr/bin"),
@@ -570,53 +701,203 @@ mod tests {
         policy
     }
 
-    /// M3: `GITHUB_TOKEN`, `AWS_SECRET_ACCESS_KEY`, `HF_TOKEN`, a custom
-    /// provider's key variable, a variable the host config reads through
-    /// `{env:}` and their lower-case spellings all reached the agent's
-    /// shell.
+    /// A standalone install — no bearer auth, no host switch — is the
+    /// user's own machine: `gh`, `aws`, `npm publish`, `psql` and a
+    /// token-reading MCP server find their credentials as they do
+    /// upstream. Only what is alforria's own to protect is withheld: the
+    /// server password, the bearer and webhook secrets, the config and
+    /// auth it was handed through the environment, and the variables a
+    /// provider's key is read from — built in, learned from a config or
+    /// the catalog, or referred to by the host config — whatever the case
+    /// they are spelled in.
     #[test]
-    fn credentials_do_not_reach_a_standalone_shell() {
+    fn a_standalone_child_keeps_the_users_credentials_and_loses_alforrias_own() {
+        let base = env(&[
+            ("PATH", "/usr/bin"),
+            ("HOME", "/home/agent"),
+            ("EDITOR", "vi"),
+            // The user's, for the user's tools.
+            ("GH_TOKEN", "gh"),
+            ("GITHUB_TOKEN", "github"),
+            ("AWS_ACCESS_KEY_ID", "AKIA"),
+            ("AWS_SECRET_ACCESS_KEY", "aws"),
+            ("AWS_PROFILE", "prod"),
+            ("AZURE_CLIENT_ID", "azure"),
+            ("GOOGLE_APPLICATION_CREDENTIALS", "/secrets/gcp.json"),
+            ("NPM_TOKEN", "npm"),
+            ("PGPASSWORD", "pg"),
+            ("DB_PASSWORD", "db"),
+            ("SSH_AUTH_SOCK", "/run/agent.sock"),
+            // alforria's own.
+            ("OPENCODE_SERVER_PASSWORD", "password-leak"),
+            ("opencode_server_password", "password-lower-leak"),
+            ("ALFORRIA_SERVER_TOKEN", "bearer-leak"),
+            ("ALFORRIA_WEBHOOK_SECRET", "webhook-leak"),
+            ("OPENCODE_AUTH_CONTENT", "auth-leak"),
+            ("OPENCODE_CONFIG_CONTENT", "config-leak"),
+            // Provider keys: built in, learned, referred to.
+            ("ANTHROPIC_API_KEY", "builtin-leak"),
+            ("openai_api_key", "builtin-lower-leak"),
+            ("ACME_GATEWAY_AUTH", "provider-leak"),
+            ("acme_gateway_auth", "provider-lower-leak"),
+            ("ACME_REFERENCED", "referenced-leak"),
+        ]);
         let policy = with_names(ShellEnvPolicy::default());
-        let passed = ["CARGO_HOME", "EDITOR", "HOME", "PATH"];
-        assert_eq!(names(&policy.shell_env_from(credentials())), passed);
-        // Nor a helper a config names (an MCP server, a language server).
-        assert_eq!(names(&policy.scrubbed_env_from(credentials())), passed);
+        assert!(!policy.is_restricted());
+        let passed = [
+            "AWS_ACCESS_KEY_ID",
+            "AWS_PROFILE",
+            "AWS_SECRET_ACCESS_KEY",
+            "AZURE_CLIENT_ID",
+            "DB_PASSWORD",
+            "EDITOR",
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "HOME",
+            "NPM_TOKEN",
+            "PATH",
+            "PGPASSWORD",
+            "SSH_AUTH_SOCK",
+        ];
+        assert_eq!(names(&policy.shell_env_from(base.clone())), passed);
+        // A helper (an MCP server, a language server, git) gets the same.
+        assert_eq!(names(&policy.scrubbed_env_from(base)), passed);
     }
 
+    /// A host chooses its posture whatever the mode: a standalone one can
+    /// deny the credential patterns or write its own allowlist, a
+    /// restricted one can hand a credential over or inherit everything
+    /// that does not look like one.
     #[test]
-    fn allow_lets_a_named_credential_through() {
-        let policy = with_names(policy(serde_json::json!({
-            "allow": ["GITHUB_TOKEN", "ACME_GATEWAY_AUTH", "ACME_REFERENCED", "AWS_PROFILE"]
-        })));
-        // Exactly the names written: not their other spellings, and not
-        // the rest of a pattern's family.
+    fn deny_allow_and_inherit_override_either_posture() {
+        // Standalone, tightened by `deny` — matched whatever the case.
+        let policy = with_names(policy_of(
+            serde_json::json!({
+                "deny": ["*_token", "AWS_*", "PGPASSWORD"]
+            }),
+            false,
+        ));
+        let kept = names(&policy.shell_env_from(credentials()));
+        assert_eq!(
+            kept,
+            [
+                "AZURE_CLIENT_ID",
+                "CARGO_HOME",
+                "DB_PASSWORD",
+                "EDITOR",
+                "GOOGLE_APPLICATION_CREDENTIALS",
+                "HOME",
+                "PATH"
+            ]
+        );
+        assert_eq!(names(&policy.scrubbed_env_from(credentials())), kept);
+
+        // Standalone, as an allowlist of its own.
+        let policy = with_names(policy_of(
+            serde_json::json!({
+                "inherit": ["PATH", "HOME", "GITHUB_TOKEN"]
+            }),
+            false,
+        ));
         assert_eq!(
             names(&policy.shell_env_from(credentials())),
+            ["GITHUB_TOKEN", "HOME", "PATH"]
+        );
+
+        // Standalone, releasing a provider's key variable and a referenced
+        // one: exactly the names written, not their other spellings.
+        let policy = with_names(policy_of(
+            serde_json::json!({
+                "allow": ["ACME_GATEWAY_AUTH", "ACME_REFERENCED"],
+                "inherit": ["ACME_*", "acme_*"]
+            }),
+            false,
+        ));
+        assert_eq!(
+            names(&policy.shell_env_from(credentials())),
+            ["ACME_GATEWAY_AUTH", "ACME_REFERENCED"]
+        );
+
+        // Restricted, loosened by `allow`: exactly the names written, not
+        // the rest of a pattern's family.
+        let policy = with_names(policy_of(
+            serde_json::json!({ "allow": ["GITHUB_TOKEN", "AWS_PROFILE", "ACME_GATEWAY_AUTH"] }),
+            true,
+        ));
+        let kept = names(&policy.shell_env_from(credentials()));
+        assert_eq!(
+            kept,
             [
                 "ACME_GATEWAY_AUTH",
-                "ACME_REFERENCED",
                 "AWS_PROFILE",
-                "CARGO_HOME",
-                "EDITOR",
                 "GITHUB_TOKEN",
                 "HOME",
                 "PATH"
             ]
         );
-        // The host's own `deny` is the one thing `allow` does not lift,
-        // and it too matches whatever the case.
-        let policy = with_names(policy_of(
-            serde_json::json!({ "allow": ["GITHUB_TOKEN"], "deny": ["github_*", "editor"] }),
-            false,
-        ));
-        assert_eq!(
-            names(&policy.shell_env_from(credentials())),
-            ["CARGO_HOME", "HOME", "PATH"]
-        );
+        assert_eq!(names(&policy.scrubbed_env_from(credentials())), kept);
+
+        // Restricted, inheriting everything: the credential patterns and
+        // alforria's own still hold.
+        let policy = with_names(policy_of(serde_json::json!({ "inherit": "all" }), true));
+        let kept = names(&policy.shell_env_from(credentials()));
+        assert_eq!(kept, ["CARGO_HOME", "EDITOR", "HOME", "PATH"]);
+        assert_eq!(names(&policy.scrubbed_env_from(credentials())), kept);
+
+        // The host's own `deny` is the one thing `allow` does not lift, in
+        // either posture.
+        for restricted in [false, true] {
+            let policy = with_names(policy_of(
+                serde_json::json!({
+                    "allow": ["GITHUB_TOKEN", "EDITOR"],
+                    "deny": ["github_*", "editor"]
+                }),
+                restricted,
+            ));
+            let kept = names(&policy.shell_env_from(credentials()));
+            assert!(!kept.contains(&"GITHUB_TOKEN".to_string()), "{kept:?}");
+            assert!(!kept.contains(&"github_token".to_string()), "{kept:?}");
+            assert!(!kept.contains(&"EDITOR".to_string()), "{kept:?}");
+        }
     }
 
-    /// With bearer auth the default is an allowlist: what is not on it
-    /// does not pass, whatever it is called.
+    /// The names learned from a config or the catalog follow a reload:
+    /// each source's names replace what it said before, and one source
+    /// never forgets for another.
+    #[test]
+    fn a_source_read_again_replaces_its_names() {
+        let mut policy = ShellEnvPolicy::default();
+        assert!(policy.learn(SOURCE_CATALOG, ["CATALOG_ONE", "shared_auth"]));
+        assert!(policy.learn(SOURCE_HOST_PROVIDERS, ["HOST_ONE", "SHARED_AUTH"]));
+        for name in ["CATALOG_ONE", "catalog_one", "HOST_ONE", "SHARED_AUTH"] {
+            assert!(policy.denied(name), "{name} must be denied");
+        }
+        // Unchanged: nothing to swap.
+        assert!(!policy.learn(SOURCE_CATALOG, ["SHARED_AUTH", "catalog_one"]));
+
+        // The catalog now names another variable.
+        assert!(policy.learn(SOURCE_CATALOG, ["CATALOG_TWO"]));
+        assert!(!policy.denied("CATALOG_ONE"));
+        assert!(policy.denied("CATALOG_TWO"));
+        // Still the host's.
+        assert!(policy.denied("SHARED_AUTH"));
+        assert!(policy.denied("HOST_ONE"));
+
+        // A source with nothing left releases its names; the basics are
+        // never learned.
+        assert!(policy.learn(SOURCE_HOST_PROVIDERS, [] as [&str; 0]));
+        assert!(!policy.learn(SOURCE_HOST_PROVIDERS, ["PATH", "HOME", ""]));
+        assert!(!policy.denied("HOST_ONE"));
+        assert!(!policy.denied("SHARED_AUTH"));
+        assert!(!policy.denied("PATH"));
+        assert!(policy.learn(SOURCE_CATALOG, [] as [&str; 0]));
+        assert_eq!(policy, ShellEnvPolicy::default());
+    }
+
+    /// On a restricted server the default is an allowlist: what is not on
+    /// it does not pass, whatever it is called — to a shell or to a helper
+    /// the server starts (an MCP stdio server, a language server, git).
     #[test]
     fn a_restricted_server_passes_only_the_allowlist() {
         let mut base = credentials();
@@ -638,6 +919,7 @@ mod tests {
         ];
         let policy = with_names(ShellEnvPolicy::default().restricted(true));
         assert_eq!(names(&policy.shell_env_from(base.clone())), basics);
+        assert_eq!(names(&policy.scrubbed_env_from(base.clone())), basics);
         assert_eq!(
             with_names(ShellEnvPolicy::from_config(None).restricted(true)),
             policy
@@ -663,6 +945,10 @@ mod tests {
         expected.sort();
         assert_eq!(names(&env), expected);
         assert_eq!(value(&env, "TERM").as_deref(), Some("dumb"));
+        // A helper gets the same names; `set` is for shells.
+        let env = policy.scrubbed_env_from(base.clone());
+        assert_eq!(names(&env), expected);
+        assert_eq!(value(&env, "TERM").as_deref(), Some("xterm"));
 
         // A host that sets `inherit` has said what it wants; the deny list
         // still holds.
@@ -675,7 +961,19 @@ mod tests {
             serde_json::json!({ "inherit": ["PATH", "INNOCUOUS"] }),
             true,
         );
-        assert_eq!(names(&policy.shell_env_from(base)), ["INNOCUOUS", "PATH"]);
+        assert_eq!(
+            names(&policy.shell_env_from(base.clone())),
+            ["INNOCUOUS", "PATH"]
+        );
+        // A helper keeps the basics under any `inherit`: without them it
+        // does not start.
+        let mut expected = basics.to_vec();
+        expected.push("INNOCUOUS");
+        expected.sort();
+        assert_eq!(names(&policy.scrubbed_env_from(base.clone())), expected);
+        let policy = policy_of(serde_json::json!({ "inherit": "none" }), true);
+        assert_eq!(names(&policy.shell_env_from(base.clone())), [""; 0]);
+        assert_eq!(names(&policy.scrubbed_env_from(base)), basics);
     }
 
     /// A host config that reads `{env:HOME}` must not cost the shell its
@@ -695,7 +993,7 @@ mod tests {
     /// only the secrets themselves stay out of a URL.
     #[test]
     fn a_base_url_is_refused_secrets_only() {
-        let mut policy = policy(serde_json::json!({ "deny": ["MY_*"] }));
+        let mut policy = policy_of(serde_json::json!({ "deny": ["MY_*"] }), true);
         policy.deny_names(["AZURE_RESOURCE_NAME", "CLOUDFLARE_ACCOUNT_ID"]);
         for name in ["AZURE_RESOURCE_NAME", "CLOUDFLARE_ACCOUNT_ID", "AWS_REGION"] {
             assert!(policy.denied(name), "{name} is kept from a shell");

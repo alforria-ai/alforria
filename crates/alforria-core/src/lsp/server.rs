@@ -1513,7 +1513,11 @@ mod tests {
             .collect();
         names.sort();
         // Nothing of this process's own environment either: the probe
-        // starts from `base` alone.
-        assert_eq!(names, ["PATH", "PROBE_VISIBLE"]);
+        // starts from `base` alone. On a standalone install the user's
+        // own credentials pass, as they do to the server it probes for.
+        assert_eq!(
+            names,
+            ["GITHUB_TOKEN", "PATH", "PROBE_VISIBLE", "github_token"]
+        );
     }
 }
