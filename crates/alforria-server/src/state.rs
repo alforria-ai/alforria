@@ -373,6 +373,9 @@ impl InstanceStore {
             .remove(&directory)
             .is_some();
         if removed {
+            // What the instance's config had the shell environment policy
+            // withhold goes with it; the next boot learns it again.
+            forget_instance_names(&directory);
             self.emit_disposed(&directory.display().to_string());
         }
     }
@@ -388,9 +391,17 @@ impl InstanceStore {
             .map(|(directory, _)| directory)
             .collect();
         for directory in removed {
+            forget_instance_names(&directory);
             self.emit_disposed(&directory.display().to_string());
         }
     }
+}
+
+fn forget_instance_names(directory: &Path) {
+    alforria_core::shell_env::learn(
+        &alforria_core::shell_env::source_instance(directory),
+        [] as [&str; 0],
+    );
 }
 
 /// `FSUtil.resolve` (`core/src/fs-util.ts:247-258`): `path.resolve` against
@@ -1492,6 +1503,21 @@ pub fn catalog_in(
     Arc::new(move || {
         let mut providers = service.get()?;
         libertai.merge(&mut providers);
+        Ok(providers)
+    })
+}
+
+/// `source`, with every read teaching the shell environment policy the
+/// variables the catalog's providers read their keys from
+/// (`alforria_core::shell_env::SOURCE_CATALOG`): the names follow the
+/// catalog as it is now, not as it was when the server started.
+pub fn learning_catalog(source: CatalogSource) -> CatalogSource {
+    Arc::new(move || {
+        let providers = source()?;
+        alforria_core::shell_env::learn(
+            alforria_core::shell_env::SOURCE_CATALOG,
+            providers.values().flat_map(|provider| provider.env.iter()),
+        );
         Ok(providers)
     })
 }

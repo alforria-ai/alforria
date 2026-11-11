@@ -428,7 +428,7 @@ pub fn production_context(
     // M7.7: the provider-runtime inputs — the models-dev catalog and the
     // `auth.json` store shared by the routes and every instance engine.
     let runtime = engine::EngineRuntime {
-        catalog: state::catalog_in(paths.cache.clone(), libertai_catalog),
+        catalog: state::learning_catalog(state::catalog_in(paths.cache.clone(), libertai_catalog)),
         auth: Arc::new(state::FileAuthStore::new(paths.data.join("auth.json"))),
         schedule: opts.schedule,
     };
@@ -449,13 +449,6 @@ pub fn production_context(
             outbox::Outbox::new(storage.clone(), None).map_err(io::Error::other)?
         }
     };
-    // The variables the catalog's providers read their keys from are kept
-    // from the agent's processes, whatever they are called.
-    if let Ok(providers) = (runtime.catalog)() {
-        policy
-            .shell_env
-            .deny_names(providers.values().flat_map(|provider| provider.env.iter()));
-    }
     let policy = Arc::new(policy);
     // The unattended policy sits on each instance's ask services.
     instances.set_on_boot({
@@ -486,6 +479,10 @@ pub fn production_context(
     ctx.policy = policy;
     ctx.outbox = outbox;
     alforria_core::shell_env::install(ctx.policy.shell_env.clone());
+    // The variables the catalog's providers read their keys from are kept
+    // from the agent's processes, whatever they are called: learned now,
+    // and again at every later read (`state::learning_catalog`).
+    let _ = (runtime.catalog)();
     ctx.hosts = middleware::host::HostAllowlist::new(&opts.hostname, &opts.hosts, &opts.cors);
     ctx.engine_factory = engines.factory();
     ctx.tools = engines.tools();
@@ -589,6 +586,33 @@ fn production_instance_factory(
     InstanceStore::new(factory)
 }
 
+/// Teach the shell environment policy the variables the configs of the
+/// instance at `params.directory` read a key or a secret from, replacing
+/// what the previous boot learned: the host's own (`provider.*.env[]`,
+/// `{env:NAME}`), shared by every instance, and this instance's — its
+/// merged config's providers (a project can declare one of its own) and
+/// the `{env:NAME}` of its project files. A name is withheld while any
+/// source names it.
+fn learn_config_names(
+    params: &alforria_core::LoadParams,
+    config: &alforria_core::config::schema::Config,
+    host_config: &alforria_core::config::schema::Config,
+) {
+    use alforria_core::shell_env;
+    let loader = alforria_core::ConfigLoader::new();
+    shell_env::learn(
+        shell_env::SOURCE_HOST_PROVIDERS,
+        policy::provider_env_names(host_config),
+    );
+    shell_env::learn(
+        shell_env::SOURCE_HOST_REFERENCES,
+        loader.host_env_references(params),
+    );
+    let mut names: Vec<String> = policy::provider_env_names(config).cloned().collect();
+    names.extend(loader.project_env_references(params));
+    shell_env::learn(&shell_env::source_instance(&params.directory), names);
+}
+
 /// One instance boot: config load + project resolution + service wiring
 /// (TS `InstanceStore.boot` + `InstanceBootstrap.run`,
 /// `project/instance-store.ts:45-61`).
@@ -602,6 +626,10 @@ fn instance_for_directory(
 ) -> Result<Arc<alforria_core::SessionServices>, ServerError> {
     let params = alforria_core::LoadParams::new(directory.to_path_buf(), paths.clone());
     let (config, _opencode_dirs) = alforria_core::ConfigLoader::new().load(&params)?;
+    let host_config = alforria_core::ConfigLoader::new().load_trusted(&params)?;
+    // A boot is where a config is read again: what it has the shell
+    // environment policy withhold replaces what the last one said.
+    learn_config_names(&params, &config, &host_config);
 
     // `skill.dirs()` — directory sources from the config (`skills.paths`);
     // http(s) entries are URL sources materialized through the discovery
@@ -691,7 +719,7 @@ fn instance_for_directory(
         home: paths.home.clone(),
         // The host's own config is the ceiling of every agent's rules: a
         // project's config narrows a permission, never widens one.
-        host_config: Some(alforria_core::ConfigLoader::new().load_trusted(&params)?),
+        host_config: Some(host_config),
         // What a restricted or outside-input session's tools may not
         // write: everything the loaders consult for this instance.
         protected: Some(Arc::new(alforria_core::protect::Protected::for_instance(

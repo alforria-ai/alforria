@@ -885,19 +885,35 @@ impl ConfigLoader {
             }
         }
         files.extend(flags_value(&params.flags.config).map(PathBuf::from));
-        let mut texts: Vec<String> = files
-            .iter()
-            .filter_map(|file| fs::read_to_string(file).ok())
-            .collect();
-        texts.extend(flags_value(&params.flags.config_content).map(str::to_string));
-        let mut names: Vec<String> = texts
-            .iter()
-            .flat_map(|text| super::variable::env_references(text))
-            .map(str::to_string)
-            .collect();
-        names.sort();
-        names.dedup();
-        names
+        env_references_in(&files, flags_value(&params.flags.config_content))
+    }
+
+    /// Every variable the project's own config files at
+    /// `params.directory` refer to through `{env:NAME}`: the project files
+    /// from the directory up to the worktree and the `.opencode`
+    /// directories beside them, read as text. A project that reads a key
+    /// from a variable has named one the agent's processes should not see
+    /// (`shell_env::learn`, per instance). A remote config is not a file
+    /// and adds nothing here.
+    pub fn project_env_references(&self, params: &LoadParams) -> Vec<String> {
+        if params.flags.disable_project_config {
+            return Vec::new();
+        }
+        let mut files = up(
+            crate::project_files::PROJECT_CONFIG_FILES,
+            &params.directory,
+            params.worktree.as_deref(),
+        );
+        for dir in up(
+            &[crate::project_files::CONFIG_DIR],
+            &params.directory,
+            params.worktree.as_deref(),
+        ) {
+            for name in ["opencode.json", "opencode.jsonc"] {
+                files.push(dir.join(name));
+            }
+        }
+        env_references_in(&files, None)
     }
 
     /// Load and merge everything; returns the validated config plus the
@@ -1484,6 +1500,24 @@ impl ConfigLoader {
         }
         self.load_config(&text, Source::Path(path.to_path_buf()), env, rules)
     }
+}
+
+/// The `{env:NAME}` names in `files` (those that can be read) and in
+/// `content`, sorted, each once.
+fn env_references_in(files: &[PathBuf], content: Option<&str>) -> Vec<String> {
+    let mut texts: Vec<String> = files
+        .iter()
+        .filter_map(|file| fs::read_to_string(file).ok())
+        .collect();
+    texts.extend(content.map(str::to_string));
+    let mut names: Vec<String> = texts
+        .iter()
+        .flat_map(|text| super::variable::env_references(text))
+        .map(str::to_string)
+        .collect();
+    names.sort();
+    names.dedup();
+    names
 }
 
 /// Tell a standalone user, once per file and reference, which `{env:}` and
