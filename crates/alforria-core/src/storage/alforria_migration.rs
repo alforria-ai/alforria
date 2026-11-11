@@ -14,6 +14,10 @@
 //! [`MIGRATIONS`]. Never edit a file that has shipped, never rename an id
 //! and never reorder the list: the journal knows a migration by its id, and
 //! a database that has already run it must find the same id again.
+//! To change what a shipped migration did, add a new one that repairs it, as
+//! `0008_session_mark_backfill` does for `memory_0002_provenance`, whose
+//! body was once edited in place. The bodies an id used to have are kept
+//! under `alforria_migrations/test_data/` and only tests read them.
 //!
 //! The first five ids come from two branches that each grew a migration set
 //! of their own before they were merged (`0001`/`0002` and the
@@ -56,6 +60,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
     (
         "0007_session_ceiling",
         include_str!("alforria_migrations/0007_session_ceiling.sql"),
+    ),
+    (
+        "0008_session_mark_backfill",
+        include_str!("alforria_migrations/0008_session_mark_backfill.sql"),
     ),
 ];
 
@@ -522,6 +530,495 @@ mod tests {
                 .unwrap_or_else(|| panic!("{id}: later migrations are <number>_<area>_<what>"));
             assert!(number > last, "{id} is out of order");
             last = number;
+        }
+    }
+
+    const BACKFILL: &str = "0008_session_mark_backfill";
+
+    /// The body `memory_0002_provenance` had at commit 8068a0d, before it
+    /// was edited in place under the same id. Test data: a database that
+    /// ran it must end where one that ran the current body does.
+    const MEMORY_0002_AT_8068A0D: &str =
+        include_str!("alforria_migrations/test_data/memory_0002_provenance.historical_8068a0d.sql");
+
+    /// Every migration before `id`: the database a build without it left.
+    fn until(id: &str) -> Vec<(&'static str, &'static str)> {
+        assert!(MIGRATIONS.iter().any(|(known, _)| *known == id), "{id}");
+        MIGRATIONS
+            .iter()
+            .copied()
+            .take_while(|(known, _)| *known != id)
+            .collect()
+    }
+
+    fn project(conn: &Connection) {
+        conn.execute_batch(
+            "INSERT INTO project (id, worktree, sandboxes, time_created, time_updated) VALUES ('proj', '/p', '[]', 1, 1);",
+        )
+        .unwrap();
+    }
+
+    fn session(conn: &Connection, id: &str, parent: Option<&str>, metadata: Option<&str>) {
+        conn.execute(
+            "INSERT INTO session (id, project_id, parent_id, slug, directory, title, version, metadata, time_created, time_updated)
+             VALUES (?1, 'proj', ?2, ?1, '/p', 't', '1', ?3, 1, 1)",
+            rusqlite::params![id, parent, metadata],
+        )
+        .unwrap();
+    }
+
+    /// `(outside_content, outside_start)`, by the one definition.
+    fn marks(conn: &Connection, id: &str) -> (bool, bool) {
+        use crate::session::store::SessionMark;
+        conn.query_row(
+            &format!(
+                "SELECT {}, {}",
+                SessionMark::OutsideContent.sql("?1"),
+                SessionMark::OutsideStart.sql("?1")
+            ),
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+    }
+
+    /// A session's `outside-input` ceiling, as stored.
+    fn outside_ceiling_of(conn: &Connection, id: &str) -> Option<String> {
+        use rusqlite::OptionalExtension;
+        conn.query_row(
+            "SELECT readings FROM session_ceiling WHERE session_id = ?1 AND name = ?2",
+            [id, crate::trigger::OUTSIDE_CEILING],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap()
+    }
+
+    /// The read-only ceiling of a trigger with no block of its own, as the
+    /// live code stores it.
+    fn read_only_ceiling() -> String {
+        serde_json::to_string(&vec![crate::trigger::outside_ceiling(&Vec::new())]).unwrap()
+    }
+
+    /// `(trust, provenance.untrusted)` of a memory record.
+    fn trust(conn: &Connection, id: &str) -> (String, Option<bool>) {
+        conn.query_row(
+            "SELECT trust, CASE WHEN json_valid(provenance) THEN json_extract(provenance, '$.untrusted') END
+             FROM memory WHERE id = ?1",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+    }
+
+    fn verified() -> (String, Option<bool>) {
+        ("verified".to_string(), Some(false))
+    }
+
+    fn demoted() -> (String, Option<bool>) {
+        ("unverified".to_string(), Some(true))
+    }
+
+    /// M4. `memory_0002_provenance` had two bodies under one id. A database
+    /// that ran either ends with the schema of a fresh one, the descendants
+    /// of a webhook run marked, and the record one of them wrote at depth 3
+    /// unverified. (The first body looked at a session and its direct
+    /// parent only, and promoted that record.)
+    #[test]
+    fn a_database_that_ran_either_body_of_memory_0002_ends_like_a_fresh_one() {
+        let current = subset(&["memory_0002_provenance"])[0].1;
+        assert_ne!(MEMORY_0002_AT_8068A0D, current);
+        let fresh = {
+            let mut conn = upstream();
+            apply(&mut conn).unwrap();
+            (own_objects(&conn), upstream_objects(&conn))
+        };
+        for (name, body) in [
+            ("the body at 8068a0d", MEMORY_0002_AT_8068A0D),
+            ("the current body", current),
+        ] {
+            // The assistant branch's set, as the build of that time had it.
+            let mut conn = upstream();
+            apply_set(
+                &mut conn,
+                &subset(&["trigger_0001_init", "memory_0001_init"]),
+            )
+            .unwrap();
+            project(&conn);
+            session(&conn, "ses_ok", None, None);
+            session(&conn, "ses_hook", None, Some(r#"{"untrustedInput":true}"#));
+            session(&conn, "ses_child", Some("ses_hook"), None);
+            session(&conn, "ses_grand", Some("ses_child"), None);
+            for (id, session_id) in [("mem_grand", "ses_grand"), ("mem_ok", "ses_ok")] {
+                conn.execute(
+                    "INSERT INTO memory (id, project_id, kind, content, metadata, time_created, time_updated)
+                     VALUES (?1, 'proj', 'note', 'planted by the webhook body', json_object('sessionID', ?2), 1, 1)",
+                    [id, session_id],
+                )
+                .unwrap();
+            }
+            apply_set(&mut conn, &[("memory_0002_provenance", body)]).unwrap();
+            // This build opens it.
+            apply(&mut conn).unwrap();
+            apply(&mut conn).unwrap();
+            assert_eq!(own_objects(&conn), fresh.0, "{name}");
+            assert_eq!(upstream_objects(&conn), fresh.1, "{name}");
+            let mut ids = journal(&conn);
+            ids.sort();
+            let mut expected = all_ids();
+            expected.sort();
+            assert_eq!(ids, expected, "{name}");
+            assert_eq!(trust(&conn, "mem_grand"), demoted(), "{name}");
+            assert_eq!(trust(&conn, "mem_ok"), verified(), "{name}");
+            for id in ["ses_hook", "ses_child", "ses_grand"] {
+                assert_eq!(marks(&conn, id), (true, true), "{name}: {id}");
+                assert_eq!(
+                    outside_ceiling_of(&conn, id),
+                    Some(read_only_ceiling()),
+                    "{name}: {id}"
+                );
+            }
+            assert_eq!(marks(&conn, "ses_ok"), (false, false), "{name}");
+            assert_eq!(outside_ceiling_of(&conn, "ses_ok"), None, "{name}");
+        }
+    }
+
+    /// M5, step by step. A session with `metadata.triggerID` gets both
+    /// marks and the read-only ceiling unless its trigger is stored, parses
+    /// and is plainly started by the clock; its descendants follow it.
+    #[test]
+    fn a_trigger_s_session_is_marked_unless_its_trigger_is_plainly_started_by_the_clock() {
+        let mut conn = upstream();
+        apply_set(&mut conn, &until(BACKFILL)).unwrap();
+        project(&conn);
+        let clock = [
+            (
+                "cron",
+                r#"{"on":{"cron":"0 9 * * *","timezone":"Europe/Paris"},"prompt":"p"}"#,
+            ),
+            (
+                "interval",
+                r#"{"on":{"interval":"1h"},"prompt":"p","session":"reuse","inheritedPermission":[]}"#,
+            ),
+            ("at", r#"{"on":{"at":"2027-01-01T00:00:00Z"},"prompt":"p"}"#),
+            (
+                "cron_explicit",
+                r#"{"on":{"cron":"* * * * *","webhook":false,"watch":null},"prompt":"p"}"#,
+            ),
+        ];
+        let outside = [
+            ("webhook", r#"{"on":{"webhook":true},"prompt":"p"}"#),
+            ("watch", r#"{"on":{"watch":{"path":"inbox"}},"prompt":"p"}"#),
+            // Not something a build would store; nothing here is taken on
+            // trust.
+            (
+                "cron_and_webhook",
+                r#"{"on":{"cron":"* * * * *","webhook":true},"prompt":"p"}"#,
+            ),
+            (
+                "cron_and_watch",
+                r#"{"on":{"cron":"* * * * *","watch":{"path":"x"}},"prompt":"p"}"#,
+            ),
+            (
+                "webhook_as_number",
+                r#"{"on":{"cron":"* * * * *","webhook":1},"prompt":"p"}"#,
+            ),
+            (
+                "unknown_kind",
+                r#"{"on":{"cron":"* * * * *","mail":true},"prompt":"p"}"#,
+            ),
+            ("no_kind", r#"{"on":{},"prompt":"p"}"#),
+            ("no_on", r#"{"prompt":"p"}"#),
+            ("on_is_text", r#"{"on":"cron","prompt":"p"}"#),
+            ("cron_is_not_text", r#"{"on":{"cron":true},"prompt":"p"}"#),
+            ("not_json", "not json"),
+            ("cut_short", r#"{"on":{"cron":"* * * * *""#),
+        ];
+        let store = |directory: &str, id: &str, spec: &str| {
+            conn.execute(
+                "INSERT INTO \"trigger\" (directory, id, project_id, spec, time_created, time_updated)
+                 VALUES (?1, ?2, 'proj', ?3, 1, 1)",
+                [directory, id, spec],
+            )
+            .unwrap();
+        };
+        for (id, spec) in clock.iter().chain(&outside) {
+            store("/p", id, spec);
+            session(
+                &conn,
+                &format!("ses_{id}"),
+                None,
+                Some(&serde_json::json!({ "triggerID": id, "note": 1 }).to_string()),
+            );
+        }
+        // A clock trigger of that name, but of another directory; and one
+        // whose id only matches a number loosely.
+        store("/elsewhere", "elsewhere", clock[0].1);
+        session(
+            &conn,
+            "ses_elsewhere",
+            None,
+            Some(r#"{"triggerID":"elsewhere"}"#),
+        );
+        store("/p", "7", clock[0].1);
+        session(&conn, "ses_number", None, Some(r#"{"triggerID":7}"#));
+        // No row: deleted since, or declared in the config only.
+        session(&conn, "ses_gone", None, Some(r#"{"triggerID":"gone"}"#));
+        session(&conn, "ses_null", None, Some(r#"{"triggerID":null}"#));
+        // Below a marked one, and below one that is not.
+        session(&conn, "ses_webhook_child", Some("ses_webhook"), None);
+        session(
+            &conn,
+            "ses_webhook_grand",
+            Some("ses_webhook_child"),
+            Some(r#"{"k":"v"}"#),
+        );
+        session(&conn, "ses_gone_child", Some("ses_gone"), None);
+        session(&conn, "ses_cron_child", Some("ses_cron"), None);
+        // No trigger started these.
+        session(&conn, "ses_plain", None, None);
+        session(&conn, "ses_other", None, Some(r#"{"note":"triggerID"}"#));
+        session(&conn, "ses_bad", None, Some("not json"));
+
+        apply(&mut conn).unwrap();
+
+        let mut unmarked: Vec<String> = clock.iter().map(|(id, _)| format!("ses_{id}")).collect();
+        unmarked.extend(["ses_cron_child", "ses_plain", "ses_other", "ses_bad"].map(String::from));
+        for id in &unmarked {
+            assert_eq!(marks(&conn, id), (false, false), "{id}");
+            assert_eq!(outside_ceiling_of(&conn, id), None, "{id}");
+        }
+        let mut marked: Vec<String> = outside.iter().map(|(id, _)| format!("ses_{id}")).collect();
+        marked.extend(
+            [
+                "ses_elsewhere",
+                "ses_number",
+                "ses_gone",
+                "ses_null",
+                "ses_webhook_child",
+                "ses_webhook_grand",
+                "ses_gone_child",
+            ]
+            .map(String::from),
+        );
+        for id in &marked {
+            assert_eq!(marks(&conn, id), (true, true), "{id}");
+            assert_eq!(
+                outside_ceiling_of(&conn, id),
+                Some(read_only_ceiling()),
+                "{id}"
+            );
+        }
+        let sessions: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            sessions as usize,
+            marked.len() + unmarked.len(),
+            "every case is checked"
+        );
+        // The metadata is the session's still.
+        let kept: String = conn
+            .query_row(
+                "SELECT metadata FROM session WHERE id = 'ses_webhook'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, r#"{"note":1,"triggerID":"webhook"}"#);
+    }
+
+    /// The backfill on a database with nothing in it writes nothing, and a
+    /// second run over one it has repaired changes nothing: marks and
+    /// ceilings that exist are kept as they are, records are demoted once.
+    #[test]
+    fn the_backfill_is_a_no_op_on_an_empty_database_and_the_second_time() {
+        let body = subset(&[BACKFILL])[0].1;
+        // The marks it reads and writes are the ones the lookups read.
+        for mark in [
+            crate::session::store::SessionMark::OutsideStart,
+            crate::session::store::SessionMark::OutsideContent,
+        ] {
+            assert!(body.contains(&format!("'{}'", mark.as_str())), "{mark:?}");
+        }
+        assert!(body.contains(
+            &crate::session::store::SessionMark::OutsideContent
+                .sql("json_extract(memory.provenance, '$.sessionID')")
+        ));
+        assert!(body.contains(&format!("'{}'", read_only_ceiling())));
+        assert!(body.contains(&format!("'{}'", crate::trigger::OUTSIDE_CEILING)));
+
+        let mut conn = upstream();
+        apply(&mut conn).unwrap();
+        let rows = |conn: &Connection| -> Vec<String> {
+            let mut out = column(
+                conn,
+                "SELECT 'mark|' || session_id || '|' || mark || '|' || time_created FROM session_mark",
+            );
+            out.extend(column(
+                conn,
+                "SELECT 'ceiling|' || session_id || '|' || name || '|' || readings || '|' || time_updated FROM session_ceiling",
+            ));
+            out.extend(column(
+                conn,
+                "SELECT 'memory|' || id || '|' || trust || '|' || COALESCE(provenance, '') || '|' || time_updated FROM memory",
+            ));
+            out.extend(column(
+                conn,
+                "SELECT 'session|' || id || '|' || COALESCE(metadata, '') FROM session",
+            ));
+            out.sort();
+            out
+        };
+        assert!(rows(&conn).is_empty(), "nothing to repair, nothing written");
+
+        project(&conn);
+        // As 0006 left a session it took the mark from the metadata of:
+        // marked, no ceiling. Its child predates inheritance.
+        session(&conn, "ses_carried", None, None);
+        session(&conn, "ses_carried_child", Some("ses_carried"), None);
+        // As this build makes a webhook run's session: marked, with the
+        // ceiling its trigger's block gives it.
+        session(&conn, "ses_run", None, Some(r#"{"triggerID":"hook"}"#));
+        // Provenance only: it read a web page. No ceiling, and its child
+        // (made before it did) is not its business.
+        session(&conn, "ses_read", None, None);
+        session(&conn, "ses_read_child", Some("ses_read"), None);
+        session(&conn, "ses_clean", None, None);
+        let own = r#"[[{"permission":"*","pattern":"*","action":"deny"},{"permission":"bash","pattern":"git status","action":"allow"}]]"#;
+        conn.execute_batch(&format!(
+            "INSERT INTO session_mark (session_id, mark, time_created) VALUES
+                ('ses_carried', 'outside_start', 5), ('ses_carried', 'outside_content', 5),
+                ('ses_run', 'outside_start', 5), ('ses_run', 'outside_content', 5),
+                ('ses_read', 'outside_content', 5);
+             INSERT INTO session_ceiling (session_id, name, readings, time_updated) VALUES
+                ('ses_run', 'outside-input', '{own}', 5),
+                ('ses_run', 'trigger-creator', '[[]]', 5);"
+        ))
+        .unwrap();
+        for (id, trust, provenance) in [
+            (
+                "mem_child",
+                "verified",
+                Some(r#"{"source":"tool","sessionID":"ses_carried_child","untrusted":false}"#),
+            ),
+            (
+                "mem_read",
+                "verified",
+                Some(r#"{"source":"tool","sessionID":"ses_read","untrusted":false,"history":[]}"#),
+            ),
+            (
+                "mem_gone",
+                "verified",
+                Some(r#"{"source":"tool","sessionID":"ses_deleted","untrusted":false}"#),
+            ),
+            (
+                "mem_no_session",
+                "verified",
+                Some(r#"{"source":"tool","untrusted":false}"#),
+            ),
+            (
+                "mem_flush_gone",
+                "unverified",
+                Some(r#"{"source":"flush","sessionID":"ses_deleted","untrusted":false}"#),
+            ),
+            (
+                "mem_clean",
+                "verified",
+                Some(r#"{"source":"tool","sessionID":"ses_clean","untrusted":false}"#),
+            ),
+            (
+                "mem_read_child",
+                "verified",
+                Some(r#"{"source":"tool","sessionID":"ses_read_child","untrusted":false}"#),
+            ),
+            (
+                "mem_api",
+                "verified",
+                Some(r#"{"source":"api","untrusted":false}"#),
+            ),
+            (
+                "mem_flush",
+                "unverified",
+                Some(r#"{"source":"flush","sessionID":"ses_clean","untrusted":false}"#),
+            ),
+            (
+                "mem_already",
+                "unverified",
+                Some(r#"{"source":"tool","sessionID":"ses_run","untrusted":true}"#),
+            ),
+            ("mem_junk", "verified", Some("not json")),
+            ("mem_none", "unverified", None),
+        ] {
+            conn.execute(
+                "INSERT INTO memory (id, project_id, kind, content, trust, provenance, time_created, time_updated)
+                 VALUES (?1, 'proj', 'note', ?1, ?2, ?3, 1, 1)",
+                rusqlite::params![id, trust, provenance],
+            )
+            .unwrap();
+        }
+        let before = rows(&conn);
+
+        conn.execute_batch(body).unwrap();
+        let once = rows(&conn);
+        assert_ne!(once, before);
+        conn.execute_batch(body).unwrap();
+        assert_eq!(rows(&conn), once, "the second run changed something");
+
+        assert_eq!(marks(&conn, "ses_carried_child"), (true, true));
+        for id in ["ses_carried", "ses_carried_child"] {
+            assert_eq!(
+                outside_ceiling_of(&conn, id),
+                Some(read_only_ceiling()),
+                "{id}"
+            );
+        }
+        // What was there is as it was: the run's own ceiling, the time of
+        // its marks, the provenance mark that is no ceiling.
+        assert_eq!(outside_ceiling_of(&conn, "ses_run").as_deref(), Some(own));
+        for kept in [
+            "mark|ses_run|outside_start|5",
+            "mark|ses_carried|outside_content|5",
+            "ceiling|ses_run|trigger-creator|[[]]|5",
+        ] {
+            assert!(once.iter().any(|row| row == kept), "{kept}");
+        }
+        assert_eq!(marks(&conn, "ses_read"), (true, false));
+        assert_eq!(marks(&conn, "ses_read_child"), (false, false));
+        assert_eq!(marks(&conn, "ses_clean"), (false, false));
+        for id in ["ses_read", "ses_read_child", "ses_clean"] {
+            assert_eq!(outside_ceiling_of(&conn, id), None, "{id}");
+        }
+        for id in [
+            "mem_child",
+            "mem_read",
+            "mem_gone",
+            "mem_no_session",
+            "mem_flush_gone",
+        ] {
+            assert_eq!(trust(&conn, id), demoted(), "{id}");
+        }
+        for id in ["mem_clean", "mem_read_child", "mem_api"] {
+            assert_eq!(trust(&conn, id), verified(), "{id}");
+        }
+        // The rest of a demoted origin is kept.
+        assert!(once.iter().any(|row| row
+            == r#"memory|mem_read|unverified|{"source":"tool","sessionID":"ses_read","untrusted":true,"history":[]}|1"#));
+        // Not touched: nothing to learn, or nothing to read.
+        for row in &before {
+            if [
+                "mem_flush|",
+                "mem_already|",
+                "mem_junk|",
+                "mem_none|",
+                "mem_api|",
+                "mem_clean|",
+            ]
+            .iter()
+            .any(|id| row.starts_with(&format!("memory|{id}")))
+            {
+                assert!(once.contains(row), "{row}");
+            }
         }
     }
 }
