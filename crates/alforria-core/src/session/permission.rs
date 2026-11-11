@@ -1623,6 +1623,7 @@ mod tests {
         let instance = crate::tool::def::InstanceContext {
             directory: temp.path().to_path_buf(),
             worktree: temp.path().to_path_buf(),
+            write_guard: None,
         };
         let extra = crate::tool::def::Extra::default();
         let metadata = crate::tool::ripgrep::test_support::RecordingAsk::new();

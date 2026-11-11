@@ -948,6 +948,7 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
     let instance = InstanceContext {
         directory: input.directory.clone(),
         worktree: input.worktree.clone(),
+        write_guard: None,
     };
     let context = alforria_core::session::store::SessionContext {
         project_id: services

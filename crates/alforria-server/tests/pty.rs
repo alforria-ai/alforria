@@ -37,6 +37,7 @@ fn test_services(directory: &std::path::Path) -> Arc<alforria_core::SessionServi
         tmp_dir: directory.to_path_buf(),
         home: directory.to_path_buf(),
         host_config: None,
+        protected: None,
     };
     Arc::new(alforria_core::SessionServices::new(
         storage,

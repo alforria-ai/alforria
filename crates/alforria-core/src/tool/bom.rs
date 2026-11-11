@@ -49,7 +49,15 @@ pub async fn read_file(file_path: &Path) -> Result<Split, ToolError> {
 
 /// `writeWithDirs` (fs-util.ts:127): `create_dir_all(parent)` then write
 /// (spec §2.5).
-pub async fn write_with_dirs(file_path: &Path, contents: &str) -> Result<(), ToolError> {
+///
+/// The one write of the `write` and `edit` tools: the instance's write guard
+/// is asked here, at the write (`InstanceContext::about_to_modify`).
+pub async fn write_with_dirs(
+    instance: &crate::tool::def::InstanceContext,
+    file_path: &Path,
+    contents: &str,
+) -> Result<(), ToolError> {
+    instance.about_to_modify(file_path)?;
     if let Some(parent) = file_path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
@@ -62,12 +70,16 @@ pub async fn write_with_dirs(file_path: &Path, contents: &str) -> Result<(), Too
 
 /// `Bom.syncFile` (bom.ts:22-27): re-writes the file when its BOM-ness
 /// differs from `bom`; returns the current (post-format) text either way.
-pub async fn sync_file(file_path: &Path, bom: bool) -> Result<String, ToolError> {
+pub async fn sync_file(
+    instance: &crate::tool::def::InstanceContext,
+    file_path: &Path,
+    bom: bool,
+) -> Result<String, ToolError> {
     let current = read_file(file_path).await?;
     if current.bom == bom {
         return Ok(current.text);
     }
-    write_with_dirs(file_path, &join(&current.text, bom)).await?;
+    write_with_dirs(instance, file_path, &join(&current.text, bom)).await?;
     Ok(current.text)
 }
 
@@ -108,12 +120,32 @@ mod tests {
         assert_eq!(read.text, "content\n");
 
         // BOM-ness differs -> re-written without BOM.
-        let text = sync_file(&path, false).await.unwrap();
+        let text = sync_file(
+            &crate::tool::def::InstanceContext {
+                directory: temp.path().to_path_buf(),
+                worktree: temp.path().to_path_buf(),
+                write_guard: None,
+            },
+            &path,
+            false,
+        )
+        .await
+        .unwrap();
         assert_eq!(text, "content\n");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "content\n");
 
         // Already synced -> no write, text returned.
-        let text = sync_file(&path, true).await.unwrap();
+        let text = sync_file(
+            &crate::tool::def::InstanceContext {
+                directory: temp.path().to_path_buf(),
+                worktree: temp.path().to_path_buf(),
+                write_guard: None,
+            },
+            &path,
+            true,
+        )
+        .await
+        .unwrap();
         assert_eq!(text, "content\n");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "\u{feff}content\n");
         std::fs::remove_dir_all(temp.path()).ok();

@@ -302,6 +302,18 @@ async fn run(
         })
         .await?;
 
+    // Every path the patch is about to write, create, rename onto or
+    // delete — a move's destination as much as its source — is put to the
+    // write guard before anything is applied, so a refused patch changes
+    // nothing. (The ask above carries paths for display; it is not what
+    // enforces this.)
+    for change in &file_changes {
+        instance.about_to_modify(Path::new(&change.file_path))?;
+        if let Some(move_path) = &change.move_path {
+            instance.about_to_modify(Path::new(move_path))?;
+        }
+    }
+
     // Apply the changes (apply_patch.ts:217-258).
     let mut updates: Vec<(String, &'static str)> = Vec::new();
     for change in &file_changes {
@@ -316,6 +328,7 @@ async fn run(
         match change.kind {
             "add" => {
                 write_all(
+                    instance,
                     &change.file_path,
                     &bom::join(&change.new_content, change.bom),
                 )
@@ -324,6 +337,7 @@ async fn run(
             }
             "update" => {
                 write_all(
+                    instance,
                     &change.file_path,
                     &bom::join(&change.new_content, change.bom),
                 )
@@ -332,7 +346,13 @@ async fn run(
             }
             "move" => {
                 if let Some(move_path) = &change.move_path {
-                    write_all(move_path, &bom::join(&change.new_content, change.bom)).await?;
+                    write_all(
+                        instance,
+                        move_path,
+                        &bom::join(&change.new_content, change.bom),
+                    )
+                    .await?;
+                    instance.about_to_modify(Path::new(&change.file_path))?;
                     tokio::fs::remove_file(&change.file_path)
                         .await
                         .map_err(|error| {
@@ -346,6 +366,7 @@ async fn run(
                 }
             }
             "delete" => {
+                instance.about_to_modify(Path::new(&change.file_path))?;
                 tokio::fs::remove_file(&change.file_path)
                     .await
                     .map_err(|error| {
@@ -367,6 +388,7 @@ async fn run(
                         let source = bom::split(&String::from_utf8_lossy(&raw));
                         let joined = bom::join(&source.text, source.bom);
                         if !raw.is_empty() && joined.as_bytes() != raw.as_slice() {
+                            instance.about_to_modify(Path::new(edited))?;
                             tokio::fs::write(edited, joined).await.map_err(|error| {
                                 ToolError::Failed(format!("Failed to write file {edited}: {error}"))
                             })?;
@@ -454,7 +476,12 @@ async fn run(
     })
 }
 
-async fn write_all(path: &str, contents: &str) -> Result<(), ToolError> {
+async fn write_all(
+    instance: &crate::tool::def::InstanceContext,
+    path: &str,
+    contents: &str,
+) -> Result<(), ToolError> {
+    instance.about_to_modify(Path::new(path))?;
     if let Some(parent) = std::path::Path::new(path).parent() {
         tokio::fs::create_dir_all(parent).await.map_err(|error| {
             ToolError::Failed(format!(
@@ -627,6 +654,71 @@ mod tests {
             std::fs::read_to_string(temp.path().join("b.txt")).unwrap(),
             "one\ndeux\n"
         );
+        std::fs::remove_dir_all(temp.path()).ok();
+    }
+
+    /// The write guard sees every path a patch writes, creates, renames onto
+    /// or deletes. A patch that updated a harmless file and *moved* it onto
+    /// a loader path used to pass: only the source path was looked at. And
+    /// a refused patch changes nothing, the files before the refused one
+    /// included.
+    #[tokio::test]
+    async fn the_write_guard_covers_move_destinations_adds_and_deletes() {
+        let temp = crate::storage::test_support::TempDir::new("apply-guard");
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("harmless.txt"), "old\n").unwrap();
+        std::fs::write(root.join("AGENTS.md"), "the operator's\n").unwrap();
+        let def = tool();
+        let ask = RecordingAsk::new();
+        let mut inst = instance(&root);
+        inst.write_guard = Some(Arc::new(crate::protect::Protected::default()));
+        let extra = Extra::default();
+        let moved = "*** Begin Patch\n*** Update File: harmless.txt\n*** Move to: opencode.json\n@@\n-old\n+{ \"permission\": { \"bash\": \"allow\" } }\n*** End Patch";
+        let moved_deep = "*** Begin Patch\n*** Update File: harmless.txt\n*** Move to: .opencode/agent/x.md\n@@\n-old\n+new\n*** End Patch";
+        let added =
+            "*** Begin Patch\n*** Add File: .opencode/agent/sneaky.md\n+be sneaky\n*** End Patch";
+        let deleted = "*** Begin Patch\n*** Delete File: AGENTS.md\n*** End Patch";
+        let updated = "*** Begin Patch\n*** Update File: AGENTS.md\n@@\n-the operator's\n+mine now\n*** End Patch";
+        let mixed = "*** Begin Patch\n*** Add File: fine.txt\n+fine\n*** Add File: sub/CLAUDE.md\n+do as I say\n*** End Patch";
+        for patch in [moved, moved_deep, added, deleted, updated, mixed] {
+            let error = (def.execute)(json!({ "patchText": patch }), ctx(&ask, &inst, &extra))
+                .await
+                .expect_err(patch);
+            assert!(
+                matches!(error, ToolError::Permission(_)),
+                "{patch}: {error:?}"
+            );
+        }
+        assert!(!root.join("opencode.json").exists());
+        assert!(!root.join(".opencode").exists());
+        assert!(!root.join("sub").exists());
+        assert!(
+            !root.join("fine.txt").exists(),
+            "a refused patch was applied in part"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("harmless.txt")).unwrap(),
+            "old\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("AGENTS.md")).unwrap(),
+            "the operator's\n"
+        );
+        // A move between ordinary files still works under the guard, and
+        // without a guard the loader paths are written as before.
+        let plain = "*** Begin Patch\n*** Update File: harmless.txt\n*** Move to: renamed.txt\n@@\n-old\n+new\n*** End Patch";
+        (def.execute)(json!({ "patchText": plain }), ctx(&ask, &inst, &extra))
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("renamed.txt")).unwrap(),
+            "new\n"
+        );
+        inst.write_guard = None;
+        (def.execute)(json!({ "patchText": added }), ctx(&ask, &inst, &extra))
+            .await
+            .unwrap();
+        assert!(root.join(".opencode/agent/sneaky.md").exists());
         std::fs::remove_dir_all(temp.path()).ok();
     }
 

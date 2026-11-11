@@ -363,6 +363,47 @@ async fn a_bearer_server_does_not_serve_a_directory_holding_its_host_config() {
     );
     assert!(alforria_server::startup_refusal(&f.ctx).is_some());
 
+    // Inside a protected location, or one itself — a directory under the
+    // config directory, the data directory, a place under the state
+    // directory that does not exist yet — and reached through a symlink:
+    // each is refused, with an error naming both paths.
+    fn inside_config(dirs: &Dirs) -> std::path::PathBuf {
+        dirs.home.join(".config/alforria/work")
+    }
+    fn the_data_dir(dirs: &Dirs) -> std::path::PathBuf {
+        dirs.home.join(".local/share/alforria")
+    }
+    fn under_state(dirs: &Dirs) -> std::path::PathBuf {
+        dirs.home.join(".local/state/alforria/not/yet/there")
+    }
+    fn through_a_link(dirs: &Dirs) -> std::path::PathBuf {
+        let link = dirs.other.join("link-to-config");
+        #[cfg(unix)]
+        let _ = std::os::unix::fs::symlink(dirs.home.join(".config"), &link);
+        link.join("alforria/work")
+    }
+    for directory in [inside_config, the_data_dir, under_state, through_a_link] {
+        let f = fixture_with(bearer_over(directory), Some("pw"), Vec::new());
+        let served = directory(&f.dirs);
+        let reason = alforria_server::startup_refusal(&f.ctx)
+            .unwrap_or_else(|| panic!("{} must be refused", served.display()));
+        assert!(reason.contains("overlaps"), "{reason}");
+        assert!(
+            reason.contains(&f.dirs.home.display().to_string()),
+            "both paths are named: {reason}"
+        );
+        let error = alforria_server::listen_with(
+            &alforria_server::ListenOptions {
+                port: 0,
+                ..Default::default()
+            },
+            f.ctx.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("refusing to listen"), "{error}");
+    }
+
     // A project beside the home, and a server without bearer auth over
     // anything: served.
     let f = fixture_with(

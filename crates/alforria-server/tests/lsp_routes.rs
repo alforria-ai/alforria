@@ -66,6 +66,7 @@ fn fixture() -> Fixture {
         tmp_dir: dir.path().to_path_buf(),
         home: dir.path().to_path_buf(),
         host_config: None,
+        protected: None,
     };
     let services = Arc::new(SessionServices::new(
         storage.clone(),

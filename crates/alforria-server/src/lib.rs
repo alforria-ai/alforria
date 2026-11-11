@@ -241,24 +241,27 @@ pub async fn listen_with(opts: &ListenOptions, ctx: Arc<ServerContext>) -> io::R
 /// `$HOME` is the usual way to get there.
 pub fn startup_refusal(ctx: &ServerContext) -> Option<String> {
     ctx.policy.bearer.as_ref()?;
-    let paths = &ctx.paths;
-    let mut locations = vec![("the data directory", paths.data.clone())];
-    if !ctx.policy.managed_only {
-        locations.push(("the global config directory", paths.config.clone()));
-        locations.push(("~/.opencode", paths.home.join(".opencode")));
-    }
+    // The same protected set the write guard is built from
+    // (`alforria_core::protect`), compared both ways and with both sides
+    // resolved alike: a directory that contains a protected location, is
+    // one, or lies inside one.
+    let params = alforria_core::LoadParams::new(ctx.paths.home.clone(), ctx.paths.clone());
+    let protected = alforria_core::protect::Protected::host(
+        &ctx.paths,
+        &alforria_core::ConfigLoader::new().managed_dir(&params),
+        !ctx.policy.managed_only,
+    );
     for root in ctx.policy.directories.roots() {
-        for (name, location) in &locations {
-            if state::resolve_directory(location).starts_with(root) {
-                return Some(format!(
-                    "{} is in server.directories (or is the working directory) and contains \
-                     {name} ({}): the agent could rewrite the host config or read the \
-                     credentials. Serve a directory that does not contain it, or move the host \
-                     config to the managed directory and set server.trust.host to \"managed\".",
-                    root.display(),
-                    location.display()
-                ));
-            }
+        if let Some((what, location)) = protected.overlap(root) {
+            return Some(format!(
+                "{} is in server.directories (or is the working directory) and overlaps {what} \
+                 ({}): one contains the other, so the agent could rewrite the host config, read \
+                 the credentials or replace what the server runs. Serve a directory apart from \
+                 it; for the user's config files, moving the host config to the managed \
+                 directory with server.trust.host \"managed\" lifts this.",
+                root.display(),
+                location.display()
+            ));
         }
     }
     None
@@ -679,6 +682,16 @@ fn instance_for_directory(
         // The host's own config is the ceiling of every agent's rules: a
         // project's config narrows a permission, never widens one.
         host_config: Some(alforria_core::ConfigLoader::new().load_trusted(&params)?),
+        // What a restricted or outside-input session's tools may not
+        // write: everything the loaders consult for this instance.
+        protected: Some(Arc::new(alforria_core::protect::Protected::for_instance(
+            &paths,
+            &alforria_core::ConfigLoader::new().managed_dir(&params),
+            &alforria_core::ConfigLoader::new().search_dirs(&params),
+            &params.flags,
+            &config,
+            directory,
+        ))),
     };
     // M7.2: the background-job service backs the run-state cancel seam.
     let background =

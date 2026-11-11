@@ -2260,68 +2260,217 @@ fn write_turn(path: &str) -> support::Script {
     )
 }
 
-/// The agent's own edit tools do not write the files its configuration is
-/// loaded from when the session is restricted: an `edit` allow used to be
-/// enough for a chat token's session to rewrite `opencode.json`, an agent
-/// or `AGENTS.md`, and the next instance of the project loaded it. The
+/// A host config under which nothing but the write guard stands between a
+/// session's edit tools and a file: `edit` and `external_directory` are
+/// allowed outright.
+fn permissive(signer: &Signer, extra: Value) -> impl FnOnce(&Dirs) -> Value + '_ {
+    move |dirs| {
+        let mut config = host_config(signer)(dirs);
+        config["permission"] = json!({ "edit": "allow", "external_directory": "allow" });
+        config["triggers"] = json!({ "webhook_min_interval": "0s" });
+        config["trigger"] = json!({
+            // A webhook run carries outside input; its own block grants edit.
+            "deliveries": { "on": { "webhook": true }, "prompt": "Handle the delivery",
+                            "permission": { "edit": "allow", "external_directory": "allow" } },
+        });
+        alforria_core::merge_patch(&mut config, &extra);
+        config
+    }
+}
+
+/// Every path the loaders consult for this instance, as files to try to
+/// write: the instance's own protected set (built from the config loader's
+/// search directories, the global paths and the loaded config), and every
+/// loader name in the project, in an ancestor of it, and in the home.
+fn loader_targets(f: &Fixture) -> Vec<std::path::PathBuf> {
+    use alforria_core::project_files::{loader_files, LOADER_DIRS};
+    let services = f.ctx.instances.load(&f.dirs.repo).expect("instance");
+    let protected = services.agents.protected();
+    assert!(protected.locations().len() >= 6, "{protected:?}");
+    let mut targets: Vec<std::path::PathBuf> = protected
+        .locations()
+        .iter()
+        .map(|(_, location)| location.join("zz-guard-probe.txt"))
+        .collect();
+    let ancestor = f.dirs.repo.parent().unwrap().to_path_buf();
+    for base in [
+        f.dirs.repo.clone(),
+        f.dirs.repo.join("sub"),
+        ancestor,
+        f.dirs.home.clone(),
+    ] {
+        for name in loader_files() {
+            targets.push(base.join(name));
+        }
+        for dir in LOADER_DIRS {
+            targets.push(base.join(dir).join("zz-guard-probe.md"));
+        }
+    }
+    targets
+}
+
+async fn prompt_and_settle(f: &Fixture, auth: &str, text: &str) {
+    let session = create_session(f, &f.dirs.repo, auth).await;
+    let response = call(
+        &f.router,
+        "POST",
+        &format!("/session/{session}/prompt_async"),
+        Some(auth),
+        Some(json!({ "parts": [{ "type": "text", "text": text }] })),
+    )
+    .await;
+    assert!(response.status().is_success(), "{}", response.status());
+    wait_idle(f, &session).await;
+}
+
+/// The agent's own edit tools do not write what its configuration is loaded
+/// from when the session is restricted — whichever loader would read the
+/// file and wherever it looks: in the project, in an ancestor directory,
+/// in the home or a global location. The guard is at the write itself, so
+/// it holds with `edit` and `external_directory` allowed outright. The
 /// operator's own session writes them as before, and `edit_loader` in the
 /// host config hands the write back.
 #[tokio::test]
-async fn a_restricted_sessions_edit_tools_refuse_loader_paths() {
+async fn a_restricted_sessions_edit_tools_refuse_every_loader_location() {
     let signer = Signer::new();
-    let targets = [
-        "opencode.json",
-        ".opencode/agent/sneaky.md",
-        "AGENTS.md",
-        "notes.txt",
-    ];
-    let scripts = || -> Vec<support::Script> {
+    // One fixture to learn the targets (their paths differ per fixture, so
+    // the scripts are built per fixture below).
+    let scripts_for = |targets: &[std::path::PathBuf]| -> Vec<support::Script> {
         targets
             .iter()
-            .flat_map(|target| [write_turn(target), support::text_turn("done")])
+            .flat_map(|target| {
+                [
+                    write_turn(&target.display().to_string()),
+                    support::text_turn("done"),
+                ]
+            })
             .collect()
     };
-    let drive = |f: Fixture, auth: String| async move {
-        for target in targets {
-            let session = create_session(&f, &f.dirs.repo, &auth).await;
-            let response = call(
-                &f.router,
-                "POST",
-                &format!("/session/{session}/prompt_async"),
-                Some(&auth),
-                Some(json!({ "parts": [{ "type": "text", "text": format!("write {target}") }] })),
-            )
-            .await;
-            assert!(response.status().is_success(), "{}", response.status());
-            wait_idle(&f, &session).await;
-        }
-        let written: Vec<bool> = targets
-            .iter()
-            .map(|target| f.dirs.repo.join(target).exists())
-            .collect();
-        (f, written)
-    };
 
-    // A chat token's session is restricted.
-    let f = fixture_with(host_config(&signer), Some(PASSWORD), scripts());
+    let f = fixture_with(permissive(&signer, json!({})), Some(PASSWORD), Vec::new());
+    let targets = loader_targets(&f);
+    assert!(targets.len() > 40, "{}", targets.len());
+    f.llm.extend(scripts_for(&targets));
     let chat = bearer(&signer.token(AUDIENCE, "chat"));
-    let (f, written) = drive(f, chat.clone()).await;
-    assert_eq!(written, [false, false, false, true], "{targets:?}");
-    drop(f);
+    for target in &targets {
+        prompt_and_settle(&f, &chat, &format!("write {}", target.display())).await;
+        assert!(
+            !target.exists(),
+            "a restricted session wrote {}",
+            target.display()
+        );
+    }
+    // The guard is not a blanket refusal: an ordinary file is written.
+    f.llm.extend(scripts_for(&[f.dirs.repo.join("notes.txt")]));
+    prompt_and_settle(&f, &chat, "write notes").await;
+    assert!(f.dirs.repo.join("notes.txt").exists());
 
-    // The operator's session is not.
-    let f = fixture_with(host_config(&signer), Some(PASSWORD), scripts());
-    let (f, written) = drive(f, basic()).await;
-    assert_eq!(written, [true, true, true, true], "{targets:?}");
+    // The operator's session is not guarded.
+    let own = [
+        f.dirs.repo.join("opencode.json"),
+        f.dirs.repo.join("AGENTS.md"),
+    ];
+    f.llm.extend(scripts_for(&own));
+    for target in &own {
+        prompt_and_settle(&f, &basic(), "write").await;
+        assert!(target.exists(), "{}", target.display());
+    }
     drop(f);
 
     // The operator's policy can grant it to restricted sessions.
-    let granting = |dirs: &Dirs| {
-        let mut config = host_config(&signer)(dirs);
-        config["permission"] = json!({ "edit_loader": "allow" });
-        config
-    };
-    let f = fixture_with(granting, Some(PASSWORD), scripts());
-    let (_f, written) = drive(f, chat).await;
-    assert_eq!(written, [true, true, true, true], "{targets:?}");
+    let f = fixture_with(
+        permissive(&signer, json!({ "permission": { "edit_loader": "allow" } })),
+        Some(PASSWORD),
+        Vec::new(),
+    );
+    let granted = [
+        f.dirs.repo.join("AGENTS.md"),
+        f.dirs.repo.join(".opencode/agent/a.md"),
+    ];
+    f.llm.extend(scripts_for(&granted));
+    for target in &granted {
+        prompt_and_settle(&f, &chat, "write").await;
+        assert!(target.exists(), "{}", target.display());
+    }
+}
+
+/// A session that carries outside input — a webhook run — is guarded the
+/// same way, though it was the operator's trigger that started it and its
+/// own block grants `edit`.
+#[tokio::test]
+async fn an_outside_input_sessions_edit_tools_refuse_loader_locations() {
+    let signer = Signer::new();
+    let f = fixture_with(permissive(&signer, json!({})), Some(PASSWORD), Vec::new());
+    let mut targets = loader_targets(&f);
+    // Every protected location, and a spread of the names.
+    let locations = f
+        .ctx
+        .instances
+        .load(&f.dirs.repo)
+        .unwrap()
+        .agents
+        .protected()
+        .locations()
+        .len();
+    let names: Vec<_> = targets
+        .split_off(locations)
+        .into_iter()
+        .step_by(5)
+        .collect();
+    targets.extend(names);
+    targets.push(f.dirs.repo.join("notes.txt"));
+    f.llm.extend(
+        targets
+            .iter()
+            .flat_map(|target| {
+                [
+                    write_turn(&target.display().to_string()),
+                    support::text_turn("done"),
+                ]
+            })
+            .collect(),
+    );
+    let dir = dir_query(&f.dirs.repo);
+    for (index, target) in targets.iter().enumerate() {
+        let response = call(
+            &f.router,
+            "POST",
+            &format!("/trigger/deliveries/hook?{dir}"),
+            Some(&basic()),
+            Some(json!({ "delivery": index })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let run = body_json(response).await;
+        // Wait for this run to settle before the next delivery.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let runs = body_json(
+                call(
+                    &f.router,
+                    "GET",
+                    &format!("/trigger/deliveries/runs?{dir}"),
+                    Some(&basic()),
+                    None,
+                )
+                .await,
+            )
+            .await;
+            let settled = runs.as_array().unwrap().iter().any(|entry| {
+                entry["id"] == run["id"]
+                    && entry["status"] != "running"
+                    && entry["status"] != "queued"
+            });
+            if settled {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the run never settled: {runs}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let expected = *target == f.dirs.repo.join("notes.txt");
+        assert_eq!(target.exists(), expected, "{}", target.display());
+    }
 }

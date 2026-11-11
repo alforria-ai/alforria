@@ -57,6 +57,7 @@ fn make_services(dir: &std::path::Path) -> (Arc<SessionServices>, std::path::Pat
         tmp_dir: dir.to_path_buf(),
         home: dir.to_path_buf(),
         host_config: None,
+        protected: None,
     };
     (
         Arc::new(SessionServices::new(

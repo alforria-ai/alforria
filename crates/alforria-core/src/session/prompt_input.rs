@@ -963,6 +963,7 @@ async fn exec_read(
         instance: &crate::tool::def::InstanceContext {
             directory: deps.worktree.clone(),
             worktree: deps.worktree.clone(),
+            write_guard: None,
         },
         ask: &ask,
         metadata: &ask,

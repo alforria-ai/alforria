@@ -111,6 +111,7 @@ pub fn boot(directory: Option<&Path>) -> Result<Instance, TypedError> {
                 .load_trusted(&LoadParams::new(directory.clone(), paths.clone()))
                 .map_err(core_error)?,
         ),
+        protected: None,
     };
     let background = BackgroundJobService::new(Arc::new(alforria_core::catalog::SystemClock));
     let services = Arc::new(SessionServices::new(

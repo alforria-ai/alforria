@@ -1322,6 +1322,7 @@ mod tests {
         let instance = InstanceContext {
             directory: directory.to_path_buf(),
             worktree: worktree.to_path_buf(),
+            write_guard: None,
         };
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()
@@ -1397,6 +1398,7 @@ mod tests {
         let instance = InstanceContext {
             directory: dir.clone(),
             worktree: dir.clone(),
+            write_guard: None,
         };
         let cwd = dir.clone();
         let scan = futures_executor_collect(&nodes, &cwd, &instance);
@@ -1437,6 +1439,7 @@ mod tests {
         let instance = InstanceContext {
             directory: dir.to_path_buf(),
             worktree: dir.to_path_buf(),
+            write_guard: None,
         };
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
@@ -1620,6 +1623,7 @@ mod tests {
         let instance = InstanceContext {
             directory: std::env::temp_dir(),
             worktree: Path::new("/").to_path_buf(),
+            write_guard: None,
         };
         let extra = Extra::default();
         let def = tool.def(Arc::new(FixedAgents)).await;
@@ -1725,6 +1729,7 @@ mod tests {
         let instance = InstanceContext {
             directory: std::env::temp_dir(),
             worktree: Path::new("/").to_path_buf(),
+            write_guard: None,
         };
         let extra = Extra::default();
         let def = tool.def(Arc::new(FixedAgents)).await;
@@ -1806,6 +1811,7 @@ mod tests {
         let instance = InstanceContext {
             directory: std::env::temp_dir(),
             worktree: Path::new("/").to_path_buf(),
+            write_guard: None,
         };
         let extra = Extra::default();
         let abort = tokio_util::sync::CancellationToken::new();
@@ -1844,6 +1850,7 @@ mod tests {
         let instance = InstanceContext {
             directory: std::env::temp_dir(),
             worktree: Path::new("/").to_path_buf(),
+            write_guard: None,
         };
         let extra = Extra::default();
         let def = tool.def(Arc::new(FixedAgents)).await;
@@ -1903,6 +1910,7 @@ mod tests {
         let instance = InstanceContext {
             directory: std::env::temp_dir(),
             worktree: Path::new("/").to_path_buf(),
+            write_guard: None,
         };
         let extra = Extra::default();
         let def = tool.def(Arc::new(FixedAgents)).await;
@@ -1972,6 +1980,7 @@ mod tests {
         let instance = InstanceContext {
             directory: std::env::temp_dir(),
             worktree: Path::new("/").to_path_buf(),
+            write_guard: None,
         };
         let extra = Extra::default();
         let def = tool.def(Arc::new(FixedAgents)).await;

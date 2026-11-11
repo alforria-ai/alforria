@@ -93,6 +93,9 @@ pub struct AgentRegistryInput {
     /// (`tool::permission::Policy`). `None`: no cap — `config` is
     /// all there is.
     pub host_config: Option<Config>,
+    /// What a restricted or outside-input session's tools may not write
+    /// (`protect::Protected::for_instance`). `None`: loader names only.
+    pub protected: Option<std::sync::Arc<crate::protect::Protected>>,
 }
 
 impl Default for AgentRegistryInput {
@@ -106,6 +109,7 @@ impl Default for AgentRegistryInput {
             tmp_dir: PathBuf::new(),
             home: PathBuf::new(),
             host_config: None,
+            protected: None,
         }
     }
 }
@@ -132,6 +136,8 @@ pub struct AgentRegistry {
     agents: IndexMap<String, AgentInfo>,
     /// `cfg.default_agent` (resolved once at construction).
     default_agent: Option<String>,
+    /// [`AgentRegistryInput::protected`].
+    protected: std::sync::Arc<crate::protect::Protected>,
 }
 
 const PROMPT_COMPACTION: &str = include_str!("../agent/prompt/compaction.txt");
@@ -617,7 +623,13 @@ impl AgentRegistry {
         AgentRegistry {
             agents,
             default_agent: cfg.default_agent.clone(),
+            protected: input.protected.clone().unwrap_or_default(),
         }
+    }
+
+    /// What a restricted or outside-input session's tools may not write.
+    pub fn protected(&self) -> std::sync::Arc<crate::protect::Protected> {
+        self.protected.clone()
     }
 
     /// `get` (agent.ts:312-314).
@@ -685,6 +697,7 @@ mod tests {
             tmp_dir: PathBuf::from("/tmp"),
             home: PathBuf::from("/home/user"),
             host_config: None,
+            protected: None,
         }
     }
 
@@ -788,6 +801,7 @@ mod tests {
             tmp_dir: PathBuf::from("/tmp"),
             home: PathBuf::from("/home/user"),
             host_config: None,
+            protected: None,
         });
         let build = registry.get("build").unwrap();
         assert_eq!(

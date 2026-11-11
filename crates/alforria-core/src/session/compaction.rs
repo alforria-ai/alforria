@@ -2030,6 +2030,7 @@ mod tests {
             instance: crate::tool::def::InstanceContext {
                 directory: h.worktree.clone(),
                 worktree: h.worktree.clone(),
+                write_guard: None,
             },
             output_token_max: None,
             project_id: None,

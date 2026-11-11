@@ -8,7 +8,7 @@
 
 use std::borrow::Cow;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -89,6 +89,30 @@ pub struct Extra {
 pub struct InstanceContext {
     pub directory: PathBuf,
     pub worktree: PathBuf,
+    /// Set for a session that is restricted or has seen outside content:
+    /// what its tools may not write (`protect::Protected`). `None`: no
+    /// guard.
+    pub write_guard: Option<std::sync::Arc<crate::protect::Protected>>,
+}
+
+impl InstanceContext {
+    /// **Every mutating file operation of a tool calls this with the path
+    /// it is about to create, overwrite, rename onto or delete**, before it
+    /// does. Enforcement lives here, at the write, and does not depend on
+    /// what the tool put in a permission ask.
+    pub fn about_to_modify(&self, path: &Path) -> Result<(), ToolError> {
+        let Some(guard) = &self.write_guard else {
+            return Ok(());
+        };
+        match guard.guards(path) {
+            None => Ok(()),
+            Some(reason) => Err(ToolError::Permission(format!(
+                "{reason}. This session is restricted or has read outside content, so it may \
+                 not write there; the operator can allow it with `\"edit_loader\": \"allow\"` \
+                 in the host config's `permission`."
+            ))),
+        }
+    }
 }
 
 /// `ctx.ask(...)` — permission requests flow through this seam; failures map
@@ -379,6 +403,7 @@ mod tests {
         let instance = InstanceContext {
             directory: temp.path().to_path_buf(),
             worktree: temp.path().to_path_buf(),
+            write_guard: None,
         };
         let extra = Extra::default();
         let ctx = ctx(&ask, &instance, &extra);
@@ -418,6 +443,7 @@ mod tests {
         let instance = InstanceContext {
             directory: temp.path().to_path_buf(),
             worktree: temp.path().to_path_buf(),
+            write_guard: None,
         };
         let extra = Extra::default();
         let ctx = ctx(&ask, &instance, &extra);
@@ -455,6 +481,7 @@ mod tests {
         let instance = InstanceContext {
             directory: temp.path().to_path_buf(),
             worktree: temp.path().to_path_buf(),
+            write_guard: None,
         };
         let extra = Extra::default();
         let ctx = ctx(&ask, &instance, &extra);
@@ -497,6 +524,7 @@ mod tests {
         let instance = InstanceContext {
             directory: temp.path().to_path_buf(),
             worktree: temp.path().to_path_buf(),
+            write_guard: None,
         };
         let extra = Extra::default();
         let ctx = ctx(&ask, &instance, &extra);
@@ -534,6 +562,7 @@ mod tests {
         let instance = InstanceContext {
             directory: temp.path().to_path_buf(),
             worktree: temp.path().to_path_buf(),
+            write_guard: None,
         };
         let extra = Extra::default();
         let ctx = ctx(&ask, &instance, &extra);

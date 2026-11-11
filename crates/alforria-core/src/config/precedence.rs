@@ -1286,6 +1286,19 @@ impl ConfigLoader {
         Ok(result)
     }
 
+    /// The config directories this loader searches for `params`, and the
+    /// managed directory it reads: what `protect::Protected` guards.
+    pub fn search_dirs(&self, params: &LoadParams) -> Vec<PathBuf> {
+        let mut dirs = self.directories(params);
+        dirs.push(managed_config_dir(params));
+        dirs
+    }
+
+    /// The managed config directory for `params`.
+    pub fn managed_dir(&self, params: &LoadParams) -> PathBuf {
+        managed_config_dir(params)
+    }
+
     /// `ConfigPaths.directories` — global config dir, every `.opencode`
     /// from `directory` up to `worktree`, `.opencode` in home, then
     /// `OPENCODE_CONFIG_DIR`; unique, order-preserving.

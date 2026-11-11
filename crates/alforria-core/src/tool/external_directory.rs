@@ -196,6 +196,7 @@ mod tests {
         InstanceContext {
             directory: Path::new("/home/u/project").to_path_buf(),
             worktree: Path::new("/home/u/project").to_path_buf(),
+            write_guard: None,
         }
     }
 
@@ -204,6 +205,7 @@ mod tests {
         let ctx = InstanceContext {
             directory: Path::new("/home/u/project").to_path_buf(),
             worktree: Path::new("/home/u/wt").to_path_buf(),
+            write_guard: None,
         };
         assert!(contains_path(Path::new("/home/u/project"), &ctx));
         assert!(contains_path(
@@ -226,6 +228,7 @@ mod tests {
         let non_git = InstanceContext {
             directory: Path::new("/home/u/project").to_path_buf(),
             worktree: Path::new("/").to_path_buf(),
+            write_guard: None,
         };
         assert!(!contains_path(Path::new("/etc/passwd"), &non_git));
     }

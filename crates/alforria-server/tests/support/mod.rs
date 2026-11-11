@@ -219,6 +219,11 @@ impl QueueLlm {
     }
 
     /// Answer tool-less requests with `text` from now on.
+    /// Queue more scripts behind the ones not yet played.
+    pub fn extend(&self, scripts: Vec<Script>) {
+        self.scripts.lock().unwrap().extend(scripts);
+    }
+
     pub fn set_toolless(&self, text: &str) {
         *self.toolless.lock().unwrap() = text.to_string();
     }

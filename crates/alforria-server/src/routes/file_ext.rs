@@ -426,16 +426,14 @@ fn restricted_upload_allowed(
             ctx.policy.upload_directories.join(", ")
         ));
     }
-    let loader_path = crate::confine::project_roots(location)
-        .iter()
-        .filter_map(|root| target.strip_prefix(root).ok())
-        .any(alforria_core::project_files::is_loader_path);
-    if loader_path {
-        return Err(
-            "this token may not write config, instruction, agent, command, skill, workflow or \
-             git files"
-                .to_string(),
-        );
+    // The same guard the edit tools' writes go through
+    // (`alforria_core::protect`): loader names anywhere on the resolved
+    // path, and every location the loaders consult for this instance.
+    if let Some(reason) = location.services.agents.protected().guards(target) {
+        return Err(format!(
+            "{reason}: this token may not write config, instruction, agent, command, skill, \
+             workflow or git files"
+        ));
     }
     Ok(())
 }

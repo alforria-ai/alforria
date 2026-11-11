@@ -189,6 +189,7 @@ pub(crate) fn harness_with_config(name: &str, script: MockScript, config: Value)
         tmp_dir: temp.path().to_path_buf(),
         home: temp.path().to_path_buf(),
         host_config: None,
+        protected: None,
     };
     let services = SessionServices::new(
         Arc::new(crate::storage::Storage::open(temp.path().join("db.sqlite")).unwrap()),
@@ -764,6 +765,7 @@ fn engine_build_with(
         tmp_dir: temp.path().to_path_buf(),
         home: temp.path().to_path_buf(),
         host_config: None,
+        protected: None,
     };
     let services = SessionServices::new(
         Arc::new(crate::storage::Storage::open(temp.path().join("db.sqlite")).unwrap()),
@@ -787,6 +789,7 @@ fn engine_build_with(
     let instance = crate::tool::def::InstanceContext {
         directory: worktree.clone(),
         worktree: worktree.clone(),
+        write_guard: None,
     };
     let context = crate::session::store::SessionContext {
         project_id: "global".to_string(),

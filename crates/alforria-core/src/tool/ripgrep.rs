@@ -433,6 +433,7 @@ pub(crate) mod test_support {
         InstanceContext {
             directory: directory.to_path_buf(),
             worktree: directory.to_path_buf(),
+            write_guard: None,
         }
     }
 

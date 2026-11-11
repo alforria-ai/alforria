@@ -55,6 +55,9 @@ pub struct ResolveDeps {
     pub registry: ToolRegistry,
     pub permission: Arc<dyn AskPermission>,
     pub instance: InstanceContext,
+    /// What a guarded session's tools may not write
+    /// (`AgentRegistry::protected`).
+    pub protected: Arc<crate::protect::Protected>,
     pub clock: Arc<dyn Clock>,
     /// TS `yield* mcp.tools()` — the engine's MCP tool seam
     /// (tools.ts:389). `None` in unit tests.
@@ -129,7 +132,13 @@ pub async fn resolve(
         Some(permission) => input.agent.permission.extended(permission),
         None => input.agent.permission.clone(),
     };
-    let loader_guard = input.guard_loader_paths.then(|| deps.instance.clone());
+    // A restricted or outside-input session's tools do not write what the
+    // loaders (or the server) read, unless the operator's policy grants
+    // `edit_loader` outright. Enforced at each write
+    // (`InstanceContext::about_to_modify`), not from an ask's patterns.
+    let write_guard = (input.guard_loader_paths
+        && !ruleset.explicitly_allows(crate::project_files::EDIT_LOADER_PERMISSION, "*"))
+    .then(|| deps.protected.clone());
     // Shared by every tool's closure: one copy of the history, not one per
     // tool.
     let messages: Arc<Vec<Value>> = Arc::new(
@@ -153,6 +162,7 @@ pub async fn resolve(
         let instance = InstanceContext {
             directory: deps.instance.directory.clone(),
             worktree: deps.instance.worktree.clone(),
+            write_guard: write_guard.clone(),
         };
         let clock = deps.clock.clone();
         let agent_name = input.agent.name.clone();
@@ -160,7 +170,6 @@ pub async fn resolve(
         let bypass_agent_check = input.bypass_agent_check;
         let messages = messages.clone();
         let ruleset = ruleset.clone();
-        let loader_guard = loader_guard.clone();
         let model_value = model_value.clone();
         let session_id = session_id.clone();
         let message_id = message_id.clone();
@@ -182,7 +191,6 @@ pub async fn resolve(
                 let bypass_agent_check = bypass_agent_check;
                 let messages = messages.clone();
                 let ruleset = ruleset.clone();
-                let loader_guard = loader_guard.clone();
                 let model_value = model_value.clone();
                 let session_id = session_id.clone();
                 let message_id = message_id.clone();
@@ -193,7 +201,6 @@ pub async fn resolve(
                         message_id: message_id.clone(),
                         call_id: call_id.clone(),
                         ruleset: ruleset.clone(),
-                        loader_guard: loader_guard.clone(),
                     };
                     let sink = MetadataAdapter {
                         processor: processor.clone(),
@@ -330,9 +337,6 @@ pub async fn resolve(
                             message_id: message_id.clone(),
                             call_id: call_id.clone(),
                             ruleset: ruleset.clone(),
-                            // An MCP tool asks under its own key, never
-                            // `edit`.
-                            loader_guard: None,
                         };
                         ask.ask(AskRequest {
                             permission: key.clone(),
@@ -532,13 +536,6 @@ struct PermissionAdapter {
     message_id: String,
     call_id: String,
     ruleset: crate::tool::permission::Policy,
-    /// Set for a session that is restricted or has seen outside content:
-    /// its edit tools do not write the files the loaders act on — config,
-    /// instructions, agents, commands, skills, workflows, git hooks
-    /// (`project_files`, the names the upload route refuses too) — unless
-    /// the operator's policy grants `edit_loader`. Otherwise an `edit`
-    /// allow is enough to rewrite the policy the next instance loads.
-    loader_guard: Option<InstanceContext>,
 }
 
 impl Ask for PermissionAdapter {
@@ -547,29 +544,6 @@ impl Ask for PermissionAdapter {
         request: AskRequest,
     ) -> crate::tool::def::BoxFuture<'a, Result<(), crate::tool::error::ToolError>> {
         Box::pin(async move {
-            if let (Some(instance), "edit") = (&self.loader_guard, request.permission.as_str()) {
-                use crate::project_files::{edit_targets_loader_path, EDIT_LOADER_PERMISSION};
-                for pattern in &request.patterns {
-                    let loader = edit_targets_loader_path(
-                        &instance.directory,
-                        &instance.worktree,
-                        std::path::Path::new(pattern),
-                    );
-                    if loader
-                        && !self
-                            .ruleset
-                            .explicitly_allows(EDIT_LOADER_PERMISSION, pattern)
-                    {
-                        return Err(crate::tool::error::ToolError::Permission(format!(
-                            "{pattern} is a file the agent's own configuration is loaded from \
-                             (config, instructions, agents, commands, skills, workflows, git \
-                             hooks). This session is restricted or has read outside content, so \
-                             it may not write it; the operator can allow it with the \
-                             `{EDIT_LOADER_PERMISSION}` permission in the host config."
-                        )));
-                    }
-                }
-            }
             self.permission
                 .ask(PermissionAsk {
                     session_id: self.session_id.clone(),
@@ -965,12 +939,14 @@ mod mcp_tests {
             instance: crate::tool::def::InstanceContext {
                 directory: h.worktree.clone(),
                 worktree: h.worktree.clone(),
+                write_guard: None,
             },
             clock: Arc::new(crate::session::test_support::FixedClock),
             mcp: Some(mcp),
             truncate: Arc::new(crate::tool::truncate::TruncateService::default_limits(
                 std::env::temp_dir().join("opencode-mcp-tool-tests"),
             )),
+            protected: Default::default(),
         };
         let agent = h.services.agents.get("build").cloned().unwrap();
         let input = ResolveInput {

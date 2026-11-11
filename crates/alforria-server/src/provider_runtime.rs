@@ -1261,6 +1261,7 @@ mod tests {
                 tmp_dir: dir.path().to_path_buf(),
                 home: paths.home.clone(),
                 host_config: None,
+                protected: None,
             },
         ));
         let engine = build_engine(&EngineInput {

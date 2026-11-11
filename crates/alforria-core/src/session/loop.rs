@@ -645,7 +645,9 @@ pub async fn run_loop(
                 instance: InstanceContext {
                     directory: deps.instance.directory.clone(),
                     worktree: deps.instance.worktree.clone(),
+                    write_guard: None,
                 },
+                protected: deps.agents.protected(),
                 clock: deps.clock.clone(),
                 mcp: deps.mcp_tools.clone(),
                 truncate: deps.truncate.clone(),
@@ -1980,6 +1982,7 @@ mod tests {
             tmp_dir: temp.path().to_path_buf(),
             home: temp.path().to_path_buf(),
             host_config: None,
+            protected: None,
         };
         let services = crate::session::SessionServices::new(
             Arc::new(crate::storage::Storage::open(temp.path().join("db.sqlite")).unwrap()),
@@ -2121,6 +2124,7 @@ mod tests {
             instance: InstanceContext {
                 directory: h.worktree.clone(),
                 worktree: h.worktree.clone(),
+                write_guard: None,
             },
             experimental_plan_mode: false,
             vcs: false,

@@ -473,14 +473,29 @@ which of the three it is, or it does not compile.
   carry a capability — see `server.trust` below. Everything else is dropped
   with a warning naming the file.
 - **A restricted session, or one that has read outside content, does not
-  write loader files.** `opencode.json`, `.opencode/`, `AGENTS.md`,
-  `CLAUDE.md`, `.claude/`, `.agents/`, `.git/` — the names the upload route
-  refuses, from the same constants — are refused to its `edit`, `write` and
-  `apply_patch` tools whatever the `edit` permission says, judged on where
-  the path really leads. `"permission": { "edit_loader": "allow" }` in the
-  host config hands it back. The operator's own sessions write them as
-  before, and `bash`, where it is allowed, writes anything the server's user
-  can: deny or ask about `bash` if that matters.
+  write what the loaders read** — as defence in depth. Every file operation
+  of `edit`, `write` and `apply_patch` (a patch's adds, updates, deletes,
+  and both ends of a move), and the upload route, put the path they are
+  about to modify to one guard (`alforria_core::protect`), at the write and
+  on where the path really leads. It refuses a loader name anywhere on the
+  path — `opencode.json`, `.opencode/`, `AGENTS.md`, `CLAUDE.md`, `.claude/`,
+  `.agents/`, `.git/`, in the project, in an ancestor directory (the loaders
+  walk up, to `/` for a directory that is not a repository) or in the home —
+  and every location the loaders and the server consult for the instance:
+  the global config directory, the managed directory, the data, state and
+  cache directories, the binary's directory, and what the config names
+  (`OPENCODE_CONFIG*`, `skills.paths`, `workflows.paths`, local
+  `instructions`). `"permission": { "edit_loader": "allow" }` in the host
+  config (all or nothing) hands it back; the operator's own sessions are not
+  guarded.
+
+  **This is not the control.** A session that may run `bash` writes any
+  file the server's user can, and the guard does not see it; session
+  revert restores files the session itself changed. What keeps a project
+  from carrying policy on an unattended server is the two points above —
+  the host's permission ceiling, and project config restricted to keys that
+  carry nothing. Deny `bash` (or run the agent as a user that cannot write
+  these places) if the files themselves must be safe.
 - The host config (`server.*`, `shell_env`, `hook.*`) is never read from the
   project, whatever the agent writes there.
 
@@ -531,8 +546,11 @@ carry no host key at all.
 
 With bearer auth configured the server **refuses to listen** when a directory
 in `server.directories` (or the working directory, when the list is empty)
-is or contains the data directory, or — unless `server.trust.host` is
-`"managed"` — the global config directory or `~/.opencode`.
+overlaps a protected location — contains it, is it, or lies inside it, with
+symlinks resolved on both sides and whether or not the location exists yet:
+the data, state and cache directories, the managed directory, the binary's
+directory, and — unless `server.trust.host` is `"managed"` — the global
+config directory and `~/.opencode`. The error names both paths.
 
 ### Turns nobody requests, and callers that are not people
 
