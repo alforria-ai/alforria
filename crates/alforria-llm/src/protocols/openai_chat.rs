@@ -32,7 +32,7 @@ use crate::route::client::{RouteDefaults, RouteHandle};
 use crate::route::endpoint::Endpoint;
 use crate::route::framing::Framing;
 use crate::route::protocol::Protocol;
-use crate::schema::errors::LlmError;
+use crate::schema::errors::{LlmError, LlmErrorReason};
 use crate::schema::events::{LlmEvent, Usage};
 use crate::schema::ids::{FinishReason, MessageRole, ProviderMetadata};
 use crate::schema::messages::{ContentPart, LlmRequest, Message, ToolChoice, ToolResultValue};
@@ -195,7 +195,9 @@ struct ToolCallDeltaFunction {
 
 #[derive(Debug, Clone, Deserialize)]
 struct ToolCallDelta {
-    index: f64,
+    /// Some OpenAI-compatible servers omit the index; see `tool_index`.
+    #[serde(default)]
+    index: Option<f64>,
     #[serde(default)]
     id: Option<String>,
     #[serde(default)]
@@ -222,6 +224,9 @@ struct Choice {
     delta: Option<Delta>,
     #[serde(default)]
     finish_reason: Option<String>,
+    /// Moonshot and a few others report usage here instead of at top level.
+    #[serde(default)]
+    usage: Option<serde_json::Value>,
 }
 
 /// One decoded SSE `data:` payload. `usage` stays raw so the mapped
@@ -229,9 +234,14 @@ struct Choice {
 /// `providerMetadata` (`{openai: …}`).
 #[derive(Debug, Clone, Deserialize)]
 struct Event {
-    choices: Vec<Choice>,
+    /// Absent or `null` on usage-only and error frames.
+    #[serde(default)]
+    choices: Option<Vec<Choice>>,
     #[serde(default)]
     usage: Option<serde_json::Value>,
+    /// A provider failure reported inside the stream (HTTP status was 200).
+    #[serde(default)]
+    error: Option<serde_json::Value>,
 }
 
 /// Streaming parser state (TS `ParserState`).
@@ -242,6 +252,10 @@ pub struct State {
     pub usage: Option<Usage>,
     pub finish_reason: Option<FinishReason>,
     pub lifecycle: lifecycle::State,
+    /// Index and id of the tool call the last delta belonged to, used to
+    /// place deltas that arrive without an `index`.
+    pub latest_tool: Option<(u32, Option<String>)>,
+    pub next_tool_index: u32,
 }
 
 fn parse_event(frame: &serde_json::Value) -> Result<Event, LlmError> {
@@ -254,7 +268,7 @@ fn parse_event(frame: &serde_json::Value) -> Result<Event, LlmError> {
         )
     })?;
     if let Some(usage) = &event.usage {
-        if !usage.is_object() {
+        if !usage.is_object() && !usage.is_null() {
             return Err(shared::event_error(
                 ADAPTER,
                 "Invalid OpenAI Chat event: usage must be an object",
@@ -634,9 +648,11 @@ fn from_request(request: &LlmRequest) -> Result<OpenAiChatBody, LlmError> {
                     .collect(),
             )
         },
+        // `tool_choice` without `tools` is a 400 on OpenAI and most
+        // compatible servers.
         tool_choice: match &request.tool_choice {
-            Some(tool_choice) => Some(lower_tool_choice(tool_choice)?),
-            None => None,
+            Some(tool_choice) if !request.tools.is_empty() => Some(lower_tool_choice(tool_choice)?),
+            _ => None,
         },
         stream: true,
         stream_options: OpenAiChatStreamOptions {
@@ -663,7 +679,7 @@ fn from_request(request: &LlmRequest) -> Result<OpenAiChatBody, LlmError> {
 /// TS `mapFinishReason`.
 fn map_finish_reason(reason: &str) -> FinishReason {
     match reason {
-        "stop" => FinishReason::Stop,
+        "stop" | "end" => FinishReason::Stop,
         "length" => FinishReason::Length,
         "content_filter" => FinishReason::ContentFilter,
         "function_call" | "tool_calls" => FinishReason::ToolCalls,
@@ -681,10 +697,21 @@ fn map_usage(usage: Option<&serde_json::Value>) -> Option<Usage> {
     let field = |name: &str| usage.get(name).and_then(serde_json::Value::as_f64);
     // TS uses `?.` chains — a missing details object means "no breakdown",
     // not "no usage".
-    let cached = usage
-        .get("prompt_tokens_details")
-        .and_then(|details| details.get("cached_tokens"))
-        .and_then(serde_json::Value::as_f64);
+    // Providers disagree on where cache hits live: OpenAI nests them in
+    // `prompt_tokens_details`, DeepSeek uses `prompt_cache_hit_tokens`, Z.ai a
+    // top-level `cached_tokens`, DigitalOcean `cache_read_input_tokens`.
+    // Reading only the first overstates cost on the others.
+    let details = |name: &str| {
+        usage
+            .get("prompt_tokens_details")
+            .and_then(|details| details.get(name))
+            .and_then(serde_json::Value::as_f64)
+    };
+    let cached = details("cached_tokens")
+        .or_else(|| field("prompt_cache_hit_tokens"))
+        .or_else(|| field("cached_tokens"))
+        .or_else(|| field("cache_read_input_tokens"));
+    let cache_write = details("cache_write_tokens").or_else(|| field("cache_created_input_tokens"));
     let reasoning = usage
         .get("completion_tokens_details")
         .and_then(|details| details.get("reasoning_tokens"))
@@ -711,9 +738,12 @@ fn map_usage(usage: Option<&serde_json::Value>) -> Option<Usage> {
     Some(Usage {
         input_tokens: prompt_tokens,
         output_tokens: completion_tokens,
-        non_cached_input_tokens: subtract_tokens(prompt_tokens, cached),
+        non_cached_input_tokens: match cache_write {
+            Some(_) => subtract_tokens(prompt_tokens, shared::sum_tokens(&[cached, cache_write])),
+            None => subtract_tokens(prompt_tokens, cached),
+        },
         cache_read_input_tokens: cached,
-        cache_write_input_tokens: None,
+        cache_write_input_tokens: cache_write,
         reasoning_tokens: reasoning,
         total_tokens: total_tokens(prompt_tokens, completion_tokens, field("total_tokens")),
         provider_metadata: Some(ProviderMetadata::from([("openai".to_string(), raw)])),
@@ -733,12 +763,94 @@ fn tool_key(index: f64) -> Result<u32, LlmError> {
     Ok(index as u32)
 }
 
+/// The index a tool-call delta belongs to. OpenAI always sends one; some
+/// compatible servers do not, so fall back to batch position for parallel
+/// deltas, a fresh slot when the id changes, and otherwise the latest call.
+fn tool_index(
+    tool: &ToolCallDelta,
+    position: usize,
+    batch: usize,
+    latest: Option<&(u32, Option<String>)>,
+    next: u32,
+) -> Result<u32, LlmError> {
+    if let Some(index) = tool.index {
+        return tool_key(index);
+    }
+    if batch > 1 {
+        return Ok(position as u32);
+    }
+    let id = tool.id.as_deref().filter(|id| !id.is_empty());
+    match (id, latest) {
+        (Some(id), Some((_, Some(latest_id)))) if latest_id != id => Ok(next),
+        (_, Some((index, _))) => Ok(*index),
+        (_, None) => Ok(position as u32),
+    }
+}
+
+/// A failure the provider reports inside a 200 stream (`{"error": {...}}`).
+/// Classified like an HTTP error so rate limits retry and context overflow
+/// triggers compaction, instead of surfacing as an undecodable frame.
+fn stream_error(error: &serde_json::Value, frame: &serde_json::Value) -> LlmError {
+    let message = error
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| error.as_str())
+        .filter(|message| !message.trim().is_empty())
+        .unwrap_or("Provider reported an error")
+        .to_string();
+    let status = error
+        .get("code")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|code| u16::try_from(code).ok());
+    LlmError {
+        module: "ProviderShared".to_string(),
+        method: "stream".to_string(),
+        reason: crate::provider_error::classify_stream_failure(
+            &message,
+            status,
+            &frame.to_string(),
+        ),
+    }
+}
+
 fn step(state: State, event: &serde_json::Value) -> Result<(State, Vec<LlmEvent>), LlmError> {
+    let frame = event;
     let event = parse_event(event)?;
+    if let Some(error) = event.error.as_ref().filter(|error| !error.is_null()) {
+        return Err(stream_error(error, frame));
+    }
     let mut events = Vec::new();
-    let usage = map_usage(event.usage.as_ref()).or(state.usage);
-    let choice = event.choices.first();
+    let choice = event.choices.as_deref().and_then(<[Choice]>::first);
+    let usage = map_usage(event.usage.as_ref().filter(|usage| !usage.is_null()))
+        .or_else(|| map_usage(choice.and_then(|choice| choice.usage.as_ref())))
+        .or(state.usage);
     let finish_reason = match choice.and_then(|choice| choice.finish_reason.as_deref()) {
+        Some("error") => {
+            return Err(LlmError {
+                module: "ProviderShared".to_string(),
+                method: "stream".to_string(),
+                reason: LlmErrorReason::UnknownProvider {
+                    message: "Provider reported an error (finish_reason: error)".to_string(),
+                    status: None,
+                    provider_metadata: None,
+                    http: None,
+                },
+            })
+        }
+        Some("network_error") => {
+            return Err(LlmError {
+                module: "ProviderShared".to_string(),
+                method: "stream".to_string(),
+                reason: LlmErrorReason::ProviderInternal {
+                    message: "Provider reported a network error (finish_reason: network_error)"
+                        .to_string(),
+                    status: 502.0,
+                    retry_after_ms: None,
+                    provider_metadata: None,
+                    http: None,
+                },
+            })
+        }
         Some(reason) if !reason.is_empty() => Some(map_finish_reason(reason)),
         _ => state.finish_reason,
     };
@@ -774,11 +886,30 @@ fn step(state: State, event: &serde_json::Value) -> Result<(State, Vec<LlmEvent>
         lifecycle = lifecycle::reasoning_end(lifecycle, &mut events, "reasoning-0", None);
     }
 
-    for tool in tool_deltas {
+    let mut latest_tool = state.latest_tool;
+    let mut next_tool_index = state.next_tool_index;
+    for (position, tool) in tool_deltas.iter().enumerate() {
+        let key = tool_index(
+            tool,
+            position,
+            tool_deltas.len(),
+            latest_tool.as_ref(),
+            next_tool_index,
+        )?;
+        let id = tool
+            .id
+            .clone()
+            .filter(|id| !id.is_empty())
+            .or_else(|| match &latest_tool {
+                Some((index, id)) if *index == key => id.clone(),
+                _ => None,
+            });
+        latest_tool = Some((key, id));
+        next_tool_index = next_tool_index.max(key.saturating_add(1));
         let outcome = tool_stream::append_or_start(
             ADAPTER,
             tools,
-            tool_key(tool.index)?,
+            key,
             tool_stream::ToolDelta {
                 id: tool.id.clone(),
                 name: tool
@@ -803,7 +934,6 @@ fn step(state: State, event: &serde_json::Value) -> Result<(State, Vec<LlmEvent>
         // (openai-compatible-chat-language-model.ts: "check if tool call
         // is complete (some providers send the full tool call in one
         // chunk)"). Later deltas for a finished call are ignored.
-        let key = tool_key(tool.index)?;
         let input = tools
             .get(&key)
             .map(|tool| tool.input.as_str())
@@ -818,10 +948,23 @@ fn step(state: State, event: &serde_json::Value) -> Result<(State, Vec<LlmEvent>
     // Finalize accumulated tool inputs eagerly when finish_reason arrives so
     // JSON parse failures fail the stream at the boundary rather than at
     // halt. The resulting events are held back for `on_halt` (STOP S11).
+    //
+    // A response cut off by the output limit or a content filter never
+    // confirmed its pending calls: their JSON is partial by construction, so
+    // they are dropped and the finish reason reaches the caller, which can
+    // then continue the turn. Failing the stream here would hide `length`.
+    let cut_off = matches!(
+        finish_reason,
+        Some(FinishReason::Length | FinishReason::ContentFilter)
+    );
     let (tools, tool_call_events) =
         if finish_reason.is_some() && state.finish_reason.is_none() && !tools.is_empty() {
-            let finished = tool_stream::finish_all(ADAPTER, tools)?;
-            (finished.tools, finished.events)
+            if cut_off {
+                (tool_stream::empty(), state.tool_call_events)
+            } else {
+                let finished = tool_stream::finish_all(ADAPTER, tools)?;
+                (finished.tools, finished.events)
+            }
         } else {
             (tools, state.tool_call_events)
         };
@@ -833,6 +976,8 @@ fn step(state: State, event: &serde_json::Value) -> Result<(State, Vec<LlmEvent>
             usage,
             finish_reason,
             lifecycle,
+            latest_tool,
+            next_tool_index,
         },
         events,
     ))
@@ -908,6 +1053,8 @@ impl Protocol for OpenAiChat {
             usage: None,
             finish_reason: None,
             lifecycle: lifecycle::initial(),
+            latest_tool: None,
+            next_tool_index: 0,
         }
     }
 
@@ -1589,6 +1736,177 @@ mod tests {
         .unwrap();
         assert_eq!(usage.input_tokens, Some(100.0));
         assert_eq!(usage.non_cached_input_tokens, Some(0.0));
+    }
+
+    #[test]
+    fn usage_reads_cache_hits_wherever_the_provider_reports_them() {
+        for usage in [
+            json!({"prompt_tokens": 100, "prompt_cache_hit_tokens": 60}),
+            json!({"prompt_tokens": 100, "cached_tokens": 60}),
+            json!({"prompt_tokens": 100, "cache_read_input_tokens": 60}),
+        ] {
+            let mapped = map_usage(Some(&usage)).unwrap();
+            assert_eq!(mapped.cache_read_input_tokens, Some(60.0), "{usage}");
+            assert_eq!(mapped.non_cached_input_tokens, Some(40.0), "{usage}");
+        }
+        let mapped = map_usage(Some(&json!({
+            "prompt_tokens": 100,
+            "prompt_tokens_details": {"cached_tokens": 50, "cache_write_tokens": 30},
+        })))
+        .unwrap();
+        assert_eq!(mapped.cache_write_input_tokens, Some(30.0));
+        assert_eq!(mapped.non_cached_input_tokens, Some(20.0));
+    }
+
+    #[test]
+    fn usage_on_the_choice_is_used_when_top_level_is_absent() {
+        let protocol = OpenAiChat;
+        let state = protocol.initial(&request());
+        let (state, _) = protocol
+            .step(
+                state,
+                &json!({"choices": [{"delta": {}, "finish_reason": "stop",
+                    "usage": {"prompt_tokens": 7, "completion_tokens": 3}}]}),
+            )
+            .unwrap();
+        assert_eq!(state.usage.unwrap().input_tokens, Some(7.0));
+    }
+
+    #[test]
+    fn mid_stream_error_frame_is_classified_not_a_decode_failure() {
+        let protocol = OpenAiChat;
+        let frame = json!({"error": {"message": "Rate limit reached", "type": "rate_limit_error"}});
+        // The frame decodes even though it has no `choices`.
+        assert!(protocol.decode_frame(&frame).unwrap().is_some());
+        let error = protocol
+            .step(protocol.initial(&request()), &frame)
+            .unwrap_err();
+        assert!(
+            matches!(error.reason, LlmErrorReason::RateLimit { .. }),
+            "{error:?}"
+        );
+        assert!(error.retryable());
+
+        let overflow = json!({"error": {"message": "context window exceeded", "code": 400}});
+        let error = protocol
+            .step(protocol.initial(&request()), &overflow)
+            .unwrap_err();
+        assert!(matches!(
+            error.reason,
+            LlmErrorReason::InvalidRequest {
+                classification: Some(
+                    crate::schema::errors::ProviderFailureClassification::ContextOverflow
+                ),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn frames_without_choices_are_tolerated() {
+        let protocol = OpenAiChat;
+        let state = protocol.initial(&request());
+        let (state, events) = protocol
+            .step(state, &json!({"usage": {"prompt_tokens": 1}}))
+            .unwrap();
+        assert!(events.is_empty());
+        let (_, events) = protocol
+            .step(state, &json!({"choices": null, "usage": null}))
+            .unwrap();
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn finish_reason_error_raises_instead_of_ending_quietly() {
+        let protocol = OpenAiChat;
+        let error = protocol
+            .step(
+                protocol.initial(&request()),
+                &chunk(json!({}), Some("error")),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error.reason,
+            LlmErrorReason::UnknownProvider { .. }
+        ));
+        let error = protocol
+            .step(
+                protocol.initial(&request()),
+                &chunk(json!({}), Some("network_error")),
+            )
+            .unwrap_err();
+        assert!(error.retryable());
+    }
+
+    #[test]
+    fn truncated_tool_call_surfaces_length_instead_of_failing() {
+        let protocol = OpenAiChat;
+        let state = protocol.initial(&request());
+        let (state, _) = protocol
+            .step(
+                state,
+                &chunk(
+                    json!({"tool_calls": [{"index": 0, "id": "call_1",
+                        "function": {"name": "write", "arguments": "{\"path\":\"a.txt\",\"content\":\"hal"}}]}),
+                    None,
+                ),
+            )
+            .unwrap();
+        let (state, _) = protocol
+            .step(state, &chunk(json!({}), Some("length")))
+            .expect("a cut-off tool call must not fail the stream");
+        let events = protocol.on_halt(state);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, LlmEvent::ToolCall { .. })),
+            "the partial call must not be executed: {events:?}"
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            LlmEvent::Finish {
+                reason: FinishReason::Length,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn tool_deltas_without_an_index_follow_the_latest_call() {
+        let protocol = OpenAiChat;
+        let mut state = protocol.initial(&request());
+        let frames = [
+            json!({"tool_calls": [{"id": "call_1", "function": {"name": "a", "arguments": ""}}]}),
+            json!({"tool_calls": [{"function": {"arguments": "{\"x\":"}}]}),
+            json!({"tool_calls": [{"function": {"arguments": "1}"}}]}),
+            // A new id without an index opens a second call.
+            json!({"tool_calls": [{"id": "call_2", "function": {"name": "b", "arguments": "{}"}}]}),
+        ];
+        let mut calls = Vec::new();
+        for frame in frames {
+            let (next, events) = protocol.step(state, &chunk(frame, None)).unwrap();
+            state = next;
+            for event in events {
+                if let LlmEvent::ToolCall { id, input, .. } = event {
+                    calls.push((id.to_string(), input));
+                }
+            }
+        }
+        assert_eq!(
+            calls,
+            vec![
+                ("call_1".to_string(), json!({"x": 1})),
+                ("call_2".to_string(), json!({})),
+            ]
+        );
+    }
+
+    #[test]
+    fn tool_choice_is_omitted_without_tools() {
+        let mut request = request();
+        request.tool_choice = Some(ToolChoice::named("get_weather"));
+        let body = OpenAiChat.lower_body(&request).unwrap();
+        assert!(body.get("tool_choice").is_none(), "{body}");
     }
 
     #[test]

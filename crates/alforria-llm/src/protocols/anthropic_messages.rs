@@ -769,13 +769,25 @@ fn lower_messages(
                             provider_metadata,
                             ..
                         } => {
+                            let signature = encrypted
+                                .clone()
+                                .or_else(|| signature_from_metadata(provider_metadata))
+                                .filter(|signature| !signature.trim().is_empty());
+                            // Thinking without a signature comes from another
+                            // model earlier in the session. Anthropic itself
+                            // rejects it (`signature: Field required`), and an
+                            // empty block is rejected everywhere, so replaying
+                            // either would fail the whole request.
+                            if signature.is_none()
+                                && (text.trim().is_empty() || request.model.provider == "anthropic")
+                            {
+                                continue;
+                            }
                             content.push(AnthropicAssistantBlock::Thinking(
                                 AnthropicThinkingBlock {
                                     r#type: ThinkingTag::Thinking,
                                     thinking: text.clone(),
-                                    signature: encrypted
-                                        .clone()
-                                        .or_else(|| signature_from_metadata(provider_metadata)),
+                                    signature,
                                     cache_control: None,
                                 },
                             ));
@@ -1335,6 +1347,23 @@ fn on_content_block_stop(state: State, event: &Event) -> Result<(State, Vec<LlmE
 fn on_message_delta(state: State, event: &Event) -> (State, Vec<LlmEvent>) {
     let usage = merge_usage(state.usage.clone(), map_usage(event.usage.as_ref()));
     let mut events = Vec::new();
+    // Only the delta carrying `stop_reason` ends the message. A usage-only
+    // delta used to emit a second finish with reason `unknown`.
+    let has_stop_reason = event
+        .delta
+        .as_ref()
+        .and_then(|delta| delta.stop_reason.as_deref())
+        .is_some_and(|reason| !reason.is_empty());
+    if !has_stop_reason {
+        return (
+            State {
+                tools: state.tools,
+                usage,
+                lifecycle: state.lifecycle,
+            },
+            events,
+        );
+    }
     let provider_metadata = event
         .delta
         .as_ref()
@@ -1775,11 +1804,54 @@ mod tests {
             ContentPart::reasoning("thinking"),
             Message::text("Hello!"),
         ])];
+        // Unsigned thinking came from another model: Anthropic would reject
+        // it, so it is not replayed there.
+        let body = AnthropicMessages.lower_body(&request).unwrap();
+        assert_eq!(
+            body["messages"][0]["content"],
+            json!([{"type": "text", "text": "Hello!"}]),
+        );
+        // Compatible hosts accept unsigned thinking, but never an empty block.
+        request.model.provider = "minimax".to_string();
         let body = AnthropicMessages.lower_body(&request).unwrap();
         assert_eq!(
             body["messages"][0]["content"][0],
             json!({"type": "thinking", "thinking": "thinking"}),
         );
+        request.messages = vec![Message::assistant(vec![
+            ContentPart::reasoning("  "),
+            Message::text("Hello!"),
+        ])];
+        let body = AnthropicMessages.lower_body(&request).unwrap();
+        assert_eq!(body["messages"][0]["content"][0]["type"], json!("text"));
+    }
+
+    #[test]
+    fn usage_only_message_delta_does_not_finish_twice() {
+        let protocol = AnthropicMessages;
+        let state = protocol.initial(&request());
+        let (state, first) = protocol
+            .step(
+                state,
+                &event(
+                    "message_delta",
+                    json!({"delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 5}}),
+                ),
+            )
+            .unwrap();
+        assert!(first
+            .iter()
+            .any(|event| matches!(event, LlmEvent::Finish { .. })));
+        let (_, second) = protocol
+            .step(
+                state,
+                &event(
+                    "message_delta",
+                    json!({"delta": {}, "usage": {"output_tokens": 6}}),
+                ),
+            )
+            .unwrap();
+        assert!(second.is_empty(), "{second:?}");
     }
 
     #[test]

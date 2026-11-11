@@ -451,7 +451,7 @@ where
 {
     bytes.eventsource().filter_map(|event| async move {
         match event {
-            Ok(event) if !event.data.is_empty() && event.data != "[DONE]" => Some(Ok(event.data)),
+            Ok(event) if is_payload(&event.data) => Some(Ok(event.data)),
             Ok(_) => None,
             Err(EventStreamError::Transport(error)) => Some(Err(error)),
             Err(error) => Some(Err(LlmError::invalid(format!(
@@ -459,6 +459,15 @@ where
             )))),
         }
     })
+}
+
+/// Whether an SSE `data:` value is a real payload. Besides the empty
+/// keep-alive and the `[DONE]` sentinel, some gateways send `data: null` or
+/// put an SSE comment in the data field (`data: : keepalive`, OpenRouter's
+/// `: OPENROUTER PROCESSING`); none of them is JSON a protocol can decode.
+fn is_payload(data: &str) -> bool {
+    let data = data.trim();
+    !data.is_empty() && data != "[DONE]" && data != "null" && !data.starts_with(':')
 }
 
 const BASE64_ALPHABET: &[u8; 64] =
@@ -884,6 +893,8 @@ mod tests {
             Ok(b"event: message_start\ndata: {\"a\":1}\n\n".to_vec()),
             Ok(b"data: [DONE]\n\n".to_vec()),
             Ok(b"data:\n\n".to_vec()),
+            Ok(b"data: null\n\n".to_vec()),
+            Ok(b"data: : keepalive\n\n".to_vec()),
             Ok(b"data: {\"b\":2}\n\n".to_vec()),
         ];
         let stream = sse_framing(futures::stream::iter(chunks));

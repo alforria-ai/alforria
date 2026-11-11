@@ -249,6 +249,9 @@ struct GeminiUsage {
     thoughts_token_count: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     prompt_token_count: Option<f64>,
+    /// Input billed for built-in tool use, reported beside the prompt count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_use_prompt_token_count: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     candidates_token_count: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -591,23 +594,25 @@ fn from_request(request: &LlmRequest) -> Result<GeminiBody, LlmError> {
 
 fn map_usage(usage: &GeminiUsage) -> Usage {
     let cached = usage.cached_content_token_count;
+    let prompt_tokens = match usage.tool_use_prompt_token_count {
+        Some(_) => {
+            shared::sum_tokens(&[usage.prompt_token_count, usage.tool_use_prompt_token_count])
+        }
+        None => usage.prompt_token_count,
+    };
     // `candidatesTokenCount` is visible-only; sum with thoughts to produce
     // the inclusive `outputTokens` the contract expects.
     let output_tokens = usage
         .candidates_token_count
         .map(|candidates| candidates + usage.thoughts_token_count.unwrap_or(0.0));
     Usage {
-        input_tokens: usage.prompt_token_count,
+        input_tokens: prompt_tokens,
         output_tokens,
-        non_cached_input_tokens: shared::subtract_tokens(usage.prompt_token_count, cached),
+        non_cached_input_tokens: shared::subtract_tokens(prompt_tokens, cached),
         cache_read_input_tokens: cached,
         cache_write_input_tokens: None,
         reasoning_tokens: usage.thoughts_token_count,
-        total_tokens: shared::total_tokens(
-            usage.prompt_token_count,
-            output_tokens,
-            usage.total_token_count,
-        ),
+        total_tokens: shared::total_tokens(prompt_tokens, output_tokens, usage.total_token_count),
         provider_metadata: Some(google_metadata(
             serde_json::to_value(usage).unwrap_or(Value::Null),
         )),
