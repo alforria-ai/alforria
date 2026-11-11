@@ -34,7 +34,12 @@ fn fs_contains(parent: &Path, child: &Path) -> bool {
 /// `containsPath` (instance-context.ts:18-24): true when the path is inside
 /// `ctx.directory` or `ctx.worktree`. Non-git projects set worktree to `"/"`,
 /// which would match ANY absolute path, so the worktree check is skipped.
+///
+/// The path is normalised lexically first: `strip_prefix` compares
+/// components literally, so `/project/../etc/passwd` would otherwise count
+/// as inside `/project`.
 pub fn contains_path(filepath: &Path, ctx: &InstanceContext) -> bool {
+    let filepath = &crate::git::lexical_normalize(filepath);
     if fs_contains(&ctx.directory, filepath) {
         return true;
     }
@@ -72,7 +77,14 @@ pub async fn assert_external_directory(
     }
 
     let instance = ctx.instance;
-    let full = Path::new(target);
+    // Normalise so the prompt and the saved `always` rule name the directory
+    // actually touched, not a `..`-laden spelling of it.
+    let normalized = if Path::new(target).is_absolute() {
+        crate::git::lexical_normalize(Path::new(target))
+    } else {
+        Path::new(target).to_path_buf()
+    };
+    let full = normalized.as_path();
     if contains_path(full, instance) {
         return Ok(false);
     }
@@ -170,6 +182,16 @@ mod tests {
         ));
         assert!(contains_path(Path::new("/home/u/wt/other"), &ctx));
         assert!(!contains_path(Path::new("/home/u/projectx/file"), &ctx));
+        // `..` must not smuggle an outside path past the prefix check.
+        assert!(!contains_path(
+            Path::new("/home/u/project/../../etc/passwd"),
+            &ctx
+        ));
+        assert!(!contains_path(Path::new("/home/u/wt/../secret"), &ctx));
+        assert!(contains_path(
+            Path::new("/home/u/project/src/../Cargo.toml"),
+            &ctx
+        ));
         // "/" worktree never matches (non-git quirk).
         let non_git = InstanceContext {
             directory: Path::new("/home/u/project").to_path_buf(),
@@ -221,6 +243,24 @@ mod tests {
                 "parentDir": "/tmp/outside",
             })
         );
+    }
+
+    #[tokio::test]
+    async fn dotdot_escape_asks_with_the_real_directory() {
+        let ask = RecordingAsk::new();
+        let instance = instance();
+        let extra = Extra::default();
+        let c = ctx(&ask, &instance, &extra);
+        let asked = assert_external_directory(
+            &c,
+            Some("/home/u/project/../../etc/passwd"),
+            ExternalOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert!(asked);
+        let requests = ask.requests.lock().unwrap();
+        assert_eq!(requests[0].patterns, vec!["/home/etc/*".to_string()]);
     }
 
     #[tokio::test]

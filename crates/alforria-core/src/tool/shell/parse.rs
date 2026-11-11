@@ -40,6 +40,28 @@ pub struct CommandNode {
 /// TS sees.
 pub trait ShellParser: Send + Sync {
     fn parse(&self, command: &str) -> Result<Vec<CommandNode>>;
+
+    /// File redirections in the command. Redirect targets are not command
+    /// parts, so [`ShellParser::parse`] alone never sees the files they read
+    /// or truncate. Parsers without redirect syntax return none.
+    fn redirects(&self, _command: &str) -> Result<Vec<Redirect>> {
+        Ok(Vec::new())
+    }
+}
+
+/// One file redirection (`> out`, `2>> log`, `< input`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Redirect {
+    /// The target word as written (still quoted).
+    pub target: String,
+    /// True for redirections that create or truncate the target.
+    pub writes: bool,
+    /// Text of the enclosing statement, redirection included.
+    pub source: String,
+    /// True when no command in the statement would carry this redirection in
+    /// its own permission pattern: either the statement has no command at all
+    /// (`> file`), or its body is a single command the scan may drop (`cd`).
+    pub standalone: bool,
 }
 
 /// Node kinds accepted as command parts. TS also accepts
@@ -150,6 +172,62 @@ impl ShellParser for BashParser {
             });
         }
         Ok(out)
+    }
+
+    fn redirects(&self, command: &str) -> Result<Vec<Redirect>> {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_bash::LANGUAGE.into())
+            .map_err(|err| anyhow::anyhow!("failed to load bash grammar: {err}"))?;
+        let tree = parser
+            .parse(command, None)
+            .ok_or_else(|| anyhow::anyhow!("Failed to parse command"))?;
+        let mut out = Vec::new();
+        collect_redirects(&mut out, tree.root_node(), command);
+        Ok(out)
+    }
+}
+
+fn collect_redirects(out: &mut Vec<Redirect>, node: tree_sitter::Node<'_>, src: &str) {
+    if node.kind() == "file_redirect" {
+        let mut operator = "";
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if !child.is_named() {
+                operator = child.kind();
+            }
+        }
+        let statement = match node.parent() {
+            Some(parent) if parent.kind() == "redirected_statement" => parent,
+            // Inside a `command` node (`cmd > out` in some grammar versions).
+            Some(parent) => parent,
+            None => node,
+        };
+        let body = statement.child_by_field_name("body");
+        let standalone = match body {
+            Some(body) => body.kind() == "command",
+            None => statement.kind() != "command",
+        };
+        let mut destinations = node.walk();
+        for destination in node.children_by_field_name("destination", &mut destinations) {
+            let target = src[destination.byte_range()].to_string();
+            // `2>&1`, `>&-`: file-descriptor plumbing, not a file.
+            let fd_dup = matches!(operator, ">&" | "<&")
+                && (target == "-" || target.bytes().all(|b| b.is_ascii_digit()));
+            if fd_dup {
+                continue;
+            }
+            out.push(Redirect {
+                target,
+                writes: operator.contains('>'),
+                source: src[statement.byte_range()].trim().to_string(),
+                standalone,
+            });
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_redirects(out, child, src);
     }
 }
 

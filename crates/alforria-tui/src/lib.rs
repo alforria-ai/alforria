@@ -1252,6 +1252,15 @@ pub async fn execute_effect(
     }
 }
 
+/// Text safe to place inside an OSC sequence. Session titles come from the
+/// model and from other clients; a BEL or ESC in one would end the sequence
+/// early and let the rest be read as terminal commands.
+fn osc_text(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
 /// The terminal title effect (`app.tsx:455-478`): set on change, cleared
 /// when disabled (OSC 2).
 fn apply_title(app: &App, env_disabled: bool, last_title: &mut Option<String>) -> Result<()> {
@@ -1260,7 +1269,7 @@ fn apply_title(app: &App, env_disabled: bool, last_title: &mut Option<String>) -
         return Ok(());
     }
     let sequence = match &title {
-        Some(title) => format!("\x1b]2;{title}\x07"),
+        Some(title) => format!("\x1b]2;{}\x07", osc_text(title)),
         None => "\x1b]2;\x07".to_string(),
     };
     write_ansi(&sequence)?;
@@ -1667,6 +1676,15 @@ mod term {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn osc_text_drops_terminal_control_characters() {
+        assert_eq!(
+            super::osc_text("ok\x07\x1b]52;c;evil\x07 \ntitle"),
+            "ok  ]52;c;evil   title"
+        );
+        assert_eq!(super::osc_text("plain – ünïcode"), "plain – ünïcode");
+    }
+
     use async_trait::async_trait;
     use serde_json::Value;
 

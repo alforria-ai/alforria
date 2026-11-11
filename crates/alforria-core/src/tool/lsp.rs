@@ -141,15 +141,9 @@ async fn run(
     lsp: Arc<dyn LspServer>,
 ) -> Result<ExecuteResult, ToolError> {
     let instance = ctx.instance;
-    let file = if std::path::Path::new(&params.file_path).is_absolute() {
-        params.file_path.clone()
-    } else {
-        instance
-            .directory
-            .join(&params.file_path)
-            .to_string_lossy()
-            .to_string()
-    };
+    let file = crate::tool::ripgrep::ts_resolve(&instance.directory, &params.file_path)
+        .to_string_lossy()
+        .to_string();
     assert_external_directory(
         &ctx,
         Some(&file),

@@ -1,6 +1,5 @@
 //! `glob` tool — port of `tool/glob.ts` (spec M4.2).
 
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::Deserialize;
@@ -74,10 +73,10 @@ fn run(
             .await?;
 
         let instance = ctx.instance;
-        // `params.path ?? ins.directory`; absolute paths pass through
-        // untouched, relative ones resolve against the instance dir.
+        // `params.path ?? ins.directory`, resolved against the instance dir.
+        // Absolute paths are normalised too so `..` cannot dodge the
+        // external-directory check below.
         let search = match params.path.as_deref() {
-            Some(path) if Path::new(path).is_absolute() => PathBuf::from(path),
             Some(path) => ts_resolve(&instance.directory, path),
             None => instance.directory.clone(),
         };

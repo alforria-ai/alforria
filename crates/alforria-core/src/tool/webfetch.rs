@@ -15,6 +15,8 @@ use crate::tool::truncate::Truncate;
 const MAX_RESPONSE_SIZE: usize = 5 * 1024 * 1024; // 5MB
 const DEFAULT_TIMEOUT_MS: u64 = 30 * 1000; // 30 seconds
 const MAX_TIMEOUT_MS: u64 = 120 * 1000; // 2 minutes
+/// Redirect hops followed before giving up. Each hop is permission-checked.
+const MAX_REDIRECTS: usize = 10;
 
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36";
 
@@ -82,14 +84,25 @@ impl HttpClient for ReqwestClient {
                     header_map.push((key.as_str().to_string(), value.to_string()));
                 }
             }
-            let body = response
-                .bytes()
+            // Stream the body and stop one byte past the cap: the caller
+            // rejects anything over `MAX_RESPONSE_SIZE`, so there is no reason
+            // to hold more of an unbounded response in memory.
+            let mut response = response;
+            let mut body: Vec<u8> = Vec::new();
+            while let Some(chunk) = response
+                .chunk()
                 .await
-                .map_err(|err| ToolError::Failed(err.to_string()))?;
+                .map_err(|err| ToolError::Failed(err.to_string()))?
+            {
+                body.extend_from_slice(&chunk);
+                if body.len() > MAX_RESPONSE_SIZE {
+                    break;
+                }
+            }
             Ok(HttpResponse {
                 status,
                 headers: header_map,
-                body: body.to_vec(),
+                body,
             })
         })
     }
@@ -97,9 +110,45 @@ impl HttpClient for ReqwestClient {
 
 /// Production [`HttpClient`] over reqwest.
 pub fn reqwest_client() -> Arc<dyn HttpClient> {
-    Arc::new(ReqwestClient {
-        client: reqwest::Client::new(),
-    })
+    // Redirects are followed by `run`, one hop at a time, so every target is
+    // checked against the `webfetch` permission rules before it is fetched.
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap_or_default();
+    Arc::new(ReqwestClient { client })
+}
+
+/// Validate a fetch target and return it without its `#fragment`.
+///
+/// The fragment never reaches the server, so it must not take part in
+/// permission matching. Credentials in the authority (`https://a.com@evil.com`)
+/// are refused outright: they make the real host easy to misread in a prompt
+/// and can slip past a host-prefix rule.
+fn checked_url(raw: &str) -> Result<String, ToolError> {
+    if !raw.starts_with("http://") && !raw.starts_with("https://") {
+        return Err(ToolError::Failed(
+            "URL must start with http:// or https://".to_string(),
+        ));
+    }
+    let parsed = reqwest::Url::parse(raw)
+        .map_err(|error| ToolError::Failed(format!("Invalid URL: {error}")))?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(ToolError::Failed(
+            "URL must not contain credentials".to_string(),
+        ));
+    }
+    Ok(raw.split('#').next().unwrap_or(raw).to_string())
+}
+
+/// Resolve a `Location` header against the URL that produced it.
+fn redirect_target(current: &str, location: &str) -> Result<String, ToolError> {
+    let base = reqwest::Url::parse(current)
+        .map_err(|error| ToolError::Failed(format!("Invalid URL: {error}")))?;
+    let next = base
+        .join(location)
+        .map_err(|error| ToolError::Failed(format!("Invalid redirect target: {error}")))?;
+    checked_url(next.as_str())
 }
 
 #[derive(Debug, Deserialize)]
@@ -176,11 +225,7 @@ async fn run(
     http: Arc<dyn HttpClient>,
 ) -> Result<ExecuteResult, ToolError> {
     {
-        if !params.url.starts_with("http://") && !params.url.starts_with("https://") {
-            return Err(ToolError::Failed(
-                "URL must start with http:// or https://".to_string(),
-            ));
-        }
+        let mut url = checked_url(&params.url)?;
 
         let format = params.format.as_deref().unwrap_or("markdown");
         let timeout_secs = params.timeout.unwrap_or((DEFAULT_TIMEOUT_MS / 1000) as f64);
@@ -189,7 +234,7 @@ async fn run(
         ctx.ask
             .ask(AskRequest {
                 permission: "webfetch".to_string(),
-                patterns: vec![params.url.clone()],
+                patterns: vec![url.clone()],
                 always: vec!["*".to_string()],
                 metadata: json!({
                     "url": params.url,
@@ -205,31 +250,50 @@ async fn run(
             ("Accept-Language", "en-US,en;q=0.9"),
         ];
         let is_ok = |response: &HttpResponse| (200..300).contains(&response.status);
-        let mut response = http
-            .get(
-                &params.url,
-                headers.clone(),
-                std::time::Duration::from_millis(timeout_ms),
-            )
-            .await?;
+        let timeout = std::time::Duration::from_millis(timeout_ms);
+        let mut response = http.get(&url, headers.clone(), timeout).await?;
+        // Follow redirects by hand so each target passes the same permission
+        // check as the URL the model asked for.
+        let mut hops = 0;
+        while (300..400).contains(&response.status) {
+            let Some(location) = response.header("location").map(str::to_string) else {
+                break;
+            };
+            hops += 1;
+            if hops > MAX_REDIRECTS {
+                return Err(ToolError::Failed(format!(
+                    "Too many redirects (more than {MAX_REDIRECTS})"
+                )));
+            }
+            let next = redirect_target(&url, &location)?;
+            ctx.ask
+                .ask(AskRequest {
+                    permission: "webfetch".to_string(),
+                    patterns: vec![next.clone()],
+                    always: vec!["*".to_string()],
+                    metadata: json!({
+                        "url": next,
+                        "format": format,
+                        "timeout": params.timeout,
+                        "redirectedFrom": url,
+                    }),
+                })
+                .await?;
+            url = next;
+            response = http.get(&url, headers.clone(), timeout).await?;
+        }
         // `HttpClient.filterStatusOk` — a non-2xx fails the tool, except
         // the Cloudflare-challenge retry below (webfetch.ts:84-97).
         if !is_ok(&response) {
             if response.status == 403 && response.header("cf-mitigated") == Some("challenge") {
                 let mut retry = headers;
                 retry[0] = ("User-Agent", "opencode");
-                response = http
-                    .get(
-                        &params.url,
-                        retry,
-                        std::time::Duration::from_millis(timeout_ms),
-                    )
-                    .await?;
+                response = http.get(&url, retry, timeout).await?;
             }
             if !is_ok(&response) {
                 return Err(ToolError::Failed(format!(
                     "StatusCode error ({} GET {})",
-                    response.status, params.url
+                    response.status, url
                 )));
             }
         }
@@ -669,6 +733,92 @@ mod tests {
             result.unwrap_err().to_string(),
             "URL must start with http:// or https://"
         );
+    }
+
+    #[tokio::test]
+    async fn rejects_credentials_in_the_authority() {
+        let http = Arc::new(FakeHttp::new(vec![]));
+        let (result, asks) = call(
+            http.clone(),
+            json!({ "url": "https://example.com@evil.test/x" }),
+        )
+        .await;
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "URL must not contain credentials"
+        );
+        assert!(asks.is_empty());
+        assert!(http.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn fragment_is_not_part_of_the_permission_pattern() {
+        let fake = Arc::new(FakeHttp::new(vec![response(200, vec![], "ok")]));
+        let (result, asks) = call(
+            fake.clone(),
+            json!({ "url": "https://example.com/page#frag", "format": "text" }),
+        )
+        .await;
+        result.unwrap();
+        assert_eq!(asks[0].patterns, vec!["https://example.com/page"]);
+        assert_eq!(fake.calls()[0].0, "https://example.com/page");
+    }
+
+    #[tokio::test]
+    async fn each_redirect_target_is_permission_checked() {
+        let fake = Arc::new(FakeHttp::new(vec![
+            response(302, vec![("location", "https://other.test/landing")], ""),
+            response(301, vec![("location", "/final")], ""),
+            response(200, vec![("content-type", "text/plain")], "done"),
+        ]));
+        let (result, asks) = call(
+            fake.clone(),
+            json!({ "url": "https://example.com/start", "format": "text" }),
+        )
+        .await;
+        assert_eq!(result.unwrap().output, "done");
+        let patterns: Vec<_> = asks.iter().map(|ask| ask.patterns[0].clone()).collect();
+        assert_eq!(
+            patterns,
+            vec![
+                "https://example.com/start",
+                "https://other.test/landing",
+                "https://other.test/final",
+            ]
+        );
+        assert_eq!(
+            asks[1].metadata["redirectedFrom"],
+            json!("https://example.com/start")
+        );
+        assert_eq!(fake.calls().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn redirect_to_a_non_http_scheme_is_refused() {
+        let fake = Arc::new(FakeHttp::new(vec![response(
+            302,
+            vec![("location", "file:///etc/passwd")],
+            "",
+        )]));
+        let (result, _) = call(fake.clone(), json!({ "url": "https://example.com" })).await;
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "URL must start with http:// or https://"
+        );
+        assert_eq!(fake.calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn redirect_loops_are_bounded() {
+        let hops = (0..=MAX_REDIRECTS)
+            .map(|_| response(302, vec![("location", "/again")], ""))
+            .collect();
+        let fake = Arc::new(FakeHttp::new(hops));
+        let (result, _) = call(fake.clone(), json!({ "url": "https://example.com" })).await;
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .starts_with("Too many redirects"));
     }
 
     #[tokio::test]

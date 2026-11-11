@@ -14,6 +14,7 @@ use crate::tool::edit::{diagnostic_report, trim_diff, FileEvents, Lsp};
 use crate::tool::error::ToolError;
 use crate::tool::external_directory::{assert_external_directory, ExternalOptions, Kind};
 use crate::tool::patch_parser::{derive_new_contents_from_chunks, parse_patch, Hunk};
+use crate::tool::ripgrep::ts_resolve;
 use crate::tool::truncate::Truncate;
 
 #[derive(Debug, Deserialize)]
@@ -127,7 +128,7 @@ async fn run(
             Hunk::Delete { path } => (path, "delete"),
             Hunk::Update { path, .. } => (path, "update"),
         };
-        let file_path = instance.directory.join(hunk_path);
+        let file_path = ts_resolve(&instance.directory, hunk_path);
         let file_path_str = file_path.to_string_lossy().to_string();
         assert_external_directory(
             &ctx,
@@ -202,7 +203,10 @@ async fn run(
 
                 let move_path = move_path
                     .as_ref()
-                    .map(|move_path| instance.directory.join(move_path));
+                    .map(|move_path| ts_resolve(&instance.directory, move_path))
+                    // A move onto itself is a plain update; treating it as a
+                    // move would write the file and then delete it.
+                    .filter(|move_path| *move_path != file_path);
                 if let Some(move_path) = &move_path {
                     let move_str = move_path.to_string_lossy().to_string();
                     assert_external_directory(
@@ -622,6 +626,66 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(temp.path().join("b.txt")).unwrap(),
             "one\ndeux\n"
+        );
+        std::fs::remove_dir_all(temp.path()).ok();
+    }
+
+    #[tokio::test]
+    async fn move_onto_itself_keeps_the_file() {
+        let temp = crate::storage::test_support::TempDir::new("apply-self-move");
+        std::fs::write(temp.path().join("a.txt"), "one\ntwo\n").unwrap();
+        let patch = concat!(
+            "*** Begin Patch\n",
+            "*** Update File: a.txt\n",
+            "*** Move to: ./a.txt\n",
+            "@@\n",
+            "-two\n",
+            "+deux\n",
+            "*** End Patch",
+        );
+        let def = tool();
+        let ask = RecordingAsk::new();
+        let inst = instance(temp.path());
+        let extra = Extra::default();
+        let ctx = ctx(&ask, &inst, &extra);
+        (def.execute)(json!({ "patchText": patch }), ctx)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("a.txt")).unwrap(),
+            "one\ndeux\n"
+        );
+        std::fs::remove_dir_all(temp.path()).ok();
+    }
+
+    #[tokio::test]
+    async fn dotdot_path_asks_external_directory() {
+        let temp = crate::storage::test_support::TempDir::new("apply-dotdot");
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let patch = concat!(
+            "*** Begin Patch\n",
+            "*** Add File: ../escaped.txt\n",
+            "+hi\n",
+            "*** End Patch",
+        );
+        let def = tool();
+        let ask = RecordingAsk::new();
+        let inst = instance(&project);
+        let extra = Extra::default();
+        let ctx = ctx(&ask, &inst, &extra);
+        (def.execute)(json!({ "patchText": patch }), ctx)
+            .await
+            .unwrap();
+        let external: Vec<_> = ask
+            .requests()
+            .into_iter()
+            .filter(|request| request.permission == "external_directory")
+            .collect();
+        assert_eq!(external.len(), 1, "a ../ write must prompt");
+        assert_eq!(
+            external[0].patterns,
+            vec![format!("{}/*", temp.path().display())]
         );
         std::fs::remove_dir_all(temp.path()).ok();
     }

@@ -722,6 +722,9 @@ impl GitSnapshot {
                     "diff",
                     "--cached",
                     "--no-ext-diff",
+                    // Without this a rename lists only the destination, and
+                    // revert never restores the original path.
+                    "--no-renames",
                     "--name-only",
                     hash,
                     "--",

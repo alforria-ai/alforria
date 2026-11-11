@@ -246,53 +246,7 @@ impl SessionPrompt {
         let agent_name = cmd.agent.clone().or_else(|| input.agent.clone());
 
         // `$N` / `$ARGUMENTS` substitution (prompt.ts:1378-1408).
-        let args: Vec<String> = match_args(&input.arguments)
-            .iter()
-            .map(|arg| quote_trim(arg))
-            .collect();
-
-        let template_command = &cmd.template;
-        let mut placeholders: Vec<u64> = Vec::new();
-        let mut last = 0u64;
-        for item in placeholder_regex().find_iter(template_command) {
-            let value: u64 = item
-                .as_str()
-                .get(1..)
-                .and_then(|m| m.parse().ok())
-                .unwrap_or(0);
-            placeholders.push(value);
-            if value > last {
-                last = value;
-            }
-        }
-
-        let mut template = placeholder_regex()
-            .replace_all(template_command, |captures: &regex::Captures| {
-                let position: u64 = captures
-                    .get(1)
-                    .map(|m| m.as_str())
-                    .and_then(|m| m.parse().ok())
-                    .unwrap_or(0);
-                let arg_index = (position as usize).saturating_sub(1);
-                if arg_index >= args.len() {
-                    return String::new();
-                }
-                if position == last {
-                    args[arg_index..].join(" ")
-                } else {
-                    args[arg_index].clone()
-                }
-            })
-            .into_owned();
-        let uses_arguments_placeholder = template_command.contains("$ARGUMENTS");
-        template = template.replace("$ARGUMENTS", &input.arguments);
-
-        if placeholders.is_empty()
-            && !uses_arguments_placeholder
-            && !input.arguments.trim().is_empty()
-        {
-            template = format!("{template}\n\n{}", input.arguments);
-        }
+        let mut template = substitute_arguments(&cmd.template, &input.arguments);
 
         // Backtick-shell substitution (prompt.ts:1411-1421).
         let shell_matches: Vec<String> = bash_regex()
@@ -683,6 +637,73 @@ fn quote_trim_regex() -> &'static regex::Regex {
 fn placeholder_regex() -> &'static regex::Regex {
     static PLACEHOLDER: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     PLACEHOLDER.get_or_init(|| regex::Regex::new(r"\$(\d+)").expect("valid placeholder regex"))
+}
+
+/// Fill a command template's `$N` and `$ARGUMENTS` placeholders; when the
+/// template has neither, the arguments are appended.
+fn substitute_arguments(template: &str, arguments: &str) -> String {
+    let args: Vec<String> = match_args(arguments)
+        .iter()
+        .map(|arg| quote_trim(arg))
+        .collect();
+
+    let template_command = template;
+    let mut placeholders: Vec<u64> = Vec::new();
+    let mut last = 0u64;
+    for item in placeholder_regex().find_iter(template_command) {
+        let value: u64 = item
+            .as_str()
+            .get(1..)
+            .and_then(|m| m.parse().ok())
+            .unwrap_or(0);
+        // `$0` is not a positional argument; it stays literal.
+        if value == 0 {
+            continue;
+        }
+        placeholders.push(value);
+        if value > last {
+            last = value;
+        }
+    }
+
+    // One pass over the template for both `$N` and `$ARGUMENTS`: text the
+    // user typed is inserted exactly once and never re-scanned, so an
+    // argument containing `$1` or `$ARGUMENTS` stays as written.
+    let mut out = substitution_regex()
+        .replace_all(template_command, |captures: &regex::Captures| {
+            let Some(position) = captures.get(1) else {
+                return arguments.to_string();
+            };
+            let position: u64 = position.as_str().parse().unwrap_or(0);
+            if position == 0 {
+                return captures[0].to_string();
+            }
+            let arg_index = (position as usize) - 1;
+            if arg_index >= args.len() {
+                return String::new();
+            }
+            if position == last {
+                args[arg_index..].join(" ")
+            } else {
+                args[arg_index].clone()
+            }
+        })
+        .into_owned();
+    let uses_arguments_placeholder = template_command.contains("$ARGUMENTS");
+
+    if placeholders.is_empty() && !uses_arguments_placeholder && !arguments.trim().is_empty() {
+        out = format!("{out}\n\n{arguments}");
+    }
+    out
+}
+
+/// `$N` (group 1) or `$ARGUMENTS`, matched together so substitution is a
+/// single pass.
+fn substitution_regex() -> &'static regex::Regex {
+    static SUBSTITUTION: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    SUBSTITUTION.get_or_init(|| {
+        regex::Regex::new(r"\$(\d+)|\$ARGUMENTS").expect("valid substitution regex")
+    })
 }
 
 fn bash_regex() -> &'static regex::Regex {
@@ -1077,5 +1098,44 @@ fn empty_tokens() -> V1StepTokens {
             read: 0.0,
             write: 0.0,
         },
+    }
+}
+
+#[cfg(test)]
+mod substitution_tests {
+    use super::substitute_arguments;
+
+    #[test]
+    fn positional_and_arguments_placeholders() {
+        assert_eq!(
+            substitute_arguments("do $1 then $2", "a b c"),
+            "do a then b c"
+        );
+        assert_eq!(substitute_arguments("run: $ARGUMENTS", "x y"), "run: x y");
+        assert_eq!(
+            substitute_arguments("no placeholders", "x y"),
+            "no placeholders\n\nx y"
+        );
+        assert_eq!(
+            substitute_arguments("no placeholders", "  "),
+            "no placeholders"
+        );
+    }
+
+    #[test]
+    fn user_text_is_never_re_expanded() {
+        // `$ARGUMENTS` typed as an argument used to be replaced a second time.
+        assert_eq!(
+            substitute_arguments("first: $1, then: $2 | all: $ARGUMENTS", "$ARGUMENTS x"),
+            "first: $ARGUMENTS, then: x | all: $ARGUMENTS x"
+        );
+        assert_eq!(substitute_arguments("all: $ARGUMENTS", "$1"), "all: $1");
+    }
+
+    #[test]
+    fn dollar_zero_stays_literal() {
+        assert_eq!(substitute_arguments("echo $0 $1", "a"), "echo $0 a");
+        // A template with only `$0` has no real placeholder: arguments append.
+        assert_eq!(substitute_arguments("echo $0", "a"), "echo $0\n\na");
     }
 }

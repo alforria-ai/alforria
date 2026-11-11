@@ -83,8 +83,7 @@ fn run(
 
         let instance = ctx.instance;
         let requested: PathBuf = match params.path.as_deref() {
-            Some(path) if Path::new(path).is_absolute() => PathBuf::from(path),
-            Some(path) => instance.directory.join(path),
+            Some(path) => ts_resolve(&instance.directory, path),
             None => instance.directory.clone(),
         };
 

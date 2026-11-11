@@ -500,6 +500,32 @@ pub async fn collect(
     scan
 }
 
+/// Fold file redirections into the scan. `collect` only looks at command
+/// parts, so without this `> /etc/x` would never reach `external_directory`,
+/// and a statement with no command (`> file`) would skip the `bash`
+/// permission altogether.
+pub async fn collect_redirects(
+    scan: &mut Scan,
+    redirects: &[parse::Redirect],
+    cwd: &Path,
+    ps: bool,
+    shell: &str,
+    instance: &InstanceContext,
+) {
+    for redirect in redirects {
+        if let Some(resolved) = arg_path(&redirect.target, cwd, ps, shell) {
+            // `/dev/null` and friends are sinks, not files worth a prompt.
+            if !resolved.starts_with("/dev") && !contains_path(&resolved, instance) {
+                scan.push_dir(dirname(&resolved).display().to_string());
+            }
+        }
+        if redirect.writes && redirect.standalone && !scan.patterns.contains(&redirect.source) {
+            scan.push_pattern(redirect.source.clone());
+            scan.push_always(redirect.source.clone());
+        }
+    }
+}
+
 /// `ask` (shell.ts:263-291): `external_directory` first (one ask with a
 /// `dir/*` glob per external dir), then the `bash` permission.
 async fn ask(ctx: &ToolCtxRef<'_>, scan: &Scan, command: &str) -> Result<(), ToolError> {
@@ -1037,6 +1063,10 @@ impl ShellTool {
                         .parse(&params.command)
                         .map_err(|e| ToolError::Failed(e.to_string()))?;
                     let mut scan = collect(&nodes, &cwd, ps, &shell, ctx.instance).await;
+                    let redirects = parser
+                        .redirects(&params.command)
+                        .map_err(|e| ToolError::Failed(e.to_string()))?;
+                    collect_redirects(&mut scan, &redirects, &cwd, ps, &shell, ctx.instance).await;
                     if !contains_path(&cwd, ctx.instance) {
                         scan.push_dir(cwd.display().to_string());
                     }
@@ -1374,6 +1404,68 @@ mod tests {
         let dir = temp("collect-quoted");
         let scan = scan_sync("rm \"/somewhere/else\"", &dir, &dir);
         assert_eq!(scan.dirs, vec!["/somewhere".to_string()]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn redirect_scan(command: &str, dir: &Path) -> Scan {
+        let parser = parse::parser_for("bash");
+        let nodes = parser.parse(command).expect("parse");
+        let redirects = parser.redirects(command).expect("redirects");
+        let instance = InstanceContext {
+            directory: dir.to_path_buf(),
+            worktree: dir.to_path_buf(),
+        };
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                let mut scan = collect(&nodes, dir, false, "bash", &instance).await;
+                collect_redirects(&mut scan, &redirects, dir, false, "bash", &instance).await;
+                scan
+            })
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bare_redirect_still_needs_the_bash_permission() {
+        let dir = temp("redirect-bare");
+        let scan = redirect_scan("> important.txt", &dir);
+        assert_eq!(scan.patterns, vec!["> important.txt".to_string()]);
+        assert_eq!(scan.always, vec!["> important.txt".to_string()]);
+        assert!(scan.dirs.is_empty(), "{scan:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn redirect_on_a_cwd_command_still_needs_the_bash_permission() {
+        let dir = temp("redirect-cd");
+        let scan = redirect_scan("cd sub > important.txt", &dir);
+        assert_eq!(scan.patterns, vec!["cd sub > important.txt".to_string()]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn redirect_target_outside_the_project_is_an_external_dir() {
+        let dir = temp("redirect-external");
+        let scan = redirect_scan("echo hi > /somewhere/else/out.txt", &dir);
+        assert_eq!(scan.dirs, vec!["/somewhere/else".to_string()]);
+        // The command already carries the redirection in its own pattern.
+        assert_eq!(
+            scan.patterns,
+            vec!["echo hi > /somewhere/else/out.txt".to_string()]
+        );
+        let scan = redirect_scan("sort < ../../outside.txt", &dir);
+        assert_eq!(scan.dirs.len(), 1, "{scan:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn redirect_sinks_and_fd_plumbing_do_not_prompt() {
+        let dir = temp("redirect-sinks");
+        let scan = redirect_scan("make > /dev/null 2>&1", &dir);
+        assert!(scan.dirs.is_empty(), "{scan:?}");
+        assert_eq!(scan.patterns, vec!["make > /dev/null 2>&1".to_string()]);
+        let scan = redirect_scan("ls | grep x > out.txt", &dir);
+        assert!(scan.dirs.is_empty(), "{scan:?}");
+        assert_eq!(scan.patterns.len(), 2, "{scan:?}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

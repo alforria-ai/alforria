@@ -224,8 +224,13 @@ fn parts(input: &str) -> Vec<String> {
 }
 
 fn safe_host(input: &str) -> bool {
+    // `cache_path` turns each `:`-separated part into a directory, so a part
+    // of `.` or `..` (or an empty one) would walk out of the cache root.
     !input.is_empty()
         && !input.starts_with('-')
+        && !input
+            .split(':')
+            .any(|part| part.is_empty() || part == "." || part == "..")
         && !input
             .chars()
             .any(|c| c.is_whitespace() || c == '/' || c == '\\')
@@ -786,6 +791,12 @@ mod tests {
         assert!(parse("github:../etc/passwd").is_none());
         assert!(parse("github:sst/opencode/../../x").is_none());
         assert!(parse("github.com/a/b:c").is_none(), "colon in segment");
+        // A `:`-separated host part becomes a cache directory.
+        assert!(parse("example.com:../a/b").is_none(), "dot-dot host part");
+        assert!(parse("example.com:.:/a/b").is_none(), "dot host part");
+        assert!(!safe_host("a:.."));
+        assert!(!safe_host("..:a"));
+        assert!(safe_host("example.com:8443"));
     }
 
     #[test]
