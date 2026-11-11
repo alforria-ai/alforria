@@ -34,7 +34,10 @@ use crate::session::event_definitions::SESSION_ERROR;
 use crate::session::instruction::Instruction;
 use crate::session::llm::{LlmModel, LlmStream, LlmTool, LlmToolOutput, StreamInput, ToolFailure};
 use crate::session::message::{filter_compacted, latest, MessageStore, WithParts};
-use crate::session::overflow::{is_overflow, IsOverflowInput, ModelLimits};
+use crate::session::overflow::{
+    estimate_overhead, estimate_request, is_overflow, recorded_tokens, request_budget,
+    IsOverflowInput, ModelLimits, RequestSize,
+};
 use crate::session::processor::{
     AskPermission, Handle as ProcessorHandle, ProcessResult, Processor, ProcessorDeps,
     ProcessorInput, ProcessorModel, SummarySummarize,
@@ -83,6 +86,12 @@ const MAX_OUTPUT_LENGTH_CONTINUES: u32 = 3;
 /// again at once: unchecked, a provider answering with an empty 200 is called
 /// many times a second, forever.
 const MAX_UNFINISHED_RESPONSES: u32 = 3;
+
+/// Compactions in a row with no model response between them. A request that
+/// still does not fit after this many has something in it compaction cannot
+/// shrink (the system prompt, the tools, one enormous message), and trying
+/// again would loop forever.
+const MAX_COMPACTIONS_WITHOUT_PROGRESS: u32 = 3;
 
 const STRUCTURED_OUTPUT_DESCRIPTION: &str =
     "Use this tool to return your final response in the requested structured format.
@@ -312,6 +321,7 @@ pub async fn run_loop(
     let mut step: u64 = 0;
     let mut length_continues: u32 = 0;
     let mut unfinished_responses: u32 = 0;
+    let mut compactions: u32 = 0;
     let session = deps.sessions.get(session_id)?;
 
     let result: Result<WithParts, LoopError> = loop {
@@ -453,6 +463,11 @@ pub async fn run_loop(
                     output_token_max: model.output_token_max,
                 })
             {
+                if compactions >= MAX_COMPACTIONS_WITHOUT_PROGRESS {
+                    fail_context_overflow(deps, session_id)?;
+                    break last_assistant(deps, session_id).await;
+                }
+                compactions += 1;
                 deps.compaction
                     .create(compaction_create(session_id, &last_user, true, None))
                     .await?;
@@ -533,7 +548,6 @@ pub async fn run_loop(
             finish: None,
         };
         let assistant_id = crate::session::message::message_id(&assistant).to_string();
-        deps.sessions.update_message(&assistant)?;
 
         let processor = Processor::create(
             ProcessorDeps {
@@ -550,7 +564,7 @@ pub async fn run_loop(
                 clock: deps.clock.clone(),
             },
             ProcessorInput {
-                assistant_message: assistant,
+                assistant_message: assistant.clone(),
                 session_id: session_id.to_string(),
                 model: model.processor_model(),
             },
@@ -627,6 +641,28 @@ pub async fn run_loop(
                 model_messages.push(Message::assistant(MAX_STEPS_PROMPT));
             }
 
+            // Size the request before sending it: a session whose history
+            // no provider has counted (imported, or never compacted) would
+            // otherwise go out whole.
+            if compactions == 0
+                && request_overflows(
+                    deps,
+                    &model,
+                    latest.finished.as_ref(),
+                    &msgs,
+                    &model_messages,
+                    &system,
+                    &tools,
+                )
+            {
+                compactions += 1;
+                deps.compaction
+                    .create(compaction_create(session_id, &last_user, true, None))
+                    .await?;
+                continue;
+            }
+            deps.sessions.update_message(&assistant)?;
+
             let result = processor
                 .process(
                     StreamInput {
@@ -696,6 +732,11 @@ pub async fn run_loop(
                                 _ => None,
                             };
                             deps.instruction.clear(&assistant_id);
+                            if compactions >= MAX_COMPACTIONS_WITHOUT_PROGRESS {
+                                fail_context_overflow(deps, session_id)?;
+                                break last_assistant(deps, session_id).await;
+                            }
+                            compactions += 1;
                             deps.compaction
                                 .create(compaction_create(
                                     session_id,
@@ -707,6 +748,7 @@ pub async fn run_loop(
                             Outcome::Continue
                         }
                         ProcessResult::Continue => {
+                            compactions = 0;
                             deps.instruction.clear(&assistant_id);
                             let called_tools = deps
                                 .messages
@@ -806,6 +848,87 @@ fn append_output_length_continue(
 // -------------------------------------------------------------------------
 // Helpers
 // -------------------------------------------------------------------------
+
+/// Whether the request about to be sent is larger than the model can take.
+/// The newest finished response's recorded tokens count for everything
+/// before it; what no provider has counted is estimated from its size.
+fn request_overflows(
+    deps: &LoopDeps,
+    model: &ResolvedModel,
+    finished: Option<&V1Message>,
+    msgs: &[WithParts],
+    model_messages: &[Message],
+    system: &[String],
+    tools: &[LlmTool],
+) -> bool {
+    if deps.config.compaction.as_ref().and_then(|c| c.auto) == Some(false) {
+        return false;
+    }
+    let budget = request_budget(&deps.config, &model.limits, model.output_token_max);
+    // The response's own count is only good while the history it counted is
+    // still what gets sent: a summary replaces that history.
+    let anchor = finished.and_then(|finished| match finished {
+        V1Message::Assistant {
+            id,
+            summary,
+            tokens,
+            ..
+        } if *summary != Some(true) && recorded_tokens(tokens) > 0.0 => {
+            let index = msgs
+                .iter()
+                .position(|msg| crate::session::message::message_id(&msg.info) == id)?;
+            Some((recorded_tokens(tokens), index))
+        }
+        _ => None,
+    });
+    let estimate = match anchor {
+        Some((recorded, index)) => {
+            let since = to_model_messages(&msgs[index..], &model.render(), None);
+            estimate_request(&RequestSize {
+                recorded: Some(recorded),
+                since: &since,
+                overhead: 0.0,
+            })
+        }
+        None => estimate_request(&RequestSize {
+            recorded: None,
+            since: model_messages,
+            overhead: estimate_overhead(
+                system,
+                tools.iter().map(|tool| {
+                    (
+                        tool.name.as_str(),
+                        tool.description.as_str(),
+                        &tool.input_schema,
+                    )
+                }),
+            ),
+        }),
+    };
+    if estimate < budget {
+        return false;
+    }
+    tracing::info!(estimate, budget, "request would not fit, compacting first");
+    true
+}
+
+/// End the turn when compacting keeps not making the request fit.
+fn fail_context_overflow(deps: &LoopDeps, session_id: &str) -> Result<(), LoopError> {
+    let error = AssistantError::ContextOverflow {
+        message: format!(
+            "The request still exceeds the model's context limit after {MAX_COMPACTIONS_WITHOUT_PROGRESS} compactions"
+        ),
+        response_body: None,
+    };
+    deps.events
+        .publish(
+            &SESSION_ERROR,
+            serde_json::json!({ "sessionID": session_id, "error": error }),
+            PublishOptions::default(),
+        )
+        .map_err(SessionError::from)?;
+    Ok(())
+}
 
 /// `compaction.create` input builder (`prompt.ts:1300-1305`).
 #[allow(clippy::too_many_arguments)]

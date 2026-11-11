@@ -39,6 +39,8 @@ pub mod workflow_ops;
 #[cfg(test)]
 pub(crate) mod e2e;
 #[cfg(test)]
+pub(crate) mod long_session;
+#[cfg(test)]
 pub(crate) mod test_support;
 
 use std::path::{Path, PathBuf};

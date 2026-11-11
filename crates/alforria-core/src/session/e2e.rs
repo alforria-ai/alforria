@@ -88,7 +88,7 @@ fn prompt_input(session_id: &str, body: &str) -> PromptInput {
     prompt_input_for("msg_user1", session_id, body)
 }
 
-fn prompt_input_for(message_id: &str, session_id: &str, body: &str) -> PromptInput {
+pub(crate) fn prompt_input_for(message_id: &str, session_id: &str, body: &str) -> PromptInput {
     PromptInput {
         session_id: session_id.to_string(),
         message_id: Some(message_id.to_string()),

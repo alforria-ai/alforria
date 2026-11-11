@@ -1144,6 +1144,10 @@ pub struct CompactionInfo {
     pub preserve_recent_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reserved: Option<u64>,
+    /// alforria extension: the context window, in tokens, assumed for a model
+    /// that declares none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_context: Option<PositiveInt>,
 }
 
 /// `core/policy.ts` `Effect`.

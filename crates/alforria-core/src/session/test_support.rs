@@ -645,7 +645,52 @@ pub(crate) fn engine_with_compaction_script(
         serde_json::json!({}),
         None,
         EngineDefs::Real,
+        EngineOverrides::default(),
     )
+}
+
+/// What an engine swaps out of the default harness.
+#[derive(Default)]
+pub(crate) struct EngineOverrides {
+    /// The model every lookup resolves to.
+    pub(crate) model: Option<ResolvedModel>,
+    /// One provider for both the turns and the compaction summaries, in
+    /// place of the scripted ones.
+    pub(crate) llm: Option<Arc<dyn LlmStream>>,
+}
+
+/// An engine talking to `llm` as `model`.
+pub(crate) fn engine_with_provider(
+    name: &str,
+    llm: Arc<dyn LlmStream>,
+    model: ResolvedModel,
+    config: Value,
+) -> Engine {
+    engine_build_with(
+        name,
+        Vec::new(),
+        Vec::new(),
+        config,
+        None,
+        EngineDefs::Real,
+        EngineOverrides {
+            model: Some(model),
+            llm: Some(llm),
+        },
+    )
+}
+
+/// [`test_model`] with a context window of `context` tokens.
+pub(crate) fn test_model_with_context(context: f64, output: f64) -> ResolvedModel {
+    let mut model = test_model();
+    model.llm.context_limit = context;
+    model.llm.output_limit = output;
+    model.limits = ModelLimits {
+        context,
+        input: None,
+        output,
+    };
+    model
 }
 
 /// An engine whose `read` tool never resolves — the mid-flight
@@ -674,6 +719,7 @@ fn engine_build(
         config,
         session_permission,
         defs,
+        EngineOverrides::default(),
     )
 }
 
@@ -684,6 +730,7 @@ fn engine_build_with(
     config: Value,
     session_permission: Option<Value>,
     defs: EngineDefs,
+    overrides: EngineOverrides,
 ) -> Engine {
     let temp = crate::storage::test_support::TempDir::new(name);
     let worktree = temp.path().join("repo");
@@ -729,7 +776,7 @@ fn engine_build_with(
         workspace_id: None,
     };
     let models: Arc<dyn crate::session::r#loop::ModelSource> = Arc::new(StaticModels {
-        model: test_model(),
+        model: overrides.model.clone().unwrap_or_else(test_model),
     });
     let input_models: Arc<dyn crate::session::prompt_input::Models> = Arc::new(FixedInputModels);
     let snapshot = InMemorySnapshot::new(worktree.clone());
@@ -811,7 +858,10 @@ fn engine_build_with(
                 status: services.status.clone(),
                 agents: services.agents.clone(),
                 snapshot: snapshot.clone(),
-                llm: DispatchLlm::new(compaction_script),
+                llm: match &overrides.llm {
+                    Some(llm) => llm.clone(),
+                    None => DispatchLlm::new(compaction_script),
+                },
                 permission: services.permission.clone(),
                 summary: summary.clone(),
                 models: models.clone(),
@@ -845,7 +895,10 @@ fn engine_build_with(
         services: services.clone(),
         models: models.clone(),
         input_models,
-        llm: llm.clone(),
+        llm: match &overrides.llm {
+            Some(provider) => provider.clone(),
+            None => llm.clone(),
+        },
         snapshot: snapshot.clone(),
         compaction,
         subtasks,

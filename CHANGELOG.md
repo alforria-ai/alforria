@@ -45,9 +45,19 @@ pre-1.0, so minor releases may include breaking changes.
 - Remote MCP servers stay signed in: OAuth tokens refresh before they expire
   and on a 401.
 - ACP clients are told when a turn is waiting on a provider retry.
+- `compaction.default_context`: the context window, in tokens, assumed for a
+  model that declares none (128,000 when unset).
 
 ### Fixed
 
+- A session whose history no provider had counted (imported, or long and
+  never compacted) was sent whole on the next prompt, however large. The
+  request is now sized before it is sent, from the provider's own token
+  counts where there are any and from the size of the text where there are
+  none, and the session compacts first when it would not fit. A model with no
+  declared context limit is held to a default ceiling instead of none.
+- A request that still does not fit after three compactions in a row ends the
+  turn with a `ContextOverflowError` instead of compacting forever.
 - A file path containing `..` could write, search or read outside the project
   without the `external_directory` prompt, through `apply_patch`, `grep`,
   `glob` and `lsp`.
