@@ -553,15 +553,17 @@ mod tests {
             "---\n---\nReview mode.\n",
         );
 
-        let params = LoadParams::new(work.clone())
-            .worktree(work.clone())
-            .paths(GlobalPaths {
+        let params = LoadParams::new(
+            work.clone(),
+            GlobalPaths {
                 home: root.join("home"),
                 config: root.join("config"),
                 data: root.join("data"),
                 cache: root.join("cache"),
                 state: root.join("state"),
-            });
+            },
+        )
+        .worktree(work.clone());
         let (config, _) = ConfigLoader.load(&params).unwrap();
 
         let build = &config.agent.as_ref().unwrap()["build"];

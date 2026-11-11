@@ -434,3 +434,72 @@ async fn provider_oauth_authorize_and_callback_map_errors() {
         r#"{"name":"ProviderAuthOauthMissing","data":{"providerID":"anthropic"}}"#
     );
 }
+
+// -----------------------------------------------------------------------
+// the context's global paths are the only ones a handler uses
+// -----------------------------------------------------------------------
+
+/// Every handler that loads config reads the global config under the
+/// context's paths. They used to resolve the process's own directories
+/// (`GlobalPaths::from_env()`), so a test — or a second server over another
+/// data directory — read the developer's real config.
+#[tokio::test]
+async fn handlers_read_the_global_config_under_the_contexts_paths() {
+    let f = fixture();
+    let home = tempfile::tempdir().unwrap();
+    let paths = alforria_core::GlobalPaths::resolve_with(home.path().to_path_buf(), |_| None);
+    std::fs::create_dir_all(&paths.config).unwrap();
+    std::fs::write(
+        paths.config.join("opencode.json"),
+        serde_json::json!({
+            "username": "from-the-injected-home",
+            "command": { "injected-command": { "template": "say hi" } },
+            "references": { "injected-ref": { "type": "local", "path": "/nonexistent/ref" } },
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let ctx = Arc::new(ServerContext::clone(&f.ctx).with_paths(paths.clone()));
+    assert_eq!(ctx.global_paths(), paths);
+    let router = routes::build_router(ctx);
+
+    // v1 `/config` (`util::load_config`).
+    let response = send(&router, "GET", &instance_uri(&f.worktree, "config"), "").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let config: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+    assert_eq!(config["username"], "from-the-injected-home", "{config}");
+
+    // v1 `/command` (`global_control::command_list`).
+    let response = send(&router, "GET", &instance_uri(&f.worktree, "command"), "").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_string(response).await;
+    assert!(body.contains("injected-command"), "{body}");
+
+    // v2 `/api/command` and `/api/reference` (`v2::misc`, `v2::reference`).
+    for (path, needle) in [
+        ("api/command", "injected-command"),
+        ("api/reference", "injected-ref"),
+    ] {
+        let response = send(&router, "GET", &instance_uri(&f.worktree, path), "").await;
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let body = body_string(response).await;
+        assert!(body.contains(needle), "{path}: {body}");
+    }
+}
+
+/// A context built without paths gets detached temporary ones — never the
+/// process's — and its sign-in service reaches neither LibertAI nor a
+/// session file outside them.
+#[tokio::test]
+async fn a_context_without_paths_is_detached_from_the_process_directories() {
+    let f = fixture();
+    let paths = f.ctx.global_paths();
+    assert_eq!(
+        alforria_core::paths::sandbox::escape(&paths, &[std::env::temp_dir()]),
+        None,
+        "{paths:?}"
+    );
+    assert!(paths.data.to_string_lossy().contains("alforria-detached-"));
+    // Nothing is created until something writes.
+    assert!(!paths.data.exists());
+}

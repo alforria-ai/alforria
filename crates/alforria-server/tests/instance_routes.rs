@@ -885,7 +885,6 @@ async fn vcs_apply_route_round_trips_and_errors() {
 
 #[tokio::test]
 async fn experimental_worktree_routes() {
-    std::env::set_var("OPENCODE_TEST_HOME", tempfile::tempdir().unwrap().path());
     let f = git_fixture("worktree-routes");
     let router = routes::build_router(f.ctx.clone());
 

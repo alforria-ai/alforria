@@ -1148,10 +1148,22 @@ mod tests {
     fn no_args_routes_to_default_tui() {
         let matches = cli().try_get_matches_from(["alforria"]).unwrap();
         let (mut ui, _captured) = Ui::capture(false);
-        tui::with_tui_runner(Box::new(|_, _, _, _| Err(stub("tui"))), || {
-            let err = route(&matches, &mut ui, &[]).unwrap_err();
-            assert!(format_error_needed(&err).contains("tui is not implemented yet"));
+        // The bootstrap is the real one: over a temporary home, with no
+        // scheduler and no sweep (it once ran over the developer's own).
+        let home = tempfile::tempdir().unwrap();
+        tui::with_tui_boot(tui::TuiBoot::isolated(home.path()), || {
+            tui::with_tui_runner(Box::new(|_, _, _, _| Err(stub("tui"))), || {
+                let err = route(&matches, &mut ui, &[]).unwrap_err();
+                assert!(format_error_needed(&err).contains("tui is not implemented yet"));
+            });
         });
+        // The database it opened is the temporary one.
+        assert!(
+            home.path()
+                .join(".local/share/alforria/opencode.db")
+                .exists(),
+            "the bootstrap did not use the injected home"
+        );
     }
 
     #[test]

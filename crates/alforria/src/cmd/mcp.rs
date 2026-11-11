@@ -969,7 +969,7 @@ mod tests {
         std::fs::write(dir.path().join("opencode.json"), mcp_json).unwrap();
         let paths = GlobalPaths::resolve_with(dir.path().join("home"), |_| None);
         let (config, _) = ConfigLoader::new()
-            .load(&LoadParams::new(dir.path().to_path_buf()).paths(paths))
+            .load(&LoadParams::new(dir.path().to_path_buf(), paths))
             .unwrap();
         (config, dir)
     }

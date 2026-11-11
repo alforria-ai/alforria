@@ -40,6 +40,8 @@ pub fn generated_password_for(env: Option<&str>) -> Option<String> {
 /// control, and a password printed to a supervisor's log would be a second,
 /// weaker way in.
 pub fn bearer_configured() -> bool {
+    // `alforria serve` entry point, before the server context exists: the
+    // process's own host config.
     let paths = alforria_core::GlobalPaths::from_env();
     alforria_server::ServerPolicy::load(&paths).bearer.is_some()
 }

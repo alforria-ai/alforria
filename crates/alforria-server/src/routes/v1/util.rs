@@ -113,11 +113,14 @@ pub fn parse_payload<T: serde::de::DeserializeOwned>(body: &Bytes) -> Result<T, 
 }
 
 /// The instance's merged config (`Config.Service.get`) — M3 precedence.
+///
+/// `paths` are the context's (`ServerContext::paths`): the global config a
+/// handler reads is the one the server was started over.
 pub fn load_config(
+    paths: &alforria_core::GlobalPaths,
     directory: &std::path::Path,
 ) -> Result<alforria_core::config::schema::Config, ServerError> {
-    let params = alforria_core::LoadParams::new(directory.to_path_buf())
-        .paths(alforria_core::GlobalPaths::from_env());
+    let params = alforria_core::LoadParams::new(directory.to_path_buf(), paths.clone());
     let (config, _) = alforria_core::ConfigLoader::new().load(&params)?;
     Ok(config)
 }

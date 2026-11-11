@@ -378,12 +378,10 @@ pub struct ShellEnvInfo {
 /// error here rather than an empty config: these settings carry the server's
 /// access policy, and silently dropping them would change who may connect.
 pub fn load_host_config(paths: &GlobalPaths) -> Result<Config, CoreError> {
-    let params = LoadParams::new(paths.home.clone())
-        .paths(paths.clone())
-        .flags(ConfigFlags {
-            disable_project_config: true,
-            ..ConfigFlags::default()
-        });
+    let params = LoadParams::new(paths.home.clone(), paths.clone()).flags(ConfigFlags {
+        disable_project_config: true,
+        ..ConfigFlags::default()
+    });
     let loader = ConfigLoader::new();
     loader.check_global(&params)?;
     let (config, _directories) = loader.load(&params)?;

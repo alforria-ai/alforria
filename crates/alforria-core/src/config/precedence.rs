@@ -171,11 +171,13 @@ pub struct LoadParams {
 }
 
 impl LoadParams {
-    pub fn new(directory: PathBuf) -> LoadParams {
+    /// `paths` is required: a default resolved from the environment made
+    /// every caller that forgot it read the user's own config directory.
+    pub fn new(directory: PathBuf, paths: GlobalPaths) -> LoadParams {
         LoadParams {
             directory,
             worktree: None,
-            paths: GlobalPaths::from_env(),
+            paths,
             managed_config_dir: None,
             flags: ConfigFlags::default(),
             auth: Box::new(NoAuth),
@@ -1020,15 +1022,17 @@ mod tests {
             let root = temp_dir();
             let work = root.join("work");
             fs::create_dir_all(&work).unwrap();
-            let params = LoadParams::new(work.clone())
-                .worktree(work)
-                .paths(GlobalPaths {
+            let params = LoadParams::new(
+                work.clone(),
+                GlobalPaths {
                     home: root.join("home"),
                     config: root.join("config"),
                     data: root.join("data"),
                     cache: root.join("cache"),
                     state: root.join("state"),
-                });
+                },
+            )
+            .worktree(work);
             Fixture { root, params }
         }
 
@@ -1080,18 +1084,20 @@ mod tests {
             &root.join("custom.json"),
             &json!({"username": "x"}).to_string(),
         );
-        let params = LoadParams::new(root.join("work"))
-            .paths(GlobalPaths {
+        let params = LoadParams::new(
+            root.join("work"),
+            GlobalPaths {
                 home: root.clone(),
                 config: root.join("config"),
                 data: root.clone(),
                 cache: root.clone(),
                 state: root.clone(),
-            })
-            .flags(ConfigFlags {
-                config: Some(root.join("custom.json").display().to_string()),
-                ..Default::default()
-            });
+            },
+        )
+        .flags(ConfigFlags {
+            config: Some(root.join("custom.json").display().to_string()),
+            ..Default::default()
+        });
         let _ = ConfigLoader.load(&params).unwrap();
         assert!(!params.paths.config.join("opencode.jsonc").exists());
     }
@@ -1149,9 +1155,8 @@ mod tests {
             &inside.join("opencode.json"),
             &json!({"shell": "inside-sh"}).to_string(),
         );
-        let mut params = LoadParams::new(inside.clone())
-            .worktree(inside.clone())
-            .paths(f.params.paths.clone());
+        let mut params =
+            LoadParams::new(inside.clone(), f.params.paths.clone()).worktree(inside.clone());
         params.directory = inside.clone();
         params.worktree = Some(inside);
         let (config, _) = ConfigLoader.load(&params).unwrap();

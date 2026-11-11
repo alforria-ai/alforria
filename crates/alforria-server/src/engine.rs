@@ -816,6 +816,14 @@ pub struct EngineSeams {
     /// passes [`no_ambient_env`] so a key in the developer's shell cannot
     /// change what the scripted model is offered.
     pub env: Option<EnvLookup>,
+    /// The source of the built-in LibertAI model list. `None` is the
+    /// embedded snapshot — no cache file, no network — which is what every
+    /// fixture gets; the process entry point passes the real one.
+    pub libertai_catalog: Option<alforria_core::libertai::LibertaiCatalog>,
+    /// The LibertAI account endpoints and session sidecar the sign-in
+    /// routes use. `None` is offline, with the sidecar under the context's
+    /// data directory; the process entry point passes the real ones.
+    pub libertai_endpoints: Option<alforria_core::libertai::auth::Endpoints>,
 }
 
 /// See [`EngineSeams::env`].

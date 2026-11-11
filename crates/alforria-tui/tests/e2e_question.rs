@@ -370,6 +370,7 @@ async fn spawn_server(scripts: Vec<Vec<Result<LlmEvent, alforria_llm::LlmError>>
         input_models: Some(Arc::new(FixedInputModels)),
         share_http: Some(Arc::new(StubShareHttp)),
         env: alforria_server::engine::no_ambient_env(),
+        ..EngineSeams::default()
     };
     let mut ctx = alforria_server::production_context(&ListenOptions::default(), paths, seams)
         .expect("server context");

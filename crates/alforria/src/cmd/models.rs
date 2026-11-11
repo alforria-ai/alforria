@@ -10,12 +10,15 @@ use crate::error::{core_error, CliError, TypedError};
 use crate::ui::{self, Ui};
 
 pub fn run(matches: &ArgMatches, ui: &mut Ui) -> Result<(), TypedError> {
-    let catalog = crate::catalog::catalog_service();
+    // `alforria models` entry point: the process's own cache.
+    let paths = alforria_core::GlobalPaths::from_env();
+    let catalog = crate::catalog::catalog_service_in(&paths);
     run_with(
         matches.get_one::<String>("provider").map(String::as_str),
         matches.get_flag("verbose"),
         matches.get_flag("refresh"),
         &catalog,
+        &alforria_core::libertai::LibertaiCatalog::from_env(&paths.cache),
         ui,
     )
 }
@@ -25,6 +28,7 @@ pub fn run_with(
     verbose: bool,
     refresh: bool,
     catalog: &CatalogService,
+    libertai: &alforria_core::libertai::LibertaiCatalog,
     ui: &mut Ui,
 ) -> Result<(), TypedError> {
     if refresh {
@@ -37,7 +41,7 @@ pub fn run_with(
         ));
     }
     let mut providers = catalog.get().map_err(core_error)?;
-    alforria_core::libertai::merge_builtin_provider(&mut providers);
+    libertai.merge(&mut providers);
     if let Some(id) = provider {
         let Some(found) = providers.get(id) else {
             return Err(TypedError::Cli(CliError::new(format!(
@@ -103,10 +107,8 @@ mod tests {
     }
 
     fn fixture_catalog(dir: &Path) -> (Arc<CatalogService>, Arc<FixtureFetcher>) {
-        // The built-in libertai provider merge must stay deterministic:
-        // empty cache + no fetch → embedded snapshot.
-        std::env::set_var("XDG_CACHE_HOME", dir.join("cache-home"));
-        std::env::set_var("LIBERTAI_MODEL_CATALOG_URL", "");
+        // The built-in libertai provider is deterministic here: the tests
+        // pass `LibertaiCatalog::offline()` (the embedded snapshot).
         let fixture = dir.join("models.json");
         std::fs::write(&fixture, FIXTURE).unwrap();
         let fetcher = Arc::new(FixtureFetcher {
@@ -134,7 +136,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (catalog, _) = fixture_catalog(dir.path());
         let (mut ui, captured) = Ui::capture(false);
-        run_with(None, false, false, &catalog, &mut ui).unwrap();
+        run_with(
+            None,
+            false,
+            false,
+            &catalog,
+            &alforria_core::libertai::LibertaiCatalog::offline(),
+            &mut ui,
+        )
+        .unwrap();
         let stdout = captured.stdout();
         assert_eq!(
             stdout,
@@ -155,7 +165,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (catalog, _) = fixture_catalog(dir.path());
         let (mut ui, captured) = Ui::capture(false);
-        run_with(Some("openai"), false, false, &catalog, &mut ui).unwrap();
+        run_with(
+            Some("openai"),
+            false,
+            false,
+            &catalog,
+            &alforria_core::libertai::LibertaiCatalog::offline(),
+            &mut ui,
+        )
+        .unwrap();
         assert_eq!(captured.stdout(), "openai/gpt-5.1\nopenai/o4-mini\n");
     }
 
@@ -164,7 +182,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (catalog, _) = fixture_catalog(dir.path());
         let (mut ui, _captured) = Ui::capture(false);
-        let err = run_with(Some("nope"), false, false, &catalog, &mut ui).unwrap_err();
+        let err = run_with(
+            Some("nope"),
+            false,
+            false,
+            &catalog,
+            &alforria_core::libertai::LibertaiCatalog::offline(),
+            &mut ui,
+        )
+        .unwrap_err();
         let message = crate::error::format_error(&err).unwrap();
         assert_eq!(message, "Provider not found: nope");
         assert_eq!(err.exit_code(), 1);
@@ -175,7 +201,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (catalog, _) = fixture_catalog(dir.path());
         let (mut ui, captured) = Ui::capture(false);
-        run_with(Some("acme"), true, false, &catalog, &mut ui).unwrap();
+        run_with(
+            Some("acme"),
+            true,
+            false,
+            &catalog,
+            &alforria_core::libertai::LibertaiCatalog::offline(),
+            &mut ui,
+        )
+        .unwrap();
         let stdout = captured.stdout();
         assert!(stdout.starts_with("acme/acme-1\n"), "{stdout}");
         let doc = stdout.split_once("acme/acme-1\n").unwrap().1;
@@ -188,7 +222,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (catalog, fetcher) = fixture_catalog(dir.path());
         let (mut ui, captured) = Ui::capture(false);
-        run_with(None, false, true, &catalog, &mut ui).unwrap();
+        run_with(
+            None,
+            false,
+            true,
+            &catalog,
+            &alforria_core::libertai::LibertaiCatalog::offline(),
+            &mut ui,
+        )
+        .unwrap();
         assert_eq!(
             captured.stderr(),
             format!(

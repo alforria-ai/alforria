@@ -520,6 +520,7 @@ const PROMPT_REVIEW: &str = include_str!("command_review.txt");
 /// `commands` record (merged with the markdown-discovered ones by the M3
 /// loader).
 async fn command_list(
+    State(ctx): State<Arc<ServerContext>>,
     axum::Extension(location): axum::Extension<LocationContext>,
 ) -> Result<Response, ServerError> {
     let directory = location.directory.display().to_string();
@@ -554,8 +555,7 @@ async fn command_list(
             subtask: None,
         },
     ];
-    let params = alforria_core::LoadParams::new(location.directory.clone())
-        .paths(alforria_core::GlobalPaths::from_env());
+    let params = alforria_core::LoadParams::new(location.directory.clone(), ctx.paths.clone());
     let (config, _) = match alforria_core::ConfigLoader::new().load(&params) {
         Ok(loaded) => loaded,
         // Config load failures degrade to the built-ins only (the v1
@@ -594,10 +594,10 @@ async fn command_list(
 /// the `skills` config entries (`core/src/config/plugin/skill.ts`), deduped
 /// by name (later sources win).
 async fn skill_list(
+    State(ctx): State<Arc<ServerContext>>,
     axum::Extension(location): axum::Extension<LocationContext>,
 ) -> Result<Response, ServerError> {
-    let params = alforria_core::LoadParams::new(location.directory.clone())
-        .paths(alforria_core::GlobalPaths::from_env());
+    let params = alforria_core::LoadParams::new(location.directory.clone(), ctx.paths.clone());
     let (config, directories) = match alforria_core::ConfigLoader::new().load(&params) {
         Ok(loaded) => loaded,
         Err(_) => return envelope(&location, Vec::<alforria_schema::skill::SkillInfo>::new()),
@@ -620,11 +620,7 @@ async fn skill_list(
                 continue;
             }
             let path = if let Some(rest) = item.strip_prefix("~/") {
-                if let Ok(home) = std::env::var("HOME") {
-                    PathBuf::from(home).join(rest)
-                } else {
-                    continue;
-                }
+                ctx.paths.home.join(rest)
             } else {
                 location.directory.join(item)
             };

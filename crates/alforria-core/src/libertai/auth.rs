@@ -69,14 +69,37 @@ pub struct Endpoints {
 }
 
 impl Endpoints {
-    pub fn from_env() -> Endpoints {
+    /// The env-resolved account API and console, with the session sidecar
+    /// under `paths.data`.
+    pub fn from_env_in(paths: &GlobalPaths) -> Endpoints {
         Endpoints {
             account: account_base(),
             console: console_base(),
-            session_file: session_path(),
+            session_file: paths.data.join(SESSION_FILE),
         }
     }
+
+    /// Endpoints that reach nothing: the account API and console are a
+    /// closed loopback port, the sidecar is `session_file`. What a context
+    /// gets unless its entry point wires the real ones, so no fixture can
+    /// start a sign-in against LibertAI or read a developer's session.
+    pub fn offline(session_file: PathBuf) -> Endpoints {
+        Endpoints {
+            account: OFFLINE_BASE.to_string(),
+            console: OFFLINE_BASE.to_string(),
+            session_file,
+        }
+    }
+
+    /// Whether these are [`Endpoints::offline`].
+    pub fn is_offline(&self) -> bool {
+        self.account == OFFLINE_BASE
+    }
 }
+
+/// The discard port on loopback: a connection is refused at once and never
+/// leaves the machine.
+const OFFLINE_BASE: &str = "http://127.0.0.1:9";
 
 // ---------------------------------------------------------------------------
 // PKCE
@@ -108,13 +131,8 @@ impl Pkce {
     }
 }
 
-/// `{"redirect_uri", "state", "challenge", "client"}` against `{console}/cli`.
-pub fn authorize_url(pkce: &Pkce, client: &str, redirect_uri: &str) -> String {
-    Endpoints::from_env().authorize_url(pkce, client, redirect_uri)
-}
-
 impl Endpoints {
-    /// [`authorize_url`] against this console.
+    /// `{"redirect_uri", "state", "challenge", "client"}` against `{console}/cli`.
     pub fn authorize_url(&self, pkce: &Pkce, client: &str, redirect_uri: &str) -> String {
         format!(
             "{}/cli?redirect_uri={}&state={}&challenge={}&client={}",
@@ -579,13 +597,16 @@ pub struct Subscription {
 /// The rotated refresh token replaces the stored one BEFORE the query runs
 /// (rotation is one-time-use; the old token is already invalid).
 pub fn with_refreshed_session<T>(
+    endpoints: &Endpoints,
     query: impl FnOnce(&str) -> Result<T, String>,
 ) -> Result<T, String> {
-    let session = load_session()
+    let session = endpoints
+        .load_session()
         .ok_or_else(|| "not logged in — run `alforria auth login -p libertai`".to_string())?;
     let pair = refresh(&session.refresh_token)?;
-    store_session(&StoredSession {
-        refresh_token: pair.refresh_token.clone(),
+    endpoints
+        .store_session(&StoredSession {
+            refresh_token: pair.refresh_token.clone(),
         expires_at: session.expires_at,
         device_id: session.device_id,
     })
@@ -607,18 +628,6 @@ pub struct StoredSession {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
     pub device_id: String,
-}
-
-fn session_path() -> PathBuf {
-    GlobalPaths::from_env().data.join(SESSION_FILE)
-}
-
-pub fn load_session() -> Option<StoredSession> {
-    Endpoints::from_env().load_session()
-}
-
-pub fn store_session(session: &StoredSession) -> Result<(), String> {
-    Endpoints::from_env().store_session(session)
 }
 
 impl Endpoints {
@@ -730,7 +739,12 @@ mod tests {
     #[test]
     fn authorize_url_carries_custom_challenge_param() {
         let pkce = Pkce::generate();
-        let url = authorize_url(&pkce, "Alforria", "http://127.0.0.1:41234/callback");
+        let endpoints = Endpoints {
+            account: LIBERTAI_ACCOUNT_BASE.to_string(),
+            console: DEFAULT_CONSOLE_BASE.to_string(),
+            session_file: PathBuf::from("/nonexistent/libertai-auth.json"),
+        };
+        let url = endpoints.authorize_url(&pkce, "Alforria", "http://127.0.0.1:41234/callback");
         assert!(url.starts_with("https://console.libertai.io/cli?"));
         assert!(url.contains("redirect_uri=http%3A%2F%2F127.0.0.1%3A41234%2Fcallback"));
         assert!(url.contains(&format!("state={}", pkce.state)));

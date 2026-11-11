@@ -57,6 +57,14 @@ pub struct ListenOptions {
     /// servers (`serve`, `web`, the TUI's own); off for one-shot commands,
     /// which would start a scheduled turn only to exit under it.
     pub schedule: bool,
+    /// Run the restart sweep over what an earlier process left mid-turn
+    /// before serving. On by default; a caller that only wants a router
+    /// over someone else's data directory turns it off.
+    pub sweep: bool,
+    /// The global directories to serve. `None` resolves them from the
+    /// process environment — which only a process entry point may do; a
+    /// test passes its temporary home.
+    pub paths: Option<alforria_core::GlobalPaths>,
 }
 
 impl Default for ListenOptions {
@@ -68,6 +76,8 @@ impl Default for ListenOptions {
             hosts: Vec::new(),
             password: None,
             schedule: false,
+            sweep: true,
+            paths: None,
         }
     }
 }
@@ -286,8 +296,25 @@ fn ui_backend() -> Arc<dyn state::UiBackend> {
 }
 
 fn default_context(opts: &ListenOptions) -> io::Result<Arc<ServerContext>> {
-    let paths = alforria_core::GlobalPaths::from_env();
-    production_context(opts, paths, engine::EngineSeams::default())
+    // The one place a server resolves the process's own directories: the
+    // entry point of `serve`, `web`, `acp` and the TUI. (A test run that
+    // gets here without a sandbox panics in `from_env`.)
+    let paths = opts
+        .paths
+        .clone()
+        .unwrap_or_else(alforria_core::GlobalPaths::from_env);
+    // The entry point is also what turns the network on: the LibertAI
+    // model list and sign-in are offline in any other context.
+    let seams = engine::EngineSeams {
+        libertai_catalog: Some(alforria_core::libertai::LibertaiCatalog::from_env(
+            &paths.cache,
+        )),
+        libertai_endpoints: Some(alforria_core::libertai::auth::Endpoints::from_env_in(
+            &paths,
+        )),
+        ..engine::EngineSeams::default()
+    };
+    production_context(opts, paths, seams)
 }
 
 /// The production server context: shared storage + bus and the per-directory
@@ -299,6 +326,16 @@ pub fn production_context(
     paths: alforria_core::GlobalPaths,
     seams: engine::EngineSeams,
 ) -> io::Result<Arc<ServerContext>> {
+    // Every harness builds its server here: a test run over directories
+    // that are not a sandbox stops before the database is opened.
+    alforria_core::paths::sandbox::guard(&paths, "production_context");
+    let libertai_catalog = seams
+        .libertai_catalog
+        .clone()
+        .unwrap_or_else(alforria_core::libertai::LibertaiCatalog::offline);
+    let libertai_endpoints = seams.libertai_endpoints.clone().unwrap_or_else(|| {
+        alforria_core::libertai::auth::Endpoints::offline(paths.data.join("libertai-auth.json"))
+    });
     let storage = Storage::open_default(&paths.data)
         .map_err(|err| io::Error::other(format!("storage open failed: {err}")))?;
     let storage = Arc::new(storage);
@@ -318,7 +355,7 @@ pub fn production_context(
     // M7.7: the provider-runtime inputs — the models-dev catalog and the
     // `auth.json` store shared by the routes and every instance engine.
     let runtime = engine::EngineRuntime {
-        catalog: state::catalog_in(paths.cache.clone()),
+        catalog: state::catalog_in(paths.cache.clone(), libertai_catalog),
         auth: Arc::new(state::FileAuthStore::new(paths.data.join("auth.json"))),
         schedule: opts.schedule,
     };
@@ -374,7 +411,11 @@ pub fn production_context(
     ctx.vcs = Arc::new(state::CoreVcs::default());
     ctx.catalog = runtime.catalog;
     ctx.auth_store = runtime.auth;
-    ctx.paths = Some(paths.clone());
+    ctx.paths = paths.clone();
+    ctx.detached_paths = None;
+    ctx.provider_auth = Arc::new(state::ProviderAuthService::with_libertai(
+        libertai_endpoints,
+    ));
     ctx.stop_background = Arc::new({
         let engines = engines.clone();
         move || engines.stop_background()
@@ -390,11 +431,13 @@ pub fn production_context(
     let ctx = Arc::new(ctx);
     // Before the first request: no client sees a session a dead process
     // left mid-turn.
-    recovery::sweep(
-        &ctx,
-        &paths.data,
-        alforria_core::session::recovery::ResumePolicy::from_config(&global),
-    );
+    if opts.sweep {
+        recovery::sweep(
+            &ctx,
+            &paths.data,
+            alforria_core::session::recovery::ResumePolicy::from_config(&global),
+        );
+    }
     Ok(ctx)
 }
 
@@ -474,7 +517,7 @@ fn instance_for_directory(
     seams: engine::EngineSeams,
     directory: &std::path::Path,
 ) -> Result<Arc<alforria_core::SessionServices>, ServerError> {
-    let params = alforria_core::LoadParams::new(directory.to_path_buf()).paths(paths.clone());
+    let params = alforria_core::LoadParams::new(directory.to_path_buf(), paths.clone());
     let (config, _opencode_dirs) = alforria_core::ConfigLoader::new().load(&params)?;
 
     // `skill.dirs()` — directory sources from the config (`skills.paths`);
@@ -739,7 +782,10 @@ mod tests {
             paths,
             Arc::new(engine::EngineStore::default()),
             engine::EngineRuntime {
-                catalog: crate::state::default_catalog(),
+                catalog: crate::state::catalog_in(
+                    root.path().join("cache"),
+                    alforria_core::libertai::LibertaiCatalog::offline(),
+                ),
                 auth: Arc::new(crate::state::MemoryAuthStore::default()),
                 schedule: false,
             },

@@ -204,6 +204,7 @@ fn fixture(llm_text: &str) -> Fixture {
         input_models: Some(Arc::new(FixedInputModels)),
         share_http: None,
         env: alforria_server::engine::no_ambient_env(),
+        ..EngineSeams::default()
     };
     let mut ctx =
         alforria_server::production_context(&ListenOptions::default(), paths, seams).unwrap();
@@ -520,6 +521,7 @@ async fn session_create_auto_shares_when_config_auto() {
         input_models: None,
         share_http: Some(share_http.clone()),
         env: alforria_server::engine::no_ambient_env(),
+        ..EngineSeams::default()
     };
     let mut ctx =
         alforria_server::production_context(&ListenOptions::default(), paths, seams).unwrap();

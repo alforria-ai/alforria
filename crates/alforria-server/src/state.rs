@@ -1316,8 +1316,14 @@ impl Default for ProviderAuthService {
 }
 
 impl ProviderAuthService {
+    /// A service that reaches nothing: its LibertAI endpoints are
+    /// [`Endpoints::offline`](alforria_core::libertai::auth::Endpoints::offline)
+    /// with no session file to read. The process entry point installs the
+    /// real one ([`ProviderAuthService::with_libertai`]).
     pub fn new() -> ProviderAuthService {
-        ProviderAuthService::with_libertai(alforria_core::libertai::auth::Endpoints::from_env())
+        ProviderAuthService::with_libertai(alforria_core::libertai::auth::Endpoints::offline(
+            PathBuf::new(),
+        ))
     }
 
     /// A service whose LibertAI sign-in talks to `endpoints`.
@@ -1466,13 +1472,13 @@ impl alforria_core::catalog::Fetcher for NeverFetch {
     }
 }
 
-pub fn default_catalog() -> CatalogSource {
-    catalog_in(alforria_core::GlobalPaths::from_env().cache)
-}
-
 /// The catalog read from `cache`: a context built over explicit paths (a
-/// test's temporary ones) reads its own cache, not the user's.
-pub fn catalog_in(cache: PathBuf) -> CatalogSource {
+/// test's temporary ones) reads its own cache, not the user's. The built-in
+/// `libertai` provider is merged from `libertai` when the catalog has none.
+pub fn catalog_in(
+    cache: PathBuf,
+    libertai: alforria_core::libertai::LibertaiCatalog,
+) -> CatalogSource {
     let cfg = alforria_core::CatalogConfig::from_env();
     let service = alforria_core::CatalogService::new(
         cache,
@@ -1483,7 +1489,11 @@ pub fn catalog_in(cache: PathBuf) -> CatalogSource {
         Arc::new(alforria_core::catalog::SystemClock),
         Arc::new(NeverFetch),
     );
-    Arc::new(move || service.get())
+    Arc::new(move || {
+        let mut providers = service.get()?;
+        libertai.merge(&mut providers);
+        Ok(providers)
+    })
 }
 
 /// SSE heartbeat intervals. TS bakes `Stream.tick("10 seconds")` /
@@ -1603,11 +1613,15 @@ pub struct ServerContext {
     /// transcript indexers). Called first in a shutdown, so nothing new
     /// starts while the running turns are settled.
     pub stop_background: Arc<dyn Fn() + Send + Sync>,
-    /// The global directories this context was built over. `None` resolves
-    /// them from the environment at each use (the unwired contexts); the
-    /// production context pins the ones it was given, so a context built
-    /// over temporary directories never reads or writes the user's own.
-    pub paths: Option<alforria_core::GlobalPaths>,
+    /// The global directories this context was built over, and the only
+    /// ones a handler may use: nothing behind a request resolves them from
+    /// the environment. The production context pins the ones it was given;
+    /// a context built without any ([`ServerContext::new`]) gets detached
+    /// temporary ones, so it never reads or writes the user's own.
+    pub paths: alforria_core::GlobalPaths,
+    /// Keeps the detached directories of [`ServerContext::new`] until the
+    /// last clone of the context drops.
+    pub detached_paths: Option<Arc<alforria_core::paths::DetachedPaths>>,
     /// `Skill.Service` status list.
     pub skills: Arc<dyn StatusSeam>,
     /// `LSP.Service.status`.
@@ -1691,6 +1705,8 @@ impl ServerContext {
         );
         let outbox = crate::outbox::Outbox::new(storage.clone(), None)
             .expect("an outbox without hooks cannot fail");
+        let detached = alforria_core::GlobalPaths::detached();
+        let paths = detached.paths.clone();
         ServerContext {
             auth,
             instances,
@@ -1709,10 +1725,11 @@ impl ServerContext {
             auth_store: Arc::new(MemoryAuthStore::default()),
             vcs: Arc::new(NoVcs),
             worktree: alforria_core::worktree::Worktree::default(),
-            paths: None,
+            paths: paths.clone(),
+            detached_paths: Some(Arc::new(detached)),
             stop_background: Arc::new(|| {}),
             worktree_deps: Arc::new(WorktreeDeps {
-                data_dir: alforria_core::GlobalPaths::from_env().data,
+                data_dir: paths.data.clone(),
                 global_bus: global_bus_clone,
                 instances: instances_clone,
                 projects: projects.clone(),
@@ -1723,8 +1740,15 @@ impl ServerContext {
             tui: TuiControl::new(),
             tools: Arc::new(UnwiredTools),
             mcp: Arc::new(UnwiredMcp),
-            catalog: default_catalog(),
-            provider_auth: Arc::new(ProviderAuthService::new()),
+            catalog: catalog_in(
+                paths.cache.clone(),
+                alforria_core::libertai::LibertaiCatalog::offline(),
+            ),
+            provider_auth: Arc::new(ProviderAuthService::with_libertai(
+                alforria_core::libertai::auth::Endpoints::offline(
+                    paths.data.join("libertai-auth.json"),
+                ),
+            )),
             v2_permissions: Arc::new(crate::routes::v2::permission::PermissionRegistry::default()),
             pty_tickets: crate::pty::ticket::TicketCache::default(),
             hosts: crate::middleware::host::HostAllowlist::loopback(),
@@ -1742,9 +1766,32 @@ impl ServerContext {
     /// factory.
     /// See [`ServerContext::paths`].
     pub fn global_paths(&self) -> alforria_core::GlobalPaths {
-        self.paths
-            .clone()
-            .unwrap_or_else(alforria_core::GlobalPaths::from_env)
+        self.paths.clone()
+    }
+
+    /// Rebuild the context over `paths`: every default that was derived
+    /// from the detached ones follows (catalog cache, sign-in sidecar,
+    /// worktree base).
+    pub fn with_paths(mut self, paths: alforria_core::GlobalPaths) -> ServerContext {
+        alforria_core::paths::sandbox::guard(&paths, "ServerContext::with_paths");
+        self.catalog = catalog_in(
+            paths.cache.clone(),
+            alforria_core::libertai::LibertaiCatalog::offline(),
+        );
+        self.provider_auth = Arc::new(ProviderAuthService::with_libertai(
+            alforria_core::libertai::auth::Endpoints::offline(
+                paths.data.join("libertai-auth.json"),
+            ),
+        ));
+        self.worktree_deps = Arc::new(WorktreeDeps {
+            data_dir: paths.data.clone(),
+            global_bus: self.global_bus.clone(),
+            instances: self.instances.clone(),
+            projects: self.projects.clone(),
+        });
+        self.paths = paths;
+        self.detached_paths = None;
+        self
     }
 
     pub fn for_tests() -> ServerContext {

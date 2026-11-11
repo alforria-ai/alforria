@@ -77,9 +77,11 @@ pub fn boot(directory: Option<&Path>) -> Result<Instance, TypedError> {
             raw: err.to_string(),
         })?,
     };
+    // The one-shot commands' entry point (`run`, `debug`, `mcp`, …): the
+    // process's own directories, handed to the instance built below.
     let paths = alforria_core::GlobalPaths::from_env();
     let (config, config_dirs) = ConfigLoader::new()
-        .load(&LoadParams::new(directory.clone()).paths(paths.clone()))
+        .load(&LoadParams::new(directory.clone(), paths.clone()))
         .map_err(core_error)?;
 
     let storage = Arc::new(Storage::open_default(&paths.data).map_err(core_error)?);

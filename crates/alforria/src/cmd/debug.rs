@@ -716,6 +716,7 @@ pub fn run(matches: &ArgMatches, ui: &mut Ui) -> Result<(), TypedError> {
             Ok(())
         }
         "paths" => {
+            // `alforria debug paths` prints exactly what the process resolves.
             paths(ui, &alforria_core::GlobalPaths::from_env());
             Ok(())
         }
@@ -923,7 +924,8 @@ pub fn run(matches: &ArgMatches, ui: &mut Ui) -> Result<(), TypedError> {
 /// `debug v2` (v2.ts) — the v2 catalog: providers, the default model and
 /// the per-provider small-model table (smoke output over models.dev).
 fn v2(ui: &mut Ui, instance: &Instance) -> Result<(), TypedError> {
-    let catalog = crate::catalog::catalog_service();
+    // `alforria debug v2` entry point: the process's own cache.
+    let catalog = crate::catalog::catalog_service_in(&alforria_core::GlobalPaths::from_env());
     let providers = catalog.get().map_err(crate::error::core_error)?;
     let mut available: Vec<(&String, &alforria_core::catalog::Provider)> =
         providers.iter().collect();

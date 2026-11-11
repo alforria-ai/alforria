@@ -47,9 +47,10 @@ fn update_config_file(directory: &Path, payload: &Value) -> Result<(), ServerErr
 
 /// `get` (`handlers/config.ts:15-17`).
 pub async fn config_get(
+    State(ctx): State<Arc<ServerContext>>,
     axum::Extension(location): axum::Extension<LocationContext>,
 ) -> Result<Response, ServerError> {
-    let config = load_config(&location.directory)?;
+    let config = load_config(&ctx.paths, &location.directory)?;
     Ok(json_ok(config))
 }
 
@@ -82,7 +83,7 @@ pub async fn config_providers(
     State(ctx): State<Arc<ServerContext>>,
     axum::Extension(location): axum::Extension<LocationContext>,
 ) -> Result<Response, ServerError> {
-    let config = load_config(&location.directory)?;
+    let config = load_config(&ctx.paths, &location.directory)?;
     Ok(json_ok(
         crate::routes::v1::provider::config_providers_result(&ctx, &config)?,
     ))

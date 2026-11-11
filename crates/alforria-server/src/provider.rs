@@ -796,7 +796,9 @@ pub fn load_catalog(
 ) -> Result<alforria_core::catalog::Providers, ServerError> {
     let mut providers = catalog()
         .map_err(|err| ServerError::Core(alforria_core::CoreError::Catalog(err.to_string())))?;
-    alforria_core::libertai::merge_builtin_provider(&mut providers);
+    // The context's source merged its own (`state::catalog_in`); a source
+    // without one still lists the provider, from the embedded snapshot.
+    alforria_core::libertai::LibertaiCatalog::offline().merge(&mut providers);
     Ok(providers)
 }
 

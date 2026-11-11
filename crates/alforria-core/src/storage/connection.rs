@@ -38,6 +38,9 @@ impl Storage {
     /// PRAGMAs, so opening an incompatible database fails here).
     pub fn open(path: impl AsRef<Path>) -> Result<Storage, CoreError> {
         let path = path.as_ref();
+        // A test run never opens (and so never migrates) a database outside
+        // a sandbox root: `paths::sandbox`.
+        crate::paths::sandbox::guard_path(path, "Storage::open");
         let mut conn = Connection::open(path)?;
         Self::configure(&conn)?;
         refuse_foreign_schema(&conn, path)?;

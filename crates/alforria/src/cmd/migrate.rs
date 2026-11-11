@@ -71,6 +71,7 @@ pub fn run(matches: &ArgMatches, ui: &mut Ui) -> Result<(), TypedError> {
         dry_run: matches.get_flag("dry-run"),
         force: matches.get_flag("force"),
     };
+    // `alforria migrate` entry point: it moves the process's own install.
     let home = GlobalPaths::home_from_env();
     let legacy = GlobalPaths::named(home.clone(), LEGACY_DIR);
     let own = GlobalPaths::named(home, APP_DIR);

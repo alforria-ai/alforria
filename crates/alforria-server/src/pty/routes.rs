@@ -237,10 +237,13 @@ async fn create(
         .clone()
         .filter(|cwd| !cwd.is_empty())
         .unwrap_or_else(|| location.directory.display().to_string());
-    let info = ctx.ptys.resolve(&location).create(&PtyCreateInput {
-        cwd: Some(cwd),
-        ..payload
-    })?;
+    let info = ctx.ptys.resolve(&location).create_in(
+        &PtyCreateInput {
+            cwd: Some(cwd),
+            ..payload
+        },
+        Some(&ctx.paths),
+    )?;
     Ok(json_ok(info))
 }
 
@@ -329,10 +332,13 @@ async fn create_v2(
         .clone()
         .filter(|cwd| !cwd.is_empty())
         .unwrap_or_else(|| location.directory.display().to_string());
-    let info = ctx.ptys.resolve(&location).create(&PtyCreateInput {
-        cwd: Some(cwd),
-        ..payload
-    })?;
+    let info = ctx.ptys.resolve(&location).create_in(
+        &PtyCreateInput {
+            cwd: Some(cwd),
+            ..payload
+        },
+        Some(&ctx.paths),
+    )?;
     envelope(&location, &info)
 }
 

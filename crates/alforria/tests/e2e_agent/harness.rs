@@ -64,6 +64,8 @@ impl MockServer {
 const PASSED_THROUGH: &[&str] = &[
     "PATH",
     "TMPDIR",
+    // The extra sandbox root of the isolation job (`paths::sandbox`).
+    "ALFORRIA_TEST_SANDBOX",
     // Windows: process creation and the shell need these.
     "SystemRoot",
     "SYSTEMROOT",
@@ -167,8 +169,16 @@ impl Env {
     /// inherited provider key, token or real directory. A spawned test
     /// process must never read or write the owner's own files.
     pub fn command(&self, args: &[&str]) -> Command {
+        // Refuse to spawn over anything but a sandbox: the binary resolves
+        // its directories from the environment set below.
+        alforria_core::paths::sandbox::require(
+            &alforria_core::GlobalPaths::resolve_with(self.home.clone(), |_| None),
+            "e2e harness",
+        );
         let mut command = Command::new(env!("CARGO_BIN_EXE_alforria"));
         command.env_clear();
+        // The spawned binary checks for itself too: it is a test run.
+        command.env(alforria_core::paths::sandbox::GUARD_ENV, "1");
         for name in PASSED_THROUGH {
             if let Some(value) = std::env::var_os(name) {
                 command.env(name, value);

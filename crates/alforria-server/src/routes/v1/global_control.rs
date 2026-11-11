@@ -436,10 +436,10 @@ fn hints(template: &str) -> Vec<String> {
 
 /// `getCommand` (`handlers/instance.ts:67-69`).
 pub async fn command_list(
+    State(ctx): State<Arc<ServerContext>>,
     axum::Extension(location): axum::Extension<LocationContext>,
 ) -> Result<Response, ServerError> {
-    let params = alforria_core::LoadParams::new(location.directory.clone())
-        .paths(alforria_core::GlobalPaths::from_env());
+    let params = alforria_core::LoadParams::new(location.directory.clone(), ctx.paths.clone());
     let (config, _) = alforria_core::ConfigLoader::new().load(&params)?;
     let mut commands: Vec<Value> = vec![
         json!({

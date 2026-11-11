@@ -95,6 +95,7 @@ fn cell_to_string(value: &Value) -> String {
 
 /// `db [query]` (db.ts:8-43) — query execution or the `sqlite3` shell.
 pub fn run(matches: &ArgMatches, ui: &mut Ui) -> Result<(), TypedError> {
+    // `alforria db` entry point: the process's own database.
     let paths = alforria_core::GlobalPaths::from_env();
     if let Some(trim) = matches.subcommand_matches("trim-diffs") {
         return trim_diffs(&paths, trim.get_flag("vacuum"), ui);

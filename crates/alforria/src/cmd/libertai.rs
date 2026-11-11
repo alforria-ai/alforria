@@ -11,7 +11,10 @@ use crate::ui::{style, Ui};
 
 pub fn run(matches: &ArgMatches, ui: &mut Ui) -> Result<(), TypedError> {
     let json = matches.get_flag("json");
-    let subscription = auth::with_refreshed_session(auth::subscription).map_err(cli_error)?;
+    // `alforria libertai usage` entry point: the process's own session.
+    let endpoints = auth::Endpoints::from_env_in(&alforria_core::GlobalPaths::from_env());
+    let subscription =
+        auth::with_refreshed_session(&endpoints, auth::subscription).map_err(cli_error)?;
     if json {
         ui.println(&serde_json::to_string_pretty(&subscription).unwrap_or_default());
         return Ok(());

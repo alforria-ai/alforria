@@ -142,12 +142,8 @@ impl Default for ServerPolicy {
 }
 
 impl ServerPolicy {
-    /// Resolve the policy from a loaded host config.
-    pub fn from_config(config: &Config) -> Result<ServerPolicy, String> {
-        ServerPolicy::from_config_in(config, &alforria_core::GlobalPaths::home_from_env())
-    }
-
-    /// [`ServerPolicy::from_config`], expanding `~/` against `home`.
+    /// Resolve the policy from a loaded host config, expanding `~/`
+    /// against `home` (the context's, never the process's).
     pub fn from_config_in(config: &Config, home: &Path) -> Result<ServerPolicy, String> {
         let server = config.server.as_ref();
         let bearer = match server
@@ -273,7 +269,9 @@ mod tests {
 
     #[test]
     fn shutdown_defaults_to_a_ten_second_abort() {
-        let policy = ServerPolicy::from_config(&config(serde_json::json!({}))).unwrap();
+        let policy =
+            ServerPolicy::from_config_in(&config(serde_json::json!({})), Path::new("/home/test"))
+                .unwrap();
         assert_eq!(policy.shutdown, ShutdownOptions::default());
         assert_eq!(policy.shutdown.timeout, Duration::from_secs(10));
         assert_eq!(policy.shutdown.sessions, ShutdownSessions::Abort);
@@ -281,9 +279,12 @@ mod tests {
 
     #[test]
     fn shutdown_reads_the_configured_deadline_and_mode() {
-        let policy = ServerPolicy::from_config(&config(serde_json::json!({
-            "server": { "shutdown": { "timeout": "45s", "sessions": "drain" } }
-        })))
+        let policy = ServerPolicy::from_config_in(
+            &config(serde_json::json!({
+                "server": { "shutdown": { "timeout": "45s", "sessions": "drain" } }
+            })),
+            Path::new("/home/test"),
+        )
         .unwrap();
         assert_eq!(policy.shutdown.timeout, Duration::from_secs(45));
         assert_eq!(policy.shutdown.sessions, ShutdownSessions::Drain);
