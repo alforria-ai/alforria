@@ -200,7 +200,17 @@ impl Connection {
             .next_id
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let (tx, rx) = std::sync::mpsc::channel::<Message>();
-        self.pending.lock().unwrap().insert(id, Some(tx.clone()));
+        self.pending.lock().unwrap().insert(id, Some(tx));
+        // If this future is dropped (a permission settled elsewhere), forget
+        // the request: with the last sender gone the blocking `recv` below
+        // returns instead of parking a pool thread for good.
+        struct Forget<'a>(&'a Connection, i64);
+        impl Drop for Forget<'_> {
+            fn drop(&mut self) {
+                self.0.pending.lock().unwrap().remove(&self.1);
+            }
+        }
+        let _forget = Forget(self, id);
         self.transport.write(
             &json!({
                 "jsonrpc": "2.0",

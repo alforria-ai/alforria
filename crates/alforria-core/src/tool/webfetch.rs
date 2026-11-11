@@ -138,7 +138,19 @@ fn checked_url(raw: &str) -> Result<String, ToolError> {
             "URL must not contain credentials".to_string(),
         ));
     }
-    Ok(raw.split('#').next().unwrap_or(raw).to_string())
+    // Match and fetch the URL as the HTTP client understands it, not as it
+    // was typed: `https://EXAMPLE.com\\x` is a request to
+    // `https://example.com/x`, and a rule written for the latter must see it.
+    let mut normalized = parsed;
+    normalized.set_fragment(None);
+    let normalized = normalized.to_string();
+    // A bare origin keeps its familiar spelling (`https://example.com`, which
+    // rules are written against) when that is all the parser added.
+    let typed = raw.split('#').next().unwrap_or(raw);
+    if normalized.strip_suffix('/') == Some(typed) {
+        return Ok(typed.to_string());
+    }
+    Ok(normalized)
 }
 
 /// Resolve a `Location` header against the URL that produced it.
@@ -762,6 +774,26 @@ mod tests {
         result.unwrap();
         assert_eq!(asks[0].patterns, vec!["https://example.com/page"]);
         assert_eq!(fake.calls()[0].0, "https://example.com/page");
+    }
+
+    #[tokio::test]
+    async fn the_pattern_is_the_url_actually_requested() {
+        for (typed, requested) in [
+            ("https://EXAMPLE.com/Secret", "https://example.com/Secret"),
+            ("https://example.com\\secret", "https://example.com/secret"),
+            (
+                "https://example.com/a/../secret",
+                "https://example.com/secret",
+            ),
+            ("https://example.com", "https://example.com"),
+        ] {
+            let fake = Arc::new(FakeHttp::new(vec![response(200, vec![], "ok")]));
+            let (result, asks) =
+                call(fake.clone(), json!({ "url": typed, "format": "text" })).await;
+            result.unwrap();
+            assert_eq!(asks[0].patterns, vec![requested], "{typed}");
+            assert_eq!(fake.calls()[0].0, requested, "{typed}");
+        }
     }
 
     #[tokio::test]

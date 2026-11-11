@@ -89,25 +89,38 @@ pub fn migrate(
     own: &GlobalPaths,
     options: Options,
 ) -> Result<Vec<String>, String> {
+    let mut notes = Vec::new();
+    let mut wanted = options.data;
+    // A database opencode v2 has migrated is opencode's now: alforria cannot
+    // read it, and taking it away would leave opencode without its data.
+    // Leave it where it is and start alforria fresh.
+    if wanted != DataMode::Fresh && migrated_by_opencode_v2(&legacy.data) {
+        wanted = DataMode::Fresh;
+        notes.push(format!(
+            "note: {} was migrated by opencode v2 and stays with opencode; alforria starts \
+             with a new database",
+            legacy.data.join("opencode.db").display()
+        ));
+    }
     let data_action = plan(
         &legacy.data,
         &own.data,
-        match options.data {
+        match wanted {
             DataMode::Move => Action::Move,
             DataMode::Copy => Action::Copy,
             DataMode::Fresh => Action::Fresh,
         },
     );
     // Renaming a directory out from under a process that has the database
-    // open leaves it writing to paths that no longer exist.
+    // open leaves it writing to paths that no longer exist; copying a live
+    // SQLite database file by file can produce a corrupt one.
     let mut blocked = None;
-    if data_action == Action::Move && !options.force {
+    if matches!(data_action, Action::Move | Action::Copy) && !options.force {
         let users = processes_using(&legacy.data);
         if !users.is_empty() {
             let message = format!(
                 "{} is in use by process {}. Stop every running alforria and opencode \
-                 (servers, TUIs, `alforria web`) and run this again, or pass --copy to \
-                 copy the data instead of moving it.",
+                 (servers, TUIs, `alforria web`) and run this again.",
                 legacy.data.display(),
                 users
                     .iter()
@@ -154,7 +167,7 @@ pub fn migrate(
             }
             Action::Copy => {
                 if !options.dry_run {
-                    copy_tree(from, to).map_err(|error| {
+                    copy_staged(from, to).map_err(|error| {
                         format!("copying {} to {}: {error}", from.display(), to.display())
                     })?;
                 }
@@ -207,10 +220,50 @@ pub fn migrate(
         };
         report.push(line);
     }
+    report.extend(notes);
     if let Some(blocked) = blocked {
         report.push(format!("blocked: {blocked}"));
     }
     Ok(report)
+}
+
+/// Whether the legacy database carries opencode v2's schema (the marker
+/// `Storage::open` refuses on).
+fn migrated_by_opencode_v2(data: &Path) -> bool {
+    let path = data.join("opencode.db");
+    if !path.is_file() {
+        return false;
+    }
+    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY;
+    rusqlite::Connection::open_with_flags(&path, flags)
+        .and_then(|conn| {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'session_v2')",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Copy into a sibling staging directory and rename it into place, so the
+/// destination either does not exist or is complete. A copy that is
+/// interrupted or runs out of disk must not leave a half-filled directory
+/// that every later run takes for a finished migration.
+fn copy_staged(from: &Path, to: &Path) -> std::io::Result<()> {
+    let parent = to.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let name = to.file_name().unwrap_or_default().to_string_lossy();
+    let staging = parent.join(format!(".{name}.migrating"));
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging)?;
+    }
+    let copied = copy_tree(from, &staging).and_then(|()| std::fs::rename(&staging, to));
+    if copied.is_err() {
+        let _ = std::fs::remove_dir_all(&staging);
+    }
+    copied
 }
 
 /// Recursive copy that keeps symlinks as symlinks (a config directory holds
@@ -371,6 +424,78 @@ mod tests {
             "newer"
         );
         assert!(legacy.data.exists());
+    }
+
+    #[test]
+    fn a_database_opencode_v2_migrated_stays_with_opencode() {
+        let root = tempfile::tempdir().unwrap();
+        let (legacy, own) = (
+            layout(root.path(), "opencode"),
+            layout(root.path(), "alforria"),
+        );
+        seed(&legacy);
+        std::fs::remove_file(legacy.data.join("opencode.db")).unwrap();
+        rusqlite::Connection::open(legacy.data.join("opencode.db"))
+            .unwrap()
+            .execute_batch("CREATE TABLE session_v2 (id TEXT PRIMARY KEY)")
+            .unwrap();
+        let report = migrate(&legacy, &own, options(DataMode::Move)).unwrap();
+        assert!(
+            legacy.data.join("opencode.db").exists(),
+            "opencode keeps it"
+        );
+        assert!(!own.data.join("opencode.db").exists());
+        assert!(
+            own.data.join("auth.json").exists(),
+            "logins still carry over"
+        );
+        assert!(
+            report
+                .iter()
+                .any(|line| line.contains("migrated by opencode v2")),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_copy_leaves_no_half_made_destination() {
+        let root = tempfile::tempdir().unwrap();
+        let from = root.path().join("from");
+        std::fs::create_dir_all(&from).unwrap();
+        std::fs::write(from.join("a"), "a").unwrap();
+        // The destination's parent is a file, so the copy cannot land.
+        std::fs::write(root.path().join("blocker"), "").unwrap();
+        let to = root.path().join("blocker").join("to");
+        assert!(copy_staged(&from, &to).is_err());
+        assert!(!to.exists());
+
+        let to = root.path().join("to");
+        copy_staged(&from, &to).unwrap();
+        assert_eq!(std::fs::read_to_string(to.join("a")).unwrap(), "a");
+        assert!(!root.path().join(".to.migrating").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn copying_open_data_is_refused_like_moving_it() {
+        let root = tempfile::tempdir().unwrap();
+        let (legacy, own) = (
+            layout(root.path(), "opencode"),
+            layout(root.path(), "alforria"),
+        );
+        seed(&legacy);
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(std::fs::File::open(legacy.data.join("opencode.db")).unwrap())
+            .spawn()
+            .unwrap();
+        let result = migrate(&legacy, &own, options(DataMode::Copy));
+        child.kill().ok();
+        child.wait().ok();
+        let error = result.unwrap_err();
+        assert!(error.contains("is in use by process"), "{error}");
+        assert!(!error.contains("--copy"), "{error}");
+        assert!(!own.data.exists());
     }
 
     #[cfg(target_os = "linux")]

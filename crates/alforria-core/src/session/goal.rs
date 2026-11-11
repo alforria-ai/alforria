@@ -55,6 +55,9 @@ pub const MAX_ROUNDS: u32 = 50;
 pub const MAX_STALLS: u32 = 3;
 
 /// A reviewer that never answers must not leave the goal looking alive.
+/// How long an active goal may wait on background work or a busy session
+/// before it pauses.
+const WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 const REVIEW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 pub const USAGE: &str = "Usage: /goal <objective> | pause | resume | clear";
@@ -89,7 +92,38 @@ pub struct GoalState {
     pub stalls: Option<u32>,
     /// The server process that armed the goal.
     pub boot: String,
+    /// That process's id, to tell a restart from a second live process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
     pub updated_at: u64,
+}
+
+impl GoalState {
+    /// Whether the process driving this goal is gone. Several alforria
+    /// processes can share one data directory (a TUI beside `alforria web`):
+    /// a goal armed by another process that is still running is that
+    /// process's to drive, and must not be touched from here.
+    fn orphaned(&self) -> bool {
+        if self.boot == boot() {
+            return false;
+        }
+        match self.pid {
+            Some(pid) => !process_alive(pid),
+            // Written before owners were recorded.
+            None => true,
+        }
+    }
+}
+
+/// Whether `pid` names a running process. Where that cannot be told, the
+/// owner is taken to be alive: wrongly pausing a live goal is the worse
+/// mistake.
+fn process_alive(pid: u32) -> bool {
+    if cfg!(target_os = "linux") {
+        std::path::Path::new("/proc").join(pid.to_string()).exists()
+    } else {
+        true
+    }
 }
 
 /// Identifies this server process.
@@ -340,12 +374,13 @@ impl GoalStore {
         safe.then(|| self.dir.join(format!("{session_id}.json")))
     }
 
-    /// The session's goal. An active goal armed by an earlier process is
-    /// returned (and saved) paused: nothing in this process is driving it.
+    /// The session's goal. An active goal whose process is gone is returned
+    /// (and saved) paused: nothing is driving it any more. One that another
+    /// live process is driving is returned untouched.
     pub fn read(&self, session_id: &str) -> Option<GoalState> {
         let text = std::fs::read_to_string(self.path(session_id)?).ok()?;
         let goal: GoalState = serde_json::from_str(&text).ok()?;
-        if goal.status == GoalStatus::Active && goal.boot != boot() {
+        if goal.status == GoalStatus::Active && goal.orphaned() {
             let paused = GoalState {
                 status: GoalStatus::Paused,
                 reason: Some("The server restarted while the goal was active".to_string()),
@@ -486,6 +521,21 @@ impl SessionPrompt {
         if goal.status != GoalStatus::Active {
             return;
         }
+        // The turn ran in this process, so this process drives the goal from
+        // here on, whichever one armed it.
+        let goal = if goal.boot == boot() {
+            goal
+        } else {
+            let adopted = GoalState {
+                boot: boot().to_string(),
+                pid: Some(std::process::id()),
+                ..goal.clone()
+            };
+            if !self.goals().replace(session_id, &goal, &adopted) {
+                return;
+            }
+            adopted
+        };
         let stopped = self.deps.services.run_state.cancel_count(session_id) != cancels_before;
         let failure = match result {
             Err(RunnerError::Cancelled(_)) => Some("Stopped by the user".to_string()),
@@ -534,7 +584,8 @@ impl SessionPrompt {
         // A running subagent of this session wakes it with its result, and
         // the hook runs again then.
         if run_state.has_running_background(session_id) {
-            return;
+            // …unless it is cancelled, which wakes nobody: look again later.
+            return self.redrive_when_quiet(session_id, &goal.id);
         }
         if goal.rounds >= goal.max_rounds {
             let reason = format!("Reached the limit of {} rounds", goal.max_rounds);
@@ -607,8 +658,10 @@ impl SessionPrompt {
         }
         // The user got a prompt in while the reviewer ran: that turn's end
         // runs this hook again, on what they asked.
+        // Not everything that makes a session busy ends in that hook (a
+        // compaction, a shell command), so look again once it is quiet.
         if run_state.assert_not_busy(session_id).is_err() {
-            return;
+            return self.redrive_when_quiet(session_id, &latest.id);
         }
         let next = GoalState {
             rounds: latest.rounds + 1,
@@ -627,6 +680,42 @@ impl SessionPrompt {
         drop(_claim);
         self.send_goal_message(session_id, &next.id, None, text, None)
             .await;
+    }
+
+    /// Run the stop hook again once the session is idle with no background
+    /// work, for the cases where nothing else will: a goal must never sit
+    /// `active` with nothing driving it. Gives up, pausing the goal, if the
+    /// session stays occupied for [`WAIT_LIMIT`].
+    fn redrive_when_quiet(&self, session_id: &str, goal_id: &str) {
+        let (this, session_id, goal_id) =
+            (self.clone(), session_id.to_string(), goal_id.to_string());
+        tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + WAIT_LIMIT;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                let Some(goal) = this
+                    .goals()
+                    .read(&session_id)
+                    .filter(|goal| goal.id == goal_id && goal.status == GoalStatus::Active)
+                else {
+                    return;
+                };
+                let run_state = &this.deps.services.run_state;
+                let occupied = run_state.has_running_background(&session_id)
+                    || run_state.assert_not_busy(&session_id).is_err();
+                if !occupied {
+                    return this.drive_goal(&session_id).await;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return this.settle(
+                        &session_id,
+                        &goal,
+                        GoalStatus::Paused,
+                        "Nothing finished for 30 minutes while the goal waited on other work",
+                    );
+                }
+            }
+        });
     }
 
     /// Ask the model, as a reviewer with no tools, whether the goal is met.
@@ -688,6 +777,11 @@ impl SessionPrompt {
                     Ok(alforria_llm::schema::events::LlmEvent::TextDelta {
                         text: delta, ..
                     }) => text.push_str(&delta),
+                    // A failure reported inside the stream is the reason
+                    // there is no verdict; say so instead of "no verdict".
+                    Ok(alforria_llm::schema::events::LlmEvent::ProviderError {
+                        message, ..
+                    }) => return Some(message),
                     Ok(_) => {}
                     Err(error) => return Some(error.reason.to_string()),
                 }
@@ -766,6 +860,25 @@ impl SessionPrompt {
         )
     }
 
+    /// A goal turn that failed may never have reached the loop (an unknown
+    /// agent, a model that is gone), in which case the stop hook never ran:
+    /// pause the goal here so it does not stay `active` with nothing driving
+    /// it. After a turn that did run this is a no-op.
+    fn goal_turn_started(
+        &self,
+        session_id: &str,
+        turn: Option<Result<WithParts, PromptError>>,
+    ) -> Option<Result<WithParts, PromptError>> {
+        if let Some(Err(error)) = &turn {
+            self.goals().pause_active(
+                session_id,
+                &format!("The session failed: {error}"),
+                self.now_ms(),
+            );
+        }
+        turn
+    }
+
     fn toast(&self, message: &str) {
         let _ = self.deps.services.events.publish(
             &TOAST,
@@ -830,6 +943,7 @@ impl SessionPrompt {
                     rounds: 1,
                     stalls: None,
                     boot: boot().to_string(),
+                    pid: Some(std::process::id()),
                     updated_at: self.now_ms(),
                     ..goal
                 };
@@ -838,9 +952,10 @@ impl SessionPrompt {
                     &resumed.objective,
                     Feedback::Note("The user resumed the goal."),
                 );
-                return Ok(self
+                let turn = self
                     .send_goal_message(session_id, &resumed.id, None, text, Some(input))
-                    .await);
+                    .await;
+                return Ok(self.goal_turn_started(session_id, turn));
             }
             "clear" => {
                 if goal.is_none() {
@@ -867,10 +982,11 @@ impl SessionPrompt {
             max_rounds: MAX_ROUNDS,
             stalls: None,
             boot: boot().to_string(),
+            pid: Some(std::process::id()),
             updated_at: self.now_ms(),
         };
         goals.write(session_id, Some(&created));
-        Ok(self
+        let turn = self
             .send_goal_message(
                 session_id,
                 &created.id,
@@ -878,7 +994,8 @@ impl SessionPrompt {
                 kickoff_text(text),
                 Some(input),
             )
-            .await)
+            .await;
+        Ok(self.goal_turn_started(session_id, turn))
     }
 }
 

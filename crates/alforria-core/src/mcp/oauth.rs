@@ -755,13 +755,28 @@ pub async fn refresh_tokens(
     let metadata = discover_metadata(server_url)
         .await
         .map_err(|err| RefreshFailure::Transient(err.message))?;
-    let refreshed = request_refresh(
+    let refreshed = match request_refresh(
         &metadata.token_endpoint,
         &refresh_token,
         entry.client_info.as_ref(),
         &tokens,
     )
-    .await?;
+    .await
+    {
+        Ok(refreshed) => refreshed,
+        Err(RefreshFailure::Rejected(message)) => {
+            // The grant is dead. Drop it so the login reads as expired and
+            // nothing retries a refresh that cannot succeed.
+            let spent = crate::mcp::auth::McpTokens {
+                refresh_token: None,
+                expires_at: Some(tokens.expires_at.unwrap_or(0.0).min(now_seconds())),
+                ..tokens
+            };
+            auth.update_tokens(mcp_name, spent, Some(server_url));
+            return Err(RefreshFailure::Rejected(message));
+        }
+        Err(failure) => return Err(failure),
+    };
     auth.update_tokens(mcp_name, refreshed.clone(), Some(server_url));
     Ok(refreshed)
 }

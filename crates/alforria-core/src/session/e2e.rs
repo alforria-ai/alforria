@@ -1285,6 +1285,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_goal_whose_kickoff_cannot_start_is_not_left_active() {
+        use crate::session::goal::GoalStatus;
+        let e = engine(
+            "e2e-goal-kickoff-fails",
+            vec![text_stream("must never run")],
+        );
+        let session = create_engine_session(&e);
+        let mut command = goal_command(&session.id, "ship it");
+        command.agent = Some("no-such-agent".to_string());
+        assert!(e.prompt.command(command).await.is_err());
+        let goal = e
+            .prompt
+            .goals()
+            .read(&session.id)
+            .expect("the goal is kept");
+        assert_eq!(goal.status, GoalStatus::Paused);
+        assert!(
+            goal.reason
+                .as_deref()
+                .unwrap()
+                .starts_with("The session failed:"),
+            "{goal:?}"
+        );
+        assert_eq!(e.llm.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_provider_error_during_review_is_the_reason_given() {
+        use crate::session::goal::GoalStatus;
+        let e = engine(
+            "e2e-goal-review-error",
+            vec![
+                text_stream("Working."),
+                vec![Ok(LlmEvent::ProviderError {
+                    message: "overloaded_error: Overloaded".to_string(),
+                    classification: None,
+                    retryable: None,
+                    provider_metadata: None,
+                })],
+            ],
+        );
+        let session = create_engine_session(&e);
+        e.prompt
+            .command(goal_command(&session.id, "ship it"))
+            .await
+            .unwrap();
+        let goal = goal_settles(&e, &session.id).await;
+        assert_eq!(goal.status, GoalStatus::Paused);
+        assert_eq!(
+            goal.reason.as_deref(),
+            Some("The goal reviewer failed: overloaded_error: Overloaded")
+        );
+    }
+
+    #[tokio::test]
     async fn goal_controls_and_their_refusals() {
         use crate::session::goal::GoalStatus;
         let e = engine(
@@ -1349,6 +1404,8 @@ mod tests {
             max_rounds: 50,
             stalls: None,
             boot: "an-earlier-process".to_string(),
+            // No such process: the owner is gone.
+            pid: Some(u32::MAX),
             updated_at: 1,
         };
         std::fs::write(
@@ -1362,6 +1419,23 @@ mod tests {
             goal.reason.as_deref(),
             Some("The server restarted while the goal was active")
         );
+        // A goal another process is driving right now is left alone: several
+        // alforria processes can share a data directory.
+        let live = GoalState {
+            pid: Some(std::process::id()),
+            ..stale.clone()
+        };
+        let other = create_engine_session(&e);
+        std::fs::write(
+            dir.join(format!("{}.json", other.id)),
+            serde_json::to_vec(&live).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            e.prompt.goals().read(&other.id).unwrap().status,
+            GoalStatus::Active
+        );
+
         // An ordinary prompt does not wake it.
         run_prompt(&e, prompt_input(&session.id, "hello")).await;
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;

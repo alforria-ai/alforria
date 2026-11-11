@@ -828,7 +828,8 @@ fn migrate() -> Command {
              with upstream opencode. opencode v2 rewrites that database to a schema alforria \
              cannot read, so alforria now keeps its own `alforria` directories.\n\n\
              Config, cache and state are copied. Data is moved (instant on one filesystem); \
-             stop every running alforria and opencode first.",
+             stop every running alforria and opencode first. A database opencode v2 has \
+             already migrated is left to opencode and alforria starts a new one.",
         )
         .arg(flag("copy", "copy the data directory instead of moving it"))
         .arg(

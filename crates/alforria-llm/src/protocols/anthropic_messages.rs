@@ -828,7 +828,11 @@ fn lower_messages(
                         }
                     }
                 }
-                messages.push(AnthropicMessage::Assistant { content });
+                // Dropping unsigned thinking can leave nothing; an assistant
+                // message with empty content is a 400.
+                if !content.is_empty() {
+                    messages.push(AnthropicMessage::Assistant { content });
+                }
             }
             MessageRole::Tool => {
                 let mut content = Vec::new();
@@ -1824,6 +1828,22 @@ mod tests {
         ])];
         let body = AnthropicMessages.lower_body(&request).unwrap();
         assert_eq!(body["messages"][0]["content"][0]["type"], json!("text"));
+
+        // A message that was only such thinking is not sent as an empty one.
+        request.model.provider = "anthropic".to_string();
+        request.messages = vec![
+            Message::user("hi"),
+            Message::assistant(vec![ContentPart::reasoning("thinking")]),
+            Message::user("still there?"),
+        ];
+        let body = AnthropicMessages.lower_body(&request).unwrap();
+        let roles: Vec<&str> = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| message["role"].as_str().unwrap())
+            .collect();
+        assert!(!roles.contains(&"assistant"), "{body}");
     }
 
     #[test]

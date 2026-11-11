@@ -948,6 +948,32 @@ fn goal_refresh(app: &App, event: &alforria_schema::event_manifest::Event) -> Op
     })
 }
 
+/// How often an active goal is re-read.
+const GOAL_POLL_MS: u64 = 2_000;
+
+/// The reviewer settles a goal some seconds after the turn's idle event, and
+/// nothing this client decodes says so. While the open session's goal is
+/// active, re-read it on a slow tick so "achieved", "paused" and the reason
+/// show up without the user doing anything.
+fn goal_poll(app: &mut App, now_ms: u64) -> Option<Effect> {
+    let Route::Session { session_id, .. } = &app.state.route.data else {
+        return None;
+    };
+    let active = app
+        .state
+        .sync
+        .goal
+        .get(session_id)
+        .is_some_and(|goal| goal.status == "active");
+    if !active || now_ms.saturating_sub(app.state.sync.goal_polled_ms) < GOAL_POLL_MS {
+        return None;
+    }
+    app.state.sync.goal_polled_ms = now_ms;
+    Some(Effect::GoalRefresh {
+        session_id: session_id.clone(),
+    })
+}
+
 /// async work.
 pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
     let mut effects = Vec::new();
@@ -1179,6 +1205,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                 }
             }
             effects.extend(crate::ui::workflows::on_tick(app, now_ms));
+            effects.extend(goal_poll(app, now_ms));
             app.ui.startup_loading.poll(now_ms);
             if app.state.sync.status == Some(crate::state::sync::SyncStatus::Complete) {
                 app.ui.startup_ready = true;

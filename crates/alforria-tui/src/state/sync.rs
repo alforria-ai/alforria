@@ -66,6 +66,8 @@ pub struct SyncState {
     pub todo: BTreeMap<String, Vec<TodoInfo>>,
     /// Sessions with a `/goal`, by session id (alforria extension).
     pub goal: BTreeMap<String, crate::transport::api::Goal>,
+    /// When the open session's active goal was last re-read.
+    pub goal_polled_ms: u64,
     pub message: BTreeMap<String, Vec<V1Message>>,
     pub part: BTreeMap<String, Vec<V1Part>>,
     pub lsp: Vec<Value>,
