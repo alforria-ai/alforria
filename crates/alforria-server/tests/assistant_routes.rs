@@ -895,3 +895,176 @@ async fn saved_memories_reach_every_step_fenced_and_within_budget() {
     assert!(system.contains("The user moved to Lisbon."), "{system}");
     assert!(!system.contains("Biscuit"), "the budget moved on: {system}");
 }
+
+// -----------------------------------------------------------------------
+// Persona and prompt controls
+// -----------------------------------------------------------------------
+
+fn resolved_tools(input: &StreamInput) -> Vec<alforria_core::session::llm::LlmTool> {
+    alforria_core::session::llm::resolve_tools(&alforria_core::session::llm::PrepareInput {
+        user: &input.user,
+        session_id: &input.session_id,
+        parent_session_id: input.parent_session_id.as_deref(),
+        project_id: input.project_id.as_deref(),
+        client: &input.client,
+        model: &input.model,
+        agent: &input.agent,
+        permission: input.permission.as_ref(),
+        system: &input.system,
+        messages: &input.messages,
+        small: input.small,
+        tools: &input.tools,
+    })
+}
+
+/// Prompt one fresh session and return the request the model received.
+async fn first_request(f: &Fixture) -> StreamInput {
+    let (_, session) = call(f, "POST", "/session", "").await;
+    let session_id = session["id"].as_str().unwrap().to_string();
+    let (status, _) = call(
+        f,
+        "POST",
+        &format!("/session/{session_id}/message"),
+        r#"{"parts": [{"type": "text", "text": "hello"}]}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let inputs = f.llm.inputs.lock().unwrap();
+    inputs
+        .iter()
+        .find(|input| input.session_id == session_id && !input.small && !input.tools.is_empty())
+        .expect("the turn reached the model")
+        .clone()
+}
+
+/// The repo's own estimate: four characters to a token.
+fn tokens(tool: &alforria_core::session::llm::LlmTool) -> usize {
+    (tool.name.len() + tool.description.len() + tool.input_schema.to_string().len()).div_ceil(4)
+}
+
+#[tokio::test]
+async fn a_product_can_replace_the_coding_persona_of_the_prompt_and_the_tools() {
+    let f = fixture(
+        "ok",
+        json!({
+            "prompt": {
+                "environment": "Today is {{date}}. Your notes are in {{directory}}.",
+                "model_identity": false,
+                "empty_skills": false,
+            },
+            "tool": {
+                "bash": { "description": "Run a command on the user's machine." },
+                "read": { "description_append": "The user's notes are Markdown files." },
+            },
+            "websearch": {
+                "provider": "http",
+                "url": "https://search.internal.example/query",
+                "headers": { "x-team": "assistant" },
+            },
+        }),
+    );
+    let input = first_request(&f).await;
+    let system = input.system.join("\n");
+    assert!(
+        system.contains("Today is ") && system.contains("Your notes are in "),
+        "{system}"
+    );
+    assert!(system.contains(f.repo.to_str().unwrap()), "{system}");
+    for gone in [
+        "<env>",
+        "Is directory a git repo",
+        "You are powered by the model named",
+        "No skills are currently available",
+    ] {
+        assert!(!system.contains(gone), "`{gone}` is still in: {system}");
+    }
+    let tools = resolved_tools(&input);
+    let of = |name: &str| tools.iter().find(|tool| tool.name == name);
+    assert_eq!(
+        of("bash").unwrap().description,
+        "Run a command on the user's machine."
+    );
+    let read = &of("read").unwrap().description;
+    assert!(
+        read.ends_with("\nThe user's notes are Markdown files."),
+        "{read}"
+    );
+    assert!(
+        read.len() > 200,
+        "the built-in description is kept in front"
+    );
+    // A configured backend offers web search to a model of any provider.
+    assert!(of("websearch").is_some());
+
+    // By default all of it is as upstream has it.
+    let plain = fixture("ok", json!({}));
+    let input = first_request(&plain).await;
+    let system = input.system.join("\n");
+    assert!(
+        system.contains("<env>") && system.contains("You are powered by the model named"),
+        "{system}"
+    );
+    assert!(
+        system.contains("No skills are currently available"),
+        "{system}"
+    );
+}
+
+/// A tool denied by permission leaves the request entirely, and what that
+/// saves is measured here (printed with `--no-capture`).
+#[tokio::test]
+async fn disabling_tools_by_permission_removes_them_from_the_request() {
+    const DROPPED: [&str; 5] = ["task", "todowrite", "question", "skill", "webfetch"];
+    let full = fixture("ok", json!({}));
+    let before = resolved_tools(&first_request(&full).await);
+    let lean = fixture(
+        "ok",
+        json!({
+            "permission": {
+                "task": "deny", "todowrite": "deny", "question": "deny",
+                "skill": "deny", "webfetch": "deny",
+            },
+        }),
+    );
+    let after = resolved_tools(&first_request(&lean).await);
+    let names = |tools: &[alforria_core::session::llm::LlmTool]| -> Vec<String> {
+        tools.iter().map(|tool| tool.name.clone()).collect()
+    };
+    for name in DROPPED {
+        assert!(
+            names(&before).contains(&name.to_string()),
+            "{name} is offered by default"
+        );
+        assert!(
+            !names(&after).contains(&name.to_string()),
+            "{name} is gone when denied"
+        );
+    }
+    let kept: Vec<String> = names(&before)
+        .into_iter()
+        .filter(|name| !DROPPED.contains(&name.as_str()))
+        .collect();
+    assert_eq!(names(&after), kept, "nothing else changed");
+    let total = |tools: &[alforria_core::session::llm::LlmTool]| -> usize {
+        tools.iter().map(tokens).sum()
+    };
+    let mut saved = 0;
+    for name in DROPPED {
+        let tool = before.iter().find(|tool| tool.name == name).unwrap();
+        eprintln!("MEASURE tool {name}: ~{} tokens", tokens(tool));
+        saved += tokens(tool);
+    }
+    eprintln!(
+        "MEASURE tools before: ~{} tokens ({} tools); after: ~{} tokens ({} tools); saved ~{} tokens",
+        total(&before),
+        before.len(),
+        total(&after),
+        after.len(),
+        saved
+    );
+    assert_eq!(total(&before) - total(&after), saved);
+    assert!(
+        saved > 1000,
+        "these five are a large share of the tool block"
+    );
+}

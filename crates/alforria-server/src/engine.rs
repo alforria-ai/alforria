@@ -659,6 +659,8 @@ struct EngineSystemPrompts {
     directory: PathBuf,
     worktree: PathBuf,
     memory: Arc<alforria_core::memory::MemoryService>,
+    /// `prompt.*` from the config.
+    options: alforria_core::session::system::PromptOptions,
 }
 
 impl alforria_core::session::r#loop::SystemPrompts for EngineSystemPrompts {
@@ -667,7 +669,8 @@ impl alforria_core::session::r#loop::SystemPrompts for EngineSystemPrompts {
     }
 
     fn environment(&self, model: &alforria_core::session::llm::LlmModel) -> Vec<String> {
-        alforria_core::session::system::environment(
+        alforria_core::session::system::environment_with(
+            &self.options,
             &alforria_core::session::system::EnvironmentModel {
                 provider_id: model.provider_id.clone(),
                 id: model.id.clone(),
@@ -694,7 +697,10 @@ impl alforria_core::session::r#loop::SystemPrompts for EngineSystemPrompts {
             return Box::pin(async move { None });
         };
         let available: Vec<_> = self.skills.all().into_iter().cloned().collect();
-        Box::pin(async move { alforria_core::session::system::skills(&info, &available) })
+        let options = self.options.clone();
+        Box::pin(
+            async move { alforria_core::session::system::skills_with(&options, &info, &available) },
+        )
     }
 
     fn mcp<'a>(
@@ -829,6 +835,73 @@ fn bash_timeout_ms() -> u64 {
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|ms| *ms > 0)
         .unwrap_or(2 * 60 * 1000)
+}
+
+/// `prompt.*` from the config, as the system-prompt builder takes it.
+fn prompt_options(
+    config: &alforria_core::config::schema::Config,
+) -> alforria_core::session::system::PromptOptions {
+    use alforria_core::config::extension::PromptEnvironment;
+    use alforria_core::session::system::{EnvironmentBlock, PromptOptions};
+    let prompt = config.prompt.clone().unwrap_or_default();
+    PromptOptions {
+        environment: match prompt.environment {
+            None | Some(PromptEnvironment::Switch(true)) => EnvironmentBlock::Standard,
+            Some(PromptEnvironment::Switch(false)) => EnvironmentBlock::Off,
+            Some(PromptEnvironment::Template(template)) => EnvironmentBlock::Template(template),
+        },
+        model_identity: prompt.model_identity.unwrap_or(true),
+        empty_skills: prompt.empty_skills.unwrap_or(true),
+    }
+}
+
+/// The search backend the `websearch` tool uses instead of upstream's
+/// providers: what `websearch` in the config names, or LibertAI search when
+/// the libertai provider has a key. `websearch` is read from the user's own
+/// config only (`EXTENSION_KEYS`), so the address and headers are theirs.
+fn search_backend(
+    config: &alforria_core::config::schema::Config,
+    auth: &dyn crate::state::AuthStore,
+) -> Option<alforria_core::tool::websearch::HttpSearch> {
+    use alforria_core::tool::websearch::HttpSearch;
+    let websearch = config.websearch.clone().unwrap_or_default();
+    let libertai_key = || {
+        std::env::var("LIBERTAI_API_KEY")
+            .ok()
+            .filter(|key| !key.is_empty())
+            .or_else(|| {
+                let stored = auth.all().ok()?;
+                let entry = stored.get(alforria_core::libertai::LIBERTAI_PROVIDER_ID)?;
+                entry
+                    .get("key")
+                    .or_else(|| entry.get("access"))
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|key| !key.is_empty())
+                    .map(String::from)
+            })
+    };
+    match websearch.provider.as_deref() {
+        Some("http") => {
+            let url = websearch
+                .url
+                .filter(|url| url.starts_with("https://") || url.starts_with("http://"));
+            let Some(url) = url else {
+                tracing::warn!(
+                    "websearch.provider is \"http\" but websearch.url is not an http(s) URL"
+                );
+                return None;
+            };
+            Some(HttpSearch {
+                id: "http".to_string(),
+                label: "Web Search".to_string(),
+                url,
+                headers: websearch.headers.unwrap_or_default().into_iter().collect(),
+            })
+        }
+        Some("libertai") | None => libertai_key().map(|key| HttpSearch::libertai(&key)),
+        // Any other value (for example "exa") leaves upstream's choice alone.
+        Some(_) => None,
+    }
 }
 
 /// Build the per-instance engine (the M6 `SessionEngine` seam over the M5
@@ -1104,6 +1177,21 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
             home: input.paths.home.clone(),
         },
     ));
+    // alforria's own search backend, if one is configured.
+    let search_backend = search_backend(&input.config, input.runtime.auth.as_ref());
+    // A model the config declares under a name of its own can say what it
+    // really is (`provider.<id>.models.<name>.family`).
+    for (provider_id, provider) in input.config.provider.iter().flatten() {
+        for (model_id, model) in provider.models.iter().flatten() {
+            if let Some(family) = &model.family {
+                alforria_core::session::system::set_family_hint(
+                    provider_id,
+                    model_id,
+                    Some(family),
+                );
+            }
+        }
+    }
     // Websearch env keys are read once at boot (WebSearchEnv::default).
     let websearch = alforria_core::tool::websearch::websearch_tool(
         truncate.clone(),
@@ -1115,7 +1203,10 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
                 || experimental_env("OPENCODE_EXPERIMENTAL_PARALLEL"),
         },
         Arc::new(alforria_core::tool::websearch::SystemYear),
-        alforria_core::tool::websearch::WebSearchEnv::default(),
+        alforria_core::tool::websearch::WebSearchEnv {
+            backend: search_backend.clone(),
+            ..Default::default()
+        },
     );
     // `Tool.init(shell)` — the def renders the bash prompt; `render` is
     // pure (no runtime needed), so a plain block_on suffices.
@@ -1241,7 +1332,25 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
             },
             agents.clone(),
         )
-        .map_err(|err| ServerError::Core(CoreError::Storage(err.to_string())))?,
+        .map_err(|err| ServerError::Core(CoreError::Storage(err.to_string())))?
+        .with_websearch_backend(search_backend.is_some())
+        .with_descriptions(
+            input
+                .config
+                .tool
+                .iter()
+                .flatten()
+                .map(|(name, tool)| {
+                    (
+                        name.clone(),
+                        alforria_core::tool::registry::DescriptionOverride {
+                            description: tool.description.clone(),
+                            append: tool.description_append.clone(),
+                        },
+                    )
+                })
+                .collect(),
+        ),
     );
 
     // Subtask driver + summary + revert + compaction.
@@ -1335,6 +1444,7 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
             directory: input.directory.clone(),
             worktree: input.worktree.clone(),
             memory: memory.clone(),
+            options: prompt_options(&input.config),
         }),
         registry: (*registry).clone(),
         revert: revert.clone(),

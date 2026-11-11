@@ -1286,6 +1286,13 @@ pub struct Config {
     pub triggers: Option<crate::config::extension::TriggersInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<crate::config::extension::MemoryInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<crate::config::extension::PromptInfo>,
+    /// Tool description overrides, by tool name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<BTreeMap<String, crate::config::extension::ToolInfo>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub websearch: Option<crate::config::extension::WebsearchInfo>,
 }
 
 /// Decode + validate a raw config value against the full wire schema.
@@ -1389,6 +1396,9 @@ fn collect_issues(value: &serde_json::Value) -> Vec<crate::SchemaIssue> {
             "trigger" => check!(issues, key, BTreeMap<String, crate::trigger::TriggerSpec>),
             "triggers" => check!(issues, key, crate::config::extension::TriggersInfo),
             "memory" => check!(issues, key, crate::config::extension::MemoryInfo),
+            "prompt" => check!(issues, key, crate::config::extension::PromptInfo),
+            "tool" => check!(issues, key, BTreeMap<String, crate::config::extension::ToolInfo>),
+            "websearch" => check!(issues, key, crate::config::extension::WebsearchInfo),
             _ => {}
         }
     }

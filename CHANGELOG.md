@@ -77,6 +77,22 @@ pre-1.0, so minor releases may include breaking changes.
   so the next prompt sends only the summary and the live messages.
   `--dry-run` reports what would be imported, and an `import_id` makes the
   import idempotent.
+- Persona controls for products that embed alforria: `prompt.environment`
+  (`true`, `false` or a template) for the `<env>` block,
+  `prompt.model_identity` and `prompt.empty_skills` for the other fixed
+  additions, and `tool.<name>.description` / `description_append` to reword
+  a built-in tool.
+- `provider.<id>.models.<name>.family` picks the default system prompt for a
+  model whose id does not say what it is (a family name or the underlying
+  model id).
+- The `websearch` tool can use LibertAI search (on by itself when the
+  `libertai` provider has a key) or any endpoint with the same contract
+  (`websearch: { provider: "http", url, headers }`), and is then offered to
+  every model.
+- The built-in `libertai` provider accepts its catalog's aliases
+  (`claw-flash`, `claw-core`, `deep-claw`, …) as model ids, with the target
+  model's limits, cost, capabilities and prompt, and lists
+  `deepseek-v4.1-flash-1017` and its `-thinking` variant.
 - `alforria migrate` moves an install from the `opencode` directories to
   alforria's own (see Changed). `--copy` copies the data instead of moving it,
   `--fresh` starts a new database and keeps the saved logins, `--dry-run`
@@ -131,6 +147,10 @@ pre-1.0, so minor releases may include breaking changes.
   longer stores patches, and agent steps no longer reload them.
 
 ### Changed
+
+- The default system prompts call the agent `alforria` instead of `opencode`
+  and point at alforria's repository and docs. A model told it was opencode
+  will now say it is alforria.
 
 - alforria keeps its global config, data, cache and state in `alforria`
   directories (`~/.config/alforria`, `~/.local/share/alforria`, …) instead of

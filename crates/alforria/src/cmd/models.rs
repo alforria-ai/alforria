@@ -139,9 +139,13 @@ mod tests {
         assert_eq!(
             stdout,
             "opencode/grok-code\nacme/acme-1\nanthropic/claude-3-7\nanthropic/claude-4\n\
-             libertai/deepseek-v4-flash\nlibertai/deepseek-v4.1-flash\nlibertai/glm-5.3\n\
-             libertai/glm-5.3-flash\nlibertai/glm-5.3-thinking\nlibertai/hermes-3-8b-tee\n\
-             libertai/qwen3.5-122b-a10b\nlibertai/qwen3.6-35b-a3b\nlibertai/qwen3.8-27b\n\
+             libertai/claw-core\nlibertai/claw-flash\nlibertai/claw-large\nlibertai/deep-claw\n\
+             libertai/deepseek-v4-flash\nlibertai/deepseek-v4.1-flash\n\
+             libertai/deepseek-v4.1-flash-1017\nlibertai/deepseek-v4.1-flash-1017-thinking\n\
+             libertai/glm-5.2\nlibertai/glm-5.3\nlibertai/glm-5.3-flash\nlibertai/glm-5.3-thinking\n\
+             libertai/hermes-3-8b-tee\nlibertai/ltai-core\nlibertai/ltai-fast\n\
+             libertai/qwen3-coder-next\nlibertai/qwen3.5-122b-a10b\nlibertai/qwen3.5-35b-a3b\n\
+             libertai/qwen3.6-27b\nlibertai/qwen3.6-35b-a3b\nlibertai/qwen3.8-27b\n\
              openai/gpt-5.1\nopenai/o4-mini\n"
         );
     }

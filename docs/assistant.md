@@ -466,6 +466,99 @@ and a report:
 `{ messages, user, assistant, parts, toolCalls, interruptedToolCalls,
 orphanToolResults, images, systemSkipped, archived, live, boundary? }`.
 
+## Persona and prompt controls
+
+alforria's defaults are a coding agent's. A product whose agent is something
+else (a personal assistant, a support agent) can replace them. Set the
+agent's own system prompt with `agent.<name>.prompt` as before; the settings
+here cover what is added around it.
+
+```jsonc
+{
+  "prompt": {
+    "environment": false,          // or true, or a template string
+    "model_identity": false,
+    "empty_skills": false
+  },
+  "tool": {
+    "bash": { "description": "Run a command on the user's machine." },
+    "read": { "description_append": "The user's notes are Markdown files." }
+  },
+  "permission": { "task": "deny", "todowrite": "deny", "question": "deny" },
+  "provider": {
+    "acme": { "models": { "house-model": { "id": "upstream-id", "family": "anthropic" } } }
+  },
+  "websearch": { "provider": "http", "url": "https://search.example/query",
+                 "headers": { "authorization": "Bearer {env:SEARCH_KEY}" } }
+}
+```
+
+### The system prompt
+
+| Setting | Effect |
+| --- | --- |
+| `prompt.environment` | `true` (default): the `<env>` block (working directory, workspace root, git, platform, date). `false`: no block. A string: that text instead, with `{{directory}}`, `{{worktree}}`, `{{git}}` (`yes`/`no`), `{{platform}}`, `{{date}}`, `{{model}}` and `{{provider}}` filled in. |
+| `prompt.model_identity` | `false` drops the line "You are powered by the model named …". |
+| `prompt.empty_skills` | `false` drops the skills paragraph while no skill exists ("No skills are currently available."). With skills present it is unchanged. Denying the `skill` permission drops the paragraph and the tool. |
+
+Project references (`<available_references>`) are the project's own and are
+kept. The default prompt texts now say `alforria` where they said `opencode`
+and point at alforria's repository and docs.
+
+### Which prompt a model gets
+
+The default system prompt is chosen from the model's API id
+(`provider.<id>.models.<name>.id`, or the name itself): ids containing
+`claude` get the Anthropic prompt, `gpt` the GPT one, `deepseek` the DeepSeek
+one, and so on, and anything unrecognised gets the generic one. A model
+reached under a name that says nothing about it can say what it is:
+
+- `provider.<id>.models.<name>.family` is a family name (`anthropic`,
+  `gpt`, `codex`, `beast`, `astra`, `gemini`, `deepseek`, `kimi`, `meta`,
+  `trinity`, `default`) or the id of the underlying model, which is then
+  classified like any other id.
+- The built-in `libertai` provider follows its catalog's alias table: an
+  alias such as `claw-flash` is accepted as a model id, has its target's
+  limits, cost and capabilities, and gets its target's prompt.
+
+An agent with its own `prompt` is unaffected: that replaces the default
+prompt whatever the model.
+
+### Tool descriptions and the tool list
+
+`tool.<name>.description` replaces a built-in tool's description;
+`tool.<name>.description_append` adds a paragraph after it (after the
+replacement, if both are set). The parts of a description computed per
+request (the `task` tool's list of agents) are kept.
+
+A tool denied outright by permission (`"task": "deny"`, or a `"*"` pattern
+set to `deny`) is not sent to the model at all: neither its description nor
+its schema. Measured on the default build (15 tools, estimated at four
+characters per token): `task` ≈ 937 tokens, `todowrite` ≈ 662, `question` ≈
+357, `webfetch` ≈ 301, `skill` ≈ 150. Denying those five takes the tool block
+from ≈ 7,069 to ≈ 4,662 tokens, a saving of ≈ 2,407 tokens on every request.
+
+### Web search
+
+Upstream offers the `websearch` tool only to its own hosted providers or
+when `OPENCODE_ENABLE_EXA` / `OPENCODE_ENABLE_PARALLEL` is set. alforria adds
+a backend of its own, which offers the tool to every model:
+
+- With the `libertai` provider signed in (`LIBERTAI_API_KEY`, or a stored
+  key), searches go to LibertAI search
+  (`POST https://search.libertai.io/search`, bearer key) unless `websearch`
+  says otherwise.
+- `websearch: { "provider": "http", "url": …, "headers": … }` sends them to
+  any endpoint that speaks the same small contract: it receives
+  `{ "query": "…", "max_results": n }` and answers
+  `{ "results": [{ "title", "url", "snippet" }] }`.
+- `websearch.provider` set to anything else (for example `"exa"`) keeps
+  upstream's behaviour.
+
+The tool asks for the `websearch` permission either way. `websearch` is read
+from your own config only: a project cannot point searches, or the headers
+that go with them, at an address of its choosing.
+
 ## Which config may set what
 
 Some of these settings decide what runs unattended, whose data is read, or

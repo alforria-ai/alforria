@@ -3,6 +3,8 @@
 //! They live apart from `schema.rs`, which mirrors the upstream config, so
 //! the two can change without touching each other.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 /// `triggers` — the scheduler's switches. The triggers themselves are the
@@ -61,4 +63,58 @@ pub struct MemoryInfo {
     /// compaction (default false).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flush_before_compaction: Option<bool>,
+}
+
+/// `prompt.environment`: `true` (the default) keeps the `<env>` block,
+/// `false` drops it, a string replaces it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PromptEnvironment {
+    Switch(bool),
+    Template(String),
+}
+
+/// `prompt` — the fixed additions to the system prompt, for a product whose
+/// agent is not a coding agent.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PromptInfo {
+    /// The `<env>` block (working directory, git, platform, date). A string
+    /// is used in its place, with `{{directory}}`, `{{worktree}}`,
+    /// `{{git}}`, `{{platform}}`, `{{date}}`, `{{model}}` and
+    /// `{{provider}}` filled in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<PromptEnvironment>,
+    /// The "You are powered by the model named…" line (default true).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_identity: Option<bool>,
+    /// The skills paragraph when no skill exists (default true).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub empty_skills: Option<bool>,
+}
+
+/// `tool.<name>` — the wording of one tool's description.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ToolInfo {
+    /// Replaces the built-in description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Added after the description (the built-in one, or `description`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description_append: Option<String>,
+}
+
+/// `websearch` — where the `websearch` tool sends its queries.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct WebsearchInfo {
+    /// `"libertai"` (LibertAI search, with the libertai provider's key) or
+    /// `"http"` (`url` and `headers` below). Absent: upstream's choice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// For `"http"`: the endpoint. It receives
+    /// `POST { "query": …, "max_results": n }` and answers
+    /// `{ "results": [{ "title", "url", "snippet" }] }`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headers: Option<BTreeMap<String, String>>,
 }

@@ -1433,7 +1433,14 @@ mod tests {
             }
         }
         // Every extension key the schema knows is in the table.
-        let schema_keys = ["trigger", "triggers", "memory"];
+        let schema_keys = [
+            "trigger",
+            "triggers",
+            "memory",
+            "prompt",
+            "tool",
+            "websearch",
+        ];
         for key in schema_keys {
             assert!(EXTENSION_KEYS.iter().any(|(name, _)| *name == key), "{key}");
         }

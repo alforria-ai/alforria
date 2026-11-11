@@ -41,6 +41,14 @@ impl Default for RuntimeFlags {
     }
 }
 
+/// `tool.<name>` from the config: what replaces a tool's description and
+/// what is added after it (alforria extension).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DescriptionOverride {
+    pub description: Option<String>,
+    pub append: Option<String>,
+}
+
 /// `webSearchEnabled` (registry.ts:58-65).
 pub fn web_search_enabled(provider_id: &str, flags: &RuntimeFlags) -> bool {
     provider_id == "opencode"
@@ -75,6 +83,10 @@ pub struct ToolRegistry {
     flags: RuntimeFlags,
     agents: Arc<dyn Agents>,
     code_mode: Option<CodeModeDescriber>,
+    descriptions: std::collections::BTreeMap<String, DescriptionOverride>,
+    /// A search backend of alforria's own is configured: `websearch` is
+    /// offered whatever the model's provider.
+    websearch_backend: bool,
 }
 
 fn find_tool<'a>(builtin: &'a [ToolDef], custom: &'a [ToolDef], id: &str) -> Option<&'a ToolDef> {
@@ -104,7 +116,28 @@ impl ToolRegistry {
             flags,
             agents,
             code_mode: None,
+            descriptions: Default::default(),
+            websearch_backend: false,
         })
+    }
+
+    /// Offer `websearch` to every model: a backend of alforria's own
+    /// (`websearch` in the config, LibertAI search) answers it.
+    pub fn with_websearch_backend(mut self, configured: bool) -> Self {
+        self.websearch_backend = configured;
+        self
+    }
+
+    /// Apply the config's `tool.<name>.description` and
+    /// `description_append` to what [`Self::tools`] returns. A replaced
+    /// description still gets the parts computed per request (the `task`
+    /// tool's agent list).
+    pub fn with_descriptions(
+        mut self,
+        descriptions: std::collections::BTreeMap<String, DescriptionOverride>,
+    ) -> Self {
+        self.descriptions = descriptions;
+        self
     }
 
     /// The `execute` tool description seam (M4.8). `None` (the default)
@@ -177,7 +210,8 @@ impl ToolRegistry {
             .into_iter()
             .filter(|tool| {
                 if tool.id == "websearch" {
-                    return web_search_enabled(model.provider_id, &self.flags);
+                    return self.websearch_backend
+                        || web_search_enabled(model.provider_id, &self.flags);
                 }
                 if tool.id == "apply_patch" {
                     return use_patch;
@@ -200,7 +234,10 @@ impl ToolRegistry {
 
         let mut out = Vec::new();
         for tool in filtered {
-            let mut description_parts = vec![tool.description.to_string()];
+            let custom = self.descriptions.get(tool.id);
+            let mut description_parts = vec![custom
+                .and_then(|custom| custom.description.clone())
+                .unwrap_or_else(|| tool.description.to_string())];
             if tool.id == "task" {
                 description_parts.push(task_description.clone());
             }
@@ -210,6 +247,9 @@ impl ToolRegistry {
                     // `execute` is only visible with a non-empty description.
                     None => continue,
                 }
+            }
+            if let Some(append) = custom.and_then(|custom| custom.append.clone()) {
+                description_parts.push(append);
             }
             let description = description_parts
                 .into_iter()
@@ -693,5 +733,78 @@ mod tests {
             agents,
         );
         assert!(err.is_err());
+    }
+
+    /// alforria extensions: `tool.<name>` rewords a description, and a
+    /// configured search backend shows `websearch` to every provider.
+    #[tokio::test]
+    async fn descriptions_can_be_replaced_or_extended_and_a_backend_enables_websearch() {
+        let registry = |backend: bool| {
+            ToolRegistry::new(
+                tools_of(&["read", "bash", "task", "websearch", "edit"]),
+                Vec::new(),
+                RuntimeFlags::default(),
+                Arc::new(FixedAgents {
+                    agents: vec![subagent("general")],
+                    missing: false,
+                }),
+            )
+            .unwrap()
+            .with_websearch_backend(backend)
+            .with_descriptions(
+                [
+                    (
+                        "bash".to_string(),
+                        DescriptionOverride {
+                            description: Some("Run a shell command.".to_string()),
+                            append: None,
+                        },
+                    ),
+                    (
+                        "read".to_string(),
+                        DescriptionOverride {
+                            description: None,
+                            append: Some("Prefer the notes folder.".to_string()),
+                        },
+                    ),
+                    (
+                        "task".to_string(),
+                        DescriptionOverride {
+                            description: Some("Hand work to a helper.".to_string()),
+                            append: Some("Use sparingly.".to_string()),
+                        },
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            )
+        };
+        let model = || ToolModel {
+            provider_id: "libertai",
+            model_id: "claw-core",
+            agent: agent_info("build"),
+            permission: None,
+        };
+        let tools = registry(false).tools(model()).await;
+        let of = |tools: &[ToolDef], id: &str| {
+            tools
+                .iter()
+                .find(|tool| tool.id == id)
+                .map(|tool| tool.description.to_string())
+        };
+        assert_eq!(of(&tools, "bash").as_deref(), Some("Run a shell command."));
+        assert_eq!(
+            of(&tools, "read").as_deref(),
+            Some("read description\nPrefer the notes folder.")
+        );
+        // The per-request part of `task` survives a replaced description.
+        assert_eq!(
+            of(&tools, "task").as_deref(),
+            Some("Hand work to a helper.\nAvailable agent types and the tools they have access to:\n- general: This subagent should only be called manually by the user.\nUse sparingly.")
+        );
+        assert_eq!(of(&tools, "edit").as_deref(), Some("edit description"));
+        assert_eq!(of(&tools, "websearch"), None, "hidden for this provider");
+        let tools = registry(true).tools(model()).await;
+        assert!(of(&tools, "websearch").is_some());
     }
 }
