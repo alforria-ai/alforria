@@ -353,9 +353,12 @@ the `memory` table, which every query can filter on):
   rewriting an unverified record leaves it unverified; only the operator
   vouches for one. `history` keeps the last 10
   changes (who, when, which fields).
-- A session that has seen outside content writes unverified records, and a
-  record it rewrites becomes unverified. Nothing else changes for it: it
-  updates, archives and forgets as its `memory` permission allows.
+- A session that has seen outside content writes unverified records. It
+  may update, archive or forget only a record that it saved itself (the
+  record's origin names the same session) and that is not verified. Any
+  other record — written elsewhere, or verified — is refused by the tool
+  (before anyone is asked) and by the service: a web page must not be able
+  to talk a model into rewriting or deleting trusted memory.
 - A run that outside input *started* (a webhook or watch trigger; the
   outside-start mark) may add records, if its trigger's `permission` block
   grants `memory`, and those are unverified. It may not update, archive or
@@ -377,14 +380,14 @@ and `outsideStart`.
 | | **Outside content** (provenance) | **Outside start** (ceiling) |
 | --- | --- | --- |
 | Means | The session has seen content somebody else wrote. | A run in the session was started by outside input. |
-| Set when | A tool that returns outside content answers in it — `webfetch`, `websearch`, every MCP or plugin tool, code mode (`execute`); `memory` when it returns an unverified record; `session_search` when a hit comes from a marked session; `read` of a file in the upload area (`server.upload.directories`) and `grep` output that lists one; `task`, `subagents` and `workflow` when a child session is marked. Also: a prompt from a caller below `admin` that brings a file part; a run of a trigger that a marked session created or changed. And always together with the other mark. | A `webhook` or `watch` trigger starts a run in it, or any trigger run delivers a payload. |
+| Set when | A tool that returns outside content answers in it — `webfetch`, `websearch`, every MCP or plugin tool, code mode (`execute`); `memory` when it returns an unverified record; `session_search` when a hit comes from a marked session; `read` of a file in the upload area (`server.upload.directories`), and a `grep` or `glob` whose search tree is inside, is, or contains that area (decided from the call's input and the resolved paths, never from what the tool printed — so a project-wide search marks the session once an upload directory exists); `task`, `subagents` and `workflow` when a child session is marked. Also: a prompt from a caller below `admin` that brings a file part; a run of a trigger that a marked session created or changed. And always together with the other mark. | A `webhook` or `watch` trigger starts a run in it, or any trigger run delivers a payload. |
 | Where it is set | At the one place a tool's result is appended to the session (the processor), from a table that classifies every built-in tool (`tool::outside::BUILTIN`); a tool that is not in the table is treated as returning outside content. A test walks the server's registry and fails on an unclassified tool. | Where a trigger's run gets its session (`session::trigger_ops`). |
-| Effect | Memory the session writes — with the `memory` tool or by the flush before a compaction — is recorded `untrusted`, is unverified and is not injected. A trigger it creates or changes with `schedule` carries the mark into its runs' sessions. Its `session_search` excerpts are fenced and labelled `trust="untrusted"`. | The read-only ceiling of [Declaring triggers](#declaring-triggers): the stricter of the run's rules and read-only, standing `always` approvals ignored, an `ask` denied at once, `permission.unattended` never answering. Existing memory records cannot be changed. Loader files cannot be written. |
-| Does not | Change any permission. An interactive session works exactly as before after its first web search: asks are asked, approvals apply, tools are offered. | — |
+| Effect | Memory the session writes — with the `memory` tool or by the flush before a compaction — is recorded `untrusted`, is unverified and is not injected; of existing records it may change or delete only unverified ones it saved itself. A trigger it creates or changes with `schedule` carries the mark into its runs' sessions. Its `session_search` excerpts are fenced and labelled `trust="untrusted"`. | The read-only ceiling of [Declaring triggers](#declaring-triggers): the stricter of the run's rules and read-only, standing `always` approvals ignored, an `ask` denied at once, `permission.unattended` never answering. Existing memory records cannot be changed. Loader files cannot be written. |
+| Does not | Change the permission of any tool. An interactive session works as before after its first web search: asks are asked, approvals apply, tools are offered. The one thing it loses is the integrity-sensitive part of `memory` above. | — |
 
 What is *not* a cause, on purpose: `bash` (a shell can fetch anything, and
 marking it would mark every coding session and leave memory unusable), and
-`read`/`grep`/`glob` over ordinary project files (a cloned repository's
+`read`/`grep`/`glob` over ordinary project files (outside the upload area) (a cloned repository's
 README is somebody else's text too). A session that only ever used those
 writes verified memory. Deployments that need more can deny `memory` to the
 agents that browse, or set `memory.inject.unverified: false` (the default)

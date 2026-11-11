@@ -430,21 +430,6 @@ fn clean_metadata(metadata: Option<Value>) -> Result<Option<Value>, MemoryError>
     }
 }
 
-/// A run that outside input started may add records when its trigger lets
-/// it, and nothing else: it must not be able to rewrite, hide or delete
-/// what others saved. This is the ceiling's effect, not provenance's: a
-/// session that has merely seen outside content changes records as its
-/// permissions allow, and what it rewrites becomes unverified.
-fn refuse_untrusted(by: &Provenance, what: &str) -> Result<(), MemoryError> {
-    if by.add_only {
-        return Err(MemoryError::Forbidden(format!(
-            "this session was started by outside input, so it may not {what} an existing memory. \
-             It can only add new ones."
-        )));
-    }
-    Ok(())
-}
-
 /// The memory of one instance.
 pub struct MemoryService {
     storage: Arc<Storage>,
@@ -668,7 +653,7 @@ impl MemoryService {
         by: &Provenance,
     ) -> Result<MemoryRecord, MemoryError> {
         self.require_enabled()?;
-        refuse_untrusted(by, "change")?;
+        self.check_change(id, by, "change")?;
         let Some(mut record) = self.get(id)? else {
             return Err(MemoryError::NotFound(format!("memory not found: {id}")));
         };
@@ -799,11 +784,55 @@ impl MemoryService {
         self.forget_by(id, &Provenance::api())
     }
 
+    /// Whether `by` may change or delete record `id` — memory integrity
+    /// is what the marks are for, so both count here:
+    ///
+    /// * a run that outside input started (`Provenance::add_only`, the
+    ///   ceiling) may add records when its trigger lets it and nothing
+    ///   else: it changes no existing record, its own included;
+    /// * a session that has seen outside content (`Provenance::untrusted`,
+    ///   provenance) may change or delete only a record whose own origin
+    ///   names that same session and that is not verified — what it wrote
+    ///   itself since. A record written elsewhere, and any verified
+    ///   record, is not its to rewrite, hide or delete: a web page must
+    ///   not be able to talk a model into that.
+    ///
+    /// Everyone else is bound by the `memory` permission alone. The tool
+    /// asks this before it asks anyone for approval; `update_by` and
+    /// `forget_by` ask it again.
+    pub fn check_change(&self, id: &str, by: &Provenance, what: &str) -> Result<(), MemoryError> {
+        if by.add_only {
+            return Err(MemoryError::Forbidden(format!(
+                "this session was started by outside input, so it may not {what} an existing memory. \
+                 It can only add new ones."
+            )));
+        }
+        if !by.untrusted {
+            return Ok(());
+        }
+        let Some(record) = self.get(id)? else {
+            return Ok(());
+        };
+        let own = by.session_id.is_some()
+            && !record.verified
+            && record
+                .provenance
+                .as_ref()
+                .is_some_and(|origin| origin.session_id == by.session_id);
+        if own {
+            return Ok(());
+        }
+        Err(MemoryError::Forbidden(format!(
+            "this session has seen content from outside, so it may {what} only memories it saved \
+             itself since. It can still add new ones."
+        )))
+    }
+
     /// Delete a record for good. A session that carries outside text is
     /// refused.
     pub fn forget_by(&self, id: &str, by: &Provenance) -> Result<bool, MemoryError> {
         self.require_enabled()?;
-        refuse_untrusted(by, "delete")?;
+        self.check_change(id, by, "delete")?;
         let removed = self
             .storage
             .with_connection_mut(|conn| -> Result<bool, MemoryError> {
@@ -1335,24 +1364,63 @@ mod tests {
             .unwrap()
             .contains("The release branch is main."));
 
-        // Provenance without the ceiling refuses nothing — a session that
-        // has merely seen outside content (a web search) keeps working —
-        // but what it rewrites is no longer vouched for, and not injected.
-        let seen = memory
-            .remember(Some("fact"), "The staging host is stg-1.", None)
-            .unwrap();
-        assert!(seen.verified);
+        // Provenance without the ceiling: a session that has merely seen
+        // outside content (a web search) may not rewrite, re-kind, archive
+        // or delete a record written elsewhere, or a verified one…
         let by_seen = Provenance::tool("ses_seen", true);
-        let rewritten = memory
-            .update_by(
-                &seen.id,
-                &rewrite("The staging host is evil.example."),
-                &by_seen,
+        for patch in [
+            rewrite("The release branch is attacker/main."),
+            MemoryPatch {
+                kind: Some("preference".to_string()),
+                ..Default::default()
+            },
+            archive.clone(),
+        ] {
+            let error = memory.update_by(&trusted.id, &patch, &by_seen).unwrap_err();
+            assert!(
+                matches!(&error, MemoryError::Forbidden(message) if message.contains("seen content from outside")),
+                "{error}"
+            );
+        }
+        assert!(matches!(
+            memory.forget_by(&trusted.id, &by_seen),
+            Err(MemoryError::Forbidden(_))
+        ));
+        let other = memory
+            .remember_from(
+                None,
+                "Another run's note.",
+                None,
+                Provenance::tool("ses_other", true),
             )
             .unwrap();
-        assert!(!rewritten.verified);
-        assert!(!memory.injection().unwrap().contains("evil.example"));
-        assert!(memory.forget_by(&seen.id, &by_seen).unwrap());
+        assert!(memory.update_by(&other.id, &archive, &by_seen).is_err());
+        assert!(memory.forget_by(&other.id, &by_seen).is_err());
+        assert_eq!(memory.get(&trusted.id).unwrap().unwrap(), trusted);
+        // …but it keeps house among what it saved itself, which stays
+        // unverified and out of the injected block.
+        let mine = memory
+            .remember_from(
+                Some("note"),
+                "Draft: staging is stg-1.",
+                None,
+                by_seen.clone(),
+            )
+            .unwrap();
+        assert!(!mine.verified);
+        let edited = memory
+            .update_by(&mine.id, &rewrite("Draft: staging is stg-2."), &by_seen)
+            .unwrap();
+        assert!(!edited.verified);
+        assert!(!memory.injection().unwrap().contains("stg-2"));
+        assert!(memory.forget_by(&mine.id, &by_seen).unwrap());
+        // A run outside input started cannot do even that (unchanged).
+        let run = from(Source::Tool, true).add_only(true);
+        let its_own = memory
+            .remember_from(None, "A webhook run's note.", None, run.clone())
+            .unwrap();
+        assert!(memory.update_by(&its_own.id, &archive, &run).is_err());
+        assert!(memory.forget_by(&its_own.id, &run).is_err());
 
         // A trusted session's rewrite makes it that session's record, and
         // the change is on the record.

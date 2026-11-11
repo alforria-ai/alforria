@@ -2507,7 +2507,33 @@ mod tests {
         assert!(!record.verified, "{:?}", record.provenance);
         assert!(record.provenance.as_ref().unwrap().untrusted);
         assert!(memory.injection().is_none(), "nothing of it is injected");
-        // It can still tidy its own notes: provenance refuses nothing.
+        let asked_before = ask.requests().len();
+        // It cannot forget, archive or rewrite a verified record another
+        // session saved: the page it read must not be able to ask for that.
+        let trusted = memory
+            .remember(Some("fact"), "The office is in Lyon.", None)
+            .unwrap();
+        for args in [
+            json!({ "action": "forget", "id": trusted.id }),
+            json!({ "action": "update", "id": trusted.id, "archived": true }),
+            json!({ "action": "update", "id": trusted.id, "content": "The office moved to evil.example." }),
+        ] {
+            let error = (def.execute)(args.clone(), ctx(&ask, &inst, &extra))
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("seen content from outside"),
+                "{args}: {error}"
+            );
+        }
+        assert_eq!(memory.get(&trusted.id).unwrap().unwrap(), trusted);
+        assert!(memory.injection().unwrap().contains("Lyon"));
+        assert_eq!(
+            ask.requests().len(),
+            asked_before,
+            "refused before anyone is asked"
+        );
+        // It can still tidy what it saved itself.
         (def.execute)(
             json!({ "action": "update", "id": record.id, "archived": true }),
             ctx(&ask, &inst, &extra),

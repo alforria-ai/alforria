@@ -210,17 +210,11 @@ fn run_memory(
         let by = Provenance::tool(ctx.session_id, untrusted(ctx.session_id))
             .restricted(restricted(ctx.session_id))
             .add_only(ceiling(ctx.session_id));
-        // Refused before anyone is asked: a run outside input started may
-        // add records (when its trigger lets it), never touch existing
-        // ones. The ceiling's effect; provenance alone refuses nothing.
-        let outsiders_only_add = |what: &str| -> Result<(), ToolError> {
-            if by.add_only {
-                return Err(ToolError::Failed(format!(
-                    "this session was started by outside input, so it may not {what} an existing \
-                     memory. It can only add new ones."
-                )));
-            }
-            Ok(())
+        // Refused before anyone is asked (`MemoryService::check_change`):
+        // a run outside input started changes no existing record, and a
+        // session that has seen outside content only what it saved itself.
+        let may_change = |id: &str, what: &str| -> Result<(), ToolError> {
+            memory.check_change(id, &by, what).map_err(fail)
         };
         let need_id = || {
             params
@@ -307,7 +301,7 @@ fn run_memory(
             }
             "update" => {
                 let id = need_id()?;
-                outsiders_only_add("change")?;
+                may_change(id, "change")?;
                 if params.content.is_none() && params.kind.is_none() && params.archived.is_none() {
                     return Err(invalid(
                         MEMORY_TOOL,
@@ -351,7 +345,7 @@ fn run_memory(
             }
             "forget" => {
                 let id = need_id()?;
-                outsiders_only_add("delete")?;
+                may_change(id, "delete")?;
                 approve(&ctx, "forget", json!({ "action": "forget", "id": id })).await?;
                 let removed = memory.forget_by(id, &by).map_err(fail)?;
                 Ok(ExecuteResult {
