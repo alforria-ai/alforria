@@ -409,22 +409,33 @@ directory of that name. A search marks its session for what it *returned*,
 not for where it looked:
 
 - `grep` and `glob` hand the server the list of files their result holds a
-  line or a name of — the list the tool computed, not the text it printed.
-  Each path is resolved (links followed, as the kernel would) and compared
-  with the resolved upload directories. A file of the upload area in the
-  list marks the session; a list with none does not, whatever tree was
-  searched. A path that cannot be resolved counts as an upload.
+  line or a name of — the list the tool computed, not the text it printed,
+  and built from the directory the tool actually walked, not from the path
+  as the call spelled it (the two differ when the path is, or goes through,
+  a link; the printed paths keep the call's spelling). Each path is resolved
+  (links followed, as the kernel would) and compared with the resolved
+  upload directories. A file of the upload area in the list marks the
+  session; a list with none does not, even when the searched tree holds the
+  area. A path that cannot be resolved, or names a file that is not there,
+  counts as an upload.
+- A search whose resolved root is inside the upload area, or is the area,
+  marks the session whatever it returned. So does a search through a link
+  into it: `grep` of `src/link.txt -> uploads/a.txt`, or `glob` in
+  `src/drop -> uploads`. A search of a tree that merely *contains* such a
+  link does not follow it, returns nothing of the area and marks nothing.
 - The text of a result decides nothing. A matched line that spells an
   upload's path, a project file under some other `uploads` directory, or an
   upload whose name is written to read like a project file's heading do not
   change the answer.
 - When there is no complete list — the result was cut at the tool's limit
-  (250 matches for `grep`, 100 files for `glob`), or the call failed — the
-  session is marked if the tree the call's input names is inside, is, or
-  contains an upload directory that holds at least one entry. An upload
-  directory that is merely there, empty, marks nothing.
-- An upload directory that exists but cannot be listed, or cannot be
-  resolved, counts as holding uploads.
+  (250 matches for `grep`, 100 files for `glob`), the call failed, or the
+  list cannot be matched to the call — the session is marked if the
+  resolved tree the call's input names (for a file, the directory it is in)
+  is inside, is, or contains the upload area. Input that cannot be resolved
+  marks.
+- All of this is about an upload directory that holds at least one entry.
+  One that is merely there, empty, marks nothing; one that exists but
+  cannot be listed or resolved counts as holding uploads.
 
 #### What the mark costs when nothing reads it
 

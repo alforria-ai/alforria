@@ -104,12 +104,13 @@ fn run(
             .iter()
             .map(|file| ts_resolve(&search, file.to_string_lossy().as_ref()))
             .collect();
-        // alforria extension: the files named in the result, for the
-        // session's provenance mark (`tool::outside`). A result cut at the
-        // limit is not a complete list, and leaves none.
-        if !truncated {
-            ctx.extra.returned_paths.set(listed.clone());
-        }
+        // alforria extension: the files named in the result, under the
+        // directory that was searched, for the session's provenance mark
+        // (`tool::outside`). A result cut at the limit is not a complete
+        // list.
+        ctx.extra
+            .returned_paths
+            .report(&search, files.iter(), !truncated);
 
         let mut output: Vec<String> = Vec::new();
         if files.is_empty() {

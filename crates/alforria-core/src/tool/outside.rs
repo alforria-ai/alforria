@@ -42,8 +42,27 @@ use serde_json::Value;
 pub struct ReturnedPaths(Arc<Mutex<Option<Vec<PathBuf>>>>);
 
 impl ReturnedPaths {
-    /// The complete list of files this call returned something of.
-    pub fn set(&self, paths: Vec<PathBuf>) {
+    /// **The one way a tool reports what it returned.** `searched` is the
+    /// directory the tool actually walked — not the path as the call
+    /// spelled it, which may go through a link to somewhere else — and
+    /// `found` the files it returned something of, relative to it, as the
+    /// walk produced them. `complete: false` (the result was cut at the
+    /// tool's limit) reports nothing: a call without a report is judged by
+    /// the tree it searched, towards marking.
+    pub fn report<P: AsRef<Path>>(
+        &self,
+        searched: &Path,
+        found: impl IntoIterator<Item = P>,
+        complete: bool,
+    ) {
+        if !complete {
+            return;
+        }
+        let mut paths: Vec<PathBuf> = found
+            .into_iter()
+            .map(|path| searched.join(path.as_ref()))
+            .collect();
+        paths.dedup();
         *self
             .0
             .lock()
@@ -77,12 +96,13 @@ pub enum Outside {
     ReadsPath(&'static str),
     /// It searches the tree its input names under this key (the session's
     /// directory when it names none) and prints names or lines of what it
-    /// finds: outside content when a file it returned is in the upload
-    /// area, by the tool's own list of them ([`ReturnedPaths`]). Without a
-    /// complete list — the result was cut at the tool's limit, or the call
-    /// failed — it is outside content when the upload area holds something
-    /// and the searched tree is inside, is, or contains it. Never decided
-    /// from the text the tool printed.
+    /// finds. With an upload area that holds something, it is outside
+    /// content when the resolved tree is inside or is the area; otherwise
+    /// when a file it returned is in the area, by the tool's own list of
+    /// them ([`ReturnedPaths::report`]); and without a complete list — the
+    /// result was cut at the tool's limit, or the call failed — when the
+    /// tree contains the area. Never decided from the text the tool
+    /// printed, and whatever cannot be resolved counts.
     SearchesPath(&'static str),
     /// It returns what a child session produced: outside content when a
     /// child of the session is marked.
@@ -213,42 +233,60 @@ pub fn carries_outside_content(result: &ToolResult<'_>, facts: &SessionFacts<'_>
                 Ok(roots) => roots,
                 Err(()) => return true,
             };
-            if matches!(class, Outside::SearchesPath(_)) {
-                // The tool said which files it returned: those decide. One
-                // that cannot be resolved cannot be placed, and counts.
-                if let Some(returned) = facts.returned {
-                    return returned
-                        .iter()
-                        .any(|path| match crate::protect::resolve_path(path) {
-                            Ok(path) => roots.iter().any(|root| path.starts_with(root)),
-                            Err(_) => true,
-                        });
-                }
-                // It did not: the tree it searched decides, and an upload
-                // directory that is merely there has nothing to return.
-                roots.retain(|root| holds_something(root));
-                if roots.is_empty() {
-                    return false;
-                }
-            }
             let named = match result.input.get(key) {
-                Some(Value::String(path)) => facts.directory.join(path),
+                Some(Value::String(path)) => Some(facts.directory.join(path)),
                 // A search with no root searches the session's directory;
                 // a read always names its file.
                 None | Some(Value::Null) if matches!(class, Outside::SearchesPath(_)) => {
-                    facts.directory.to_path_buf()
+                    Some(facts.directory.to_path_buf())
                 }
                 // Not the shape the tool takes: it cannot be told.
-                _ => return true,
+                _ => None,
             };
-            let Ok(path) = crate::protect::resolve_path(&named) else {
+            let named = named.and_then(|named| crate::protect::resolve_path(&named).ok());
+            if matches!(class, Outside::ReadsPath(_)) {
+                return match named {
+                    Some(path) => roots.iter().any(|root| path.starts_with(root)),
+                    None => true,
+                };
+            }
+            // A search. An upload directory that is merely there has
+            // nothing to return, whatever was searched.
+            roots.retain(|root| holds_something(root));
+            if roots.is_empty() {
+                return false;
+            }
+            // What was searched cannot be told: it counts.
+            let Some(mut tree) = named else {
                 return true;
             };
-            roots.iter().any(|root| {
-                path.starts_with(root)
-                    // A search from above the area reaches into it.
-                    || (matches!(class, Outside::SearchesPath(_)) && root.starts_with(&path))
-            })
+            // `grep` given a file searches the directory the file is in.
+            if !tree.is_dir() {
+                tree.pop();
+            }
+            // A search in the area itself returns the area's content.
+            if roots.iter().any(|root| tree.starts_with(root)) {
+                return true;
+            }
+            match facts.returned {
+                // The tool said which files it returned: those decide. One
+                // that cannot be resolved, or is not there, cannot be
+                // placed, and counts.
+                Some(returned) => {
+                    returned
+                        .iter()
+                        .any(|path| match crate::protect::resolve_path(path) {
+                            Ok(path) => {
+                                std::fs::symlink_metadata(&path).is_err()
+                                    || roots.iter().any(|root| path.starts_with(root))
+                            }
+                            Err(_) => true,
+                        })
+                }
+                // It did not — the result was cut at the tool's limit, or
+                // the call failed: a tree that holds the area counts.
+                None => roots.iter().any(|root| root.starts_with(&tree)),
+            }
         }
         Outside::Child => (facts.child_marked)(),
     }
@@ -416,8 +454,37 @@ mod tests {
                 Some(&[dir.join("src/../uploads/a.txt")]),
                 ""
             ));
-            // No list (cut at the limit, or a failed call): the tree.
+            // A returned file that is not there cannot be placed.
+            assert!(search(
+                tool,
+                project(),
+                Some(&[dir.join("src/gone.txt")]),
+                ""
+            ));
+            // A search in the area returns the area's content, whatever
+            // the list says; so does one of a file in it.
+            assert!(search(
+                tool,
+                json!({ "pattern": "x", "path": "uploads" }),
+                Some(&[]),
+                ""
+            ));
+            assert!(search(
+                tool,
+                json!({ "pattern": "x", "path": "uploads/a.txt" }),
+                Some(&[]),
+                ""
+            ));
+            // No list (cut at the limit, or a failed call): the tree —
+            // for a file, the directory it is in, which is what is
+            // searched.
             assert!(search(tool, project(), None, ""), "{tool}");
+            assert!(search(
+                tool,
+                json!({ "pattern": "x", "path": "src/../none.txt" }),
+                None,
+                ""
+            ));
             assert!(!search(
                 tool,
                 json!({ "pattern": "x", "path": "src" }),

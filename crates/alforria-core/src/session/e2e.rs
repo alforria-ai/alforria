@@ -2498,6 +2498,7 @@ mod tests {
     /// no complete list and is judged by the tree that was searched. What
     /// the result looks like as text — a file name, a matched line — decides
     /// nothing.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_search_marks_the_session_for_the_upload_files_it_returned_not_for_what_it_printed() {
         let runs = SearchRuns::new(
@@ -2512,6 +2513,19 @@ mod tests {
                 ("glob", json!({ "pattern": "**/drop.txt" })),
                 ("grep", json!({ "pattern": "hiddenneedle" })),
                 ("grep", json!({ "pattern": "linkneedle", "path": "src" })),
+                (
+                    "grep",
+                    json!({ "pattern": "linkneedle", "path": "src/link.txt" }),
+                ),
+                (
+                    "grep",
+                    json!({ "pattern": "linkneedle", "path": "src/drop" }),
+                ),
+                ("glob", json!({ "pattern": "*.txt", "path": "src/drop" })),
+                (
+                    "glob",
+                    json!({ "pattern": "*.txt", "path": "src/drop/../drop" }),
+                ),
                 ("read", json!({ "filePath": "uploads/drop.txt" })),
                 ("glob", json!({ "pattern": "many/*.txt" })),
                 ("grep", json!({ "pattern": "bulkneedle" })),
@@ -2572,20 +2586,35 @@ mod tests {
             "the name's second line reads as a project heading: {output}"
         );
         assert!(marked, "an upload whose name hides where it is");
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(
-            runs.e.worktree.join("uploads/linked.txt"),
-            runs.e.worktree.join("src/link.txt"),
-        )
-        .unwrap();
-        // Whether or not the search follows the link, the decision is
-        // about the files it returned, as resolved.
+        // Links from the project into the area: a file, and the directory.
+        for (target, link) in [
+            ("uploads/linked.txt", "src/link.txt"),
+            ("uploads", "src/drop"),
+        ] {
+            std::os::unix::fs::symlink(runs.e.worktree.join(target), runs.e.worktree.join(link))
+                .unwrap();
+        }
+        // A search of the tree the links are in does not follow them:
+        // nothing of the area is returned, and nothing is marked.
         let (marked, output) = runs.run().await;
-        assert_eq!(
-            marked,
-            output.contains("linkneedle"),
-            "marked exactly when the upload's line was returned: {output}"
-        );
+        assert_eq!(output, "No files found");
+        assert!(!marked, "links that were not followed");
+        // A search *through* one searches the area, whatever the call
+        // called it — and the paths it prints are spelled under `src`.
+        let (marked, output) = runs.run().await;
+        assert!(output.contains("linkneedle, from outside"), "{output}");
+        assert!(!output.contains("/uploads/"), "{output}");
+        assert!(marked, "grep of a file link into the area");
+        let (marked, output) = runs.run().await;
+        assert!(output.contains("linkneedle, from outside"), "{output}");
+        assert!(!output.contains("/uploads/"), "{output}");
+        assert!(marked, "grep of a directory link into the area");
+        for what in ["glob of a directory link", "glob through the link and back"] {
+            let (marked, output) = runs.run().await;
+            assert!(output.contains("linked.txt"), "{output}");
+            assert!(!output.contains("/uploads/"), "{output}");
+            assert!(marked, "{what}");
+        }
         assert!(runs.run().await.0, "a read of an upload");
 
         // Cut at the limit: no complete list, so the tree decides — the
