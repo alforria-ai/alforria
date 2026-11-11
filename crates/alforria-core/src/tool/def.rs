@@ -89,7 +89,9 @@ pub struct Extra {
 pub struct InstanceContext {
     pub directory: PathBuf,
     pub worktree: PathBuf,
-    /// Set for a session that is restricted or has seen outside content:
+    /// Set for a session that is restricted or that outside input started
+    /// (`SessionMark::OutsideStart`; not for one that has merely seen
+    /// outside content):
     /// the guard its tools' writes go through (`protect::WriteGuard`).
     /// `None`: no guard.
     pub write_guard: Option<std::sync::Arc<crate::protect::WriteGuard>>,

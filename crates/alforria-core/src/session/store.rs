@@ -599,7 +599,7 @@ impl SessionStore {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
         let directory = match classify(result.tool) {
-            Outside::ReadsPath(_) | Outside::ListsFiles if !uploads.is_empty() => {
+            Outside::ReadsPath(_) | Outside::SearchesPath(_) if !uploads.is_empty() => {
                 PathBuf::from(self.get(session_id)?.directory)
             }
             _ => PathBuf::new(),
