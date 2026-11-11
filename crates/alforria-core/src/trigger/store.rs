@@ -427,6 +427,19 @@ impl TriggerStore {
         })
     }
 
+    /// Give a tick back: the run that answered it never started. Only if
+    /// nobody has taken a later one since.
+    pub fn unclaim_tick(&self, id: &str, claimed_at: u64) -> Result<(), CoreError> {
+        self.storage.with_connection(|conn| {
+            conn.execute(
+                "UPDATE trigger_state SET last_scheduled = NULL
+                 WHERE directory = ?1 AND trigger_id = ?2 AND last_scheduled IS ?3",
+                params![self.directory, id, claimed_at as i64],
+            )?;
+            Ok(())
+        })
+    }
+
     /// Insert or replace a run, then drop the oldest beyond the cap. A run
     /// that is settled no longer holds its trigger.
     pub fn put_run(&self, run: &TriggerRun) -> Result<(), CoreError> {
@@ -498,6 +511,12 @@ impl TriggerStore {
     /// A run another live process owns is that process's, and is left
     /// alone. Where a platform cannot tell whether a process is alive (not
     /// a Unix), every other process's run counts as abandoned.
+    ///
+    /// A run that answered a scheduled tick and was still queued never
+    /// started a turn (the process died between taking the tick and
+    /// running it): its tick is given back, so a one-shot, or a trigger
+    /// with `catch_up`, fires it after all. One that was running is the
+    /// restart sweep's to resume, and its tick stays taken.
     pub fn fail_orphaned(&self, now_ms: u64) -> Result<usize, CoreError> {
         let unfinished: Vec<TriggerRun> = self.storage.with_connection(|conn| {
             let mut stmt =
@@ -524,8 +543,12 @@ impl TriggerStore {
             )
         })?;
         for mut run in unfinished.iter().cloned() {
+            let never_started = run.status == RunStatus::Queued && run.scheduled.is_some();
             interrupt(&mut run, now_ms);
             self.put_run(&run)?;
+            if never_started {
+                self.unclaim_tick(&run.trigger_id, run.time.started)?;
+            }
         }
         Ok(unfinished.len())
     }

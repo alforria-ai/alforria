@@ -1372,7 +1372,11 @@ async fn a_tick_interrupted_by_a_crash_is_closed_and_never_fired_twice() {
     let start = f.clock.now_ms();
     let hour = 3_600_000;
     let interrupted = {
-        let service = f.service(config.clone());
+        // Room for both: each has started its turn when the process dies.
+        let service = f.service_with(TriggerSettings {
+            concurrency: 2,
+            ..f.settings(config.clone())
+        });
         // 01:30: both are due (the interval since 01:00).
         f.clock.set(start + hour + hour / 2);
         let runs = service.tick(f.clock.now_ms());
@@ -1893,4 +1897,165 @@ async fn a_server_alone_on_its_data_directory_schedules_as_before() {
         service.get("hourly").unwrap().last_fired,
         Some(f.clock.now_ms())
     );
+}
+
+// -- Shutdown and crash windows (M10) ----------------------------------------
+
+/// M10. A run that was waiting for a slot when the server stopped started
+/// its turn afterwards, once the run ahead of it was settled: a turn
+/// nothing would settle. It is recorded as skipped instead, and the runs
+/// the service still counts are the turns left to settle.
+#[tokio::test]
+async fn a_queued_run_does_not_start_after_stop() {
+    let f = Fixture::new(
+        "trigger-stop-queued",
+        "2027-01-01T00:00:00Z",
+        FakeOps::gated("ok"),
+    );
+    let service = f.service(two_hooks());
+    let mut rx = f.events.all();
+    let running = service.hook("a", b"x").unwrap();
+    until("a's turn starts", || turns_of(&f.ops, "a") == 1).await;
+    let queued = service.hook("b", b"y").unwrap();
+    assert_eq!(service.run(&queued.id).unwrap().status, RunStatus::Queued);
+    assert_eq!(service.in_flight(), 1);
+
+    service.stop();
+    assert_eq!(service.in_flight(), 1, "only the turn that had started");
+    // The shutdown settles the running turn, which frees the slot.
+    f.ops.release(1);
+    let settled = settle(&service, &[running, queued]).await;
+    assert_eq!(settled[0].status, RunStatus::Completed);
+    assert_eq!(settled[1].status, RunStatus::Skipped, "{:?}", settled[1]);
+    assert_eq!(settled[1].cause.as_deref(), Some(STOPPED_BEFORE_START));
+    assert_eq!(service.in_flight(), 0);
+    let started: Vec<String> = f
+        .ops
+        .turns()
+        .iter()
+        .map(|turn| turn.trigger_id.clone())
+        .collect();
+    assert_eq!(started, vec!["a".to_string()], "b's turn never began");
+    assert!(!service.get("b").unwrap().running);
+    assert!(drain(&mut rx).iter().any(|(kind, data)| {
+        kind == "trigger.skipped" && data["cause"] == STOPPED_BEFORE_START
+    }));
+}
+
+/// M10. A scheduled run that the shutdown left queued gives its tick back:
+/// the next start fires it if the trigger catches up, instead of the tick
+/// being taken and never answered.
+#[tokio::test]
+async fn a_tick_left_queued_by_a_shutdown_is_caught_up_at_the_next_start() {
+    let f = Fixture::new(
+        "trigger-stop-tick",
+        "2027-01-01T00:00:00Z",
+        FakeOps::gated("ok"),
+    );
+    let config = json!({
+        "busy": { "on": { "webhook": true }, "prompt": "Busy" },
+        "remind": { "on": { "at": "2027-01-01T00:10:00Z" }, "prompt": "Remind me" },
+    });
+    let due = f.clock.now_ms() + 600_000;
+    {
+        let service = f.service(config.clone());
+        let ahead = service.hook("busy", b"x").unwrap();
+        until("the turn ahead starts", || turns_of(&f.ops, "busy") == 1).await;
+        f.clock.set(due);
+        let queued = service.tick(due);
+        assert_eq!(queued.len(), 1);
+        service.stop();
+        f.ops.release(1);
+        let settled = settle(&service, &[ahead, queued[0].clone()]).await;
+        assert_eq!(settled[1].status, RunStatus::Skipped);
+        assert_eq!(turns_of(&f.ops, "remind"), 0);
+    }
+    f.the_process_died();
+    f.clock.set(due + 300_000);
+    f.ops.release(1);
+    let service = f.service(config);
+    let fired = settle(&service, &service.tick(f.clock.now_ms())).await;
+    assert_eq!(fired.len(), 1, "{fired:?}");
+    assert_eq!(
+        (fired[0].trigger_id.as_str(), fired[0].reason.as_str()),
+        ("remind", "catch_up")
+    );
+    assert_eq!(turns_of(&f.ops, "remind"), 1);
+    assert!(service.tick(f.clock.now_ms()).is_empty(), "once");
+}
+
+/// M10. The process is killed between taking a one-shot's tick and running
+/// it. The tick used to be taken with nothing to show for it: no run, and
+/// a reminder that never fired, `catch_up` or not. The run is stored in the
+/// transaction that takes the tick, so the next server finds it, closes it
+/// as interrupted and gives the tick back.
+#[tokio::test]
+async fn a_one_shot_whose_tick_was_taken_by_a_process_that_died_is_fired_after_all() {
+    let f = Fixture::new(
+        "trigger-claim-crash",
+        "2027-01-01T00:00:00Z",
+        FakeOps::answering("ok"),
+    );
+    let start = f.clock.now_ms();
+    let due = start + 600_000;
+    let stranded = TriggerService::new_run("remind", "schedule", Some(due), due);
+    {
+        let service = f.service(json!({}));
+        service
+            .create(
+                Some("remind".to_string()),
+                spec(json!({
+                    "on": { "at": "2027-01-01T00:10:00Z" },
+                    "prompt": "Remind me",
+                    "catch_up": true,
+                })),
+                None,
+                None,
+            )
+            .unwrap();
+        // 00:10 arrives. The tick is taken, and the process is killed
+        // before anything else happens: all there is of the fire is what
+        // that one transaction wrote.
+        let claim = f
+            .store()
+            .with_owner(dead_owner())
+            .claim_tick("remind", None, due, &stranded)
+            .unwrap();
+        assert_eq!(claim, TickClaim::Run);
+    }
+    assert_eq!(
+        f.store().state("remind").unwrap().unwrap().last_scheduled,
+        Some(due)
+    );
+    assert_eq!(
+        f.store().run(&stranded.id).unwrap().unwrap().status,
+        RunStatus::Queued,
+        "the tick's run is on record"
+    );
+
+    f.clock.set(start + 900_000);
+    let service = f.service(json!({}));
+    let closed = service.run(&stranded.id).unwrap();
+    assert_eq!(closed.status, RunStatus::Failed);
+    assert_eq!(closed.error.as_deref(), Some(crate::trigger::INTERRUPTED));
+    assert_eq!(service.get("remind").unwrap().next, Some(f.clock.now_ms()));
+    let fired = settle(&service, &service.tick(f.clock.now_ms())).await;
+    assert_eq!(fired.len(), 1, "{fired:?}");
+    assert_eq!(fired[0].reason, "catch_up");
+    assert_eq!(fired[0].status, RunStatus::Completed);
+    assert_eq!(f.ops.turns().len(), 1);
+    assert_eq!(service.runs("remind", 10).unwrap().len(), 2);
+    // Once: it is a one-shot again.
+    assert_eq!(service.get("remind").unwrap().next, None);
+    assert!(service.tick(f.clock.advance(60_000)).is_empty());
+
+    // A tick somebody else has taken since is not given back.
+    f.store().unclaim_tick("remind", due).unwrap();
+    assert!(f
+        .store()
+        .state("remind")
+        .unwrap()
+        .unwrap()
+        .last_scheduled
+        .is_some());
 }

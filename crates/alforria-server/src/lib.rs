@@ -515,6 +515,10 @@ pub fn production_context(
         let engines = engines.clone();
         move || engines.stop_background()
     });
+    ctx.background_in_flight = Arc::new({
+        let engines = engines.clone();
+        move || engines.triggers_in_flight()
+    });
     // Everything this context writes goes under the paths it was given:
     // worktrees too, which defaulted to the process's own data directory.
     ctx.worktree_deps = Arc::new(state::WorktreeDeps {

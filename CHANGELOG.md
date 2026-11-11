@@ -224,6 +224,14 @@ pre-1.0, so minor releases may include breaking changes.
 
 ### Fixed
 
+- A trigger run that was queued behind another when the server stopped no
+  longer starts its turn after the shutdown has settled the others: it is
+  recorded as skipped and, for a scheduled tick, the tick is given back. A
+  turn that starts while a shutdown is settling the rest is settled too.
+- A server killed between taking a scheduled tick and starting its run no
+  longer loses the tick silently (a one-shot reminder never fired, even
+  with `catch_up`). The run is stored in the same transaction as the tick,
+  and the next start closes it as interrupted and gives the tick back.
 - Two servers on one data directory no longer do the same work twice.
   A turn interrupted by a kill was resumed by every server that started
   afterwards (the marker was a liveness check, not a claim); a starting

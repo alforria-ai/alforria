@@ -95,6 +95,26 @@ failed ("the turn was stopped before it finished") or completed. A turn
 that ended inside the process leaves no restart marker, so the next start
 repairs and resumes nothing on its account.
 
+A trigger run that was still waiting for its turn (`triggers.concurrency`
+runs go at a time) does not start once the schedulers have stopped: it is
+recorded as skipped ("the server was shutting down before this run's turn
+came"). If it answered a scheduled tick, the tick is given back, so the
+next start fires it for a one-shot or a trigger with `catch_up`. And the
+settling in step 2 is not one pass over the turns running at one moment:
+a turn that reaches its session while the others are being settled — a
+request already in flight, a trigger run that had passed its last check —
+is settled too, until nothing is running and nothing is on its way, or
+the deadline passes.
+
+A hard kill between a scheduled tick being taken and its run starting no
+longer loses the tick. The run is written in the transaction that takes
+the tick; the next start (or the follower that takes over) finds it
+queued under an owner that is gone, closes it as interrupted and gives
+the tick back. A one-shot then fires, late, as any missed one-shot does
+unless it says `catch_up: false`; a cron or interval trigger fires it
+only with `catch_up`. A run whose turn had started is different: its tick
+stays taken and the turn is `server.resume`'s to deal with.
+
 ### Two servers on one data directory: leader and follower
 
 Nothing stops two alforria processes from sharing a data directory: a TUI
@@ -162,6 +182,7 @@ Limits:
 | Filesystems without `flock` (some network mounts) | Every process takes itself for the leader: ticks and other fires are still claimed in the database and run once, but each process watches the paths, so a watched change can run once per process if the first run has ended before the second server's debounce does |
 | The webhook rate limit | `triggers.webhook_min_interval` is counted per process: two servers accept one delivery each per interval. Only one runs while the first is unfinished |
 | Different configs | Triggers declared in a config are scheduled by the leader from *its* config. Two servers meant to share a data directory should share the config |
+| A tick taken by a process that died before running it | Given back when the run is found queued under an owner that is gone, which is at the next start or takeover. Until then the trigger shows the run as queued |
 | A build older than this | Knows none of the above. Do not run it beside a newer one on the same data directory |
 
 ## What the agent's shell can see: `shell_env` (host)

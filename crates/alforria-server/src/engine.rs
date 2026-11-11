@@ -1675,6 +1675,18 @@ impl EngineStore {
         }
     }
 
+    /// How many trigger runs are past their shutdown check with their turn
+    /// not yet ended (`TriggerService::in_flight`). After
+    /// [`Self::stop_background`] it only goes down.
+    pub fn triggers_in_flight(&self) -> usize {
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .map(|entry| entry.engine.triggers.in_flight())
+            .sum()
+    }
+
     /// The `EngineFactory` seam — resolves the engine for a request's
     /// instance, or a defect-500 when the instance has no engine (the
     /// engine build failed at boot).

@@ -77,6 +77,9 @@ const MAX_RUN_TEXT: usize = 64 * 1024;
 const KEEP_FINISHED_MS: u64 = 24 * 60 * 60 * 1000;
 /// How often a follower asks whether the scheduler's place is free.
 pub const FOLLOWER_RETRY_MS: u64 = 5_000;
+/// Why a queued run did not start: the server was shutting down by the
+/// time a slot was free.
+pub const STOPPED_BEFORE_START: &str = "the server was shutting down before this run's turn came";
 /// Why a fire did not run when the trigger's run is another process's.
 const BUSY_ELSEWHERE: &str =
     "the previous run has not finished (another server sharing this data directory is running it)";
@@ -266,6 +269,17 @@ pub struct TriggerService {
     role: Option<RoleLock>,
     /// This process asked for the place and another had it.
     follower: AtomicBool,
+    /// Runs that passed the shutdown check and whose turn has not ended.
+    in_flight: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// Counts a run as in flight until its turn has ended, however it ends.
+struct InFlight(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl TriggerService {
@@ -352,6 +366,7 @@ impl TriggerService {
         Arc::new(TriggerService {
             role,
             follower: AtomicBool::new(false),
+            in_flight: Arc::default(),
             ops,
             events,
             store,
@@ -1192,11 +1207,21 @@ impl TriggerService {
     /// by the clock, a watch, a webhook or a request, and the watchers are
     /// dropped. Runs already started are turns like any other and are
     /// settled with them.
+    ///
+    /// A run that is still waiting for a slot does not start
+    /// ([`Self::execute`] looks again once it has one), and once this
+    /// returns [`Self::in_flight`] only goes down: the runs it counts are
+    /// the turns left to settle.
     pub fn stop(&self) {
-        self.stopped.store(true, Ordering::SeqCst);
-        for entry in self.lock().values_mut() {
-            entry.watcher = None;
-            entry.pending = None;
+        {
+            // Under the lock a run takes to pass its last check, so none
+            // passes it after this.
+            let mut entries = self.lock();
+            self.stopped.store(true, Ordering::SeqCst);
+            for entry in entries.values_mut() {
+                entry.watcher = None;
+                entry.pending = None;
+            }
         }
         // The scheduler's place is free for a process that lives on.
         if let Some(role) = &self.role {
@@ -1207,6 +1232,13 @@ impl TriggerService {
 
     pub fn stopped(&self) -> bool {
         self.stopped.load(Ordering::SeqCst)
+    }
+
+    /// How many runs are past the shutdown check with their turn not yet
+    /// ended: after [`Self::stop`], the turns a shutdown still has to
+    /// settle, including one that has not reached its session yet.
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::SeqCst)
     }
 
     /// Milliseconds until something may be due.
@@ -1523,9 +1555,27 @@ impl TriggerService {
 
     async fn execute(self: Arc<Self>, turn: TriggerTurn, mut run: TriggerRun) {
         let slot = self.slots.clone().acquire_owned().await;
+        // The wait for a slot can outlast the server: `stop` may have come
+        // while this run was queued, and a turn started now would begin
+        // after the shutdown had settled the others. Looked at under the
+        // lock `stop` takes, so a run either does not start or is counted
+        // before `stop` returns.
+        let started = {
+            let _entries = self.lock();
+            (!self.stopped()).then(|| {
+                self.in_flight.fetch_add(1, Ordering::SeqCst);
+                InFlight(self.in_flight.clone())
+            })
+        };
+        let Some(started) = started else {
+            drop(slot);
+            self.abandon(&turn, run);
+            return;
+        };
         run.status = RunStatus::Running;
         let _ = self.store.put_run(&run);
         let result = self.ops.run_turn(&turn).await;
+        drop(started);
         drop(slot);
         let now = self.clock.now_ms();
         let duration = now.saturating_sub(run.time.started);
@@ -1604,6 +1654,34 @@ impl TriggerService {
         }
         self.settled.notify_waiters();
         self.wake.notify_one();
+    }
+
+    /// A queued run that will not start, because the server is stopping:
+    /// recorded as skipped. The tick it answered is given back, so the next
+    /// start fires it if the trigger catches up.
+    fn abandon(&self, turn: &TriggerTurn, mut run: TriggerRun) {
+        let now = self.clock.now_ms();
+        run.status = RunStatus::Skipped;
+        run.cause = Some(STOPPED_BEFORE_START.to_string());
+        run.time.ended = Some(now);
+        let _ = self.store.put_run(&run);
+        if run.scheduled.is_some() {
+            let _ = self.store.unclaim_tick(&turn.trigger_id, run.time.started);
+        }
+        let mut data = json!({
+            "triggerID": turn.trigger_id,
+            "runID": run.id,
+            "reason": run.reason,
+            "cause": run.cause,
+        });
+        if let Some(scheduled) = run.scheduled {
+            data["scheduled"] = json!(scheduled);
+        }
+        self.publish(&TRIGGER_SKIPPED, data);
+        if let Some(entry) = self.lock().get_mut(&turn.trigger_id) {
+            entry.busy = false;
+        }
+        self.settled.notify_waiters();
     }
 
     /// Wait for a run to finish (or be skipped) and return it.

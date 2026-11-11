@@ -1630,6 +1630,11 @@ pub struct ServerContext {
     /// transcript indexers). Called first in a shutdown, so nothing new
     /// starts while the running turns are settled.
     pub stop_background: Arc<dyn Fn() + Send + Sync>,
+    /// How many turns the background services have committed to that may
+    /// not have reached their session yet: after `stop_background`, a
+    /// shutdown waits for these to show up (or end) before it takes the
+    /// running turns to be all there are.
+    pub background_in_flight: Arc<dyn Fn() -> usize + Send + Sync>,
     /// The global directories this context was built over, and the only
     /// ones a handler may use: nothing behind a request resolves them from
     /// the environment. The production context pins the ones it was given;
@@ -1745,6 +1750,7 @@ impl ServerContext {
             paths: paths.clone(),
             detached_paths: Some(Arc::new(detached)),
             stop_background: Arc::new(|| {}),
+            background_in_flight: Arc::new(|| 0),
             worktree_deps: Arc::new(WorktreeDeps {
                 data_dir: paths.data.clone(),
                 global_bus: global_bus_clone,
