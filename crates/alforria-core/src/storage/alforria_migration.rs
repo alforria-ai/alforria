@@ -53,6 +53,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "0006_session_mark",
         include_str!("alforria_migrations/0006_session_mark.sql"),
     ),
+    (
+        "0007_session_ceiling",
+        include_str!("alforria_migrations/0007_session_ceiling.sql"),
+    ),
 ];
 
 /// The journal table.
@@ -66,6 +70,7 @@ pub const OWN_TABLES: &[&str] = &[
     JOURNAL,
     "session_restriction",
     "session_mark",
+    "session_ceiling",
     "outbox",
     "trigger",
     "trigger_state",

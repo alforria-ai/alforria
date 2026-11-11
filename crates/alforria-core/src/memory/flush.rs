@@ -159,9 +159,8 @@ impl MemoryFlush {
             return false;
         };
         let own = session.permission.unwrap_or_default();
-        agent
-            .permission
-            .extended(&own)
+        self.sessions
+            .bounded(session_id, agent.permission.extended(&own))
             .evaluate(crate::tool::memory::MEMORY_TOOL, "remember")
             .action
             == PermissionV1Action::Allow

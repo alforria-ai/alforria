@@ -453,6 +453,12 @@ pub struct CreateInput {
     /// ([`SessionMark`]). A child gets its parent's as well, whatever this
     /// says.
     pub marks: SessionMarks,
+    /// alforria extension: ceilings the session starts with
+    /// ([`SessionCeiling`]), beyond its parent's.
+    pub ceilings: Vec<SessionCeiling>,
+    /// alforria extension: a fork takes its source's ceilings, as a child
+    /// takes its parent's.
+    pub ceilings_from: Option<String>,
 }
 
 /// What the server records about where a session's text came from
@@ -521,6 +527,19 @@ impl SessionMarks {
         }
         out
     }
+}
+
+/// A named permission ceiling stored for a session (alforria extension):
+/// readings of the rules that cap whatever policy is in force when a turn
+/// runs ([`SessionStore::bounded`]). Server-owned, inherited by children and
+/// forks, and sealed: a session's own rules and standing approvals do not
+/// reach it (`tool::permission::Ceiling::sealed`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionCeiling {
+    /// `trigger::rules::CREATOR_CEILING`, `trigger::rules::OUTSIDE_CEILING`.
+    pub name: String,
+    /// Each is a ceiling of its own: the strictest of all applies.
+    pub readings: Vec<PermissionV1Ruleset>,
 }
 
 /// Session metadata keys the server keeps for itself. A client cannot set,
@@ -699,6 +718,20 @@ impl SessionStore {
         for mark in marks.list() {
             self.mark(&info.id, mark)?;
         }
+        // The same for the ceilings: a child or a fork is capped as its
+        // source is, from before it exists. An error here is an error for
+        // the creation.
+        for source in [&input.parent_id, &input.ceilings_from]
+            .into_iter()
+            .flatten()
+        {
+            for ceiling in self.ceilings(source)? {
+                self.set_ceiling(&info.id, &ceiling)?;
+            }
+        }
+        for ceiling in &input.ceilings {
+            self.set_ceiling(&info.id, ceiling)?;
+        }
         self.publish(
             &event_definitions::SESSION_CREATED,
             serde_json::to_value(SessionCreatedData {
@@ -849,6 +882,88 @@ impl SessionStore {
                 Ok::<_, CoreError>(())
             })
             .map_err(SessionError::from)
+    }
+
+    /// The ceilings stored for a session, by name.
+    pub fn ceilings(&self, session_id: &str) -> Result<Vec<SessionCeiling>, SessionError> {
+        let rows = self
+            .storage
+            .with_connection(|conn| {
+                let mut statement = conn.prepare(
+                    "SELECT name, readings FROM session_ceiling WHERE session_id = ?1 ORDER BY name",
+                )?;
+                let rows = statement
+                    .query_map([session_id], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok::<_, CoreError>(rows)
+            })
+            .map_err(SessionError::from)?;
+        rows.into_iter()
+            .map(|(name, readings)| {
+                Ok(SessionCeiling {
+                    name,
+                    readings: serde_json::from_str(&readings)?,
+                })
+            })
+            .collect()
+    }
+
+    /// Set (replace) one of a session's ceilings.
+    pub fn set_ceiling(
+        &self,
+        session_id: &str,
+        ceiling: &SessionCeiling,
+    ) -> Result<(), SessionError> {
+        let now = self.now() as i64;
+        let readings = serde_json::to_string(&ceiling.readings)?;
+        self.storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "INSERT INTO session_ceiling (session_id, name, readings, time_updated)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT (session_id, name) DO UPDATE SET
+                        readings = excluded.readings, time_updated = excluded.time_updated",
+                    rusqlite::params![session_id, ceiling.name, readings, now],
+                )
+                .map(|_| ())
+                .map_err(CoreError::from)
+            })
+            .map_err(SessionError::from)
+    }
+
+    /// **The policy a turn in `session_id` is judged by**, given the policy
+    /// in force for its agent (and, already read into it, the session's own
+    /// rules): that policy under every ceiling stored for the session. The
+    /// one evaluation (`Policy::evaluate`) then gives the strictest of the
+    /// policy as it stands now, the host's ceiling it carries, a trigger
+    /// creator's bounds and the outside-input ceiling. Ceilings that cannot
+    /// be read are one that denies everything.
+    pub fn bounded(
+        &self,
+        session_id: &str,
+        policy: crate::tool::permission::Policy,
+    ) -> crate::tool::permission::Policy {
+        use alforria_schema::permission_v1::{PermissionV1Action, PermissionV1Rule};
+        match self.ceilings(session_id) {
+            Ok(ceilings) => ceilings.into_iter().fold(policy, |policy, ceiling| {
+                ceiling
+                    .readings
+                    .into_iter()
+                    .fold(policy, |policy, reading| {
+                        policy.with_sealed_ceiling(&ceiling.name, reading)
+                    })
+            }),
+            Err(_) => policy.with_sealed_ceiling(
+                "unreadable",
+                vec![PermissionV1Rule {
+                    permission: "*".to_string(),
+                    pattern: "*".to_string(),
+                    action: PermissionV1Action::Deny,
+                }],
+            ),
+        }
     }
 
     /// Remove a session's marks. An operator's decision, like
@@ -1643,6 +1758,7 @@ impl SessionStore {
                     .flatten(),
                 restricted: caller_restricted || self.is_restricted(session_id)?,
                 marks,
+                ceilings_from: Some(session_id.to_string()),
                 ..Default::default()
             },
         )?;

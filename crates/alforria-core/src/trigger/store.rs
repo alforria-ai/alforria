@@ -3,7 +3,6 @@
 
 use std::sync::Arc;
 
-use alforria_schema::permission_v1::PermissionV1Ruleset;
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
@@ -22,7 +21,7 @@ pub struct StoredSpec {
         default,
         skip_serializing_if = "Option::is_none"
     )]
-    pub inherited: Option<PermissionV1Ruleset>,
+    pub inherited: Option<crate::trigger::CreatorBounds>,
     /// Whoever created the trigger was restricted (`session::caller`): a
     /// credential below `admin`, or the `schedule` tool in a restricted
     /// session. Recorded when it is created and never changed; its runs

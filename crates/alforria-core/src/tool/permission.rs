@@ -84,6 +84,13 @@ pub struct Ceiling {
     /// What it is, for messages (`"host"`).
     pub name: String,
     pub rules: Ruleset,
+    /// Nothing later is read into it: a session's own rules and a standing
+    /// approval ([`Policy::extended`]) leave it as it is. The host's
+    /// ceiling is not sealed — the operator's later rules override it as
+    /// they override the written list. A trigger run's ceilings are: the
+    /// creator's bounds and the outside-input ceiling are not the
+    /// session's to widen.
+    pub sealed: bool,
 }
 
 /// What an agent may do: the rules as every config wrote them, and the
@@ -130,7 +137,24 @@ impl Policy {
             self.ceilings.push(Ceiling {
                 name: name.to_string(),
                 rules,
+                sealed: false,
             });
+        }
+        self
+    }
+
+    /// Add a sealed ceiling ([`Ceiling::sealed`]): a reading that caps the
+    /// policy whatever is appended to it afterwards. Always kept, even when
+    /// it equals the written list today — the written list may be extended
+    /// tomorrow.
+    pub fn with_sealed_ceiling(mut self, name: &str, rules: Ruleset) -> Policy {
+        let sealed = Ceiling {
+            name: name.to_string(),
+            rules,
+            sealed: true,
+        };
+        if !self.ceilings.contains(&sealed) {
+            self.ceilings.push(sealed);
         }
         self
     }
@@ -153,11 +177,12 @@ impl Policy {
     /// This policy followed by `later` rules that count in every reading:
     /// a session's own rules, a standing approval. They are the operator's
     /// (or an answer to an ask), so they override a ceiling's rule the way
-    /// they override a written one.
+    /// they override a written one — except a sealed ceiling's
+    /// ([`Ceiling::sealed`]), which nothing later reaches.
     pub fn extended(&self, later: &Ruleset) -> Policy {
         let mut policy = self.clone();
         policy.written.extend(later.iter().cloned());
-        for ceiling in &mut policy.ceilings {
+        for ceiling in policy.ceilings.iter_mut().filter(|c| !c.sealed) {
             ceiling.rules.extend(later.iter().cloned());
         }
         policy
@@ -517,9 +542,8 @@ mod tests {
     /// it, `routes::v2::util`.)
     #[test]
     fn every_core_evaluation_path_agrees_with_the_policy() {
-        use crate::trigger::rules::{session_rules, RunRules};
+        use crate::trigger::rules::{run_policy, CreatorBounds, RunRules};
         for (index, (policy, queries)) in differential::cases().into_iter().enumerate() {
-            let flat = policy.render();
             let none = Ruleset::new();
             for (permission, pattern) in &queries {
                 let decided = policy.evaluate(permission, pattern).action;
@@ -538,25 +562,44 @@ mod tests {
                 {
                     assert_eq!(decided, PermissionV1Action::Deny, "{permission} {pattern}");
                 }
-                // A trigger run's effective rules, built from the rendering:
-                // never more permissive, trusted or carrying outside text.
-                // (Every fifth case: these lists are long.)
+                // A trigger run's policy, bounded by this policy as its
+                // creator's: never more permissive, trusted or started by
+                // outside input. (Every fifth case: these are long.)
                 for untrusted in [false, true].into_iter().filter(|_| index % 5 == 0) {
-                    let session = session_rules(&RunRules {
-                        agent: &flat,
-                        inherited: &flat,
+                    let run = run_policy(&RunRules {
+                        inherited: &CreatorBounds::of(&policy),
                         own: &none,
                         untrusted,
-                    });
-                    let run = policy
-                        .extended(&session)
-                        .evaluate(permission, pattern)
-                        .action;
+                    })
+                    .over(&policy)
+                    .evaluate(permission, pattern)
+                    .action;
                     assert!(
                         strictness(run) >= strictness(decided),
                         "trigger run (untrusted={untrusted}) {permission} {pattern}: \
                          {run:?} < {decided:?}\n{policy:#?}"
                     );
+                    // And exactly the creator's answer for a trusted run
+                    // under a policy that has since been thrown wide open.
+                    if !untrusted {
+                        let open = Policy::plain(vec![PermissionV1Rule {
+                            permission: "*".to_string(),
+                            pattern: "*".to_string(),
+                            action: PermissionV1Action::Allow,
+                        }]);
+                        let later = run_policy(&RunRules {
+                            inherited: &CreatorBounds::of(&policy),
+                            own: &none,
+                            untrusted,
+                        })
+                        .over(&open)
+                        .evaluate(permission, pattern)
+                        .action;
+                        assert_eq!(
+                            later, decided,
+                            "loosened {permission} {pattern}\n{policy:#?}"
+                        );
+                    }
                 }
             }
         }

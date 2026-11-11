@@ -5,7 +5,7 @@
 //! the engine's own — is bound as that credential was. An operator who
 //! wants to take such a session over lifts the restriction first.
 //!
-//! - `GET    /session/{sessionID}/restriction`   `{ "restricted": bool, "outsideContent": bool, "outsideStart": bool }`
+//! - `GET    /session/{sessionID}/restriction`   `{ "restricted": bool, "outsideContent": bool, "outsideStart": bool, "ceilings": [name] }`
 //!   (the last two are the session's marks, `session::store::SessionMark`)
 //! - `DELETE /session/{sessionID}/restriction`   lift it; `{ "restricted": false, "lifted": bool }`
 //!
@@ -40,10 +40,20 @@ async fn show(
         .is_restricted(&session_id)
         .map_err(session_error)?;
     let marks = ctx.sessions.marks(&session_id).map_err(session_error)?;
+    // The names of the permission ceilings stored for it
+    // (`trigger-creator`, `outside-input`).
+    let ceilings: Vec<String> = ctx
+        .sessions
+        .ceilings(&session_id)
+        .map_err(session_error)?
+        .into_iter()
+        .map(|ceiling| ceiling.name)
+        .collect();
     Ok(Json(json!({
         "restricted": restricted,
         "outsideContent": marks.outside_content,
         "outsideStart": marks.outside_start,
+        "ceilings": ceilings,
     })))
 }
 

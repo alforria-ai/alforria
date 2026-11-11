@@ -697,7 +697,7 @@ async fn stored_triggers_and_their_state_survive_a_restart_without_replaying_mis
     let run = fire_next(&f, &service, &stored_id).await;
     assert_eq!(run.session_id.as_deref(), Some(session_id.as_str()));
     let turn = f.ops.turns().pop().unwrap();
-    assert_eq!(turn.inherited, inherited);
+    assert_eq!(turn.inherited.readings(), vec![inherited]);
     assert!(turn.own.is_empty() && !turn.untrusted);
     assert_eq!(turn.session_id.as_deref(), Some(session_id.as_str()));
 }

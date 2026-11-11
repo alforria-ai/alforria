@@ -48,6 +48,9 @@ use crate::trigger::{
 /// The session-engine implementation of [`TriggerOps`].
 pub struct ProductionTriggerOps {
     sessions: SessionStore,
+    /// Kept for the constructor: a run reads its agent's rules when it
+    /// happens, not here.
+    #[allow(dead_code)]
     agents: crate::session::agents::AgentRegistry,
     context: SessionContext,
     facade: Mutex<Option<Arc<dyn PromptFacade>>>,
@@ -84,26 +87,15 @@ impl ProductionTriggerOps {
             .ok_or_else(|| "trigger prompt facade is not bound".to_string())
     }
 
-    /// The rules for the run's session. They are worked out afresh for every
-    /// run from the rules of the agent it will use, so they follow the agent
-    /// and can only ever narrow it (`trigger::rules`).
-    fn rules(&self, turn: &TriggerTurn) -> alforria_schema::permission_v1::PermissionV1Ruleset {
-        let agent = turn
-            .agent
-            .clone()
-            .or_else(|| self.agents.default_agent().ok())
-            // The flat rendering: never more permissive than the policy.
-            .and_then(|name| {
-                self.agents
-                    .get(&name)
-                    .map(|agent| agent.permission.render())
-            })
-            .unwrap_or_default();
-        turn.session_rules(&agent)
-    }
-
     fn create_session(&self, turn: &TriggerTurn, title: String) -> Result<String, String> {
-        let permission = self.rules(turn);
+        // The session's own rules are the trigger's block; the creator's
+        // bounds and the outside-input ceiling are stored as ceilings
+        // (`trigger::rules`). The agent's rules are not copied anywhere:
+        // each turn reads them as they then stand.
+        let crate::trigger::RunPolicy {
+            session: permission,
+            ceilings,
+        } = turn.run_policy();
         let mut metadata = JsonMap::new();
         metadata.insert("triggerID".to_string(), json!(turn.trigger_id));
         let session = self
@@ -117,6 +109,7 @@ impl ProductionTriggerOps {
                     metadata: Some(metadata),
                     // The session is its creator's kind, for life.
                     restricted: turn.restricted,
+                    ceilings,
                     // Read by anything that must not take this session's
                     // word for things, such as the memory flush before a
                     // compaction; and what puts the ceiling on it.
@@ -203,8 +196,18 @@ impl ProductionTriggerOps {
                                 )
                                 .map_err(|error| error.to_string())?;
                         }
-                        // The rules may have changed since the session was made.
-                        let permission = self.rules(&bound);
+                        // The block and the bounds may have changed since
+                        // the session was made. A ceiling is replaced,
+                        // never removed: one the session has, it keeps.
+                        let crate::trigger::RunPolicy {
+                            session: permission,
+                            ceilings,
+                        } = bound.run_policy();
+                        for ceiling in &ceilings {
+                            self.sessions
+                                .set_ceiling(&session.id, ceiling)
+                                .map_err(|error| error.to_string())?;
+                        }
                         if session.permission.clone().unwrap_or_default() != permission {
                             self.sessions
                                 .set_permission(&session.id, permission)
@@ -392,7 +395,7 @@ mod tests {
             model: None,
             mode,
             session_id: None,
-            inherited: Vec::new(),
+            inherited: Default::default(),
             own: vec![PermissionV1Rule {
                 permission: "bash".to_string(),
                 pattern: "*".to_string(),

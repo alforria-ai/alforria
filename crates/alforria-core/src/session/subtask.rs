@@ -196,9 +196,12 @@ impl SessionSubtask {
                 })
             })
             .collect();
-        let ruleset = task_agent
-            .permission
-            .extended(input.session.permission.as_ref().unwrap_or(&Vec::new()));
+        let ruleset = self.deps.sessions.bounded(
+            &input.session.id,
+            task_agent
+                .permission
+                .extended(input.session.permission.as_ref().unwrap_or(&Vec::new())),
+        );
         let ask = SessionAsk::new(
             self.deps.permission.clone(),
             input.session_id.clone(),

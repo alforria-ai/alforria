@@ -233,15 +233,32 @@ carries that fact (`outsideContent` in what is stored): the sessions of its
 runs start with the outside-content mark, so what they save to memory is
 unverified. It is provenance only — such a run is not read-only.
 
-A trigger created by the tool runs as the agent that created it. Its sessions
-carry a copy of the rules that governed the creating session at that moment
-(the agent's rules, then the session's own), applied again on every run after
-the agent's current rules, so a run can never do more than its creator could
-when it asked. The tool cannot set `agent`, `model` or `permission`.
+A trigger created by the tool runs as the agent that created it, within its
+creator's bounds. The bounds are what governed the creating session at that
+moment — every reading of its policy: the agent's rules with the session's
+own, and each ceiling over them — recorded with the trigger. They are a
+**ceiling**, not rules that are replayed: a run is judged by one evaluation
+over the strictest of
+
+1. the policy in force *when the run happens* for its agent and its session
+   (so an operator who later denies `bash`, asks about edits or denies
+   `*.env` reads binds every existing trigger from its next run);
+2. the creator's bounds (so loosening the policy later does not lift a run
+   past what its creator could do);
+3. the outside-input ceiling, when a webhook or a watch started the run;
+4. the host's ceiling.
+
+The bounds and the outside-input ceiling are stored for the run's session by
+the server (`session_ceiling`; `GET /session/{id}/restriction` lists their
+names as `ceilings`), are inherited by its subagents and forks, and are
+sealed: neither a rule added to the session nor a standing `always`
+approval reaches them. The run session's own `permission` holds only the
+trigger's `permission` block. The tool cannot set `agent`, `model` or
+`permission`.
 
 The tool only changes triggers from its own conversation tree. The session
 that created a trigger, and that session's ancestors, may update, pause,
-resume and delete it; an update leaves the copied rules as they are. A
+resume and delete it; an update leaves the recorded bounds as they are. A
 descendant (a subagent, whose rules may be narrower) may only pause or delete
 it. Triggers from the config, triggers created over HTTP and triggers of other
 conversations are listed but cannot be changed, paused or deleted by the

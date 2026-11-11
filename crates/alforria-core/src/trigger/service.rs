@@ -20,6 +20,7 @@ use serde_json::{json, Value};
 use crate::event::{EventBus, PublishOptions};
 use crate::tool::external_directory::{contains_real, real_path};
 use crate::tool::permission::from_config;
+use crate::trigger::rules::CreatorBounds;
 use crate::trigger::store::{StoredSpec, StoredTrigger, TriggerState, TriggerStore};
 use crate::trigger::watch::{self, WatchHandle, WatchIgnore};
 use crate::trigger::{
@@ -88,7 +89,7 @@ struct PendingWatch {
 struct Entry {
     source: TriggerSource,
     spec: TriggerSpec,
-    inherited: Option<PermissionV1Ruleset>,
+    inherited: Option<CreatorBounds>,
     origin_session_id: Option<String>,
     /// Its creator was restricted (`StoredSpec::restricted`).
     restricted: bool,
@@ -332,7 +333,7 @@ impl TriggerService {
         id: &str,
         source: TriggerSource,
         spec: TriggerSpec,
-        inherited: Option<PermissionV1Ruleset>,
+        inherited: Option<CreatorBounds>,
         origin_session_id: Option<String>,
         restricted: bool,
         outside_content: bool,
@@ -457,7 +458,7 @@ impl TriggerService {
             spec,
             Creator {
                 origin_session_id,
-                inherited,
+                inherited: inherited.map(CreatorBounds::Flat),
                 restricted: false,
                 outside_content: false,
             },

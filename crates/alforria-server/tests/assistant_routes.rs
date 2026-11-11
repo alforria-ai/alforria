@@ -543,13 +543,23 @@ async fn no_registered_tool_acts_on_an_untrusted_run_without_a_grant() {
         assert_eq!(plain.evaluate(name, "anything").action, Deny, "{name}");
     }
     // The ceiling only narrows: what the agent held back stays held back.
+    // (The one evaluation says `ask` where the agent does; for a run that
+    // outside input started the permission service denies an ask at once.)
+    let unattended =
+        |policy: &alforria_core::tool::permission::Policy, permission: &str, pattern: &str| {
+            match policy.evaluate(permission, pattern).action {
+                Allow => Allow,
+                _ => Deny,
+            }
+        };
     assert_ne!(agent.evaluate("read", ".env").action, Allow);
-    assert_eq!(plain.evaluate("read", ".env").action, Deny);
+    assert_ne!(plain.evaluate("read", ".env").action, Allow);
+    assert_eq!(unattended(&plain, "read", ".env"), Deny);
     assert_eq!(plain.evaluate("read", "src/main.rs").action, Allow);
     assert_eq!(plain.evaluate("external_directory", "/etc/*").action, Deny);
     for (permission, pattern) in [("read", "a"), ("grep", "a"), ("glob", "a"), ("bash", "ls")] {
         if agent.evaluate(permission, pattern).action != Allow {
-            assert_eq!(plain.evaluate(permission, pattern).action, Deny);
+            assert_eq!(unattended(&plain, permission, pattern), Deny);
         }
     }
 
@@ -562,10 +572,9 @@ async fn no_registered_tool_acts_on_an_untrusted_run_without_a_grant() {
     );
     assert_eq!(granted.evaluate("bash", "rm -rf /").action, Deny);
     assert_eq!(granted.evaluate("edit", "x").action, Deny);
-    assert_eq!(granted.evaluate("read", ".env").action, Deny);
+    assert_eq!(unattended(&granted, "read", ".env"), Deny);
 }
 
-/// Cloning a repository must not be enough to schedule turns in it.
 /// H6: every tool the server registers is classified as returning outside
 /// content or not (`alforria_core::tool::outside::BUILTIN`). A tool added to
 /// the registry without a line in that table fails here: whether its
@@ -622,6 +631,7 @@ async fn every_registered_tool_is_classified_as_returning_outside_content_or_not
     }
 }
 
+/// Cloning a repository must not be enough to schedule turns in it.
 #[tokio::test]
 async fn a_projects_own_config_cannot_declare_triggers() {
     let f = fixture("ok", json!({}));

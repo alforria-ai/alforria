@@ -998,12 +998,19 @@ async fn a_session_can_be_restricted_and_untrusted_and_both_marks_hold() {
     let fork_info = session_info(&f, &fork_id).await;
     assert_eq!(marks(&f, &fork_id).await, (true, true));
     assert_eq!(fork_info["permission"], info["permission"], "{fork_info}");
-    assert!(
-        fork_info["permission"]
-            .as_array()
-            .is_some_and(|rules| !rules.is_empty()),
-        "{fork_info}"
-    );
+    // The ceiling is the server's, stored for the session and its fork —
+    // not rules in the session a client could read as the whole story.
+    for id in [&session, &fork_id] {
+        let (_, body) = json_of(
+            &f,
+            "GET",
+            &format!("/session/{id}/restriction"),
+            &basic(),
+            None,
+        )
+        .await;
+        assert_eq!(body["ceilings"], json!(["outside-input"]), "{body}");
+    }
     prompt(&f, &fork_id, &chat).await;
     assert!(!marker.exists(), "the fork executed a command");
 

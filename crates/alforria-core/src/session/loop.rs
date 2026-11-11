@@ -535,7 +535,7 @@ pub async fn run_loop(
             V1Message::User { agent, .. } => agent.clone(),
             _ => return Err(LoopError::Unknown("user message required".to_string())),
         };
-        let Some(agent) = deps.agents.get(&user_agent).cloned() else {
+        let Some(mut agent) = deps.agents.get(&user_agent).cloned() else {
             let available: Vec<String> = deps
                 .agents
                 .list()
@@ -558,6 +558,12 @@ pub async fn run_loop(
                 user_agent, hint
             )));
         };
+        // alforria extension: the agent's policy as this session is held
+        // to it — under the session's stored ceilings (a trigger creator's
+        // bounds, the outside-input ceiling; `SessionStore::bounded`).
+        // Everything below reads the agent's rules from here, so the tool
+        // list, every ask and the system prompt agree.
+        agent.permission = deps.sessions.bounded(session_id, agent.permission);
         let max_steps = agent.steps.unwrap_or(f64::INFINITY);
         let is_last_step = step as f64 >= max_steps;
 

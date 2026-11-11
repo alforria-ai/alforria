@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use alforria_schema::permission_v1::PermissionV1Ruleset;
+use alforria_schema::permission_v1::{PermissionV1Action, PermissionV1Rule, PermissionV1Ruleset};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
@@ -29,6 +29,11 @@ pub trait ScheduleSessions: Send + Sync {
     /// Everything that governs `session_id` running as `agent` right now:
     /// the agent's rules, then the session's own.
     fn effective_rules(&self, session_id: &str, agent: &str) -> PermissionV1Ruleset;
+    /// The same as bounds for a trigger: every reading of the session's
+    /// policy (`trigger::rules::CreatorBounds`).
+    fn bounds(&self, session_id: &str, agent: &str) -> crate::trigger::CreatorBounds {
+        crate::trigger::CreatorBounds::Flat(self.effective_rules(session_id, agent))
+    }
     /// The session's parent, its parent's parent, and so on.
     fn ancestors(&self, session_id: &str) -> Vec<String>;
     /// Whether the session is restricted (`session::caller`). A trigger
@@ -61,6 +66,27 @@ impl ScheduleSessions for SessionTree {
             rules.extend(session.permission.unwrap_or_default());
         }
         rules
+    }
+
+    fn bounds(&self, session_id: &str, agent: &str) -> crate::trigger::CreatorBounds {
+        // The policy a turn of this session is judged by: the agent's,
+        // the session's own rules, and the session's ceilings. A session
+        // or an agent that cannot be read bounds the trigger to nothing.
+        let deny_all = || {
+            crate::trigger::CreatorBounds::Flat(vec![PermissionV1Rule {
+                permission: "*".to_string(),
+                pattern: "*".to_string(),
+                action: PermissionV1Action::Deny,
+            }])
+        };
+        let (Some(agent), Ok(session)) = (self.agents.get(agent), self.sessions.get(session_id))
+        else {
+            return deny_all();
+        };
+        let policy = agent
+            .permission
+            .extended(&session.permission.unwrap_or_default());
+        crate::trigger::CreatorBounds::of(&self.sessions.bounded(session_id, policy))
     }
 
     fn restricted(&self, session_id: &str) -> bool {
@@ -424,11 +450,11 @@ fn run(
                     json!({ "action": "create", "trigger": spec }),
                 )
                 .await?;
-                // The trigger's sessions carry the rules that govern this
-                // session as this agent, as they stand now. They are applied
-                // again on every run, after the agent's own, so the run can
-                // never do more than its creator could when it asked.
-                let inherited = sessions.effective_rules(ctx.session_id, ctx.agent);
+                // The trigger records what governs this session as this
+                // agent, as it stands now: its creator's bounds, a ceiling
+                // over every run. A run is judged by the policy in force
+                // when it happens and by these, whichever is stricter.
+                let inherited = sessions.bounds(ctx.session_id, ctx.agent);
                 let record = triggers
                     .create_as(
                         params.id.clone().filter(|id| !id.trim().is_empty()),
@@ -951,10 +977,11 @@ mod tests {
         )
         .list()
         .unwrap();
-        let rules = stored[0].stored.inherited.clone().unwrap();
+        let rules = stored[0].stored.inherited.clone().unwrap().readings();
         // The agent's rules, then the session's, as they stood at creation.
+        assert_eq!(rules.len(), 1);
         assert_eq!(
-            rules
+            rules[0]
                 .iter()
                 .map(|rule| rule.pattern.as_str())
                 .collect::<Vec<_>>(),
@@ -1028,6 +1055,7 @@ mod tests {
         .into_iter()
         .find(|trigger| trigger.id == id)
         .and_then(|trigger| trigger.stored.inherited)
+        .map(|bounds| bounds.readings().concat())
     }
 
     #[tokio::test]

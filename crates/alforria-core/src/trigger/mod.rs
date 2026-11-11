@@ -25,7 +25,10 @@ use crate::config::schema::PermissionInfo;
 use crate::event::definition::Definition;
 use crate::tool::def::BoxFuture;
 
-pub use rules::{session_rules, RunRules, READ_ONLY};
+pub use rules::{
+    outside_ceiling, run_policy, CreatorBounds, RunPolicy, RunRules, CREATOR_CEILING,
+    OUTSIDE_CEILING, READ_ONLY,
+};
 pub use schedule::{format_duration, format_instant, parse_duration, parse_instant, CronSchedule};
 pub use service::{TriggerService, TriggerSettings};
 
@@ -205,10 +208,10 @@ pub const MIN_INTERVAL_MS: u64 = 10_000;
 pub const DEFAULT_DEBOUNCE_MS: u64 = 5_000;
 
 impl TriggerTurn {
-    /// The ruleset for this run's session, given the rules of its agent.
-    pub fn session_rules(&self, agent: &PermissionV1Ruleset) -> PermissionV1Ruleset {
-        session_rules(&RunRules {
-            agent,
+    /// What to put on this run's session: its own rules and its ceilings
+    /// (`trigger::rules`).
+    pub fn run_policy(&self) -> RunPolicy {
+        run_policy(&RunRules {
             inherited: &self.inherited,
             own: &self.own,
             untrusted: self.untrusted,
@@ -479,8 +482,8 @@ pub struct TriggerTurn {
     pub mode: SessionMode,
     /// The session a `reuse` trigger used last time.
     pub session_id: Option<String>,
-    /// The effective rules of the session that scheduled the trigger.
-    pub inherited: PermissionV1Ruleset,
+    /// The bounds of the session that scheduled the trigger.
+    pub inherited: CreatorBounds,
     /// The trigger's own `permission` block.
     pub own: PermissionV1Ruleset,
     /// The prompt carries text from outside: the run is read-only except
@@ -533,8 +536,8 @@ pub enum SessionTarget {
 pub struct Creator {
     /// The session whose `schedule` tool is asking, if a tool is.
     pub origin_session_id: Option<String>,
-    /// The effective rules of that session (`tool::schedule`).
-    pub inherited: Option<PermissionV1Ruleset>,
+    /// The bounds of that session (`tool::schedule`, `trigger::rules`).
+    pub inherited: Option<CreatorBounds>,
     /// The creator is restricted (`session::caller`): a credential below
     /// `admin`, or a tool call in a restricted session.
     pub restricted: bool,

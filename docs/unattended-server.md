@@ -38,7 +38,7 @@ page, `server.resume` and `storage` (retention, `synchronous`) are host keys:
 they decide what a restart does in every project and how durable the shared
 database is.
 
-alforria's own tables (`session_restriction`, `session_mark`, `outbox`, and the trigger and
+alforria's own tables (`session_restriction`, `session_mark`, `session_ceiling`, `outbox`, and the trigger and
 memory tables) are created by one set of migrations
 (`crates/alforria-core/src/storage/alforria_migration.rs`), beside the
 upstream schema and journal, which stay byte-compatible.
