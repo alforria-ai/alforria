@@ -322,10 +322,39 @@ pub struct NoFollowDir {
 /// `contents`, creating its directories — every component opened without
 /// following a link ([`NoFollowDir`]).
 pub fn write_no_follow(landing: &Path, contents: &[u8]) -> io::Result<()> {
+    write_no_follow_mode(landing, contents, None)
+}
+
+/// [`write_no_follow`], also setting whether the file is executable
+/// (`Some`) — on the handle that was written, not by name. Other
+/// permission bits are left as they are. No effect where there is no such
+/// bit.
+pub fn write_no_follow_mode(
+    landing: &Path,
+    contents: &[u8],
+    executable: Option<bool>,
+) -> io::Result<()> {
     use std::io::Write;
     let (parent, name) = split_landing(landing)?;
     let mut file = NoFollowDir::open(parent, true)?.create(name, false)?;
-    file.write_all(contents)
+    file.write_all(contents)?;
+    #[cfg(unix)]
+    if let Some(executable) = executable {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = file.metadata()?.permissions().mode();
+        let wanted = if executable {
+            // Executable by whoever may read it.
+            mode | ((mode & 0o444) >> 2)
+        } else {
+            mode & !0o111
+        };
+        if wanted != mode {
+            file.set_permissions(std::fs::Permissions::from_mode(wanted))?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = executable;
+    Ok(())
 }
 
 /// Remove the file at `landing` (absolute, resolved) through its parent's

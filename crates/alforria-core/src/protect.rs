@@ -56,8 +56,8 @@
 //!    (`beneath::NoFollowDir`). There is no second resolution of the name
 //!    for a rename or a link swapped in between to redirect: such a write
 //!    fails. `write`, `edit`, `apply_patch` (through
-//!    `InstanceContext::write_file` / `remove_file`) and the upload route
-//!    write this way.
+//!    `InstanceContext::write_file` / `remove_file`), the upload route and
+//!    a guarded session's revert write this way.
 //! 2. **the protected set is incomplete** — a place a loader reads is not
 //!    in it. The set is built from the loaders' own answers, a loader name
 //!    is refused anywhere, and for the config's `instructions` — globs,
@@ -76,6 +76,15 @@
 //! * **Other writers.** `bash`, a formatter, an LSP or MCP server, a
 //!   workflow script: anything that is not one of the guarded operations
 //!   above writes what the server's user can.
+//! * **What a guarded revert leaves alone.** `session::revert` judges every
+//!   file a revert or unrevert means to write ([`Protected::judge`]),
+//!   refuses the whole revert when one is protected, and then writes
+//!   exactly the judged files at their judged landings through the handle
+//!   ([`restore_at`], [`remove_at`]) — the check and the write are one
+//!   list, and the check-to-write window is closed as for a tool. The price
+//!   is that such a revert is narrower than upstream's whole-tree restore:
+//!   a file the snapshot service does not list (git-ignored ones) and a
+//!   path the snapshot holds as a symlink or a submodule are not restored.
 //! * **A directory renamed afterwards.** The guard judges where a write
 //!   lands when it is made. A process that can rename inside the project —
 //!   which here means the session's own shell — can let the write land in
@@ -629,6 +638,14 @@ pub fn write_at(landing: &Path, contents: &[u8]) -> std::io::Result<()> {
     #[cfg(any(test, feature = "fail-points"))]
     fail_point::fire(landing);
     crate::beneath::write_no_follow(landing, contents)
+}
+
+/// [`write_at`] for a file restored from a snapshot: its executable bit is
+/// set or cleared too, on the handle that was written.
+pub fn restore_at(landing: &Path, contents: &[u8], executable: bool) -> std::io::Result<()> {
+    #[cfg(any(test, feature = "fail-points"))]
+    fail_point::fire(landing);
+    crate::beneath::write_no_follow_mode(landing, contents, Some(executable))
 }
 
 /// Remove the file at a judged `landing`, through the parent's handle; see

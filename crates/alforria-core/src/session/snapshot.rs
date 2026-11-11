@@ -37,6 +37,23 @@ pub struct PatchPart {
     pub files: Vec<String>,
 }
 
+/// alforria extension: one file a guarded session's revert restores
+/// ([`Snapshot::write_checked`]). The write guard has judged `file` and
+/// `landing` is where it said the write lands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckedWrite {
+    /// The snapshot to take the file from.
+    pub hash: String,
+    /// The file as the patch listing names it (absolute, in the worktree).
+    pub file: String,
+    /// `protect::Protected::judge` of `file`: resolved, no link in it.
+    pub landing: PathBuf,
+    /// What to do when the snapshot does not hold the file: remove it
+    /// (rolling a patch back, as [`Snapshot::revert`] does) or leave it
+    /// (restoring a snapshot, as [`Snapshot::restore`] does).
+    pub delete_missing: bool,
+}
+
 /// `Snapshot.FileDiff` — the schema crate owns the wire shape.
 pub type FileDiff = alforria_schema::file_diff::SnapshotFileDiff;
 
@@ -52,6 +69,18 @@ pub trait Snapshot: Send + Sync {
     fn restore(&self, id: &str) -> BoxFuture<'static, Result<(), CoreError>>;
     /// Roll the listed files back to their snapshot contents.
     fn revert(&self, patches: Vec<PatchPart>) -> BoxFuture<'static, Result<(), CoreError>>;
+    /// alforria extension — how a *guarded* session's revert writes
+    /// (`session::revert`): exactly the listed files and nothing else, each
+    /// taken from its snapshot and written at the landing the write guard
+    /// judged, through that landing's directory handle
+    /// (`protect::restore_at` / `remove_at`). [`Snapshot::restore`] and
+    /// [`Snapshot::revert`] let git write whatever its own listing covers,
+    /// by name; here the list that was checked is the list that is
+    /// written. A listed path the snapshot holds as anything but a regular
+    /// file (a symlink, a submodule, a directory) is left as it is. The
+    /// first failure stops and is returned.
+    fn write_checked(&self, writes: Vec<CheckedWrite>)
+        -> BoxFuture<'static, Result<(), CoreError>>;
     /// Diff text of the worktree vs the snapshot.
     fn diff(&self, id: &str) -> BoxFuture<'static, Result<String, CoreError>>;
     /// Per-file diffs between two snapshots.
@@ -86,6 +115,13 @@ impl Snapshot for DisabledSnapshot {
     }
 
     fn revert(&self, _patches: Vec<PatchPart>) -> BoxFuture<'static, Result<(), CoreError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn write_checked(
+        &self,
+        _writes: Vec<CheckedWrite>,
+    ) -> BoxFuture<'static, Result<(), CoreError>> {
         Box::pin(async { Ok(()) })
     }
 
@@ -921,6 +957,71 @@ impl GitSnapshot {
         }
     }
 
+    /// [`Snapshot::write_checked`]: per file, what the snapshot holds
+    /// (`ls-tree`), its bytes (`cat-file`), and the write through the
+    /// judged landing's directory handle. git writes nothing here.
+    fn write_checked_impl(&self, writes: Vec<CheckedWrite>) -> Result<(), CoreError> {
+        let _guard = self.lock();
+        let failed = |what: &str, file: &str, why: &dyn std::fmt::Display| {
+            CoreError::Storage(format!("snapshot restore failed: {what} {file}: {why}"))
+        };
+        for write in writes {
+            let rel = relative(&self.worktree, &write.file);
+            let args = self.args(&CFG, &["ls-tree", "-z", &write.hash, "--", &rel]);
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let tree = self.runner.run(Some(&self.worktree), &[], &args, None);
+            if tree.code != 0 {
+                return Err(failed("ls-tree", &write.file, &tree.stderr));
+            }
+            // `<mode> <type> <object>\t<path>\0`, the path verbatim.
+            let entry = tree
+                .stdout
+                .split(|byte| *byte == 0)
+                .filter_map(|line| {
+                    let tab = line.iter().position(|byte| *byte == b'\t')?;
+                    (line[tab + 1..] == *rel.as_bytes())
+                        .then(|| String::from_utf8_lossy(&line[..tab]).into_owned())
+                })
+                .next();
+            let Some(entry) = entry else {
+                if write.delete_missing {
+                    tracing::info!(
+                        "file did not exist in snapshot, deleting: file={}",
+                        write.file
+                    );
+                    match crate::protect::remove_at(&write.landing) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(failed("remove", &write.file, &error)),
+                    }
+                }
+                continue;
+            };
+            let mut fields = entry.split(' ');
+            let (mode, kind, object) = (
+                fields.next().unwrap_or_default(),
+                fields.next().unwrap_or_default(),
+                fields.next().unwrap_or_default(),
+            );
+            if kind != "blob" || !matches!(mode, "100644" | "100755") {
+                tracing::info!(
+                    "not a regular file in the snapshot, keeping: file={} mode={mode}",
+                    write.file
+                );
+                continue;
+            }
+            let args = self.args(&CFG, &["cat-file", "blob", object]);
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let blob = self.runner.run(Some(&self.worktree), &[], &args, None);
+            if blob.code != 0 {
+                return Err(failed("cat-file", &write.file, &blob.stderr));
+            }
+            crate::protect::restore_at(&write.landing, &blob.stdout, mode == "100755")
+                .map_err(|error| failed("write", &write.file, &error))?;
+        }
+        Ok(())
+    }
+
     /// `diff` (`snapshot/index.ts:526-544`).
     fn diff_impl(&self, hash: &str) -> String {
         let _guard = self.lock();
@@ -1237,6 +1338,18 @@ impl Snapshot for GitSnapshot {
         })
     }
 
+    fn write_checked(
+        &self,
+        writes: Vec<CheckedWrite>,
+    ) -> BoxFuture<'static, Result<(), CoreError>> {
+        let snapshot = self.clone();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || snapshot.write_checked_impl(writes))
+                .await
+                .map_err(|_| CoreError::Storage("snapshot task failed".to_string()))?
+        })
+    }
+
     fn diff(&self, id: &str) -> BoxFuture<'static, Result<String, CoreError>> {
         let snapshot = self.clone();
         let id = id.to_string();
@@ -1497,6 +1610,14 @@ impl Snapshot for InMemorySnapshot {
         Box::pin(async move { result })
     }
 
+    fn write_checked(
+        &self,
+        writes: Vec<CheckedWrite>,
+    ) -> BoxFuture<'static, Result<(), CoreError>> {
+        let result = self.write_checked_sync(writes);
+        Box::pin(async move { result })
+    }
+
     fn diff(&self, id: &str) -> BoxFuture<'static, Result<String, CoreError>> {
         let result = self.diff_sync(id);
         Box::pin(async move { result })
@@ -1592,6 +1713,39 @@ impl InMemorySnapshot {
                         let _ = std::fs::remove_file(&target);
                     }
                 }
+            }
+        }
+        Ok(())
+    }
+
+    fn write_checked_sync(&self, writes: Vec<CheckedWrite>) -> Result<(), CoreError> {
+        let failed =
+            |error: std::io::Error| CoreError::Storage(format!("snapshot restore failed: {error}"));
+        for write in writes {
+            let content = {
+                let state = self.lock_state();
+                let Some(snapshot) = state.get(&write.hash) else {
+                    return Err(CoreError::Storage(format!(
+                        "snapshot {} not found",
+                        write.hash
+                    )));
+                };
+                let Ok(rel) = Path::new(&write.file).strip_prefix(&self.worktree) else {
+                    continue;
+                };
+                snapshot.get(rel.to_string_lossy().as_ref()).cloned()
+            };
+            match content {
+                Some(content) => {
+                    crate::protect::write_at(&write.landing, content.as_bytes()).map_err(failed)?
+                }
+                None if write.delete_missing => match crate::protect::remove_at(&write.landing) {
+                    Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                        return Err(failed(error))
+                    }
+                    _ => {}
+                },
+                None => {}
             }
         }
         Ok(())

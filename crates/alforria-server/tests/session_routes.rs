@@ -209,6 +209,8 @@ struct StubState {
     unreverts: Vec<String>,
     fail_share: bool,
     busy: bool,
+    /// The engine refuses a revert or unrevert with this message.
+    refuse_revert: Option<String>,
 }
 
 #[derive(Default)]
@@ -310,12 +312,16 @@ impl SessionEngine for StubEngine {
             .reverts
             .push(input.session_id.clone());
         let busy = self.state.lock().unwrap().busy;
+        let refused = self.state.lock().unwrap().refuse_revert.clone();
         let session_info = self.session_info(&input.session_id);
         Box::pin(async move {
             if busy {
                 return Err(SessionError::Busy(alforria_core::BusyError {
                     session_id: input.session_id,
                 }));
+            }
+            if let Some(message) = refused {
+                return Err(SessionError::Refused(message));
             }
             Ok(session_info)
         })
@@ -331,12 +337,16 @@ impl SessionEngine for StubEngine {
             .unreverts
             .push(session_id.clone());
         let busy = self.state.lock().unwrap().busy;
+        let refused = self.state.lock().unwrap().refuse_revert.clone();
         let session_info = self.session_info(&session_id);
         Box::pin(async move {
             if busy {
                 return Err(SessionError::Busy(alforria_core::BusyError {
                     session_id: session_id.clone(),
                 }));
+            }
+            if let Some(message) = refused {
+                return Err(SessionError::Refused(message));
             }
             Ok(session_info)
         })
@@ -1057,6 +1067,38 @@ async fn revert_unrevert_and_diff() {
         diffs[0]["file"],
         serde_json::Value::from(format!("{session_id}/file.txt"))
     );
+}
+
+/// A revert the engine refuses — one that would write a protected file in
+/// a guarded session (`session::revert`) — is a 403 `ForbiddenError`
+/// carrying the engine's message, on both routes; not a defect 500.
+#[tokio::test]
+async fn a_refused_revert_is_a_403() {
+    let f = fixture();
+    let router = routes::build_router(f.ctx.clone());
+    let session = create_session(&router).await;
+    let session_id = session["id"].as_str().unwrap().to_string();
+    f.engine.state.lock().unwrap().refuse_revert =
+        Some("the revert would rewrite AGENTS.md. Nothing was reverted.".to_string());
+    for (route, body) in [
+        ("revert", "{\"messageID\":\"msg_01JDY\"}"),
+        ("unrevert", ""),
+    ] {
+        let response = send(
+            &router,
+            "POST",
+            &format!("/session/{session_id}/{route}"),
+            body,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{route}");
+        let body: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(body["_tag"], "ForbiddenError", "{route}: {body}");
+        assert_eq!(
+            body["message"], "the revert would rewrite AGENTS.md. Nothing was reverted.",
+            "{route}"
+        );
+    }
 }
 
 #[tokio::test]

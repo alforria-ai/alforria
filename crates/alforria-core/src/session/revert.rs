@@ -18,7 +18,7 @@ use crate::session::error::SessionError;
 use crate::session::event_definitions::SESSION_DIFF;
 use crate::session::message::message_id;
 use crate::session::run_state::SessionRunState;
-use crate::session::snapshot::{PatchPart, Snapshot};
+use crate::session::snapshot::{CheckedWrite, PatchPart, Snapshot};
 use crate::session::store::SessionStore;
 use crate::session::summary::SessionSummary;
 
@@ -57,6 +57,14 @@ pub struct RevertInput {
     pub part_id: Option<String>,
 }
 
+/// A file a guarded session's revert means to write, before the guard has
+/// judged it ([`SessionRevert::check_guarded`]).
+struct Candidate {
+    hash: String,
+    file: String,
+    delete_missing: bool,
+}
+
 /// Everything the revert service closes over.
 pub struct RevertDeps {
     pub sessions: SessionStore,
@@ -66,6 +74,10 @@ pub struct RevertDeps {
     pub state: Arc<SessionRunState>,
     /// `Global.Path.data` — the storage key-value root.
     pub data_dir: PathBuf,
+    /// alforria extension: what a guarded session may not write
+    /// (`AgentRegistry::protected`). A revert restores files from snapshots
+    /// directly, not through a tool, so it is judged here.
+    pub protected: Arc<crate::protect::Protected>,
 }
 
 /// `SessionRevert.Service` (revert.ts:28-136).
@@ -76,6 +88,83 @@ pub struct SessionRevert {
 impl SessionRevert {
     pub fn new(deps: RevertDeps) -> SessionRevert {
         SessionRevert { deps }
+    }
+
+    /// alforria extension: a guarded session — restricted, or started by
+    /// outside input: the sessions whose tools write through the write
+    /// guard — does not revert onto what the guard protects, and its
+    /// revert writes nothing the guard was not asked about.
+    ///
+    /// Upstream's revert lets git write: `checkout <hash> -- <files>` for
+    /// the reverted patches and `checkout-index -a -f` over the whole tree
+    /// for a snapshot. Checking a listing first and then letting git write
+    /// by its own rules would have the check and the write disagree
+    /// (ignored files, anything the listing leaves out). So for a guarded
+    /// session the listing *is* the write: every candidate is judged
+    /// ([`crate::protect::Protected::judge`]), and exactly the judged files
+    /// are then written, each at the landing that was judged and through
+    /// its directory's handle ([`Snapshot::write_checked`]). What is not on
+    /// the list is left untouched.
+    ///
+    /// If the guard refuses any candidate the whole revert is refused
+    /// before anything is written: a revert that skipped files would leave
+    /// the tree in a state no message of the session describes. No
+    /// `edit_loader` grant is looked up — a grant is an agent's, and a
+    /// revert has no agent. An unguarded session never comes here: its
+    /// reverts are upstream's, git invocation for git invocation.
+    fn check_guarded(
+        &self,
+        session: &V1SessionInfo,
+        candidates: Vec<Candidate>,
+    ) -> Result<Vec<CheckedWrite>, SessionError> {
+        let mut refused: Vec<String> = Vec::new();
+        let mut checked: Vec<CheckedWrite> = Vec::new();
+        for candidate in candidates {
+            let path = std::path::Path::new(&session.directory).join(&candidate.file);
+            match self.deps.protected.judge(&path) {
+                Ok(landing) => checked.push(CheckedWrite {
+                    hash: candidate.hash,
+                    file: candidate.file,
+                    landing,
+                    delete_missing: candidate.delete_missing,
+                }),
+                Err(_) if refused.contains(&candidate.file) => {}
+                Err(_) => refused.push(candidate.file),
+            }
+        }
+        if refused.is_empty() {
+            return Ok(checked);
+        }
+        refused.sort();
+        Err(SessionError::Refused(format!(
+            "this session is restricted or was started by outside input, and the revert would \
+             rewrite files the agent's configuration is loaded from: {}. Nothing was reverted.",
+            refused.join(", ")
+        )))
+    }
+
+    /// Whether the session is a guarded one. A restriction that cannot be
+    /// read counts as one, as in the loop.
+    fn guarded(&self, session_id: &str) -> bool {
+        let sessions = &self.deps.sessions;
+        sessions.started_by_outside_input(session_id)
+            || sessions.is_restricted(session_id).unwrap_or(true)
+    }
+
+    /// A guarded restore of `snapshot`: the files that differ from it now,
+    /// as the snapshot service lists them. A file the snapshot does not
+    /// hold is left where it is, as `checkout-index` leaves it.
+    async fn restore_candidates(&self, snapshot: &str) -> Result<Vec<Candidate>, SessionError> {
+        let patch = self.deps.snapshot.patch(snapshot).await?;
+        Ok(patch
+            .files
+            .into_iter()
+            .map(|file| Candidate {
+                hash: snapshot.to_string(),
+                file,
+                delete_missing: false,
+            })
+            .collect())
     }
 
     /// `revert` (revert.ts:38-89 — binding).
@@ -134,18 +223,54 @@ impl SessionRevert {
             return Ok(session);
         };
 
+        // A guarded session: judge every file before the first write (and
+        // before a snapshot is taken for it), then write exactly those.
+        // Nothing of this is computed for a session without a guard.
+        let checked = if self.guarded(&session.id) {
+            let mut candidates = Vec::new();
+            if let Some(previous) = session
+                .revert
+                .as_ref()
+                .and_then(|revert| revert.snapshot.as_deref())
+            {
+                candidates.extend(self.restore_candidates(previous).await?);
+            }
+            // One write per file, from the first patch that names it, as
+            // `Snapshot::revert` reads the same list.
+            let mut seen = std::collections::HashSet::new();
+            for patch in &patches {
+                for file in &patch.files {
+                    if seen.insert(file.clone()) {
+                        candidates.push(Candidate {
+                            hash: patch.hash.clone(),
+                            file: file.clone(),
+                            delete_missing: true,
+                        });
+                    }
+                }
+            }
+            Some(self.check_guarded(&session, candidates)?)
+        } else {
+            None
+        };
+
         rev.snapshot = match &session.revert {
             Some(previous) => previous.snapshot.clone(),
             None => self.deps.snapshot.track().await,
         };
-        if let Some(previous) = session
-            .revert
-            .as_ref()
-            .and_then(|revert| revert.snapshot.clone())
-        {
-            self.deps.snapshot.restore(&previous).await?;
+        match checked {
+            Some(checked) => self.deps.snapshot.write_checked(checked).await?,
+            None => {
+                if let Some(previous) = session
+                    .revert
+                    .as_ref()
+                    .and_then(|revert| revert.snapshot.clone())
+                {
+                    self.deps.snapshot.restore(&previous).await?;
+                }
+                self.deps.snapshot.revert(patches).await?;
+            }
         }
-        self.deps.snapshot.revert(patches).await?;
         if let Some(snapshot) = &rev.snapshot {
             rev.diff = Some(self.deps.snapshot.diff(snapshot).await?);
         }
@@ -192,7 +317,13 @@ impl SessionRevert {
             return Ok(session);
         };
         if let Some(snapshot) = revert.snapshot {
-            self.deps.snapshot.restore(&snapshot).await?;
+            if self.guarded(session_id) {
+                let candidates = self.restore_candidates(&snapshot).await?;
+                let checked = self.check_guarded(&session, candidates)?;
+                self.deps.snapshot.write_checked(checked).await?;
+            } else {
+                self.deps.snapshot.restore(&snapshot).await?;
+            }
         }
         self.deps.sessions.clear_revert(session_id)?;
         self.deps.sessions.get(session_id)
@@ -283,6 +414,7 @@ mod tests {
             summary: Arc::new(summary),
             state: h.services.run_state.clone(),
             data_dir: h.temp.path().to_path_buf(),
+            protected: h.services.agents.protected(),
         })
     }
 
@@ -475,6 +607,470 @@ mod tests {
             std::fs::read_to_string(h.worktree.join("a.txt")).unwrap(),
             "goodbye\n"
         );
+    }
+
+    /// `scenario`, with an `AGENTS.md` the turn also "changed": it did not
+    /// exist at the snapshot, so a revert of the turn would delete it.
+    async fn scenario_touching_a_loader_file(
+        name: &str,
+    ) -> (
+        crate::session::test_support::Harness,
+        alforria_schema::session_v1::V1SessionInfo,
+    ) {
+        let (h, session) = scenario(name).await;
+        std::fs::write(h.worktree.join("AGENTS.md"), "the operator's\n").unwrap();
+        let V1Part::Patch { hash, .. } = h
+            .services
+            .sessions
+            .messages(&session.id, None)
+            .unwrap()
+            .iter()
+            .flat_map(|msg| msg.parts.clone())
+            .find(|part| matches!(part, V1Part::Patch { .. }))
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        h.services
+            .sessions
+            .update_part(&patch_part(
+                &session.id,
+                "msg_a1",
+                "prt_3_patch",
+                &hash,
+                vec![h.worktree.join("AGENTS.md").to_string_lossy().into_owned()],
+            ))
+            .unwrap();
+        (h, session)
+    }
+
+    fn revert_all(session_id: &str) -> RevertInput {
+        RevertInput {
+            session_id: session_id.to_string(),
+            message_id: "msg_u1".to_string(),
+            part_id: None,
+        }
+    }
+
+    /// Revert restores files from snapshots directly, not through a tool,
+    /// so it used to go around the write guard. In a guarded session
+    /// (restricted, or started by outside input) a revert or unrevert that
+    /// would write a loader file is refused whole, before anything is
+    /// restored; one that touches other files only goes through.
+    #[tokio::test]
+    async fn a_guarded_session_does_not_revert_onto_a_loader_file() {
+        let read = |h: &crate::session::test_support::Harness, name: &str| {
+            std::fs::read_to_string(h.worktree.join(name)).ok()
+        };
+
+        // Revert: the turn's patches name AGENTS.md.
+        let (h, session) = scenario_touching_a_loader_file("revert-guarded").await;
+        h.services.sessions.restrict(&session.id).unwrap();
+        let service = revert_service(&h);
+        let refused = service.revert(revert_all(&session.id)).await.unwrap_err();
+        let SessionError::Refused(message) = &refused else {
+            panic!("{refused:?}");
+        };
+        assert!(message.contains("AGENTS.md"), "{message}");
+        assert!(!message.contains("a.txt"), "{message}");
+        // Nothing was restored and the session is not marked reverted.
+        assert_eq!(read(&h, "AGENTS.md").as_deref(), Some("the operator's\n"));
+        assert_eq!(read(&h, "a.txt").as_deref(), Some("goodbye\n"));
+        assert!(h
+            .services
+            .sessions
+            .get(&session.id)
+            .unwrap()
+            .revert
+            .is_none());
+
+        // A guarded session whose revert touches other files only: it
+        // reverts, and unreverts.
+        let (h, session) = scenario("revert-guarded-plain").await;
+        std::fs::write(h.worktree.join("AGENTS.md"), "the operator's\n").unwrap();
+        h.services.sessions.restrict(&session.id).unwrap();
+        let service = revert_service(&h);
+        service.revert(revert_all(&session.id)).await.unwrap();
+        assert_eq!(read(&h, "a.txt").as_deref(), Some("hello\n"));
+        service.unrevert(&session.id).await.unwrap();
+        assert_eq!(read(&h, "a.txt").as_deref(), Some("goodbye\n"));
+
+        // Unrevert: the snapshot taken at the revert holds AGENTS.md, which
+        // has changed since, so restoring it would rewrite the file.
+        service.revert(revert_all(&session.id)).await.unwrap();
+        std::fs::write(h.worktree.join("AGENTS.md"), "edited since\n").unwrap();
+        let refused = service.unrevert(&session.id).await.unwrap_err();
+        assert!(
+            matches!(&refused, SessionError::Refused(message) if message.contains("AGENTS.md")),
+            "{refused:?}"
+        );
+        assert_eq!(read(&h, "AGENTS.md").as_deref(), Some("edited since\n"));
+        assert_eq!(read(&h, "a.txt").as_deref(), Some("hello\n"));
+        assert!(h
+            .services
+            .sessions
+            .get(&session.id)
+            .unwrap()
+            .revert
+            .is_some());
+
+        // A session started by outside input is guarded the same way.
+        let (h, session) = scenario_touching_a_loader_file("revert-outside").await;
+        h.services
+            .sessions
+            .mark(
+                &session.id,
+                crate::session::store::SessionMark::OutsideStart,
+            )
+            .unwrap();
+        let refused = revert_service(&h).revert(revert_all(&session.id)).await;
+        assert!(matches!(refused, Err(SessionError::Refused(_))));
+        assert_eq!(read(&h, "AGENTS.md").as_deref(), Some("the operator's\n"));
+    }
+
+    /// A session without a guard reverts exactly as before, loader files
+    /// included.
+    #[tokio::test]
+    async fn an_unguarded_session_reverts_loader_files_as_before() {
+        let (h, session) = scenario_touching_a_loader_file("revert-unguarded").await;
+        let service = revert_service(&h);
+        let info = service.revert(revert_all(&session.id)).await.unwrap();
+        assert!(info.revert.is_some());
+        assert_eq!(
+            std::fs::read_to_string(h.worktree.join("a.txt")).unwrap(),
+            "hello\n"
+        );
+        assert!(!h.worktree.join("AGENTS.md").exists(), "rolled back");
+        std::fs::write(h.worktree.join("AGENTS.md"), "edited since\n").unwrap();
+        service.unrevert(&session.id).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(h.worktree.join("AGENTS.md")).unwrap(),
+            "the operator's\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(h.worktree.join("a.txt")).unwrap(),
+            "goodbye\n"
+        );
+    }
+
+    /// A restricted session over a real git snapshot store: the files of
+    /// `before` committed, a snapshot taken, `change` applied as the
+    /// turn's edits and recorded as one patch part naming `patched`.
+    struct GitScenario {
+        h: crate::session::test_support::Harness,
+        session: alforria_schema::session_v1::V1SessionInfo,
+        service: SessionRevert,
+        _data: crate::storage::test_support::TempDir,
+    }
+
+    impl GitScenario {
+        fn write(&self, name: &str, content: &str) {
+            let path = self.h.worktree.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
+
+        fn read(&self, name: &str) -> Option<String> {
+            std::fs::read_to_string(self.h.worktree.join(name)).ok()
+        }
+
+        fn reverted(&self) -> bool {
+            let sessions = &self.h.services.sessions;
+            sessions.get(&self.session.id).unwrap().revert.is_some()
+        }
+    }
+
+    async fn git_scenario(
+        name: &str,
+        guarded: bool,
+        before: &[(&str, &str)],
+        change: impl FnOnce(&std::path::Path),
+        patched: &[&str],
+    ) -> GitScenario {
+        git_scenario_with(name, guarded, before, |_| {}, change, patched).await
+    }
+
+    /// [`git_scenario`], with `prepare` run on the files before the
+    /// snapshot is taken.
+    async fn git_scenario_with(
+        name: &str,
+        guarded: bool,
+        before: &[(&str, &str)],
+        prepare: impl FnOnce(&std::path::Path),
+        change: impl FnOnce(&std::path::Path),
+        patched: &[&str],
+    ) -> GitScenario {
+        use crate::git::{GitRunner, SubprocessGit};
+        let h = harness(name, vec![]);
+        let data = crate::storage::test_support::TempDir::new("revert-snap-data");
+        let git = |args: &[&str]| SubprocessGit.run(Some(&h.worktree), args);
+        assert_eq!(git(&["init", "--quiet"]).exit_code, 0, "git init");
+        git(&["config", "user.email", "t@e.st"]);
+        git(&["config", "user.name", "T"]);
+        for (file, content) in before {
+            let path = h.worktree.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
+        prepare(&h.worktree);
+        git(&["add", "-A"]);
+        git(&["commit", "--quiet", "--allow-empty", "-m", "x"]);
+        let snapshot = crate::session::snapshot::GitSnapshot::with_cleanup(
+            crate::session::snapshot::GitSnapshotInput {
+                directory: h.worktree.clone(),
+                worktree: h.worktree.clone(),
+                project_id: "test".to_string(),
+                vcs_is_git: true,
+                snapshot_enabled: true,
+                data: data.path().to_path_buf(),
+            },
+            std::time::Duration::from_secs(3600),
+            std::time::Duration::from_secs(3600),
+        );
+        let session = create_session(&h.services.sessions, &h.worktree);
+        let hash = snapshot.track().await.unwrap();
+        change(&h.worktree);
+
+        let sessions = &h.services.sessions;
+        sessions
+            .update_message(&user_message(&session.id, "msg_u1", 1.0))
+            .unwrap();
+        sessions
+            .update_part(&text_part(&session.id, "msg_u1", "prt_u1", "do it"))
+            .unwrap();
+        sessions
+            .update_message(&assistant_message(
+                &session.id,
+                "msg_a1",
+                "msg_u1",
+                2,
+                None,
+                None,
+            ))
+            .unwrap();
+        sessions
+            .update_part(&text_part(&session.id, "msg_a1", "prt_1_text", "done"))
+            .unwrap();
+        let files = patched
+            .iter()
+            .map(|file| h.worktree.join(file).to_string_lossy().into_owned())
+            .collect();
+        sessions
+            .update_part(&patch_part(
+                &session.id,
+                "msg_a1",
+                "prt_2_patch",
+                &hash,
+                files,
+            ))
+            .unwrap();
+        if guarded {
+            sessions.restrict(&session.id).unwrap();
+        }
+        let snapshot: Arc<dyn Snapshot> = snapshot;
+        let summary = SessionSummary::new(SummaryDeps {
+            sessions: h.services.sessions.clone(),
+            snapshot: snapshot.clone(),
+            events: h.services.events.clone(),
+            config: Arc::new(h.config.clone()),
+        });
+        let service = SessionRevert::new(RevertDeps {
+            sessions: h.services.sessions.clone(),
+            events: h.services.events.clone(),
+            snapshot,
+            summary: Arc::new(summary),
+            state: h.services.run_state.clone(),
+            data_dir: h.temp.path().to_path_buf(),
+            protected: h.services.agents.protected(),
+        });
+        GitScenario {
+            h,
+            session,
+            service,
+            _data: data,
+        }
+    }
+
+    const BEFORE: &[(&str, &str)] = &[
+        ("a.txt", "hello\n"),
+        ("keep.txt", "k1\n"),
+        ("AGENTS.md", "root v1\n"),
+        ("local/AGENTS.md", "v1\n"),
+        ("local/notes.txt", "n1\n"),
+    ];
+
+    /// A turn that changed `a.txt`; the revert of it has been made, and
+    /// since then `local/` became git-ignored and files in it, and
+    /// `keep.txt`, were edited. Unreverting restores the snapshot taken at
+    /// the revert, which holds all of them.
+    async fn reverted_then_edited(name: &str, guarded: bool) -> GitScenario {
+        let s = git_scenario(
+            name,
+            guarded,
+            BEFORE,
+            |worktree| std::fs::write(worktree.join("a.txt"), "goodbye\n").unwrap(),
+            &["a.txt"],
+        )
+        .await;
+        s.service.revert(revert_all(&s.session.id)).await.unwrap();
+        assert_eq!(s.read("a.txt").as_deref(), Some("hello\n"));
+        s.write(".gitignore", "local/\n");
+        s.write("local/AGENTS.md", "edited since\n");
+        s.write("local/notes.txt", "n2\n");
+        s.write("keep.txt", "k2\n");
+        s
+    }
+
+    /// The check and the write are one list. A guarded session's restore
+    /// used to check the snapshot service's listing — which leaves ignored
+    /// files out — and then let `checkout-index -a -f` write the whole
+    /// tree: a git-ignored loader file was rewritten unchecked. Now exactly
+    /// the checked files are written, and what is not listed is untouched.
+    #[tokio::test]
+    async fn a_guarded_restore_writes_exactly_the_files_that_were_checked() {
+        let s = reverted_then_edited("revert-git-exact", true).await;
+        s.service.unrevert(&s.session.id).await.unwrap();
+        assert!(!s.reverted());
+        // Listed, ordinary: restored.
+        assert_eq!(s.read("a.txt").as_deref(), Some("goodbye\n"));
+        assert_eq!(s.read("keep.txt").as_deref(), Some("k1\n"));
+        // Not listed (ignored): untouched — the loader file above all.
+        assert_eq!(s.read("local/AGENTS.md").as_deref(), Some("edited since\n"));
+        assert_eq!(s.read("local/notes.txt").as_deref(), Some("n2\n"));
+        // Not in the snapshot: left, as a restore leaves it.
+        assert_eq!(s.read(".gitignore").as_deref(), Some("local/\n"));
+        assert_eq!(s.read("AGENTS.md").as_deref(), Some("root v1\n"));
+    }
+
+    /// A tracked loader file among the candidates refuses the whole
+    /// unrevert, and nothing at all is written: not the ordinary files, not
+    /// the ignored loader file.
+    #[tokio::test]
+    async fn a_refused_guarded_restore_writes_nothing() {
+        let s = reverted_then_edited("revert-git-refused", true).await;
+        s.write("AGENTS.md", "root edited\n");
+        let refused = s.service.unrevert(&s.session.id).await.unwrap_err();
+        let SessionError::Refused(message) = &refused else {
+            panic!("{refused:?}");
+        };
+        assert!(message.contains("AGENTS.md"), "{message}");
+        assert!(!message.contains("keep.txt"), "{message}");
+        assert!(s.reverted(), "still reverted");
+        for (file, content) in [
+            ("a.txt", "hello\n"),
+            ("keep.txt", "k2\n"),
+            ("AGENTS.md", "root edited\n"),
+            ("local/AGENTS.md", "edited since\n"),
+            ("local/notes.txt", "n2\n"),
+            (".gitignore", "local/\n"),
+        ] {
+            assert_eq!(s.read(file).as_deref(), Some(content), "{file}");
+        }
+    }
+
+    /// The same state in a session without a guard: upstream's whole-tree
+    /// restore, ignored files and loader files included.
+    #[tokio::test]
+    async fn an_unguarded_restore_is_the_whole_tree_as_before() {
+        let s = reverted_then_edited("revert-git-unguarded", false).await;
+        s.write("AGENTS.md", "root edited\n");
+        s.service.unrevert(&s.session.id).await.unwrap();
+        for (file, content) in [
+            ("a.txt", "goodbye\n"),
+            ("keep.txt", "k1\n"),
+            ("AGENTS.md", "root v1\n"),
+            ("local/AGENTS.md", "v1\n"),
+            ("local/notes.txt", "n1\n"),
+            (".gitignore", "local/\n"),
+        ] {
+            assert_eq!(s.read(file).as_deref(), Some(content), "{file}");
+        }
+    }
+
+    /// A guarded revert of a turn that renamed, added, deleted and edited
+    /// files: both ends of the rename, the addition and the deletion are
+    /// each a listed file, restored or removed one by one; a file the turn
+    /// changed that no patch lists is untouched. A rename *onto* a loader
+    /// name refuses the lot.
+    #[tokio::test]
+    async fn a_guarded_revert_handles_renames_additions_and_deletions() {
+        let before: &[(&str, &str)] = &[
+            ("old.txt", "old\n"),
+            ("gone.txt", "gone\n"),
+            ("edit.txt", "e1\n"),
+            ("unlisted.txt", "u1\n"),
+            ("plain.md", "plain\n"),
+        ];
+        let change = |worktree: &std::path::Path| {
+            std::fs::rename(worktree.join("old.txt"), worktree.join("new.txt")).unwrap();
+            std::fs::remove_file(worktree.join("gone.txt")).unwrap();
+            std::fs::write(worktree.join("added.txt"), "added\n").unwrap();
+            std::fs::write(worktree.join("edit.txt"), "e2\n").unwrap();
+            std::fs::write(worktree.join("unlisted.txt"), "u2\n").unwrap();
+        };
+        let patched = ["old.txt", "new.txt", "gone.txt", "added.txt", "edit.txt"];
+        let s = git_scenario("revert-git-rename", true, before, change, &patched).await;
+        s.service.revert(revert_all(&s.session.id)).await.unwrap();
+        assert!(s.reverted());
+        assert_eq!(s.read("old.txt").as_deref(), Some("old\n"));
+        assert_eq!(s.read("new.txt"), None);
+        assert_eq!(s.read("gone.txt").as_deref(), Some("gone\n"));
+        assert_eq!(s.read("added.txt"), None);
+        assert_eq!(s.read("edit.txt").as_deref(), Some("e1\n"));
+        assert_eq!(s.read("unlisted.txt").as_deref(), Some("u2\n"));
+
+        // `plain.md` renamed to `CLAUDE.md`: the destination is a loader
+        // file the revert would delete.
+        let change = |worktree: &std::path::Path| {
+            std::fs::rename(worktree.join("plain.md"), worktree.join("CLAUDE.md")).unwrap();
+            std::fs::write(worktree.join("edit.txt"), "e2\n").unwrap();
+        };
+        let patched = ["plain.md", "CLAUDE.md", "edit.txt"];
+        let s = git_scenario("revert-git-rename-loader", true, before, change, &patched).await;
+        let refused = s.service.revert(revert_all(&s.session.id)).await;
+        assert!(
+            matches!(&refused, Err(SessionError::Refused(message)) if message.contains("CLAUDE.md")),
+            "{refused:?}"
+        );
+        assert!(!s.reverted());
+        assert_eq!(s.read("plain.md"), None);
+        assert_eq!(s.read("CLAUDE.md").as_deref(), Some("plain\n"));
+        assert_eq!(s.read("edit.txt").as_deref(), Some("e2\n"));
+    }
+
+    /// The executable bit of a restored file follows the snapshot, set on
+    /// the handle that was written.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_guarded_revert_restores_the_executable_bit() {
+        use std::os::unix::fs::PermissionsExt;
+        fn chmod(worktree: &std::path::Path, name: &str, mode: u32) {
+            std::fs::set_permissions(worktree.join(name), std::fs::Permissions::from_mode(mode))
+                .unwrap();
+        }
+        let s = git_scenario_with(
+            "revert-git-exec",
+            true,
+            &[("run.sh", "#!/bin/sh\n"), ("data.txt", "d1\n")],
+            |worktree| chmod(worktree, "run.sh", 0o755),
+            |worktree| {
+                std::fs::remove_file(worktree.join("run.sh")).unwrap();
+                std::fs::write(worktree.join("run.sh"), "changed\n").unwrap();
+                std::fs::write(worktree.join("data.txt"), "d2\n").unwrap();
+                chmod(worktree, "data.txt", 0o755);
+            },
+            &["run.sh", "data.txt"],
+        )
+        .await;
+        s.service.revert(revert_all(&s.session.id)).await.unwrap();
+        let bits = |name: &str| {
+            let meta = std::fs::metadata(s.h.worktree.join(name)).unwrap();
+            meta.permissions().mode() & 0o111
+        };
+        assert_eq!(s.read("run.sh").as_deref(), Some("#!/bin/sh\n"));
+        assert_ne!(bits("run.sh"), 0, "executable again");
+        assert_eq!(s.read("data.txt").as_deref(), Some("d1\n"));
+        assert_eq!(bits("data.txt"), 0, "not executable again");
     }
 
     #[tokio::test]

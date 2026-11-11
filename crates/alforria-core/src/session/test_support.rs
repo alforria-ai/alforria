@@ -895,6 +895,7 @@ fn engine_build_with(
             summary: summary.clone(),
             state: services.run_state.clone(),
             data_dir: temp.path().to_path_buf(),
+            protected: services.agents.protected(),
         },
     ));
     let compaction: Arc<dyn crate::session::r#loop::Compaction> =

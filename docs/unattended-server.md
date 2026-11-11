@@ -763,11 +763,17 @@ which of the three it is, or it does not compile.
   own sessions are not guarded. The guard goes with the session, not with
   the server: a restricted or outside-started session continued from the
   command line (`alforria run --session`) is held to the same set, built by
-  the same constructor (`Protected::for_loaded`).
+  the same constructor (`Protected::for_loaded`). Session revert and
+  unrevert are held to it too: in such a session one that would rewrite or
+  delete a protected file is refused whole (`403`, naming the files) and
+  nothing is restored; the other reverts of the session go through, and
+  write exactly the files that were checked, through the same handle-based
+  write as the tools. To
+  revert past a change to a loader file, lift the restriction
+  (`DELETE /session/{id}/restriction`, `admin`) or restore the file by hand.
 
   **This is not the control.** A session that may run `bash` writes any
-  file the server's user can, and the guard does not see it; session
-  revert restores files the session itself changed. What keeps a project
+  file the server's user can, and the guard does not see it. What keeps a project
   from carrying policy on an unattended server is the two points above —
   the host's permission ceiling, and project config restricted to keys that
   carry nothing. Deny `bash` (or run the agent as a user that cannot write
@@ -780,6 +786,7 @@ which of the three it is, or it does not compile.
   | Writes by anything but `write`, `edit`, `apply_patch` and the upload route: `bash`, a formatter, an LSP or MCP server, a workflow script | The session itself, when its policy lets it run them | The guard never sees these. Deny `bash` and do not hand the session such helpers, or run the server as a user that cannot write the loader files |
   | A directory renamed after the write: the write lands in `plain/`, then `plain` is renamed `.opencode` | A process able to rename inside the project while the session runs — in practice the session's own shell (`bash` allowed) or another local process of the same user | No race is involved and no check at the write can see it. It needs exactly the capability of the row above, so it adds nothing to it. The window between the guard's check and its write is closed (the write goes through the judged directory's handle); names changing afterwards are not something a write-time guard decides |
   | The last instant of the check-to-write window on a platform without `openat` (Windows) | The same process, racing the write | There is no directory handle to write through. The write is made by name, with the judged path resolved again immediately before each step (creating directories, creating the file, the rename, a removal) and the step refused when the path has changed: a link swapped in before that comparison is refused, one swapped in between the comparison and the system call after it is followed. Unattended deployments are expected on Unix, where the window is closed |
+  | Files a guarded session's revert does not restore | — | In a guarded session revert and unrevert judge every file they mean to write, refuse the whole revert (`403`, nothing written, the session not marked reverted) when one is a protected location, and then write exactly the judged files, each at its judged path through the directory handle — not `git checkout`, which writes by its own listing and by name. So the check and the write cannot disagree and the check-to-write window is closed as for a tool. It is narrower than an operator's revert: a file the snapshot listing leaves out (git-ignored files) and a path the snapshot holds as a symlink or a submodule stay as they are. No `edit_loader` grant is consulted: a revert has no agent |
   | Sessions without a guard: the operator's own (not restricted, not started by outside input) | — | By design. They write by name, exactly as upstream does |
 - The host config (`server.*`, `shell_env`, `hook.*`) is never read from the
   project, whatever the agent writes there.

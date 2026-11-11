@@ -62,6 +62,11 @@ pub enum SessionError {
     NotFound(#[from] NotFoundError),
     #[error(transparent)]
     Busy(#[from] BusyError),
+    /// alforria extension: the operation is not allowed for this session —
+    /// a revert in a guarded session that would write a protected location
+    /// (`session::revert`). The message is safe to return.
+    #[error("ForbiddenError: {0}")]
+    Refused(String),
 }
 
 impl SessionError {

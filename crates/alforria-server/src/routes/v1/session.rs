@@ -373,6 +373,8 @@ fn defect(err: impl std::fmt::Display) -> ServerError {
 fn session_error(err: SessionError) -> ServerError {
     match err {
         SessionError::NotFound(e) => ApiError::not_found(e.message).into(),
+        // alforria extension (a revert refused in a guarded session).
+        SessionError::Refused(message) => ApiError::Forbidden { message }.into(),
         other => defect(other),
     }
 }

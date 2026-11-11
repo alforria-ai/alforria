@@ -436,7 +436,11 @@ pre-1.0, so minor releases may include breaking changes.
   (Unix; what the guard does not cover is listed in
   `docs/unattended-server.md`). The guard is the same wherever such a
   session runs: `alforria run --session` on one protects the same resolved
-  locations as the server.
+  locations as the server. Reverting or unreverting such a session is
+  refused (`403`, nothing restored) when it would rewrite or delete one of
+  those files, and otherwise restores exactly the files that were checked
+  (git-ignored files and symlinks are left as they are); other sessions
+  revert as before.
 - When the global config does not load, a project's capability-bearing keys
   are not applied until it does (the load itself still degrades to defaults,
   as before).
