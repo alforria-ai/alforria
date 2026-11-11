@@ -69,8 +69,8 @@ project.
 | `prompt` | What the turn is asked. `@file` mentions resolve as they do in a command. |
 | `title` | Names the session (default: the trigger id). |
 | `agent`, `model` | Agent name and `provider/model`; the defaults otherwise. |
-| `session` | `"new"` (default) makes a session per run, titled `<title> · <time>`. `"reuse"` appends to one long-lived session per trigger. A session id runs in that session. |
-| `permission` | A permission block like an agent's. It becomes the session's own ruleset. |
+| `session` | `"new"` (default) makes a session per run, titled `<title> · <time>`. `"reuse"` appends to one long-lived session per trigger. A session id runs in that session, under that session's rules. |
+| `permission` | A permission block like an agent's. It becomes the ruleset of the session the trigger makes (`new`, `reuse`); a session the trigger names keeps its own rules and the block is not applied. |
 | `report` | `"final"` (default) delivers the final answer; `"none"` never does. |
 | `quiet_token` | A final answer that is exactly this text (ignoring surrounding whitespace) means "nothing to report". |
 | `enabled` | `false` keeps the trigger without running it. |
@@ -134,7 +134,10 @@ run time, but only the config changes or removes them.
   claimed in the database before it fires.
 - A run cut short by a restart is closed as `failed`, with an error that
   starts with `interrupted`. Its turn is repaired like any interrupted turn
-  and, under `server.resume: "continue"`, resumed once in its session. The
+  and, under `server.resume: "continue"`, resumed once in its session —
+  unless the trigger named that session (a session id, `current`): then it
+  gets a note instead, because the bounds held over such a run do not
+  outlive the process. The
   tick it answered was claimed before it ran, so nothing fires it a second
   time; `catch_up` still makes up for a later tick missed while the server
   was down.
@@ -157,7 +160,10 @@ run time, but only the config changes or removes them.
   resolving one attaches a file or names a subagent with no permission
   asked.
 - A session a trigger names (`session: "ses_…"`) must belong to the
-  trigger's own directory.
+  trigger's own directory. A run there is bound by that session's policy
+  and, for a trigger the `schedule` tool made, by its creator's bounds —
+  held over the run while it lasts, not stored on the session (see
+  [The `schedule` tool](#the-schedule-tool)).
 - The scheduler runs in `alforria serve`, `alforria web` and the TUI. `serve`
   and `web` boot every directory that has triggers at startup. One-shot
   commands (`alforria run`, `acp`) never fire triggers.
@@ -255,6 +261,18 @@ sealed: neither a rule added to the session nor a standing `always`
 approval reaches them. The run session's own `permission` holds only the
 trigger's `permission` block. The tool cannot set `agent`, `model` or
 `permission`.
+
+With `session: "current"` (or after an update that points the trigger at a
+session) the run happens in a conversation that is not the trigger's own,
+and nothing is stored for it: the creator's bounds are held over the
+**run** instead. While its turn lasts, every decision made for that session
+is under them — including for the subagents it starts, which keep them —
+and when it ends the session is judged as before. Without this a reminder
+scheduled by a conversation that could not run a command would run it once
+the conversation's rules, or the config, had been loosened, or once the
+trigger had been moved to a session with wider rules. The details and the
+limits are in "A trigger that names a session" in
+[unattended-server.md](unattended-server.md).
 
 The tool only changes triggers from its own conversation tree. The session
 that created a trigger, and that session's ancestors, may update, pause,

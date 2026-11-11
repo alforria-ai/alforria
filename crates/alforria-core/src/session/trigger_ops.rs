@@ -134,8 +134,23 @@ impl ProductionTriggerOps {
             && std::path::Path::new(&session.directory) == self.context.directory
     }
 
-    /// The session this turn runs in, created if need be.
-    fn session_for(&self, turn: &TriggerTurn) -> Result<String, String> {
+    /// The session this turn runs in, created if need be, and what binds
+    /// the run there beyond what is stored for the session.
+    ///
+    /// A session of the trigger's own (`new`, `reuse`) carries the
+    /// creator's bounds and the outside-input ceiling itself. A session
+    /// the trigger *names* is somebody's conversation: it keeps its own
+    /// rules and gets no ceiling stored — which would narrow it for good,
+    /// for its user too — so the same ceilings are held over the run
+    /// instead ([`SessionStore::bind_run`]), for as long as its turn
+    /// lasts. Without them a trigger a session scheduled would run there
+    /// under whatever that session's policy has become since, or — moved
+    /// there by an update — under a session's policy its creator never
+    /// had.
+    fn session_for(
+        &self,
+        turn: &TriggerTurn,
+    ) -> Result<(String, Option<crate::session::store::RunCeilings>), String> {
         match &turn.mode {
             SessionMode::Existing(id) => match self.target(id) {
                 SessionTarget::Missing => Err(format!("session {id} no longer exists")),
@@ -145,12 +160,26 @@ impl ProductionTriggerOps {
                     "session {id} is not restricted (any more): a trigger created by a \
                      restricted caller only runs in a restricted session"
                 )),
-                SessionTarget::Found { .. } => Ok(id.clone()),
+                SessionTarget::Found { .. } => {
+                    // Provenance, as in a kept session: the prompt was
+                    // written after outside content was seen.
+                    if turn.untrusted || turn.outside_content {
+                        self.sessions
+                            .mark(id, crate::session::store::SessionMark::OutsideContent)
+                            .map_err(|error| error.to_string())?;
+                    }
+                    let ceilings = turn.run_policy().ceilings;
+                    let bound =
+                        (!ceilings.is_empty()).then(|| self.sessions.bind_run(id, ceilings));
+                    Ok((id.clone(), bound))
+                }
             },
-            SessionMode::New => self.create_session(
-                turn,
-                format!("{} · {}", turn.title, format_instant(turn.now_ms)),
-            ),
+            SessionMode::New => self
+                .create_session(
+                    turn,
+                    format!("{} · {}", turn.title, format_instant(turn.now_ms)),
+                )
+                .map(|id| (id, None)),
             SessionMode::Reuse => {
                 let kept = turn
                     .session_id
@@ -213,9 +242,11 @@ impl ProductionTriggerOps {
                                 .set_permission(&session.id, permission)
                                 .map_err(|error| error.to_string())?;
                         }
-                        Ok(session.id)
+                        Ok((session.id, None))
                     }
-                    None => self.create_session(turn, turn.title.clone()),
+                    None => self
+                        .create_session(turn, turn.title.clone())
+                        .map(|id| (id, None)),
                 }
             }
         }
@@ -248,7 +279,9 @@ impl TriggerOps for ProductionTriggerOps {
                 message,
             };
             let facade = self.facade().map_err(|message| fail(None, message))?;
-            let session_id = self
+            // `_bound` holds the run's ceilings over a named session until
+            // this turn has ended, however it ends.
+            let (session_id, _bound) = self
                 .session_for(turn)
                 .map_err(|message| fail(None, message))?;
             let mark = || {

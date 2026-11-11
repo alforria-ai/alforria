@@ -408,6 +408,13 @@ pub enum TurnKind {
     Resume,
     /// A note about an earlier interrupted turn: nothing was running.
     Note,
+    /// A trigger's run in a session the trigger named rather than made
+    /// (`session: "ses_…"`, the `schedule` tool's `current`). What held
+    /// such a run to its creator's bounds was held over the run, in the
+    /// process that died (`SessionStore::bind_run`), so carrying it on
+    /// would be carrying it on under the session's own policy: it gets a
+    /// note, never a resume.
+    BoundRun,
 }
 
 /// What [`repair`] found and fixed.
@@ -446,7 +453,7 @@ impl Interrupted {
             (_, TurnKind::Shell | TurnKind::Note) => ResumePolicy::None,
             (ResumePolicy::None, _) => ResumePolicy::None,
             (ResumePolicy::Notify, _) => ResumePolicy::Notify,
-            (ResumePolicy::Continue, TurnKind::Resume) => ResumePolicy::Notify,
+            (ResumePolicy::Continue, TurnKind::Resume | TurnKind::BoundRun) => ResumePolicy::Notify,
             (ResumePolicy::Continue, TurnKind::Prompt) => ResumePolicy::Continue,
         }
     }
@@ -467,9 +474,29 @@ fn restart_kind(part: &V1Part) -> Option<TurnKind> {
     }
 }
 
-fn turn_kind(user: &WithParts) -> TurnKind {
+/// The trigger whose run a prompt part belongs to (`metadata.trigger`,
+/// `session::trigger_ops`).
+fn trigger_of(part: &V1Part) -> Option<&str> {
+    let V1Part::Text {
+        metadata: Some(metadata),
+        ..
+    } = part
+    else {
+        return None;
+    };
+    metadata.get("trigger")?.get("id")?.as_str()
+}
+
+/// `session_trigger`: the trigger that made the session (`triggerID` in its
+/// metadata, a key only the server writes).
+fn turn_kind(user: &WithParts, session_trigger: Option<&str>) -> TurnKind {
     if let Some(kind) = user.parts.iter().find_map(restart_kind) {
         return kind;
+    }
+    if let Some(trigger) = user.parts.iter().find_map(trigger_of) {
+        if session_trigger != Some(trigger) {
+            return TurnKind::BoundRun;
+        }
     }
     let shell = !user.parts.is_empty()
         && user.parts.iter().all(|part| {
@@ -535,7 +562,14 @@ pub fn repair(
         None => (None, TurnKind::Prompt, false),
         Some(user) => {
             let id = message_id(&user.info).to_string();
-            let kind = turn_kind(user);
+            let kind = turn_kind(
+                user,
+                session
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("triggerID"))
+                    .and_then(Value::as_str),
+            );
             let messages = services.sessions.messages_since(session_id, &id)?;
             let incomplete = kind != TurnKind::Note && turn_incomplete(&messages, &id);
             (Some(id), kind, incomplete)
@@ -1189,6 +1223,49 @@ mod tests {
         ] {
             assert_eq!(found.action(policy), ResumePolicy::None);
         }
+    }
+
+    /// A trigger's run in a session it named was held to its creator's
+    /// bounds by the process that died. It is told about, not carried on;
+    /// a run in the trigger's own session, whose ceilings are stored, is
+    /// resumed as before.
+    #[test]
+    fn a_triggers_run_in_a_named_session_is_noted_not_resumed() {
+        let prompt = |trigger: Option<&str>| {
+            let mut part = text_part("ses_a", "msg_1", "prt_1", "Do the thing");
+            if let (V1Part::Text { metadata, .. }, Some(trigger)) = (&mut part, trigger) {
+                *metadata = json!({ "trigger": { "id": trigger, "run": "trr_1" } })
+                    .as_object()
+                    .cloned();
+            }
+            crate::session::test_support::with_parts(
+                user_message("ses_a", "msg_1", 1.0),
+                vec![part],
+            )
+        };
+        assert_eq!(turn_kind(&prompt(None), None), TurnKind::Prompt);
+        assert_eq!(
+            turn_kind(&prompt(Some("nightly")), Some("nightly")),
+            TurnKind::Prompt
+        );
+        for session_trigger in [None, Some("another")] {
+            assert_eq!(
+                turn_kind(&prompt(Some("nightly")), session_trigger),
+                TurnKind::BoundRun
+            );
+        }
+        let found = Interrupted {
+            session_id: "ses_a".to_string(),
+            turn: Some("msg_1".to_string()),
+            kind: TurnKind::BoundRun,
+            incomplete: true,
+            child: false,
+            messages: 1,
+            tools: 0,
+        };
+        assert_eq!(found.action(ResumePolicy::Continue), ResumePolicy::Notify);
+        assert_eq!(found.action(ResumePolicy::Notify), ResumePolicy::Notify);
+        assert_eq!(found.action(ResumePolicy::None), ResumePolicy::None);
     }
 
     #[test]
