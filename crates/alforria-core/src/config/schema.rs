@@ -631,7 +631,7 @@ impl AgentInfo {
     ];
 
     /// Keys exempt from the unknown-key → `options` migration (`KNOWN_KEYS`).
-    const KNOWN_KEYS: &'static [&'static str] = &[
+    pub(crate) const KNOWN_KEYS: &'static [&'static str] = &[
         "name",
         "model",
         "variant",
