@@ -938,7 +938,9 @@ as its own does not exist for it.
   most 50 triggers exist that an agent or a restricted caller made.
 - **Memory.** A write needs the default agent's `memory` permission for the
   action to be `allow` (an `ask` is a refusal: nobody can be asked for an
-  HTTP call), and `GET /memory/session` needs `session_search`. What it
+  HTTP call), and `GET /memory/session` needs `session_search`. With
+  `?session=<id>` — a session of this directory it may act in — the rules
+  are that session's policy instead, its ceilings included. What it
   writes is a client's record: shown to restricted sessions, never injected
   into the operator's, and its rewrite never verifies a record. Memory is
   kept per project, and for a directory that is not a git repository — all

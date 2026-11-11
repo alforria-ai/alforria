@@ -349,15 +349,309 @@ async fn a_scheduled_run_follows_the_policy_now_and_stays_within_its_creators_bo
     );
 }
 
+/// A session of this engine under `ceilings`, whose own rules try to hand
+/// everything back.
+fn session_under(
+    e: &crate::session::test_support::Engine,
+    kind: &str,
+    ceilings: &[crate::session::store::SessionCeiling],
+) -> V1SessionInfo {
+    e.services
+        .sessions
+        .create(
+            &e.services.instance_context(&e.worktree, None).unwrap(),
+            &crate::session::store::CreateInput {
+                title: Some(format!("entry points: {kind}")),
+                agent: Some("build".to_string()),
+                permission: Some(vec![alforria_schema::permission_v1::PermissionV1Rule {
+                    permission: "*".to_string(),
+                    pattern: "*".to_string(),
+                    action: PermissionV1Action::Allow,
+                }]),
+                ceilings: ceilings.to_vec(),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+}
+
+const PROBES: [(&str, &str); 8] = [
+    ("bash", "ls"),
+    ("edit", "src/lib.rs"),
+    ("read", "src/lib.rs"),
+    ("read", ".env"),
+    ("task", "general"),
+    ("memory", "remember"),
+    ("webfetch", "https://x"),
+    ("doom_loop", "read"),
+];
+
+/// `decided` is never more permissive than `floor`, on every probe.
+fn assert_within(
+    what: &str,
+    decided: &crate::tool::permission::Policy,
+    floor: &crate::tool::permission::Policy,
+) {
+    use crate::tool::permission::strictness;
+    for (permission, pattern) in PROBES {
+        let (got, least) = (
+            decided.evaluate(permission, pattern).action,
+            floor.evaluate(permission, pattern).action,
+        );
+        assert!(
+            strictness(got) >= strictness(least),
+            "{what} decided {permission} {pattern} as {got:?}, the session's policy says {least:?}"
+        );
+    }
+}
+
+/// The ceilings alone, over a policy that allows everything: what a child
+/// session, which starts from its own rules, must still be under.
+fn ceilings_only(
+    ceilings: &[crate::session::store::SessionCeiling],
+) -> crate::tool::permission::Policy {
+    use alforria_schema::permission_v1::PermissionV1Rule;
+    ceilings
+        .iter()
+        .flat_map(|ceiling| ceiling.readings.iter())
+        .fold(
+            crate::tool::permission::Policy::plain(vec![PermissionV1Rule {
+                permission: "*".to_string(),
+                pattern: "*".to_string(),
+                action: PermissionV1Action::Allow,
+            }]),
+            |policy, reading| policy.with_sealed_ceiling("probe", reading.clone()),
+        )
+}
+
+/// The subtask driver (a command's `subtask: true`, an `@agent` part): the
+/// subagent it starts is asked for under the session's ceilings.
+async fn drive_subtask(kind: &str, ceilings: &[crate::session::store::SessionCeiling]) {
+    use crate::session::r#loop::Subtasks;
+    let e = engine(
+        &format!("policy-subtask-{kind}"),
+        vec![text_stream("subagent answer")],
+    );
+    let session = session_under(&e, kind, ceilings);
+    let user = crate::session::test_support::user_message(&session.id, "msg_p1", 1.0);
+    e.services.sessions.update_message(&user).unwrap();
+    let driver =
+        crate::session::subtask::SessionSubtask::new(crate::session::subtask::SubtaskDeps {
+            sessions: e.services.sessions.clone(),
+            events: e.services.events.clone(),
+            agents: e.services.agents.clone(),
+            models: e.models.clone(),
+            registry: e.registry.clone(),
+            permission: e.services.permission.clone(),
+            clock: std::sync::Arc::new(crate::session::test_support::FixedClock),
+            instance: e.instance.clone(),
+        });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        driver.handle(crate::session::r#loop::SubtaskInput {
+            task: V1Part::Subtask {
+                id: "par_01M2SUBTASKPART000000000000".to_string(),
+                session_id: session.id.clone(),
+                message_id: "msg_p1".to_string(),
+                prompt: "do the subtask".to_string(),
+                description: "subtask description".to_string(),
+                agent: "general".to_string(),
+                model: None,
+                command: None,
+            },
+            model: crate::session::test_support::test_model(),
+            last_user: user.clone(),
+            session_id: session.id.clone(),
+            session: session.clone(),
+            messages: vec![],
+            cancel: tokio_util::sync::CancellationToken::new(),
+        }),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("{kind}: the subtask did not finish"))
+    .unwrap();
+    assert_eq!(e.llm.calls(), 1, "{kind}: the subagent's one request");
+    let request = e.llm.input(0);
+    assert_eq!(
+        request.parent_session_id.as_deref(),
+        Some(session.id.as_str()),
+        "{kind}: the request is the child's"
+    );
+    assert_within(
+        &format!("{kind}: the subtask's subagent"),
+        &request.agent.permission,
+        &ceilings_only(ceilings),
+    );
+}
+
+/// The doom-loop ask: three identical tool calls ask `doom_loop` of the
+/// session's policy. With the session's own rules and ceilings that is an
+/// allow or a deny here, never the agent's own `ask` — which would be
+/// published as a request and wait for an answer nobody gives.
+async fn drive_doom_loop(kind: &str, ceilings: &[crate::session::store::SessionCeiling]) {
+    use alforria_llm::schema::events::LlmEvent;
+    use alforria_llm::schema::ids::FinishReason;
+    use alforria_schema::session_v1::V1ToolState;
+    let call = |id: &str| LlmEvent::ToolCall {
+        id: id.to_string(),
+        name: "read".to_string(),
+        input: serde_json::json!({ "filePath": "a.txt" }),
+        provider_executed: None,
+        provider_metadata: None,
+    };
+    let e = engine(
+        &format!("policy-doom-{kind}"),
+        vec![
+            vec![
+                Ok(call("cal_1")),
+                Ok(call("cal_2")),
+                Ok(call("cal_3")),
+                Ok(LlmEvent::StepFinish {
+                    index: 0.0,
+                    reason: FinishReason::ToolCalls,
+                    usage: None,
+                    provider_metadata: None,
+                }),
+                Ok(LlmEvent::Finish {
+                    reason: FinishReason::ToolCalls,
+                    usage: None,
+                    provider_metadata: None,
+                }),
+            ],
+            text_stream("recovered"),
+        ],
+    );
+    std::fs::write(e.worktree.join("a.txt"), "x\n").unwrap();
+    let session = session_under(&e, kind, ceilings);
+    let agent = e.services.agents.get("build").unwrap().permission.clone();
+    let decided = e
+        .services
+        .sessions
+        .policy(&session.id, &agent)
+        .evaluate("doom_loop", "read")
+        .action;
+    // The agent alone would ask: the test tells the two apart.
+    assert_eq!(
+        agent.evaluate("doom_loop", "read").action,
+        PermissionV1Action::Ask
+    );
+    assert_ne!(decided, PermissionV1Action::Ask, "{kind}");
+    let mut asked = e.services.events.subscribe("permission.asked");
+    let finished = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        e.prompt.prompt(crate::session::e2e::prompt_input_for(
+            "msg_doom",
+            &session.id,
+            "loop the tool",
+        )),
+    )
+    .await;
+    assert!(
+        asked.try_recv().is_err(),
+        "{kind}: the doom-loop ask was judged by the agent's policy, not the session's"
+    );
+    finished
+        .unwrap_or_else(|_| panic!("{kind}: the turn did not finish"))
+        .unwrap();
+    let states: Vec<bool> = e
+        .services
+        .messages
+        .stream(&session.id)
+        .unwrap()
+        .iter()
+        .flat_map(|message| message.parts.iter())
+        .filter_map(|part| match part {
+            V1Part::Tool { tool, state, .. } if tool == "read" => {
+                Some(matches!(state, V1ToolState::Completed { .. }))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(states.len(), 3, "{kind}: {states:?}");
+    assert_eq!(
+        states.iter().all(|completed| *completed),
+        decided == PermissionV1Action::Allow,
+        "{kind}: a denied doom loop stops a call, an allowed one stops none: {states:?}"
+    );
+}
+
+/// The goal paths: the kickoff turn, a round the loop starts by itself,
+/// and the reviewer between them all go out under the session's policy.
+async fn drive_goal(kind: &str, ceilings: &[crate::session::store::SessionCeiling]) {
+    let e = engine(
+        &format!("policy-goal-{kind}"),
+        vec![
+            text_stream("I think it is done."),
+            text_stream(
+                r#"{"verdict":"continue","reason":"no output shown","next_step":"run it"}"#,
+            ),
+            text_stream("Ran it."),
+            text_stream(r#"{"verdict":"done","reason":"the run is shown"}"#),
+        ],
+    );
+    let session = session_under(&e, kind, ceilings);
+    let agent = e.services.agents.get("build").unwrap().permission.clone();
+    let bounded = e.services.sessions.policy(&session.id, &agent);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        e.prompt.command(crate::session::prompt::CommandInput {
+            session_id: session.id.clone(),
+            message_id: None,
+            agent: Some("build".to_string()),
+            model: None,
+            variant: None,
+            arguments: "make it work".to_string(),
+            command: "goal".to_string(),
+            parts: Vec::new(),
+            caller: crate::session::caller::Caller::Operator,
+        }),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("{kind}: the kickoff turn did not end"))
+    .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while e
+            .prompt
+            .goals()
+            .read(&session.id)
+            .expect("a goal is set")
+            .status
+            == crate::session::goal::GoalStatus::Active
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{kind}: the goal did not settle"));
+    assert_eq!(e.llm.calls(), 4, "{kind}: two turns, each reviewed");
+    for (index, what) in [
+        (0, "the goal's kickoff turn"),
+        (1, "the goal reviewer"),
+        (2, "a goal round"),
+        (3, "the goal reviewer"),
+    ] {
+        let request = e.llm.input(index);
+        assert_eq!(request.session_id, session.id);
+        assert_within(
+            &format!("{kind}: {what}"),
+            &request.agent.permission,
+            &bounded,
+        );
+        // The reviewer has nothing to act with.
+        assert_eq!(request.tools.is_empty(), index % 2 == 1, "{kind}: {what}");
+    }
+}
+
 /// The session's policy has one assembly point (`SessionStore::policy`),
 /// and `Policy::extended` is private, so "agent rules + session rules"
 /// cannot be evaluated without the session's ceilings. This drives the
 /// entry points that reach a decision for a session — the loop's request
-/// (tool list, asks, system prompt), the doom-loop ask, the memory flush
-/// check, the workflow `task` check and the schedule tool's bounds — with a
-/// session under each kind of ceiling, and holds each to the bounded
-/// policy: never more permissive.
-#[tokio::test]
+/// (tool list, asks, system prompt), the subtask driver, the doom-loop
+/// ask, the goal's turns and its reviewer, the memory flush check, the
+/// workflow `task` check and the schedule tool's bounds — with a session
+/// under each kind of ceiling, and holds each to the bounded policy: never
+/// more permissive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_entry_point_judges_a_session_under_its_ceilings() {
     use crate::session::store::SessionCeiling;
     use crate::tool::permission::{strictness, Policy};
@@ -376,6 +670,7 @@ async fn every_entry_point_judges_a_session_under_its_ceilings() {
             rule("bash", "*", Deny),
             rule("task", "*", Deny),
             rule("memory", "*", Deny),
+            rule("doom_loop", "*", Deny),
         ]],
     };
     let outside = SessionCeiling {
@@ -417,16 +712,11 @@ async fn every_entry_point_judges_a_session_under_its_ceilings() {
         Vec::new(),
     );
     let wide_open = Policy::plain(vec![rule("*", "*", Allow)]);
-    const PROBES: [(&str, &str); 8] = [
-        ("bash", "ls"),
-        ("edit", "src/lib.rs"),
-        ("read", "src/lib.rs"),
-        ("read", ".env"),
-        ("task", "general"),
-        ("memory", "remember"),
-        ("webfetch", "https://x"),
-        ("doom_loop", "read"),
-    ];
+    for (kind, ceilings) in &kinds {
+        drive_subtask(kind, ceilings).await;
+        drive_doom_loop(kind, ceilings).await;
+        drive_goal(kind, ceilings).await;
+    }
     for (index, (kind, ceilings)) in kinds.iter().enumerate() {
         let session = sessions
             .create(

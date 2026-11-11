@@ -659,6 +659,64 @@ async fn v2_permission_ask_reply_flow() {
         .contains("PermissionNotFoundError"));
 }
 
+/// The ask is a session's, so the answer is the session's policy
+/// (`SessionStore::policy`): a ceiling stored for the session — a trigger
+/// creator's bounds, the outside-input ceiling — decides it, and the
+/// session's own rules do not lift it. The agent's policy alone used to
+/// answer, and allowed a client what the session itself was denied.
+#[tokio::test]
+async fn v2_permission_ask_is_answered_by_the_sessions_policy() {
+    use alforria_schema::permission_v1::{PermissionV1Action, PermissionV1Rule};
+    let rule = |permission: &str, pattern: &str, action| PermissionV1Rule {
+        permission: permission.to_string(),
+        pattern: pattern.to_string(),
+        action,
+    };
+    let f = fixture();
+    let router = routes::build_router(f.ctx.clone());
+    let directory = f.worktree.to_string_lossy().to_string();
+    let ask = serde_json::json!({ "action": "bash", "resources": ["git push"] });
+
+    let plain = create_session(&router, &directory).await;
+    let plain = plain["data"]["id"].as_str().unwrap().to_string();
+    let (_, body) = permission_ask(&router, &plain, &ask).await;
+    assert_eq!(body["data"]["effect"], "allow", "no ceiling: the agent's");
+
+    let bound = create_session(&router, &directory).await;
+    let bound = bound["data"]["id"].as_str().unwrap().to_string();
+    f.ctx
+        .sessions
+        .set_ceiling(
+            &bound,
+            &session::store::SessionCeiling {
+                name: alforria_core::trigger::CREATOR_CEILING.to_string(),
+                readings: vec![vec![
+                    rule("*", "*", PermissionV1Action::Allow),
+                    rule("bash", "*", PermissionV1Action::Deny),
+                ]],
+            },
+        )
+        .unwrap();
+    // The session's own rules try to hand it back.
+    f.ctx
+        .sessions
+        .set_permission(&bound, vec![rule("bash", "*", PermissionV1Action::Allow)])
+        .unwrap();
+    let (status, body) = permission_ask(&router, &bound, &ask).await;
+    assert_ne!(
+        body["data"]["effect"], "allow",
+        "a session under a ceiling that denies bash: {status} {body}"
+    );
+    // What the ceiling leaves alone is still the agent's to allow.
+    let (_, body) = permission_ask(
+        &router,
+        &bound,
+        &serde_json::json!({ "action": "read", "resources": ["src/lib.rs"] }),
+    )
+    .await;
+    assert_eq!(body["data"]["effect"], "allow");
+}
+
 #[tokio::test]
 async fn v2_permission_deny_all_and_reject_cascade() {
     let f = fixture();

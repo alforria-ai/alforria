@@ -748,9 +748,14 @@ impl SessionPrompt {
         let V1Message::User { agent, model, .. } = &user else {
             return Review::Failed("the session has no user message".to_string());
         };
-        let Some(agent) = deps.services.agents.get(agent).cloned() else {
+        let Some(mut agent) = deps.services.agents.get(agent).cloned() else {
             return Review::Failed(format!("agent {agent} is not available"));
         };
+        // The reviewer has no tools and decides nothing by these rules; it
+        // still goes out as the session is held (`SessionStore::policy`),
+        // so nothing downstream of the request reads the agent's policy
+        // without the session's ceilings.
+        agent.permission = deps.services.sessions.policy(session_id, &agent.permission);
         let model = match deps
             .models
             .get_model(&model.provider_id, &model.model_id, session_id)

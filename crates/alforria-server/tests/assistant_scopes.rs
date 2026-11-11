@@ -748,6 +748,112 @@ async fn memory_writes_below_admin_follow_the_memory_permission() {
     }
 }
 
+/// A memory write that names a session (`?session=`) is judged by that
+/// session's policy — its own rules and its ceilings, what the tool would
+/// meet there — not by the default agent's alone. The session must be one
+/// the caller may act in.
+#[tokio::test]
+async fn a_memory_write_for_a_session_is_judged_by_that_sessions_policy() {
+    use alforria_schema::permission_v1::{PermissionV1Action, PermissionV1Rule};
+    let signer = Signer::new();
+    let f = fixture_with(
+        host_config(&signer, json!({ "permission": { "memory": "allow" } })),
+        Some(PASSWORD),
+        Vec::new(),
+    );
+    let chat = bearer(&signer.token(AUDIENCE, "chat"));
+    let dir = dir_query(&f.dirs.repo);
+    let note = || Some(json!({ "content": "A note." }));
+
+    // No session: the default agent's rules, which allow it.
+    assert_eq!(
+        send(&f, "POST", &format!("/memory?{dir}"), &chat, note()).await,
+        StatusCode::OK
+    );
+    // A session of the caller's with nothing of its own: the same.
+    let mine = create_session(&f, &f.dirs.repo, &chat).await;
+    assert_eq!(
+        send(
+            &f,
+            "POST",
+            &format!("/memory?{dir}&session={mine}"),
+            &chat,
+            note()
+        )
+        .await,
+        StatusCode::OK
+    );
+    // The same session under a ceiling that denies memory — a trigger
+    // creator's bounds, the outside-input ceiling.
+    f.ctx
+        .sessions
+        .set_ceiling(
+            &mine,
+            &alforria_core::session::store::SessionCeiling {
+                name: alforria_core::trigger::CREATOR_CEILING.to_string(),
+                readings: vec![vec![
+                    PermissionV1Rule {
+                        permission: "*".to_string(),
+                        pattern: "*".to_string(),
+                        action: PermissionV1Action::Allow,
+                    },
+                    PermissionV1Rule {
+                        permission: "memory".to_string(),
+                        pattern: "*".to_string(),
+                        action: PermissionV1Action::Deny,
+                    },
+                ]],
+            },
+        )
+        .unwrap();
+    let (status, record) = json_of(
+        &f,
+        "POST",
+        &format!("/memory?{dir}&session={mine}"),
+        &chat,
+        note(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{record}");
+    // The operator's session is not the caller's to speak for, and a
+    // session that is not there is a 404.
+    let operators = create_session(&f, &f.dirs.repo, &basic()).await;
+    assert_eq!(
+        send(
+            &f,
+            "POST",
+            &format!("/memory?{dir}&session={operators}"),
+            &chat,
+            note()
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        send(
+            &f,
+            "POST",
+            &format!("/memory?{dir}&session=ses_nowhere"),
+            &chat,
+            note()
+        )
+        .await,
+        StatusCode::NOT_FOUND
+    );
+    // The operator is the operator, whatever session is named.
+    assert_eq!(
+        send(
+            &f,
+            "POST",
+            &format!("/memory?{dir}&session={mine}"),
+            &basic(),
+            note()
+        )
+        .await,
+        StatusCode::OK
+    );
+}
+
 /// The durable replay of a session's events is the one `/api` route open
 /// below `admin`, and only for sessions in a directory the token may open.
 #[tokio::test]

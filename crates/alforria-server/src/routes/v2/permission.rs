@@ -262,6 +262,13 @@ struct AskPayload {
 /// policy (the default agent when unset), deny-all when there is none. A
 /// [`Policy`](alforria_core::tool::permission::Policy), not a rule list:
 /// the agent's ceilings come with it.
+///
+/// alforria extension: the ask is a session's, so the answer is the
+/// session's policy (`SessionStore::policy`) — the agent's, read with the
+/// session's own rules, under the session's stored and run ceilings. The
+/// agent's policy alone would allow a client what a trigger creator's
+/// bounds or the outside-input ceiling deny the session. A session with no
+/// rules and no ceilings of its own gets the agent's policy, as upstream.
 fn configured(
     location: &LocationContext,
     session_id: &str,
@@ -289,7 +296,10 @@ fn configured(
     let Some(info) = location.services.agents.get(&agent) else {
         return Ok(missing());
     };
-    Ok(info.permission.clone())
+    Ok(location
+        .services
+        .sessions
+        .policy(session_id, &info.permission))
 }
 
 /// `policy` followed by the project's saved (always-allow) rules.

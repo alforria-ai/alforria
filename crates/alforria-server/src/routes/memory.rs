@@ -32,10 +32,15 @@
 //! the rules a turn of its own would meet with the `memory` and
 //! `session_search` tools:
 //!
-//! * a write needs the default agent's `memory` permission for the action
-//!   (`remember`, `update`, `forget`) to be `allow`, and `GET
-//!   /memory/session` needs `session_search`. An `ask` is a refusal: nobody
-//!   is there to answer one for an HTTP call;
+//! * a write needs the `memory` permission for the action (`remember`,
+//!   `update`, `forget`) to be `allow`, and `GET /memory/session` needs
+//!   `session_search`. An `ask` is a refusal: nobody is there to answer
+//!   one for an HTTP call. The rules are a session's when the request
+//!   names one (`?session=<id>`, a session of this directory the caller
+//!   may act in): that session's policy, with its own rules and its
+//!   ceilings, exactly what the tool would meet there. With no session
+//!   they are the default agent's — what a session the caller creates now
+//!   starts from;
 //! * what it writes is recorded as a client's (`Source::Client`), from a
 //!   restricted writer: shown to restricted sessions, never injected into
 //!   the operator's, and its rewrite of an unverified record leaves it
@@ -130,13 +135,66 @@ fn located(
     Ok((memory, project_id, services))
 }
 
+/// The policy a credential below `admin` is judged by here.
+///
+/// * With `?session=<id>` it is that session's
+///   (`SessionStore::policy`): its agent's rules, its own, and its
+///   ceilings — what a turn there would meet with the tool. The session
+///   must be one of this directory's that the caller may act in; one that
+///   is not there reads as missing.
+/// * With no session it is the default agent's policy, the host's ceiling
+///   included: what a session the caller creates now starts from, since
+///   such a session has no rules or ceilings of its own (a credential
+///   below `admin` cannot give it any).
+///
+/// `None` when there is no agent to judge by: nothing is allowed.
+fn caller_policy(
+    services: &alforria_core::SessionServices,
+    directory: &RequestDirectory,
+    uri: &Uri,
+) -> Result<Option<alforria_core::tool::permission::Policy>, ServerError> {
+    let Some(session_id) = query_param(uri.query(), "session") else {
+        return Ok(services
+            .agents
+            .default_info()
+            .ok()
+            .map(|agent| agent.permission));
+    };
+    let not_found = || {
+        memory_error(MemoryError::NotFound(format!(
+            "session not found: {session_id}"
+        )))
+    };
+    let session = services
+        .sessions
+        .get(&session_id)
+        .map_err(|_| not_found())?;
+    if std::path::Path::new(&session.directory) != directory.0.as_path() {
+        return Err(not_found());
+    }
+    alforria_core::session::caller::Caller::Restricted
+        .may_act_on(
+            services
+                .sessions
+                .is_restricted(&session_id)
+                .unwrap_or(false),
+        )
+        .map_err(|message| ServerError::Api(ApiError::Forbidden { message }))?;
+    let agent = match session.agent.as_deref() {
+        Some(name) => services.agents.get(name).cloned(),
+        None => services.agents.default_info().ok(),
+    };
+    Ok(agent.map(|agent| services.sessions.policy(&session_id, &agent.permission)))
+}
+
 /// Who is writing, and whether it may: the operator freely, a credential
-/// below `admin` when the default agent's rules allow `permission` for
-/// `pattern` outright (see the module docs).
+/// below `admin` when the rules it is judged by ([`caller_policy`]) allow
+/// `permission` for `pattern` outright (see the module docs).
 fn writer(
     ctx: &ServerContext,
     directory: &RequestDirectory,
     principal: &Option<axum::Extension<Principal>>,
+    uri: &Uri,
     permission: &str,
     pattern: &str,
 ) -> Result<(Arc<MemoryService>, String, Provenance), ServerError> {
@@ -144,8 +202,8 @@ fn writer(
     if !crate::confine::restricted(principal) {
         return Ok((memory, project_id, Provenance::api()));
     }
-    let allowed = services.agents.default_info().is_ok_and(|agent| {
-        agent.permission.evaluate(permission, pattern).action
+    let allowed = caller_policy(&services, directory, uri)?.is_some_and(|policy| {
+        policy.evaluate(permission, pattern).action
             == alforria_schema::permission_v1::PermissionV1Action::Allow
     });
     if !allowed {
@@ -223,10 +281,11 @@ struct CreateBody {
 async fn create(
     State(ctx): State<Arc<ServerContext>>,
     principal: Option<axum::Extension<Principal>>,
+    uri: Uri,
     axum::Extension(directory): axum::Extension<RequestDirectory>,
     Json(body): Json<CreateBody>,
 ) -> Result<Json<MemoryRecord>, ServerError> {
-    let (memory, _, by) = writer(&ctx, &directory, &principal, "memory", "remember")?;
+    let (memory, _, by) = writer(&ctx, &directory, &principal, &uri, "memory", "remember")?;
     memory
         .remember_from(body.kind.as_deref(), &body.content, body.metadata, by)
         .map(Json)
@@ -258,7 +317,8 @@ async fn search_sessions(
     axum::Extension(directory): axum::Extension<RequestDirectory>,
 ) -> Result<Json<Value>, ServerError> {
     // The tool asks for `session_search` before it reads other sessions.
-    let (memory, project_id, _) = writer(&ctx, &directory, &principal, "session_search", "*")?;
+    let (memory, project_id, _) =
+        writer(&ctx, &directory, &principal, &uri, "session_search", "*")?;
     let query = query_text(&uri)?;
     let limit = number(&uri, "limit").unwrap_or(20);
     // The search may index a backlog first: keep it off the runtime.
@@ -287,11 +347,12 @@ async fn read(
 async fn update(
     State(ctx): State<Arc<ServerContext>>,
     principal: Option<axum::Extension<Principal>>,
+    uri: Uri,
     axum::Extension(directory): axum::Extension<RequestDirectory>,
     Path(id): Path<String>,
     Json(patch): Json<MemoryPatch>,
 ) -> Result<Json<MemoryRecord>, ServerError> {
-    let (memory, _, by) = writer(&ctx, &directory, &principal, "memory", "update")?;
+    let (memory, _, by) = writer(&ctx, &directory, &principal, &uri, "memory", "update")?;
     memory
         .update_by(&id, &patch, &by)
         .map(Json)
@@ -301,10 +362,11 @@ async fn update(
 async fn remove(
     State(ctx): State<Arc<ServerContext>>,
     principal: Option<axum::Extension<Principal>>,
+    uri: Uri,
     axum::Extension(directory): axum::Extension<RequestDirectory>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ServerError> {
-    let (memory, _, by) = writer(&ctx, &directory, &principal, "memory", "forget")?;
+    let (memory, _, by) = writer(&ctx, &directory, &principal, &uri, "memory", "forget")?;
     let deleted = memory.forget_by(&id, &by).map_err(memory_error)?;
     Ok(Json(json!({ "deleted": deleted })))
 }

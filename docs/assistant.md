@@ -629,10 +629,16 @@ All take `?directory=` and return plain JSON. With memory off they answer 403.
 | `DELETE /memory/{id}` | `{ deleted }`. |
 
 With bearer tokens the routes are open to `chat` and `connector` under the
-tools' rules: a write needs the default agent's `memory` permission for the
-action (`remember`, `update`, `forget`) to be `allow`, `GET /memory/session`
-needs `session_search`, and an `ask` is a refusal. What such a token writes
-is a `client` record from a restricted writer. A record id belongs to the
+tools' rules: a write needs the `memory` permission for the action
+(`remember`, `update`, `forget`) to be `allow`, `GET /memory/session` needs
+`session_search`, and an `ask` is a refusal. The rules are the default
+agent's — what a session the token creates now starts from. A client that
+writes on behalf of a session says so with `?session=<id>` (a session of
+this directory the token may act in), and is then judged by that session's
+policy: its agent's rules, its own, and its ceilings (a trigger creator's
+bounds, the outside-input ceiling), exactly what the `memory` tool would
+meet there. What such a token writes is a `client` record from a restricted
+writer. A record id belongs to the
 instance's memory: an id from another project, or from another directory
 that is not a repository, is a 404 (see [Whose records](#whose-records),
 which also lists the `admin`-only `/memory/unattributed` routes).

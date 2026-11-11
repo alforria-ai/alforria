@@ -245,6 +245,16 @@ pre-1.0, so minor releases may include breaking changes.
 
 ### Fixed
 
+- Two more places judged a session by its agent's policy alone, without the
+  session's own rules and ceilings (a trigger creator's bounds, the
+  outside-input ceiling): the v2 permission ask
+  (`POST /api/session/{id}/permission`), and the `/memory` routes for a
+  token below `admin`. The v2 ask is now answered by the session's policy,
+  as every turn is; a memory write that names a session (`?session=<id>`)
+  is judged by that session's policy, and one that names none by the
+  default agent's as before. The goal reviewer's request, which has no
+  tools, now carries the session's policy too. For a session with no rules
+  or ceilings of its own, nothing changes.
 - A trigger run that was queued behind another when the server stopped no
   longer starts its turn after the shutdown has settled the others: it is
   recorded as skipped and, for a scheduled tick, the tick is given back. A
