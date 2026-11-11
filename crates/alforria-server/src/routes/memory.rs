@@ -13,6 +13,11 @@
 //! - `GET    /memory/{id}`         one record
 //! - `PATCH  /memory/{id}`         `{ content?, kind?, metadata?, archived? }`
 //! - `DELETE /memory/{id}`         `{ deleted }`
+//! - `GET    /memory/unattributed`       records that belong to no directory
+//!   (`?limit=`, `?offset=`) — `admin`
+//! - `PATCH  /memory/unattributed/{id}`  file one under this request's
+//!   directory — `admin`
+//! - `DELETE /memory/unattributed/{id}`  `{ deleted }` — `admin`
 //!
 //! Changes are announced by `memory.updated` (`{ id, action }`). With
 //! `memory.enabled` off every route answers 403.
@@ -36,8 +41,25 @@
 //!   the operator's, and its rewrite of an unverified record leaves it
 //!   unverified. Nothing in a body sets a record's origin or trust.
 //!
-//! A record id is looked up within the instance's memory (its project, or
-//! the global one): an id from elsewhere is a 404.
+//! A record id is looked up within the instance's memory: an id from
+//! elsewhere is a 404.
+//!
+//! # Whose records
+//!
+//! A repository's records are its project's, shared by its worktrees and
+//! subdirectories. A directory that is not a repository has no project of
+//! its own — all of them are the project `global` — so there the key is the
+//! request's directory as the allowlist resolved it
+//! ([`RequestDirectory`]): a token confined to one directory lists, reads,
+//! searches, changes and deletes that directory's records, and
+//! `/memory/session` reads that directory's sessions. `scope: "global"` is
+//! the user asking for one memory across everything, and is that.
+//!
+//! A `global` record with no directory (saved before this, with no session
+//! to tell where) is no directory's. The `/memory/unattributed` routes are
+//! the operator's — Basic auth or an `admin` token, the same line that
+//! makes a write the user's own act — to list them, file one under a
+//! directory, or delete it.
 
 use std::sync::Arc;
 
@@ -65,6 +87,11 @@ pub fn register(router: Router<Arc<ServerContext>>) -> Router<Arc<ServerContext>
         .route("/memory", get(list).post(create))
         .route("/memory/search", get(search))
         .route("/memory/session", get(search_sessions))
+        .route("/memory/unattributed", get(list_unattributed))
+        .route(
+            "/memory/unattributed/{id}",
+            axum::routing::patch(claim_unattributed).delete(remove_unattributed),
+        )
         .route("/memory/{id}", get(read).patch(update).delete(remove))
 }
 
@@ -279,5 +306,58 @@ async fn remove(
 ) -> Result<Json<Value>, ServerError> {
     let (memory, _, by) = writer(&ctx, &directory, &principal, "memory", "forget")?;
     let deleted = memory.forget_by(&id, &by).map_err(memory_error)?;
+    Ok(Json(json!({ "deleted": deleted })))
+}
+
+/// The operator's memory, for the records no directory has. The scope table
+/// asks for `admin` already; the handler does not rely on a table row.
+fn operator(
+    ctx: &ServerContext,
+    directory: &RequestDirectory,
+    principal: &Option<axum::Extension<Principal>>,
+) -> Result<Arc<MemoryService>, ServerError> {
+    if crate::confine::restricted(principal) {
+        return Err(ServerError::Api(ApiError::Forbidden {
+            message: "records that belong to no directory are the operator's: this needs the \
+                      admin scope"
+                .to_string(),
+        }));
+    }
+    memory(ctx, directory).map(|(memory, _)| memory)
+}
+
+async fn list_unattributed(
+    State(ctx): State<Arc<ServerContext>>,
+    principal: Option<axum::Extension<Principal>>,
+    uri: Uri,
+    axum::Extension(directory): axum::Extension<RequestDirectory>,
+) -> Result<Json<Vec<MemoryRecord>>, ServerError> {
+    operator(&ctx, &directory, &principal)?
+        .list_unattributed(number(&uri, "limit"), number(&uri, "offset").unwrap_or(0))
+        .map(Json)
+        .map_err(memory_error)
+}
+
+async fn claim_unattributed(
+    State(ctx): State<Arc<ServerContext>>,
+    principal: Option<axum::Extension<Principal>>,
+    axum::Extension(directory): axum::Extension<RequestDirectory>,
+    Path(id): Path<String>,
+) -> Result<Json<MemoryRecord>, ServerError> {
+    operator(&ctx, &directory, &principal)?
+        .claim_unattributed(&id)
+        .map(Json)
+        .map_err(memory_error)
+}
+
+async fn remove_unattributed(
+    State(ctx): State<Arc<ServerContext>>,
+    principal: Option<axum::Extension<Principal>>,
+    axum::Extension(directory): axum::Extension<RequestDirectory>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ServerError> {
+    let deleted = operator(&ctx, &directory, &principal)?
+        .forget_unattributed(&id)
+        .map_err(memory_error)?;
     Ok(Json(json!({ "deleted": deleted })))
 }

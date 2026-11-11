@@ -1624,3 +1624,550 @@ async fn a_file_part_from_a_token_below_admin_marks_the_session_as_provenance() 
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(marks(&f, &ours).await, (false, false));
 }
+
+async fn say(f: &Fixture, session: &str, auth: &str, text: &str) {
+    let (status, body) = json_of(
+        f,
+        "POST",
+        &format!("/session/{session}/message"),
+        auth,
+        Some(json!({ "parts": [{ "type": "text", "text": text }] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// Bring the transcript index up to date without waiting for text to settle.
+fn index_transcripts(f: &Fixture, directory: &std::path::Path) {
+    let services = f.ctx.instances.load(directory).unwrap();
+    let location = alforria_server::middleware::location::LocationContext {
+        directory: directory.to_path_buf(),
+        workspace_id: None,
+        services,
+    };
+    let (memory, _) = (f.ctx.engine_factory)(&location).unwrap().memory().unwrap();
+    memory.index_pending(1000, 0).unwrap();
+}
+
+fn ids_of(list: &Value) -> Vec<String> {
+    list.as_array()
+        .unwrap_or_else(|| panic!("not a list: {list}"))
+        .iter()
+        .map(|record| record["id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// M7. Two directories that are not repositories are both the project
+/// `global`, and memory was keyed on the project: a `chat` token confined
+/// to one of them listed, read, searched, changed and deleted the other's
+/// records, was shown them in its system context, and read excerpts of the
+/// other's sessions. The key is now the directory the allowlist admitted.
+#[tokio::test]
+async fn a_token_confined_to_one_directory_reaches_no_memory_or_transcript_of_another() {
+    let signer = Signer::new();
+    let f = fixture_with(host_config(&signer, json!({})), Some(PASSWORD), Vec::new());
+    // Neither directory is a repository; the token may open `repo` only.
+    let chat = bearer(&signer.token(AUDIENCE, "chat"));
+    let dir = dir_query(&f.dirs.repo);
+    let other = dir_query(&f.dirs.other);
+
+    // The operator works next door.
+    let (status, secret) = json_of(
+        &f,
+        "POST",
+        &format!("/memory?{other}"),
+        &basic(),
+        Some(json!({ "content": "Other-directory secret: the vault code is 4242." })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{secret}");
+    assert_eq!(secret["projectID"], "global");
+    assert_eq!(secret["directory"], f.dirs.other.display().to_string());
+    let id = secret["id"].as_str().unwrap().to_string();
+    let secret_session = create_session(&f, &f.dirs.other, &basic()).await;
+    say(
+        &f,
+        &secret_session,
+        &basic(),
+        "the zebra passphrase is tangerine",
+    )
+    .await;
+    assert!(
+        system_of(&f, f.llm.request_count() - 1).contains("4242"),
+        "its own directory's sessions are shown the record"
+    );
+
+    // The token cannot open that directory at all…
+    assert_eq!(
+        send(&f, "GET", &format!("/memory?{other}"), &chat, None).await,
+        StatusCode::FORBIDDEN
+    );
+    // …and from the one it may open, nothing of it is there.
+    let (status, list) = json_of(&f, "GET", &format!("/memory?{dir}"), &chat, None).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    assert_eq!(list, json!([]));
+    let (status, list) = json_of(
+        &f,
+        "GET",
+        &format!("/memory?archived=true&{dir}"),
+        &chat,
+        None,
+    )
+    .await;
+    assert_eq!((status, list), (StatusCode::OK, json!([])));
+    let (status, body) = json_of(&f, "GET", &format!("/memory/{id}?{dir}"), &chat, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    for query in ["vault", "4242.", "secret%20vault"] {
+        let (status, hits) = json_of(
+            &f,
+            "GET",
+            &format!("/memory/search?q={query}&archived=true&{dir}"),
+            &chat,
+            None,
+        )
+        .await;
+        assert_eq!((status, hits), (StatusCode::OK, json!([])), "{query}");
+    }
+    let (status, body) = json_of(
+        &f,
+        "PATCH",
+        &format!("/memory/{id}?{dir}"),
+        &chat,
+        Some(json!({ "content": "The vault code is 0000.", "archived": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    let (status, body) = json_of(&f, "DELETE", &format!("/memory/{id}?{dir}"), &chat, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["deleted"], false, "{body}");
+    // The operator is bound by the same key: it is the directory's, not
+    // the caller's.
+    let (status, body) = json_of(&f, "GET", &format!("/memory/{id}?{dir}"), &basic(), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    // The record is as it was.
+    let (_, still) = json_of(&f, "GET", &format!("/memory/{id}?{other}"), &basic(), None).await;
+    assert_eq!(still, secret);
+
+    // Its sessions are not shown the record either, restricted or not.
+    let chat_session = create_session(&f, &f.dirs.repo, &chat).await;
+    say(&f, &chat_session, &chat, "where is the zebra crossing").await;
+    let system = system_of(&f, f.llm.request_count() - 1);
+    assert!(!system.contains("4242"), "{system}");
+    let operator_session = create_session(&f, &f.dirs.repo, &basic()).await;
+    say(&f, &operator_session, &basic(), "hello").await;
+    let system = system_of(&f, f.llm.request_count() - 1);
+    assert!(!system.contains("4242"), "{system}");
+
+    // Transcripts: both directories' sessions mention the zebra. The token
+    // finds its own and no excerpt of the other's.
+    index_transcripts(&f, &f.dirs.repo);
+    let (status, found) = json_of(
+        &f,
+        "GET",
+        &format!("/memory/session?q=zebra&{dir}"),
+        &chat,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{found}");
+    let sessions: Vec<&str> = found["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|hit| hit["sessionID"].as_str().unwrap())
+        .collect();
+    assert!(!sessions.is_empty(), "{found}");
+    assert!(
+        sessions.iter().all(|session| *session == chat_session),
+        "{found}"
+    );
+    assert!(!found.to_string().contains("tangerine"), "{found}");
+    for query in ["tangerine", "passphrase%20tangerine"] {
+        let (status, found) = json_of(
+            &f,
+            "GET",
+            &format!("/memory/session?q={query}&{dir}"),
+            &chat,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{found}");
+        assert_eq!(found["hits"], json!([]), "{query}");
+    }
+    let (_, found) = json_of(
+        &f,
+        "GET",
+        &format!("/memory/session?q=tangerine&{other}"),
+        &basic(),
+        None,
+    )
+    .await;
+    assert!(found.to_string().contains(&secret_session), "{found}");
+
+    // What the token saves is its directory's, and the neighbour's
+    // sessions do not get it.
+    let (status, mine) = json_of(
+        &f,
+        "POST",
+        &format!("/memory?{dir}"),
+        &chat,
+        Some(json!({ "content": "The chat user prefers short answers." })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{mine}");
+    assert_eq!(mine["directory"], f.dirs.repo.display().to_string());
+    let (_, list) = json_of(&f, "GET", &format!("/memory?{other}"), &basic(), None).await;
+    assert_eq!(ids_of(&list), [id.as_str()]);
+}
+
+/// M7. The key is the directory as the server resolved it: every spelling
+/// of one directory is one set of records, and a link is the place it
+/// leads to — for the allowlist and for memory alike.
+#[cfg(unix)]
+#[tokio::test]
+async fn every_spelling_of_a_directory_is_one_memory_and_a_link_is_where_it_leads() {
+    let signer = Signer::new();
+    let f = fixture_with(host_config(&signer, json!({})), Some(PASSWORD), Vec::new());
+    let chat = bearer(&signer.token(AUDIENCE, "chat"));
+    let root = f.dirs.repo.parent().unwrap().to_path_buf();
+    std::fs::create_dir_all(f.dirs.repo.join("sub")).unwrap();
+    // A link to the allowed directory from outside it, and a link out of
+    // it to the neighbour.
+    std::os::unix::fs::symlink(&f.dirs.repo, root.join("alias")).unwrap();
+    std::os::unix::fs::symlink(&f.dirs.other, f.dirs.repo.join("next-door")).unwrap();
+
+    let (_, mine) = json_of(
+        &f,
+        "POST",
+        &format!("/memory?{}", dir_query(&f.dirs.repo)),
+        &chat,
+        Some(json!({ "content": "Saved under the plain spelling." })),
+    )
+    .await;
+    let mine = mine["id"].as_str().unwrap().to_string();
+    let (_, theirs) = json_of(
+        &f,
+        "POST",
+        &format!("/memory?{}", dir_query(&f.dirs.other)),
+        &basic(),
+        Some(json!({ "content": "The neighbour's record." })),
+    )
+    .await;
+    let theirs = theirs["id"].as_str().unwrap().to_string();
+
+    for spelling in [
+        root.join("alias"),
+        f.dirs.repo.join("sub").join(".."),
+        f.dirs.repo.join("."),
+        root.join("other").join("..").join("repo"),
+    ] {
+        let query = dir_query(&spelling);
+        let (status, list) = json_of(&f, "GET", &format!("/memory?{query}"), &chat, None).await;
+        assert_eq!(status, StatusCode::OK, "{}: {list}", spelling.display());
+        assert_eq!(ids_of(&list), [mine.as_str()], "{}", spelling.display());
+        let (status, saved) = json_of(
+            &f,
+            "POST",
+            &format!("/memory?{query}"),
+            &chat,
+            Some(json!({ "content": "Saved under another spelling." })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{saved}");
+        assert_eq!(
+            saved["directory"],
+            f.dirs.repo.display().to_string(),
+            "{}",
+            spelling.display()
+        );
+        assert_eq!(
+            send(
+                &f,
+                "DELETE",
+                &format!(
+                    "/memory/{}?{}",
+                    saved["id"].as_str().unwrap(),
+                    dir_query(&f.dirs.repo)
+                ),
+                &chat,
+                None
+            )
+            .await,
+            StatusCode::OK
+        );
+    }
+
+    // The link out of the allowed directory names the neighbour: the token
+    // is refused it, and for the operator it is the neighbour's memory.
+    let link = dir_query(&f.dirs.repo.join("next-door"));
+    assert_eq!(
+        send(&f, "GET", &format!("/memory?{link}"), &chat, None).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        send(&f, "GET", &format!("/memory/{theirs}?{link}"), &chat, None).await,
+        StatusCode::FORBIDDEN
+    );
+    let (status, list) = json_of(&f, "GET", &format!("/memory?{link}"), &basic(), None).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    assert_eq!(ids_of(&list), [theirs.as_str()]);
+    // A subdirectory that is not a repository is a directory of its own.
+    let sub = dir_query(&f.dirs.repo.join("sub"));
+    let (status, list) = json_of(&f, "GET", &format!("/memory?{sub}"), &basic(), None).await;
+    assert_eq!((status, list), (StatusCode::OK, json!([])));
+}
+
+/// M7 changes nothing for a repository: its records and transcripts are
+/// the project's, shared by its subdirectories and its worktrees.
+#[tokio::test]
+async fn a_repositorys_memory_is_shared_by_its_directories_and_worktrees() {
+    let signer = Signer::new();
+    let f = fixture_with(host_config(&signer, json!({})), Some(PASSWORD), Vec::new());
+    git_init(&f.dirs.repo);
+    std::fs::create_dir_all(f.dirs.repo.join("sub")).unwrap();
+    let worktree = f.dirs.repo.parent().unwrap().join("worktree");
+    let status = std::process::Command::new("git")
+        .args(["worktree", "add", "--quiet", "-b", "side"])
+        .arg(&worktree)
+        .current_dir(&f.dirs.repo)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .status()
+        .expect("git");
+    assert!(status.success());
+    let dir = dir_query(&f.dirs.repo);
+
+    let (status, record) = json_of(
+        &f,
+        "POST",
+        &format!("/memory?{dir}"),
+        &basic(),
+        Some(json!({ "content": "Run the linter before pushing." })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{record}");
+    assert_ne!(record["projectID"], "global");
+    assert!(record.get("directory").is_none(), "{record}");
+    let id = record["id"].as_str().unwrap().to_string();
+    let session = create_session(&f, &f.dirs.repo, &basic()).await;
+    say(&f, &session, &basic(), "the heron nests by the weir").await;
+    index_transcripts(&f, &f.dirs.repo);
+
+    for elsewhere in [f.dirs.repo.join("sub"), worktree.clone()] {
+        let query = dir_query(&elsewhere);
+        let name = elsewhere.display();
+        let (status, list) = json_of(&f, "GET", &format!("/memory?{query}"), &basic(), None).await;
+        assert_eq!(status, StatusCode::OK, "{name}: {list}");
+        assert_eq!(ids_of(&list), [id.as_str()], "{name}");
+        let (status, read) =
+            json_of(&f, "GET", &format!("/memory/{id}?{query}"), &basic(), None).await;
+        assert_eq!(status, StatusCode::OK, "{name}: {read}");
+        assert_eq!(read["content"], record["content"], "{name}");
+        let (_, hits) = json_of(
+            &f,
+            "GET",
+            &format!("/memory/search?q=linter&{query}"),
+            &basic(),
+            None,
+        )
+        .await;
+        assert_eq!(ids_of(&hits), [id.as_str()], "{name}");
+        let (status, changed) = json_of(
+            &f,
+            "PATCH",
+            &format!("/memory/{id}?{query}"),
+            &basic(),
+            Some(json!({ "metadata": { "seen": name.to_string() } })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{name}: {changed}");
+        let (_, found) = json_of(
+            &f,
+            "GET",
+            &format!("/memory/session?q=heron&{query}"),
+            &basic(),
+            None,
+        )
+        .await;
+        assert!(found.to_string().contains(&session), "{name}: {found}");
+        // A session there is shown the record.
+        let there = create_session(&f, &elsewhere, &basic()).await;
+        say(&f, &there, &basic(), "hello").await;
+        let system = system_of(&f, f.llm.request_count() - 1);
+        assert!(system.contains("linter before pushing"), "{name}: {system}");
+    }
+    let (_, deleted) = json_of(
+        &f,
+        "DELETE",
+        &format!("/memory/{id}?{}", dir_query(&worktree)),
+        &basic(),
+        None,
+    )
+    .await;
+    assert_eq!(deleted["deleted"], true);
+    let (_, list) = json_of(&f, "GET", &format!("/memory?{dir}"), &basic(), None).await;
+    assert_eq!(list, json!([]));
+}
+
+/// M7. A `global` record no directory can be found for (it was saved
+/// before records were kept per directory, by something that left no
+/// session) is shown to no directory. The operator — Basic auth or an
+/// `admin` token — lists such records, files one under a directory, or
+/// deletes it; a token below `admin` gets none of that.
+#[tokio::test]
+async fn unattributed_records_are_the_operators_to_list_file_and_delete() {
+    let signer = Signer::new();
+    let f = fixture_with(host_config(&signer, json!({})), Some(PASSWORD), Vec::new());
+    let dir = dir_query(&f.dirs.repo);
+    let other = dir_query(&f.dirs.other);
+    // As an upgraded database holds them: `global`, no directory.
+    let services = f.ctx.instances.load(&f.dirs.repo).unwrap();
+    for (id, content) in [
+        ("mem_old", "The legacy door code is 7711."),
+        ("mem_stale", "Something nobody wants."),
+    ] {
+        services.storage.with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO memory (id, project_id, kind, content, trust, provenance, time_created, time_updated)
+                 VALUES (?1, 'global', 'note', ?2, 'verified', '{\"source\":\"api\",\"untrusted\":false}', 1, 1)",
+                [id, content],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO memory_fts (content, id) VALUES (?1, ?2)",
+                [content, id],
+            )
+            .unwrap();
+        });
+    }
+
+    let admin = bearer(&signer.token(AUDIENCE, "admin"));
+    for token in ["chat", "connector"] {
+        let narrow = bearer(&signer.token(AUDIENCE, token));
+        for (method, path) in [
+            ("GET", "/memory/unattributed".to_string()),
+            ("PATCH", "/memory/unattributed/mem_old".to_string()),
+            ("DELETE", "/memory/unattributed/mem_old".to_string()),
+        ] {
+            assert_eq!(
+                send(&f, method, &format!("{path}?{dir}"), &narrow, None).await,
+                StatusCode::FORBIDDEN,
+                "{token}: {method} {path}"
+            );
+        }
+        // And nothing a directory asks finds one.
+        let (_, list) = json_of(
+            &f,
+            "GET",
+            &format!("/memory?archived=true&{dir}"),
+            &narrow,
+            None,
+        )
+        .await;
+        assert_eq!(list, json!([]), "{token}");
+        let (_, hits) = json_of(
+            &f,
+            "GET",
+            &format!("/memory/search?q=legacy&{dir}"),
+            &narrow,
+            None,
+        )
+        .await;
+        assert_eq!(hits, json!([]), "{token}");
+        assert_eq!(
+            send(&f, "GET", &format!("/memory/mem_old?{dir}"), &narrow, None).await,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            send(
+                &f,
+                "PATCH",
+                &format!("/memory/mem_old?{dir}"),
+                &narrow,
+                Some(json!({ "content": "x" }))
+            )
+            .await,
+            StatusCode::NOT_FOUND
+        );
+        let (_, deleted) = json_of(
+            &f,
+            "DELETE",
+            &format!("/memory/mem_old?{dir}"),
+            &narrow,
+            None,
+        )
+        .await;
+        assert_eq!(deleted["deleted"], false, "{token}");
+    }
+    let chat = bearer(&signer.token(AUDIENCE, "chat"));
+    let session = create_session(&f, &f.dirs.repo, &chat).await;
+    say(&f, &session, &chat, "hello").await;
+    assert!(!system_of(&f, f.llm.request_count() - 1).contains("7711"));
+    // Not the operator's ordinary view of a directory either.
+    let (_, list) = json_of(&f, "GET", &format!("/memory?{dir}"), &basic(), None).await;
+    assert_eq!(list, json!([]));
+
+    for operator in [basic(), admin] {
+        let (status, list) = json_of(
+            &f,
+            "GET",
+            &format!("/memory/unattributed?{dir}"),
+            &operator,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{list}");
+        assert_eq!(ids_of(&list), ["mem_stale", "mem_old"]);
+        assert!(list[0].get("directory").is_none(), "{list}");
+    }
+    // Filed under the directory the request names.
+    let (status, filed) = json_of(
+        &f,
+        "PATCH",
+        &format!("/memory/unattributed/mem_old?{other}"),
+        &basic(),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{filed}");
+    assert_eq!(filed["directory"], f.dirs.other.display().to_string());
+    assert_eq!(filed["verified"], true, "{filed}");
+    let (_, list) = json_of(&f, "GET", &format!("/memory?{other}"), &basic(), None).await;
+    assert_eq!(ids_of(&list), ["mem_old"]);
+    assert_eq!(
+        send(&f, "GET", &format!("/memory/mem_old?{dir}"), &chat, None).await,
+        StatusCode::NOT_FOUND,
+        "filed next door, it is next door's"
+    );
+    assert_eq!(
+        send(
+            &f,
+            "PATCH",
+            &format!("/memory/unattributed/mem_old?{dir}"),
+            &basic(),
+            None
+        )
+        .await,
+        StatusCode::NOT_FOUND,
+        "a record that has a directory is not up for filing"
+    );
+    let (status, deleted) = json_of(
+        &f,
+        "DELETE",
+        &format!("/memory/unattributed/mem_stale?{dir}"),
+        &basic(),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(deleted["deleted"], true);
+    let (_, list) = json_of(
+        &f,
+        "GET",
+        &format!("/memory/unattributed?{dir}"),
+        &basic(),
+        None,
+    )
+    .await;
+    assert_eq!(list, json!([]));
+}

@@ -112,6 +112,9 @@ pub const ROUTES: &[(&str, &str, Scope)] = &[
     ("POST", "/memory", Chat),
     ("GET", "/memory/search", Chat),
     ("GET", "/memory/session", Chat),
+    // Records that belong to no directory are the operator's. Listed, and
+    // before `/memory/{id}`, which the path would otherwise match.
+    ("GET", "/memory/unattributed", Scope::Admin),
     ("GET", "/memory/{id}", Chat),
     ("PATCH", "/memory/{id}", Chat),
     ("DELETE", "/memory/{id}", Chat),
@@ -159,6 +162,8 @@ const CWD_ROUTES: &[&str] = &[
     "/memory",
     "/memory/search",
     "/memory/session",
+    "/memory/unattributed",
+    "/memory/unattributed/{id}",
     "/memory/{id}",
 ];
 
@@ -291,6 +296,9 @@ mod tests {
             ("PUT", "/memory/note"),
             ("POST", "/memory/search"),
             ("POST", "/memory/mem_1/verify"),
+            ("GET", "/memory/unattributed"),
+            ("PATCH", "/memory/unattributed/mem_1"),
+            ("DELETE", "/memory/unattributed/mem_1"),
             ("GET", "/api/session/ses_1/history"),
             ("GET", "/api/event"),
             ("POST", "/api/session/ses_1/event"),
@@ -337,6 +345,7 @@ mod tests {
             ("POST", "/memory"),
             ("GET", "/memory/search"),
             ("GET", "/memory/session"),
+            ("GET", "/memory/unattributed"),
             ("GET", "/memory/{id}"),
             ("PATCH", "/memory/{id}"),
             ("DELETE", "/memory/{id}"),
