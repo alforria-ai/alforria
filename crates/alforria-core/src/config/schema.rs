@@ -213,6 +213,11 @@ pub struct ServerInfo {
     // --- alforria extensions (`config::host`), read from the host config ---
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shutdown: Option<super::host::ShutdownInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<super::host::ServerAuthInfo>,
+    /// The project directories a token without the `admin` scope may open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directories: Option<Vec<String>>,
 }
 
 // ---------------------------------------------------------------------------

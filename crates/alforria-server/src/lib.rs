@@ -2,6 +2,8 @@
 //! tagged-error wire envelopes, the CORS/compression/fence middleware quirks
 //! and the `serve` listener bootstrap.
 
+pub mod bearer;
+pub mod confine;
 pub mod engine;
 pub mod error;
 pub mod middleware;
@@ -254,7 +256,8 @@ pub fn production_context(
         runtime.clone(),
         seams,
     );
-    let mut auth = AuthConfig::from_env();
+    let policy = Arc::new(ServerPolicy::load(&paths));
+    let mut auth = AuthConfig::from_env().with_bearer(policy.bearer.clone());
     if let Some(password) = &opts.password {
         auth.password = Some(password.clone());
     }
@@ -266,7 +269,7 @@ pub fn production_context(
         opts.cors.clone(),
         ui_backend(),
     );
-    ctx.policy = Arc::new(ServerPolicy::load(&paths));
+    ctx.policy = policy;
     alforria_core::shell_env::install(ctx.policy.shell_env.clone());
     ctx.hosts = middleware::host::HostAllowlist::new(&opts.hostname, &opts.hosts, &opts.cors);
     ctx.engine_factory = engines.factory();

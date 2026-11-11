@@ -218,6 +218,9 @@ enum Rejection {
     SessionNotFound { session_id: String },
     /// Instance-load failure (config errors carry their own 400 envelope).
     Load(crate::error::ServerError),
+    /// The resolved directory is outside `server.directories` for a
+    /// credential narrower than `admin` (alforria extension).
+    Forbidden(String),
 }
 
 impl From<crate::error::ServerError> for Rejection {
@@ -246,6 +249,12 @@ impl Rejection {
                 .into_response()
             }
             Rejection::Load(err) => err.into_response(),
+            Rejection::Forbidden(directory) => crate::error::ApiError::Forbidden {
+                message: format!(
+                    "this token may not open {directory}: it is outside server.directories"
+                ),
+            }
+            .into_response(),
         }
     }
 }
@@ -351,7 +360,22 @@ impl<S> LocationService<S> {
         }
     }
 
-    fn load(&self, directory: &str) -> Result<Arc<SessionServices>, Rejection> {
+    /// Load the instance for the request's resolved directory. This is
+    /// where a session-derived directory meets the directory allowlist:
+    /// a credential narrower than `admin` is refused before the instance
+    /// (its config, its project) is touched.
+    fn load(
+        &self,
+        req: &Request<Body>,
+        directory: &str,
+    ) -> Result<Arc<SessionServices>, Rejection> {
+        let restricted = req
+            .extensions()
+            .get::<crate::bearer::Principal>()
+            .is_some_and(|principal| principal.restricted());
+        if restricted && !self.ctx.policy.directories.allows(Path::new(directory)) {
+            return Err(Rejection::Forbidden(directory.to_string()));
+        }
         self.ctx
             .instances
             .load(Path::new(directory))
@@ -406,7 +430,7 @@ impl<S> LocationService<S> {
         // `provideInstanceContext` decodes the resolved directory
         // (`instance-context.ts:15-21`).
         let directory = decode_best_effort(&directory);
-        let services = self.load(&directory)?;
+        let services = self.load(req, &directory)?;
         Ok(LocationContext {
             directory: crate::state::resolve_directory(Path::new(&directory)),
             workspace_id: env_workspace_id.or(workspace_id),
@@ -451,7 +475,7 @@ impl<S> LocationService<S> {
                 None => crate::state::cwd().display().to_string(),
             },
         };
-        let services = self.load(&directory)?;
+        let services = self.load(req, &directory)?;
         Ok(LocationContext {
             directory: crate::state::resolve_directory(Path::new(&directory)),
             workspace_id,
@@ -481,7 +505,7 @@ impl<S> LocationService<S> {
         };
         let directory = info.directory.clone();
         let workspace_id = info.workspace_id.clone();
-        let services = self.load(&directory)?;
+        let services = self.load(req, &directory)?;
         Ok(LocationContext {
             directory: crate::state::resolve_directory(Path::new(&directory)),
             workspace_id,

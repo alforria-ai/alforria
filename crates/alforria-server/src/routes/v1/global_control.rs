@@ -666,6 +666,7 @@ pub async fn find_symbol() -> Result<Response, ServerError> {
 /// `list` (`handlers/file.ts:66-93`).
 pub async fn file_list(
     axum::Extension(location): axum::Extension<LocationContext>,
+    principal: Option<axum::Extension<crate::bearer::Principal>>,
     uri: Uri,
 ) -> Result<Response, ServerError> {
     let path = match query_param(uri.query(), "path") {
@@ -674,6 +675,15 @@ pub async fn file_list(
     };
     let directory = &location.directory;
     let target = directory.join(&path);
+    // The operator's clients browse the whole filesystem through this route
+    // (the folder picker). A credential narrower than `admin` is confined
+    // to the project, like `content` below.
+    let restricted = principal.is_some_and(|principal| principal.0.restricted());
+    if restricted && !path_contains(directory, &target) {
+        return Err(ServerError::Api(crate::error::ApiError::Forbidden {
+            message: "this token may only list files inside the project".to_string(),
+        }));
+    }
     let entries = std::fs::read_dir(&target).map_err(defect)?;
     let ignore = CombinedIgnore::load(directory);
     let mut out: Vec<Value> = Vec::new();

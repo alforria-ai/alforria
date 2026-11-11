@@ -3,6 +3,7 @@
 
 pub mod agents;
 pub mod background;
+pub mod caller;
 pub mod compaction;
 pub mod error;
 pub mod event_definitions;

@@ -35,6 +35,7 @@ use crate::error::{ApiError, ServerError};
 use crate::middleware::auth::query_param;
 use crate::middleware::location::LocationContext;
 use crate::state::{ServerContext, SessionEngine};
+use alforria_core::session::prompt_input::PromptError;
 
 // ---------------------------------------------------------------------------
 // wire payloads (groups/session.ts)
@@ -285,6 +286,18 @@ struct ShellPayload {
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+/// A prompt or command the engine refused: 403 when the caller may not do
+/// it (alforria extension, `alforria_core::session::caller`), else the
+/// empty 400 upstream answers with.
+fn prompt_refusal(error: PromptError) -> Result<Response, ServerError> {
+    match error {
+        PromptError::Forbidden { message } => {
+            Err(ServerError::Api(ApiError::Forbidden { message }))
+        }
+        _ => Ok(bad_request_empty()),
+    }
+}
 
 fn json_ok(value: impl serde::Serialize) -> Response {
     let body = serde_json::to_string(&value).expect("serialization cannot fail");
@@ -698,6 +711,7 @@ pub async fn message(
 pub async fn create(
     State(state): State<Arc<ServerContext>>,
     axum::Extension(location): axum::Extension<LocationContext>,
+    principal: Option<axum::Extension<crate::bearer::Principal>>,
     body: Bytes,
 ) -> Result<Response, ServerError> {
     let payload: Option<CreatePayload> = if String::from_utf8_lossy(&body).trim().is_empty() {
@@ -716,6 +730,17 @@ pub async fn create(
             }
         }
     };
+    // alforria extension: below `admin`, a session cannot be created with
+    // its own permission rules or a workspace. (The agent it names is
+    // judged when a turn is about to run as it, in core.)
+    if let (true, Some(payload)) = (crate::confine::restricted(&principal), &payload) {
+        crate::confine::check_no_ruleset(payload.permission.is_some())?;
+        if payload.workspace_id.is_some() {
+            return Err(ServerError::Api(ApiError::Forbidden {
+                message: "selecting a workspace needs the admin scope".to_string(),
+            }));
+        }
+    }
     let input = match payload.map(|p| decode_create_payload(&p)) {
         Some(Ok(input)) => Some(input),
         Some(Err(())) => return Ok(bad_request_empty()),
@@ -775,10 +800,14 @@ pub async fn remove(
 /// `update` (`handlers/session.ts:183-204`).
 pub async fn update(
     axum::Extension(location): axum::Extension<LocationContext>,
+    principal: Option<axum::Extension<crate::bearer::Principal>>,
     Path(session_id): Path<String>,
     body: Bytes,
 ) -> Result<Response, ServerError> {
     let payload: UpdatePayload = parse_payload(&body)?;
+    if crate::confine::restricted(&principal) {
+        crate::confine::check_no_ruleset(payload.permission.is_some())?;
+    }
     let current = require_session(&location, &session_id)?;
     if let Some(title) = &payload.title {
         location
@@ -875,6 +904,7 @@ pub async fn abort(
 pub async fn init(
     State(ctx): State<Arc<ServerContext>>,
     axum::Extension(location): axum::Extension<LocationContext>,
+    principal: Option<axum::Extension<crate::bearer::Principal>>,
     Path(session_id): Path<String>,
     body: Bytes,
 ) -> Result<Response, ServerError> {
@@ -892,11 +922,12 @@ pub async fn init(
             arguments: String::new(),
             command: "init".to_string(),
             parts: Vec::new(),
+            caller: crate::confine::caller(&principal),
         })
         .await
     {
         Ok(_) => Ok(json_ok(true)),
-        Err(_) => Ok(bad_request_empty()),
+        Err(error) => prompt_refusal(error),
     }
 }
 
@@ -1009,6 +1040,7 @@ pub async fn summarize(
 pub async fn prompt(
     State(ctx): State<Arc<ServerContext>>,
     axum::Extension(location): axum::Extension<LocationContext>,
+    principal: Option<axum::Extension<crate::bearer::Principal>>,
     Path(session_id): Path<String>,
     body: Bytes,
 ) -> Result<Response, ServerError> {
@@ -1020,6 +1052,7 @@ pub async fn prompt(
     let engine = engine(&ctx, &location)?;
     let message = match engine
         .prompt(PromptInput {
+            caller: crate::confine::caller(&principal),
             session_id: session_id.clone(),
             message_id: payload.message_id,
             model: payload.model.map(|m| session::prompt_input::ModelRef {
@@ -1041,7 +1074,7 @@ pub async fn prompt(
         .await
     {
         Ok(message) => message,
-        Err(_) => return Ok(bad_request_empty()),
+        Err(error) => return prompt_refusal(error),
     };
     Ok(json_ok(with_parts_json(&message)))
 }
@@ -1051,6 +1084,7 @@ pub async fn prompt(
 pub async fn prompt_async(
     State(ctx): State<Arc<ServerContext>>,
     axum::Extension(location): axum::Extension<LocationContext>,
+    principal: Option<axum::Extension<crate::bearer::Principal>>,
     Path(session_id): Path<String>,
     body: Bytes,
 ) -> Result<Response, ServerError> {
@@ -1062,6 +1096,7 @@ pub async fn prompt_async(
     let engine = engine(&ctx, &location)?;
     let services = location.services.clone();
     let input = PromptInput {
+        caller: crate::confine::caller(&principal),
         session_id: session_id.clone(),
         message_id: payload.message_id,
         model: payload.model.map(|m| session::prompt_input::ModelRef {
@@ -1104,6 +1139,7 @@ pub async fn prompt_async(
 pub async fn command(
     State(ctx): State<Arc<ServerContext>>,
     axum::Extension(location): axum::Extension<LocationContext>,
+    principal: Option<axum::Extension<crate::bearer::Principal>>,
     Path(session_id): Path<String>,
     body: Bytes,
 ) -> Result<Response, ServerError> {
@@ -1131,11 +1167,12 @@ pub async fn command(
                     url: part.url,
                 })
                 .collect(),
+            caller: crate::confine::caller(&principal),
         })
         .await
     {
         Ok(message) => message,
-        Err(_) => return Ok(bad_request_empty()),
+        Err(error) => return prompt_refusal(error),
     };
     Ok(json_ok(with_parts_json(&message)))
 }
@@ -1214,13 +1251,18 @@ pub async fn unrevert(
 
 /// `permissionRespond` (`handlers/session.ts:362-378`) — deprecated.
 pub async fn permission_respond(
+    State(ctx): State<Arc<ServerContext>>,
     axum::Extension(location): axum::Extension<LocationContext>,
+    principal: Option<axum::Extension<crate::bearer::Principal>>,
     Path((session_id, permission_id)): Path<(String, String)>,
     body: Bytes,
 ) -> Result<Response, ServerError> {
     require_param("per", &permission_id)?;
     require_session(&location, &session_id)?;
     let payload: PermissionResponsePayload = parse_payload(&body)?;
+    if crate::confine::restricted(&principal) {
+        crate::confine::check_reply(&ctx, payload.response)?;
+    }
     match location.services.permission.reply(PermissionV1ReplyInput {
         request_id: permission_id,
         reply: payload.response,

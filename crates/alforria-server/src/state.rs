@@ -34,6 +34,9 @@ use crate::sse::{GlobalBus, GlobalEvent, INSTANCE_DISPOSED_TYPE};
 pub struct AuthConfig {
     pub username: String,
     pub password: Option<String>,
+    /// Bearer authentication (alforria extension, `server.auth.bearer`):
+    /// static tokens and Ed25519 JWTs with scopes, next to Basic.
+    pub bearer: Option<Arc<crate::bearer::BearerAuth>>,
 }
 
 impl AuthConfig {
@@ -41,7 +44,21 @@ impl AuthConfig {
         AuthConfig {
             username: username.into(),
             password,
+            bearer: None,
         }
+    }
+
+    /// The same config, also accepting bearer credentials.
+    pub fn with_bearer(mut self, bearer: Option<Arc<crate::bearer::BearerAuth>>) -> AuthConfig {
+        self.bearer = bearer;
+        self
+    }
+
+    /// Whether Basic auth has a password to check (`auth.ts:24-26`).
+    pub fn password_required(&self) -> bool {
+        self.password
+            .as_ref()
+            .is_some_and(|password| !password.is_empty())
     }
 
     pub fn from_env() -> AuthConfig {
@@ -52,6 +69,7 @@ impl AuthConfig {
             username: std::env::var("OPENCODE_SERVER_USERNAME")
                 .unwrap_or_else(|_| "alforria".to_string()),
             password: std::env::var("OPENCODE_SERVER_PASSWORD").ok(),
+            bearer: None,
         }
     }
 
@@ -61,20 +79,21 @@ impl AuthConfig {
         uuid::Uuid::new_v4().simple().to_string()
     }
 
-    /// Auth is enforced only when the password is present *and* non-empty
-    /// (`auth.ts:24-26`).
+    /// Auth is enforced when the password is present *and* non-empty
+    /// (`auth.ts:24-26`), or when bearer authentication is configured.
     pub fn required(&self) -> bool {
-        match &self.password {
-            Some(password) => !password.is_empty(),
-            None => false,
-        }
+        self.password_required() || self.bearer.is_some()
     }
 
-    /// `authorized` (`auth.ts:22-28`).
+    /// `authorized` (`auth.ts:22-28`). An empty password never authorizes:
+    /// upstream only gets here with one set, but with bearer authentication
+    /// configured a request can reach this check without.
     pub fn authorized(&self, username: &str, password: &str) -> bool {
         match &self.password {
-            Some(expected) => username == self.username && password == expected,
-            None => false,
+            Some(expected) if !expected.is_empty() => {
+                username == self.username && password == expected
+            }
+            _ => false,
         }
     }
 
@@ -372,7 +391,7 @@ pub fn cwd() -> PathBuf {
 
 /// `path.resolve`-style lexical normalization — collapse `.`/`..` without
 /// touching the filesystem; `..` above the root clamps to the root.
-fn lexical_normalize(path: &Path) -> PathBuf {
+pub(crate) fn lexical_normalize(path: &Path) -> PathBuf {
     let mut parts: Vec<OsString> = Vec::new();
     let mut root = PathBuf::new();
     for component in path.components() {

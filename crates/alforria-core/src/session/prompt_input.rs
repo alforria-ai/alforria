@@ -14,6 +14,7 @@
 //! against Node 24): the "no-escape" set is `[A-Za-z0-9]` plus
 //! `!$&'()*+,-./:;=@_` — note `~`, `?` and `#` ARE escaped.
 
+use crate::session::caller::Caller;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -131,6 +132,11 @@ pub struct PromptInput {
     pub system: Option<String>,
     pub variant: Option<String>,
     pub parts: Vec<PromptPartInput>,
+    /// Who is asking (alforria extension, [`crate::session::caller`]). The
+    /// restrictions of a caller below `admin` are enforced where the
+    /// effective agent, tools and files are resolved, in
+    /// [`create_user_message`].
+    pub caller: Caller,
 }
 
 // ---------------------------------------------------------------------------
@@ -217,6 +223,9 @@ pub struct PromptDeps<'a> {
     pub lsp: &'a dyn LspServer,
     pub images: &'a dyn ImageNormalizer,
     pub worktree: PathBuf,
+    /// The instance directory: with `worktree`, the project a restricted
+    /// caller's file parts are confined to.
+    pub directory: PathBuf,
     pub now_ms: u64,
 }
 
@@ -228,6 +237,9 @@ pub enum PromptError {
     Session(#[from] SessionError),
     #[error("{message}")]
     Unknown { message: String },
+    /// The caller may not do this ([`crate::session::caller::Caller`]).
+    #[error("{message}")]
+    Forbidden { message: String },
 }
 
 /// `NamedError.Unknown` — published as
@@ -467,7 +479,7 @@ fn is_file_name_char(c: char) -> bool {
 }
 
 /// All `matchAll` captures of `FILE_REGEX` — the group-1 strings, in order.
-fn file_matches(template: &str) -> Vec<String> {
+pub fn file_matches(template: &str) -> Vec<String> {
     let chars: Vec<(usize, char)> = template.char_indices().collect();
     let mut out = Vec::new();
     let mut idx = 0;
@@ -655,6 +667,18 @@ pub async fn create_user_message(
     deps: &PromptDeps<'_>,
     input: &PromptInput,
 ) -> Result<CreateUserMessage, PromptError> {
+    // alforria extension: ids are upserts. A message or part id of the
+    // caller's choosing could name one that already exists and replace it —
+    // a tool result, an earlier answer. A caller below `admin` does not
+    // choose ids; the server assigns them.
+    let assigned;
+    let input = if input.caller.is_restricted() {
+        assigned = without_caller_ids(input);
+        &assigned
+    } else {
+        input
+    };
+
     // 641-651 — agent resolution.
     let agent_name = input.agent.as_deref();
     let ag = match agent_name {
@@ -685,6 +709,48 @@ pub async fn create_user_message(
                 message: err.to_string(),
             })?,
     };
+
+    // alforria extension: what a caller below `admin` may ask for, judged
+    // on the values this turn will actually use — the agent just resolved
+    // (whether the request, the session or the default named it), the
+    // session being prompted, the tools map and the parts as they will be
+    // stored — before anything is written.
+    if input.caller.is_restricted() {
+        let forbid = |message: String| PromptError::Forbidden { message };
+        // A subagent's session is driven by its parent's turn.
+        if deps.sessions.get(&input.session_id)?.parent_id.is_some() {
+            return Err(forbid(
+                "this token may not prompt a subagent's session directly".to_string(),
+            ));
+        }
+        input.caller.check_agent(&ag).map_err(forbid)?;
+        input
+            .caller
+            .check_tools(input.tools.as_ref())
+            .map_err(forbid)?;
+        for part in &input.parts {
+            match part {
+                // An agent part makes the turn skip the `task` permission
+                // ask for that agent (`bypass_agent_check`).
+                PromptPartInput::Agent { .. } => {
+                    return Err(forbid(
+                        "this token may not address an agent with an agent part".to_string(),
+                    ))
+                }
+                // A subtask part starts a subagent with an agent, model and
+                // command of the caller's choosing.
+                PromptPartInput::Subtask { .. } => {
+                    return Err(forbid(
+                        "this token may not start a subtask directly".to_string(),
+                    ))
+                }
+                PromptPartInput::File { url, source, .. } => {
+                    check_restricted_file(deps, input.caller, url, source).map_err(forbid)?
+                }
+                PromptPartInput::Text { .. } => {}
+            }
+        }
+    }
 
     // 653-663 — model resolution + variant fallback.
     let model = match (&input.model, &ag.model) {
@@ -891,6 +957,47 @@ async fn exec_read(
     (deps.read.execute)(args, ctx)
         .await
         .map_err(|err| err.to_string())
+}
+
+/// `input` with every caller-chosen message and part id dropped.
+fn without_caller_ids(input: &PromptInput) -> PromptInput {
+    let mut input = input.clone();
+    input.message_id = None;
+    for part in &mut input.parts {
+        match part {
+            PromptPartInput::Text { id, .. }
+            | PromptPartInput::File { id, .. }
+            | PromptPartInput::Agent { id, .. }
+            | PromptPartInput::Subtask { id, .. } => *id = None,
+        }
+    }
+    input
+}
+
+/// What a file part from a restricted caller may be: inline data, or a
+/// `file:` URL inside the project. Anything that would make the server (or
+/// the provider, on its behalf) fetch from somewhere of the caller's
+/// choosing — an MCP resource, `http(s):`, any other scheme — is refused.
+fn check_restricted_file(
+    deps: &PromptDeps<'_>,
+    caller: Caller,
+    url: &str,
+    source: &Option<V1FilePartSource>,
+) -> Result<(), String> {
+    if !caller.is_restricted() {
+        return Ok(());
+    }
+    if matches!(source, Some(V1FilePartSource::Resource { .. })) {
+        return Err("this token may not attach an MCP resource".to_string());
+    }
+    // Exactly the two spellings the resolver below acts on; any other
+    // (another scheme, another case, a bare path) is not something this
+    // caller gets to hand to the server or the provider.
+    match url.split(':').next().unwrap_or_default() {
+        "data" => Ok(()),
+        "file" => caller.check_read(&file_url_to_path(url), &deps.directory, &deps.worktree),
+        _ => Err("this token may only attach inline data or files inside the project".to_string()),
+    }
 }
 
 /// `resolvePart` (prompt.ts:699-993): one input part to resolved parts.
@@ -1103,6 +1210,12 @@ async fn resolve_file_part(
         // 819-970 — file: URLs.
         ("file", _) => {
             let filepath = file_url_to_path(url);
+            // The read itself: a restricted caller's path is judged here,
+            // on the path about to be opened, whatever produced the part.
+            input
+                .caller
+                .check_read(&filepath, &deps.directory, &deps.worktree)
+                .map_err(|message| PromptError::Forbidden { message })?;
             let part_mime = if filepath.is_dir() {
                 "application/x-directory".to_string()
             } else {
@@ -1647,6 +1760,7 @@ mod tests {
         lsp: &'a dyn LspServer,
     ) -> PromptDeps<'a> {
         PromptDeps {
+            directory: std::path::PathBuf::from("/"),
             events: &h.services.events,
             sessions: &h.services.sessions,
             agents: &h.services.agents,
@@ -1662,6 +1776,7 @@ mod tests {
 
     fn input(session_id: &str, parts: Vec<PromptPartInput>) -> PromptInput {
         PromptInput {
+            caller: Default::default(),
             session_id: session_id.to_string(),
             message_id: Some("msg_user".to_string()),
             model: Some(ModelRef {

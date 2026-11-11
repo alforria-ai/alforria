@@ -50,12 +50,33 @@ pre-1.0, so minor releases may include breaking changes.
   `server.shutdown.sessions: "drain"`), kill the terminals and tool processes,
   checkpoint the database and exit 0, all within `server.shutdown.timeout`
   (default 10 s). See `docs/unattended-server.md`.
+- Bearer authentication next to HTTP Basic (`server.auth.bearer` in the
+  global config): static tokens stored as SHA-256 digests, and Ed25519 JWTs
+  verified against configured public keys, with `exp`, `nbf`, `aud` and an
+  optional `iss` enforced. A token carries a scope: `chat` (sessions,
+  messages, events, permission and question replies, project files),
+  `connector` (chat plus local automation) or `admin` (everything). Routes
+  not listed for a scope need `admin`. `server.directories` lists the project
+  directories a token narrower than `admin` may open; by default that is the
+  server's working directory. With bearer authentication configured and no
+  password set, `alforria serve` generates none. A token below `admin` cannot
+  run shell directly, set permission rules, switch tools on, pick hidden
+  agents or answer a permission request `always`
+  (`server.auth.bearer.reply_always` opts in); the threat model is in
+  `docs/unattended-server.md`.
 - `shell_env` (global config) controls what the agent's shells inherit from
   the server's environment: `inherit` (`"all"`, `"none"` or a list), `allow`,
   `set` and `deny`.
 
 ### Fixed
 
+- A custom command ran inline shell found in its *arguments*: `/cmd` with an
+  argument containing `` !`…` ``, or one that broke out of the template's own
+  `` !`…` ``, executed it with no permission check. Inline shell is now taken
+  from the configured template only, and the arguments reach it as shell
+  parameters (`$1`, `$ARGUMENTS`) instead of being pasted into the command.
+  Templates that relied on an argument being pasted in as shell source
+  (rather than as a value) need rewriting.
 - Stopping a session `shell` command (`POST /session/{id}/shell`) did not
   kill it: the command was never given the process group the stop signals.
 - A file path containing `..` could write, search or read outside the project

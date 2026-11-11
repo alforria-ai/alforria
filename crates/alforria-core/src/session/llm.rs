@@ -668,7 +668,7 @@ enum Dispatch {
 /// (processor.ts:436), and the default ai-sdk runtime likewise delays
 /// `finish-step` until the step's tool results are in — so the step's
 /// `patch` part and the turn diff see the tools' file edits.
-fn dispatch_tool_calls(stream: LlmEventStream, tools: Vec<LlmTool>) -> LlmEventStream {
+pub fn dispatch_tool_calls(stream: LlmEventStream, tools: Vec<LlmTool>) -> LlmEventStream {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let state = Dispatch::Streaming {
         stream,

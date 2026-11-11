@@ -855,6 +855,9 @@ impl SessionPrompt {
                 system: None,
                 variant,
                 parts,
+                // Later rounds are the engine's own; the first one is
+                // whoever typed `/goal`.
+                caller: chosen.map(|input| input.caller).unwrap_or_default(),
             })
             .await,
         )

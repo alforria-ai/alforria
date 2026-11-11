@@ -358,3 +358,65 @@ async fn the_agents_shells_cannot_read_denied_variables() {
     assert!(response.status().is_success(), "{}", response.status());
     check(&read_env_dump(&run.project.join("pty-env.txt")), "terminal");
 }
+
+/// With `server.auth.bearer` in the host config and no
+/// `OPENCODE_SERVER_PASSWORD`, `serve` neither warns that it is unsecured
+/// nor generates and prints a password: tokens are the only way in.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bearer_configured_server_prints_no_password_and_takes_tokens() {
+    use std::io::{BufRead, BufReader};
+
+    let env = Env::new("bearer-only");
+    // sha256("operator-token")
+    let digest = "0850123315d21ab90f4f7236408a52ef6dbd6a02a6550e5c10dc73f4d993680e";
+    write_host_config(
+        &env,
+        json!({ "server": { "auth": { "bearer": { "tokens_sha256": [digest] } } } }),
+    );
+    let mut child = env
+        .command(&["serve", "--port", "0"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn serve");
+    let stdout = child.stdout.take().expect("stdout");
+    let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let sink = lines.clone();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            sink.lock().unwrap().push(line);
+        }
+    });
+    let url = wait_for("the handshake", || {
+        lines.lock().unwrap().iter().find_map(|line| {
+            line.strip_prefix("alforria server listening on ")
+                .map(str::to_string)
+        })
+    });
+
+    let http = reqwest::Client::new();
+    let anonymous = http
+        .get(format!("{url}/global/health"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status().as_u16(), 401);
+    let authorized = http
+        .get(format!("{url}/global/health"))
+        .bearer_auth("operator-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(authorized.status().as_u16(), 200);
+
+    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+    let status = child.wait().expect("serve exits");
+    assert_eq!(status.code(), Some(0));
+    let printed = lines.lock().unwrap().clone();
+    assert_eq!(
+        printed.len(),
+        1,
+        "only the handshake is printed: {printed:?}"
+    );
+}

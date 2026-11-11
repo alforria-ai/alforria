@@ -104,6 +104,78 @@ pub struct ShutdownInfo {
 }
 
 // ---------------------------------------------------------------------------
+// server.auth.bearer, server.directories
+// ---------------------------------------------------------------------------
+
+/// One string or a list of them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum OneOrMany {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl OneOrMany {
+    pub fn to_vec(&self) -> Vec<String> {
+        match self {
+            OneOrMany::One(value) => vec![value.clone()],
+            OneOrMany::Many(values) => values.clone(),
+        }
+    }
+}
+
+/// A static bearer token, held as the SHA-256 of the token: a bare hex
+/// digest (scope `admin`), or a digest with the scope it grants.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum BearerTokenInfo {
+    Digest(String),
+    Scoped {
+        sha256: String,
+        /// Space-separated scopes (`chat`, `connector`, `admin`); `admin`
+        /// when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<String>,
+        /// A label for logs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
+}
+
+/// `server.auth.bearer` — bearer authentication next to HTTP Basic.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct BearerAuthInfo {
+    /// Ed25519 public keys that sign the JWTs this server accepts: PEM
+    /// (`BEGIN PUBLIC KEY`), or base64 / hex of the raw 32-byte key or of
+    /// its SPKI DER.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keys: Option<Vec<String>>,
+    /// The `aud` a JWT must carry (any of these). Required with `keys`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audience: Option<OneOrMany>,
+    /// The `iss` a JWT must carry, when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
+    /// Clock skew tolerated on `exp` / `nbf` (default 30 s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leeway: Option<DurationSetting>,
+    /// Static tokens, as SHA-256 digests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_sha256: Option<Vec<BearerTokenInfo>>,
+    /// Let a credential below `admin` answer a permission request `always`
+    /// (a standing allow rule). Off by default: `once` and `reject` only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_always: Option<bool>,
+}
+
+/// `server.auth`.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct ServerAuthInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bearer: Option<BearerAuthInfo>,
+}
+
+// ---------------------------------------------------------------------------
 // shell_env
 // ---------------------------------------------------------------------------
 

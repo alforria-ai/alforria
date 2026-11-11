@@ -48,6 +48,11 @@ same care as any other tool that can execute code on your machine.
 - Setting `OPENCODE_SERVER_PASSWORD` to an empty string is an explicit opt-out:
   the server prints a warning and runs unauthenticated. Do not do this on a
   shared or public network.
+- `server.auth.bearer` in the global config adds bearer credentials next to
+  Basic: static tokens held as SHA-256 digests and Ed25519 JWTs checked
+  against public keys, each limited to a scope (`chat`, `connector`, `admin`)
+  and, below `admin`, to the directories in `server.directories`. See
+  `docs/unattended-server.md`.
 - The server rejects foreign `Origin` headers, permits its own origin and
   loopback names, and accepts extra origins only through `--cors`.
 - PTY websockets refuse foreign origins.

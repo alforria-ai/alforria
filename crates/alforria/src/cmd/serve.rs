@@ -34,6 +34,16 @@ pub fn generated_password_for(env: Option<&str>) -> Option<String> {
     }
 }
 
+/// Whether the host config sets up bearer authentication
+/// (`server.auth.bearer`). Such a server is not unsecured without a
+/// password, and is not given a generated one: the tokens are its access
+/// control, and a password printed to a supervisor's log would be a second,
+/// weaker way in.
+pub fn bearer_configured() -> bool {
+    let paths = alforria_core::GlobalPaths::from_env();
+    alforria_server::ServerPolicy::load(&paths).bearer.is_some()
+}
+
 /// The lines after the handshake telling the user how to sign in.
 pub fn credentials_lines(username: &str, password: &str) -> String {
     format!("  username: {username}\n  password: {password}\n")
@@ -73,8 +83,13 @@ pub fn init_logging_from_env() {
 pub fn run(matches: &ArgMatches, ui: &mut Ui, raw: &[OsString]) -> Result<(), TypedError> {
     init_logging_from_env();
     let env_password = std::env::var("OPENCODE_SERVER_PASSWORD").ok();
-    let generated = generated_password_for(env_password.as_deref());
-    if generated.is_none() && !password_set() {
+    let bearer = bearer_configured();
+    let generated = if bearer {
+        None
+    } else {
+        generated_password_for(env_password.as_deref())
+    };
+    if generated.is_none() && !password_set() && !bearer {
         ui.write_stdout(&format!("{UNSECURED_WARNING}\n"));
     }
     let args = NetworkOptions::from_matches(matches);

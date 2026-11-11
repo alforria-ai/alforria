@@ -330,6 +330,7 @@ impl TaskOps for ProductionTaskOps {
                 .ok()
                 .and_then(|session| session.agent.clone());
             let input = crate::session::prompt_input::PromptInput {
+                caller: Default::default(),
                 session_id: parent_session_id.to_string(),
                 message_id: None,
                 model: None,
@@ -366,6 +367,7 @@ impl ProductionTaskOps {
     ) -> Result<PromptOutcome, ToolError> {
         let facade = self.facade()?;
         let input = crate::session::prompt_input::PromptInput {
+            caller: Default::default(),
             session_id: session_id.to_string(),
             message_id: Some(crate::session::ids::MessageId::ascending(None).map_err(tool_error)?),
             model: Some(crate::session::prompt_input::ModelRef {

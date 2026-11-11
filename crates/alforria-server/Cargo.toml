@@ -6,6 +6,8 @@ license.workspace = true
 
 [dependencies]
 sha2 = { workspace = true }
+ring = { workspace = true }
+hex = { workspace = true }
 alforria-llm = { workspace = true }
 alforria-schema = { workspace = true }
 alforria-core = { workspace = true }
