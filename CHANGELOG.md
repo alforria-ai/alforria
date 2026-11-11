@@ -54,6 +54,20 @@ pre-1.0, so minor releases may include breaking changes.
   its own triggers and one-shot reminders, gated by a `schedule` permission.
   It only changes triggers its own conversation scheduled, and what it
   schedules runs under the rules its creator had.
+- Long-term memory (`memory.enabled`, off by default): a `memory` tool that
+  saves typed records (fact, preference, task, note) and searches them, the
+  most recent of which are added to the system context of every step in a
+  fenced `<memory>` block, and a `session_search` tool for full-text search
+  across past sessions. `memory.scope` keeps memory per project or shares it;
+  `memory.flush_before_compaction` gives the model one bounded chance to save
+  what matters before a compaction. Also `GET/POST /memory`,
+  `GET/PATCH/DELETE /memory/{id}`, `GET /memory/search` and
+  `GET /memory/session`. The transcript index is built in the background and
+  costs nothing when a message is written. Records carry where they came
+  from, and those written by a flush or by a run that carried outside text
+  are searched but not injected. `memory` and `trigger` settings are read
+  from your own config only; a project may at most switch memory off. See
+  `docs/assistant.md`.
 - `alforria migrate` moves an install from the `opencode` directories to
   alforria's own (see Changed). `--copy` copies the data instead of moving it,
   `--fresh` starts a new database and keeps the saved logins, `--dry-run`

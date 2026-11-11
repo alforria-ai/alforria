@@ -203,6 +203,10 @@ pub trait SessionEngine: Send + Sync {
     fn triggers(&self) -> Option<Arc<alforria_core::trigger::TriggerService>> {
         None
     }
+    /// The instance's memory and the id of its project (alforria extension).
+    fn memory(&self) -> Option<(Arc<alforria_core::memory::MemoryService>, String)> {
+        None
+    }
 }
 
 fn workflows_unavailable() -> ServerError {

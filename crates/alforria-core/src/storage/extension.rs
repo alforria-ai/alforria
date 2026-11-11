@@ -12,10 +12,20 @@ use rusqlite::Connection;
 use crate::CoreError;
 
 /// Every alforria migration, in the order it is applied. Append only.
-pub const MIGRATIONS: &[(&str, &str)] = &[(
-    "trigger_0001_init",
-    include_str!("migrations/trigger_0001_init.sql"),
-)];
+pub const MIGRATIONS: &[(&str, &str)] = &[
+    (
+        "trigger_0001_init",
+        include_str!("migrations/trigger_0001_init.sql"),
+    ),
+    (
+        "memory_0001_init",
+        include_str!("migrations/memory_0001_init.sql"),
+    ),
+    (
+        "memory_0002_provenance",
+        include_str!("migrations/memory_0002_provenance.sql"),
+    ),
+];
 
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -30,7 +40,10 @@ pub fn apply(conn: &mut Connection) -> Result<(), CoreError> {
     apply_set(conn, MIGRATIONS)
 }
 
-fn apply_set(conn: &mut Connection, migrations: &[(&str, &str)]) -> Result<(), CoreError> {
+pub(crate) fn apply_set(
+    conn: &mut Connection,
+    migrations: &[(&str, &str)],
+) -> Result<(), CoreError> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS alforria_migration (id TEXT PRIMARY KEY, time_completed INTEGER NOT NULL)",
         [],
@@ -96,8 +109,10 @@ mod tests {
     }
 
     #[test]
-    fn the_shipped_migrations_apply_to_an_empty_database() {
+    fn the_shipped_migrations_apply_to_a_fresh_database() {
         let mut conn = Connection::open_in_memory().unwrap();
+        // They sit on top of the upstream schema, as in `Storage::open`.
+        crate::storage::migration::apply(&mut conn).unwrap();
         apply(&mut conn).unwrap();
         apply(&mut conn).unwrap();
         assert!(tables(&conn).contains(&"trigger".to_string()));

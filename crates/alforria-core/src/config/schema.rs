@@ -1284,6 +1284,8 @@ pub struct Config {
     pub trigger: Option<BTreeMap<String, crate::trigger::TriggerSpec>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub triggers: Option<crate::config::extension::TriggersInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<crate::config::extension::MemoryInfo>,
 }
 
 /// Decode + validate a raw config value against the full wire schema.
@@ -1386,6 +1388,7 @@ fn collect_issues(value: &serde_json::Value) -> Vec<crate::SchemaIssue> {
             "experimental" => check!(issues, key, ExperimentalInfo),
             "trigger" => check!(issues, key, BTreeMap<String, crate::trigger::TriggerSpec>),
             "triggers" => check!(issues, key, crate::config::extension::TriggersInfo),
+            "memory" => check!(issues, key, crate::config::extension::MemoryInfo),
             _ => {}
         }
     }

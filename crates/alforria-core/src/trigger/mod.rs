@@ -25,7 +25,7 @@ use crate::config::schema::PermissionInfo;
 use crate::event::definition::Definition;
 use crate::tool::def::BoxFuture;
 
-pub use rules::{session_rules, RunRules, READ_ONLY};
+pub use rules::{session_rules, session_untrusted, RunRules, READ_ONLY, UNTRUSTED_KEY};
 pub use schedule::{format_duration, format_instant, parse_duration, parse_instant, CronSchedule};
 pub use service::{TriggerService, TriggerSettings};
 

@@ -446,6 +446,25 @@ pub struct CreateInput {
     pub path: Option<String>,
 }
 
+/// The session metadata key that marks a session whose prompts carry text
+/// from outside (an alforria extension): a webhook or watch trigger started
+/// it, or it descends from a session that has the mark. It is written when
+/// the session is created and never removed.
+pub const UNTRUSTED_INPUT_KEY: &str = "untrustedInput";
+
+/// The one definition of "this session carries untrusted input": the stored
+/// mark. [`UNTRUSTED_INPUT_SQL`] is the same test in SQL.
+pub fn carries_untrusted_input(session: &V1SessionInfo) -> bool {
+    session
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get(UNTRUSTED_INPUT_KEY))
+        == Some(&serde_json::Value::Bool(true))
+}
+
+/// [`carries_untrusted_input`] for a `session` row aliased `s`.
+pub const UNTRUSTED_INPUT_SQL: &str = "COALESCE(json_extract(s.metadata, '$.untrustedInput'), 0)";
+
 /// `Session.Service` (session.ts:486-985).
 #[derive(Clone)]
 pub struct SessionStore {
@@ -490,6 +509,23 @@ impl SessionStore {
         input: &CreateInput,
     ) -> Result<V1SessionInfo, SessionError> {
         let now = self.now();
+        // alforria extension: a session that descends from one carrying
+        // outside text carries it too. The mark is written here, once, so
+        // nothing has to walk the ancestors later; a parent that cannot be
+        // read counts as marked.
+        let mut metadata = input.metadata.clone();
+        if let Some(parent_id) = &input.parent_id {
+            let inherited = self
+                .get(parent_id)
+                .map(|parent| carries_untrusted_input(&parent))
+                .unwrap_or(true);
+            if inherited {
+                metadata.get_or_insert_with(JsonMap::new).insert(
+                    UNTRUSTED_INPUT_KEY.to_string(),
+                    serde_json::Value::Bool(true),
+                );
+            }
+        }
         let title = input.title.clone().unwrap_or_else(|| {
             format!(
                 "{}{}",
@@ -516,7 +552,7 @@ impl SessionStore {
             title,
             agent: input.agent.clone(),
             model: input.model.clone(),
-            metadata: input.metadata.clone(),
+            metadata,
             permission: input.permission.clone(),
             cost: Some(0.0),
             tokens: Some(empty_tokens()),
@@ -852,6 +888,18 @@ impl SessionStore {
 
     /// `setMetadata` (session.ts:761-763).
     pub fn set_metadata(&self, session_id: &str, metadata: JsonMap) -> Result<(), SessionError> {
+        // alforria extension: the untrusted-input mark is sticky. Replacing
+        // the metadata can set it, never clear it.
+        let mut metadata = metadata;
+        if self
+            .get(session_id)
+            .is_ok_and(|session| carries_untrusted_input(&session))
+        {
+            metadata.insert(
+                UNTRUSTED_INPUT_KEY.to_string(),
+                serde_json::Value::Bool(true),
+            );
+        }
         self.patch(
             session_id,
             SessionPatch {

@@ -518,11 +518,23 @@ pub struct CompactionDeps {
 /// `SessionCompaction.Service` (compaction.ts:165-191).
 pub struct SessionCompaction {
     deps: CompactionDeps,
+    /// Called once with the text about to be summarised (alforria
+    /// extension: `memory.flush_before_compaction`).
+    before: Option<Arc<dyn crate::memory::flush::BeforeCompaction>>,
 }
 
 impl SessionCompaction {
     pub fn new(deps: CompactionDeps) -> SessionCompaction {
-        SessionCompaction { deps }
+        SessionCompaction { deps, before: None }
+    }
+
+    /// Run `hook` before each summary is written.
+    pub fn with_before(
+        mut self,
+        hook: Option<Arc<dyn crate::memory::flush::BeforeCompaction>>,
+    ) -> SessionCompaction {
+        self.before = hook;
+        self
     }
 
     fn storage_error(message: impl Into<String>) -> SessionError {
@@ -773,6 +785,18 @@ impl SessionCompaction {
             .filter(|text| !text.is_empty())
             .collect::<Vec<_>>()
             .join("\n\n");
+        // alforria extension, the single call site: before the conversation
+        // is replaced by its summary, the hook may save memories from it.
+        if let Some(hook) = &self.before {
+            hook.before_compaction(crate::memory::flush::FlushInput {
+                session_id: &input.session_id,
+                conversation: &conversation,
+                agent: &user_agent,
+                user: &user_message,
+                model: &model,
+            })
+            .await;
+        }
         let next_prompt = match compacting_prompt {
             Some(prompt) => [
                 prompt,
@@ -2004,6 +2028,66 @@ mod tests {
         assert_eq!(result[0].user_index, 0);
         assert_eq!(result[0].assistant_index, 1);
         assert_eq!(result[0].summary.as_deref(), Some("done"));
+    }
+
+    /// alforria extension: the hook sees the conversation once, before the
+    /// summary request (`memory.flush_before_compaction`).
+    #[tokio::test]
+    async fn process_calls_the_before_hook_once_with_the_conversation() {
+        use crate::memory::flush::{BeforeCompaction, FlushInput};
+        use crate::session::message::filter_compacted;
+        use crate::session::test_support::{create_session, text_stream};
+
+        struct Recorder {
+            seen: std::sync::Mutex<Vec<(String, String, usize)>>,
+            llm: std::sync::Arc<crate::session::test_support::MockLlm>,
+        }
+        impl BeforeCompaction for Recorder {
+            fn before_compaction<'a>(
+                &'a self,
+                input: FlushInput<'a>,
+            ) -> crate::tool::def::BoxFuture<'a, ()> {
+                Box::pin(async move {
+                    self.seen.lock().unwrap().push((
+                        input.session_id.to_string(),
+                        input.conversation.to_string(),
+                        self.llm.calls(),
+                    ));
+                })
+            }
+        }
+
+        let h = harness("compaction-before-hook", vec![text_stream("## Objective")]);
+        let session = create_session(&h.services.sessions, &h.worktree);
+        push_message(&h, &user_message(&session.id, "msg_u1", 1.0));
+        h.services
+            .sessions
+            .update_part(&text_part(&session.id, "msg_u1", "prt_u1", "fix the bug"))
+            .unwrap();
+        create_compaction(&h, &session.id, true, false).await;
+        let parent_id = last_user_id(&h, &session.id);
+        let msgs = filter_compacted(h.services.messages.stream(&session.id).unwrap());
+        let recorder = std::sync::Arc::new(Recorder {
+            seen: std::sync::Mutex::new(Vec::new()),
+            llm: h.llm.clone(),
+        });
+        compaction_service(&h)
+            .with_before(Some(recorder.clone()))
+            .process(crate::session::r#loop::CompactionProcess {
+                messages: msgs,
+                parent_id,
+                session_id: session.id.clone(),
+                auto: true,
+                overflow: None,
+            })
+            .await
+            .unwrap();
+        let seen = recorder.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, session.id);
+        assert!(seen[0].1.contains("fix the bug"), "{}", seen[0].1);
+        assert_eq!(seen[0].2, 0, "before the summary request");
+        assert_eq!(h.llm.calls(), 1);
     }
 
     #[test]

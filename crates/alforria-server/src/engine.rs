@@ -239,6 +239,10 @@ pub struct ProductionEngine {
     workflows: Arc<WorkflowService>,
     /// Scheduled and event-started turns (alforria extension).
     triggers: Arc<alforria_core::trigger::TriggerService>,
+    /// Long-term memory records and transcript search (alforria extension).
+    memory: Arc<alforria_core::memory::MemoryService>,
+    /// The project `session_search` and `/memory` act for.
+    project_id: String,
 }
 
 /// The [`SessionEngine`] surface (`state.rs`) over the M5 services. The
@@ -392,6 +396,10 @@ impl SessionEngine for ProductionEngine {
 
     fn triggers(&self) -> Option<Arc<alforria_core::trigger::TriggerService>> {
         Some(self.triggers.clone())
+    }
+
+    fn memory(&self) -> Option<(Arc<alforria_core::memory::MemoryService>, String)> {
+        Some((self.memory.clone(), self.project_id.clone()))
     }
 }
 
@@ -650,9 +658,14 @@ struct EngineSystemPrompts {
     mcp: Arc<alforria_core::mcp::McpService>,
     directory: PathBuf,
     worktree: PathBuf,
+    memory: Arc<alforria_core::memory::MemoryService>,
 }
 
 impl alforria_core::session::r#loop::SystemPrompts for EngineSystemPrompts {
+    fn memory(&self) -> Option<String> {
+        self.memory.injection()
+    }
+
     fn environment(&self, model: &alforria_core::session::llm::LlmModel) -> Vec<String> {
         alforria_core::session::system::environment(
             &alforria_core::session::system::EnvironmentModel {
@@ -872,6 +885,36 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
     let workflows = WorkflowService::new(
         workflow_ops.clone() as Arc<dyn WorkflowOps>,
         workflow_settings,
+    );
+    // Memory (alforria extension): off unless the config turns it on.
+    let memory_config = input.config.memory.clone().unwrap_or_default();
+    let memory_inject = memory_config.inject.clone().unwrap_or_default();
+    let memory_global =
+        memory_config.scope == Some(alforria_core::config::extension::MemoryScope::Global);
+    let project_id = context.project_id.clone();
+    let memory = alforria_core::memory::MemoryService::new(
+        services.storage.clone(),
+        Some(services.events.clone()),
+        clock.clone(),
+        alforria_core::memory::MemorySettings {
+            enabled: memory_config.enabled == Some(true) && !bool_env("OPENCODE_DISABLE_MEMORY"),
+            project_id: if memory_global {
+                alforria_core::GLOBAL_ID.to_string()
+            } else {
+                project_id.clone()
+            },
+            global: memory_global,
+            inject_recent: memory_inject
+                .recent
+                .map(|value| value as usize)
+                .unwrap_or(alforria_core::memory::MemorySettings::DEFAULT_INJECT_RECENT),
+            inject_max_chars: memory_inject
+                .max_chars
+                .map(|value| value as usize)
+                .unwrap_or(alforria_core::memory::MemorySettings::DEFAULT_INJECT_MAX_CHARS),
+            inject_unverified: memory_inject.unverified == Some(true),
+            flush_before_compaction: memory_config.flush_before_compaction == Some(true),
+        },
     );
     // Triggers (alforria extension): the config's plus the stored ones.
     let trigger_ops = alforria_core::session::trigger_ops::ProductionTriggerOps::new(
@@ -1165,6 +1208,23 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
             }),
         ));
     }
+    if memory.enabled() {
+        let sessions = services.sessions.clone();
+        builtin.push(alforria_core::tool::memory::memory_tool(
+            truncate.clone(),
+            agents.clone(),
+            memory.clone(),
+            Arc::new(move |session_id: &str| {
+                alforria_core::trigger::session_untrusted(&sessions, session_id)
+            }),
+        ));
+        builtin.push(alforria_core::tool::memory::session_search_tool(
+            truncate.clone(),
+            agents.clone(),
+            memory.clone(),
+            project_id.clone(),
+        ));
+    }
     // -- end of the always-on assistant tools ---------------------------------
     let registry = Arc::new(
         ToolRegistry::new(
@@ -1210,8 +1270,18 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
         state: services.run_state.clone(),
         data_dir: input.paths.data.clone(),
     }));
-    let compaction: Arc<dyn alforria_core::session::r#loop::Compaction> =
-        Arc::new(SessionCompaction::new(CompactionDeps {
+    let memory_flush: Option<Arc<dyn alforria_core::memory::flush::BeforeCompaction>> =
+        (memory.enabled() && memory.settings().flush_before_compaction).then(|| {
+            Arc::new(alforria_core::memory::flush::MemoryFlush {
+                memory: memory.clone(),
+                llm: llm.clone(),
+                sessions: services.sessions.clone(),
+                agents: services.agents.clone(),
+                client: client_env(),
+            }) as Arc<dyn alforria_core::memory::flush::BeforeCompaction>
+        });
+    let compaction: Arc<dyn alforria_core::session::r#loop::Compaction> = Arc::new(
+        SessionCompaction::new(CompactionDeps {
             sessions: services.sessions.clone(),
             messages: services.messages.clone(),
             events: services.events.clone(),
@@ -1228,7 +1298,9 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
             output_token_max: crate::provider_runtime::output_token_max(),
             project_id: None,
             client: client_env(),
-        }));
+        })
+        .with_before(memory_flush),
+    );
 
     let instruction = Arc::new(Instruction::new(
         InstructionFlags {
@@ -1262,6 +1334,7 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
             mcp: mcp_service.clone(),
             directory: input.directory.clone(),
             worktree: input.worktree.clone(),
+            memory: memory.clone(),
         }),
         registry: (*registry).clone(),
         revert: revert.clone(),
@@ -1286,6 +1359,10 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
     trigger_ops.bind(prompt.clone());
     if input.runtime.schedule {
         triggers.start();
+    }
+    // Index past sessions in the background, wherever a server lives on.
+    if input.runtime.schedule {
+        memory.start_indexer();
     }
 
     // M7.5: the share network service (share-next.ts) behind its HTTP +
@@ -1336,6 +1413,8 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
         llm,
         workflows,
         triggers,
+        memory,
+        project_id,
     }))
 }
 

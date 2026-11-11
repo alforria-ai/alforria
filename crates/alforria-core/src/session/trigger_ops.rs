@@ -76,6 +76,11 @@ impl ProductionTriggerOps {
         let permission = self.rules(turn);
         let mut metadata = JsonMap::new();
         metadata.insert("triggerID".to_string(), json!(turn.trigger_id));
+        if turn.untrusted {
+            // Read by anything that must not take this session's word for
+            // things, such as the memory flush before a compaction.
+            metadata.insert(crate::trigger::UNTRUSTED_KEY.to_string(), json!(true));
+        }
         let session = self
             .sessions
             .create(

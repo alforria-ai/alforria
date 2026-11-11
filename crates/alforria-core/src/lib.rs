@@ -21,6 +21,7 @@ pub mod jsonc;
 pub mod libertai;
 pub mod lsp;
 pub mod mcp;
+pub mod memory;
 pub mod merge;
 pub mod paths;
 pub mod project;
