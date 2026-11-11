@@ -30,19 +30,6 @@ pub const READ_ONLY: [&str; 7] = [
     "invalid",
 ];
 
-pub use crate::session::store::UNTRUSTED_INPUT_KEY as UNTRUSTED_KEY;
-
-/// Whether `session_id` carries text from outside: the mark stored on the
-/// session ([`crate::session::store::carries_untrusted_input`]), which a
-/// session gets from the trigger that started it or from its parent when it
-/// is created. A session that cannot be read counts as carrying it.
-pub fn session_untrusted(sessions: &crate::session::store::SessionStore, session_id: &str) -> bool {
-    sessions
-        .get(session_id)
-        .map(|session| crate::session::store::carries_untrusted_input(&session))
-        .unwrap_or(true)
-}
-
 fn rule(permission: &str, pattern: &str, action: PermissionV1Action) -> PermissionV1Rule {
     PermissionV1Rule {
         permission: permission.to_string(),
@@ -345,7 +332,7 @@ mod tests {
     /// inherited at creation however deep, and never cleared.
     #[tokio::test]
     async fn the_untrusted_mark_is_inherited_at_creation_and_is_sticky() {
-        use crate::session::store::{carries_untrusted_input, CreateInput, UNTRUSTED_INPUT_KEY};
+        use crate::session::store::{CreateInput, SessionMark};
         use crate::session::test_support::{create_engine_session, engine};
         let e = engine("untrusted-mark", Vec::new());
         let sessions = &e.services.sessions;
@@ -364,16 +351,14 @@ mod tests {
         };
         // A trigger run, its subagent, and that subagent's subagent.
         let run = create_engine_session(&e);
-        let mut mark = alforria_schema::schema::JsonMap::new();
-        mark.insert(UNTRUSTED_INPUT_KEY.to_string(), serde_json::json!(true));
-        sessions.set_metadata(&run.id, mark).unwrap();
+        sessions.mark(&run.id, SessionMark::OutsideStart).unwrap();
         let sub = child_of(&run.id, None);
         let mut own = alforria_schema::schema::JsonMap::new();
         own.insert("workflowAgent".to_string(), serde_json::json!("general"));
         let subsub = child_of(&sub.id, Some(own));
         for id in [&run.id, &sub.id, &subsub.id] {
-            assert!(carries_untrusted_input(&sessions.get(id).unwrap()), "{id}");
-            assert!(session_untrusted(sessions, id), "{id}");
+            assert!(sessions.started_by_outside_input(id), "{id}");
+            assert!(sessions.seen_outside_content(id), "{id}");
         }
         assert_eq!(
             subsub.metadata.as_ref().unwrap()["workflowAgent"],
@@ -381,21 +366,21 @@ mod tests {
         );
         // A fork copies the conversation, and the mark with it.
         let fork = sessions.fork(&context, &subsub.id, None).unwrap();
-        assert!(session_untrusted(sessions, &fork.id));
+        assert!(sessions.started_by_outside_input(&fork.id));
         // Replacing the metadata cannot clear it.
         sessions
             .set_metadata(&subsub.id, alforria_schema::schema::JsonMap::new())
             .unwrap();
-        assert!(session_untrusted(sessions, &subsub.id));
+        assert!(sessions.started_by_outside_input(&subsub.id));
         // An ordinary session and its children are not marked.
         let plain = create_engine_session(&e);
         let plain_child = child_of(&plain.id, None);
-        assert!(!session_untrusted(sessions, &plain.id));
-        assert!(!session_untrusted(sessions, &plain_child.id));
+        assert!(!sessions.started_by_outside_input(&plain.id));
+        assert!(!sessions.started_by_outside_input(&plain_child.id));
         // What cannot be read is not vouched for.
-        assert!(session_untrusted(sessions, "ses_missing"));
+        assert!(sessions.started_by_outside_input("ses_missing"));
         let lost = child_of("ses_missing", None);
-        assert!(session_untrusted(sessions, &lost.id));
+        assert!(sessions.started_by_outside_input(&lost.id));
     }
 
     #[test]

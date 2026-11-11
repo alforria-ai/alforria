@@ -1581,7 +1581,7 @@ mod tests {
                     conn.query_row(
                         &format!(
                             "SELECT {}, s.metadata FROM session s WHERE s.id = ?1",
-                            crate::session::store::UNTRUSTED_INPUT_SQL
+                            crate::session::store::SessionMark::OutsideStart.sql("s.id")
                         ),
                         [id],
                         |row| Ok((row.get::<_, i64>(0)? != 0, row.get(1)?)),

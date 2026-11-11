@@ -49,6 +49,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "memory_0002_provenance",
         include_str!("alforria_migrations/memory_0002_provenance.sql"),
     ),
+    (
+        "0006_session_mark",
+        include_str!("alforria_migrations/0006_session_mark.sql"),
+    ),
 ];
 
 /// The journal table.
@@ -61,6 +65,7 @@ pub const JOURNAL: &str = "alforria_migration";
 pub const OWN_TABLES: &[&str] = &[
     JOURNAL,
     "session_restriction",
+    "session_mark",
     "outbox",
     "trigger",
     "trigger_state",
@@ -393,6 +398,94 @@ mod tests {
         }
         let conn = Connection::open(&path).unwrap();
         assert_eq!(journal(&conn), all_ids());
+    }
+
+    /// The marks that lived in client-writable session metadata move to
+    /// `session_mark`, with every descendant; anything that is not plainly
+    /// "no" counts, and the metadata key goes.
+    #[test]
+    fn metadata_marks_move_to_the_servers_table_with_their_descendants() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::storage::migration::apply(&mut conn).unwrap();
+        let before: Vec<_> = MIGRATIONS
+            .iter()
+            .copied()
+            .take_while(|(id, _)| *id != "0006_session_mark")
+            .collect();
+        apply_set(&mut conn, &before).unwrap();
+        conn.execute_batch(
+            "INSERT INTO project (id, worktree, sandboxes, time_created, time_updated) VALUES ('proj', '/p', '[]', 1, 1);",
+        )
+        .unwrap();
+        let insert = |id: &str, parent: Option<&str>, metadata: Option<&str>| {
+            conn.execute(
+                "INSERT INTO session (id, project_id, parent_id, slug, directory, title, version, metadata, time_created, time_updated)
+                 VALUES (?1, 'proj', ?2, ?1, '/p', 't', '1', ?3, 1, 1)",
+                rusqlite::params![id, parent, metadata],
+            )
+            .unwrap();
+        };
+        insert(
+            "ses_true",
+            None,
+            Some(r#"{"untrustedInput":true,"note":1}"#),
+        );
+        insert("ses_child", Some("ses_true"), None);
+        insert("ses_grand", Some("ses_child"), Some(r#"{"k":"v"}"#));
+        // What a client could store: Rust read these as unmarked, SQL as
+        // marked or as an error. They count.
+        insert("ses_one", None, Some(r#"{"untrustedInput":1}"#));
+        insert("ses_yes", None, Some(r#"{"untrustedInput":"yes"}"#));
+        insert("ses_obj", None, Some(r#"{"untrustedInput":{"x":1}}"#));
+        // Plainly no.
+        insert("ses_false", None, Some(r#"{"untrustedInput":false}"#));
+        insert("ses_zero", None, Some(r#"{"untrustedInput":0}"#));
+        insert("ses_null", None, Some(r#"{"untrustedInput":null}"#));
+        insert("ses_plain", None, None);
+        insert("ses_bad", None, Some("not json"));
+        apply(&mut conn).unwrap();
+        let marked = |id: &str| -> (bool, bool) {
+            use crate::session::store::SessionMark;
+            conn.query_row(
+                &format!(
+                    "SELECT {}, {}",
+                    SessionMark::OutsideContent.sql("?1"),
+                    SessionMark::OutsideStart.sql("?1")
+                ),
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        };
+        for id in [
+            "ses_true",
+            "ses_child",
+            "ses_grand",
+            "ses_one",
+            "ses_yes",
+            "ses_obj",
+        ] {
+            assert_eq!(marked(id), (true, true), "{id}");
+        }
+        for id in ["ses_false", "ses_zero", "ses_null", "ses_plain", "ses_bad"] {
+            assert_eq!(marked(id), (false, false), "{id}");
+        }
+        let left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session WHERE json_valid(metadata) AND json_type(metadata, '$.untrustedInput') IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 0, "the metadata key is gone");
+        let kept: String = conn
+            .query_row(
+                "SELECT metadata FROM session WHERE id = 'ses_true'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, r#"{"note":1}"#);
     }
 
     /// The order is the list's, and the list only grows at its end: the

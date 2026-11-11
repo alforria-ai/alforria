@@ -179,7 +179,7 @@ impl SessionServices {
                 // context's and the processor's: `SessionAsk`,
                 // `AskPermission`), so an id that does not resolve is never
                 // the ordinary case.
-                crate::trigger::session_untrusted(&sessions, session_id)
+                sessions.started_by_outside_input(session_id)
             })
         }));
         let question = Arc::new(QuestionService::new(events.clone()));

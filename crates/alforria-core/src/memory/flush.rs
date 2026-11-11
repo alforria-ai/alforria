@@ -182,7 +182,7 @@ impl MemoryFlush {
             );
             return 0;
         }
-        let untrusted = crate::trigger::session_untrusted(&self.sessions, input.session_id);
+        let untrusted = self.sessions.seen_outside_content(input.session_id);
         let written = Arc::new(AtomicUsize::new(0));
         let stream_input = StreamInput {
             user: input.user.clone(),
@@ -479,11 +479,12 @@ mod tests {
     async fn a_granted_untrusted_session_flushes_marked_records_that_are_not_injected() {
         use PermissionV1Action::{Allow, Deny};
         let f = fixture("memory-flush-untrusted", true, facts(2));
-        let mut metadata = alforria_schema::schema::JsonMap::new();
-        metadata.insert(crate::trigger::UNTRUSTED_KEY.to_string(), json!(true));
         f.h.services
             .sessions
-            .set_metadata(&f.session_id, metadata)
+            .mark(
+                &f.session_id,
+                crate::session::store::SessionMark::OutsideStart,
+            )
             .unwrap();
         // The ceiling, then the trigger's own grant.
         f.h.services

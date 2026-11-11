@@ -664,7 +664,7 @@ pub async fn run_loop(
                     prompt_ops: deps.prompt_ops.clone(),
                     cancel: cancel.clone(),
                     // A restriction that cannot be read counts as one.
-                    guard_loader_paths: crate::session::store::carries_untrusted_input(&session)
+                    guard_loader_paths: deps.sessions.started_by_outside_input(&session.id)
                         || deps.sessions.is_restricted(&session.id).unwrap_or(true),
                 },
             )

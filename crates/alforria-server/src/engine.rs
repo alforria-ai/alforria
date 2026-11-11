@@ -1353,9 +1353,7 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
             memory.clone(),
             Arc::new({
                 let sessions = sessions.clone();
-                move |session_id: &str| {
-                    alforria_core::trigger::session_untrusted(&sessions, session_id)
-                }
+                move |session_id: &str| sessions.seen_outside_content(session_id)
             }),
             // A restriction that cannot be read counts as one.
             Arc::new(move |session_id: &str| sessions.is_restricted(session_id).unwrap_or(true)),

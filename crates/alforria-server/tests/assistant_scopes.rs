@@ -91,6 +91,24 @@ async fn restricted(f: &Fixture, session: &str) -> bool {
     body["restricted"].as_bool().unwrap()
 }
 
+/// The session's marks, as the server stores them: `(outsideContent,
+/// outsideStart)`.
+async fn marks(f: &Fixture, session: &str) -> (bool, bool) {
+    let (status, body) = json_of(
+        f,
+        "GET",
+        &format!("/session/{session}/restriction"),
+        &basic(),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    (
+        body["outsideContent"].as_bool().unwrap(),
+        body["outsideStart"].as_bool().unwrap(),
+    )
+}
+
 async fn session_info(f: &Fixture, session: &str) -> Value {
     let (status, body) = json_of(f, "GET", &format!("/session/{session}"), &basic(), None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -908,7 +926,11 @@ async fn a_session_can_be_restricted_and_untrusted_and_both_marks_hold() {
     // standing approval did not apply.
     assert!(restricted(&f, &session).await);
     let info = session_info(&f, &session).await;
-    assert_eq!(info["metadata"]["untrustedInput"], true, "{info}");
+    assert_eq!(marks(&f, &session).await, (true, true));
+    assert!(
+        info["metadata"].get("untrustedInput").is_none(),
+        "the marks are the server's, not metadata: {info}"
+    );
     assert!(!marker.exists(), "an untrusted run executed a command");
     let asked: Vec<String> = f
         .ctx
@@ -944,7 +966,9 @@ async fn a_session_can_be_restricted_and_untrusted_and_both_marks_hold() {
     .await;
     assert!(status.is_success() || status == StatusCode::BAD_REQUEST);
     let info = session_info(&f, &session).await;
-    assert_eq!(info["metadata"]["untrustedInput"], true, "{info}");
+    assert_eq!(marks(&f, &session).await, (true, true));
+    assert!(info["metadata"].get("untrustedInput").is_none(), "{info}");
+    assert_eq!(info["metadata"]["triggerID"], "deliveries", "{info}");
     assert!(restricted(&f, &session).await);
     assert_eq!(
         send(
@@ -972,7 +996,7 @@ async fn a_session_can_be_restricted_and_untrusted_and_both_marks_hold() {
     let fork_id = fork["id"].as_str().unwrap().to_string();
     assert!(restricted(&f, &fork_id).await);
     let fork_info = session_info(&f, &fork_id).await;
-    assert_eq!(fork_info["metadata"]["untrustedInput"], true, "{fork_info}");
+    assert_eq!(marks(&f, &fork_id).await, (true, true));
     assert_eq!(fork_info["permission"], info["permission"], "{fork_info}");
     assert!(
         fork_info["permission"]
@@ -1003,7 +1027,8 @@ async fn a_session_can_be_restricted_and_untrusted_and_both_marks_hold() {
             "depth {depth}"
         );
         assert!(
-            alforria_core::session::store::carries_untrusted_input(&child),
+            services.sessions.started_by_outside_input(&child.id)
+                && services.sessions.seen_outside_content(&child.id),
             "depth {depth}"
         );
         parent = child.id;
@@ -1022,8 +1047,7 @@ async fn a_session_can_be_restricted_and_untrusted_and_both_marks_hold() {
         StatusCode::OK
     );
     assert!(!restricted(&f, &session).await);
-    let info = session_info(&f, &session).await;
-    assert_eq!(info["metadata"]["untrustedInput"], true, "{info}");
+    assert_eq!(marks(&f, &session).await, (true, true));
     // And the chat client's trigger no longer runs in that session: it
     // starts one of its own kind instead of prompting the operator's.
     let (status, _) = json_of(
@@ -1475,4 +1499,76 @@ async fn a_trigger_scheduled_from_a_restricted_session_stays_restricted() {
     let requests = f.llm.requests.lock().unwrap();
     let sent = serde_json::to_string(&requests.last().unwrap().messages).unwrap();
     assert!(sent.contains("Check in with @notes.txt"), "{sent}");
+}
+
+/// M8: the session marks are server-owned. A chat token that writes
+/// `untrustedInput` into a session's metadata — as a boolean on create, as
+/// a string or a number on update — sets no mark, stores no reserved key,
+/// and cannot make the operator's transcript search fail (it used to answer
+/// 500 for everyone once such a session was indexed).
+#[tokio::test]
+async fn client_metadata_cannot_set_a_mark_or_break_session_search() {
+    let signer = Signer::new();
+    let f = fixture_with(
+        host_config(&signer, json!({})),
+        Some(PASSWORD),
+        vec![support::text_turn("noted"), support::text_turn("ok")],
+    );
+    git_init(&f.dirs.repo);
+    let chat = bearer(&signer.token(AUDIENCE, "chat"));
+    let dir = dir_query(&f.dirs.repo);
+
+    let good = create_session(&f, &f.dirs.repo, &basic()).await;
+    prompt(&f, &good, &basic()).await;
+
+    let (status, body) = json_of(
+        &f,
+        "POST",
+        &format!("/session?{dir}"),
+        &chat,
+        Some(json!({ "metadata": { "untrustedInput": "yes", "triggerID": "inbox", "mine": 1 } })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["metadata"], json!({ "mine": 1 }), "{body}");
+    let poison = body["id"].as_str().unwrap().to_string();
+    assert_eq!(marks(&f, &poison).await, (false, false));
+    prompt(&f, &poison, &chat).await;
+
+    for value in [json!(true), json!(1), json!("yes"), json!({ "x": 1 })] {
+        let (status, body) = json_of(
+            &f,
+            "PATCH",
+            &format!("/session/{poison}?{dir}"),
+            &chat,
+            Some(json!({ "metadata": { "untrustedInput": value, "mine": 2 } })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["metadata"], json!({ "mine": 2 }), "{body}");
+        assert_eq!(marks(&f, &poison).await, (false, false));
+        {
+            let services = f.ctx.instances.load(&f.dirs.repo).unwrap();
+            let location = alforria_server::middleware::location::LocationContext {
+                directory: f.dirs.repo.clone(),
+                workspace_id: None,
+                services,
+            };
+            let (memory, _) = (f.ctx.engine_factory)(&location).unwrap().memory().unwrap();
+            memory.index_pending(1000, 0).unwrap();
+        }
+        let (status, body) = json_of(
+            &f,
+            "GET",
+            &format!("/memory/session?q=hello&{dir}"),
+            &basic(),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            body.to_string().contains(&poison),
+            "the session is found: {body}"
+        );
+    }
 }

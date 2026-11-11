@@ -5,7 +5,6 @@
 use alforria_schema::permission_v1::PermissionV1Action;
 use alforria_schema::session_v1::{V1Part, V1SessionInfo};
 
-use crate::session::store::carries_untrusted_input;
 use crate::session::test_support::{engine, text_stream};
 use crate::session::trigger_ops::ProductionTriggerOps;
 use crate::trigger::{SessionMode, TriggerOps, TriggerPayload, TriggerTurn};
@@ -64,7 +63,7 @@ async fn a_payload_marks_the_reused_session_it_lands_in() {
 
     let first = ops.run_turn(&turn(false)).await.unwrap();
     let before = e.services.sessions.get(&first.session_id).unwrap();
-    assert!(!carries_untrusted_input(&before));
+    assert!(!e.services.sessions.started_by_outside_input(&before.id));
 
     let mut second = turn(true);
     second.session_id = Some(first.session_id.clone());
@@ -84,7 +83,7 @@ async fn a_payload_marks_the_reused_session_it_lands_in() {
             });
     assert!(body_in_history);
     assert!(
-        carries_untrusted_input(&session),
+        e.services.sessions.started_by_outside_input(&session.id),
         "the session holding the webhook body must carry the mark"
     );
     assert!(has_ceiling(&session));
@@ -109,14 +108,14 @@ async fn a_marked_reuse_session_keeps_its_ceiling_when_the_kind_changes() {
 
     let first = ops.run_turn(&turn(true)).await.unwrap();
     let before = e.services.sessions.get(&first.session_id).unwrap();
-    assert!(carries_untrusted_input(&before) && has_ceiling(&before));
+    assert!(e.services.sessions.started_by_outside_input(&before.id) && has_ceiling(&before));
 
     let mut second = turn(false);
     second.session_id = Some(first.session_id.clone());
     let out = ops.run_turn(&second).await.unwrap();
     assert_eq!(out.session_id, first.session_id);
     let after = e.services.sessions.get(&out.session_id).unwrap();
-    assert!(carries_untrusted_input(&after));
+    assert!(e.services.sessions.started_by_outside_input(&after.id));
     assert!(
         has_ceiling(&after),
         "the read-only ceiling was lifted from a session whose history holds a webhook body"

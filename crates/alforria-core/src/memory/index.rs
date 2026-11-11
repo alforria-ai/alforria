@@ -274,7 +274,7 @@ impl MemoryService {
                        AND (?2 OR s.project_id = ?3)
                        AND (?4 IS NULL OR transcript_fts.session_id != ?4)
                      ORDER BY rank LIMIT ?5",
-                    untrusted = crate::session::store::UNTRUSTED_INPUT_SQL
+                    untrusted = crate::session::store::SessionMark::OutsideContent.sql("s.id")
                 ))?;
                 let rows = stmt
                     .query_map(

@@ -5,7 +5,8 @@
 //! the engine's own — is bound as that credential was. An operator who
 //! wants to take such a session over lifts the restriction first.
 //!
-//! - `GET    /session/{sessionID}/restriction`   `{ "restricted": bool }`
+//! - `GET    /session/{sessionID}/restriction`   `{ "restricted": bool, "outsideContent": bool, "outsideStart": bool }`
+//!   (the last two are the session's marks, `session::store::SessionMark`)
 //! - `DELETE /session/{sessionID}/restriction`   lift it; `{ "restricted": false, "lifted": bool }`
 //!
 //! Both are outside the frozen tables and absent from the scope table, so
@@ -38,7 +39,12 @@ async fn show(
         .sessions
         .is_restricted(&session_id)
         .map_err(session_error)?;
-    Ok(Json(json!({ "restricted": restricted })))
+    let marks = ctx.sessions.marks(&session_id).map_err(session_error)?;
+    Ok(Json(json!({
+        "restricted": restricted,
+        "outsideContent": marks.outside_content,
+        "outsideStart": marks.outside_start,
+    })))
 }
 
 async fn lift(

@@ -106,11 +106,6 @@ impl ProductionTriggerOps {
         let permission = self.rules(turn);
         let mut metadata = JsonMap::new();
         metadata.insert("triggerID".to_string(), json!(turn.trigger_id));
-        if turn.untrusted {
-            // Read by anything that must not take this session's word for
-            // things, such as the memory flush before a compaction.
-            metadata.insert(crate::trigger::UNTRUSTED_KEY.to_string(), json!(true));
-        }
         let session = self
             .sessions
             .create(
@@ -122,6 +117,13 @@ impl ProductionTriggerOps {
                     metadata: Some(metadata),
                     // The session is its creator's kind, for life.
                     restricted: turn.restricted,
+                    // Read by anything that must not take this session's
+                    // word for things, such as the memory flush before a
+                    // compaction; and what puts the ceiling on it.
+                    marks: crate::session::store::SessionMarks {
+                        outside_content: turn.untrusted,
+                        outside_start: turn.untrusted,
+                    },
                     ..Default::default()
                 },
             )
@@ -180,14 +182,15 @@ impl ProductionTriggerOps {
                         // marks the session it lands in. (The service also
                         // lets a kept session go when the kind changes;
                         // this holds if that is ever bypassed.)
-                        let carried = crate::session::store::carries_untrusted_input(&session);
+                        let carried = self.sessions.started_by_outside_input(&session.id);
                         let mut bound = turn.clone();
                         bound.untrusted = turn.untrusted || carried;
                         if bound.untrusted && !carried {
-                            let mut metadata = session.metadata.clone().unwrap_or_default();
-                            metadata.insert(crate::trigger::UNTRUSTED_KEY.to_string(), json!(true));
                             self.sessions
-                                .set_metadata(&session.id, metadata)
+                                .mark(
+                                    &session.id,
+                                    crate::session::store::SessionMark::OutsideStart,
+                                )
                                 .map_err(|error| error.to_string())?;
                         }
                         // The rules may have changed since the session was made.

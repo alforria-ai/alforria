@@ -899,7 +899,11 @@ fn decode_create_payload(payload: &CreatePayload) -> Result<session::CreateInput
         title: payload.title.clone(),
         agent: payload.agent.clone(),
         model: payload.model.clone(),
-        metadata: payload.metadata.clone(),
+        // The server's own keys are not a client's to set.
+        metadata: payload.metadata.clone().map(|mut metadata| {
+            session::store::strip_reserved_metadata(&mut metadata);
+            metadata
+        }),
         permission: payload.permission.clone(),
         workspace_id: payload.workspace_id.clone(),
         ..Default::default()
@@ -942,7 +946,7 @@ pub async fn update(
         location
             .services
             .sessions
-            .set_metadata(&session_id, metadata)
+            .set_client_metadata(&session_id, metadata)
             .map_err(session_error)?;
     }
     if let Some(permission) = &payload.permission {
