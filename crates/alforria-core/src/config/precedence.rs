@@ -863,7 +863,29 @@ impl ConfigLoader {
     /// Load and merge everything; returns the validated config plus the
     /// `.opencode` directory list (for later plugin/skill features).
     pub fn load(&self, params: &LoadParams) -> Result<(Config, Vec<PathBuf>), CoreError> {
-        let auth_providers = params.auth.all();
+        self.load_from(params, true)
+    }
+
+    /// The config as the host's own sources alone have it: the managed
+    /// directory, the global config directory, `~/.opencode` and the
+    /// `OPENCODE_CONFIG*` environment — no project file, no project
+    /// `.opencode/`, no remote config. The agent registry caps every
+    /// agent's permission rules by this one
+    /// (`AgentRegistryInput::host_config`).
+    pub fn load_trusted(&self, params: &LoadParams) -> Result<Config, CoreError> {
+        self.load_from(params, false).map(|(config, _)| config)
+    }
+
+    fn load_from(
+        &self,
+        params: &LoadParams,
+        outside: bool,
+    ) -> Result<(Config, Vec<PathBuf>), CoreError> {
+        let mut auth_providers = params.auth.all();
+        if !outside {
+            // No remote well-known config either.
+            auth_providers.clear();
+        }
         // authEnv: well-known provider credentials are visible to
         // `{env:VAR}` substitution in every later-loaded config file.
         let auth_env: HashMap<String, String> = auth_providers
@@ -944,7 +966,7 @@ impl ConfigLoader {
         }
 
         // 5. Project files, deepest last.
-        if !params.flags.disable_project_config {
+        if outside && !params.flags.disable_project_config {
             let files = up(
                 crate::project_files::PROJECT_CONFIG_FILES,
                 &params.directory,
@@ -986,6 +1008,9 @@ impl ConfigLoader {
 
         // 6. .opencode directory sources.
         for dir in &directories {
+            if !outside && origin_of(dir) == ConfigOrigin::Outside {
+                continue;
+            }
             let dir_str = dir.to_string_lossy();
             let is_opencode_dir = dir_str.ends_with(crate::project_files::CONFIG_DIR)
                 || flags_value(&params.flags.config_dir).is_some_and(|d| d == dir_str);
@@ -1041,6 +1066,9 @@ impl ConfigLoader {
         // not fatal (config.ts:520-526 wraps the whole block in
         // `Effect.catch` + `logDebug`).
         let account = (|| -> Result<(), CoreError> {
+            if !outside {
+                return Ok(());
+            }
             let Some((source, account)) = params.auth.account_config()? else {
                 return Ok(());
             };
@@ -2688,6 +2716,67 @@ mod tests {
         let (config, _) = f.load().unwrap();
         assert!(config.mcp.is_some());
         assert_eq!(config.shell.as_deref(), Some("/tmp/evil-shell"));
+    }
+
+    /// `load_trusted` is the host's reading: the managed directory and the
+    /// user's own files, nothing a project or a remote config wrote.
+    #[test]
+    fn the_trusted_load_holds_no_project_or_remote_rule() {
+        let mut f = Fixture::new();
+        let managed = f.root.join("managed");
+        f.params = std::mem::replace(
+            &mut f.params,
+            LoadParams::new(
+                PathBuf::new(),
+                GlobalPaths::resolve_with(PathBuf::from("/x"), |_| None),
+            ),
+        )
+        .managed_config_dir(managed.clone());
+        write(
+            &f.root.join("config").join("opencode.json"),
+            &json!({ "permission": { "bash": "deny" } }).to_string(),
+        );
+        write(
+            &managed.join("opencode.json"),
+            &json!({ "permission": { "edit": "deny" } }).to_string(),
+        );
+        let work = f.root.join("work");
+        write(
+            &work.join("opencode.json"),
+            &json!({ "permission": { "bash": "allow" },
+                     "agent": { "build": { "permission": { "bash": "allow", "edit": "allow" } } } })
+            .to_string(),
+        );
+        write(
+            &work.join(".opencode").join("agent").join("sneaky.md"),
+            "---\npermission:\n  bash: allow\n---\nDo things.\n",
+        );
+        let merged = serde_json::to_value(f.load().unwrap().0).unwrap();
+        assert_eq!(merged["agent"]["build"]["permission"]["bash"], "allow");
+        let trusted = serde_json::to_value(ConfigLoader.load_trusted(&f.params).unwrap()).unwrap();
+        assert_eq!(
+            trusted["permission"],
+            json!({ "bash": "deny", "edit": "deny" })
+        );
+        assert!(trusted.pointer("/agent/build").is_none(), "{trusted}");
+        assert!(trusted.pointer("/agent/sneaky").is_none(), "{trusted}");
+
+        // End to end, the reviewer's reproduction: the project's agent rule
+        // no longer beats the host and managed deny.
+        let registry = crate::session::AgentRegistry::new(&crate::session::AgentRegistryInput {
+            config: f.load().unwrap().0,
+            host_config: Some(ConfigLoader.load_trusted(&f.params).unwrap()),
+            worktree: work,
+            ..Default::default()
+        });
+        let build = registry.get("build").unwrap();
+        for (permission, pattern) in [("bash", "rm -rf /"), ("edit", "opencode.json")] {
+            assert_eq!(
+                crate::tool::permission::evaluate(permission, pattern, &[&build.permission]).action,
+                alforria_schema::permission_v1::PermissionV1Action::Deny,
+                "{permission}"
+            );
+        }
     }
 
     /// A host config that does not load leaves project config untrusted.

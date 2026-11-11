@@ -83,6 +83,13 @@ pub struct AgentRegistryInput {
     pub tmp_dir: PathBuf,
     /// The user home directory (`~/` + `$HOME` expansion in `fromConfig`).
     pub home: PathBuf,
+    /// The config as the host's own sources alone have it
+    /// (`ConfigLoader::load_trusted`): every agent's rules are capped by
+    /// what this config gives it, so a project's or a remote config can
+    /// narrow a permission and never widen one
+    /// (`tool::permission::with_ceiling`). `None`: no cap — `config` is
+    /// all there is.
+    pub host_config: Option<Config>,
 }
 
 impl Default for AgentRegistryInput {
@@ -95,6 +102,7 @@ impl Default for AgentRegistryInput {
             data_dir: PathBuf::new(),
             tmp_dir: PathBuf::new(),
             home: PathBuf::new(),
+            host_config: None,
         }
     }
 }
@@ -214,8 +222,47 @@ pub fn slug_create() -> String {
 }
 
 impl AgentRegistry {
-    /// Construct the registry (agent.ts:88-311).
+    /// Construct the registry (agent.ts:88-311), with every agent's rules
+    /// under the ceiling of [`AgentRegistryInput::host_config`].
     pub fn new(input: &AgentRegistryInput) -> AgentRegistry {
+        let mut registry = AgentRegistry::build(input);
+        let Some(host) = &input.host_config else {
+            return registry;
+        };
+        // The same agents as the host's config alone would build them. An
+        // agent only a lower-trust config defines is built from its own
+        // description, without the rules that came with it.
+        let mut host = host.clone();
+        let host_agents = host.agent.get_or_insert_with(Default::default);
+        for (name, info) in input.config.agent.iter().flatten() {
+            host_agents.entry(name.clone()).or_insert_with(|| {
+                let mut info = info.clone();
+                info.permission = Default::default();
+                info.tools = None;
+                info
+            });
+        }
+        let trusted = AgentRegistry::build(&AgentRegistryInput {
+            config: host,
+            host_config: None,
+            ..input.clone()
+        });
+        for (name, agent) in registry.agents.iter_mut() {
+            let ceiling = match trusted.agents.get(name) {
+                Some(trusted) => trusted.permission.clone(),
+                // The host's config has no such agent (it disabled it):
+                // nothing is allowed.
+                None => rules(&[("*", vec![("*", PermissionV1Action::Deny)])]),
+            };
+            agent.permission = crate::tool::permission::with_ceiling(
+                std::mem::take(&mut agent.permission),
+                ceiling,
+            );
+        }
+        registry
+    }
+
+    fn build(input: &AgentRegistryInput) -> AgentRegistry {
         let cfg = &input.config;
         // Empty dirs (e.g. a `Default` input) must not become a `/*` glob
         // that whitelists every absolute path.
@@ -636,6 +683,7 @@ mod tests {
             data_dir: PathBuf::from("/data"),
             tmp_dir: PathBuf::from("/tmp"),
             home: PathBuf::from("/home/user"),
+            host_config: None,
         }
     }
 
@@ -740,6 +788,7 @@ mod tests {
             data_dir: PathBuf::from("/data"),
             tmp_dir: PathBuf::from("/tmp"),
             home: PathBuf::from("/home/user"),
+            host_config: None,
         });
         let build = registry.get("build").unwrap();
         assert_eq!(
@@ -866,6 +915,58 @@ mod tests {
                 PermissionV1Action::Deny
             );
         }
+    }
+
+    /// The host's (or the managed) config is a ceiling: a project's
+    /// `agent.<name>.permission` came after it in a last-match-wins list and
+    /// overruled a host deny. Now the answer is the stricter of the two; the
+    /// host's own agent overrides still widen its own top-level rules.
+    #[test]
+    fn a_project_cannot_widen_what_the_host_config_denies() {
+        let host: Config = serde_json::from_value(serde_json::json!({
+            "permission": { "bash": "deny", "edit": "ask", "webfetch": "ask" },
+            "agent": { "build": { "permission": { "webfetch": "allow" } } },
+        }))
+        .unwrap();
+        // The merged config: the project added an agent rule and an agent.
+        let merged: Config = serde_json::from_value(serde_json::json!({
+            "permission": { "bash": "deny", "edit": "ask", "webfetch": "ask", "read": "deny" },
+            "agent": {
+                "build": { "permission": { "webfetch": "allow", "bash": "allow", "edit": "allow" } },
+                "mine": { "mode": "primary", "permission": { "bash": "allow" } },
+            },
+        }))
+        .unwrap();
+        let action = |registry: &AgentRegistry, agent: &str, permission: &str| {
+            evaluate(permission, "x", &[&registry.get(agent).unwrap().permission]).action
+        };
+        // Upstream's reading (no host config given): the project wins.
+        let uncapped = AgentRegistry::new(&AgentRegistryInput {
+            config: merged.clone(),
+            ..Default::default()
+        });
+        assert_eq!(
+            action(&uncapped, "build", "bash"),
+            PermissionV1Action::Allow
+        );
+
+        let capped = AgentRegistry::new(&AgentRegistryInput {
+            config: merged,
+            host_config: Some(host),
+            ..Default::default()
+        });
+        assert_eq!(action(&capped, "build", "bash"), PermissionV1Action::Deny);
+        assert_eq!(action(&capped, "build", "edit"), PermissionV1Action::Ask);
+        // The host's own agent override still applies.
+        assert_eq!(
+            action(&capped, "build", "webfetch"),
+            PermissionV1Action::Allow
+        );
+        // The project's narrowing holds.
+        assert_eq!(action(&capped, "build", "read"), PermissionV1Action::Deny);
+        // An agent only the project defines gets the host's rules, not its own grant.
+        assert_eq!(action(&capped, "mine", "bash"), PermissionV1Action::Deny);
+        assert_eq!(action(&capped, "mine", "webfetch"), PermissionV1Action::Ask);
     }
 
     #[test]

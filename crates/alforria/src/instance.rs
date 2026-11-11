@@ -105,6 +105,12 @@ pub fn boot(directory: Option<&Path>) -> Result<Instance, TypedError> {
         data_dir: paths.data.clone(),
         tmp_dir: std::env::temp_dir().join("alforria"),
         home: paths.home.clone(),
+        // The host's own config caps every agent's rules, as in a server.
+        host_config: Some(
+            ConfigLoader::new()
+                .load_trusted(&LoadParams::new(directory.clone(), paths.clone()))
+                .map_err(core_error)?,
+        ),
     };
     let background = BackgroundJobService::new(Arc::new(alforria_core::catalog::SystemClock));
     let services = Arc::new(SessionServices::new(

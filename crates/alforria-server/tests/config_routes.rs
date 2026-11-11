@@ -50,6 +50,7 @@ fn fixture() -> Fixture {
         data_dir: dir.path().to_path_buf(),
         tmp_dir: dir.path().to_path_buf(),
         home: dir.path().to_path_buf(),
+        host_config: None,
     };
     let services_for_factory = agent_input.clone();
     let storage_for_factory = storage.clone();

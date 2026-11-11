@@ -1975,6 +1975,7 @@ mod tests {
             data_dir: dir.path().to_path_buf(),
             tmp_dir: dir.path().to_path_buf(),
             home: dir.path().to_path_buf(),
+            host_config: None,
         };
         SessionServices::new(
             storage,

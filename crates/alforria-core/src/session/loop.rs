@@ -1976,6 +1976,7 @@ mod tests {
             data_dir: temp.path().to_path_buf(),
             tmp_dir: temp.path().to_path_buf(),
             home: temp.path().to_path_buf(),
+            host_config: None,
         };
         let services = crate::session::SessionServices::new(
             Arc::new(crate::storage::Storage::open(temp.path().join("db.sqlite")).unwrap()),

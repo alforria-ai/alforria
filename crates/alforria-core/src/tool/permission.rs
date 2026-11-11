@@ -42,14 +42,54 @@ pub fn wildcard_match(input: &str, pattern: &str) -> bool {
 /// `Permission.evaluate` (permission/index.ts:28-38): the last matching rule
 /// across the flattened rulesets, or the default `ask` rule when nothing
 /// matches.
+///
+/// alforria extension — the host's ceiling. A ruleset may hold a section
+/// built by [`with_ceiling`]: the rules as every config wrote them, and the
+/// rules as the *host's* config alone would have them. Upstream's
+/// last-match-wins puts a project's `agent.<name>.permission` after the
+/// host's rules, so a file the agent can write overruled a host or managed
+/// `deny`. With a ceiling the answer is the stricter of the two readings
+/// (deny over ask over allow): a lower-trust config can narrow what the
+/// host allows and can never widen it. Rules outside the section — a
+/// session's, a standing approval — count in both readings, as before.
 pub fn evaluate(permission: &str, pattern: &str, rulesets: &[&Ruleset]) -> PermissionV1Rule {
-    for ruleset in rulesets.iter().rev() {
-        for rule in ruleset.iter().rev() {
-            if wildcard_match(permission, &rule.permission)
-                && wildcard_match(pattern, &rule.pattern)
-            {
-                return rule.clone();
+    let has_ceiling = rulesets
+        .iter()
+        .any(|ruleset| ruleset.iter().any(|rule| ceiling_marker(rule).is_some()));
+    if !has_ceiling {
+        return last_match(permission, pattern, rulesets.iter().flat_map(|r| r.iter()));
+    }
+    // Two readings of the same list: one without the host's copy, one
+    // without the lower-trust original.
+    let reading = |skip: Section| {
+        let mut section = Section::Outside;
+        let mut kept = Vec::new();
+        for rule in rulesets.iter().flat_map(|ruleset| ruleset.iter()) {
+            match ceiling_marker(rule) {
+                Some(next) => section = next,
+                None if section != skip => kept.push(rule),
+                None => {}
             }
+        }
+        last_match(permission, pattern, kept.into_iter())
+    };
+    let written = reading(Section::Host);
+    let host = reading(Section::Written);
+    if strictness(host.action) > strictness(written.action) {
+        host
+    } else {
+        written
+    }
+}
+
+fn last_match<'a>(
+    permission: &str,
+    pattern: &str,
+    rules: impl DoubleEndedIterator<Item = &'a PermissionV1Rule>,
+) -> PermissionV1Rule {
+    for rule in rules.rev() {
+        if wildcard_match(permission, &rule.permission) && wildcard_match(pattern, &rule.pattern) {
+            return rule.clone();
         }
     }
     PermissionV1Rule {
@@ -57,6 +97,61 @@ pub fn evaluate(permission: &str, pattern: &str, rulesets: &[&Ruleset]) -> Permi
         pattern: "*".to_string(),
         action: PermissionV1Action::Ask,
     }
+}
+
+/// Deny over ask over allow.
+pub fn strictness(action: PermissionV1Action) -> u8 {
+    match action {
+        PermissionV1Action::Allow => 0,
+        PermissionV1Action::Ask => 1,
+        PermissionV1Action::Deny => 2,
+    }
+}
+
+/// The permission name of the marker rules that delimit a ceiling section.
+/// No tool asks under it, so a reader that does not know the markers sees
+/// three rules that never match.
+pub const CEILING_PERMISSION: &str = "alforria:ceiling";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Section {
+    Outside,
+    /// The rules as every config wrote them.
+    Written,
+    /// The rules as the host's config alone has them.
+    Host,
+}
+
+fn ceiling_marker(rule: &PermissionV1Rule) -> Option<Section> {
+    if rule.permission != CEILING_PERMISSION {
+        return None;
+    }
+    Some(match rule.pattern.as_str() {
+        "written" => Section::Written,
+        "host" => Section::Host,
+        _ => Section::Outside,
+    })
+}
+
+/// `written` under the ceiling `host`: the ruleset [`evaluate`] reads both
+/// ways. When the two are the same list there is nothing to cap and
+/// `written` is returned as it is — which is every install whose projects
+/// set no permission rules.
+pub fn with_ceiling(written: Ruleset, host: Ruleset) -> Ruleset {
+    if written == host {
+        return written;
+    }
+    let marker = |pattern: &str| PermissionV1Rule {
+        permission: CEILING_PERMISSION.to_string(),
+        pattern: pattern.to_string(),
+        action: PermissionV1Action::Deny,
+    };
+    let mut ruleset = vec![marker("written")];
+    ruleset.extend(written);
+    ruleset.push(marker("host"));
+    ruleset.extend(host);
+    ruleset.push(marker("end"));
+    ruleset
 }
 
 /// The config action enum is a decode-only twin of the wire action —
@@ -145,11 +240,25 @@ pub fn disabled(
             } else {
                 tool
             };
-            let rule = ruleset
-                .iter()
-                .rev()
-                .find(|rule| wildcard_match(permission, &rule.permission));
-            matches!(rule, Some(rule) if rule.pattern == "*" && rule.action == PermissionV1Action::Deny)
+            // With a ceiling, either reading that ends in a bare deny
+            // disables the tool.
+            let denies = |skip: Section| {
+                let mut section = Section::Outside;
+                let mut found = None;
+                for rule in ruleset {
+                    match ceiling_marker(rule) {
+                        Some(next) => section = next,
+                        None if section != skip
+                            && wildcard_match(permission, &rule.permission) =>
+                        {
+                            found = Some(rule)
+                        }
+                        None => {}
+                    }
+                }
+                matches!(found, Some(rule) if rule.pattern == "*" && rule.action == PermissionV1Action::Deny)
+            };
+            denies(Section::Host) || denies(Section::Written)
         })
         .map(|tool| tool.to_string())
         .collect()
@@ -165,6 +274,57 @@ mod tests {
             pattern: pattern.to_string(),
             action,
         }
+    }
+
+    /// The host's reading is a ceiling: a lower-trust allow never beats a
+    /// host deny or ask, a lower-trust deny still narrows, and rules
+    /// outside the section count in both readings.
+    #[test]
+    fn a_ceiling_is_the_stricter_of_the_two_readings() {
+        use PermissionV1Action::{Allow, Ask, Deny};
+        let host = vec![
+            rule("*", "*", Allow),
+            rule("bash", "*", Deny),
+            rule("bash", "git status*", Allow),
+            rule("edit", "*", Ask),
+            rule("read", "*", Allow),
+            rule("task", "*", Deny),
+        ];
+        // A project appended its own rules after the host's.
+        let mut written = host.clone();
+        written.extend([
+            rule("bash", "*", Allow),
+            rule("edit", "*", Allow),
+            rule("read", "*.secret", Deny),
+            rule("task", "*", Allow),
+        ]);
+        let capped = with_ceiling(written.clone(), host.clone());
+        let action = |permission: &str, pattern: &str, rulesets: &[&Ruleset]| {
+            evaluate(permission, pattern, rulesets).action
+        };
+        // Upstream's reading, for contrast: the project wins.
+        assert_eq!(action("bash", "rm -rf /", &[&written]), Allow);
+        // Capped: the host's deny and ask stand, its own allow hole too.
+        assert_eq!(action("bash", "rm -rf /", &[&capped]), Deny);
+        assert_eq!(action("bash", "git status", &[&capped]), Allow);
+        assert_eq!(action("edit", "a.rs", &[&capped]), Ask);
+        // The project's narrowing holds.
+        assert_eq!(action("read", "x.secret", &[&capped]), Deny);
+        assert_eq!(action("read", "x.txt", &[&capped]), Allow);
+        // A session rule or a standing approval after the agent's rules
+        // counts in both readings, flattened or not.
+        let session = vec![rule("edit", "docs/*", Allow), rule("webfetch", "*", Deny)];
+        assert_eq!(action("edit", "docs/a.md", &[&capped, &session]), Allow);
+        assert_eq!(action("webfetch", "x", &[&capped, &session]), Deny);
+        let flat = merge(&[&capped, &session]);
+        assert_eq!(action("edit", "docs/a.md", &[&flat]), Allow);
+        assert_eq!(action("bash", "rm -rf /", &[&flat]), Deny);
+        // Tool disabling sees a bare deny in either reading.
+        assert!(disabled(&["task"], &capped).contains("task"));
+        assert!(!disabled(&["task"], &written).contains("task"));
+        assert!(!disabled(&["edit"], &capped).contains("edit"));
+        // Nothing to cap: the list is untouched.
+        assert_eq!(with_ceiling(host.clone(), host.clone()), host);
     }
 
     #[test]

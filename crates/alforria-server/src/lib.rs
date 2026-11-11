@@ -638,6 +638,9 @@ fn instance_for_directory(
         data_dir: paths.data.clone(),
         tmp_dir: std::env::temp_dir().join("alforria"),
         home: paths.home.clone(),
+        // The host's own config is the ceiling of every agent's rules: a
+        // project's config narrows a permission, never widens one.
+        host_config: Some(alforria_core::ConfigLoader::new().load_trusted(&params)?),
     };
     // M7.2: the background-job service backs the run-state cancel seam.
     let background =
