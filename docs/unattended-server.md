@@ -185,6 +185,7 @@ Limits:
 | Process-id reuse | Detected on Linux by the start time. On other Unix systems a dead owner whose id was given to another process reads as alive: its run stays `running`, and its trigger is skipped, until that process exits |
 | Platforms that are not Unix | Whether a process is alive cannot be told: a starting server closes every unsettled run that is not its own (the old behaviour), and restart markers of other processes are left alone |
 | Filesystems without `flock` (some network mounts) | Every process takes itself for the leader: ticks and other fires are still claimed in the database and run once, but each process watches the paths, so a watched change can run once per process if the first run has ended before the second server's debounce does |
+| Webhook deliveries (`hook.webhook`) on a filesystem without `flock` | Every process takes itself for the one that delivers: a delivery can be sent once per process, under the same delivery id, and a hook's order is not kept between them. Receivers deduplicate on the id either way |
 | The webhook rate limit | `triggers.webhook_min_interval` is counted per process: two servers accept one delivery each per interval. Only one runs while the first is unfinished |
 | Different configs | Triggers declared in a config are scheduled by the leader from *its* config. Two servers meant to share a data directory should share the config |
 | A tick taken by a process that died before running it | Given back when the run is found queued under an owner that is gone, which is at the next start or takeover. Until then the trigger shows the run as queued |
@@ -1007,7 +1008,8 @@ may open.
 ```
 
 Oldest first. An item leaves the list when it is answered, times out, or
-its turn is aborted.
+its turn is aborted. On a server with `hook.webhook` configured the answer
+has one more member, `outbox`, described with the hooks below.
 
 ## Telling a control plane: `hook.webhook` (host)
 
@@ -1106,18 +1108,62 @@ adds `properties.text` (cut to 16 KiB) to `trigger.completed` when the run's
 To act on a `permission.asked`, call `GET /attention` or `GET /permission`
 with a token.
 
-**Delivery.** A 2xx is success. Anything else — another status, a timeout,
-a refused connection — is retried after `retry_initial`, doubling up to
-`retry_max`, until it succeeds or the event is `max_age` old. Redirects are
-not followed. Deliveries are attempted in the order they were recorded but
-are not ordered across retries; use `time`. Delivery is at least once: a
-receiver that accepted a request whose response was lost sees it again,
+**Delivery.** A 2xx is success. What happens otherwise depends on the
+answer:
+
+| The receiver… | |
+| --- | --- |
+| answers 2xx | delivered |
+| answers 4xx, other than 408, 425 and 429 | **given up at once, never retried**: the request itself was refused (a wrong URL, a rejected signature, a body it will not take) and sending it again changes nothing. The row is closed as failed with the status (`the receiver answered 404`) and a warning is logged |
+| answers 408, 425, 429, any 5xx, a 3xx (redirects are not followed), or anything else | retried |
+| does not answer within `timeout`, or cannot be reached | retried |
+
+A retry comes after `retry_initial`, doubling up to `retry_max`, until the
+delivery succeeds or the event is `max_age` old. Delivery is at least once:
+a receiver that accepted a request whose response was lost sees it again,
 with the same delivery id.
 
-The outbox is a table in the server's database (`outbox`), so it survives a
-restart: a server that stops while a delivery is backing off resumes it when
-it starts again. Each hook owns its deliveries by `name`; removing or
+**Each hook is a queue of its own.** A hook's deliveries go out in the order
+they were recorded, one at a time; while one is being retried, the ones
+recorded after it wait behind it, and follow in order once it is delivered,
+given up or `max_age` old. The hooks are worked at the same time: a
+receiver that hangs or keeps failing delays its own deliveries and no other
+hook's. (A receiver that must not lose its place behind one event it cannot
+take should refuse that event with a 4xx.)
+
+**Recorded before anything else happens.** The row is written while the
+event is being published, before the publish returns: a server killed
+right after a turn's `session.idle` has the delivery in its database, and
+sends it when it starts again. The outbox is a table in the server's
+database (`outbox`), so a server that stops while a delivery is backing
+off resumes it too. Stopping the server never waits for a receiver: an
+attempt in flight is dropped and made again on the next start, under the
+same delivery id. Each hook owns its deliveries by `name`; removing or
 renaming a hook abandons what it was still owed.
+
+**Bounded, and it says so.** Beyond `max_pending` undelivered events the
+oldest are deleted: those deliveries are never made. Each time it happens
+the server logs a warning (at most one a minute, with the running total),
+and `GET /attention` carries the numbers on a server that has hooks:
+
+```jsonc
+{ "count": 0, "items": [],
+  "outbox": {
+    "pending": 12,   // still owed
+    "failed": 1,     // given up (refused, too old, hook removed) and still kept by `retention`
+    "dropped": 0     // deleted beyond max_pending since this server started
+  } }
+```
+
+Without `hook.webhook` the `outbox` member is absent.
+
+**Several servers on one data directory.** Every server records the
+deliveries its own events owe, in the shared table; one of them sends. The
+role is an advisory lock on `<data>/lock/outbox.lock`, like the scheduler's
+and the maintenance role: the others ask for it every few seconds and one
+has it when the holder stops or dies, so a delivery is not sent by two
+servers at once. A row another server recorded is picked up within about
+five seconds. `dropped` is counted per process.
 
 ## Files for a browser: tickets, raw reads, uploads
 

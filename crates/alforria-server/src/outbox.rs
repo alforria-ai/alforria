@@ -19,13 +19,30 @@
 //! * **bounded** — delivered and abandoned rows are pruned after
 //!   `retention`; undelivered ones are capped at `max_pending`.
 //!
-//! Capture is synchronous and cheap (a channel send from the bus listener);
-//! a writer thread turns captures into rows, so nothing touches the
-//! database from inside an event publish.
+//! **Capture is synchronous.** The bus listener writes the row before the
+//! publish that carried the event returns, so whatever goes on to treat the
+//! event as handled — the turn that ends after its `session.idle`, the
+//! process that is killed right after — finds the delivery already in the
+//! database. Listeners run after a durable event's own commit and outside
+//! the storage lock.
+//!
+//! **Delivery is per hook.** Each hook's undelivered rows are a queue in
+//! the order they were recorded. A pass works the queues of all hooks at
+//! the same time and each queue from its head, and leaves a queue at its
+//! first failure: a receiver that hangs or answers 500 holds up its own
+//! later deliveries (they stay in order behind the one being retried) and
+//! nobody else's.
+//!
+//! **One process delivers.** Of several servers sharing a data directory
+//! all record rows and the one holding the outbox role's lock delivers
+//! them, so a row is never sent by two processes at once; the others ask
+//! for the role on every pass and one has it when the holder exits.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
+
+use alforria_core::owner::RoleLock;
 
 use alforria_core::config::host::{HookInfo, WebhookInfo};
 use alforria_core::event::definition::Payload;
@@ -77,10 +94,45 @@ impl Default for OutboxSettings {
     }
 }
 
-enum Message {
-    Event(Box<Payload>),
-    /// Reply once everything sent before this has been written.
-    Flush(mpsc::Sender<()>),
+/// How long the delivery loop sleeps at most: rows another process
+/// recorded, and a role its holder gave up, are noticed within this.
+const POLL: Duration = Duration::from_secs(5);
+
+/// How many of a hook's deliveries one pass reads; the next pass follows
+/// at once while a queue is longer.
+const PASS_BATCH: usize = 100;
+
+/// At most one "dropped" warning per this long.
+const DROP_LOG_INTERVAL_MS: u64 = 60_000;
+
+/// Whether a receiver's answer other than 2xx is worth another attempt.
+/// A 4xx says the request itself is wrong and sending it again will not
+/// change that — except the three that speak of timing: 408 (request
+/// timeout), 425 (too early) and 429 (too many requests).
+pub fn permanent_status(status: u16) -> bool {
+    (400..500).contains(&status) && !matches!(status, 408 | 425 | 429)
+}
+
+/// What one attempt came to.
+enum Outcome {
+    Delivered,
+    /// Try again after the backoff.
+    Retry(String),
+    /// Never again: the row is closed as failed.
+    Permanent(String),
+}
+
+/// The outbox in numbers, for `GET /attention`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct OutboxStats {
+    /// Rows not delivered yet and not given up on.
+    pub pending: u64,
+    /// Rows given up on (refused for good, too old, hook removed) that
+    /// `retention` still keeps.
+    pub failed: u64,
+    /// Undelivered rows this process deleted because more than
+    /// `max_pending` were waiting, since it started.
+    pub dropped: u64,
 }
 
 /// One row, as [`Outbox::deliveries`] reports it.
@@ -104,14 +156,35 @@ pub struct Outbox {
     hooks: Vec<Hook>,
     settings: OutboxSettings,
     clock: Arc<dyn Clock>,
-    capture: Mutex<Option<mpsc::Sender<Message>>>,
     /// Bus subscriptions, kept alive for as long as the outbox is.
     subscriptions: Mutex<Vec<alforria_core::Subscription>>,
     /// Wakes the delivery loop when a row is written.
     wake: Arc<tokio::sync::Notify>,
-    stopped: AtomicBool,
+    /// Cancelled by [`Outbox::stop`]: the loop ends and the attempts in
+    /// flight are dropped (their rows stay due).
+    cancel: tokio_util::sync::CancellationToken,
+    /// The delivery loop [`Outbox::spawn`] started.
+    task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Which of the processes on this data directory delivers
+    /// ([`Outbox::deliver_as`]). Without one this process always does.
+    role: OnceLock<RoleLock>,
+    /// Said once, when another process holds the role.
+    follower_told: std::sync::atomic::AtomicBool,
+    /// Rows dropped beyond `max_pending` since this process started.
+    dropped: AtomicU64,
+    /// When the last "dropped" warning was logged, ms (`0`: never).
+    drop_logged: AtomicU64,
     http: reqwest::Client,
 }
+
+/// The file whose lock says which of the processes sharing a data
+/// directory delivers its webhooks.
+pub fn outbox_lock(data_dir: &std::path::Path) -> RoleLock {
+    RoleLock::new(data_dir.join("lock").join("outbox.lock"))
+}
+
+/// An undelivered row nobody has given up on.
+const PENDING: &str = "time_delivered IS NULL AND time_failed IS NULL";
 
 fn decode_seed(text: &str) -> Option<[u8; 32]> {
     let text = text.trim();
@@ -282,34 +355,16 @@ impl Outbox {
             hooks,
             settings,
             clock,
-            capture: Mutex::new(None),
             subscriptions: Mutex::new(Vec::new()),
             wake: Arc::new(tokio::sync::Notify::new()),
-            stopped: AtomicBool::new(false),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            task: Mutex::new(None),
+            role: OnceLock::new(),
+            follower_told: std::sync::atomic::AtomicBool::new(false),
+            dropped: AtomicU64::new(0),
+            drop_logged: AtomicU64::new(0),
             http,
         });
-        if outbox.enabled() {
-            let (tx, rx) = mpsc::channel::<Message>();
-            *outbox.capture.lock().unwrap_or_else(|p| p.into_inner()) = Some(tx);
-            // The writer holds a weak handle: it ends when the outbox does.
-            let writer = Arc::downgrade(&outbox);
-            std::thread::Builder::new()
-                .name("alforria-outbox".to_string())
-                .spawn(move || {
-                    while let Ok(message) = rx.recv() {
-                        let Some(outbox) = writer.upgrade() else {
-                            break;
-                        };
-                        match message {
-                            Message::Event(payload) => outbox.record(&payload),
-                            Message::Flush(done) => {
-                                let _ = done.send(());
-                            }
-                        }
-                    }
-                })
-                .map_err(|err| format!("outbox writer: {err}"))?;
-        }
         Ok(outbox)
     }
 
@@ -320,6 +375,51 @@ impl Outbox {
 
     pub fn settings(&self) -> OutboxSettings {
         self.settings
+    }
+
+    /// Deliver only while holding `role` (see [`outbox_lock`]): of the
+    /// processes sharing a data directory, one sends. Set once, before the
+    /// loop starts; a later call changes nothing.
+    pub fn deliver_as(&self, role: RoleLock) {
+        let _ = self.role.set(role);
+    }
+
+    /// Whether this process is the one that delivers, taking the place if
+    /// it is free.
+    fn delivers(&self) -> bool {
+        let Some(role) = self.role.get() else {
+            return true;
+        };
+        if role.acquire() {
+            return true;
+        }
+        if !self.follower_told.swap(true, Ordering::SeqCst) {
+            tracing::info!(
+                "another process delivers this data directory's webhooks: this one records \
+                 its events for it and takes over when that process exits"
+            );
+        }
+        false
+    }
+
+    /// Pending, failed and dropped deliveries.
+    pub fn stats(&self) -> OutboxStats {
+        let count = |filter: &str| {
+            self.storage
+                .with_connection(|conn| {
+                    conn.query_row(
+                        &format!("SELECT COUNT(*) FROM outbox WHERE {filter}"),
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                })
+                .unwrap_or(0) as u64
+        };
+        OutboxStats {
+            pending: count(PENDING),
+            failed: count("time_failed IS NOT NULL"),
+            dropped: self.dropped.load(Ordering::SeqCst),
+        }
     }
 
     /// Capture the events of a project instance from now on.
@@ -347,34 +447,12 @@ impl Outbox {
         })
     }
 
-    /// Hand an event to the writer if any hook selects it. Called from
-    /// inside the bus publish, so it only filters and sends.
+    /// Record an event if any hook selects it. Called from inside the bus
+    /// publish, and the rows are written before it returns: nothing that
+    /// follows the event can happen without them.
     pub fn capture(&self, payload: &Payload) {
-        if !self.wants(&payload.r#type) {
-            return;
-        }
-        if let Some(tx) = self
-            .capture
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .as_ref()
-        {
-            let _ = tx.send(Message::Event(Box::new(payload.clone())));
-        }
-    }
-
-    /// Wait until every event captured so far is a row.
-    pub fn flush(&self) {
-        let tx = self
-            .capture
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone();
-        if let Some(tx) = tx {
-            let (done, wait) = mpsc::channel();
-            if tx.send(Message::Flush(done)).is_ok() {
-                let _ = wait.recv_timeout(Duration::from_secs(5));
-            }
+        if self.wants(&payload.r#type) {
+            self.record(payload);
         }
     }
 
@@ -452,8 +530,56 @@ impl Outbox {
             }
         }
         if wrote {
-            self.prune();
+            self.cap_pending();
             self.wake.notify_one();
+        }
+    }
+
+    /// Drop the oldest undelivered rows beyond `max_pending`. A drop is a
+    /// delivery that will never be made: it is counted
+    /// ([`OutboxStats::dropped`]) and logged.
+    fn cap_pending(&self) {
+        let dropped = self.storage.with_connection(|conn| {
+            let pending: i64 = conn.query_row(
+                &format!("SELECT COUNT(*) FROM outbox WHERE {PENDING}"),
+                [],
+                |row| row.get(0),
+            )?;
+            let over = pending - self.settings.max_pending as i64;
+            if over <= 0 {
+                return Ok(0);
+            }
+            conn.execute(
+                &format!(
+                    "DELETE FROM outbox WHERE id IN \
+                     (SELECT id FROM outbox WHERE {PENDING} ORDER BY rowid LIMIT ?1)"
+                ),
+                [over],
+            )
+        });
+        match dropped {
+            Ok(0) => {}
+            Ok(dropped) => {
+                let total =
+                    self.dropped.fetch_add(dropped as u64, Ordering::SeqCst) + dropped as u64;
+                let now = self.clock.now_ms().max(1);
+                let last = self.drop_logged.load(Ordering::SeqCst);
+                if (last == 0 || now.saturating_sub(last) >= DROP_LOG_INTERVAL_MS)
+                    && self
+                        .drop_logged
+                        .compare_exchange(last, now, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                {
+                    tracing::warn!(
+                        dropped = total,
+                        max_pending = self.settings.max_pending,
+                        "outbox: more than hook.outbox.max_pending deliveries are waiting; the \
+                         oldest are dropped and will never be delivered ({total} since this \
+                         server started)"
+                    );
+                }
+            }
+            Err(err) => tracing::warn!("outbox: capping the undelivered rows failed: {err}"),
         }
     }
 
@@ -467,28 +593,34 @@ impl Outbox {
                 "DELETE FROM outbox WHERE COALESCE(time_delivered, time_failed) IS NOT NULL \
                  AND COALESCE(time_delivered, time_failed) <= ?1",
                 [cutoff],
-            )?;
-            conn.execute(
-                "DELETE FROM outbox WHERE time_delivered IS NULL AND time_failed IS NULL AND id NOT IN \
-                 (SELECT id FROM outbox WHERE time_delivered IS NULL AND time_failed IS NULL \
-                  ORDER BY rowid DESC LIMIT ?1)",
-                [self.settings.max_pending as i64],
             )
         });
         if let Err(err) = result {
             tracing::warn!("outbox: prune failed: {err}");
         }
+        self.cap_pending();
     }
 
     /// Every row, oldest first (tests, diagnostics).
     pub fn deliveries(&self) -> Vec<Delivery> {
+        self.rows("?1 = ''", "", usize::MAX)
+    }
+
+    /// The head of a hook's queue: its oldest undelivered rows, in order.
+    fn queue(&self, hook: &str) -> Vec<Delivery> {
+        self.rows(&format!("hook = ?1 AND {PENDING}"), hook, PASS_BATCH)
+    }
+
+    fn rows(&self, filter: &str, hook: &str, limit: usize) -> Vec<Delivery> {
         self.storage
             .with_connection(|conn| -> rusqlite::Result<Vec<Delivery>> {
-                let mut statement = conn.prepare(
+                let mut statement = conn.prepare(&format!(
                     "SELECT id, hook, event_type, body, attempts, time_created, time_next, \
-                     time_delivered, time_failed, last_error FROM outbox ORDER BY rowid",
-                )?;
-                let rows = statement.query_map([], |row| {
+                     time_delivered, time_failed, last_error FROM outbox \
+                     WHERE {filter} ORDER BY rowid LIMIT ?2"
+                ))?;
+                let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+                let rows = statement.query_map(rusqlite::params![hook, limit], |row| {
                     Ok(Delivery {
                         id: row.get(0)?,
                         hook: row.get(1)?,
@@ -543,25 +675,112 @@ impl Outbox {
         });
     }
 
-    /// Try every delivery that is due, once. Returns how many attempts
-    /// were made.
-    pub async fn deliver_due(&self) -> usize {
+    /// Close the undelivered rows of hooks the config no longer has.
+    fn abandon_removed_hooks(&self) {
+        let now = self.clock.now_ms() as i64;
+        let result = self
+            .storage
+            .with_connection(|conn| -> rusqlite::Result<()> {
+                let mut statement =
+                    conn.prepare(&format!("SELECT DISTINCT hook FROM outbox WHERE {PENDING}"))?;
+                let owed: Vec<String> = statement
+                    .query_map([], |row| row.get(0))?
+                    .collect::<rusqlite::Result<_>>()?;
+                for hook in owed {
+                    if self.hooks.iter().any(|known| known.key == hook) {
+                        continue;
+                    }
+                    conn.execute(
+                        &format!(
+                            "UPDATE outbox SET time_failed = ?2, last_error = ?3 \
+                         WHERE hook = ?1 AND {PENDING}"
+                        ),
+                        rusqlite::params![hook, now, "the hook is no longer configured"],
+                    )?;
+                }
+                Ok(())
+            });
+        if let Err(err) = result {
+            tracing::warn!("outbox: closing a removed hook's deliveries failed: {err}");
+        }
+    }
+
+    /// One attempt at one delivery, and its result written to the row.
+    async fn attempt(&self, hook: &Hook, delivery: &Delivery) -> Outcome {
+        let attempt = delivery.attempts + 1;
+        let timestamp = self.clock.now_ms() / 1000;
+        let response = self
+            .http
+            .post(&hook.url)
+            .header("content-type", "application/json")
+            .header("x-alforria-delivery", &delivery.id)
+            .header("x-alforria-event", &delivery.event_type)
+            .header("x-alforria-timestamp", timestamp)
+            .header("x-alforria-attempt", attempt)
+            .header(
+                "x-alforria-signature",
+                Outbox::signature(hook, timestamp, &delivery.body),
+            )
+            .body(delivery.body.clone())
+            .send()
+            .await;
+        let outcome = match response {
+            Ok(response) if response.status().is_success() => Outcome::Delivered,
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let error = format!("the receiver answered {status}");
+                if permanent_status(status) {
+                    Outcome::Permanent(error)
+                } else {
+                    Outcome::Retry(error)
+                }
+            }
+            // No URL in the message: it may carry credentials.
+            Err(err) if err.is_timeout() => {
+                Outcome::Retry("the receiver did not answer in time".to_string())
+            }
+            Err(err) if err.is_connect() => {
+                Outcome::Retry("could not connect to the receiver".to_string())
+            }
+            Err(_) => Outcome::Retry("the request failed".to_string()),
+        };
         let now = self.clock.now_ms();
-        let due: Vec<Delivery> = self
-            .deliveries()
-            .into_iter()
-            .filter(|delivery| !delivery.delivered && !delivery.failed && delivery.time_next <= now)
-            .collect();
+        let written = self.storage.with_connection(|conn| match &outcome {
+            Outcome::Delivered => conn.execute(
+                "UPDATE outbox SET attempts = ?2, time_delivered = ?3, last_error = NULL WHERE id = ?1",
+                rusqlite::params![delivery.id, attempt, now as i64],
+            ),
+            Outcome::Retry(error) => {
+                let next = now + self.backoff(attempt).as_millis() as u64;
+                conn.execute(
+                    "UPDATE outbox SET attempts = ?2, time_next = ?3, last_error = ?4 WHERE id = ?1",
+                    rusqlite::params![delivery.id, attempt, next as i64, error],
+                )
+            }
+            Outcome::Permanent(error) => conn.execute(
+                "UPDATE outbox SET attempts = ?2, time_failed = ?3, last_error = ?4 WHERE id = ?1",
+                rusqlite::params![delivery.id, attempt, now as i64, error],
+            ),
+        });
+        if let Err(err) = written {
+            tracing::warn!("outbox: could not record the result of a delivery: {err}");
+        }
+        if let Outcome::Permanent(error) = &outcome {
+            tracing::warn!(
+                hook = %hook.key,
+                delivery = %delivery.id,
+                event = %delivery.event_type,
+                "outbox: {error}; the delivery is given up, not retried"
+            );
+        }
+        outcome
+    }
+
+    /// One hook's pass: its queue from the head, in order, until a row is
+    /// not due yet or an attempt fails. Returns how many attempts it made.
+    async fn deliver_hook(&self, hook: &Hook, now: u64) -> usize {
         let mut attempted = 0;
-        for delivery in due {
-            let Some(hook) = self.hooks.iter().find(|hook| hook.key == delivery.hook) else {
-                self.finish(
-                    &delivery.id,
-                    "time_failed",
-                    Some("the hook is no longer configured"),
-                );
-                continue;
-            };
+        for delivery in self.queue(&hook.key) {
             if now.saturating_sub(delivery.time_created) > self.settings.max_age.as_millis() as u64
             {
                 self.finish(
@@ -576,70 +795,53 @@ impl Outbox {
                 );
                 continue;
             }
+            // The head is backing off: what was recorded after it waits.
+            if delivery.time_next > now {
+                break;
+            }
             attempted += 1;
-            let attempt = delivery.attempts + 1;
-            let timestamp = self.clock.now_ms() / 1000;
-            let response = self
-                .http
-                .post(&hook.url)
-                .header("content-type", "application/json")
-                .header("x-alforria-delivery", &delivery.id)
-                .header("x-alforria-event", &delivery.event_type)
-                .header("x-alforria-timestamp", timestamp)
-                .header("x-alforria-attempt", attempt)
-                .header(
-                    "x-alforria-signature",
-                    Outbox::signature(hook, timestamp, &delivery.body),
-                )
-                .body(delivery.body.clone())
-                .send()
-                .await;
-            let failure = match response {
-                Ok(response) if response.status().is_success() => None,
-                Ok(response) => Some(format!(
-                    "the receiver answered {}",
-                    response.status().as_u16()
-                )),
-                // No URL in the message: it may carry credentials.
-                Err(err) if err.is_timeout() => {
-                    Some("the receiver did not answer in time".to_string())
-                }
-                Err(err) if err.is_connect() => {
-                    Some("could not connect to the receiver".to_string())
-                }
-                Err(_) => Some("the request failed".to_string()),
-            };
-            match failure {
-                None => {
-                    let now = self.clock.now_ms() as i64;
-                    let _ = self.storage.with_connection(|conn| {
-                        conn.execute(
-                            "UPDATE outbox SET attempts = ?2, time_delivered = ?3, last_error = NULL WHERE id = ?1",
-                            rusqlite::params![delivery.id, attempt, now],
-                        )
-                    });
-                }
-                Some(error) => {
-                    let next = self.clock.now_ms() + self.backoff(attempt).as_millis() as u64;
-                    let _ = self.storage.with_connection(|conn| {
-                        conn.execute(
-                            "UPDATE outbox SET attempts = ?2, time_next = ?3, last_error = ?4 WHERE id = ?1",
-                            rusqlite::params![delivery.id, attempt, next as i64, error],
-                        )
-                    });
-                }
+            match self.attempt(hook, &delivery).await {
+                Outcome::Delivered => {}
+                Outcome::Retry(_) | Outcome::Permanent(_) => break,
             }
         }
         attempted
     }
 
-    /// When the next undelivered row is due, if there is one.
+    /// Try what is due, once: every hook's queue at the same time, each in
+    /// order and up to its first failure. Returns how many attempts were
+    /// made — none in a process that is not the one delivering.
+    pub async fn deliver_due(&self) -> usize {
+        if !self.delivers() {
+            return 0;
+        }
+        self.abandon_removed_hooks();
+        let now = self.clock.now_ms();
+        let passes = self.hooks.iter().map(|hook| self.deliver_hook(hook, now));
+        futures::future::join_all(passes).await.into_iter().sum()
+    }
+
+    /// When the next delivery is due, if one is waiting: the earliest of
+    /// the hooks' heads.
     fn next_due(&self) -> Option<u64> {
-        self.deliveries()
-            .into_iter()
-            .filter(|delivery| !delivery.delivered && !delivery.failed)
-            .map(|delivery| delivery.time_next)
-            .min()
+        self.storage
+            .with_connection(|conn| -> rusqlite::Result<Option<i64>> {
+                // With a bare MIN, SQLite takes the other columns from the
+                // row that holds the minimum: each hook's oldest row.
+                let mut statement = conn.prepare(&format!(
+                    "SELECT MIN(rowid), time_next FROM outbox WHERE {PENDING} GROUP BY hook"
+                ))?;
+                let heads = statement.query_map([], |row| row.get::<_, i64>(1))?;
+                let mut earliest = None;
+                for head in heads {
+                    let head = head?;
+                    earliest = Some(earliest.map_or(head, |known: i64| known.min(head)));
+                }
+                Ok(earliest)
+            })
+            .ok()
+            .flatten()
+            .map(|due| due.max(0) as u64)
     }
 
     /// Deliver until [`Outbox::stop`]. Rows written before this starts —
@@ -648,25 +850,60 @@ impl Outbox {
         if !self.enabled() {
             return;
         }
-        while !self.stopped.load(Ordering::SeqCst) {
-            self.deliver_due().await;
+        loop {
+            // A stop drops the attempts in flight: their rows stay due and
+            // go out again, with the same delivery id, on the next start.
+            tokio::select! {
+                biased;
+                _ = self.cancel.cancelled() => break,
+                _ = self.deliver_due() => {}
+            }
             self.prune();
             let now = self.clock.now_ms();
             let wait = match self.next_due() {
-                Some(due) => Duration::from_millis(due.saturating_sub(now).clamp(10, 60_000)),
-                None => Duration::from_secs(60),
+                Some(due) if self.role.get().is_none_or(RoleLock::held) => {
+                    Duration::from_millis(due.saturating_sub(now))
+                        .clamp(Duration::from_millis(10), POLL)
+                }
+                _ => POLL,
             };
             tokio::select! {
+                biased;
+                _ = self.cancel.cancelled() => break,
                 _ = self.wake.notified() => {}
                 _ = tokio::time::sleep(wait) => {}
             }
         }
+        // Another process may deliver from here on.
+        if let Some(role) = self.role.get() {
+            role.release();
+        }
     }
 
-    /// Stop the delivery loop after its current pass.
+    /// Start the delivery loop on the current runtime, once.
+    pub fn spawn(self: &Arc<Self>) {
+        if !self.enabled() {
+            return;
+        }
+        let mut task = self.task.lock().unwrap_or_else(|p| p.into_inner());
+        if task.is_none() {
+            *task = Some(tokio::spawn(self.clone().run()));
+        }
+    }
+
+    /// Tell the delivery loop to end. Returns at once.
     pub fn stop(&self) {
-        self.stopped.store(true, Ordering::SeqCst);
-        self.wake.notify_one();
+        self.cancel.cancel();
+    }
+
+    /// [`Outbox::stop`], then wait for the loop [`Outbox::spawn`] started.
+    /// It never waits for a receiver: an attempt in flight is dropped.
+    pub async fn shutdown(&self) {
+        self.stop();
+        let task = self.task.lock().unwrap_or_else(|p| p.into_inner()).take();
+        if let Some(task) = task {
+            let _ = task.await;
+        }
     }
 }
 

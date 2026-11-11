@@ -198,7 +198,6 @@ async fn a_selected_event_is_delivered_signed_and_small() {
         "permission.replied",
         json!({ "sessionID": "ses_1" }),
     ));
-    outbox.flush();
     assert_eq!(
         outbox.deliveries().len(),
         1,
@@ -268,7 +267,6 @@ async fn failed_deliveries_are_retried_with_backoff() {
     )
     .unwrap();
     outbox.capture(&event("session.idle", json!({ "sessionID": "ses_1" })));
-    outbox.flush();
 
     assert_eq!(outbox.deliver_due().await, 1);
     let row = outbox.deliveries().remove(0);
@@ -347,7 +345,6 @@ async fn deliveries_can_be_signed_with_ed25519() {
         "question.asked",
         json!({ "id": "que_1", "sessionID": "ses_1" }),
     ));
-    outbox.flush();
     assert_eq!(outbox.deliver_due().await, 1);
 
     let request = receiver.requests().remove(0);
@@ -403,11 +400,12 @@ async fn deliveries_survive_a_restart_mid_backoff() {
                 "error": { "name": "ProviderAuthError", "data": { "message": "secret detail" } }
             }),
         ));
-        outbox.flush();
-        assert_eq!(outbox.deliver_due().await, 2);
+        // The hook's first delivery fails; the second waits behind it.
+        assert_eq!(outbox.deliver_due().await, 1);
         let rows = outbox.deliveries();
         assert_eq!(rows.len(), 2);
-        assert!(rows.iter().all(|row| !row.delivered && row.attempts == 1));
+        assert!(rows.iter().all(|row| !row.delivered));
+        assert_eq!((rows[0].attempts, rows[1].attempts), (1, 0));
         assert_eq!(
             rows[0].last_error.as_deref(),
             Some("could not connect to the receiver")
@@ -429,6 +427,7 @@ async fn deliveries_survive_a_restart_mid_backoff() {
 
     assert_eq!(header(&requests[0], "x-alforria-delivery"), delivery_id);
     assert_eq!(header(&requests[0], "x-alforria-attempt"), "2");
+    assert_eq!(header(&requests[1], "x-alforria-attempt"), "1");
     let second: Value = serde_json::from_str(&requests[1].body).unwrap();
     assert_eq!(second["type"], "session.error");
     assert_eq!(second["properties"]["error"], "ProviderAuthError");
@@ -462,7 +461,6 @@ async fn the_outbox_is_bounded() {
 
     // Delivered, then kept for the retention period and no longer.
     outbox.capture(&idle("ses_delivered"));
-    outbox.flush();
     assert_eq!(outbox.deliver_due().await, 1);
     clock.advance(Duration::from_secs(59 * 60));
     outbox.prune();
@@ -474,7 +472,6 @@ async fn the_outbox_is_bounded() {
     // Undeliverable: retried until max_age, then abandoned, then pruned.
     receiver.answer_with(&[500; 64]);
     outbox.capture(&idle("ses_stuck"));
-    outbox.flush();
     let mut attempts = 0;
     for _ in 0..40 {
         attempts += outbox.deliver_due().await;
@@ -507,7 +504,6 @@ async fn the_outbox_is_bounded() {
         clock.advance(Duration::from_millis(5));
         outbox.capture(&idle(&format!("ses_{index}")));
     }
-    outbox.flush();
     let kept: Vec<String> = outbox
         .deliveries()
         .iter()
@@ -519,6 +515,9 @@ async fn the_outbox_is_bounded() {
         })
         .collect();
     assert_eq!(kept, ["ses_3", "ses_4", "ses_5"]);
+    // What went is counted.
+    let stats = outbox.stats();
+    assert_eq!((stats.pending, stats.dropped), (3, 3));
 }
 
 /// Hooks select by name or pattern, each gets its own delivery, and a hook
@@ -548,7 +547,6 @@ async fn hooks_select_events_by_pattern_and_own_their_deliveries() {
         json!({ "triggerID": "trg_1", "name": "nightly" }),
     ));
     outbox.capture(&event("session.idle", json!({ "sessionID": "s" })));
-    outbox.flush();
     let rows = outbox.deliveries();
     let mut owed: Vec<(String, String)> = rows
         .iter()
@@ -604,7 +602,6 @@ async fn hooks_select_events_by_pattern_and_own_their_deliveries() {
     let idle = Outbox::new(storage(&dir), None).unwrap();
     assert!(!idle.enabled());
     idle.capture(&event("permission.asked", json!({})));
-    idle.flush();
 }
 
 /// End to end through the server: a turn that asks for permission with no
@@ -893,4 +890,415 @@ async fn a_triggers_events_are_delivered_small_and_its_answer_only_on_request() 
     // Only what it selected, and nothing with the answer in it.
     assert_eq!(wordy.requests().len(), 1);
     f.ctx.outbox.stop();
+}
+
+/// A receiver that accepts connections and never answers.
+struct Hung {
+    url: String,
+    accepted: Arc<AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Hung {
+    async fn start() -> Hung {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted: Arc<AtomicUsize> = Arc::default();
+        let count = accepted.clone();
+        let task = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+                count.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        Hung {
+            url: format!("http://127.0.0.1:{port}/hook"),
+            accepted,
+            task,
+        }
+    }
+
+    async fn wait_for(&self, count: usize) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while self.accepted.load(Ordering::SeqCst) < count {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the hung receiver was never called"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+}
+
+impl Drop for Hung {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+fn session_of(request: &Received) -> String {
+    serde_json::from_str::<Value>(&request.body).unwrap()["sessionID"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// One receiver that never answers holds up its own deliveries and nobody
+/// else's: the other hook's event arrives while the first attempt at the
+/// dead one is still in flight (its timeout is a minute away).
+#[tokio::test]
+async fn a_hung_receiver_does_not_delay_another_hooks_delivery() {
+    let dead = Hung::start().await;
+    let healthy = Receiver::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let outbox = Outbox::new(
+        storage(&dir),
+        Some(&hook(json!({
+            "webhook": [
+                { "name": "dead", "url": dead.url, "secret": "s", "events": ["session.idle"] },
+                { "name": "healthy", "url": healthy.url, "secret": "s", "events": ["permission.asked"] }
+            ],
+            "outbox": { "timeout": "60s" }
+        }))),
+    )
+    .unwrap();
+    // Five idle events owed to the dead receiver, recorded first, then the
+    // one a control plane is waiting for.
+    for index in 0..5 {
+        outbox.capture(&event(
+            "session.idle",
+            json!({ "sessionID": format!("ses_{index}") }),
+        ));
+    }
+    outbox.capture(&event(
+        "permission.asked",
+        json!({ "id": "per_1", "sessionID": "ses_x", "permission": "bash" }),
+    ));
+    let pass = tokio::spawn({
+        let outbox = outbox.clone();
+        async move { outbox.deliver_due().await }
+    });
+    let arrived = healthy.wait_for(1).await;
+    assert_eq!(header(&arrived[0], "x-alforria-event"), "permission.asked");
+    dead.wait_for(1).await;
+    assert!(!pass.is_finished(), "the dead hook's attempt is in flight");
+    // The dead hook's queue is worked in order: one attempt, at its head.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(dead.accepted.load(Ordering::SeqCst), 1);
+    let rows = outbox.deliveries();
+    assert!(rows[5].delivered, "{:?}", rows[5]);
+    assert!(rows[..5].iter().all(|row| !row.delivered && !row.failed));
+    pass.abort();
+}
+
+/// A hook's deliveries stay in the order they were recorded: what follows a
+/// failed one waits for it, and goes out after it once it succeeds.
+#[tokio::test]
+async fn a_hooks_later_deliveries_wait_behind_its_first_failure() {
+    let receiver = Receiver::start().await;
+    let other = Receiver::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let clock = TestClock::new();
+    let outbox = Outbox::with_clock(
+        storage(&dir),
+        Some(&hook(json!({
+            "webhook": [
+                { "name": "first", "url": receiver.url, "secret": "s", "events": ["session.idle"] },
+                { "name": "other", "url": other.url, "secret": "s", "events": ["session.idle"] }
+            ],
+            "outbox": { "retry_initial": "1m", "retry_max": "1m" }
+        }))),
+        clock.clone(),
+    )
+    .unwrap();
+    receiver.answer_with(&[500]);
+    for index in 0..3 {
+        outbox.capture(&event(
+            "session.idle",
+            json!({ "sessionID": format!("ses_{index}") }),
+        ));
+    }
+    // One attempt at the failing hook's head; the other hook gets all three.
+    assert_eq!(outbox.deliver_due().await, 4);
+    assert_eq!(receiver.requests().len(), 1);
+    let sessions = |receiver: &Receiver| -> Vec<String> {
+        receiver.requests().iter().map(session_of).collect()
+    };
+    assert_eq!(sessions(&other), ["ses_0", "ses_1", "ses_2"]);
+    // While the head backs off, nothing behind it is tried.
+    clock.advance(Duration::from_secs(30));
+    assert_eq!(outbox.deliver_due().await, 0);
+    assert_eq!(receiver.requests().len(), 1);
+    let waiting: Vec<u32> = outbox
+        .deliveries()
+        .iter()
+        .filter(|row| row.hook == "first")
+        .map(|row| row.attempts)
+        .collect();
+    assert_eq!(waiting, [1, 0, 0]);
+    // The head is due again and succeeds: the rest follow, in order.
+    clock.advance(Duration::from_secs(31));
+    assert_eq!(outbox.deliver_due().await, 3);
+    assert_eq!(sessions(&receiver), ["ses_0", "ses_0", "ses_1", "ses_2"]);
+    assert!(outbox.deliveries().iter().all(|row| row.delivered));
+}
+
+/// A receiver that refuses a delivery for good (404, 410, any 4xx that is
+/// not about timing) is not asked again: the row is closed at once with the
+/// status. A 500, a 429, a 408 and a timeout are retried.
+#[tokio::test]
+async fn a_refused_delivery_is_given_up_and_a_failed_one_is_retried() {
+    use alforria_server::outbox::permanent_status;
+    for status in [400, 401, 403, 404, 405, 410, 413, 422, 499] {
+        assert!(permanent_status(status), "{status}");
+    }
+    for status in [200, 301, 302, 408, 425, 429, 500, 502, 503, 504] {
+        assert!(!permanent_status(status), "{status}");
+    }
+
+    let receiver = Receiver::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let clock = TestClock::new();
+    let outbox = Outbox::with_clock(
+        storage(&dir),
+        Some(&hook(json!({
+            "webhook": [{ "url": receiver.url, "secret": "s", "events": ["session.idle"] }],
+            "outbox": { "retry_initial": "1m", "retry_max": "1m", "max_age": "72h" }
+        }))),
+        clock.clone(),
+    )
+    .unwrap();
+    let idle = |session: &str| event("session.idle", json!({ "sessionID": session }));
+
+    for (index, status) in [404u16, 410].into_iter().enumerate() {
+        receiver.answer_with(&[status]);
+        outbox.capture(&idle(&format!("ses_gone_{index}")));
+        assert_eq!(outbox.deliver_due().await, 1);
+        let row = outbox.deliveries().remove(index);
+        assert!(row.failed && !row.delivered, "{row:?}");
+        assert_eq!(row.attempts, 1);
+        assert_eq!(
+            row.last_error.as_deref(),
+            Some(format!("the receiver answered {status}").as_str())
+        );
+        // Not now, and not after any backoff.
+        let before = receiver.requests().len();
+        assert_eq!(outbox.deliver_due().await, 0);
+        clock.advance(Duration::from_secs(3600));
+        assert_eq!(outbox.deliver_due().await, 0);
+        assert_eq!(receiver.requests().len(), before, "{status} is not retried");
+    }
+    assert_eq!(outbox.stats().failed, 2);
+    assert_eq!(outbox.stats().pending, 0);
+
+    // The ones worth another attempt get one, with the same delivery id.
+    receiver.answer_with(&[500, 429, 408]);
+    outbox.capture(&idle("ses_retried"));
+    for attempt in 1..=3u32 {
+        assert_eq!(outbox.deliver_due().await, 1);
+        let row = outbox.deliveries().remove(2);
+        assert!(!row.failed && !row.delivered, "{row:?}");
+        assert_eq!(row.attempts, attempt);
+        clock.advance(Duration::from_secs(61));
+    }
+    assert_eq!(outbox.deliver_due().await, 1);
+    let row = outbox.deliveries().remove(2);
+    assert!(row.delivered, "{row:?}");
+    assert_eq!(row.attempts, 4);
+    let requests = receiver.requests();
+    let retried: Vec<&str> = requests[2..]
+        .iter()
+        .map(|request| header(request, "x-alforria-delivery"))
+        .collect();
+    assert_eq!(retried, [row.id.as_str(); 4]);
+
+    // A receiver that does not answer in time is retried too.
+    let hung = Hung::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let outbox = Outbox::new(
+        storage(&dir),
+        Some(&hook(json!({
+            "webhook": [{ "url": hung.url, "secret": "s", "events": ["session.idle"] }],
+            "outbox": { "timeout": "200ms" }
+        }))),
+    )
+    .unwrap();
+    outbox.capture(&idle("ses_slow"));
+    assert_eq!(outbox.deliver_due().await, 1);
+    let row = outbox.deliveries().remove(0);
+    assert!(!row.failed && !row.delivered, "{row:?}");
+    assert_eq!(
+        row.last_error.as_deref(),
+        Some("the receiver did not answer in time")
+    );
+}
+
+/// The delivery is in the database before the publish that carried the
+/// event returns: a process killed right after `session.idle` — here, an
+/// outbox dropped at once, with nothing flushed or awaited — leaves it for
+/// the next one.
+#[tokio::test]
+async fn the_row_is_on_disk_before_the_event_is_published() {
+    use alforria_core::event::definition::Definition;
+    let receiver = Receiver::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let config = hook(json!({
+        "webhook": [{ "url": receiver.url, "secret": "s", "events": ["session.idle"] }]
+    }));
+    {
+        let storage = storage(&dir);
+        let bus = alforria_core::EventBus::new_shared(storage.clone(), None);
+        let outbox = Outbox::new(storage, Some(&config)).unwrap();
+        outbox.attach(&bus);
+        bus.publish(
+            &Definition::ephemeral("session.idle"),
+            json!({ "sessionID": "ses_killed" }),
+            Default::default(),
+        )
+        .unwrap();
+        // Another connection, as another process would have, sees the row
+        // the moment the publish has returned.
+        let other = Storage::open(dir.path().join("db.sqlite")).unwrap();
+        let rows: i64 = other
+            .with_connection(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM outbox", [], |row| row.get(0))
+            })
+            .unwrap();
+        assert_eq!(rows, 1);
+        // The "kill": everything goes, nothing was delivered.
+    }
+    assert!(receiver.requests().is_empty());
+    let outbox = Outbox::new(storage(&dir), Some(&config)).unwrap();
+    assert_eq!(outbox.deliveries().len(), 1);
+    assert_eq!(outbox.deliver_due().await, 1);
+    assert_eq!(session_of(&receiver.requests()[0]), "ses_killed");
+}
+
+/// Events dropped beyond `max_pending` are counted, and `GET /attention`
+/// shows the count on a server that has hooks — and nothing new on one that
+/// has none.
+#[tokio::test]
+async fn dropped_deliveries_are_counted_and_shown() {
+    let dead = Hung::start().await;
+    let url = dead.url.clone();
+    let f = support::fixture_with(
+        move |_| {
+            json!({
+                "hook": {
+                    "webhook": [{ "url": url, "secret": "s", "events": ["session.idle"] }],
+                    "outbox": { "max_pending": 2 }
+                }
+            })
+        },
+        None,
+        Vec::new(),
+    );
+    let attention = || async {
+        support::body_json(support::call(&f.router, "GET", "/attention", None, None).await).await
+    };
+    assert_eq!(
+        attention().await["outbox"],
+        json!({ "pending": 0, "failed": 0, "dropped": 0 })
+    );
+    for index in 0..5 {
+        f.ctx.outbox.capture(&event(
+            "session.idle",
+            json!({ "sessionID": format!("ses_{index}") }),
+        ));
+    }
+    let stats = f.ctx.outbox.stats();
+    assert_eq!((stats.pending, stats.dropped), (2, 3));
+    let body = attention().await;
+    assert_eq!(
+        body["outbox"],
+        json!({ "pending": 2, "failed": 0, "dropped": 3 })
+    );
+    assert_eq!(body["count"], 0);
+
+    // No hooks: the answer is what it always was.
+    let plain = support::fixture_with(|_| json!({}), None, Vec::new());
+    let body =
+        support::body_json(support::call(&plain.router, "GET", "/attention", None, None).await)
+            .await;
+    assert_eq!(body, json!({ "count": 0, "items": [] }));
+}
+
+/// Stopping never waits for a receiver: with an attempt hanging (its
+/// timeout a minute away) the loop ends at once, and the delivery it was
+/// making is still owed.
+#[tokio::test]
+async fn shutdown_does_not_wait_for_a_hung_receiver() {
+    let dead = Hung::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let outbox = Outbox::new(
+        storage(&dir),
+        Some(&hook(json!({
+            "webhook": [{ "url": dead.url, "secret": "s", "events": ["session.idle"] }],
+            "outbox": { "timeout": "60s" }
+        }))),
+    )
+    .unwrap();
+    outbox.spawn();
+    outbox.capture(&event("session.idle", json!({ "sessionID": "ses_1" })));
+    dead.wait_for(1).await;
+    tokio::time::timeout(Duration::from_secs(5), outbox.shutdown())
+        .await
+        .expect("shutdown waited for the receiver");
+    let row = outbox.deliveries().remove(0);
+    assert!(!row.delivered && !row.failed, "{row:?}");
+    assert_eq!(row.attempts, 0, "an attempt cut short is not counted");
+}
+
+/// Two servers on one data directory both record what their own events owe,
+/// and one of them delivers: a row is sent once. When that one stops, the
+/// other takes over.
+#[tokio::test]
+async fn two_processes_on_one_data_directory_deliver_a_row_once() {
+    use alforria_server::outbox::outbox_lock;
+    let receiver = Receiver::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let config = hook(json!({
+        "webhook": [{ "url": receiver.url, "secret": "s", "events": ["session.idle"] }]
+    }));
+    let process = || {
+        let outbox = Outbox::new(storage(&dir), Some(&config)).unwrap();
+        outbox.deliver_as(outbox_lock(dir.path()));
+        outbox
+    };
+    let (first, second) = (process(), process());
+    let idle = |session: &str| event("session.idle", json!({ "sessionID": session }));
+
+    // The first to make a pass is the one that delivers.
+    assert_eq!(first.deliver_due().await, 0);
+    second.capture(&idle("ses_from_second"));
+    assert_eq!(second.deliver_due().await, 0, "a follower sends nothing");
+    assert!(receiver.requests().is_empty());
+    assert_eq!(
+        first.deliver_due().await,
+        1,
+        "the other's row is its to send"
+    );
+    assert_eq!(second.deliver_due().await, 0);
+    assert_eq!(receiver.requests().len(), 1);
+    assert!(second.deliveries()[0].delivered);
+
+    // Both loops running: every row goes out once.
+    first.spawn();
+    second.spawn();
+    first.capture(&idle("ses_a"));
+    second.capture(&idle("ses_b"));
+    receiver.wait_for(3).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(receiver.requests().len(), 3);
+
+    // The one delivering stops: the other has the place on its next pass.
+    first.shutdown().await;
+    second.capture(&idle("ses_after"));
+    let requests = receiver.wait_for(4).await;
+    assert_eq!(session_of(&requests[3]), "ses_after");
+    second.shutdown().await;
+    assert_eq!(receiver.requests().len(), 4);
 }

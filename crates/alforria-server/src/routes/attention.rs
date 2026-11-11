@@ -24,6 +24,12 @@
 //!
 //! Oldest first. A credential below `admin` sees the projects it may open
 //! (`server.directories`). Outside the frozen v1/v2 tables.
+//!
+//! On a server with `hook.webhook` configured there is one more member,
+//! `"outbox": { "pending": 0, "failed": 0, "dropped": 0 }`: deliveries still
+//! owed, deliveries given up that `hook.outbox.retention` still keeps, and
+//! undelivered events this process dropped beyond `hook.outbox.max_pending`
+//! since it started. Without hooks the member is absent.
 
 use std::sync::Arc;
 
@@ -118,5 +124,16 @@ async fn attention(
     }
     items.sort_by_key(|(asked, _)| *asked);
     let items: Vec<Value> = items.into_iter().map(|(_, item)| item).collect();
-    Json(json!({ "count": items.len(), "items": items }))
+    let mut body = json!({ "count": items.len(), "items": items });
+    // The webhook outbox in numbers, on a server that has hooks: what is
+    // still owed, what was given up, and what was dropped for want of room.
+    if ctx.outbox.enabled() {
+        let stats = ctx.outbox.stats();
+        body["outbox"] = json!({
+            "pending": stats.pending,
+            "failed": stats.failed,
+            "dropped": stats.dropped,
+        });
+    }
+    Json(body)
 }

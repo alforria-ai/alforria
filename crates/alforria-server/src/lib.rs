@@ -114,7 +114,7 @@ impl Listener {
     pub async fn stop(self) -> io::Result<()> {
         self.websockets.close_all();
         (self.ctx.stop_background)();
-        self.ctx.outbox.stop();
+        self.ctx.outbox.shutdown().await;
         self.shutdown
             .send(true)
             .map_err(|_| io::Error::other("server task already stopped"))?;
@@ -155,10 +155,10 @@ impl Listener {
         )
         .await;
         shutdown::kill_processes(&self.ctx, &mut report);
-        // What the turns just published (their `session.idle`) is written
-        // down before the process goes; delivery resumes on the next start.
-        self.ctx.outbox.flush();
-        self.ctx.outbox.stop();
+        // What the turns just published (their `session.idle`) was written
+        // down as it was published; delivery resumes on the next start.
+        // Nothing here waits for a receiver.
+        self.ctx.outbox.shutdown().await;
 
         // Whatever is still connected now is a stream: close the websockets
         // with 1001, give in-flight responses the rest of the budget, then
@@ -215,7 +215,7 @@ pub async fn listen_with(opts: &ListenOptions, ctx: Arc<ServerContext>) -> io::R
     });
     let task = tokio::spawn(async move { serve.await });
     // Webhook deliveries, including whatever an earlier process left.
-    tokio::spawn(ctx.outbox.clone().run());
+    ctx.outbox.spawn();
 
     let warnings = startup_warnings(&ctx);
     for warning in &warnings {
@@ -464,6 +464,8 @@ pub fn production_context(
             outbox::Outbox::new(storage.clone(), None).map_err(io::Error::other)?
         }
     };
+    // Of the processes that share the data directory, one delivers.
+    outbox.deliver_as(outbox::outbox_lock(&paths.data));
     let policy = Arc::new(policy);
     // The unattended policy sits on each instance's ask services.
     instances.set_on_boot({

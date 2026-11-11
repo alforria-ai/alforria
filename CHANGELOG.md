@@ -154,8 +154,16 @@ pre-1.0, so minor releases may include breaking changes.
   any other by name or pattern) to a URL through a durable outbox: at least
   once, with exponential backoff, a delivery id to deduplicate on, an
   HMAC-SHA256 or Ed25519 signature over timestamp and body, and bounded
-  retention. Deliveries survive a restart. The payload carries ids, the
-  session and its title, never message content.
+  retention. Deliveries survive a restart, and a kill: the row is written
+  before the event's publish returns. The payload carries ids, the session
+  and its title, never message content. Each hook is a queue of its own,
+  delivered in order and at the same time as the others, so a receiver that
+  hangs delays only its own deliveries. A 4xx other than 408, 425 and 429
+  is given up at once instead of retried until `max_age`. Events deleted
+  beyond `hook.outbox.max_pending` are logged and counted, and on a server
+  with hooks `GET /attention` carries `outbox: { pending, failed, dropped }`.
+  Stopping the server does not wait for a receiver. Of several servers on
+  one data directory, one delivers (`<data>/lock/outbox.lock`).
 - `shell_env` (global config) controls what the agent's shells and helper
   processes inherit from the server's environment: `inherit` (`"all"`,
   `"none"` or a list), `allow`, `set` and `deny` (matched without regard to
