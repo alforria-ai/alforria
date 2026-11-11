@@ -172,6 +172,11 @@ old leader left unfinished are closed as interrupted, and a tick that came
 due in the gap is fired only by a trigger with `catch_up`. A clean
 shutdown releases the scheduler's place as its first step.
 
+Inside one process the scheduler's place goes to the newest instance of a
+directory: when an instance is booted again (a config change disposes it),
+the new one stops the scheduler of the one it replaces, whose running
+turns finish, instead of waiting behind it as a follower.
+
 Limits:
 
 | | |

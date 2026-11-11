@@ -380,6 +380,9 @@ pre-1.0, so minor releases may include breaking changes.
   and the others are followers, where each used to do both on its own; a
   follower takes over within seconds of the leader's exit. Migration
   `0010_trigger_run_owner` adds two columns and an index to `trigger_run`.
+  When a directory's instance is booted again inside one server (after
+  `/instance/dispose` or a config change), the new instance's scheduler takes the
+  place of the old instance's, which stops firing.
 - On macOS and other non-Linux Unix systems the owner of a restart marker is
   now checked with a signal-0 probe, so a turn a killed server left mid-way
   is repaired at the next start there too (it was only on Linux).

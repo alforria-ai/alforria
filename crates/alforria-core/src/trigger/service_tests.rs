@@ -1870,6 +1870,37 @@ async fn the_second_server_is_a_follower_and_takes_over_when_the_scheduler_exits
     // operating system's (`owner::tests::a_role_has_one_holder_until_it_lets_go`).
 }
 
+/// Within one process the scheduler's place passes to the newest instance
+/// of a directory: an instance booted again after a config change is not
+/// left a follower of the one it replaced.
+#[tokio::test]
+async fn a_reloaded_instance_takes_the_schedulers_place_from_the_one_it_replaces() {
+    let f = Fixture::new(
+        "trigger-reload",
+        "2027-01-01T00:00:00Z",
+        FakeOps::answering("ok"),
+    );
+    let old = f.service_with(f.shared(json!({
+        "hourly": { "on": { "cron": "@hourly" }, "prompt": "Old" },
+    })));
+    old.start();
+    assert!(!old.is_follower());
+    // The config changed and the instance was booted again.
+    let new = f.service_with(f.shared(json!({
+        "hourly": { "on": { "cron": "@hourly" }, "prompt": "Old" },
+        "added": { "on": { "interval": "30m" }, "prompt": "New" },
+    })));
+    new.start();
+    assert!(old.stopped());
+    assert!(!new.is_follower());
+    let half = f.clock.advance(1_800_000);
+    assert!(old.tick(half).is_empty());
+    let fired = settle(&new, &new.tick(half)).await;
+    assert_eq!(fired.len(), 1);
+    assert_eq!(fired[0].trigger_id, "added");
+    new.stop();
+}
+
 /// A service alone on its data directory always has the scheduler's place
 /// and wins every claim: nothing about it changes.
 #[tokio::test]

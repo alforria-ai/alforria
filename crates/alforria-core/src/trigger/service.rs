@@ -473,6 +473,29 @@ impl TriggerService {
         self.follower.load(Ordering::SeqCst) && !self.scheduling()
     }
 
+    /// Within one process a directory's instance can be booted again (a
+    /// config change disposes it): the service of the instance that was
+    /// replaced still holds the scheduler's place, and would keep the new
+    /// one a follower for as long as the process lives. The new one stops
+    /// it — nothing fires from the old instance any more; the turns it has
+    /// running finish — and registers itself as the one to stop next time.
+    fn supersede(self: &Arc<Self>) {
+        static SCHEDULERS: Mutex<BTreeMap<PathBuf, std::sync::Weak<TriggerService>>> =
+            Mutex::new(BTreeMap::new());
+        let Some(role) = &self.role else {
+            return;
+        };
+        let previous = SCHEDULERS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(role.path().to_path_buf(), Arc::downgrade(self));
+        if let Some(previous) = previous.and_then(|previous| previous.upgrade()) {
+            if !Arc::ptr_eq(&previous, self) {
+                previous.stop();
+            }
+        }
+    }
+
     /// Whether this process is the directory's scheduler, taking the place
     /// if it is free. A follower asks again on every pass of its loop, so
     /// it takes over within [`FOLLOWER_RETRY_MS`] of the scheduler's exit.
@@ -1174,6 +1197,7 @@ impl TriggerService {
             return;
         }
         // Before the watchers: only the directory's scheduler has any.
+        self.supersede();
         self.leads(self.clock.now_ms());
         let ids: Vec<String> = self.lock().keys().cloned().collect();
         for id in ids {
