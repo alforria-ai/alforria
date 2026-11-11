@@ -812,10 +812,13 @@ as its own does not exist for it.
   HTTP call), and `GET /memory/session` needs `session_search`. What it
   writes is a client's record: shown to restricted sessions, never injected
   into the operator's, and its rewrite never verifies a record. Memory is
-  kept per project, and every directory that is not a git repository
-  belongs to the one `global` project: a token confined to such a directory
-  shares memory with the others. Give the directory a repository of its own
-  to keep its memory apart.
+  kept per project, and for a directory that is not a git repository — all
+  of which belong to the one `global` project — per directory: a token
+  confined to such a directory reads and changes that directory's records
+  and searches that directory's sessions, nothing of another's. The
+  exception is yours to make: `memory.scope: "global"` shares one memory
+  across everything, for every caller. The `/memory/unattributed` routes
+  need `admin`. See "Whose records" in [assistant.md](assistant.md).
 - **Event replay.** `GET /api/session/{id}/event` answers for sessions in an
   allowed directory, the operator's included (as `GET
   /session/{id}/message` does).

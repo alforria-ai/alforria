@@ -295,11 +295,59 @@ Memory is what an agent keeps across sessions. It is off by default:
 | Field | Meaning |
 | --- | --- |
 | `enabled` | `true` adds the `memory` and `session_search` tools, the `<memory>` block, the `/memory` routes and the transcript index. Default `false`. `OPENCODE_DISABLE_MEMORY=1` forces it off. |
-| `scope` | `"project"` (default): each project has its own records and searches its own sessions. `"global"`: one set of records shared by every project, and session search covers all projects. |
+| `scope` | `"project"` (default): each project has its own records and searches its own sessions; a directory that is not a repository has its own too (see [Whose records](#whose-records)). `"global"`: one set of records shared by every project and every directory, and session search covers all of them — for every caller, a token confined to one directory included. Only your own config can set it. |
 | `inject.recent` | The most records the system context carries (default 20; 0 turns injection off). |
 | `inject.max_chars` | The most characters of record content it carries (default 4000). |
 | `inject.unverified` | Also inject records written by a compaction flush or from a session that carried outside text. Default `false`: those records are found by search only. |
 | `flush_before_compaction` | Before a compaction, give the model one request in which to save memories from the conversation about to be summarised. Default `false`. |
+
+### Whose records
+
+A repository's records belong to its project. Its subdirectories and its
+worktrees are the same project and share them, and `session_search` reads
+the project's sessions.
+
+A directory that is not a git repository has no project of its own:
+upstream files every such directory under one project, `global`. Memory
+does not share that way. For a `global` record the key is the **directory**
+— the one the server resolved for the request or the instance, links
+followed, the same value the `server.directories` allowlist is asked about
+and that a session stores. So:
+
+- each non-repository directory has its own records: a list, an id, a
+  search, an update, a delete and the `<memory>` block all stay within it,
+  for the tool, for `/memory` and for every caller, the operator included;
+- `session_search` and `GET /memory/session` read the sessions of that
+  directory only;
+- every spelling of one directory (`dir/.`, `dir/sub/..`, a link to it) is
+  one set of records, and a link is the place it leads to: a token confined
+  to `/srv/a` that names `/srv/a/link-to-b` is refused by the allowlist, as
+  it is for everything else;
+- a subdirectory of a non-repository directory is a directory of its own.
+
+A record shows its key as `directory` (absent on a project's record).
+`scope: "global"` is the explicit opposite — one memory across everything —
+and reads every `global` record whatever its directory; it still records
+where each one was written.
+
+**Records from before this.** Earlier builds kept one shared set for all
+non-repository directories. On first open the `0009_memory_directory`
+migration gives each existing `global` record the directory of the session
+that wrote it (the `memory` tool and the compaction flush record their
+session), so a directory keeps what was saved in it. A record with no
+session to go by — anything saved through `POST /memory`, or by a session
+deleted since — gets no directory and is **unattributed**: no directory is
+shown it, by any route, tool or system context. Unattributed records are the
+operator's to sort out (Basic auth, an `admin` token, or no authentication —
+the same line that makes a `/memory` write the user's own):
+
+| Route | |
+| --- | --- |
+| `GET /memory/unattributed` | The unattributed records, newest first. `?limit=`, `?offset=`. The same list from any directory. |
+| `PATCH /memory/unattributed/{id}` | File the record under the request's `?directory=` (which must not be a repository). Content, origin and trust are unchanged. |
+| `DELETE /memory/unattributed/{id}` | `{ deleted }`. |
+
+A token below `admin` is refused all three.
 
 ### Two kinds of memory
 
@@ -572,9 +620,11 @@ tools' rules: a write needs the default agent's `memory` permission for the
 action (`remember`, `update`, `forget`) to be `allow`, `GET /memory/session`
 needs `session_search`, and an `ask` is a refusal. What such a token writes
 is a `client` record from a restricted writer. A record id belongs to the
-instance's memory: an id from another project is a 404.
+instance's memory: an id from another project, or from another directory
+that is not a repository, is a 404 (see [Whose records](#whose-records),
+which also lists the `admin`-only `/memory/unattributed` routes).
 
-A record is `{ id, projectID, kind, content, metadata?, archived,
+A record is `{ id, projectID, directory?, kind, content, metadata?, archived,
 provenance?, verified, time: { created, updated } }`. Changes are announced by `memory.updated`
 (`{ id, action }`, `action` being `remembered`, `updated` or `forgotten`).
 

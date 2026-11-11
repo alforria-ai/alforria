@@ -414,6 +414,23 @@ pre-1.0, so minor releases may include breaking changes.
   an `interrupted` error.
 - A memory record written by a `chat` or `connector` token, or by a session
   one of them created, is injected into restricted sessions only.
+- Memory in a directory that is not a git repository is kept per directory.
+  All such directories are one project (`global`), and they used to share
+  one set of records and one transcript search — which also let a token
+  confined to one directory read, change and delete another's. Now each has
+  its own records and searches its own sessions; a repository's memory is
+  still its project's, shared by its worktrees and subdirectories. **If you
+  had turned memory on and used it outside a repository**, you can notice
+  this: after the upgrade a directory shows the records that were saved *in
+  it* (the `0009_memory_directory` migration attributes each existing record
+  through the session that wrote it) and no longer those saved in another
+  non-repository directory. Records with no session to go by — saved
+  through `POST /memory`, or by a session deleted since — are shown in no
+  directory until you file them: `GET /memory/unattributed`, then
+  `PATCH /memory/unattributed/{id}?directory=…` or `DELETE` (Basic auth, an
+  `admin` token, or no authentication). `memory.scope: "global"` still
+  shares one memory across everything. Memory is off by default; an install
+  that never enabled it sees no change. See `docs/assistant.md`.
 - `git` run by the server (status, diff, snapshots) no longer inherits the
   server's secrets: a repository's own filters and hooks see the scrubbed
   environment.
