@@ -374,8 +374,9 @@ impl InstanceStore {
             .is_some();
         if removed {
             // What the instance's config had the shell environment policy
-            // withhold goes with it; the next boot learns it again.
-            forget_instance_names(&directory);
+            // withhold stays withheld: its turns, terminals and MCP
+            // servers can outlive the cache entry. Only the next boot of
+            // the directory replaces it (`shell_env::learn_at`).
             self.emit_disposed(&directory.display().to_string());
         }
     }
@@ -391,17 +392,9 @@ impl InstanceStore {
             .map(|(directory, _)| directory)
             .collect();
         for directory in removed {
-            forget_instance_names(&directory);
             self.emit_disposed(&directory.display().to_string());
         }
     }
-}
-
-fn forget_instance_names(directory: &Path) {
-    alforria_core::shell_env::learn(
-        &alforria_core::shell_env::source_instance(directory),
-        [] as [&str; 0],
-    );
 }
 
 /// `FSUtil.resolve` (`core/src/fs-util.ts:247-258`): `path.resolve` against

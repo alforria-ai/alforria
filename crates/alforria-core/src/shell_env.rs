@@ -41,8 +41,10 @@
 //! The policy comes from `shell_env` in the host config
 //! (`config::host::load_host_config`) and is process-wide: [`install`] it
 //! once at startup; until then [`current`] is the standalone default. The
-//! learned names are kept per source and replaced through [`learn`] each
-//! time that source is read again (a catalog read, an instance boot).
+//! learned names are kept per source and replaced through [`learn_at`]
+//! each time that source is read again (a catalog read, an instance
+//! boot), and in no other way: a disposed instance's names stay until its
+//! directory boots again, because its processes can outlive it.
 //!
 //! This is not a sandbox. A child running as the server's user can still
 //! read `/proc/<server pid>/environ` and the server's files; keeping those
@@ -177,8 +179,17 @@ pub struct ShellEnvPolicy {
     /// The host's `deny` patterns, upper-cased.
     deny: Vec<String>,
     /// Names the server reads a key or a secret from, upper-cased, by the
-    /// source they were learned from ([`ShellEnvPolicy::learn`]).
-    named: BTreeMap<String, BTreeSet<String>>,
+    /// source they were learned from ([`ShellEnvPolicy::learn_at`]).
+    named: BTreeMap<String, Learned>,
+}
+
+/// What one source last had the policy withhold.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct Learned {
+    /// The reading it comes from ([`next_generation`]): an older reading
+    /// never replaces a newer one.
+    generation: u64,
+    names: BTreeSet<String>,
 }
 
 fn is_literal(name: &str) -> bool {
@@ -264,6 +275,12 @@ impl ShellEnvPolicy {
         self.restricted
     }
 
+    /// Whether the host set `shell_env.inherit` itself, so that the
+    /// posture's default selection does not apply.
+    pub fn inherit_configured(&self) -> bool {
+        self.inherit.is_some()
+    }
+
     fn learnable<S: AsRef<str>>(names: impl IntoIterator<Item = S>) -> BTreeSet<String> {
         names
             .into_iter()
@@ -284,37 +301,54 @@ impl ShellEnvPolicy {
         self.named
             .entry(String::new())
             .or_default()
+            .names
             .extend(Self::learnable(names));
     }
 
     /// Make `names` the whole of what `source` (a `SOURCE_*` name) has the
     /// server deny, replacing what it said before: a name a reloaded config
     /// or catalog no longer mentions is released, a new one is withheld.
-    /// Returns whether anything changed. Otherwise as
+    /// Returns whether the denied names changed. Otherwise as
     /// [`ShellEnvPolicy::deny_names`].
+    ///
+    /// `generation` orders the readings of one source
+    /// ([`next_generation`], taken before the source is read): a reading
+    /// older than the one already held is ignored, so a boot that finishes
+    /// late cannot put back what a later boot replaced. Replacing is the
+    /// only way a source's names go — nothing is forgotten because an
+    /// instance was disposed, whose processes can outlive it.
+    pub fn learn_at<S: AsRef<str>>(
+        &mut self,
+        source: &str,
+        generation: u64,
+        names: impl IntoIterator<Item = S>,
+    ) -> bool {
+        let names = Self::learnable(names);
+        let known = self.named.entry(source.to_string()).or_default();
+        if generation < known.generation {
+            return false;
+        }
+        known.generation = generation;
+        if known.names == names {
+            return false;
+        }
+        known.names = names;
+        true
+    }
+
+    /// [`ShellEnvPolicy::learn_at`] as a reading no older than the one
+    /// held.
     pub fn learn<S: AsRef<str>>(
         &mut self,
         source: &str,
         names: impl IntoIterator<Item = S>,
     ) -> bool {
-        let names = Self::learnable(names);
-        if self
-            .named
-            .get(source)
-            .map_or(names.is_empty(), |known| *known == names)
-        {
-            return false;
-        }
-        if names.is_empty() {
-            self.named.remove(source);
-        } else {
-            self.named.insert(source.to_string(), names);
-        }
-        true
+        let generation = self.named.get(source).map_or(0, |known| known.generation);
+        self.learn_at(source, generation, names)
     }
 
     fn learned(&self, upper: &str) -> bool {
-        self.named.values().any(|names| names.contains(upper))
+        self.named.values().any(|known| known.names.contains(upper))
     }
 
     fn allowed(&self, name: &str) -> bool {
@@ -451,15 +485,30 @@ pub fn install(policy: ShellEnvPolicy) {
     *CURRENT.write().unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(policy));
 }
 
-/// [`ShellEnvPolicy::learn`] on the process-wide policy: called each time
-/// `source` is read again, so that the names follow a config or catalog
-/// reload instead of staying what they were at startup.
-pub fn learn<S: AsRef<str>>(source: &str, names: impl IntoIterator<Item = S>) {
+static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// A number greater than every one handed out before, in this process:
+/// taken *before* a source is read, it says which of two readings is the
+/// later one ([`learn_at`]).
+pub fn next_generation() -> u64 {
+    GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// [`ShellEnvPolicy::learn_at`] on the process-wide policy: called each
+/// time `source` is read again, so that the names follow a config or
+/// catalog reload instead of staying what they were at startup. The
+/// comparison of generations and the replacement happen under one lock.
+pub fn learn_at<S: AsRef<str>>(source: &str, generation: u64, names: impl IntoIterator<Item = S>) {
     let mut current = CURRENT.write().unwrap_or_else(|p| p.into_inner());
     let mut policy = current.as_deref().cloned().unwrap_or_default();
-    if policy.learn(source, names) {
-        *current = Some(Arc::new(policy));
-    }
+    // The generation is recorded even when the names are the same.
+    policy.learn_at(source, generation, names);
+    *current = Some(Arc::new(policy));
+}
+
+/// [`learn_at`] as a reading made now.
+pub fn learn<S: AsRef<str>>(source: &str, names: impl IntoIterator<Item = S>) {
+    learn_at(source, next_generation(), names);
 }
 
 /// The process-wide policy: the installed one, else the default.
@@ -917,7 +966,35 @@ mod tests {
         assert!(!policy.denied("SHARED_AUTH"));
         assert!(!policy.denied("PATH"));
         assert!(policy.learn(SOURCE_CATALOG, [] as [&str; 0]));
-        assert_eq!(policy, ShellEnvPolicy::default());
+        assert!(!policy.denied("CATALOG_TWO"));
+    }
+
+    /// Two readings of one source can finish in either order (two boots
+    /// of one directory): the one that started later stands, whichever
+    /// arrives last — an older one never empties or overwrites it.
+    #[test]
+    fn an_older_reading_arriving_late_changes_nothing() {
+        let source = source_instance(std::path::Path::new("/repo"));
+        let mut policy = ShellEnvPolicy::default();
+        assert!(policy.learn_at(&source, 7, ["NEWER_KEY"]));
+        // The boot that started earlier finishes now: with other names,
+        // and with none at all.
+        assert!(!policy.learn_at(&source, 5, ["OLDER_KEY"]));
+        assert!(!policy.learn_at(&source, 6, [] as [&str; 0]));
+        assert!(policy.denied("NEWER_KEY"));
+        assert!(!policy.denied("OLDER_KEY"));
+        // The same reading again, and a later one, do replace.
+        assert!(policy.learn_at(&source, 7, ["NEWER_KEY", "SECOND_KEY"]));
+        assert!(policy.learn_at(&source, 8, ["LATEST_KEY"]));
+        assert!(!policy.denied("NEWER_KEY"));
+        assert!(policy.denied("LATEST_KEY"));
+        // A later reading with nothing is remembered as later too.
+        assert!(policy.learn_at(&source, 9, [] as [&str; 0]));
+        assert!(!policy.learn_at(&source, 8, ["LATEST_KEY"]));
+        assert!(!policy.denied("LATEST_KEY"));
+        // Another source is not ordered against this one.
+        assert!(policy.learn_at(SOURCE_CATALOG, 1, ["CATALOG_KEY"]));
+        assert!(policy.denied("CATALOG_KEY"));
     }
 
     /// On a restricted server the default is an allowlist: what is not on

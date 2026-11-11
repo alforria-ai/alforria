@@ -59,8 +59,9 @@ fn provider(env: &str) -> alforria_core::catalog::Provider {
 /// A standalone server. A project declares a provider of its own that
 /// reads its key from `MY_CORP_LLM_KEY` — a name no list or pattern knows —
 /// and refers to `{env:PROJECT_REFERENCED}`: both are withheld from the
-/// agent's shell once the instance has booted, and released when the
-/// project no longer names them and its config is read again. The host
+/// agent's shell once the instance has booted, stay withheld when the
+/// instance is disposed, and are released only when the directory boots
+/// again with a config that no longer names them. The host
 /// config and the catalog are followed the same way. `GITHUB_TOKEN` and
 /// `AWS_PROFILE` pass throughout.
 #[test]
@@ -129,8 +130,33 @@ fn learned_names_follow_a_config_or_catalog_reload() {
         serde_json::json!({ "provider": { "corp": { "env": ["MY_CORP_OTHER"] } } }),
     );
     ctx.instances.dispose_directory(&repo);
-    assert_eq!(shell_names(), everything, "a disposed instance's names go");
+    // Disposing forgets nothing: the instance's turns, terminals and MCP
+    // servers can still be starting processes.
+    assert_eq!(
+        shell_names(),
+        without(&["MY_CORP_LLM_KEY", "my_corp_llm_key", "PROJECT_REFERENCED"]),
+        "a disposed instance's names stay withheld"
+    );
     ctx.instances.load(&repo).unwrap();
+    assert_eq!(shell_names(), without(&["MY_CORP_OTHER"]));
+    ctx.instances.dispose_all();
+    assert_eq!(shell_names(), without(&["MY_CORP_OTHER"]));
+
+    // Boots and disposals of one directory racing each other never leave
+    // the name released.
+    std::thread::scope(|scope| {
+        for _ in 0..4 {
+            scope.spawn(|| {
+                for _ in 0..5 {
+                    ctx.instances.load(&repo).unwrap();
+                    ctx.instances.dispose_directory(&repo);
+                }
+            });
+        }
+    });
+    assert_eq!(shell_names(), without(&["MY_CORP_OTHER"]));
+    // A boot that started before those and reports only now is ignored.
+    shell_env::learn_at(&shell_env::source_instance(&repo), 0, [] as [&str; 0]);
     assert_eq!(shell_names(), without(&["MY_CORP_OTHER"]));
 
     // The host config gains a provider and a reference after startup.

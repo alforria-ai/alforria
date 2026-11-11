@@ -592,25 +592,34 @@ fn production_instance_factory(
 /// `{env:NAME}`), shared by every instance, and this instance's — its
 /// merged config's providers (a project can declare one of its own) and
 /// the `{env:NAME}` of its project files. A name is withheld while any
-/// source names it.
+/// source names it. Nothing is forgotten when an instance is disposed —
+/// its processes can outlive it — and a boot of an older `generation`
+/// that arrives late changes nothing.
 fn learn_config_names(
+    generation: u64,
     params: &alforria_core::LoadParams,
     config: &alforria_core::config::schema::Config,
     host_config: &alforria_core::config::schema::Config,
 ) {
     use alforria_core::shell_env;
     let loader = alforria_core::ConfigLoader::new();
-    shell_env::learn(
+    shell_env::learn_at(
         shell_env::SOURCE_HOST_PROVIDERS,
+        generation,
         policy::provider_env_names(host_config),
     );
-    shell_env::learn(
+    shell_env::learn_at(
         shell_env::SOURCE_HOST_REFERENCES,
+        generation,
         loader.host_env_references(params),
     );
     let mut names: Vec<String> = policy::provider_env_names(config).cloned().collect();
     names.extend(loader.project_env_references(params));
-    shell_env::learn(&shell_env::source_instance(&params.directory), names);
+    shell_env::learn_at(
+        &shell_env::source_instance(&params.directory),
+        generation,
+        names,
+    );
 }
 
 /// One instance boot: config load + project resolution + service wiring
@@ -625,11 +634,14 @@ fn instance_for_directory(
     directory: &std::path::Path,
 ) -> Result<Arc<alforria_core::SessionServices>, ServerError> {
     let params = alforria_core::LoadParams::new(directory.to_path_buf(), paths.clone());
+    // Taken before the configs are read: of two boots, the one that read
+    // them later is the one whose names stand.
+    let generation = alforria_core::shell_env::next_generation();
     let (config, _opencode_dirs) = alforria_core::ConfigLoader::new().load(&params)?;
     let host_config = alforria_core::ConfigLoader::new().load_trusted(&params)?;
     // A boot is where a config is read again: what it has the shell
     // environment policy withhold replaces what the last one said.
-    learn_config_names(&params, &config, &host_config);
+    learn_config_names(generation, &params, &config, &host_config);
 
     // `skill.dirs()` — directory sources from the config (`skills.paths`);
     // http(s) entries are URL sources materialized through the discovery
