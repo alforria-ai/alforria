@@ -1013,6 +1013,15 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
                 project_id.clone()
             },
             global: memory_global,
+            // The key of a `global` project's records and sessions: the
+            // instance's directory, resolved as the allowlist resolved it
+            // (`state::resolve_directory`) and once more by the guard's
+            // resolver, so two spellings of one directory are one key and a
+            // link is the place it leads to.
+            directory: alforria_core::protect::resolve_path(&input.directory)
+                .unwrap_or_else(|_| input.directory.clone())
+                .display()
+                .to_string(),
             inject_recent: memory_inject
                 .recent
                 .map(|value| value as usize)

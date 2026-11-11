@@ -94,6 +94,13 @@ pub struct MemoryRecord {
     pub id: String,
     #[serde(rename = "projectID")]
     pub project_id: String,
+    /// Where a record of the `global` project was written: the resolved
+    /// directory of the instance ([`MemorySettings::directory`]). Absent on
+    /// a real project's record, and on a `global` record nobody could
+    /// attribute — which no directory is shown
+    /// ([`MemoryService::list_unattributed`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory: Option<String>,
     /// What sort of thing it is: `fact`, `preference`, `task`, `note`, or any
     /// short lowercase word.
     pub kind: String,
@@ -302,6 +309,15 @@ pub struct MemorySettings {
     pub project_id: String,
     /// `scope: "global"`: `session_search` covers every project.
     pub global: bool,
+    /// The instance's directory, resolved the way the server resolves the
+    /// directory of a request (links followed): what a session of this
+    /// instance stores as its directory.
+    ///
+    /// A directory that is not a repository has no project of its own —
+    /// every one of them is [`crate::GLOBAL_ID`] — so there the project
+    /// says nothing about whose records these are and the directory is the
+    /// key ([`MemorySettings::directory_key`]).
+    pub directory: String,
     /// How many records the system context may carry.
     pub inject_recent: usize,
     /// How many characters of record content the system context may carry.
@@ -315,6 +331,40 @@ pub struct MemorySettings {
 impl MemorySettings {
     pub const DEFAULT_INJECT_RECENT: usize = 20;
     pub const DEFAULT_INJECT_MAX_CHARS: usize = 4_000;
+
+    /// The directory this instance's records are confined to, when they
+    /// are: the instance is in the shared `global` project (its directory
+    /// is not a repository) and the user has not asked for one memory
+    /// across everything (`scope: "global"`). `None` for a real project,
+    /// whose key is the project — its worktrees share their records.
+    ///
+    /// Every query over records goes through [`scope_sql`] with this, and
+    /// so does the transcript search: a record or a session of the `global`
+    /// project that carries another directory, or none, is not this
+    /// instance's.
+    pub fn directory_key(&self) -> Option<&str> {
+        (self.project_id == crate::GLOBAL_ID && !self.global).then_some(self.directory.as_str())
+    }
+
+    /// What a new record stores as its directory: the instance's, whenever
+    /// the record is the `global` project's — also under `scope: "global"`,
+    /// which reads across directories but still records where each record
+    /// was written, so that turning the scope back keeps them apart.
+    fn written_directory(&self) -> Option<&str> {
+        (self.project_id == crate::GLOBAL_ID).then_some(self.directory.as_str())
+    }
+}
+
+/// "This instance's records", as SQL over the `memory` table under `alias`:
+/// the project (parameter `?project`), and within the `global` project the
+/// directory (parameter `?directory`, bound to
+/// [`MemorySettings::directory_key`]). A `global` record with no directory
+/// matches no directory.
+fn scope_sql(alias: &str, project: usize, directory: usize) -> String {
+    format!(
+        "{alias}.project_id = ?{project} \
+         AND (?{directory} IS NULL OR {alias}.directory = ?{directory})"
+    )
 }
 
 /// A new record id. Ids ascend in the order they are made, so records saved
@@ -399,6 +449,7 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryRecord> {
     Ok(MemoryRecord {
         id: row.get("id")?,
         project_id: row.get("project_id")?,
+        directory: row.get("directory")?,
         kind: row.get("kind")?,
         content: row.get("content")?,
         metadata: metadata.and_then(|text| serde_json::from_str(&text).ok()),
@@ -412,7 +463,8 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryRecord> {
     })
 }
 
-const COLUMNS: &str = "m.id, m.project_id, m.kind, m.content, m.metadata, m.archived, m.trust, \
+const COLUMNS: &str =
+    "m.id, m.project_id, m.directory, m.kind, m.content, m.metadata, m.archived, m.trust, \
      m.provenance, m.time_created, m.time_updated";
 
 /// A caller's metadata, without the key older versions kept the origin
@@ -533,6 +585,7 @@ impl MemoryService {
         let record = MemoryRecord {
             id: new_id(),
             project_id: self.settings.project_id.clone(),
+            directory: self.settings.written_directory().map(str::to_string),
             kind,
             content,
             metadata,
@@ -548,8 +601,11 @@ impl MemoryService {
             .with_connection_mut(|conn| -> Result<(), MemoryError> {
                 let tx = conn.transaction()?;
                 let count: i64 = tx.query_row(
-                    "SELECT COUNT(*) FROM memory WHERE project_id = ?1",
-                    [&record.project_id],
+                    &format!(
+                        "SELECT COUNT(*) FROM memory m WHERE {}",
+                        scope_sql("m", 1, 2)
+                    ),
+                    params![record.project_id, self.settings.directory_key()],
                     |row| row.get(0),
                 )?;
                 if count as usize >= MAX_RECORDS {
@@ -560,8 +616,8 @@ impl MemoryService {
                 tx.execute(
                     "INSERT INTO memory
                         (id, project_id, kind, content, metadata, archived, trust, provenance,
-                         time_created, time_updated)
-                     VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8, ?8)",
+                         time_created, time_updated, directory)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8, ?8, ?9)",
                     params![
                         record.id,
                         record.project_id,
@@ -571,6 +627,7 @@ impl MemoryService {
                         provenance.trust(),
                         json!(provenance).to_string(),
                         now as i64,
+                        record.directory,
                     ],
                 )?;
                 tx.execute(
@@ -590,9 +647,10 @@ impl MemoryService {
             Ok(conn
                 .query_row(
                     &format!(
-                        "SELECT {COLUMNS} FROM memory m WHERE m.id = ?1 AND m.project_id = ?2"
+                        "SELECT {COLUMNS} FROM memory m WHERE m.id = ?1 AND {}",
+                        scope_sql("m", 2, 3)
                     ),
-                    params![id, self.settings.project_id],
+                    params![id, self.settings.project_id, self.settings.directory_key()],
                     row_to_record,
                 )
                 .optional()?)
@@ -610,9 +668,10 @@ impl MemoryService {
         self.storage.with_connection(|conn| {
             let mut stmt = conn.prepare(&format!(
                 "SELECT {COLUMNS} FROM memory m
-                 WHERE m.project_id = ?1 AND (?2 OR m.archived = 0) AND (?3 IS NULL OR m.kind = ?3)
+                 WHERE {} AND (?2 OR m.archived = 0) AND (?3 IS NULL OR m.kind = ?3)
                    AND (?6 = 0 OR m.trust = 'verified')
-                 ORDER BY m.time_updated DESC, m.id DESC LIMIT ?4 OFFSET ?5"
+                 ORDER BY m.time_updated DESC, m.id DESC LIMIT ?4 OFFSET ?5",
+                scope_sql("m", 1, 7)
             ))?;
             let rows = stmt
                 .query_map(
@@ -622,7 +681,8 @@ impl MemoryService {
                         kind,
                         limit as i64,
                         query.offset as i64,
-                        query.verified_only
+                        query.verified_only,
+                        self.settings.directory_key()
                     ],
                     row_to_record,
                 )?
@@ -667,12 +727,13 @@ impl MemoryService {
                                 ORDER BY memory.time_updated DESC, memory.id DESC
                             ) AS writer_rank
                      FROM memory
-                     WHERE memory.project_id = ?1 AND memory.archived = 0
+                     WHERE {scope} AND memory.archived = 0
                        AND (?2 OR memory.trust = 'verified')
                        AND (?2 OR ?3 OR NOT COALESCE({RESTRICTED}, 0))
                  ) m
                  WHERE m.writer_rank <= ?4
-                 ORDER BY m.time_updated DESC, m.id DESC"
+                 ORDER BY m.time_updated DESC, m.id DESC",
+                scope = scope_sql("memory", 1, 5)
             ))?;
             let rows = stmt
                 .query_map(
@@ -680,7 +741,8 @@ impl MemoryService {
                         self.settings.project_id,
                         self.settings.inject_unverified,
                         restricted_session,
-                        limit as i64
+                        limit as i64,
+                        self.settings.directory_key()
                     ],
                     |row| Ok((row_to_record(row)?, row.get::<_, i64>("writer_class")?)),
                 )?
@@ -944,8 +1006,11 @@ impl MemoryService {
             .with_connection_mut(|conn| -> Result<bool, MemoryError> {
                 let tx = conn.transaction()?;
                 let removed = tx.execute(
-                    "DELETE FROM memory WHERE id = ?1 AND project_id = ?2",
-                    params![id, self.settings.project_id],
+                    &format!(
+                        "DELETE FROM memory WHERE id = ?1 AND {}",
+                        scope_sql("memory", 2, 3)
+                    ),
+                    params![id, self.settings.project_id, self.settings.directory_key()],
                 )?;
                 if removed > 0 {
                     tx.execute("DELETE FROM memory_fts WHERE id = ?1", [id])?;
@@ -987,9 +1052,10 @@ impl MemoryService {
                 let mut stmt = conn.prepare(&format!(
                     "SELECT {COLUMNS}, snippet(memory_fts, 0, '[', ']', '…', 24) AS snippet
                      FROM memory_fts JOIN memory m ON m.id = memory_fts.id
-                     WHERE memory_fts MATCH ?1 AND m.project_id = ?2
+                     WHERE memory_fts MATCH ?1 AND {}
                        AND (?3 OR m.archived = 0) AND (?4 IS NULL OR m.kind = ?4)
-                     ORDER BY rank LIMIT ?5"
+                     ORDER BY rank LIMIT ?5",
+                    scope_sql("m", 2, 6)
                 ))?;
                 let rows = stmt
                     .query_map(
@@ -998,7 +1064,8 @@ impl MemoryService {
                             self.settings.project_id,
                             include_archived,
                             kind,
-                            limit as i64
+                            limit as i64,
+                            self.settings.directory_key()
                         ],
                         |row| {
                             Ok(MemoryHit {
@@ -1019,9 +1086,10 @@ impl MemoryService {
         self.storage.with_connection(|conn| {
             let mut stmt = conn.prepare(&format!(
                 "SELECT {COLUMNS} FROM memory m
-                 WHERE m.project_id = ?1 AND m.content LIKE ?2 ESCAPE '\\'
+                 WHERE {} AND m.content LIKE ?2 ESCAPE '\\'
                    AND (?3 OR m.archived = 0) AND (?4 IS NULL OR m.kind = ?4)
-                 ORDER BY m.time_updated DESC LIMIT ?5"
+                 ORDER BY m.time_updated DESC LIMIT ?5",
+                scope_sql("m", 1, 6)
             ))?;
             let rows = stmt
                 .query_map(
@@ -1030,7 +1098,8 @@ impl MemoryService {
                         format!("%{}%", escape_like(query)),
                         include_archived,
                         kind,
-                        limit as i64
+                        limit as i64,
+                        self.settings.directory_key()
                     ],
                     row_to_record,
                 )?
@@ -1043,6 +1112,111 @@ impl MemoryService {
                 })
                 .collect())
         })
+    }
+
+    /// Records of the `global` project that belong to no directory, most
+    /// recently updated first: ones saved before records were kept per
+    /// directory whose origin names no session (anything saved through
+    /// `/memory`) or a session that is gone. No directory is shown them —
+    /// not by a list, a search, an id or the system context — since nothing
+    /// says which directory's they are. This is the operator's view of
+    /// them; callers decide who the operator is (the server: Basic auth or
+    /// an `admin` token).
+    pub fn list_unattributed(
+        &self,
+        limit: Option<usize>,
+        offset: usize,
+    ) -> Result<Vec<MemoryRecord>, MemoryError> {
+        self.require_enabled()?;
+        let limit = limit.unwrap_or(100).clamp(1, 500);
+        self.storage.with_connection(|conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {COLUMNS} FROM memory m
+                 WHERE m.project_id = ?1 AND m.directory IS NULL
+                 ORDER BY m.time_updated DESC, m.id DESC LIMIT ?2 OFFSET ?3"
+            ))?;
+            let rows = stmt
+                .query_map(
+                    params![crate::GLOBAL_ID, limit as i64, offset as i64],
+                    row_to_record,
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
+    /// File an unattributed record ([`Self::list_unattributed`]) under this
+    /// instance's directory. Its content, origin and trust stay as they
+    /// are: the operator says where it belongs, not what it is worth.
+    pub fn claim_unattributed(&self, id: &str) -> Result<MemoryRecord, MemoryError> {
+        self.require_enabled()?;
+        let Some(directory) = self.settings.written_directory() else {
+            return Err(MemoryError::Invalid(
+                "this directory is a project's, and a project's memory is not kept per \
+                 directory: claim the record from the directory it belongs to"
+                    .to_string(),
+            ));
+        };
+        let claimed = self
+            .storage
+            .with_connection_mut(|conn| -> Result<bool, MemoryError> {
+                let tx = conn.transaction()?;
+                let count: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM memory WHERE project_id = ?1 AND directory = ?2",
+                    params![crate::GLOBAL_ID, directory],
+                    |row| row.get(0),
+                )?;
+                if count as usize >= MAX_RECORDS {
+                    return Err(MemoryError::Invalid(format!(
+                        "memory is full ({MAX_RECORDS} records): forget or merge some first"
+                    )));
+                }
+                let claimed = tx.execute(
+                    "UPDATE memory SET directory = ?1
+                     WHERE id = ?2 AND project_id = ?3 AND directory IS NULL",
+                    params![directory, id, crate::GLOBAL_ID],
+                )?;
+                tx.commit()?;
+                Ok(claimed > 0)
+            })?;
+        if !claimed {
+            return Err(MemoryError::NotFound(format!(
+                "no unattributed memory with id {id}"
+            )));
+        }
+        self.announce(id, "updated");
+        self.storage
+            .with_connection(|conn| {
+                conn.query_row(
+                    &format!("SELECT {COLUMNS} FROM memory m WHERE m.id = ?1"),
+                    [id],
+                    row_to_record,
+                )
+            })
+            .map_err(MemoryError::from)
+    }
+
+    /// Delete an unattributed record ([`Self::list_unattributed`]) for good.
+    pub fn forget_unattributed(&self, id: &str) -> Result<bool, MemoryError> {
+        self.require_enabled()?;
+        let removed = self
+            .storage
+            .with_connection_mut(|conn| -> Result<bool, MemoryError> {
+                let tx = conn.transaction()?;
+                let removed = tx.execute(
+                    "DELETE FROM memory WHERE id = ?1 AND project_id = ?2 AND directory IS NULL",
+                    params![id, crate::GLOBAL_ID],
+                )?;
+                if removed > 0 {
+                    tx.execute("DELETE FROM memory_fts WHERE id = ?1", [id])?;
+                }
+                tx.commit()?;
+                Ok(removed > 0)
+            })?;
+        if removed {
+            self.announce(id, "forgotten");
+        }
+        Ok(removed)
     }
 
     /// The block of memory the system context carries, or `None` when there
@@ -1083,8 +1257,11 @@ impl MemoryService {
             .storage
             .with_connection(|conn| {
                 conn.query_row(
-                    "SELECT COUNT(*) FROM memory WHERE project_id = ?1 AND archived = 0",
-                    [&self.settings.project_id],
+                    &format!(
+                        "SELECT COUNT(*) FROM memory m WHERE {} AND m.archived = 0",
+                        scope_sql("m", 1, 2)
+                    ),
+                    params![self.settings.project_id, self.settings.directory_key()],
                     |row| row.get(0),
                 )
             })
@@ -1165,10 +1342,20 @@ pub(crate) mod test_support {
             enabled: true,
             project_id: project_id.to_string(),
             global: false,
+            directory: "/test/directory".to_string(),
             inject_recent: MemorySettings::DEFAULT_INJECT_RECENT,
             inject_max_chars: MemorySettings::DEFAULT_INJECT_MAX_CHARS,
             inject_unverified: false,
             flush_before_compaction: false,
+        }
+    }
+
+    /// [`settings`] for an instance in `directory`: what a test over the
+    /// `global` project needs for its sessions to be its own.
+    pub fn settings_in(project_id: &str, directory: &std::path::Path) -> MemorySettings {
+        MemorySettings {
+            directory: directory.display().to_string(),
+            ..settings(project_id)
         }
     }
 
@@ -1313,6 +1500,200 @@ mod tests {
             memory.update(&fact.id, &MemoryPatch::default()),
             Err(MemoryError::NotFound(_))
         ));
+    }
+
+    /// M7. A directory that is not a repository has no project of its own:
+    /// all of them are `global`. Their records are kept apart by directory
+    /// in every query — list, id, both searches, change, delete, the
+    /// injected block — while a real project's stay the project's, whatever
+    /// directory of it the instance is in.
+    #[test]
+    fn records_of_the_global_project_are_kept_per_directory_and_a_projects_are_shared() {
+        use super::test_support::settings_in;
+        use std::path::Path;
+        let (_temp, storage) = storage("memory-per-directory");
+        let a = service(storage.clone(), settings_in("global", Path::new("/srv/a")));
+        let b = service(storage.clone(), settings_in("global", Path::new("/srv/b")));
+        let theirs = b
+            .remember(Some("fact"), "The vault code is 4242 (C++ build).", None)
+            .unwrap();
+        assert_eq!(theirs.directory.as_deref(), Some("/srv/b"));
+        let rewrite = MemoryPatch {
+            content: Some("Rewritten from next door.".to_string()),
+            ..Default::default()
+        };
+
+        assert!(a.list(&ListQuery::default()).unwrap().is_empty());
+        assert_eq!(a.get(&theirs.id).unwrap(), None);
+        // The full-text match, and the substring fallback (`C++`).
+        assert!(a.search("vault", None, true, 10).unwrap().is_empty());
+        assert!(a.search("C++", None, true, 10).unwrap().is_empty());
+        assert!(matches!(
+            a.update(&theirs.id, &rewrite),
+            Err(MemoryError::NotFound(_))
+        ));
+        assert!(!a.forget(&theirs.id).unwrap());
+        assert_eq!(a.injection(), None);
+        assert_eq!(a.injection_for(true), None);
+        // Nothing happened to it, and its own directory has it.
+        assert_eq!(b.get(&theirs.id).unwrap(), Some(theirs.clone()));
+        assert_eq!(b.search("vault", None, false, 10).unwrap().len(), 1);
+        assert_eq!(b.search("C++", None, false, 10).unwrap().len(), 1);
+        assert!(b.injection().unwrap().contains("4242"));
+
+        // Each directory has its own, and counts its own.
+        let mine = a.remember(None, "The office is in Lyon.", None).unwrap();
+        let block = a.injection().unwrap();
+        assert!(
+            block.contains("Lyon") && !block.contains("4242") && !block.contains("more not shown"),
+            "{block}"
+        );
+        assert_eq!(b.get(&mine.id).unwrap(), None);
+
+        // A real project: the key is the project, and two directories of it
+        // (a worktree, a subdirectory) share its records, as before.
+        let repo = service(storage.clone(), settings_in("proj", Path::new("/repo")));
+        let worktree = service(storage.clone(), settings_in("proj", Path::new("/repo-wt")));
+        let shared = repo.remember(None, "Run the linter first.", None).unwrap();
+        assert_eq!(shared.directory, None);
+        assert_eq!(worktree.get(&shared.id).unwrap(), Some(shared.clone()));
+        assert_eq!(worktree.search("linter", None, false, 10).unwrap().len(), 1);
+        assert!(worktree.injection().unwrap().contains("linter"));
+        worktree.update(&shared.id, &rewrite).unwrap();
+        assert_eq!(
+            repo.get(&shared.id).unwrap().unwrap().content,
+            "Rewritten from next door."
+        );
+        assert!(worktree.forget(&shared.id).unwrap());
+        // And nothing of `global` is a project's, or the other way round.
+        assert_eq!(repo.get(&theirs.id).unwrap(), None);
+
+        // `scope: "global"` is the user asking for one memory everywhere:
+        // it reads across directories, and still records where it wrote.
+        let mut everywhere = settings_in("global", Path::new("/srv/c"));
+        everywhere.global = true;
+        let all = service(storage, everywhere);
+        assert_eq!(all.list(&ListQuery::default()).unwrap().len(), 2);
+        let noted = all
+            .remember(None, "Saved with the shared scope.", None)
+            .unwrap();
+        assert_eq!(noted.directory.as_deref(), Some("/srv/c"));
+        assert_eq!(a.get(&noted.id).unwrap(), None);
+        assert_eq!(a.list(&ListQuery::default()).unwrap().len(), 1);
+    }
+
+    /// M7. A `global` record with no directory (saved before records were
+    /// kept per directory, by something that left no session behind) is no
+    /// directory's: nothing a directory asks finds it. The operator lists
+    /// such records, files one under a directory, or deletes it.
+    #[test]
+    fn an_unattributed_record_is_no_directorys_until_the_operator_files_it() {
+        use super::test_support::settings_in;
+        use std::path::Path;
+        let (_temp, storage) = storage("memory-unattributed");
+        let a = service(storage.clone(), settings_in("global", Path::new("/srv/a")));
+        let b = service(storage.clone(), settings_in("global", Path::new("/srv/b")));
+        let repo = service(storage.clone(), settings_in("proj", Path::new("/repo")));
+        let plant = |id: &str, content: &str| {
+            storage
+                .with_connection(|conn| {
+                    conn.execute(
+                        "INSERT INTO memory (id, project_id, kind, content, trust, provenance,
+                                             time_created, time_updated)
+                         VALUES (?1, 'global', 'note', ?2, 'verified',
+                                 '{\"source\":\"api\",\"untrusted\":false}', 1, 1)",
+                        params![id, content],
+                    )?;
+                    conn.execute(
+                        "INSERT INTO memory_fts (content, id) VALUES (?1, ?2)",
+                        params![content, id],
+                    )
+                })
+                .unwrap();
+        };
+        plant("mem_old", "The legacy door code is 7711.");
+        plant("mem_stale", "Something nobody wants.");
+        a.remember(None, "A record of this directory.", None)
+            .unwrap();
+        let rewrite = MemoryPatch {
+            content: Some("x".to_string()),
+            ..Default::default()
+        };
+
+        for memory in [&a, &b, &repo] {
+            assert!(memory
+                .list(&ListQuery {
+                    archived: true,
+                    ..Default::default()
+                })
+                .unwrap()
+                .iter()
+                .all(|record| record.id != "mem_old"));
+            assert_eq!(memory.get("mem_old").unwrap(), None);
+            assert!(memory.search("legacy", None, true, 10).unwrap().is_empty());
+            assert!(memory.search("7711.", None, true, 10).unwrap().is_empty());
+            assert!(matches!(
+                memory.update("mem_old", &rewrite),
+                Err(MemoryError::NotFound(_))
+            ));
+            assert!(!memory.forget("mem_old").unwrap());
+            for restricted in [false, true] {
+                assert!(!memory
+                    .injection_for(restricted)
+                    .unwrap_or_default()
+                    .contains("7711"));
+            }
+        }
+
+        // The operator's view is the same from anywhere, and holds nothing
+        // that has a directory or a project.
+        for memory in [&a, &b, &repo] {
+            let ids: Vec<String> = memory
+                .list_unattributed(None, 0)
+                .unwrap()
+                .into_iter()
+                .map(|record| record.id)
+                .collect();
+            assert_eq!(ids, ["mem_stale", "mem_old"]);
+        }
+        // A project's memory is not kept per directory: nothing to file under.
+        assert!(matches!(
+            repo.claim_unattributed("mem_old"),
+            Err(MemoryError::Invalid(_))
+        ));
+        let claimed = a.claim_unattributed("mem_old").unwrap();
+        assert_eq!(claimed.directory.as_deref(), Some("/srv/a"));
+        assert!(claimed.verified, "its origin and trust are as they were");
+        assert_eq!(a.get("mem_old").unwrap(), Some(claimed));
+        assert_eq!(a.search("legacy", None, false, 10).unwrap().len(), 1);
+        assert!(a.injection().unwrap().contains("7711"));
+        assert_eq!(b.get("mem_old").unwrap(), None);
+        // Filed once: it is not up for claiming again, here or next door,
+        // and a record that has a directory never was.
+        for memory in [&a, &b] {
+            assert!(matches!(
+                memory.claim_unattributed("mem_old"),
+                Err(MemoryError::NotFound(_))
+            ));
+        }
+        let own = a.list(&ListQuery::default()).unwrap();
+        assert_eq!(own.len(), 2);
+        assert!(!b.forget_unattributed("mem_old").unwrap());
+        assert_eq!(a.list(&ListQuery::default()).unwrap().len(), 2);
+
+        assert!(b.forget_unattributed("mem_stale").unwrap());
+        assert!(!b.forget_unattributed("mem_stale").unwrap());
+        assert!(a.list_unattributed(None, 0).unwrap().is_empty());
+        let indexed: i64 = storage
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM memory_fts WHERE id = 'mem_stale'",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(indexed, 0);
     }
 
     fn from(source: Source, untrusted: bool) -> Provenance {

@@ -66,6 +66,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "0008_session_mark_backfill",
         include_str!("alforria_migrations/0008_session_mark_backfill.sql"),
     ),
+    (
+        "0009_memory_directory",
+        include_str!("alforria_migrations/0009_memory_directory.sql"),
+    ),
 ];
 
 /// The journal table.
@@ -660,6 +664,10 @@ mod tests {
                 "0008_session_mark_backfill",
                 "08507915238e88562725d53d034ba76d2913013e7754944e91db15b53cb246b7",
             ),
+            (
+                "0009_memory_directory",
+                "f5847853d1bbd28fc38d587880aa0854edd1bd299097137a77a364b5b2ab80e9",
+            ),
         ];
         for (id, sql) in MIGRATIONS {
             let hash = format!("{:x}", Sha256::digest(sql.replace("\r\n", "\n")));
@@ -681,6 +689,196 @@ mod tests {
             PINNED.len(),
             MIGRATIONS.len(),
             "a pinned migration is gone from MIGRATIONS: shipped migrations are never removed"
+        );
+    }
+
+    /// M7. Records of the `global` project get the directory of the
+    /// session their origin names; one that names no session, a session
+    /// that is gone, or has no readable origin gets none — and then no
+    /// directory is shown it, only the operator's list is. A project's
+    /// records are left alone. The upgraded database has the objects of a
+    /// fresh one.
+    #[test]
+    fn global_records_are_attributed_through_their_session_and_the_rest_to_no_directory() {
+        const DIRECTORY: &str = "0009_memory_directory";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.sqlite");
+        let fresh = {
+            let mut conn = upstream();
+            apply(&mut conn).unwrap();
+            own_objects(&conn)
+        };
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            crate::storage::migration::apply(&mut conn).unwrap();
+            apply_set(&mut conn, &until(DIRECTORY)).unwrap();
+            conn.execute_batch(
+                "INSERT INTO project (id, worktree, sandboxes, time_created, time_updated) VALUES
+                    ('proj', '/repo', '[]', 1, 1), ('global', '/', '[]', 1, 1);",
+            )
+            .unwrap();
+            for (id, project, directory) in [
+                ("ses_a", "global", "/srv/a"),
+                ("ses_b", "global", "/srv/b"),
+                ("ses_repo", "proj", "/repo"),
+            ] {
+                conn.execute(
+                    "INSERT INTO session (id, project_id, slug, directory, title, version, time_created, time_updated)
+                     VALUES (?1, ?2, ?1, ?3, 't', '1', 1, 1)",
+                    [id, project, directory],
+                )
+                .unwrap();
+            }
+            for (id, project, provenance) in [
+                (
+                    "mem_tool_a",
+                    "global",
+                    Some(r#"{"source":"tool","sessionID":"ses_a","untrusted":false}"#),
+                ),
+                (
+                    "mem_flush_b",
+                    "global",
+                    Some(r#"{"source":"flush","sessionID":"ses_b","untrusted":false}"#),
+                ),
+                // `scope: "global"`, written from a repository.
+                (
+                    "mem_shared",
+                    "global",
+                    Some(r#"{"source":"tool","sessionID":"ses_repo","untrusted":false}"#),
+                ),
+                (
+                    "mem_api",
+                    "global",
+                    Some(r#"{"source":"api","untrusted":false}"#),
+                ),
+                (
+                    "mem_client",
+                    "global",
+                    Some(r#"{"source":"client","untrusted":false,"restricted":true}"#),
+                ),
+                (
+                    "mem_gone",
+                    "global",
+                    Some(r#"{"source":"tool","sessionID":"ses_deleted","untrusted":true}"#),
+                ),
+                (
+                    "mem_number",
+                    "global",
+                    Some(r#"{"source":"tool","sessionID":7,"untrusted":true}"#),
+                ),
+                ("mem_junk", "global", Some("not json")),
+                ("mem_none", "global", None),
+                (
+                    "mem_proj",
+                    "proj",
+                    Some(r#"{"source":"tool","sessionID":"ses_repo","untrusted":false}"#),
+                ),
+            ] {
+                conn.execute(
+                    "INSERT INTO memory (id, project_id, kind, content, trust, provenance, time_created, time_updated)
+                     VALUES (?1, ?2, 'note', ?1, 'verified', ?3, 1, 1)",
+                    rusqlite::params![id, project, provenance],
+                )
+                .unwrap();
+                conn.execute("INSERT INTO memory_fts (content, id) VALUES (?1, ?1)", [id])
+                    .unwrap();
+            }
+        }
+        // This build opens it, twice.
+        let storage = std::sync::Arc::new(crate::storage::Storage::open(&path).unwrap());
+        storage.with_connection_mut(apply).unwrap();
+        let directories: Vec<String> = storage.with_connection(|conn| {
+            assert_eq!(own_objects(conn), fresh);
+            assert_eq!(journal(conn), all_ids());
+            column(
+                conn,
+                "SELECT id || '=' || COALESCE(directory, '-') FROM memory ORDER BY id",
+            )
+        });
+        assert_eq!(
+            directories,
+            [
+                "mem_api=-",
+                "mem_client=-",
+                "mem_flush_b=/srv/b",
+                "mem_gone=-",
+                "mem_junk=-",
+                "mem_none=-",
+                "mem_number=-",
+                "mem_proj=-",
+                "mem_shared=/repo",
+                "mem_tool_a=/srv/a",
+            ]
+        );
+
+        // What each caller is shown afterwards.
+        use crate::memory::test_support::{service, settings_in};
+        use crate::memory::ListQuery;
+        let ids = |records: Vec<crate::memory::MemoryRecord>| -> Vec<String> {
+            let mut ids: Vec<String> = records.into_iter().map(|record| record.id).collect();
+            ids.sort();
+            ids
+        };
+        let from = |project: &str, directory: &str| {
+            service(
+                storage.clone(),
+                settings_in(project, std::path::Path::new(directory)),
+            )
+        };
+        let unattributed = [
+            "mem_api",
+            "mem_client",
+            "mem_gone",
+            "mem_junk",
+            "mem_none",
+            "mem_number",
+        ];
+        for (project, directory, own) in [
+            // The directory a record was written in still has it.
+            ("global", "/srv/a", vec!["mem_tool_a"]),
+            ("global", "/srv/b", vec!["mem_flush_b"]),
+            ("global", "/srv/new", vec![]),
+            // A project's records are the project's, from any directory.
+            ("proj", "/repo", vec!["mem_proj"]),
+            ("proj", "/repo/sub", vec!["mem_proj"]),
+        ] {
+            let memory = from(project, directory);
+            assert_eq!(
+                ids(memory.list(&ListQuery::default()).unwrap()),
+                own,
+                "{directory}"
+            );
+            for id in unattributed {
+                assert_eq!(memory.get(id).unwrap(), None, "{directory}: {id}");
+                assert!(
+                    memory.search(id, None, true, 10).unwrap().is_empty(),
+                    "{directory}: {id}"
+                );
+                for restricted in [false, true] {
+                    assert!(
+                        !memory
+                            .injection_for(restricted)
+                            .unwrap_or_default()
+                            .contains(id),
+                        "{directory}: {id}"
+                    );
+                }
+            }
+            assert_eq!(
+                ids(memory.list_unattributed(None, 0).unwrap()),
+                unattributed,
+                "{directory}"
+            );
+        }
+        // `scope: "global"` reads every `global` record, as it did.
+        let mut everywhere = settings_in("global", std::path::Path::new("/repo"));
+        everywhere.global = true;
+        assert_eq!(
+            service(storage.clone(), everywhere)
+                .list(&ListQuery::default())
+                .unwrap()
+                .len(),
+            9
         );
     }
 

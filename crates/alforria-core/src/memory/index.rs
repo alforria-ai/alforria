@@ -239,6 +239,12 @@ impl MemoryService {
 
     /// Full-text search over past sessions, best match first: this project's
     /// (every project's with `scope: "global"`), without `exclude_session`.
+    ///
+    /// A directory that is not a repository is in the shared `global`
+    /// project with every other such directory, so there the project is
+    /// not enough: only sessions of this instance's own directory are
+    /// searched ([`crate::memory::MemorySettings::directory_key`], compared
+    /// with the directory each session stores).
     /// The second value says the index is still being built, so results may
     /// be incomplete.
     pub fn search_sessions(
@@ -257,6 +263,11 @@ impl MemoryService {
         }
         let building = self.index_within(SEARCH_BUDGET, SETTLE_MS);
         let limit = limit.clamp(1, 50);
+        // The sessions of the `global` project are every non-repository
+        // directory's: keep to this one's. (`project_id` is the instance's
+        // project, which under `scope: "global"` is not the records'.)
+        let directory = (project_id == crate::GLOBAL_ID && !self.settings().global)
+            .then(|| self.settings().directory.clone());
         for operator in ["AND", "OR"] {
             let Some(expression) = fts_query(query, operator) else {
                 break;
@@ -271,7 +282,7 @@ impl MemoryService {
                      JOIN part p ON p.id = transcript_fts.part_id
                      JOIN session s ON s.id = transcript_fts.session_id
                      WHERE transcript_fts MATCH ?1
-                       AND (?2 OR s.project_id = ?3)
+                       AND (?2 OR (s.project_id = ?3 AND (?6 IS NULL OR s.directory = ?6)))
                        AND (?4 IS NULL OR transcript_fts.session_id != ?4)
                      ORDER BY rank LIMIT ?5",
                     untrusted = crate::session::store::SessionMark::OutsideContent.sql("s.id")
@@ -283,7 +294,8 @@ impl MemoryService {
                             self.settings().global,
                             project_id,
                             exclude_session,
-                            limit as i64
+                            limit as i64,
+                            directory
                         ],
                         |row| {
                             Ok(SessionHit {
@@ -362,7 +374,7 @@ impl MemoryService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::test_support::{service, settings};
+    use crate::memory::test_support::{service, settings_in};
     use crate::session::test_support::{
         assistant_message, create_session, harness, text_part, user_message, with_parts,
     };
@@ -392,7 +404,10 @@ mod tests {
     #[test]
     fn past_sessions_are_indexed_lazily_and_searched_within_the_project() {
         let h = harness("memory-index", Vec::new());
-        let memory = service(h.services.storage.clone(), settings("global"));
+        let memory = service(
+            h.services.storage.clone(),
+            settings_in("global", &h.worktree),
+        );
         let first = create_session(&h.services.sessions, &h.worktree);
         h.services
             .sessions
@@ -468,7 +483,7 @@ mod tests {
             .unwrap()
             .0
             .is_empty());
-        let mut everywhere = settings("global");
+        let mut everywhere = settings_in("global", &h.worktree);
         everywhere.global = true;
         let global = service(h.services.storage.clone(), everywhere);
         assert_eq!(
@@ -485,6 +500,63 @@ mod tests {
         }
     }
 
+    /// M7. Every directory that is not a repository is in the project
+    /// `global`: a search from one of them reads its own sessions only.
+    #[test]
+    fn sessions_of_the_global_project_are_searched_within_their_directory() {
+        let h = harness("memory-index-directories", Vec::new());
+        let (here, there) = (h.worktree.join("here"), h.worktree.join("there"));
+        let mine = create_session(&h.services.sessions, &here);
+        say(
+            &h,
+            &mine.id,
+            1,
+            true,
+            "The zebra crossing needs repainting.",
+        );
+        let theirs = create_session(&h.services.sessions, &there);
+        say(
+            &h,
+            &theirs.id,
+            1,
+            true,
+            "The zebra passphrase is tangerine.",
+        );
+        let from = |directory: &std::path::Path| {
+            let memory = service(h.services.storage.clone(), settings_in("global", directory));
+            memory.index_pending(100, 0).unwrap();
+            memory
+        };
+        let sessions = |memory: &MemoryService, query: &str, project: &str| -> Vec<String> {
+            let (hits, _) = memory.search_sessions(query, 10, None, project).unwrap();
+            hits.into_iter().map(|hit| hit.session_id).collect()
+        };
+        assert_eq!(
+            sessions(&from(&here), "zebra", "global"),
+            [mine.id.as_str()]
+        );
+        // Every word, then any word: neither reaches next door.
+        assert!(sessions(&from(&here), "tangerine", "global").is_empty());
+        assert_eq!(
+            sessions(&from(&here), "tangerine zebra", "global"),
+            [mine.id.as_str()]
+        );
+        assert_eq!(
+            sessions(&from(&there), "zebra", "global"),
+            [theirs.id.as_str()]
+        );
+        // A directory with no sessions finds none.
+        assert!(sessions(&from(&h.worktree), "zebra", "global").is_empty());
+        // A real project is searched as a project, whatever the directory;
+        // these sessions are not its.
+        assert!(sessions(&from(&here), "zebra", "proj_other").is_empty());
+        // `scope: "global"` is every session there is, as before.
+        let mut everywhere = settings_in("global", &here);
+        everywhere.global = true;
+        let all = service(h.services.storage.clone(), everywhere);
+        assert_eq!(sessions(&all, "zebra", "global").len(), 2);
+    }
+
     #[test]
     fn streaming_text_synthetic_parts_and_deleted_sessions_stay_out() {
         let h = harness("memory-index-skip", Vec::new());
@@ -493,7 +565,7 @@ mod tests {
             h.services.storage.clone(),
             None,
             Arc::new(crate::catalog::SystemClock),
-            settings("global"),
+            settings_in("global", &h.worktree),
         );
         let session = create_session(&h.services.sessions, &h.worktree);
         say(
@@ -561,7 +633,10 @@ mod tests {
     #[test]
     fn a_large_backlog_is_indexed_in_bounded_passes() {
         let h = harness("memory-index-large", Vec::new());
-        let memory = service(h.services.storage.clone(), settings("global"));
+        let memory = service(
+            h.services.storage.clone(),
+            settings_in("global", &h.worktree),
+        );
         let session = create_session(&h.services.sessions, &h.worktree);
         for index in 0..1050 {
             say(

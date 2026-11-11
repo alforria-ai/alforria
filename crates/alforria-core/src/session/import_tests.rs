@@ -435,7 +435,7 @@ async fn after_a_long_import_the_next_prompt_sends_the_summary_and_the_tail_only
     // And searchable, once the indexer has been over it.
     let memory = crate::memory::test_support::service(
         e.services.storage.clone(),
-        crate::memory::test_support::settings("global"),
+        crate::memory::test_support::settings_in("global", &e.worktree),
     );
     assert!(!memory.index_within(std::time::Duration::from_secs(60), 0));
     let (hits, _) = memory

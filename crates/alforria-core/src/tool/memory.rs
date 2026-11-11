@@ -766,7 +766,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn session_search_returns_fenced_excerpts_from_other_sessions() {
         let h = harness("session-search-tool", Vec::new());
-        let memory = service(h.services.storage.clone(), settings("global"));
+        let memory = service(
+            h.services.storage.clone(),
+            crate::memory::test_support::settings_in("global", &h.worktree),
+        );
         let say = |session: &str, text: &str| {
             let message_id = format!("msg_{session}");
             h.services
@@ -863,6 +866,144 @@ mod tests {
         );
     }
 
+    /// M7. Two directories that are not repositories are both the project
+    /// `global`. A model working in one reads, changes and is shown nothing
+    /// of the other: not through the `memory` tool, not through
+    /// `session_search`, not in its system context.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_tools_of_one_directory_reach_nothing_of_another_in_the_global_project() {
+        use crate::memory::test_support::settings_in;
+        let h = harness("memory-tool-directories", Vec::new());
+        let (here, there) = (h.worktree.join("here"), h.worktree.join("there"));
+        let tools = |directory: &std::path::Path| {
+            let memory = service(h.services.storage.clone(), settings_in("global", directory));
+            let truncate = Arc::new(TruncateService::default_limits(h.temp.path().to_path_buf()));
+            let def = memory_tool(
+                truncate.clone(),
+                fixed_agents(),
+                memory.clone(),
+                Arc::new(|_: &str| false),
+                Arc::new(|_: &str| false),
+                Arc::new(|_: &str| false),
+            );
+            let search = session_search_tool(
+                truncate,
+                fixed_agents(),
+                memory.clone(),
+                "global".to_string(),
+            );
+            (memory, def, search)
+        };
+        let (mine, memory_here, search_here) = tools(&here);
+        let (theirs, memory_there, search_there) = tools(&there);
+        let ask = RecordingAsk::new();
+        let inst = instance(h.temp.path());
+        let extra = Extra::default();
+
+        let saved = (memory_there.execute)(
+            json!({ "action": "remember", "content": "The vault code is 4242." }),
+            ctx(&ask, &inst, &extra),
+        )
+        .await
+        .unwrap();
+        let id = saved.metadata["id"].as_str().unwrap().to_string();
+
+        let listed = (memory_here.execute)(json!({ "action": "list" }), ctx(&ask, &inst, &extra))
+            .await
+            .unwrap();
+        assert_eq!(listed.output, "Nothing is remembered yet.");
+        let found = (memory_here.execute)(
+            json!({ "action": "search", "query": "vault" }),
+            ctx(&ask, &inst, &extra),
+        )
+        .await
+        .unwrap();
+        assert_eq!(found.output, "No memory matches.");
+        let changed = (memory_here.execute)(
+            json!({ "action": "update", "id": id, "content": "The vault code is 0000." }),
+            ctx(&ask, &inst, &extra),
+        )
+        .await;
+        assert!(
+            changed.as_ref().is_err_and(|error| error
+                .to_string()
+                .contains(&format!("memory not found: {id}"))),
+            "{:?}",
+            changed.map(|result| result.output)
+        );
+        let forgotten = (memory_here.execute)(
+            json!({ "action": "forget", "id": id }),
+            ctx(&ask, &inst, &extra),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            forgotten.output,
+            format!("There is no memory with id {id}.")
+        );
+        assert_eq!(mine.injection(), None);
+        assert_eq!(mine.injection_for(true), None);
+        // It is all still there, for the directory it was saved in.
+        assert_eq!(
+            theirs.get(&id).unwrap().unwrap().content,
+            "The vault code is 4242."
+        );
+        assert!(theirs.injection().unwrap().contains("4242"));
+
+        // Transcripts: a session in each directory mentions the zebra.
+        let say = |directory: &std::path::Path, text: &str| {
+            let session = create_session(&h.services.sessions, directory);
+            let message_id = format!("msg_{}", session.id);
+            h.services
+                .sessions
+                .update_message(&user_message(&session.id, &message_id, 1.0))
+                .unwrap();
+            h.services
+                .sessions
+                .update_part(&text_part(
+                    &session.id,
+                    &message_id,
+                    &format!("prt_{}", session.id),
+                    text,
+                ))
+                .unwrap();
+            session.id
+        };
+        let own = say(&here, "The zebra crossing needs repainting.");
+        let other = say(&there, "The zebra passphrase is tangerine.");
+        mine.index_pending(100, 0).unwrap();
+        let result = (search_here.execute)(json!({ "query": "zebra" }), ctx(&ask, &inst, &extra))
+            .await
+            .unwrap();
+        assert_eq!(result.metadata["count"], 1, "{}", result.output);
+        assert!(
+            result.output.contains(&own)
+                && !result.output.contains(&other)
+                && !result.output.contains("tangerine"),
+            "{}",
+            result.output
+        );
+        let result = (search_here.execute)(
+            json!({ "query": "tangerine passphrase" }),
+            ctx(&ask, &inst, &extra),
+        )
+        .await
+        .unwrap();
+        assert!(
+            result.output.starts_with("No past session matches."),
+            "{}",
+            result.output
+        );
+        let result = (search_there.execute)(json!({ "query": "zebra" }), ctx(&ask, &inst, &extra))
+            .await
+            .unwrap();
+        assert!(
+            result.output.contains(&other) && !result.output.contains(&own),
+            "{}",
+            result.output
+        );
+    }
+
     /// Trigger run → subagent → subagent: at depth 3 the session is as
     /// untrusted as the run it descends from, in the tool and in SQL alike.
     #[tokio::test(flavor = "multi_thread")]
@@ -893,7 +1034,10 @@ mod tests {
         let caller = child(Some("ses_1"), &sub.id);
         let other = child(None, &sub.id);
 
-        let memory = service(e.services.storage.clone(), settings("global"));
+        let memory = service(
+            e.services.storage.clone(),
+            crate::memory::test_support::settings_in("global", &e.worktree),
+        );
         let trusted = memory
             .remember(None, "The office is in Lyon.", None)
             .unwrap();
