@@ -1504,20 +1504,25 @@ mod tests {
         let mut policy = ShellEnvPolicy::from_config(Some(&info));
         policy.deny_names(["ACME_GATEWAY_AUTH"]);
 
-        let dump = run_capture_in("env", &[], policy.scrubbed_env_from(base))
-            .await
-            .expect("env runs");
-        let mut names: Vec<&str> = dump
-            .lines()
-            .filter_map(|line| line.split_once('=').map(|(name, _)| name))
-            .collect();
-        names.sort();
+        async fn names(policy: &ShellEnvPolicy, base: Vec<(OsString, OsString)>) -> Vec<String> {
+            let dump = run_capture_in("env", &[], policy.scrubbed_env_from(base))
+                .await
+                .expect("env runs");
+            let mut names: Vec<String> = dump
+                .lines()
+                .filter_map(|line| line.split_once('=').map(|(name, _)| name.to_string()))
+                .collect();
+            names.sort();
+            names
+        }
         // Nothing of this process's own environment either: the probe
         // starts from `base` alone. On a standalone install the user's
         // own credentials pass, as they do to the server it probes for.
         assert_eq!(
-            names,
+            names(&policy, base.clone()).await,
             ["GITHUB_TOKEN", "PATH", "PROBE_VISIBLE", "github_token"]
         );
+        // On a restricted server the probe starts from the allowlist.
+        assert_eq!(names(&policy.restricted(true), base).await, ["PATH"]);
     }
 }
