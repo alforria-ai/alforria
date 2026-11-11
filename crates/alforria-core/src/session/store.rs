@@ -542,78 +542,6 @@ pub struct SessionCeiling {
     pub readings: Vec<PermissionV1Ruleset>,
 }
 
-/// Ceilings that hold for one **run** in a session, not for the session
-/// (alforria extension): while this value lives, every policy assembled
-/// for the session ([`SessionStore::policy`]) is also under them, and a
-/// child session created meanwhile gets them stored for life. Dropping it
-/// takes them off again; nothing is written to the session.
-///
-/// This is how a trigger's run in a session it names (`session: "ses_…"`,
-/// the `schedule` tool's `current`) is held to its creator's bounds:
-/// storing them on the session would narrow, for good, a session its user
-/// also works in.
-///
-/// Kept in memory, per process and by session id — not by store, so no
-/// second store over the same database can assemble the session's policy
-/// without them. A process that dies takes its runs with it; what a
-/// restart does about a run it interrupted is `session::recovery`'s.
-#[must_use = "the run is bound only while this is alive"]
-pub struct RunCeilings {
-    session_id: String,
-    token: u64,
-}
-
-impl Drop for RunCeilings {
-    fn drop(&mut self) {
-        let mut runs = run_ceilings();
-        if let Some(bound) = runs.get_mut(&self.session_id) {
-            bound.retain(|(token, _)| *token != self.token);
-            if bound.is_empty() {
-                runs.remove(&self.session_id);
-            }
-        }
-    }
-}
-
-type BoundRuns = std::collections::HashMap<String, Vec<(u64, Vec<SessionCeiling>)>>;
-
-fn run_ceilings() -> std::sync::MutexGuard<'static, BoundRuns> {
-    static RUNS: std::sync::OnceLock<std::sync::Mutex<BoundRuns>> = std::sync::OnceLock::new();
-    RUNS.get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-/// The ceilings of the runs now bound to `session_id`.
-fn bound_ceilings(session_id: &str) -> Vec<SessionCeiling> {
-    run_ceilings()
-        .get(session_id)
-        .into_iter()
-        .flatten()
-        .flat_map(|(_, ceilings)| ceilings.iter().cloned())
-        .collect()
-}
-
-/// `ceilings` with one entry per name, its readings those of every entry
-/// of that name: storing a ceiling replaces the one of the same name, and
-/// two sources of one name must both hold.
-fn merged_by_name(ceilings: Vec<SessionCeiling>) -> Vec<SessionCeiling> {
-    let mut out: Vec<SessionCeiling> = Vec::new();
-    for ceiling in ceilings {
-        match out.iter_mut().find(|kept| kept.name == ceiling.name) {
-            Some(kept) => {
-                for reading in ceiling.readings {
-                    if !kept.readings.contains(&reading) {
-                        kept.readings.push(reading);
-                    }
-                }
-            }
-            None => out.push(ceiling),
-        }
-    }
-    out
-}
-
 /// A session's ceilings as read from the store: the argument
 /// `Policy::for_session` needs. Only [`SessionStore::policy`] makes one.
 pub struct StoredCeilings(Vec<SessionCeiling>);
@@ -905,21 +833,13 @@ impl SessionStore {
         // The same for the ceilings: a child or a fork is capped as its
         // source is, from before it exists. An error here is an error for
         // the creation.
-        let mut inherited = Vec::new();
         for source in [&input.parent_id, &input.ceilings_from]
             .into_iter()
             .flatten()
         {
-            inherited.extend(self.ceilings(source)?);
-        }
-        // A child made while a run is bound to its parent is that run's:
-        // it keeps the run's ceilings for life ([`RunCeilings`]). A fork
-        // is not — it is somebody's new conversation over the same text.
-        if let Some(parent_id) = &input.parent_id {
-            inherited.extend(bound_ceilings(parent_id));
-        }
-        for ceiling in merged_by_name(inherited) {
-            self.set_ceiling(&info.id, &ceiling)?;
+            for ceiling in self.ceilings(source)? {
+                self.set_ceiling(&info.id, &ceiling)?;
+            }
         }
         for ceiling in &input.ceilings {
             self.set_ceiling(&info.id, ceiling)?;
@@ -1131,10 +1051,8 @@ impl SessionStore {
     /// store produces). The result, through the one `Policy::evaluate`, is
     /// the strictest of: `agent`'s policy as it stands now (with the host's
     /// ceiling it carries) read with the session's own rules, a trigger
-    /// creator's bounds, the outside-input ceiling, and the ceilings of a
-    /// run now bound to the session ([`SessionStore::bind_run`]). A session
-    /// or ceilings that cannot be read give a policy that denies
-    /// everything.
+    /// creator's bounds, and the outside-input ceiling. A session or
+    /// ceilings that cannot be read give a policy that denies everything.
     pub fn policy(
         &self,
         session_id: &str,
@@ -1142,13 +1060,10 @@ impl SessionStore {
     ) -> crate::tool::permission::Policy {
         use alforria_schema::permission_v1::{PermissionV1Action, PermissionV1Rule};
         match (self.get(session_id), self.ceilings(session_id)) {
-            (Ok(session), Ok(mut ceilings)) => {
-                ceilings.extend(bound_ceilings(session_id));
-                agent.for_session(
-                    &session.permission.unwrap_or_default(),
-                    &StoredCeilings(ceilings),
-                )
-            }
+            (Ok(session), Ok(ceilings)) => agent.for_session(
+                &session.permission.unwrap_or_default(),
+                &StoredCeilings(ceilings),
+            ),
             _ => agent.for_session(
                 &Vec::new(),
                 &StoredCeilings(vec![SessionCeiling {
@@ -1160,22 +1075,6 @@ impl SessionStore {
                     }]],
                 }]),
             ),
-        }
-    }
-
-    /// Hold `ceilings` over every turn of `session_id` until the returned
-    /// value is dropped ([`RunCeilings`]). Nothing is stored for the
-    /// session.
-    pub fn bind_run(&self, session_id: &str, ceilings: Vec<SessionCeiling>) -> RunCeilings {
-        static TOKENS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let token = TOKENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        run_ceilings()
-            .entry(session_id.to_string())
-            .or_default()
-            .push((token, ceilings));
-        RunCeilings {
-            session_id: session_id.to_string(),
-            token,
         }
     }
 

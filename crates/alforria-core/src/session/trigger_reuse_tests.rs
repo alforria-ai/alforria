@@ -18,6 +18,7 @@ fn turn(untrusted: bool) -> TriggerTurn {
         model: None,
         mode: SessionMode::Reuse,
         session_id: None,
+        origin_session_id: None,
         inherited: Default::default(),
         own: Vec::new(),
         untrusted,
@@ -349,26 +350,33 @@ async fn a_scheduled_run_follows_the_policy_now_and_stays_within_its_creators_bo
     );
 }
 
-/// A trigger's run in a session it **names** (`session: "ses_…"`, the
-/// `schedule` tool's `current`) is held to its creator's bounds for as long
-/// as the run lasts, and the session is not: nothing is stored for it, and
-/// its own turns afterwards are judged as before.
+/// The bounds of a run are carried by the session it runs in, so they
+/// hold for everything the run leaves behind — and a trigger that has
+/// bounds of its own cannot be pointed at a session that is not its own.
 ///
-/// It used to run there under the session's live policy alone, so a trigger
-/// scheduled by a session that could not run `rm` did run it once it was
-/// pointed at — or its session had become — one that could.
-#[tokio::test]
-async fn a_run_in_a_named_session_is_held_to_its_creators_bounds_and_the_session_is_not() {
-    use crate::tool::permission::Policy;
+/// The bounds used to be held beside a named session for the length of
+/// the run's turn: a background subagent's result, delivered after the
+/// turn had ended, started a turn there without them; a subagent session
+/// that existed before the run, resumed by it, never had them; and a
+/// payload delivered into a named session got a provenance mark and no
+/// ceiling.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bounded_run_is_bounded_in_everything_it_leaves_behind() {
     use crate::tool::schedule::{ScheduleSessions, SessionTree};
+    use crate::tool::task::TaskOps;
     use alforria_schema::permission_v1::PermissionV1Rule;
-    use PermissionV1Action::{Allow, Ask, Deny};
+    use PermissionV1Action::{Allow, Deny};
     let rule = |permission: &str, pattern: &str, action| PermissionV1Rule {
         permission: permission.to_string(),
         pattern: pattern.to_string(),
         action,
     };
-    let e = engine("trig-named-session", vec![text_stream("one")]);
+    let e = engine(
+        "trig-bounded-aftermath",
+        (0..6)
+            .map(|index| text_stream(&format!("answer {index}")))
+            .collect(),
+    );
     let sessions = e.services.sessions.clone();
     let context = e.services.instance_context(&e.worktree, None).unwrap();
     let ops =
@@ -379,126 +387,282 @@ async fn a_run_in_a_named_session_is_held_to_its_creators_bounds_and_the_session
         agents: e.services.agents.clone(),
     };
     let agent = e.services.agents.get("build").unwrap().permission.clone();
+    let live = |id: &str| sessions.policy(id, &agent);
+    let rm = |policy: &crate::tool::permission::Policy| policy.evaluate("bash", "rm -rf /").action;
 
-    // The creator could not run `rm` and was to be asked about pushes.
+    // The creator could not run `rm`.
     let creator = crate::session::test_support::create_engine_session(&e);
     sessions
         .set_permission(
             &creator.id,
-            vec![
-                rule("bash", "*", Allow),
-                rule("bash", "rm *", Deny),
-                rule("bash", "git push *", Ask),
-            ],
+            vec![rule("bash", "*", Allow), rule("bash", "rm *", Deny)],
         )
         .unwrap();
-    // The session the trigger names may do anything.
-    let named = session_under(&e, "named", &[]);
-    let live = |id: &str| sessions.policy(id, &agent);
-    assert_eq!(live(&named.id).evaluate("bash", "rm -rf /").action, Allow);
-
-    let mut scheduled = turn(false);
-    scheduled.mode = SessionMode::Existing(named.id.clone());
-    scheduled.inherited = tree.bounds(&creator.id, "build");
-    let run = ops.run_turn(&scheduled).await.unwrap();
-    assert_eq!(run.session_id, named.id);
-
-    // The turn was judged under the creator's bounds…
-    let judged = e.llm.input(0).agent.permission;
-    assert_eq!(judged.evaluate("bash", "rm -rf /").action, Deny);
-    assert_eq!(judged.evaluate("bash", "git push origin").action, Ask);
-    assert_eq!(judged.evaluate("bash", "make test").action, Allow);
-    assert!(judged
-        .ceilings()
-        .iter()
-        .any(|ceiling| ceiling.name == crate::trigger::CREATOR_CEILING && ceiling.sealed));
-    // …and the session is as it was: nothing stored, nothing narrowed.
-    assert_eq!(sessions.ceilings(&named.id).unwrap(), Vec::new());
-    assert_eq!(live(&named.id).evaluate("bash", "rm -rf /").action, Allow);
-    assert_eq!(
-        named.permission,
-        sessions.get(&named.id).unwrap().permission
-    );
-
-    // While a run is bound: every policy assembled for the session is
-    // under it, a child made meanwhile keeps it for life, a fork does not
-    // (it is somebody's new conversation), and another session is not
-    // touched.
-    let ceilings = scheduled.run_policy().ceilings;
-    let other = session_under(&e, "other", &[]);
-    let (child, fork) = {
-        let _bound = sessions.bind_run(&named.id, ceilings.clone());
-        assert_eq!(live(&named.id).evaluate("bash", "rm -rf /").action, Deny);
-        assert_eq!(live(&other.id).evaluate("bash", "rm -rf /").action, Allow);
-        // The schedule tool there records the run's bounds too.
-        let recorded = tree.bounds(&named.id, "build").readings();
-        let rescheduled = recorded.iter().fold(
-            Policy::plain(vec![rule("*", "*", Allow)]),
-            |policy, reading| policy.with_sealed_ceiling("recorded", reading.clone()),
-        );
-        assert_eq!(rescheduled.evaluate("bash", "rm -rf /").action, Deny);
-        let child = sessions
-            .create(
-                &context,
-                &crate::session::store::CreateInput {
-                    parent_id: Some(named.id.clone()),
-                    permission: Some(vec![rule("*", "*", Allow)]),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        (child, sessions.fork(&context, &named.id, None).unwrap())
+    let scheduled = |mode: SessionMode| {
+        let mut turn = turn(false);
+        turn.mode = mode;
+        turn.operator_authored = false;
+        turn.origin_session_id = Some(creator.id.clone());
+        turn.inherited = tree.bounds(&creator.id, "build");
+        turn
     };
-    assert_eq!(live(&named.id).evaluate("bash", "rm -rf /").action, Allow);
-    assert_eq!(live(&child.id).evaluate("bash", "rm -rf /").action, Deny);
-    assert_eq!(live(&fork.id).evaluate("bash", "rm -rf /").action, Allow);
 
-    // A child of a session that has a stored ceiling of the same name gets
-    // both: one does not replace the other.
-    let stored = session_under(
-        &e,
-        "stored",
-        &[crate::session::store::SessionCeiling {
-            name: crate::trigger::CREATOR_CEILING.to_string(),
-            readings: vec![vec![rule("*", "*", Allow), rule("edit", "*", Deny)]],
-        }],
+    // 1. Pointed at somebody's conversation, which may do anything — with
+    //    a subagent session of its own from before: the run is refused
+    //    and nothing is said there.
+    let named = session_under(&e, "named", &[]);
+    let earlier = sessions
+        .create(
+            &context,
+            &crate::session::store::CreateInput {
+                parent_id: Some(named.id.clone()),
+                permission: Some(vec![rule("*", "*", Allow)]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(rm(&live(&named.id)), Allow);
+    let refused = ops
+        .run_turn(&scheduled(SessionMode::Existing(named.id.clone())))
+        .await
+        .unwrap_err();
+    assert!(
+        refused.message.contains("a session of its own"),
+        "{}",
+        refused.message
     );
-    let both = {
-        let _bound = sessions.bind_run(&stored.id, ceilings);
+    assert_eq!(e.llm.calls(), 0, "nothing ran in the named session");
+    assert!(e
+        .services
+        .messages
+        .stream_without_diffs(&named.id)
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        rm(&live(&earlier.id)),
+        Allow,
+        "and its subagent is untouched"
+    );
+
+    // 2. In a session of its own the bounds are stored, so they are still
+    //    there after the turn has ended…
+    let mut reuse = scheduled(SessionMode::Reuse);
+    let run = ops.run_turn(&reuse).await.unwrap();
+    assert_eq!(rm(&e.llm.input(0).agent.permission), Deny);
+    assert_eq!(rm(&live(&run.session_id)), Deny);
+    // …for a subagent it started: the session, and the turn its result
+    // starts in the run's session when it is delivered later…
+    let child = sessions
+        .create(
+            &context,
+            &crate::session::store::CreateInput {
+                parent_id: Some(run.session_id.clone()),
+                permission: Some(vec![rule("*", "*", Allow)]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(rm(&live(&child.id)), Deny);
+    e.ops
+        .inject_background_result(&run.session_id, None, "the background result")
+        .await;
+    let delivered = e.llm.input(1);
+    assert_eq!(delivered.session_id, run.session_id);
+    assert_eq!(rm(&delivered.agent.permission), Deny);
+    // …and for that subagent when a later run of the trigger resumes it:
+    // it existed before this run, and is bound all the same.
+    reuse.session_id = Some(run.session_id.clone());
+    let again = ops.run_turn(&reuse).await.unwrap();
+    assert_eq!(again.session_id, run.session_id);
+    let resumed = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        e.ops.resume(
+            &child.id,
+            "build",
+            &crate::tool::task::ModelRef {
+                provider_id: "anthropic".to_string(),
+                model_id: "claude".to_string(),
+            },
+            None,
+            "carry on",
+        ),
+    )
+    .await
+    .expect("the resumed subagent answers");
+    assert!(resumed.is_ok(), "{:?}", resumed.err());
+    let request = e.llm.input(e.llm.calls() - 1);
+    assert_eq!(request.session_id, child.id);
+    assert_eq!(rm(&request.agent.permission), Deny);
+
+    // 3. Outside content. A run that carries a payload, or that outside
+    //    input starts, is never delivered into a named session, whoever
+    //    wrote the trigger; and a trigger written after outside content
+    //    was seen names only a session that has the mark.
+    let before = e.llm.calls();
+    let mut payload = turn(true);
+    payload.mode = SessionMode::Existing(named.id.clone());
+    let mut started = turn(false);
+    started.untrusted = true;
+    started.mode = SessionMode::Existing(named.id.clone());
+    let mut carried = turn(false);
+    carried.outside_content = true;
+    carried.mode = SessionMode::Existing(named.id.clone());
+    for (what, turn) in [
+        ("payload", payload),
+        ("outside start", started),
+        ("provenance", carried.clone()),
+    ] {
+        let refused = ops.run_turn(&turn).await.unwrap_err();
+        assert!(
+            refused.message.contains("a session of its own")
+                || refused.message.contains("its own session"),
+            "{what}: {}",
+            refused.message
+        );
+    }
+    assert_eq!(e.llm.calls(), before);
+    assert!(e
+        .services
+        .messages
+        .stream_without_diffs(&named.id)
+        .unwrap()
+        .is_empty());
+    assert!(!sessions.seen_outside_content(&named.id));
+    assert!(!sessions.started_by_outside_input(&named.id));
+    // Where the session has the mark already the run is a turn of it.
+    sessions
+        .mark(
+            &named.id,
+            crate::session::store::SessionMark::OutsideContent,
+        )
+        .unwrap();
+    ops.run_turn(&carried).await.unwrap();
+}
+
+/// Each run asks again which session its trigger may name
+/// (`trigger::rules::check_named_session`): a trigger stored by an earlier
+/// build, or one whose session changed since, is refused when it fires.
+#[tokio::test]
+async fn a_run_is_held_to_which_session_its_trigger_may_name() {
+    let e = engine(
+        "trig-named-rows",
+        (0..8)
+            .map(|index| text_stream(&format!("answer {index}")))
+            .collect(),
+    );
+    let sessions = e.services.sessions.clone();
+    let context = e.services.instance_context(&e.worktree, None).unwrap();
+    let ops =
+        ProductionTriggerOps::new(sessions.clone(), e.services.agents.clone(), context.clone());
+    ops.bind(e.prompt.clone());
+    let plain = || crate::session::test_support::create_engine_session(&e);
+    let restricted = || {
         sessions
             .create(
                 &context,
                 &crate::session::store::CreateInput {
-                    parent_id: Some(stored.id.clone()),
-                    permission: Some(vec![rule("*", "*", Allow)]),
+                    restricted: true,
                     ..Default::default()
                 },
             )
             .unwrap()
     };
-    assert_eq!(live(&both.id).evaluate("edit", "src/lib.rs").action, Deny);
-    assert_eq!(live(&both.id).evaluate("bash", "rm -rf /").action, Deny);
-    assert_eq!(live(&stored.id).evaluate("bash", "rm -rf /").action, Allow);
-}
+    let bounds = crate::trigger::CreatorBounds::Flat(vec![
+        alforria_schema::permission_v1::PermissionV1Rule {
+            permission: "*".to_string(),
+            pattern: "*".to_string(),
+            action: PermissionV1Action::Allow,
+        },
+    ]);
+    let (origin, other, theirs, gone) = (plain(), plain(), restricted(), plain());
+    sessions.remove(&gone.id).unwrap();
 
-/// A trigger written after outside content was seen leaves that mark on a
-/// session it names, as it does on one it keeps: provenance, nothing else.
-#[tokio::test]
-async fn a_run_in_a_named_session_carries_its_triggers_provenance() {
-    let e = engine("trig-named-provenance", vec![text_stream("one")]);
-    let sessions = e.services.sessions.clone();
-    let context = e.services.instance_context(&e.worktree, None).unwrap();
-    let ops = ProductionTriggerOps::new(sessions.clone(), e.services.agents.clone(), context);
-    ops.bind(e.prompt.clone());
-    let named = crate::session::test_support::create_engine_session(&e);
-    assert!(!sessions.seen_outside_content(&named.id));
-    let mut carried = turn(false);
-    carried.mode = SessionMode::Existing(named.id.clone());
-    carried.outside_content = true;
-    ops.run_turn(&carried).await.unwrap();
-    assert!(sessions.seen_outside_content(&named.id));
-    assert!(!sessions.started_by_outside_input(&named.id));
-    assert_eq!(sessions.ceilings(&named.id).unwrap(), Vec::new());
+    // (what, session named, origin, bounded, restricted creator, allowed)
+    type Row<'a> = (&'a str, &'a str, Option<&'a str>, bool, bool, bool);
+    let rows: Vec<Row<'_>> = vec![
+        (
+            "tool, current",
+            &origin.id,
+            Some(&origin.id),
+            true,
+            false,
+            true,
+        ),
+        (
+            "tool, another session",
+            &other.id,
+            Some(&origin.id),
+            true,
+            false,
+            false,
+        ),
+        (
+            "tool, a session that is gone",
+            &gone.id,
+            Some(&gone.id),
+            true,
+            false,
+            false,
+        ),
+        ("operator, a session", &other.id, None, false, false, true),
+        (
+            "operator, a restricted session",
+            &theirs.id,
+            None,
+            false,
+            false,
+            true,
+        ),
+        (
+            "operator, a session that is gone",
+            &gone.id,
+            None,
+            false,
+            false,
+            false,
+        ),
+        ("bounded, no origin", &other.id, None, true, false, false),
+        (
+            "chat, a restricted session",
+            &theirs.id,
+            None,
+            false,
+            true,
+            true,
+        ),
+        (
+            "chat, an operator's session",
+            &other.id,
+            None,
+            false,
+            true,
+            false,
+        ),
+    ];
+    for (what, session, origin, bounded, by_restricted, allowed) in rows {
+        let mut turn = turn(false);
+        turn.mode = SessionMode::Existing(session.to_string());
+        turn.origin_session_id = origin.map(str::to_string);
+        turn.operator_authored = origin.is_none() && !by_restricted;
+        turn.restricted = by_restricted;
+        if bounded {
+            turn.inherited = bounds.clone();
+        }
+        let before = e.llm.calls();
+        let ran = ops.run_turn(&turn).await;
+        assert_eq!(
+            ran.is_ok(),
+            allowed,
+            "{what}: {:?}",
+            ran.as_ref().err().map(|f| &f.message)
+        );
+        assert_eq!(e.llm.calls() > before, allowed, "{what}");
+        if allowed {
+            // A turn of that session, under its own policy: nothing is
+            // stored for it.
+            assert_eq!(sessions.ceilings(session).unwrap(), Vec::new(), "{what}");
+        }
+    }
 }
 
 /// A session of this engine under `ceilings`, whose own rules try to hand

@@ -876,10 +876,10 @@ set it up and the session it lands in.
 
 | Source | Runs as | Bound by |
 | --- | --- | --- |
-| A trigger the operator wrote (config, an `admin` request, the `schedule` tool in an unrestricted session) | `Caller::Session` | The session it lands in: unrestricted in a session of its own, restricted if it names a restricted session. One the `schedule` tool made is also under its creator's bounds: stored for a session of its own, held over the run in a session it names (see "A trigger that names a session"). |
+| A trigger the operator wrote (config, an `admin` request, the `schedule` tool in an unrestricted session) | `Caller::Session` | The session it lands in: unrestricted in a session of its own, restricted if it names a restricted session. One the `schedule` tool made is also under its creator's bounds, stored for the session of its own it runs in; the only session it can name is the conversation that scheduled it (see "A trigger that names a session"). |
 | A trigger a restricted caller created (a `chat`/`connector` request, or the `schedule` tool in a restricted session) | `Caller::Restricted` — that caller's request, replayed | Recorded on the trigger when it is created and never changed. Its runs happen in restricted sessions only: the sessions it creates are created restricted, a session it names must be this directory's and restricted, and the engine refuses the turn if the session's restriction has been lifted since. Its prompt is text: `@file` and `@agent` mentions are resolved only in a prompt the operator wrote. |
 | A webhook call (`POST /trigger/{id}/hook`) | The trigger's caller, above | What it delivers is outside text: the run's session carries the outside-start mark (and with it outside-content), its shells get the restricted environment (`shell_env`: the allowlist, no `GITHUB_TOKEN` or `AWS_*` unless `allow` names them) whatever the server's posture, and its rules are the read-only ceiling **plus whatever the trigger's own `permission` block grants** — a webhook trigger whose block allows `bash` runs `bash` on a body its caller wrote, so who may call it matters. A `hook` credential calls the one trigger it is bound to; the body is capped at 256 KiB before it is read, and a trigger accepts one delivery per `triggers.webhook_min_interval` (default 1 s; sooner is a 429 with `Retry-After`), whoever sends it. |
-| A restart follow-up (`server.resume: notify` / `continue`) | `Caller::Session` | The interrupted session's own restriction and rules. A trigger's interrupted turn in a session of its own (`new`, `reuse`) is resumed like any other, once; in a session the trigger *named* it gets a note and is never resumed, because the bounds that held it there were the run's and went with the process (below). Either way its run is closed as interrupted and its tick is not fired again. With several servers on the data directory, the one that claims the dead process's marker does this and no other (see "Two servers on one data directory"). |
+| A restart follow-up (`server.resume: notify` / `continue`) | `Caller::Session` | The interrupted session's own restriction and rules. A trigger's interrupted turn is resumed like any other, once; its run is closed as interrupted and its tick is not fired again. With several servers on the data directory, the one that claims the dead process's marker does this and no other (see "Two servers on one data directory"). |
 | The same fire reaching two servers on one data directory (a tick, a webhook call, a watch, a manual run) | The trigger's caller, above | One unsettled run per trigger across the processes, claimed in the database: one server runs it, the other records it as skipped. Only a run whose owner process is provably gone is closed by another server. |
 | The memory flush before a compaction | No turn: one model request with one tool | The session's own `memory` permission (an `ask` is a refusal), its outside-content mark and its restriction, all recorded on what it writes. |
 | A `/goal` round, a subagent's run, a subagent's result, an auto-resume | `Caller::Session` | The session, as before. |
@@ -887,61 +887,33 @@ set it up and the session it lands in.
 #### A trigger that names a session
 
 A trigger's `session` is `"new"`, `"reuse"`, or a session id (the `schedule`
-tool's `current` is the id of the conversation that scheduled it). The first
-two give the run a session of its own, and what binds the run is stored
-there: the creator's bounds and, for outside input, the read-only ceiling.
-A named session is somebody's conversation, and the question is what binds
-a run in it.
+tool's `current` is the id of the conversation that scheduled it). The rule
+behind everything below: **the bounds of a run are carried by the session
+it runs in** — stored for it by the server (`session_ceiling`,
+`session_mark`), inherited by its subagents and forks, and read wherever a
+policy is assembled (`SessionStore::policy`). Nothing binds a run from
+beside its session: a bound held only while the run's turn lasts would end
+with the turn while a background subagent or workflow it started carried
+on, and would never reach a subagent session that already existed.
 
-*Who can point a trigger at which session.* The session must be this
-directory's. A restricted creator — a `chat` or `connector` request, or the
-`schedule` tool in a restricted session — may name only a restricted
-session, checked when the trigger is created, when its `session` is
-changed, and again when each run starts (a session whose restriction was
-lifted since is refused). So a token below `admin` cannot schedule into an
-operator's session. A `webhook` or `watch` trigger cannot name a session at
-all.
+So a trigger whose run needs bounds of its own always runs in a session of
+its own, and a named session is only ever one whose own policy and marks
+are already the right ones for the run:
 
-*Why the session's own policy is still not enough.* Among sessions a
-creator may name, the policy differs, and it changes:
+| Trigger | May name | Why |
+| --- | --- | --- |
+| A `webhook` or `watch` trigger, or any run that carries a payload | no session, ever | The read-only ceiling and the outside-start mark belong on a session made for the run. |
+| One a session's `schedule` tool made (it has creator's bounds) | only that very session — `current` — and only for `cron`, `interval`, `at`, `in` | The run is a turn of the conversation that asked for it, under that conversation's policy and marks as they then stand: the creator *is* the session, so there are no separate bounds to lose. Any other session would need the creator's bounds held over it. |
+| One written after outside content was seen | only a session that already has the outside-content mark | With `current` that is the creating session itself. A session that has seen outside content cannot change a trigger that runs in a conversation that has not. |
+| One the operator wrote (the config, an `admin` request) | any session of this directory | It has no bounds of its own; the run is a turn under that session's policy. Its `permission` block is not applied there — the block becomes the rules of a session the trigger makes. |
+| One a `chat` or `connector` request created | a restricted session of this directory | `Caller::may_act_on`: it cannot schedule into an operator's session. |
 
-- the `schedule` tool's `current` records the conversation as it was. By
-  the time the trigger fires, the operator may have loosened the config,
-  or a later prompt may have switched tools on for that session;
-- an update can move a trigger to another session — the tool lets the
-  creating session's ancestors do it, and a `chat` token may point a
-  restricted trigger at any restricted session — whose rules its creator
-  never had.
-
-Either way the run would do, unattended, what the session that scheduled it
-could not. So the creator's bounds are held over the **run**: for as long
-as its turn lasts, every policy assembled for that session is also under
-them (the tool list, each ask, the doom-loop ask, subagents it starts — a
-subagent session created meanwhile keeps them for life — and the bounds of
-anything it schedules in turn). They are not stored for the session.
-Storing them would narrow, for good, a conversation its user also works in;
-when the run's turn ends the session is judged as before.
-
-What that costs and what it does not cover:
-
-- A prompt of yours that reaches the session *while* the run's turn is
-  going is processed in that turn and is under the run's bounds until it
-  ends. It is never wider, only narrower, and only for that long.
-- The bounds are the creator's policy as it was read, without the
-  project's standing `always` approvals: something the creator would have
-  been asked about is asked about again in the run, as it is in a run with
-  a session of its own.
-- A trigger written by the operator (the config, an `admin` request) has no
-  creator's bounds, and its run in a named session is bound by that session
-  alone, as before. Its `permission` block is **not** applied there: the
-  block becomes the rules of a session the trigger makes, and a named
-  session keeps its own.
-- The bounds live in the memory of the server running the turn. If it is
-  killed mid-run, `server.resume: "continue"` does not carry the turn on:
-  it leaves a note (`notify`), since the turn would continue under the
-  session's own policy.
-- A trigger written after outside content was seen leaves the
-  outside-content mark on the session it names, as on one it keeps.
+The rule is one function (`trigger::rules::check_named_session`), asked
+when a trigger is created, when its `session` or its kind is changed, and
+again when each run starts. A trigger stored by an earlier build, one
+whose target lost its restriction, or a run that arrives with a payload is
+refused at the run: it is recorded as `failed` with the reason and nothing
+is written to the session.
 
 Three things can be recorded about a session. They are independent, each
 has one cause and one effect, and all three live in tables only the server

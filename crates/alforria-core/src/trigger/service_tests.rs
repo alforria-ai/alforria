@@ -76,7 +76,10 @@ impl TriggerOps for FakeOps {
             .unwrap()
             .get(session_id)
             .copied()
-            .unwrap_or(crate::trigger::SessionTarget::Found { restricted: false })
+            .unwrap_or(crate::trigger::SessionTarget::Found {
+                restricted: false,
+                outside_content: false,
+            })
     }
 
     fn run_turn<'a>(
@@ -1149,6 +1152,274 @@ async fn runs_that_carry_outside_text_are_marked_untrusted_whatever_started_them
     }
 }
 
+/// Which session a trigger may name (`rules::check_named_session`), row by
+/// row, when it is created and when it is changed. (Each run asks again:
+/// `session::trigger_reuse_tests`.)
+#[tokio::test]
+async fn a_trigger_names_only_a_session_whose_own_bounds_are_its_runs() {
+    use crate::trigger::{Creator, SessionTarget};
+    let f = Fixture::new(
+        "trigger-named-session",
+        "2027-01-01T00:00:00Z",
+        FakeOps::answering("ok"),
+    );
+    {
+        let mut targets = f.ops.targets.lock().unwrap();
+        for (id, restricted, outside_content) in [
+            ("ses_origin", false, false),
+            ("ses_other", false, false),
+            ("ses_marked", false, true),
+            ("ses_restricted", true, false),
+        ] {
+            targets.insert(
+                id.to_string(),
+                SessionTarget::Found {
+                    restricted,
+                    outside_content,
+                },
+            );
+        }
+        targets.insert("ses_gone".to_string(), SessionTarget::Missing);
+    }
+    let service = f.service(json!({}));
+    let bounds = || {
+        Some(CreatorBounds::Flat(
+            serde_json::from_value(json!([
+                { "permission": "*", "pattern": "*", "action": "allow" },
+                { "permission": "bash", "pattern": "*", "action": "deny" }
+            ]))
+            .unwrap(),
+        ))
+    };
+    // Who is asking.
+    let tool = |origin: &str, outside_content: bool| Creator {
+        origin_session_id: Some(origin.to_string()),
+        inherited: bounds(),
+        restricted: false,
+        outside_content,
+    };
+    let operator = Creator::default;
+    let chat = || Creator {
+        restricted: true,
+        ..Default::default()
+    };
+    let job =
+        |on: Value, session: &str| spec(json!({ "on": on, "prompt": "Go", "session": session }));
+    let clock = || json!({ "interval": "1h" });
+
+    // (what, creator, `on`, session, allowed)
+    let rows: Vec<(&str, Creator, Value, &str, bool)> = vec![
+        // A session's own tool: that conversation, for a clock trigger.
+        (
+            "tool, current, interval",
+            tool("ses_origin", false),
+            clock(),
+            "ses_origin",
+            true,
+        ),
+        (
+            "tool, current, cron",
+            tool("ses_origin", false),
+            json!({ "cron": "0 3 * * *" }),
+            "ses_origin",
+            true,
+        ),
+        (
+            "tool, current, at",
+            tool("ses_origin", false),
+            json!({ "at": "2027-06-01T00:00:00Z" }),
+            "ses_origin",
+            true,
+        ),
+        (
+            "tool, current, webhook",
+            tool("ses_origin", false),
+            json!({ "webhook": true }),
+            "ses_origin",
+            false,
+        ),
+        (
+            "tool, current, watch",
+            tool("ses_origin", false),
+            json!({ "watch": { "path": "src" } }),
+            "ses_origin",
+            false,
+        ),
+        // …and never any other session.
+        (
+            "tool, another session",
+            tool("ses_origin", false),
+            clock(),
+            "ses_other",
+            false,
+        ),
+        (
+            "tool, a restricted session",
+            tool("ses_origin", false),
+            clock(),
+            "ses_restricted",
+            false,
+        ),
+        (
+            "tool, a session that is gone",
+            tool("ses_gone", false),
+            clock(),
+            "ses_gone",
+            false,
+        ),
+        // Its provenance: only where the session has the mark already.
+        (
+            "marked tool, current (marked)",
+            tool("ses_marked", true),
+            clock(),
+            "ses_marked",
+            true,
+        ),
+        (
+            "marked tool, current (unmarked)",
+            tool("ses_origin", true),
+            clock(),
+            "ses_origin",
+            false,
+        ),
+        // A session of its own is always open to it.
+        ("tool, new", tool("ses_origin", true), clock(), "new", true),
+        (
+            "tool, reuse, webhook",
+            tool("ses_origin", true),
+            json!({ "webhook": true }),
+            "reuse",
+            true,
+        ),
+        // The operator names any session of the project, for a clock trigger.
+        (
+            "operator, a session",
+            operator(),
+            clock(),
+            "ses_other",
+            true,
+        ),
+        (
+            "operator, a restricted session",
+            operator(),
+            clock(),
+            "ses_restricted",
+            true,
+        ),
+        (
+            "operator, webhook into a session",
+            operator(),
+            json!({ "webhook": true }),
+            "ses_other",
+            false,
+        ),
+        (
+            "operator, watch into a session",
+            operator(),
+            json!({ "watch": { "path": "src" } }),
+            "ses_other",
+            false,
+        ),
+        (
+            "operator, a session that is gone",
+            operator(),
+            clock(),
+            "ses_gone",
+            false,
+        ),
+        // Bounds recorded with no tool behind them still need their own session.
+        (
+            "bounded, no origin",
+            Creator {
+                inherited: bounds(),
+                ..Default::default()
+            },
+            clock(),
+            "ses_other",
+            false,
+        ),
+        // A restricted caller: a restricted session it may act in.
+        (
+            "chat, a restricted session",
+            chat(),
+            clock(),
+            "ses_restricted",
+            true,
+        ),
+        (
+            "chat, an operator's session",
+            chat(),
+            clock(),
+            "ses_other",
+            false,
+        ),
+        (
+            "chat, webhook into a session",
+            chat(),
+            json!({ "webhook": true }),
+            "ses_restricted",
+            false,
+        ),
+    ];
+    for (index, (what, creator, on, session, allowed)) in rows.into_iter().enumerate() {
+        // At create.
+        let created = service.create_as(
+            Some(format!("create-{index}")),
+            job(on.clone(), session),
+            creator.clone(),
+        );
+        assert_eq!(created.is_ok(), allowed, "create — {what}: {created:?}");
+        // At update: the same trigger in a session of its own, pointed at
+        // the session afterwards, with the kind it has and then given it.
+        let id = format!("update-{index}");
+        service
+            .create_as(Some(id.clone()), job(clock(), "new"), creator.clone())
+            .unwrap();
+        let moved = service
+            .update(&id, &json!({ "session": session, "on": on }))
+            .map(|_| ());
+        assert_eq!(moved.is_ok(), allowed, "update — {what}: {moved:?}");
+        if allowed && session.starts_with("ses") {
+            // Named, and then turned into a kind that cannot be.
+            let turned = service.update(&id, &json!({ "on": { "webhook": true } }));
+            assert!(turned.is_err(), "kind change — {what}: {turned:?}");
+            assert_eq!(
+                service.get(&id).unwrap().spec.session.as_deref(),
+                Some(session)
+            );
+        }
+    }
+
+    // A session that has seen outside content cannot leave its mark on a
+    // trigger that runs in a conversation that has not: the change it was
+    // about to make is refused before it is made.
+    service
+        .create_as(
+            Some("reminder".to_string()),
+            job(clock(), "ses_origin"),
+            tool("ses_origin", false),
+        )
+        .unwrap();
+    assert!(matches!(
+        service.mark_outside_content("reminder"),
+        Err(TriggerError::Invalid(_))
+    ));
+    assert!(!service
+        .store
+        .list()
+        .unwrap()
+        .into_iter()
+        .any(|trigger| trigger.id == "reminder" && trigger.stored.outside_content));
+    service
+        .create_as(
+            Some("own".to_string()),
+            job(clock(), "reuse"),
+            tool("ses_origin", false),
+        )
+        .unwrap();
+    service.mark_outside_content("own").unwrap();
+}
+
 /// A trigger remembers whether a restricted caller created it, across
 /// restarts and whoever changes it later, and is held to that: it targets
 /// restricted sessions only, its runs say so, and its prompt is text.
@@ -1165,11 +1436,17 @@ async fn a_trigger_is_bound_by_who_created_it() {
         targets.insert("ses_gone".to_string(), SessionTarget::Missing);
         targets.insert(
             "ses_operators".to_string(),
-            SessionTarget::Found { restricted: false },
+            SessionTarget::Found {
+                restricted: false,
+                outside_content: false,
+            },
         );
         targets.insert(
             "ses_mine".to_string(),
-            SessionTarget::Found { restricted: true },
+            SessionTarget::Found {
+                restricted: true,
+                outside_content: false,
+            },
         );
     }
     let config = json!({ "nightly": { "on": { "cron": "0 3 * * *" }, "prompt": "Tidy" } });

@@ -491,6 +491,8 @@ pub struct TriggerTurn {
     pub mode: SessionMode,
     /// The session a `reuse` trigger used last time.
     pub session_id: Option<String>,
+    /// The session whose `schedule` tool made the trigger, if a tool did.
+    pub origin_session_id: Option<String>,
     /// The bounds of the session that scheduled the trigger.
     pub inherited: CreatorBounds,
     /// The trigger's own `permission` block.
@@ -537,6 +539,10 @@ pub enum SessionTarget {
     Found {
         /// The session is restricted (`session::caller`).
         restricted: bool,
+        /// The session carries the outside-content mark
+        /// (`SessionMark::OutsideContent`); one whose marks cannot be read
+        /// counts as carrying it.
+        outside_content: bool,
     },
 }
 

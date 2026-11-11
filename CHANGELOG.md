@@ -201,8 +201,8 @@ pre-1.0, so minor releases may include breaking changes.
   there, `"notify"` adds a note the model reads with the next prompt, and
   `"continue"` prompts the model to carry on. A turn is resumed once: if the
   server dies again while resuming, the turn is left with a note. Subagents
-  and `!shell` commands are repaired but never resumed, a trigger's run in
-  a session it named gets a note, and `/goal` still comes back paused.
+  and `!shell` commands are repaired but never resumed, and `/goal` still
+  comes back paused.
 - `storage.synchronous`: `"full"` puts every commit on disk before it
   returns, for machines that are stopped by being killed; `"normal"`, the
   default and upstream's setting, never corrupts the database but can lose
@@ -266,18 +266,22 @@ pre-1.0, so minor releases may include breaking changes.
   every route that names a session, applied after routing; only `fork` is
   exempt, by name. `GET /permission` and `GET /question` list such a token
   the asks it may answer, as `GET /attention` does, in the same shape.
-- A trigger the `schedule` tool made, running in a session it names
-  (`session: "current"`, or a session id after an update), ran under that
-  session's policy alone: its creator's bounds were stored only for
-  sessions a trigger makes itself. A conversation that could not run a
-  command could schedule it and have it run once its rules or the config
-  were loosened, or once the trigger was moved to a session with wider
-  rules. The bounds are now held over the run — for as long as its turn
-  lasts, and for the subagents it starts — without being stored on the
-  session, which is judged as before once the run ends. Such a run also
-  leaves the outside-content mark its trigger carries, and after a kill it
-  gets a note under `server.resume: "continue"` instead of being carried
-  on outside its bounds. See "A trigger that names a session" in
+- A trigger could be pointed at an existing session in ways that left its
+  run without the bounds it needed: one the `schedule` tool made, moved to
+  another conversation by an update, ran there without its creator's
+  bounds (they are stored only on sessions a trigger makes), and a run
+  that arrived with a payload in a named session got neither the read-only
+  ceiling nor the outside-start mark. The bounds of a run are now always
+  carried by the session it runs in, so which session a trigger may name
+  is restricted instead: a `webhook` or `watch` trigger, or a run with a
+  payload, never names one; a trigger the `schedule` tool made names only
+  the conversation that scheduled it (`current`, for `cron`, `interval`,
+  `at` and `in`), where the run is a turn under that conversation's own
+  policy; one written after outside content was seen names only a session
+  that has the mark; one you wrote names any session of the directory; a
+  `chat` or `connector` token's, a restricted one. Checked at create, at
+  update and at every run — a stored trigger that no longer fits fails its
+  run with the reason. See "A trigger that names a session" in
   `docs/unattended-server.md`.
 - A trigger run that was queued behind another when the server stopped no
   longer starts its turn after the shutdown has settled the others: it is

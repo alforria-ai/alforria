@@ -217,7 +217,7 @@ Actions:
 - `pause` / `resume`: stop or restart trigger `id` without deleting it.
 - `delete`: remove trigger `id`.
 
-`session` says where the turn runs: "new" (default) starts a fresh session per run, "reuse" keeps one long-lived session for the trigger, and "current" runs in this conversation, which is what a reminder for the user usually wants.
+`session` says where the turn runs: "new" (default) starts a fresh session per run, "reuse" keeps one long-lived session for the trigger, and "current" runs in this conversation, which is what a reminder for the user usually wants. "current" is for cron, interval, at and in; a watch or webhook trigger always gets a session of its own.
 
 `quiet_token`: if a run's final answer is exactly this text, it counts as "nothing to report" and is not delivered. Use it for checks that usually find nothing, and tell the prompt to answer with the token in that case. `report: "none"` never delivers the answer.
 
@@ -605,7 +605,10 @@ mod tests {
     impl TriggerOps for NoTurns {
         // The test's sessions are the caller's own.
         fn target(&self, _session_id: &str) -> crate::trigger::SessionTarget {
-            crate::trigger::SessionTarget::Found { restricted: false }
+            crate::trigger::SessionTarget::Found {
+                restricted: false,
+                outside_content: false,
+            }
         }
 
         fn run_turn<'a>(

@@ -134,52 +134,39 @@ impl ProductionTriggerOps {
             && std::path::Path::new(&session.directory) == self.context.directory
     }
 
-    /// The session this turn runs in, created if need be, and what binds
-    /// the run there beyond what is stored for the session.
-    ///
-    /// A session of the trigger's own (`new`, `reuse`) carries the
-    /// creator's bounds and the outside-input ceiling itself. A session
-    /// the trigger *names* is somebody's conversation: it keeps its own
-    /// rules and gets no ceiling stored — which would narrow it for good,
-    /// for its user too — so the same ceilings are held over the run
-    /// instead ([`SessionStore::bind_run`]), for as long as its turn
-    /// lasts. Without them a trigger a session scheduled would run there
-    /// under whatever that session's policy has become since, or — moved
-    /// there by an update — under a session's policy its creator never
-    /// had.
-    fn session_for(
-        &self,
-        turn: &TriggerTurn,
-    ) -> Result<(String, Option<crate::session::store::RunCeilings>), String> {
+    /// The session this turn runs in, created if need be.
+    fn session_for(&self, turn: &TriggerTurn) -> Result<String, String> {
         match &turn.mode {
-            SessionMode::Existing(id) => match self.target(id) {
-                SessionTarget::Missing => Err(format!("session {id} no longer exists")),
-                // Refused again by the engine when the turn is built; said
-                // here so the run fails with the reason and no message.
-                SessionTarget::Found { restricted: false } if turn.restricted => Err(format!(
-                    "session {id} is not restricted (any more): a trigger created by a \
-                     restricted caller only runs in a restricted session"
-                )),
-                SessionTarget::Found { .. } => {
-                    // Provenance, as in a kept session: the prompt was
-                    // written after outside content was seen.
-                    if turn.untrusted || turn.outside_content {
-                        self.sessions
-                            .mark(id, crate::session::store::SessionMark::OutsideContent)
-                            .map_err(|error| error.to_string())?;
-                    }
-                    let ceilings = turn.run_policy().ceilings;
-                    let bound =
-                        (!ceilings.is_empty()).then(|| self.sessions.bind_run(id, ceilings));
-                    Ok((id.clone(), bound))
+            // A named session is somebody's conversation: nothing is stored
+            // for it and nothing is held over it, so the run is a turn
+            // under that session's own policy and marks. Which triggers
+            // may name which session is one rule
+            // (`trigger::rules::check_named_session`), asked again here for
+            // the run as it is — a stored trigger from an earlier build,
+            // one whose kind changed, a session whose restriction was
+            // lifted since. A refusal fails the run with the reason and
+            // leaves no message.
+            SessionMode::Existing(id) => {
+                let target = self.target(id);
+                if target == SessionTarget::Missing {
+                    return Err(format!("session {id} no longer exists"));
                 }
-            },
-            SessionMode::New => self
-                .create_session(
-                    turn,
-                    format!("{} · {}", turn.title, format_instant(turn.now_ms)),
-                )
-                .map(|id| (id, None)),
+                crate::trigger::rules::check_named_session(&crate::trigger::rules::NamedSession {
+                    session_id: id,
+                    target,
+                    origin_session_id: turn.origin_session_id.as_deref(),
+                    bounded: !turn.inherited.is_empty(),
+                    outside_start: turn.untrusted || turn.payload.is_some(),
+                    outside_content: turn.outside_content,
+                    restricted: turn.restricted,
+                })
+                .map(|()| id.clone())
+                .map_err(|refusal| refusal.message().to_string())
+            }
+            SessionMode::New => self.create_session(
+                turn,
+                format!("{} · {}", turn.title, format_instant(turn.now_ms)),
+            ),
             SessionMode::Reuse => {
                 let kept = turn
                     .session_id
@@ -242,11 +229,9 @@ impl ProductionTriggerOps {
                                 .set_permission(&session.id, permission)
                                 .map_err(|error| error.to_string())?;
                         }
-                        Ok((session.id, None))
+                        Ok(session.id)
                     }
-                    None => self
-                        .create_session(turn, turn.title.clone())
-                        .map(|id| (id, None)),
+                    None => self.create_session(turn, turn.title.clone()),
                 }
             }
         }
@@ -263,6 +248,7 @@ impl TriggerOps for ProductionTriggerOps {
                     // A restriction that cannot be read is not one a
                     // restricted trigger can rely on.
                     restricted: self.sessions.is_restricted(session_id).unwrap_or(false),
+                    outside_content: self.sessions.seen_outside_content(session_id),
                 }
             }
             _ => SessionTarget::Missing,
@@ -279,9 +265,7 @@ impl TriggerOps for ProductionTriggerOps {
                 message,
             };
             let facade = self.facade().map_err(|message| fail(None, message))?;
-            // `_bound` holds the run's ceilings over a named session until
-            // this turn has ended, however it ends.
-            let (session_id, _bound) = self
+            let session_id = self
                 .session_for(turn)
                 .map_err(|message| fail(None, message))?;
             let mark = || {
@@ -428,6 +412,7 @@ mod tests {
             model: None,
             mode,
             session_id: None,
+            origin_session_id: None,
             inherited: Default::default(),
             own: vec![PermissionV1Rule {
                 permission: "bash".to_string(),
@@ -596,14 +581,20 @@ mod tests {
         assert!(sessions.is_restricted(&first.session_id).unwrap());
         assert_eq!(
             ops.target(&first.session_id),
-            SessionTarget::Found { restricted: true }
+            SessionTarget::Found {
+                restricted: true,
+                outside_content: false,
+            }
         );
 
         // The operator's session is refused, and nothing is written there.
         let operators = sessions.create(&context, &Default::default()).unwrap();
         assert_eq!(
             ops.target(&operators.id),
-            SessionTarget::Found { restricted: false }
+            SessionTarget::Found {
+                restricted: false,
+                outside_content: false,
+            }
         );
         let failure = ops
             .run_turn(&restricted_turn(SessionMode::Existing(
@@ -705,7 +696,10 @@ mod tests {
         assert!(sessions.is_restricted(&moved.session_id).is_err());
         assert_eq!(
             ops.target(&moved.session_id),
-            SessionTarget::Found { restricted: false }
+            SessionTarget::Found {
+                restricted: false,
+                outside_content: false,
+            }
         );
         let failure = ops
             .run_turn(&restricted_turn(SessionMode::Existing(

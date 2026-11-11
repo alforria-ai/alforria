@@ -193,6 +193,124 @@ pub fn run_policy(input: &RunRules<'_>) -> RunPolicy {
     }
 }
 
+/// A trigger that names a session (`session: "ses_…"`) instead of running
+/// in one of its own, and what is known about the two.
+#[derive(Debug, Clone, Copy)]
+pub struct NamedSession<'a> {
+    /// The session named.
+    pub session_id: &'a str,
+    /// What the engine says about it.
+    pub target: super::SessionTarget,
+    /// The session whose `schedule` tool made the trigger, if a tool did.
+    pub origin_session_id: Option<&'a str>,
+    /// Creator's bounds are recorded for the trigger.
+    pub bounded: bool,
+    /// Outside input starts the run or comes with it: a `webhook` or
+    /// `watch` trigger, or a run that carries a payload.
+    pub outside_start: bool,
+    /// The trigger was written by a session that had seen outside content.
+    pub outside_content: bool,
+    /// The trigger's creator was restricted.
+    pub restricted: bool,
+}
+
+/// Why a trigger may not name a session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NamedSessionRefusal {
+    /// The session is not there, or the trigger is not one that can name
+    /// it.
+    Invalid(String),
+    /// The session is not the creator's to act in.
+    Forbidden(String),
+}
+
+impl NamedSessionRefusal {
+    pub fn message(&self) -> &str {
+        match self {
+            NamedSessionRefusal::Invalid(message) | NamedSessionRefusal::Forbidden(message) => {
+                message
+            }
+        }
+    }
+}
+
+/// **Which session a trigger may name.** Checked when a trigger is
+/// created, when it is changed, and again when each run starts — a stored
+/// trigger from an earlier build, or one whose kind changed, is refused
+/// there.
+///
+/// The bounds of a run are always carried by the session it runs in:
+/// stored for it (`session_ceiling`, `session_mark`), inherited by its
+/// children and forks, and read wherever a policy is assembled
+/// (`SessionStore::policy`). Nothing binds a run from beside its session.
+/// So a trigger whose run needs bounds of its own runs in a session of its
+/// own (`new`, `reuse`), and a named session is only ever one whose own
+/// policy and marks are the right ones for the run:
+///
+/// 1. A run outside input starts or comes with is never delivered into a
+///    named session: the read-only ceiling and the outside-start mark
+///    belong on a session made for it.
+/// 2. A trigger a session's `schedule` tool made names only that very
+///    session (`current`): the run is a turn of the conversation that
+///    asked for it, under that conversation's policy and marks as they
+///    then stand — the creator *is* the session, so there are no separate
+///    bounds to lose. It cannot be pointed at any other session.
+/// 3. A trigger nobody's tool made (the config, an HTTP request) may name
+///    a session; if creator's bounds are recorded for it all the same, it
+///    needs a session of its own.
+/// 4. A trigger that carries outside-content provenance names only a
+///    session that already has the mark.
+/// 5. A restricted creator names only a restricted session
+///    (`Caller::may_act_on`).
+pub fn check_named_session(named: &NamedSession<'_>) -> Result<(), NamedSessionRefusal> {
+    use NamedSessionRefusal::{Forbidden, Invalid};
+    let id = named.session_id;
+    let super::SessionTarget::Found {
+        restricted,
+        outside_content,
+    } = named.target
+    else {
+        return Err(Invalid(format!(
+            "session {id} does not exist in this project"
+        )));
+    };
+    if named.outside_start {
+        return Err(Invalid(format!(
+            "a run that carries outside input is not delivered into session {id}: a webhook or \
+             watch trigger runs in its own session (\"new\" or \"reuse\")"
+        )));
+    }
+    match named.origin_session_id {
+        Some(origin) if origin != id => {
+            return Err(Invalid(format!(
+                "a trigger a conversation scheduled runs in a session of its own (\"new\", \
+                 \"reuse\") or in that conversation (\"current\"), not in session {id}"
+            )))
+        }
+        Some(_) => {}
+        None if named.bounded => {
+            return Err(Invalid(format!(
+                "a trigger bound by its creator's rules runs in a session of its own \
+                 (\"new\" or \"reuse\"), not in session {id}"
+            )))
+        }
+        None => {}
+    }
+    if named.outside_content && !outside_content {
+        return Err(Invalid(format!(
+            "this trigger was written after outside content was seen, and session {id} has \
+             seen none: it runs in a session of its own (\"new\" or \"reuse\")"
+        )));
+    }
+    if named.restricted && !restricted {
+        return Err(Forbidden(format!(
+            "session {id} belongs to the operator: a trigger created by a restricted caller \
+             can only run in a restricted session"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 impl RunPolicy {
     /// The policy a turn of the run is judged by, given the agent's policy

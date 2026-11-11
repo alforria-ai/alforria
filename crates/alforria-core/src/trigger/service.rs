@@ -24,10 +24,10 @@ use crate::trigger::rules::CreatorBounds;
 use crate::trigger::store::{StoredSpec, StoredTrigger, TickClaim, TriggerState, TriggerStore};
 use crate::trigger::watch::{self, WatchHandle, WatchIgnore};
 use crate::trigger::{
-    format_duration, Creator, Report, RunStatus, RunTime, Schedule, SessionMode, SessionTarget,
-    TriggerError, TriggerOps, TriggerPayload, TriggerRecord, TriggerRun, TriggerSource,
-    TriggerSpec, TriggerTurn, MAX_AGENT_TRIGGERS, MAX_PAYLOAD_BYTES, MAX_STORED_TRIGGERS,
-    TRIGGER_COMPLETED, TRIGGER_FAILED, TRIGGER_FIRED, TRIGGER_SKIPPED, TRIGGER_UPDATED,
+    format_duration, Creator, Report, RunStatus, RunTime, Schedule, SessionMode, TriggerError,
+    TriggerOps, TriggerPayload, TriggerRecord, TriggerRun, TriggerSource, TriggerSpec, TriggerTurn,
+    MAX_AGENT_TRIGGERS, MAX_PAYLOAD_BYTES, MAX_STORED_TRIGGERS, TRIGGER_COMPLETED, TRIGGER_FAILED,
+    TRIGGER_FIRED, TRIGGER_SKIPPED, TRIGGER_UPDATED,
 };
 use crate::Clock;
 
@@ -105,6 +105,14 @@ struct PendingWatch {
     first: u64,
     deadline: u64,
     paths: BTreeSet<String>,
+}
+
+/// Who a trigger is, for the question of which session it may name.
+struct Named<'a> {
+    origin_session_id: Option<&'a str>,
+    inherited: Option<&'a CreatorBounds>,
+    outside_content: bool,
+    restricted: bool,
 }
 
 struct Entry {
@@ -717,25 +725,30 @@ impl TriggerService {
         )
     }
 
-    /// A session a trigger names must be one of this project's, and one its
-    /// creator may act in: a restricted creator's trigger runs in a
-    /// restricted session or not at all (`Caller::may_act_on`).
-    fn check_target(&self, spec: &TriggerSpec, restricted: bool) -> Result<(), TriggerError> {
+    /// A session a trigger names must be one the trigger may name
+    /// (`rules::check_named_session`): of this project, and one whose own
+    /// policy and marks are the right ones for the run.
+    fn check_target(&self, spec: &TriggerSpec, who: &Named<'_>) -> Result<(), TriggerError> {
         let SessionMode::Existing(session_id) = spec.session_mode() else {
             return Ok(());
         };
-        match self.ops.target(&session_id) {
-            SessionTarget::Missing => Err(TriggerError::Invalid(format!(
-                "session {session_id} does not exist in this project"
-            ))),
-            SessionTarget::Found { restricted: false } if restricted => {
-                Err(TriggerError::Forbidden(format!(
-                    "session {session_id} belongs to the operator: a trigger created by a \
-                     restricted caller can only run in a restricted session"
-                )))
+        crate::trigger::rules::check_named_session(&crate::trigger::rules::NamedSession {
+            session_id: &session_id,
+            target: self.ops.target(&session_id),
+            origin_session_id: who.origin_session_id,
+            bounded: who.inherited.is_some_and(|bounds| !bounds.is_empty()),
+            outside_start: spec.on.webhook == Some(true) || spec.on.watch.is_some(),
+            outside_content: who.outside_content,
+            restricted: who.restricted,
+        })
+        .map_err(|refusal| match refusal {
+            crate::trigger::rules::NamedSessionRefusal::Invalid(message) => {
+                TriggerError::Invalid(message)
             }
-            SessionTarget::Found { .. } => Ok(()),
-        }
+            crate::trigger::rules::NamedSessionRefusal::Forbidden(message) => {
+                TriggerError::Forbidden(message)
+            }
+        })
     }
 
     /// Whether a caller that is, or is not, restricted may change, fire or
@@ -757,6 +770,22 @@ impl TriggerService {
         }
     }
 
+    /// Whether a session's `schedule` tool may leave the outside-content
+    /// mark on trigger `id` — which it must before it changes it. A
+    /// trigger that runs in a named session can only carry the mark if
+    /// that session has it (`rules::check_named_session`).
+    fn check_mark(&self, entry: &Entry) -> Result<(), TriggerError> {
+        self.check_target(
+            &entry.spec,
+            &Named {
+                origin_session_id: entry.origin_session_id.as_deref(),
+                inherited: entry.inherited.as_ref(),
+                outside_content: true,
+                restricted: entry.restricted,
+            },
+        )
+    }
+
     /// Record that a session which had seen outside content changed a
     /// stored trigger (`StoredSpec::outside_content`): from now on its
     /// runs' sessions carry that mark. Never cleared.
@@ -768,6 +797,7 @@ impl TriggerService {
         if entry.outside_content || entry.source != TriggerSource::Runtime {
             return Ok(());
         }
+        self.check_mark(entry)?;
         self.store
             .put(&StoredTrigger {
                 id: id.to_string(),
@@ -802,7 +832,15 @@ impl TriggerService {
         } = creator;
         self.require_enabled()?;
         let schedule = spec.schedule().map_err(TriggerError::Invalid)?;
-        self.check_target(&spec, restricted)?;
+        self.check_target(
+            &spec,
+            &Named {
+                origin_session_id: origin_session_id.as_deref(),
+                inherited: inherited.as_ref(),
+                outside_content,
+                restricted,
+            },
+        )?;
         let id = match id {
             Some(id) if valid_id(&id) => id,
             Some(id) => {
@@ -947,9 +985,18 @@ impl TriggerService {
                         .map_err(TriggerError::Invalid)?;
                 }
                 // Whoever changes it, the trigger stays its creator's: a
-                // new target is held to the creator's restriction.
-                if spec.session != entry.spec.session {
-                    self.check_target(&spec, entry.restricted)?;
+                // new target, or a new kind for the old one, is held to
+                // what its creator may name.
+                if spec.session != entry.spec.session || spec.on != entry.spec.on {
+                    self.check_target(
+                        &spec,
+                        &Named {
+                            origin_session_id: entry.origin_session_id.as_deref(),
+                            inherited: entry.inherited.as_ref(),
+                            outside_content: entry.outside_content,
+                            restricted: entry.restricted,
+                        },
+                    )?;
                 }
                 let was = entry.enabled();
                 let rescheduled = entry.spec.on != spec.on;
@@ -1537,6 +1584,7 @@ impl TriggerService {
                         model: entry.spec.model_ref(),
                         mode: entry.spec.session_mode(),
                         session_id: entry.state.session_id.clone(),
+                        origin_session_id: entry.origin_session_id.clone(),
                         inherited: entry.inherited.clone().unwrap_or_default(),
                         own: entry
                             .spec

@@ -265,7 +265,7 @@ struct AskPayload {
 ///
 /// alforria extension: the ask is a session's, so the answer is the
 /// session's policy (`SessionStore::policy`) — the agent's, read with the
-/// session's own rules, under the session's stored and run ceilings. The
+/// session's own rules, under the session's stored ceilings. The
 /// agent's policy alone would allow a client what a trigger creator's
 /// bounds or the outside-input ceiling deny the session. A session with no
 /// rules and no ceilings of its own gets the agent's policy, as upstream.
