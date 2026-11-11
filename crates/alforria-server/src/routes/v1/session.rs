@@ -287,6 +287,46 @@ struct ShellPayload {
 // helpers
 // ---------------------------------------------------------------------------
 
+/// A message (and optionally one of its parts) named beside a session must
+/// belong to that session (alforria extension). The path's session is what
+/// the request was authorised for; the message or part is what gets acted
+/// on. One that exists elsewhere is answered like one that does not exist,
+/// so the route says nothing about other sessions; one that exists nowhere
+/// is left to the handler, whose behaviour for it is upstream's.
+fn require_owned(
+    location: &LocationContext,
+    session_id: &str,
+    message_id: &str,
+    part_id: Option<&str>,
+) -> Result<(), ServerError> {
+    let not_found = || {
+        ServerError::Api(ApiError::MessageNotFound {
+            session_id: session_id.to_string(),
+            message_id: message_id.to_string(),
+            message: format!("Message not found: {message_id}"),
+        })
+    };
+    let sessions = &location.services.sessions;
+    if let Some(owner) = sessions
+        .message_session(message_id)
+        .map_err(session_error)?
+    {
+        if owner != session_id {
+            return Err(not_found());
+        }
+    }
+    if let Some(part_id) = part_id {
+        if let Some((part_session, part_message)) =
+            sessions.part_owner(part_id).map_err(session_error)?
+        {
+            if part_session != session_id || part_message != message_id {
+                return Err(not_found());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// A prompt or command the engine refused: 403 when the caller may not do
 /// it (alforria extension, `alforria_core::session::caller`), else the
 /// empty 400 upstream answers with.
@@ -1231,6 +1271,12 @@ pub async fn revert(
     let payload: RevertPayload = parse_payload(&body)?;
     require_payload_id("msg", &payload.message_id)?;
     require_session(&location, &session_id)?;
+    require_owned(
+        &location,
+        &session_id,
+        &payload.message_id,
+        payload.part_id.as_deref(),
+    )?;
     let engine = engine(&ctx, &location)?;
     match engine
         .revert(RevertInput {
@@ -1275,6 +1321,15 @@ pub async fn permission_respond(
     if crate::confine::restricted(&principal) {
         crate::confine::check_reply(&ctx, payload.response)?;
     }
+    // The ask must be this session's: the path names a session, the reply
+    // acts on an ask, and they are only the same thing if checked.
+    crate::confine::authorise_answer(
+        &ctx,
+        &principal,
+        crate::confine::Ask::Permission,
+        &permission_id,
+        Some(&session_id),
+    )?;
     match location.services.permission.reply(PermissionV1ReplyInput {
         request_id: permission_id,
         reply: payload.response,
@@ -1299,6 +1354,7 @@ pub async fn delete_message(
 ) -> Result<Response, ServerError> {
     require_param("msg", &message_id)?;
     require_session(&location, &session_id)?;
+    require_owned(&location, &session_id, &message_id, None)?;
     if let Err(err) = location.services.run_state.assert_not_busy(&session_id) {
         return Err(busy_error(&err.session_id).into());
     }
@@ -1318,6 +1374,7 @@ pub async fn delete_part(
     require_param("msg", &message_id)?;
     require_param("prt", &part_id)?;
     require_session(&location, &session_id)?;
+    require_owned(&location, &session_id, &message_id, Some(&part_id))?;
     location
         .services
         .sessions
@@ -1336,6 +1393,7 @@ pub async fn update_part(
     require_param("msg", &message_id)?;
     require_param("prt", &part_id)?;
     require_session(&location, &session_id)?;
+    require_owned(&location, &session_id, &message_id, Some(&part_id))?;
     let part: V1Part = parse_payload(&body)?;
     let ids_match = match &part {
         V1Part::Text {

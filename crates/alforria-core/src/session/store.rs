@@ -555,6 +555,37 @@ impl SessionStore {
         Ok(info)
     }
 
+    /// The session a message belongs to, if the message exists (alforria
+    /// extension): routes that take a session and a message check the two
+    /// go together before acting on the message.
+    pub fn message_session(&self, message_id: &str) -> Result<Option<String>, SessionError> {
+        self.storage
+            .with_connection(|conn| {
+                let mut statement = conn.prepare("SELECT session_id FROM message WHERE id = ?1")?;
+                let mut rows = statement.query([message_id])?;
+                match rows.next()? {
+                    Some(row) => Ok::<_, CoreError>(Some(row.get::<_, String>(0)?)),
+                    None => Ok(None),
+                }
+            })
+            .map_err(SessionError::from)
+    }
+
+    /// The session and message a part belongs to, if the part exists.
+    pub fn part_owner(&self, part_id: &str) -> Result<Option<(String, String)>, SessionError> {
+        self.storage
+            .with_connection(|conn| {
+                let mut statement =
+                    conn.prepare("SELECT session_id, message_id FROM part WHERE id = ?1")?;
+                let mut rows = statement.query([part_id])?;
+                match rows.next()? {
+                    Some(row) => Ok::<_, CoreError>(Some((row.get(0)?, row.get(1)?))),
+                    None => Ok(None),
+                }
+            })
+            .map_err(SessionError::from)
+    }
+
     /// Whether a session is restricted (alforria extension,
     /// `session::caller`): created by a caller below `admin`, or descended
     /// from such a session.

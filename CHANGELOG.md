@@ -101,6 +101,12 @@ pre-1.0, so minor releases may include breaking changes.
 
 ### Fixed
 
+- Routes naming a session and a message, part or permission request inside
+  it acted on the inner id without checking it belonged to that session:
+  `POST /session/{id}/permissions/{permissionID}` could answer another
+  session's ask, and the message, part and revert routes accepted another
+  session's message id. The inner object must now belong to the session in
+  the path, or the answer is 404.
 - A custom command ran inline shell found in its *arguments*: `/cmd` with an
   argument containing `` !`…` ``, or one that broke out of the template's own
   `` !`…` ``, executed it with no permission check. Inline shell is now taken

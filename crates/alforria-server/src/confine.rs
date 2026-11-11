@@ -137,25 +137,82 @@ pub fn check_ask_session(
     }
 }
 
+/// Which kind of pending request a reply names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ask {
+    Permission,
+    Question,
+}
+
+/// Authorise an answer to a pending permission ask or question, against
+/// the session the ask actually belongs to — not against whatever session
+/// the request happens to name. Every v1 reply and reject route goes
+/// through this before it touches the ask:
+///
+/// * when the route carries a session id, the ask must belong to that
+///   session; if it does not, the answer is the same 404 an unknown ask
+///   gets, so the route says nothing about asks elsewhere;
+/// * for a credential below `admin`, the ask's own session must be one it
+///   may act in (restricted, `check_ask_session`).
+///
+/// An ask that is not pending anywhere is left for the handler's own 404.
+pub fn authorise_answer(
+    ctx: &crate::state::ServerContext,
+    principal: &Option<Extension<Principal>>,
+    kind: Ask,
+    request_id: &str,
+    path_session: Option<&str>,
+) -> Result<(), ServerError> {
+    let not_found = || {
+        ServerError::Api(match kind {
+            Ask::Permission => ApiError::PermissionNotFound {
+                request_id: request_id.to_string(),
+                message: format!("Permission request not found: {request_id}"),
+            },
+            Ask::Question => ApiError::QuestionNotFound {
+                request_id: request_id.to_string(),
+                message: format!("Question request not found: {request_id}"),
+            },
+        })
+    };
+    let owner = ask_session(ctx, kind, request_id);
+    if let Some(path_session) = path_session {
+        if owner.as_deref() != Some(path_session) {
+            return Err(not_found());
+        }
+    }
+    if restricted(principal) {
+        if let Some(owner) = &owner {
+            check_ask_session(ctx, Some(owner))?;
+        }
+    }
+    Ok(())
+}
+
 /// The session a pending permission ask or question belongs to, wherever
 /// it is loaded.
-pub fn ask_session(ctx: &crate::state::ServerContext, request_id: &str) -> Option<String> {
-    ctx.instances.cached().iter().find_map(|services| {
-        services
-            .permission
-            .list()
-            .into_iter()
-            .find(|request| request.id == request_id)
-            .map(|request| request.session_id)
-            .or_else(|| {
-                services
-                    .question
-                    .list()
-                    .into_iter()
-                    .find(|request| request.id == request_id)
-                    .map(|request| request.session_id)
-            })
-    })
+pub fn ask_session(
+    ctx: &crate::state::ServerContext,
+    kind: Ask,
+    request_id: &str,
+) -> Option<String> {
+    ctx.instances
+        .cached()
+        .iter()
+        .find_map(|services| match kind {
+            Ask::Permission => services
+                .permission
+                .list()
+                .into_iter()
+                .find(|request| request.id == request_id)
+                .map(|request| request.session_id),
+            Ask::Question => services
+                .question
+                .list()
+                .into_iter()
+                .find(|request| request.id == request_id)
+                .map(|request| request.session_id),
+        })
 }
 
 /// Whether an instance belongs to a directory a credential below `admin`

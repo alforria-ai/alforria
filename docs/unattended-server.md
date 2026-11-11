@@ -328,6 +328,33 @@ early.
   puts several mutually untrusting users on one server needs one, and
   should not rely on scopes for it.
 
+#### Routes with two identifiers
+
+Where a route names a session and something inside it, the inner object is
+looked up first and must belong to the outer one before anything is done
+with it; one that belongs elsewhere is answered like one that does not
+exist. This holds for every caller.
+
+| Route | Inner id | Checked against |
+| --- | --- | --- |
+| `POST /session/{id}/permissions/{permissionID}` | the pending ask | the ask's own session must be `{id}` (404); below `admin` that session must be restricted |
+| `POST /permission/{id}/reply` | the pending ask | below `admin`: the ask's own session must be restricted and in an allowed project |
+| `POST /question/{id}/reply`, `/reject` | the pending question | the same |
+| `GET`, `DELETE /session/{id}/message/{messageID}` | the message | its session must be `{id}` (404) |
+| `PATCH`, `DELETE /session/{id}/message/{messageID}/part/{partID}` | the message and the part | the message's session must be `{id}`, and the part must be that message's (404) |
+| `POST /session/{id}/revert` | `messageID`, `partID` | the same |
+| `POST /session/{id}/fork` | `messageID` | only messages of `{id}` are copied; a foreign id copies nothing of the other session |
+| v2 `/api/session/{id}/permission/{requestID}/…`, `/question/{requestID}/…` | the pending request | the request's session must be `{id}` (`owned_request`, `owned_question`) |
+| `GET /file/raw`, `/file/content` with `?ticket=` | the ticket | the ticket's directory and resolved file must be the request's. A ticket is a bearer capability for that one file: it is not bound to a session or to who asked for it, by design (an `<img>` sends nothing else) |
+| `/pty/{ptyID}/…` | the terminal | terminals are kept per project directory; an id from another directory is not found. `admin` only |
+| `/workflow/run/{runID}/…` | the run | runs are kept per project instance; an id from another directory is not found |
+
+One shared step does the lookup-then-authorise for answers
+(`confine::authorise_answer`) and one for messages and parts
+(`require_owned`). Trigger and memory routes from other branches need the
+same: fetch by the inner id, compare its directory or session with the
+outer scope, then act.
+
 #### Every field a `chat` token can send
 
 | Request | Field | What the engine derives from it | Where it is judged |

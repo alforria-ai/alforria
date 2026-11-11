@@ -47,6 +47,30 @@ fn write_host_config(env: &Env, config: Value) {
     .expect("write host config");
 }
 
+/// Run the spawned server with nothing of the developer's environment but
+/// `PATH`: what the harness set explicitly (the temporary home and XDG
+/// directories, the model fixture) is kept, everything inherited is
+/// dropped. No provider key, token or real directory reaches the server or
+/// the shells it starts — some of these tests dump a shell's environment
+/// to a file.
+fn isolate(command: &mut std::process::Command) {
+    let explicit: Vec<(std::ffi::OsString, std::ffi::OsString)> = command
+        .get_envs()
+        .filter_map(|(name, value)| Some((name.to_os_string(), value?.to_os_string())))
+        .collect();
+    command.env_clear();
+    command.env("PATH", std::env::var_os("PATH").unwrap_or_default());
+    command.envs(explicit);
+    // A home for anything that falls back to `$HOME` (a login shell).
+    if let Some(home) = command
+        .get_envs()
+        .find(|(name, _)| *name == "OPENCODE_TEST_HOME")
+        .and_then(|(_, value)| value.map(|value| value.to_os_string()))
+    {
+        command.env("HOME", home);
+    }
+}
+
 fn prompt_body(backend: &MockBackend, text: &str) -> Value {
     json!({
         "parts": [{"type": "text", "text": text}],
@@ -100,7 +124,10 @@ async fn start_with(
     configure: impl FnOnce(&mut std::process::Command),
 ) -> Running {
     let project = env.project_dir();
-    let serve = Serve::spawn_with(&env, configure);
+    let serve = Serve::spawn_with(&env, |command| {
+        isolate(command);
+        configure(command);
+    });
     let directory = project.display().to_string();
     let api = Api::new(serve.port, &directory);
     let log = EventLog::subscribe(&serve, &directory);
@@ -147,7 +174,7 @@ async fn sigterm_mid_turn_stops_cleanly_and_kills_the_tool() {
     assert_eq!(wal_len, 0, "the WAL was checkpointed into the database");
 
     // The same data directory serves again, with the interrupted turn in it.
-    let serve = Serve::spawn(&run.env);
+    let serve = Serve::spawn_with(&run.env, isolate);
     let api = Api::new(serve.port, run.project.display().to_string());
     let messages = api.messages(&run.session_id).await;
     let assistant = messages
@@ -207,7 +234,7 @@ async fn draining_shutdown_lets_the_turn_finish() {
         .expect("serve exits once the turn is done");
     assert_eq!(status.code(), Some(0));
 
-    let serve = Serve::spawn(&run.env);
+    let serve = Serve::spawn_with(&run.env, isolate);
     let api = Api::new(serve.port, run.project.display().to_string());
     let messages = api.messages(&run.session_id).await;
     let assistant = messages
@@ -246,7 +273,7 @@ async fn a_hard_kill_leaves_a_usable_database() {
     // Nothing ran to clean up: the orphaned tool is ours to remove.
     unsafe { libc::kill(-pid, libc::SIGKILL) };
 
-    let serve = Serve::spawn(&run.env);
+    let serve = Serve::spawn_with(&run.env, isolate);
     let api = Api::new(serve.port, run.project.display().to_string());
     let sessions = api.session_list().await;
     assert!(
@@ -270,6 +297,7 @@ fn serve_refuses_a_broken_host_config() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("opencode.json"), "{ not json").unwrap();
     let mut command = env.command(&["serve", "--port", "0"]);
+    isolate(&mut command);
     command.env("OPENCODE_SERVER_PASSWORD", "");
     let output = command.output().expect("run serve");
     assert_ne!(output.status.code(), Some(0));
@@ -311,10 +339,17 @@ async fn the_agents_shells_cannot_read_denied_variables() {
 
     let check = |dump: &str, what: &str| {
         for leak in ["sk-libertai-leak", "auth-content-leak", "denied-leak"] {
-            assert!(!dump.contains(leak), "{what} leaked {leak}:\n{dump}");
+            // The dump itself is never printed: it is an environment.
+            assert!(!dump.contains(leak), "{what} leaked {leak}");
         }
-        assert!(dump.contains("U3_VISIBLE=visible"), "{what}:\n{dump}");
-        assert!(dump.contains("U3_FROM_CONFIG=yes"), "{what}:\n{dump}");
+        assert!(
+            dump.contains("U3_VISIBLE=visible"),
+            "{what}: U3_VISIBLE missing"
+        );
+        assert!(
+            dump.contains("U3_FROM_CONFIG=yes"),
+            "{what}: U3_FROM_CONFIG missing"
+        );
     };
 
     // The bash tool, driven by the model.
@@ -373,8 +408,9 @@ async fn a_bearer_configured_server_prints_no_password_and_takes_tokens() {
         &env,
         json!({ "server": { "auth": { "bearer": { "tokens_sha256": [digest] } } } }),
     );
-    let mut child = env
-        .command(&["serve", "--port", "0"])
+    let mut command = env.command(&["serve", "--port", "0"]);
+    isolate(&mut command);
+    let mut child = command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())

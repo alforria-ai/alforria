@@ -2068,3 +2068,185 @@ async fn narrow_tokens_cannot_act_in_an_operators_session() {
     assert!(ran.iter().all(|agent| agent == "build"), "{ran:?}");
     assert!(restricted(&f, &fork).await);
 }
+
+/// Routes that take two identifiers act on the inner one only when it
+/// belongs to the outer one. For each: a valid session in the path, and a
+/// message, part or pending ask that belongs to a *different* session —
+/// the request is refused and the other session is untouched.
+#[tokio::test]
+async fn an_inner_id_from_another_session_is_never_acted_on() {
+    let signer = Signer::new();
+    let f = fixture_with(
+        policy_config(&signer, false),
+        Some(PASSWORD),
+        vec![bash_ask()],
+    );
+    let chat = bearer(&signer.token(AUDIENCE, "chat"));
+    let say = |session: String, auth: String, text: &'static str| {
+        let router = f.router.clone();
+        async move {
+            let response = call(
+                &router,
+                "POST",
+                &format!("/session/{session}/message"),
+                Some(&auth),
+                Some(json!({ "noReply": true, "parts": [{ "type": "text", "text": text }] })),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+    };
+
+    // `mine`: a session the token may act in. `theirs`: the operator's,
+    // with a message, and a turn waiting on a permission ask.
+    let mine = create_session(&f, &f.dirs.repo, &chat).await;
+    say(mine.clone(), chat.clone(), "mine-text").await;
+    let theirs = create_session(&f, &f.dirs.repo, &basic()).await;
+    say(theirs.clone(), basic(), "theirs-text").await;
+    let their_messages = messages(&f, &theirs, &basic()).await;
+    let their_message = their_messages[0]["info"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let their_part = their_messages[0]["parts"][0].clone();
+    let their_part_id = their_part["id"].as_str().unwrap().to_string();
+    let response = call(
+        &f.router,
+        "POST",
+        &format!("/session/{theirs}/prompt_async"),
+        Some(&basic()),
+        Some(json!({ "parts": [{ "type": "text", "text": "go" }] })),
+    )
+    .await;
+    assert!(response.status().is_success());
+    let their_ask = pending_permission(&f, &f.dirs.repo, &basic()).await;
+
+    let mut rewritten = their_part.clone();
+    rewritten["text"] = json!("rewritten");
+    // (who, method, route under /session/{mine}, body)
+    let cases: Vec<(&str, &str, String, Value)> = vec![
+        (
+            "chat",
+            "POST",
+            format!("permissions/{their_ask}"),
+            json!({ "response": "once" }),
+        ),
+        (
+            "basic",
+            "POST",
+            format!("permissions/{their_ask}"),
+            json!({ "response": "once" }),
+        ),
+        (
+            "basic",
+            "POST",
+            format!("permissions/{their_ask}"),
+            json!({ "response": "reject" }),
+        ),
+        (
+            "chat",
+            "GET",
+            format!("message/{their_message}"),
+            Value::Null,
+        ),
+        (
+            "basic",
+            "GET",
+            format!("message/{their_message}"),
+            Value::Null,
+        ),
+        (
+            "basic",
+            "DELETE",
+            format!("message/{their_message}"),
+            Value::Null,
+        ),
+        (
+            "basic",
+            "PATCH",
+            format!("message/{their_message}/part/{their_part_id}"),
+            rewritten,
+        ),
+        (
+            "basic",
+            "DELETE",
+            format!("message/{their_message}/part/{their_part_id}"),
+            Value::Null,
+        ),
+        (
+            "chat",
+            "POST",
+            "revert".to_string(),
+            json!({ "messageID": their_message }),
+        ),
+        (
+            "basic",
+            "POST",
+            "revert".to_string(),
+            json!({ "messageID": their_message }),
+        ),
+    ];
+    for (who, method, route, body) in cases {
+        let auth = if who == "chat" { chat.clone() } else { basic() };
+        let body = (!body.is_null()).then_some(body);
+        let response = call(
+            &f.router,
+            method,
+            &format!("/session/{mine}/{route}"),
+            Some(&auth),
+            body,
+        )
+        .await;
+        let status = response.status();
+        let text = body_string(response).await;
+        assert!(
+            status == StatusCode::NOT_FOUND
+                || status == StatusCode::FORBIDDEN
+                || status == StatusCode::BAD_REQUEST,
+            "{who} {method} {route}: {status} {text}"
+        );
+        assert!(
+            !text.contains("theirs-text"),
+            "{who} {method} {route} returned the other session's content"
+        );
+        // The other session is exactly as it was.
+        assert_eq!(
+            pending_permission(&f, &f.dirs.repo, &basic()).await,
+            their_ask,
+            "{who} {method} {route}: the other session's ask was answered"
+        );
+        let now = messages(&f, &theirs, &basic()).await;
+        assert_eq!(
+            now[0], their_messages[0],
+            "{who} {method} {route}: the other session's message changed"
+        );
+    }
+
+    // A fork "from" a message of another session copies nothing of it.
+    let fork = call(
+        &f.router,
+        "POST",
+        &format!("/session/{mine}/fork"),
+        Some(&chat),
+        Some(json!({ "messageID": their_message })),
+    )
+    .await;
+    assert_eq!(fork.status(), StatusCode::OK);
+    let fork = body_json(fork).await["id"].as_str().unwrap().to_string();
+    let forked = messages(&f, &fork, &chat).await.to_string();
+    assert!(!forked.contains("theirs-text"), "{forked}");
+
+    // The ask is answerable where it belongs.
+    assert_eq!(
+        call(
+            &f.router,
+            "POST",
+            &format!("/session/{theirs}/permissions/{their_ask}"),
+            Some(&basic()),
+            Some(json!({ "response": "reject" })),
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+}
