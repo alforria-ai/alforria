@@ -260,9 +260,34 @@ impl EntrySearch {
         let Some(globs) = glob_matcher(pattern) else {
             return false;
         };
-        dirs.iter().any(|dir| {
+        if dirs.iter().any(|dir| {
             glob_matches(&globs, dir, path)
                 || glob_matches(&globs, &crate::protect::resolve(dir), path)
+        }) {
+            return true;
+        }
+        // The walk follows links, so the pattern's fixed directory part may
+        // lead elsewhere (`rules -> /srv/rules`): the same file is then
+        // also the one at the resolved place. The fixed part is resolved
+        // and the rest of the pattern matched below it — the same matcher,
+        // and with `literal_separator` a split between components means
+        // the same thing. (A link inside the wildcard part of a pattern is
+        // not traced back from the file it leads to.)
+        let parts: Vec<&str> = pattern.split('/').collect();
+        let fixed = parts
+            .iter()
+            .take_while(|part| !part.contains(['*', '?', '[', '{']))
+            .count();
+        if fixed == 0 {
+            return false;
+        }
+        let rest = parts[fixed..].join("/");
+        dirs.iter().any(|dir| {
+            let base = crate::protect::resolve(&dir.join(parts[..fixed].join("/")));
+            if rest.is_empty() {
+                return base == path;
+            }
+            glob_matcher(&rest).is_some_and(|rest| glob_matches(&rest, &base, path))
         })
     }
 }
