@@ -615,17 +615,12 @@ pub async fn api_session_event(
         }
     };
     // Retention may have dropped the events the client wants to resume
-    // from: say so first, so it reloads instead of silently missing them.
-    let gap = ctx.bus.durable_gap(&session_id, after).ok().flatten();
+    // from, or drop them while it is still reading: the stream yields an
+    // `event.reset` marker ahead of the first event after each such hole, so
+    // the client reloads instead of silently missing them.
     let mut events = ctx.bus.durable_stream(&session_id, after);
     let (tx, rx) = mpsc::channel(64);
     tokio::spawn(async move {
-        if let Some(gap) = gap {
-            let frame = sse_frame(&serde_json::to_string(&gap.marker(&session_id)).unwrap());
-            if tx.send(frame.into()).await.is_err() {
-                return;
-            }
-        }
         loop {
             match events.next().await {
                 Ok(Some(event)) => {

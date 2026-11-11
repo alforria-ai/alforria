@@ -196,9 +196,12 @@ pre-1.0, so minor releases may include breaking changes.
   Unset, nothing is dropped. Messages and sessions are never touched.
 - `alforria db prune [--max-age <duration>] [--keep-last <n>] [--vacuum]`
   applies that policy on demand.
-- `GET /api/session/{id}/event` starts with an `event.reset` frame when the
-  events after `after` have been pruned, so a client reloads the session
-  instead of silently missing them. Without retention it never appears.
+- `GET /api/session/{id}/event` sends an `event.reset` frame wherever the
+  events its reader was due next have been pruned, so a client reloads the
+  session instead of silently missing them: first when the events after
+  `after` are gone, and in the middle of a replay when retention drops
+  events the reader had not reached yet. The frame comes before the first
+  event after the hole. Without retention it never appears.
 - The server folds the write-ahead log back into the database every five
   minutes, so the `-wal` file no longer sits at its high-water mark.
 - Scoped tokens reach the assistant features. A `chat` or `connector` token
