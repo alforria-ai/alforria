@@ -559,16 +559,21 @@ pub async fn run_loop(
 
         let outcome = {
             // `SessionTools.resolve` inputs (prompt.ts:1222-1254).
-            let bypass_agent_check = msgs
+            let bypass_agents: Vec<String> = msgs
                 .iter()
                 .rev()
                 .find(|msg| matches!(msg.info, V1Message::User { .. }))
                 .map(|msg| {
                     msg.parts
                         .iter()
-                        .any(|part| matches!(part, V1Part::Agent { .. }))
+                        .filter_map(|part| match part {
+                            V1Part::Agent { name, .. } => Some(name.clone()),
+                            _ => None,
+                        })
+                        .collect()
                 })
-                .unwrap_or(false);
+                .unwrap_or_default();
+            let bypass_agent_check = !bypass_agents.is_empty();
 
             let resolve_deps = crate::session::tools::ResolveDeps {
                 registry: deps.registry.clone(),
@@ -590,6 +595,7 @@ pub async fn run_loop(
                     processor: &processor,
                     messages: &msgs,
                     bypass_agent_check,
+                    bypass_agents,
                     prompt_ops: deps.prompt_ops.clone(),
                     cancel: cancel.clone(),
                 },

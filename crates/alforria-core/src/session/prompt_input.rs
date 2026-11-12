@@ -892,6 +892,7 @@ async fn exec_read(
     let extra = Extra {
         bypass_cwd_check: true,
         bypass_agent_check: false,
+        bypass_agents: Vec::new(),
         model: extra_model,
     };
     let ctx = ToolCtxRef {

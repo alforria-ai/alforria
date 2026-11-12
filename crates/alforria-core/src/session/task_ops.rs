@@ -155,6 +155,15 @@ impl TaskOps for ProductionTaskOps {
         })
     }
 
+    fn session_agent<'a>(&'a self, session_id: &'a str) -> BoxFuture<'a, Option<String>> {
+        Box::pin(async move {
+            self.sessions
+                .get(session_id)
+                .ok()
+                .and_then(|session| session.agent)
+        })
+    }
+
     fn agent_denies<'a>(&'a self, agent: &'a str) -> BoxFuture<'a, Vec<Rule>> {
         Box::pin(async move {
             self.agents

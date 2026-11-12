@@ -81,6 +81,11 @@ pub struct MetadataInput {
 pub struct Extra {
     pub bypass_cwd_check: bool,
     pub bypass_agent_check: bool,
+    /// The agents the user named in their message. When any are listed,
+    /// `bypass_agent_check` covers only those: mentioning one agent is not
+    /// leave for the model to start a different one unasked. Empty on the
+    /// command path, where the caller itself picks the agent.
+    pub bypass_agents: Vec<String>,
     /// `extra.model` (websearch model name, spec M4.5).
     pub model: Option<Value>,
 }

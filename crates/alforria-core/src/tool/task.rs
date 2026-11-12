@@ -154,6 +154,10 @@ pub trait TaskOps: Send + Sync {
     fn owns_session<'a>(&'a self, parent: &'a str, task_id: &'a str) -> BoxFuture<'a, bool> {
         Box::pin(async move { task_id != parent && self.session_exists(task_id).await })
     }
+    /// The agent a session was started as, when it records one.
+    fn session_agent<'a>(&'a self, _session_id: &'a str) -> BoxFuture<'a, Option<String>> {
+        Box::pin(async { None })
+    }
     /// The deny rules of the agent the caller runs as. A child session
     /// inherits them, so a subagent cannot do what its parent's agent is
     /// forbidden (plan mode's edit ban, say).
@@ -509,7 +513,12 @@ async fn run(
         )));
     }
 
-    if !ctx.extra.bypass_agent_check {
+    // The user naming an agent, or running a command that names one, is the
+    // go-ahead for that agent only.
+    let user_chose = ctx.extra.bypass_agent_check
+        && (ctx.extra.bypass_agents.is_empty()
+            || ctx.extra.bypass_agents.contains(&params.subagent_type));
+    if !user_chose {
         ctx.ask
             .ask(AskRequest {
                 permission: "task".to_string(),
@@ -533,7 +542,7 @@ async fn run(
     // The model may not pick a primary agent: `task(subagent_type: "build")`
     // from a plan session would hand it the tools plan mode withholds. A
     // command or mention the user wrote still can.
-    if next.primary && !ctx.extra.bypass_agent_check {
+    if next.primary && !user_chose {
         return Err(ToolError::Failed(format!(
             "{} is a primary agent, not a subagent type",
             params.subagent_type
@@ -541,7 +550,31 @@ async fn run(
     }
 
     let existing_session = match &params.task_id {
-        Some(task_id) if ops.owns_session(ctx.session_id, task_id).await => Some(task_id.clone()),
+        Some(task_id) if ops.owns_session(ctx.session_id, task_id).await => {
+            // A resumed child keeps the permissions it was created with. It
+            // must be the agent it was started as, and already carry every
+            // deny the caller's agent has now (the user may have moved the
+            // parent to plan mode since).
+            if let Some(agent) = ops.session_agent(task_id).await {
+                if agent != next.name {
+                    return Err(ToolError::Failed(format!(
+                        "Task {task_id} is a {agent} subagent; resume it with subagent_type \"{agent}\" or start a new task"
+                    )));
+                }
+            }
+            let held = ops.session_permission(task_id).await;
+            let missing = ops
+                .agent_denies(ctx.agent)
+                .await
+                .into_iter()
+                .any(|deny| !held.contains(&deny));
+            if missing {
+                return Err(ToolError::Failed(format!(
+                    "Task {task_id} was started with wider permissions than this session now has; start a new task"
+                )));
+            }
+            Some(task_id.clone())
+        }
         _ => None,
     };
     let session_id = match existing_session {
@@ -1417,5 +1450,29 @@ mod tests {
         .await;
         result.unwrap();
         assert!(ask.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn naming_one_agent_does_not_wave_through_another() {
+        let call = |named: &'static str| async move {
+            let def = tool_with(Arc::new(FakeOps::new()), 1);
+            let ask = RecordingAsk::new();
+            let inst = instance(std::path::Path::new("/tmp/opencode"));
+            let extra = Extra {
+                bypass_agent_check: true,
+                bypass_agents: vec![named.to_string()],
+                ..Extra::default()
+            };
+            let ctx = ctx(&ask, &inst, &extra);
+            (def.execute)(
+                json!({ "description": "d", "prompt": "p", "subagent_type": "research" }),
+                ctx,
+            )
+            .await
+            .unwrap();
+            ask.requests().len()
+        };
+        assert_eq!(call("research").await, 0);
+        assert_eq!(call("other").await, 1);
     }
 }

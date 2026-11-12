@@ -44,6 +44,8 @@ pub struct ResolveInput<'a> {
     /// `msgs` from the current loop step.
     pub messages: &'a [WithParts],
     pub bypass_agent_check: bool,
+    /// The agents the last user message mentions (see `Extra::bypass_agents`).
+    pub bypass_agents: Vec<String>,
     pub prompt_ops: Arc<dyn TaskOps>,
     /// The loop's abort signal (TS `options.abortSignal`).
     pub cancel: CancellationToken,
@@ -154,6 +156,7 @@ pub async fn resolve(
         let agent_name = input.agent.name.clone();
         let cancel = input.cancel.clone();
         let bypass_agent_check = input.bypass_agent_check;
+        let bypass_agents = input.bypass_agents.clone();
         let messages = messages.clone();
         let ruleset = ruleset.clone();
         let model_value = model_value.clone();
@@ -175,6 +178,7 @@ pub async fn resolve(
                 let agent_name = agent_name.clone();
                 let cancel = cancel.clone();
                 let bypass_agent_check = bypass_agent_check;
+                let bypass_agents = bypass_agents.clone();
                 let messages = messages.clone();
                 let ruleset = ruleset.clone();
                 let model_value = model_value.clone();
@@ -197,6 +201,7 @@ pub async fn resolve(
                     let extra = Extra {
                         bypass_cwd_check: false,
                         bypass_agent_check,
+                        bypass_agents: bypass_agents.clone(),
                         model: Some(model_value.clone()),
                     };
                     let ctx = ToolCtxRef {
@@ -940,6 +945,7 @@ mod mcp_tests {
             processor: &processor,
             messages: &[],
             bypass_agent_check: false,
+            bypass_agents: Vec::new(),
             prompt_ops: Arc::new(NoTaskOps),
             cancel: CancellationToken::new(),
         };

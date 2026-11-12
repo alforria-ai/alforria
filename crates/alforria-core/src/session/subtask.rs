@@ -184,6 +184,7 @@ impl SessionSubtask {
         let extra = Extra {
             bypass_cwd_check: false,
             bypass_agent_check: true,
+            bypass_agents: Vec::new(),
             model: None,
         };
         let messages: Vec<Value> = input

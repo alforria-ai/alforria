@@ -810,9 +810,22 @@ impl GitSnapshot {
         }
         let mut ops: Vec<Op> = Vec::new();
         let mut seen = HashSet::new();
+        // The file list comes from stored session data, which an imported
+        // or shared session controls. A path outside the worktree is never
+        // in a snapshot, so reverting it could only delete it.
+        let instance = crate::tool::def::InstanceContext {
+            directory: self.worktree.clone(),
+            worktree: self.worktree.clone(),
+        };
         for item in patches {
             for file in &item.files {
                 if !seen.insert(file.clone()) {
+                    continue;
+                }
+                if !Path::new(file).is_absolute()
+                    || !crate::tool::external_directory::contains_path(Path::new(file), &instance)
+                {
+                    tracing::warn!("not reverting a file outside the worktree: file={file}");
                     continue;
                 }
                 ops.push(Op {
@@ -2045,6 +2058,34 @@ mod git_tests {
             std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
             "one\n"
         );
+    }
+
+    #[tokio::test]
+    async fn revert_leaves_files_outside_the_worktree_alone() {
+        let outer = TempDir::new("snap-revert-outside");
+        let repo = outer.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+        commit_all(&repo);
+        let victim = outer.path().join("victim.txt");
+        std::fs::write(&victim, "keep me\n").unwrap();
+
+        let (snap, _data) = snapshot(&repo);
+        let base = snap.track().await.unwrap();
+        // A stored patch naming files the snapshot never held: each would
+        // fall through to "did not exist in the snapshot, delete".
+        snap.revert(vec![PatchPart {
+            hash: base,
+            files: vec![
+                victim.to_string_lossy().into_owned(),
+                repo.join("../victim.txt").to_string_lossy().into_owned(),
+                "../victim.txt".to_string(),
+            ],
+        }])
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep me\n");
     }
 
     #[tokio::test]

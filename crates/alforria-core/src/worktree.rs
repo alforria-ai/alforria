@@ -448,7 +448,17 @@ impl Worktree {
         let entries = self.list_porcelain(ctx, "WorktreeRemoveFailedError")?;
         let entry = locate_worktree(&entries, &directory);
         let Some(entry) = entry.filter(|entry| entry.path.is_some()) else {
+            // Not a worktree git knows: only leftovers under this project's
+            // own worktree root are ours to delete. Anything else the caller
+            // names (`/home/user/Documents`) is refused, not removed.
+            let root = canonical(&deps.data_dir().join("worktree").join(&ctx.project_id));
             if directory.exists() {
+                if directory == root || !directory.starts_with(&root) {
+                    return Err(Error::new(
+                        "WorktreeRemoveFailedError",
+                        "Not a worktree of this project",
+                    ));
+                }
                 self.stop_fsmonitor(&directory);
                 self.clean_directory(&directory)?;
             }
@@ -946,17 +956,32 @@ mod tests {
     }
 
     #[test]
-    fn remove_of_unregistered_directory_cleans_it() {
+    fn remove_of_unregistered_directory_cleans_only_its_own_leftovers() {
         let (temp, dir) = repo("worktree-remove-plain");
         let deps = deps(temp.path());
         let worktree = Worktree::default();
-        let stray = temp.path().join("stray");
-        std::fs::create_dir_all(&stray).unwrap();
+        let context = ctx(&dir);
+        // A leftover under this project's worktree root is cleaned.
+        let leftover = temp
+            .path()
+            .join("worktree")
+            .join(&context.project_id)
+            .join("old");
+        std::fs::create_dir_all(&leftover).unwrap();
         let removed = worktree
-            .remove(&deps, &ctx(&dir), stray.to_string_lossy().as_ref())
+            .remove(&deps, &context, leftover.to_string_lossy().as_ref())
             .unwrap();
         assert!(removed);
-        assert!(!stray.exists());
+        assert!(!leftover.exists());
+        // Any other directory is refused and left alone.
+        let stray = temp.path().join("stray");
+        std::fs::create_dir_all(&stray).unwrap();
+        std::fs::write(stray.join("keep"), "k").unwrap();
+        let error = worktree
+            .remove(&deps, &context, stray.to_string_lossy().as_ref())
+            .unwrap_err();
+        assert_eq!(error.tag, "WorktreeRemoveFailedError");
+        assert!(stray.join("keep").exists());
     }
 
     #[test]
