@@ -389,6 +389,16 @@ impl RuntimeModels {
                 context_limit: model["limit"]["context"].as_f64().unwrap_or(0.0),
                 output_limit: model["limit"]["output"].as_f64().unwrap_or(0.0),
                 output_token_max: self.0.output_token_max,
+                // This instance's config alone says what its model is.
+                family: self
+                    .0
+                    .config
+                    .provider
+                    .as_ref()
+                    .and_then(|providers| providers.get(provider_id))
+                    .and_then(|provider| provider.models.as_ref())
+                    .and_then(|models| models.get(model_id))
+                    .and_then(|model| model.family.clone()),
             },
             cost: v1_cost(&model["cost"]),
             limits: ModelLimits {
@@ -1247,6 +1257,131 @@ mod tests {
         let provider = json!({"key": "stored-key"});
         let options = RuntimeModels::llm_options(&provider, &json!({}), &Default::default());
         assert_eq!(options["apiKey"], json!("stored-key"));
+    }
+
+    /// B5. What a project's config declares a model to be
+    /// (`provider.<id>.models.<name>.family`) decides that project's system
+    /// prompt only. It used to be written to a process-wide table when the
+    /// instance was built, and every other project's model of the same name
+    /// got the prompt too.
+    #[tokio::test]
+    async fn a_declared_family_stays_with_the_instance_that_declared_it() {
+        use crate::engine::{build_engine, EngineInput, EngineRuntime, EngineSeams};
+        use crate::state::FileAuthStore;
+        use alforria_core::session::system;
+
+        let dir = tempfile::tempdir().unwrap();
+        let catalog: alforria_core::catalog::Providers = serde_json::from_value(json!({
+            "famco": {
+                "id": "famco",
+                "name": "Famco",
+                "env": ["ALFORRIA_TEST_FAMCO_API_KEY_UNSET"],
+                "npm": "@ai-sdk/openai-compatible",
+                "api": "https://famco.invalid/v1",
+                "models": {
+                    "house-1": {
+                        "id": "house-1",
+                        "name": "House 1",
+                        "release_date": "2026-01-01",
+                        "limit": {"context": 1000, "output": 100},
+                    },
+                },
+            },
+        }))
+        .unwrap();
+        let build = |name: &str, config: Value| {
+            let root = dir.path().join(name);
+            let worktree = root.join("repo");
+            std::fs::create_dir_all(&worktree).unwrap();
+            let paths = alforria_core::GlobalPaths {
+                home: root.join("home"),
+                config: root.join("config"),
+                data: root.join("data"),
+                cache: root.join("cache"),
+                state: root.join("state"),
+            };
+            let auth = Arc::new(FileAuthStore::new(paths.data.join("auth.json")));
+            auth.set("famco", json!({"type": "api", "key": "sk-test"}))
+                .unwrap();
+            let config: alforria_core::config::schema::Config =
+                serde_json::from_value(config).unwrap();
+            let storage = Arc::new(alforria_core::Storage::open(root.join("db.sqlite")).unwrap());
+            let clock = Arc::new(alforria_core::catalog::SystemClock);
+            let background = alforria_core::BackgroundJobService::new(clock.clone());
+            let services = Arc::new(alforria_core::SessionServices::new(
+                storage,
+                background.clone(),
+                clock,
+                &alforria_core::AgentRegistryInput {
+                    config: config.clone(),
+                    skill_dirs: Vec::new(),
+                    reference_dirs: Vec::new(),
+                    worktree: worktree.clone(),
+                    data_dir: paths.data.clone(),
+                    tmp_dir: root.clone(),
+                    home: paths.home.clone(),
+                    host_config: None,
+                    protected: None,
+                },
+            ));
+            let catalog = catalog.clone();
+            build_engine(&EngineInput {
+                services,
+                background,
+                config: Arc::new(config),
+                config_dirs: Vec::new(),
+                directory: worktree.clone(),
+                worktree,
+                paths,
+                runtime: EngineRuntime {
+                    catalog: Arc::new(move || Ok(catalog.clone())),
+                    auth,
+                    schedule: false,
+                },
+                seams: EngineSeams::default(),
+            })
+            .unwrap()
+        };
+        let prompt = |resolved: &ResolvedModel| {
+            system::provider_for_model(
+                resolved.llm.family.as_deref(),
+                &resolved.llm.id,
+                &resolved.llm.api_id,
+                &resolved.llm.provider_id,
+            )
+        };
+
+        // One project says what its model is; the other, built after it in
+        // the same process, says nothing.
+        let declaring = build(
+            "declaring",
+            json!({ "provider": { "famco": { "models": { "house-1": { "family": "anthropic" } } } } }),
+        );
+        let plain = build("plain", json!({}));
+        let declared = declaring
+            .models()
+            .get_model("famco", "house-1", "ses")
+            .await
+            .unwrap();
+        let undeclared = plain
+            .models()
+            .get_model("famco", "house-1", "ses")
+            .await
+            .unwrap();
+        assert_eq!(declared.llm.family.as_deref(), Some("anthropic"));
+        assert_eq!(
+            prompt(&declared),
+            vec![system::prompt_for(system::PromptFamily::Anthropic).to_string()]
+        );
+        assert_eq!(undeclared.llm.family, None);
+        assert_eq!(prompt(&undeclared), system::provider("house-1", "famco"));
+        assert_ne!(prompt(&undeclared), prompt(&declared));
+        // Nothing of it is process-wide.
+        assert_eq!(system::family_hint("famco", "house-1"), None);
+        assert_eq!(
+            system::provider_for("house-1", "house-1", "famco"),
+            system::provider("house-1", "famco")
+        );
     }
 
     /// A built engine resolves models with credentials set after it was

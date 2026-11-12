@@ -354,6 +354,10 @@ pre-1.0, so minor releases may include breaking changes.
 - Starting an instance read and parsed every trigger run its directory had
   kept (up to 200 a trigger) to find the unfinished ones. It now reads the
   unsettled runs only, through the index that already marks them.
+- `provider.<id>.models.<name>.family` in one project's config decided the
+  system prompt of a model of the same name in every other project the
+  server had open (it was kept in a process-wide table). It now applies to
+  the instance whose config declares it.
 
 - Routes naming a session and a message, part or permission request inside
   it acted on the inner id without checking it belonged to that session:

@@ -1249,19 +1249,6 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
     ));
     // alforria's own search backend, if one is configured.
     let search_backend = search_backend(&input.config, input.runtime.auth.as_ref(), &input.seams);
-    // A model the config declares under a name of its own can say what it
-    // really is (`provider.<id>.models.<name>.family`).
-    for (provider_id, provider) in input.config.provider.iter().flatten() {
-        for (model_id, model) in provider.models.iter().flatten() {
-            if let Some(family) = &model.family {
-                alforria_core::session::system::set_family_hint(
-                    provider_id,
-                    model_id,
-                    Some(family),
-                );
-            }
-        }
-    }
     // Websearch env keys are read once at boot (WebSearchEnv::default).
     let websearch = alforria_core::tool::websearch::websearch_tool(
         truncate.clone(),
@@ -1904,6 +1891,7 @@ mod generate_name_tests {
                 context_limit: 1000.0,
                 output_limit: 1000.0,
                 output_token_max: None,
+                family: None,
             },
             cost: alforria_core::session::usage::ModelCost::free(),
             limits: alforria_core::session::overflow::ModelLimits {

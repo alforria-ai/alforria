@@ -828,7 +828,8 @@ reached under a name that says nothing about it can say what it is:
 - `provider.<id>.models.<name>.family` is a family name (`anthropic`,
   `gpt`, `codex`, `beast`, `astra`, `gemini`, `deepseek`, `kimi`, `meta`,
   `trinity`, `default`) or the id of the underlying model, which is then
-  classified like any other id.
+  classified like any other id. It applies to the project whose config
+  declares it, not to a model of the same name in another project.
 - The built-in `libertai` provider follows its catalog's alias table: an
   alias such as `claw-flash` is accepted as a model id, has its target's
   limits, cost and capabilities, and gets its target's prompt.

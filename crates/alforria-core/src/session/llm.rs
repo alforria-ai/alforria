@@ -58,6 +58,13 @@ pub struct LlmModel {
     pub output_limit: f64,
     /// `RuntimeFlags.outputTokenMax`.
     pub output_token_max: Option<f64>,
+    /// What the model really is, when the config of the instance that
+    /// resolved it says so (`provider.<id>.models.<name>.family`, an
+    /// alforria extension): it decides the system prompt
+    /// (`system::provider_for_model`). Carried by the model, so one
+    /// project's config never names the family of another project's model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub family: Option<String>,
 }
 
 /// One executable session tool handed to the runtime (the ai-sdk `Tool`
@@ -328,7 +335,8 @@ pub fn prepare(input: &PrepareInput<'_>) -> Prepared {
     let mut system_blocks: Vec<String> = Vec::new();
     match &input.agent.prompt {
         Some(prompt) => system_blocks.push(prompt.clone()),
-        None => system_blocks.extend(crate::session::system::provider_for(
+        None => system_blocks.extend(crate::session::system::provider_for_model(
+            input.model.family.as_deref(),
             &input.model.id,
             &input.model.api_id,
             &input.model.provider_id,

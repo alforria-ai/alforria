@@ -1813,6 +1813,7 @@ mod tests {
                 context_limit: 1000.0,
                 output_limit: 100.0,
                 output_token_max: None,
+                family: None,
             },
             cost: ModelCost {
                 input: 0.0,

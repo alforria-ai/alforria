@@ -41,6 +41,7 @@ fn test_model() -> ResolvedModel {
             context_limit: 200_000.0,
             output_limit: 100.0,
             output_token_max: None,
+            family: None,
         },
         cost: ModelCost {
             input: 0.0,

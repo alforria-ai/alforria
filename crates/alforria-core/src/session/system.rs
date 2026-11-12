@@ -123,16 +123,21 @@ pub fn provider(api_id: &str, provider_id: &str) -> Vec<String> {
 // ---------------------------------------------------------------------------
 
 /// What a model really is, for models whose id does not say: a provider-side
-/// alias such as `claw-flash`, or a model the config declares under a name
-/// of its own. Keyed by provider id and model id; the value is a family name
-/// ([`family_named`]) or the id of the underlying model.
+/// alias such as `claw-flash`. Keyed by provider id and model id; the value
+/// is a family name ([`family_named`]) or the id of the underlying model.
+///
+/// Process-wide, so it holds only what is the same for every project: the
+/// alias table a provider publishes. What a config declares
+/// (`provider.<id>.models.<name>.family`) is one instance's, and travels on
+/// the model that instance resolves (`LlmModel::family`) — in this table,
+/// one project's config decided the prompt of every other project's model
+/// of the same name.
 static FAMILY_HINTS: std::sync::RwLock<
     Option<std::collections::HashMap<(String, String), String>>,
 > = std::sync::RwLock::new(None);
 
 /// Record (or, with `None`, forget) the family hint of a model. Set from
-/// `provider.<id>.models.<alias>.family` in the config and from the alias
-/// table a provider publishes.
+/// the alias table a provider publishes, never from a config.
 pub fn set_family_hint(provider_id: &str, model_id: &str, hint: Option<&str>) {
     let Ok(mut hints) = FAMILY_HINTS.write() else {
         return;
@@ -180,8 +185,25 @@ pub fn family_named(name: &str) -> Option<PromptFamily> {
 /// when there is one (a family name, or an underlying model id classified
 /// like any other); otherwise the API id does, as upstream.
 pub fn provider_for(model_id: &str, api_id: &str, provider_id: &str) -> Vec<String> {
-    let Some(hint) =
-        family_hint(provider_id, model_id).or_else(|| family_hint(provider_id, api_id))
+    provider_for_model(None, model_id, api_id, provider_id)
+}
+
+/// [`provider_for`] for a model as an instance resolved it: what that
+/// instance's config declares the model to be (`declared`,
+/// `LlmModel::family`) comes first, then the provider's published aliases.
+pub fn provider_for_model(
+    declared: Option<&str>,
+    model_id: &str,
+    api_id: &str,
+    provider_id: &str,
+) -> Vec<String> {
+    let declared = declared
+        .map(str::trim)
+        .filter(|hint| !hint.is_empty())
+        .map(String::from);
+    let Some(hint) = declared
+        .or_else(|| family_hint(provider_id, model_id))
+        .or_else(|| family_hint(provider_id, api_id))
     else {
         return provider(api_id, provider_id);
     };
@@ -587,6 +609,22 @@ mod tests {
             provider_for("claw-flash", "claw-flash", "hint-test"),
             vec![PROMPT_DEFAULT.to_string()]
         );
+        // What an instance's config declares comes with the model, ahead of
+        // the published aliases, and is not kept anywhere.
+        set_family_hint("hint-test", "claw-flash", Some("deepseek-v4.1-flash"));
+        assert_eq!(
+            provider_for_model(Some(" gemini "), "claw-flash", "claw-flash", "hint-test"),
+            vec![PROMPT_GEMINI.to_string()]
+        );
+        assert_eq!(
+            provider_for_model(Some(" "), "claw-flash", "claw-flash", "hint-test"),
+            vec![PROMPT_DEEPSEEK.to_string()]
+        );
+        assert_eq!(
+            provider_for("claw-flash", "claw-flash", "hint-test"),
+            vec![PROMPT_DEEPSEEK.to_string()]
+        );
+        set_family_hint("hint-test", "claw-flash", None);
         assert_eq!(family_named("nonsense"), None);
     }
 
