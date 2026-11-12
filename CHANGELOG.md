@@ -217,7 +217,11 @@ pre-1.0, so minor releases may include breaking changes.
   servers, language servers and git alike. The posture is logged at startup,
   tightens (never relaxes) when such a trigger or listener appears while the
   server runs, and is shown by `GET /server/posture` (admin). A run that a
-  webhook or watch trigger started always gets the restricted environment.
+  webhook or watch trigger started, and the `bash` tool of a restricted
+  session, always get the restricted environment. In either posture the
+  server's own secrets, provider key variables, `*_API_KEY` /
+  `*_API_TOKEN` names and the names learned from configs and the model
+  catalog are withheld (see Changed).
 - `compaction.default_context`: the context window, in tokens, assumed for a
   model that declares none (128,000 when unset).
 - A restart repairs the sessions the last process died in the middle of.
@@ -258,7 +262,9 @@ pre-1.0, so minor releases may include breaking changes.
   permission, and may replay a session's durable events
   (`GET /api/session/{id}/event`). A new `hook` scope opens
   `POST /trigger/{id}/hook` and nothing else, for whatever calls a webhook
-  from outside; `connector` and `admin` include it, `chat` does not.
+  from outside: such a credential is bound to one trigger (`trg` claim, or
+  `trigger` on a static token). `connector` and `admin` may call any
+  webhook trigger, `chat` none.
 - A trigger records whether a restricted caller created it (`restricted` on
   the record). Its runs happen in restricted sessions only, and every
   engine-started turn has a defined caller: see "Turns nobody requests" in
@@ -360,7 +366,8 @@ pre-1.0, so minor releases may include breaking changes.
   `debounce` over 366 days.
 - A stored trigger whose record does not say whether a restricted caller
   created it is read as restricted, not as the operator's. `restricted` is
-  now always written, `false` included.
+  now always written, `false` included. (Existing stored triggers are
+  affected: see Changed (b).)
 - Starting an instance read and parsed every trigger run its directory had
   kept (up to 200 a trigger) to find the unfinished ones. It now reads the
   unsettled runs only, through the index that already marks them.
@@ -380,8 +387,6 @@ pre-1.0, so minor releases may include breaking changes.
   `` !`…` ``, executed it with no permission check. Inline shell is now taken
   from the configured template only, and the arguments reach it as shell
   parameters (`$1`, `$ARGUMENTS`) instead of being pasted into the command.
-  Templates that relied on an argument being pasted in as shell source
-  (rather than as a value) need rewriting.
 - Stopping a session `shell` command (`POST /session/{id}/shell`) did not
   kill it: the command was never given the process group the stop signals.
 - A model that stayed unavailable (a 503 on every request) was asked three
@@ -398,7 +403,7 @@ pre-1.0, so minor releases may include breaking changes.
   published. The stored message keeps its image for a model that can read
   it. A custom model reads images when its config lists the `image` input
   modality or sets `attachment: true`; one that declares neither is treated
-  as text-only, so a custom vision model must now say so.
+  as text-only.
 - Whole numbers in provider requests (`max_tokens`, `temperature`,
   `budget_tokens`, …) are written as integers, `4096` rather than `4096.0`,
   which some OpenAI-compatible servers refuse.
@@ -489,10 +494,9 @@ pre-1.0, so minor releases may include breaking changes.
   trigger (a deleted trigger, one only the config declares, or a spec that
   does not parse proves nothing); descendants of a marked session are
   marked; and a memory record whose writing session is marked or gone is
-  unverified. A scheduled trigger declared in the config whose `reuse`
-  session is caught by this starts a fresh one once that session is
-  archived. Migration bodies are now pinned by hash in the tests, so an
-  edit to a shipped migration fails CI.
+  unverified. What this over-marks is under Changed (b). Migration bodies
+  are now pinned by hash in the tests, so an edit to a shipped migration
+  fails CI.
 - Smaller findings of the security review:
   - The Basic username and password are compared in constant time.
   - `GET /memory/search` and `GET /memory/session` answer `400` to a query
@@ -515,160 +519,113 @@ pre-1.0, so minor releases may include breaking changes.
   - The `/memory` and `/trigger` routes do their storage work on blocking
     threads instead of the runtime's workers, so a slow write or a busy
     trigger service no longer stalls unrelated requests.
+- A provider answering with an empty response no longer makes a session call it
+  in a tight loop forever: the turn fails after three such responses.
+- A provider that goes silent is timed out after `chunkTimeout` (default 5
+  minutes) and retried, instead of holding the session indefinitely.
+- Pasted line breaks no longer submit the prompt on terminals without bracketed
+  paste.
+- A prompt naming no agent no longer switches a subagent to the default agent.
+- TUI: the `view subagents` hint names its key, and up in a child session no
+  longer recalls the prompt history.
 
 ### Changed
 
-- A `lock/` directory appears in the data directory, holding empty lock
-  files (`scheduler-<hash>.lock` per project directory, `maintenance.lock`),
-  and a restart marker that is being dealt with is briefly renamed to
-  `running/<session>.….claim`. A process alone on its data directory always
-  holds the locks and wins every claim, and behaves as before. With several
-  processes on one data directory (a TUI beside `alforria serve`), one of
-  them now schedules each directory's triggers and maintains the database
-  and the others are followers, where each used to do both on its own; a
-  follower takes over within seconds of the leader's exit. Migration
-  `0010_trigger_run_owner` adds two columns and an index to `trigger_run`.
-  When a directory's instance is booted again inside one server (after
-  `/instance/dispose` or a config change), the new instance's scheduler takes the
-  place of the old instance's, which stops firing.
-- On macOS and other non-Linux Unix systems the owner of a restart marker is
-  now checked with a signal-0 probe, so a turn a killed server left mid-way
-  is repaired at the next start there too (it was only on Linux).
+Everything an existing install can notice, in three groups: (a) what
+changes for someone who configures none of the new features; (b) what
+changes for someone who ran an earlier build of this branch with triggers,
+memory, tokens or hooks; (c) what applies once bearer auth, a trigger or
+memory is configured.
 
-- A `hook` bearer credential must be bound to one trigger (`trg` claim, or
-  `trigger` on a static token) and delivers only to it; an unbound `hook`
-  token is refused. A webhook trigger accepts one delivery per
-  `triggers.webhook_min_interval` (default `"1s"`).
+#### (a) For everyone, with none of the new features configured
 
-- The server folds the write-ahead log back into the database every five
-  minutes (a truncating checkpoint), so the `-wal` file no longer sits at
-  its high-water mark. It used to be folded back only as SQLite saw fit
-  and when the database was closed. This applies to every server, whatever
-  it has configured.
-- A request to a model that declares no context window (`limit.context`
-  of 0 — a model you added to the config without one) is now sized against
-  a window of 128,000 tokens: what is sent to it is bounded to that, where
-  the whole conversation used to go out whatever its length. Such a model
-  is still not treated as overflowing for automatic compaction.
-  `compaction.default_context` sets another size; models that declare a
-  window are unaffected.
-- `alforria serve` / `web` refuse to listen on a host config that does not
-  parse **or cannot be read** (an unreadable file in the global config
-  directory, `~/.opencode` or the managed directory used to count as empty,
-  silently dropping the policy in it), and — with bearer auth configured —
-  when a directory tokens may open contains the data directory or the host
-  config.
-
-- A host or managed `permission` rule is a ceiling: a project's
-  `permission` or `agent.<name>.permission` can narrow it and no longer
-  widens it (upstream's last-match-wins let a project file overrule a host
-  `deny`). Installs whose own config sets no `ask`/`deny` see no difference.
-- On a server with `server.auth.bearer` configured, a project's or a remote
-  config keeps only keys that cannot carry a capability; `permission`, `mcp`,
-  `plugin`, `lsp`, `formatter`, `instructions`, provider options and the like
-  are dropped with a warning unless the host lists them in
-  `server.trust.project_keys`. Standalone installs are unchanged. See
-  `docs/unattended-server.md`.
-- A restricted session, or one that outside input started (a webhook or
-  watch run), cannot write `opencode.json`, `.opencode/`, `AGENTS.md` and
-  the other loader files with
-  its edit tools (`permission.edit_loader: "allow"` in the host config hands
-  it back). Such a write, and an upload, is made on the resolved path that
-  was judged, through its directory's handle with no link followed, so a
-  rename or link swap between the check and the write cannot redirect it
-  (Unix; what the guard does not cover is listed in
-  `docs/unattended-server.md`). The guard is the same wherever such a
-  session runs: `alforria run --session` on one protects the same resolved
-  locations as the server. Reverting or unreverting such a session is
-  refused (`403`, nothing restored) when it would rewrite or delete one of
-  those files, and otherwise restores exactly the files that were checked
-  (git-ignored files and symlinks are left as they are); other sessions
-  revert as before.
-- When the global config does not load, a project's capability-bearing keys
-  are not applied until it does (the load itself still degrades to defaults,
-  as before).
-
-- On a server where project config is restricted (`server.auth.bearer`
-  configured, or `server.trust.project: "restricted"`), `{env:NAME}` and
-  `{file:path}` in a **project's** `opencode.json` / `.opencode/` and in a
-  remote config are confined: `{env:}` reads only the names in
-  `server.trust.project_env` (anything else is the empty string), and
-  `{file:}` only a relative path that stays inside the project (anything
-  else is a config error; a remote config reads no file). `${VAR}` in a
-  provider base URL follows the `{env:}` rule, and a refused name there is a
-  config error. **A standalone install is unchanged**: a project config's
-  `{env:OPENAI_API_KEY}` or `{file:~/.secrets/key}` works as upstream, and a
-  warning is logged once per file and reference naming what a restricted
-  server would refuse. Your own config is never confined.
-
-- `server.resume` and `storage` (`retention`, `synchronous`) are read from
-  the host config only (the global config directory, `~/.opencode`, the
-  managed directory), like `server.auth` and `shell_env`. A host key written
-  in a project file, a remote config or an `OPENCODE_CONFIG*` source is
-  dropped with a warning naming the file.
-- A session that carries outside text (a webhook or watch run, its children
-  and forks) is held to its own rules: the project's standing `always`
-  approvals do not apply to it, an `ask` there is a deny at once, and
-  `permission.unattended` never answers for it. A fork of such a session
-  keeps its rules.
-- `@file` and `@agent` mentions in a trigger's prompt are resolved only when
-  the operator wrote the trigger (the config or an `admin` request). In a
-  trigger a model scheduled they are text.
-- A session a trigger names must belong to the trigger's own directory.
-- A trigger run whose turn is stopped is recorded as failed instead of
-  completed with a partial answer; a run the server died in is closed with
-  an `interrupted` error.
-- A memory record written by a `chat` or `connector` token, or by a session
-  one of them created, is injected into restricted sessions only.
-- Memory in a directory that is not a git repository is kept per directory.
-  All such directories are one project (`global`), and they used to share
-  one set of records and one transcript search — which also let a token
-  confined to one directory read, change and delete another's. Now each has
-  its own records and searches its own sessions; a repository's memory is
-  still its project's, shared by its worktrees and subdirectories. **If you
-  had turned memory on and used it outside a repository**, you can notice
-  this: after the upgrade a directory shows the records that were saved *in
-  it* (the `0009_memory_directory` migration attributes each existing record
-  through the session that wrote it) and no longer those saved in another
-  non-repository directory. Records with no session to go by — saved
-  through `POST /memory`, or by a session deleted since — are shown in no
-  directory until you file them: `GET /memory/unattributed`, then
-  `PATCH /memory/unattributed/{id}?directory=…` or `DELETE` (Basic auth, an
-  `admin` token, or no authentication). `memory.scope: "global"` still
-  shares one memory across everything. Memory is off by default; an install
-  that never enabled it sees no change. See `docs/assistant.md`.
-- `git` run by the server (status, diff, snapshots) no longer inherits the
-  server's secrets: a repository's own filters and hooks see the scrubbed
-  environment.
-- On SIGTERM the trigger schedulers stop firing and the transcript indexers
-  end before the running turns are settled, and a turn that ended inside the
-  process leaves no restart marker.
-- The agent's processes no longer inherit alforria's own secrets and provider
-  API keys; everything else in the environment is passed as before on a
-  standalone install (`GITHUB_TOKEN`, `AWS_*`, `NPM_TOKEN`, `PGPASSWORD` and
-  the like still reach `gh`, `aws`, `npm` and `psql`). The `bash` tool, the
-  session `shell` command, command-template `` !`cmd` `` substitutions,
-  terminals, worktree start scripts, MCP stdio servers, language servers and
-  the server's `git` calls start without: the server password and auth
-  variables (`OPENCODE_SERVER_PASSWORD`, `OPENCODE_AUTH_CONTENT`,
+- **The agent's processes no longer see provider keys.** The `bash` tool,
+  the session `shell` command, command-template `` !`cmd` `` substitutions,
+  terminals, worktree start scripts, MCP stdio servers, language servers
+  and the server's own `git` calls (status, diff, snapshots — so a
+  repository's filters and hooks too) start without: the server password
+  and auth variables (`OPENCODE_SERVER_PASSWORD`, `OPENCODE_AUTH_CONTENT`,
   `OPENCODE_CONFIG_CONTENT`, `ALFORRIA_*_SECRET` / `_TOKEN` / `_KEY` /
   `_PASSWORD`); the built-in provider key variables (`ANTHROPIC_API_KEY`,
-  `OPENAI_API_KEY`, `LIBERTAI_API_KEY`, …); any variable named `*_API_KEY`
-  or `*_API_TOKEN`; every `provider.*.env` name of the model catalog and of
-  a loaded config; and every variable a config file reads through
-  `{env:NAME}` — in any letter case. A name learned from a config or the
-  catalog stays withheld until the server restarts. To pass one through,
-  name it in `shell_env.allow`, or in an MCP server's own `environment`.
-- A standalone user who uses one of these gets the restricted shell
-  environment (an allowlist; see `shell_env` under Added) and will find
-  `GITHUB_TOKEN`, `AWS_*` and similar missing from the agent's shell until
-  `shell_env.allow` names them: `alforria serve --hostname` with an address
-  other than loopback (`0.0.0.0`, a LAN address), or a `webhook` / `watch`
-  trigger (in the config, or created by the `schedule` tool — from the
-  moment it is created, until the server restarts without it).
-- A global config file that does not parse now stops `alforria serve` and
-  `alforria web` from listening, instead of serving with the defaults: the
-  host config carries the server's access policy.
+  `OPENAI_API_KEY`, `LIBERTAI_API_KEY`, …); **any variable named
+  `*_API_KEY` or `*_API_TOKEN`**, a provider's or not (`STRIPE_API_KEY`
+  goes too); every `provider.*.env` name of a loaded config and of the
+  model catalog; and every variable a config file reads through
+  `{env:NAME}` — in any letter case. The catalog's names are those of
+  every provider it lists, used or not: with the models.dev catalog cached
+  that includes **`GITHUB_TOKEN`** (GitHub Copilot) and
+  **`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`** (Amazon
+  Bedrock), so `gh` and `aws` in the agent's shell can lose their
+  credentials. Everything else in the environment is passed as before
+  (`GH_TOKEN`, `NPM_TOKEN`, `PGPASSWORD`, `AWS_PROFILE`, …). A name learned
+  from a config or the catalog stays withheld until the server restarts.
+  To pass one through, name it in `shell_env.allow` in the global config
+  (`"shell_env": { "allow": ["GITHUB_TOKEN"] }`), or in an MCP server's own
+  `environment`.
+- **Binding beyond loopback restricts the shell environment further.**
+  `alforria serve --hostname` with anything other than `localhost` or a
+  loopback address (`0.0.0.0`, a LAN address) starts the agent's processes
+  from an allowlist (`PATH`, `HOME`, `LANG`, `LC_*`, `TERM`, `TZ`, `USER`,
+  `LOGNAME`, `SHELL`, `TMPDIR`): `GH_TOKEN`, `AWS_*`, `SSH_AUTH_SOCK`,
+  proxy variables and the rest are missing until `shell_env.allow` names
+  them. See `shell_env` under Added for the other things that select this
+  posture.
+- **A host or managed `permission` rule is a ceiling.** A project's
+  `permission` or `agent.<name>.permission` can narrow it and no longer
+  widens it (upstream's last-match-wins let a project file overrule a host
+  `deny`). Installs whose own config sets no `ask`/`deny` see no
+  difference.
+- **A host config that does not load is no longer treated as empty.**
+  `alforria serve` and `alforria web` refuse to listen when a file in the
+  global config directory, `~/.opencode` or the managed directory does not
+  parse or cannot be read (they used to serve with the defaults, silently
+  dropping the policy in it). An unreadable file in the managed directory
+  fails every config load, the TUI's and `alforria run`'s included.
+  Elsewhere the load still degrades to defaults as before, but a project's
+  capability-bearing keys (`permission`, `mcp`, `plugin`, …) are not
+  applied until the global config loads.
+- **A custom command's arguments are never shell source** (see Fixed).
+  Templates that relied on an argument being pasted into a `` !`…` `` as
+  shell source, rather than as a value, need rewriting with `$1` /
+  `$ARGUMENTS`.
+- **A custom model that declares no image input is text-only** (see
+  Fixed): a vision model you added to the config must list the `image`
+  input modality or set `attachment: true`, or its images are replaced by
+  a placeholder.
+- **A model that declares no context window is sized against 128,000
+  tokens** (`limit.context` of 0 — a model you added to the config without
+  one): what is sent to it is bounded to that, where the whole
+  conversation used to go out whatever its length. Such a model is still
+  not treated as overflowing for automatic compaction.
+  `compaction.default_context` sets another size; models that declare a
+  window are unaffected.
+- **`serve` and `web` handle SIGTERM and SIGINT, and repair after a
+  kill** (both under Added): a stop is now a clean shutdown — running
+  turns aborted and recorded, tool processes killed, exit 0 — that can take
+  up to `server.shutdown.timeout` (10 s by default), and a session left
+  mid-turn by a kill is idle with its tool calls closed as errors at the
+  next start, instead of looking busy.
+- **The write-ahead log is checkpointed every five minutes** (a truncating
+  checkpoint; `serve` and `web`, and once at startup for the TUI's built-in
+  server), so the `-wal` file no longer sits at its high-water mark. It
+  used to be folded back only as SQLite saw fit and when the database was
+  closed.
+- **New files in the data directory.** `lock/maintenance.lock` (an empty
+  lock file; also `lock/scheduler-<hash>.lock` per project directory once
+  it has a trigger and `lock/outbox.lock` with webhooks), and `running/`,
+  holding one small marker per running turn; a marker being dealt with
+  after a kill is briefly renamed `running/<session>.….claim`. A process
+  alone on its data directory always holds the locks and wins every claim.
+- **New tables in the database.** alforria's own migrations
+  (`0001`–`0010`, journal table `alforria_migration`) run on first open;
+  the upstream schema is untouched. On a database that used none of the
+  features they create empty tables. A session gets one row in
+  `session_mark` the first time a web, MCP or plugin tool answers in it;
+  with memory and triggers off nothing reads it.
+- **`triggerID` and `untrustedInput` are reserved session metadata keys**:
+  a client that sends them on session create or update has them dropped.
+- **A route naming a session and a message, part or permission request
+  answers 404** when the inner id belongs to another session (see Fixed).
 - The default system prompts call the agent `alforria` instead of `opencode`
   and point at alforria's repository and docs. A model told it was opencode
   will now say it is alforria.
@@ -688,17 +645,146 @@ pre-1.0, so minor releases may include breaking changes.
 - Quitting the TUI while a workflow runs asks for a second press.
 - The web client's overview keeps sessions for 7 days instead of 3.
 
-### Fixed
+#### (b) If you ran an earlier build of this branch with memory, triggers, tokens or hooks
 
-- A provider answering with an empty response no longer makes a session call it
-  in a tight loop forever: the turn fails after three such responses.
-- A provider that goes silent is timed out after `chunkTimeout` (default 5
-  minutes) and retried, instead of holding the session indefinitely.
-- Pasted line breaks no longer submit the prompt on terminals without bracketed
-  paste.
-- A prompt naming no agent no longer switches a subagent to the default agent.
-- TUI: the `view subagents` hint names its key, and up in a child session no
-  longer recalls the prompt history.
+- **Memory outside a repository is kept per directory.** All directories
+  that are not a git repository are one project (`global`), and they used
+  to share one set of records and one transcript search — which also let a
+  token confined to one directory read, change and delete another's. After
+  the upgrade a directory shows the records that were saved *in it* (the
+  `0009_memory_directory` migration attributes each existing record
+  through the session that wrote it) and no longer those saved in another
+  non-repository directory. Records with no session to go by — saved
+  through `POST /memory`, or by a session deleted since — are shown in no
+  directory until you file them: `GET /memory/unattributed`, then
+  `PATCH /memory/unattributed/{id}?directory=…` or `DELETE` (Basic auth, an
+  `admin` token, or no authentication). A repository's memory is still its
+  project's, and `memory.scope: "global"` still shares one memory across
+  everything.
+- **Past trigger sessions and their memory are marked on upgrade**
+  (migration `0008_session_mark_backfill`, failing closed). A session a
+  trigger started carries both marks and the read-only ceiling unless its
+  trigger is still stored and is a `cron`, `interval` or `at` trigger — a
+  deleted trigger, one only the config declares, or a spec that does not
+  parse proves nothing. So the past sessions of a *scheduled* trigger
+  declared in the config are over-marked: they are read-only, and such a
+  trigger's `reuse` session stays so until you archive it, after which the
+  trigger starts a fresh one. A memory record whose writing session is
+  marked or gone becomes unverified and is no longer injected; rewrite it
+  through `/memory` to vouch for it again.
+- **A stored trigger whose record does not say `restricted` is read as
+  restricted.** Earlier builds left the field out when it was false, so
+  the triggers you created through `POST /trigger` or the `schedule` tool
+  now create restricted sessions, resolve no `@file` / `@agent` mention,
+  can be changed, fired and deleted by a `chat` or `connector` token, and
+  fail their runs if they name a session of yours. `restricted` is now
+  always written and never changed: delete such a trigger and create it
+  again as the operator.
+- **Which session a trigger may name is restricted** (see Fixed). A
+  `webhook` or `watch` trigger, or a run with a payload, names none; a
+  trigger the `schedule` tool made names only the conversation that
+  scheduled it (`current`); a session a trigger names must belong to the
+  trigger's own directory. A stored trigger that no longer fits is not
+  rewritten: its runs are recorded as `failed` with the reason until you
+  change it.
+- **Triggers and the `schedule` tool are off until a directory has a
+  trigger.** With `triggers.enabled` unset, earlier builds ran a scheduler
+  and offered the `schedule` tool everywhere. An agent that was expected to
+  schedule its *first* trigger itself now needs `triggers.enabled: true`.
+  `serve` no longer boots its own directory at startup unless the config
+  asks for triggers.
+- **`websearch` uses LibertAI search only when the config says so**
+  (`websearch: { provider: "libertai" }`). Earlier builds switched to it,
+  and offered the tool to every model, as soon as a LibertAI key was
+  present; unset is upstream's behaviour again.
+- **A `hook` bearer credential must be bound to one trigger** (`trg`
+  claim, or `trigger` on a static token) and delivers only to it; an
+  unbound `hook` token is refused. A webhook trigger accepts one delivery
+  per `triggers.webhook_min_interval` (default `"1s"`).
+- **`GET /attention`, `GET /permission` and `GET /question` show a token
+  below `admin` only the asks it may answer** — those of restricted
+  sessions in the directories it may open — and the `outbox` counters on
+  `GET /attention` are the operator's only.
+- **Webhook deliveries go out per hook, in order.** A hook's later
+  deliveries wait behind one that is being retried; a 4xx other than 408,
+  425 and 429 is given up at once instead of retried until `max_age`; of
+  several servers on one data directory, one delivers.
+- **Several processes on one data directory** (a TUI beside
+  `alforria serve`) no longer each schedule and maintain: one schedules
+  each directory's triggers and one maintains the database, the others are
+  followers and take over within seconds of the leader's exit; every fire
+  is claimed once. Migration `0010_trigger_run_owner` adds two columns and
+  an index to `trigger_run`. When a directory's instance is booted again
+  inside one server (after `/instance/dispose` or a config change), the new
+  instance's scheduler takes the place of the old one's, which stops
+  firing. On macOS and other non-Linux Unix systems a restart marker's
+  owner is now checked with a signal-0 probe, so the repair after a kill
+  works there too (it was Linux only).
+- **A trigger run that does not finish is `failed`**, not completed with a
+  partial answer: one whose turn is stopped, one whose turn panics, and one
+  the server died in (closed with an `interrupted` error). On SIGTERM the
+  schedulers stop firing before the running turns are settled.
+- **`@file` and `@agent` mentions in a trigger's prompt** are resolved only
+  when the operator wrote the trigger (the config or an `admin` request).
+  In a trigger a model scheduled or a restricted caller created they are
+  text.
+- **A memory record written by a `chat` or `connector` token**, or by a
+  session one of them created, is injected into restricted sessions only;
+  a change of `kind` alone no longer makes a record its changer's.
+- **`server.resume` and `storage`** (`retention`, `synchronous`) are read
+  from the host config only (the global config directory, `~/.opencode`,
+  the managed directory), like `server.auth` and `shell_env`. A host key
+  written in a project file, a remote config or an `OPENCODE_CONFIG*`
+  source is dropped with a warning naming the file.
+- **A `webhook` or `watch` trigger restricts the shell environment** of the
+  whole server from the moment it exists — in the config, or created over
+  HTTP or by the `schedule` tool — until the server restarts without it:
+  `GH_TOKEN`, `AWS_*` and similar are missing from the agent's shell until
+  `shell_env.allow` names them.
+
+#### (c) Once bearer auth, a trigger or memory is configured
+
+- On a server with `server.auth.bearer` configured, a project's or a remote
+  config keeps only keys that cannot carry a capability; `permission`, `mcp`,
+  `plugin`, `lsp`, `formatter`, `instructions`, provider options and the like
+  are dropped with a warning unless the host lists them in
+  `server.trust.project_keys`. `{env:NAME}` and `{file:path}` in such a
+  config are confined too: `{env:}` reads only the names in
+  `server.trust.project_env` (anything else is the empty string), and
+  `{file:}` only a relative path that stays inside the project (anything
+  else is a config error; a remote config reads no file). `${VAR}` in a
+  provider base URL follows the `{env:}` rule, and a refused name there is
+  a config error. `server.trust.project: "restricted"` selects the same
+  without bearer auth. **A standalone install is unchanged**: a project
+  config's `{env:OPENAI_API_KEY}` or `{file:~/.secrets/key}` works as
+  upstream, and a warning is logged once per file and reference naming
+  what a restricted server would refuse. Your own config is never
+  confined. See `docs/unattended-server.md`.
+- With bearer auth configured, `serve` and `web` refuse to listen when a
+  directory tokens may open contains, is, or lies inside the data
+  directory or the host config.
+- A restricted session, or one that outside input started (a webhook or
+  watch run), cannot write `opencode.json`, `.opencode/`, `AGENTS.md` and
+  the other loader files with its edit tools
+  (`permission.edit_loader: "allow"` in the host config hands it back).
+  Such a write, and an upload, is made on the resolved path that was
+  judged, through its directory's handle with no link followed, so a
+  rename or link swap between the check and the write cannot redirect it
+  (Unix). The guard is the same wherever such a session runs:
+  `alforria run --session` on one protects the same resolved locations as
+  the server. Reverting or unreverting such a session is refused (`403`,
+  nothing restored) when it would rewrite or delete one of those files,
+  and otherwise restores exactly the files that were checked (git-ignored
+  files and symlinks are left as they are); other sessions revert as
+  before. What the guard does not cover — `bash` and every other process
+  first of all — is listed under "The write guard" in
+  `docs/unattended-server.md`.
+- A session that carries outside text (a webhook or watch run, its children
+  and forks) is held to its own rules: the project's standing `always`
+  approvals do not apply to it, an `ask` there is a deny at once, and
+  `permission.unattended` never answers for it. A fork of such a session
+  keeps its rules. Its `bash` tool gets the restricted shell environment
+  whatever the server's posture, as a restricted session's does.
 
 ## [0.3.0] - 2026-10-27
 
