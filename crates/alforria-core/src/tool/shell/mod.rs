@@ -507,6 +507,110 @@ async fn is_dir(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// A command word as the shell runs it: quotes and a leading backslash
+/// removed (`"rm"`, `\rm`), and the binary's name without its directory
+/// (`/bin/rm`).
+fn command_word(text: &str) -> String {
+    let text = unquote(text);
+    let text = text.strip_prefix('\\').unwrap_or(text);
+    Path::new(text)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| text.to_string())
+}
+
+/// Commands that only run another command.
+const WRAPPERS: &[&str] = &[
+    "env", "sudo", "doas", "command", "builtin", "exec", "nohup", "time", "nice", "ionice",
+    "setsid", "stdbuf", "timeout", "busybox",
+];
+const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "ash"];
+
+/// The command lines a node runs through another program: `sh -c '…'`,
+/// `eval …`, `env X=1 cmd`, `sudo cmd`, `xargs cmd`, `find … -exec cmd ;`.
+/// A `bash` rule such as `"rm *": "deny"` is matched against these too;
+/// otherwise any of them walks straight past it.
+fn inner_command_lines(node: &CommandNode) -> Vec<String> {
+    let words: Vec<String> = node.parts.iter().map(|part| part.text.clone()).collect();
+    let Some(first) = words.first().map(|word| command_word(word)) else {
+        return Vec::new();
+    };
+    let rest = &words[1..];
+    let join = |words: &[String]| words.join(" ");
+    let mut out = Vec::new();
+    if SHELLS.contains(&first.as_str()) {
+        if let Some(index) = rest
+            .iter()
+            .position(|word| word.starts_with('-') && !word.starts_with("--") && word.contains('c'))
+        {
+            if let Some(script) = rest.get(index + 1) {
+                out.push(unquote(script).to_string());
+            }
+        }
+    } else if first == "eval" {
+        out.push(
+            rest.iter()
+                .map(|word| unquote(word))
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+    } else if first == "xargs" || WRAPPERS.contains(&first.as_str()) {
+        // Past the wrapper's own flags, their values where they look like
+        // one, and `VAR=value` settings.
+        let start = rest
+            .iter()
+            .position(|word| {
+                !word.starts_with('-')
+                    && !word.contains('=')
+                    && !word.chars().all(|c| c.is_ascii_digit() || c == '.')
+            })
+            .unwrap_or(rest.len());
+        if start < rest.len() {
+            out.push(join(&rest[start..]));
+        }
+    } else if first == "find" {
+        let mut index = 0;
+        while index < rest.len() {
+            if matches!(
+                rest[index].as_str(),
+                "-exec" | "-execdir" | "-ok" | "-okdir"
+            ) {
+                let end = rest[index + 1..]
+                    .iter()
+                    .position(|word| matches!(unquote(word), ";" | "+" | "\\;"))
+                    .map_or(rest.len(), |offset| index + 1 + offset);
+                if index + 1 < end {
+                    out.push(join(&rest[index + 1..end]));
+                }
+                index = end;
+            }
+            index += 1;
+        }
+    }
+    out.retain(|line| !line.trim().is_empty());
+    out
+}
+
+/// `nodes` plus the commands they run through wrappers, shells and `eval`,
+/// so those are scanned and asked about like any other.
+pub fn with_inner_commands(
+    parser: &dyn parse::ShellParser,
+    nodes: Vec<CommandNode>,
+) -> Vec<CommandNode> {
+    let mut all = nodes;
+    let mut index = 0;
+    // Bounded: each pass can only add what the previous one unwrapped.
+    while index < all.len() && all.len() < 256 {
+        for line in inner_command_lines(&all[index]) {
+            if let Ok(inner) = parser.parse(&line) {
+                all.extend(inner);
+            }
+        }
+        index += 1;
+    }
+    all
+}
+
 /// `collect` (shell.ts:378-414): scan every command node for external
 /// directories and the `bash` permission patterns.
 pub async fn collect(
@@ -600,6 +704,21 @@ pub async fn collect(
             scan.push_pattern(node.source.clone());
             let prefix = arity::prefix(&tokens).join(" ");
             scan.push_always(format!("{prefix} *"));
+            // Also as the shell runs it. The source can start with a
+            // setting (`X=1 rm …`), a path (`/bin/rm …`) or quoting
+            // (`\rm`, `"rm"`), none of which a rule for `rm *` matches.
+            if !ps && shell_kind != "cmd" {
+                let mut words: Vec<String> = tokens.iter().map(|t| t.to_string()).collect();
+                words[0] = command_word(&words[0]);
+                let plain = words.join(" ");
+                // Only when the command word is what differs: a redirect or
+                // a substitution in the source is already in its pattern.
+                if words[0] != tokens[0] || !node.source.starts_with(tokens[0]) {
+                    scan.push_pattern(plain);
+                    let words: Vec<&str> = words.iter().map(String::as_str).collect();
+                    scan.push_always(format!("{} *", arity::prefix(&words).join(" ")));
+                }
+            }
         }
     }
 
@@ -1187,6 +1306,11 @@ impl ShellTool {
                     let nodes = parser
                         .parse(&params.command)
                         .map_err(|e| ToolError::Failed(e.to_string()))?;
+                    let nodes = if ps || id::to_kind(&name) == "cmd" {
+                        nodes
+                    } else {
+                        with_inner_commands(parser.as_ref(), nodes)
+                    };
                     let mut scan = collect(&nodes, &cwd, ps, &shell, ctx.instance).await;
                     let redirects = parser
                         .redirects(&params.command)
@@ -1419,7 +1543,7 @@ mod tests {
 
     fn scan_sync(command: &str, directory: &Path, worktree: &Path) -> Scan {
         let parser = parse::parser_for("bash");
-        let nodes = parser.parse(command).expect("parse");
+        let nodes = with_inner_commands(parser.as_ref(), parser.parse(command).expect("parse"));
         let cwd = directory.to_path_buf();
         let instance = InstanceContext {
             directory: directory.to_path_buf(),
@@ -1469,6 +1593,40 @@ mod tests {
             let scan = scan_sync(command, &dir, &dir);
             assert!(scan.dirs.is_empty(), "{command}: {:?}", scan.dirs);
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bash_rules_see_the_command_behind_its_disguises() {
+        let dir = temp("collect-disguises");
+        for command in [
+            "X=1 rm -rf build",
+            "/bin/rm -rf build",
+            "\\rm -rf build",
+            "\"rm\" -rf build",
+            "sh -c 'rm -rf build'",
+            "bash -lc \"rm -rf build\"",
+            "eval 'rm -rf build'",
+            "env FOO=1 rm -rf build",
+            "sudo -n rm -rf build",
+            "command rm -rf build",
+            "nohup rm -rf build",
+            "timeout 5 rm -rf build",
+            "echo a | xargs rm -rf build",
+            "find . -name x -exec rm -rf build ;",
+            "sudo env X=1 sh -c 'rm -rf build'",
+        ] {
+            let scan = scan_sync(command, &dir, &dir);
+            assert!(
+                scan.patterns.iter().any(|p| p == "rm -rf build"),
+                "{command}: {:?}",
+                scan.patterns
+            );
+            assert!(scan.always.iter().any(|p| p == "rm *"), "{command}");
+        }
+        // A plain command is asked about once, as before.
+        let scan = scan_sync("rm -rf build", &dir, &dir);
+        assert_eq!(scan.patterns, vec!["rm -rf build".to_string()]);
         std::fs::remove_dir_all(&dir).ok();
     }
 
