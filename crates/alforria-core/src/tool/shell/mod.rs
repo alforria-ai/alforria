@@ -575,13 +575,17 @@ fn inner_command_lines(node: &CommandNode) -> Vec<String> {
                 if let Some(quote) = word.find(['"', '\'']) {
                     out.push(unquote(&word[quote..]).to_string());
                 }
-                if !word.starts_with("--") && word.len() > 2 && word.is_char_boundary(2) {
-                    let mut line = unquote(&word[2..]).to_string();
-                    for next in &rest[index + 1..] {
-                        line.push(' ');
-                        line.push_str(next);
+                // In a cluster of short flags the value can start after any
+                // of them (`-iSrm`), so every split is tried.
+                if !word.starts_with("--") {
+                    for (split, _) in word.char_indices().skip(2).take(16) {
+                        let mut line = unquote(&word[split..]).to_string();
+                        for next in &rest[index + 1..] {
+                            line.push(' ');
+                            line.push_str(next);
+                        }
+                        out.push(line);
                     }
-                    out.push(line);
                 }
                 continue;
             }
@@ -626,10 +630,31 @@ pub fn with_inner_commands(
     nodes: Vec<CommandNode>,
 ) -> Result<Vec<CommandNode>, ToolError> {
     const MAX_NODES: usize = 256;
+    const MAX_WRAPPER_WORDS: usize = 64;
     let mut all = nodes;
     let mut index = 0;
+    let too_many = || {
+        ToolError::Failed(
+            "Command nests too many commands to check against the bash permission rules; run it in smaller steps"
+                .to_string(),
+        )
+    };
     while index < all.len() {
+        // A wrapper is unwrapped from every word, so its length bounds the
+        // work before any of it is done.
+        let first = all[index]
+            .parts
+            .first()
+            .map(|part| command_word(&part.text));
+        let wraps =
+            first.is_some_and(|first| first == "xargs" || WRAPPERS.contains(&first.as_str()));
+        if wraps && all[index].parts.len() > MAX_WRAPPER_WORDS {
+            return Err(too_many());
+        }
         for line in inner_command_lines(&all[index]) {
+            if all.len() > MAX_NODES {
+                return Err(too_many());
+            }
             match parser.parse(&line) {
                 Ok(inner) => all.extend(inner),
                 Err(_) => all.push(CommandNode {
@@ -645,10 +670,7 @@ pub fn with_inner_commands(
             }
         }
         if all.len() > MAX_NODES {
-            return Err(ToolError::Failed(
-                "Command nests too many commands to check against the bash permission rules; run it in smaller steps"
-                    .to_string(),
-            ));
+            return Err(too_many());
         }
         index += 1;
     }
@@ -1673,6 +1695,7 @@ mod tests {
             "env --split-string=\"rm -rf build\"",
             "env -S\"rm -rf build\"",
             "env -Srm -rf build",
+            "env -iSrm -rf build",
             // Past any number of flags and settings.
             "env -i A=1 B=2 C=3 D=4 E=5 F=6 G=7 H=8 I=9 J=10 K=11 L=12 M=13 rm -rf build",
         ] {
@@ -1684,6 +1707,10 @@ mod tests {
             );
             assert!(scan.always.iter().any(|p| p == "rm *"), "{command}");
         }
+        // Too long to unwrap is refused, not waved through.
+        let parser = parse::parser_for("bash");
+        let long = format!("env {} rm -rf build", "A=1 ".repeat(80));
+        assert!(with_inner_commands(parser.as_ref(), parser.parse(&long).unwrap()).is_err());
         // A plain command is asked about once, as before.
         let scan = scan_sync("rm -rf build", &dir, &dir);
         assert_eq!(scan.patterns, vec!["rm -rf build".to_string()]);
