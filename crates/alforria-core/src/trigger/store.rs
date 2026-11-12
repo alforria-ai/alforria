@@ -27,7 +27,11 @@ pub struct StoredSpec {
     /// credential below `admin`, or the `schedule` tool in a restricted
     /// session. Recorded when it is created and never changed; its runs
     /// are bound by it for as long as it exists.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    ///
+    /// Always written. A stored spec that does not say (a row from a build
+    /// that left `false` out, or one written by hand) reads as restricted:
+    /// what cannot be told is bound, not trusted.
+    #[serde(default = "restricted_when_unsaid")]
     pub restricted: bool,
     /// The session that created or last changed it had seen outside
     /// content (`SessionMark::OutsideContent`): its prompt may hold what an
@@ -39,6 +43,10 @@ pub struct StoredSpec {
         skip_serializing_if = "std::ops::Not::not"
     )]
     pub outside_content: bool,
+}
+
+fn restricted_when_unsaid() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq)]

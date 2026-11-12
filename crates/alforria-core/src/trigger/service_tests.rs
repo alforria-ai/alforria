@@ -2494,3 +2494,56 @@ async fn a_debounce_below_the_floor_and_a_cron_that_never_fires_are_refused_ever
         assert_eq!(service.get(id).unwrap().error, None, "{id} is unchanged");
     }
 }
+
+/// B3. A stored spec that does not say whether its creator was restricted
+/// is read as restricted; one the operator created says so, and stays the
+/// operator's across a restart.
+#[tokio::test]
+async fn a_stored_spec_that_does_not_say_is_restricted() {
+    let f = Fixture::new(
+        "trigger-restricted-default",
+        "2027-01-01T00:00:00Z",
+        FakeOps::answering("ok"),
+    );
+    let service = f.service(json!({}));
+    service
+        .create(
+            Some("mine".to_string()),
+            spec(json!({ "on": { "interval": "1h" }, "prompt": "Check" })),
+            None,
+            None,
+        )
+        .unwrap();
+    let directory = f.directory().to_string_lossy().to_string();
+    f.storage
+        .with_connection(|conn| {
+            let written: String = conn.query_row(
+                "SELECT spec FROM \"trigger\" WHERE directory = ?1 AND id = 'mine'",
+                [&directory],
+                |row| row.get(0),
+            )?;
+            let written: Value = serde_json::from_str(&written).unwrap();
+            assert_eq!(written["restricted"], json!(false), "{written}");
+            conn.execute(
+                "INSERT INTO \"trigger\"
+                    (directory, id, project_id, spec, origin_session_id, time_created, time_updated)
+                 VALUES (?1, 'unsaid', 'global', ?2, NULL, 1, 1)",
+                rusqlite::params![
+                    directory,
+                    json!({ "on": { "interval": "1h" }, "prompt": "Check" }).to_string()
+                ],
+            )?;
+            Ok::<_, crate::CoreError>(())
+        })
+        .unwrap();
+    drop(service);
+
+    let service = f.service(json!({}));
+    assert!(!service.get("mine").unwrap().restricted);
+    assert!(service.get("unsaid").unwrap().restricted);
+    let run = fire_next(&f, &service, "unsaid").await;
+    assert_eq!(run.status, RunStatus::Completed);
+    let turn = f.ops.turns().pop().unwrap();
+    assert!(turn.restricted);
+    assert!(!turn.operator_authored);
+}

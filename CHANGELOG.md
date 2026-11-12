@@ -348,6 +348,9 @@ pre-1.0, so minor releases may include breaking changes.
   `cron` expression no date matches (`0 0 30 2 *`), a `watch` `debounce`
   under 1 second (`0ms` fired a run per file event), and an `interval` or
   `debounce` over 366 days.
+- A stored trigger whose record does not say whether a restricted caller
+  created it is read as restricted, not as the operator's. `restricted` is
+  now always written, `false` included.
 
 - Routes naming a session and a message, part or permission request inside
   it acted on the inner id without checking it belonged to that session:
