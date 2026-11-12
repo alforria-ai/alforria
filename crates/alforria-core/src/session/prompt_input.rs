@@ -533,6 +533,21 @@ pub fn resolve_prompt_parts(
     worktree: &Path,
     template: &str,
 ) -> Vec<PromptPartInput> {
+    resolve_prompt_parts_within(agents, worktree, template, None)
+}
+
+/// [`resolve_prompt_parts`] for a prompt the model wrote (a subagent's, a
+/// workflow agent's). A mentioned file is attached by reading it with no
+/// permission check, which is right for what the user typed and wrong for
+/// the model: `@~/.ssh/id_rsa` would hand it any file. With `confine`, only
+/// files inside the project are attached; the mention stays in the text and
+/// the agent can read the file with its own tools and permissions.
+pub fn resolve_prompt_parts_within(
+    agents: &AgentRegistry,
+    worktree: &Path,
+    template: &str,
+    confine: Option<&crate::tool::def::InstanceContext>,
+) -> Vec<PromptPartInput> {
     let mut parts = vec![PromptPartInput::Text {
         id: None,
         text: template.to_string(),
@@ -551,6 +566,12 @@ pub fn resolve_prompt_parts(
         } else {
             resolve_from(worktree, &name)
         };
+        if confine.is_some_and(|instance| {
+            filepath.exists()
+                && !crate::tool::external_directory::contains_path(&filepath, instance)
+        }) {
+            continue;
+        }
         let Ok(stat) = std::fs::metadata(&filepath) else {
             if let Some(found) = agents.get(&name) {
                 parts.push(PromptPartInput::Agent {
@@ -1861,6 +1882,38 @@ mod tests {
             }
             other => panic!("expected file part, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_model_written_prompt_attaches_only_project_files() {
+        let temp = crate::storage::test_support::TempDir::new("prompt-resolve-confined");
+        let worktree = temp.path().join("repo");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(worktree.join("inside.txt"), "in").unwrap();
+        let secret = temp.path().join("secret.txt");
+        std::fs::write(&secret, "s").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&secret, worktree.join("link.txt")).unwrap();
+        let registry = crate::session::agents::AgentRegistry::new(
+            &crate::session::agents::AgentRegistryInput::default(),
+        );
+        let instance = crate::tool::def::InstanceContext {
+            directory: worktree.clone(),
+            worktree: worktree.clone(),
+        };
+        let template = format!("@inside.txt @{} @link.txt @../secret.txt", secret.display());
+        let files = |confine| {
+            resolve_prompt_parts_within(&registry, &worktree, &template, confine)
+                .into_iter()
+                .filter_map(|part| match part {
+                    PromptPartInput::File { filename, .. } => filename,
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(files(Some(&instance)), vec!["inside.txt".to_string()]);
+        // What the user typed is attached as before.
+        assert!(files(None).len() > 1);
     }
 
     // ------------------------------------------------------------------

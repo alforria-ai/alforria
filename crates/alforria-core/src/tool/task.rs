@@ -120,6 +120,8 @@ pub struct SubagentState {
 #[derive(Debug, Clone)]
 pub struct SubagentInfo {
     pub name: String,
+    /// A mode the user puts a session in (`build`, `plan`), not a subagent.
+    pub primary: bool,
     pub model: Option<ModelRef>,
     pub permission: Vec<Rule>,
 }
@@ -146,6 +148,18 @@ pub trait TaskOps: Send + Sync {
         -> BoxFuture<'a, Result<Option<SubagentInfo>, ToolError>>;
     /// Look up an existing session by task id.
     fn session_exists<'a>(&'a self, session_id: &'a str) -> BoxFuture<'a, bool>;
+    /// Whether `task_id` is a subagent session `parent` started. A `task_id`
+    /// is only ever the id of the caller's own child: any other session,
+    /// the caller itself included, is not its to prompt.
+    fn owns_session<'a>(&'a self, parent: &'a str, task_id: &'a str) -> BoxFuture<'a, bool> {
+        Box::pin(async move { task_id != parent && self.session_exists(task_id).await })
+    }
+    /// The deny rules of the agent the caller runs as. A child session
+    /// inherits them, so a subagent cannot do what its parent's agent is
+    /// forbidden (plan mode's edit ban, say).
+    fn agent_denies<'a>(&'a self, _agent: &'a str) -> BoxFuture<'a, Vec<Rule>> {
+        Box::pin(async { Vec::new() })
+    }
     /// The parent session's permission ruleset (`parent.permission ?? []`,
     /// task.ts:138) — the production data path for
     /// [`derive_subagent_session_permission`]. Defaults to the M4
@@ -516,14 +530,25 @@ async fn run(
         )));
     };
 
+    // The model may not pick a primary agent: `task(subagent_type: "build")`
+    // from a plan session would hand it the tools plan mode withholds. A
+    // command or mention the user wrote still can.
+    if next.primary && !ctx.extra.bypass_agent_check {
+        return Err(ToolError::Failed(format!(
+            "{} is a primary agent, not a subagent type",
+            params.subagent_type
+        )));
+    }
+
     let existing_session = match &params.task_id {
-        Some(task_id) if ops.session_exists(task_id).await => Some(task_id.clone()),
+        Some(task_id) if ops.owns_session(ctx.session_id, task_id).await => Some(task_id.clone()),
         _ => None,
     };
     let session_id = match existing_session {
         Some(session) => session,
         None => {
-            let parent_permission = ops.session_permission(ctx.session_id).await;
+            let mut parent_permission = ops.session_permission(ctx.session_id).await;
+            parent_permission.extend(ops.agent_denies(ctx.agent).await);
             let child_permission = derive_subagent_session_permission(
                 &parent_permission,
                 &next.permission,
@@ -911,6 +936,7 @@ mod tests {
             FakeOps {
                 depth: 0,
                 agent: Some(SubagentInfo {
+                    primary: false,
                     name: "research".to_string(),
                     model: Some(ModelRef {
                         model_id: "m".to_string(),

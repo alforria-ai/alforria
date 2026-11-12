@@ -118,6 +118,7 @@ impl TaskOps for ProductionTaskOps {
     ) -> BoxFuture<'a, Result<Option<SubagentInfo>, ToolError>> {
         Box::pin(async move {
             Ok(self.agents.get(name).cloned().map(|found| SubagentInfo {
+                primary: found.mode == crate::tool::def::AgentMode::Primary,
                 name: found.name.clone(),
                 model: found.model.as_ref().map(|model| ModelRef {
                     model_id: model.model_id.clone(),
@@ -144,6 +145,34 @@ impl TaskOps for ProductionTaskOps {
     /// (task.ts:131-133).
     fn session_exists<'a>(&'a self, session_id: &'a str) -> BoxFuture<'a, bool> {
         Box::pin(async move { self.sessions.get(session_id).is_ok() })
+    }
+
+    fn owns_session<'a>(&'a self, parent: &'a str, task_id: &'a str) -> BoxFuture<'a, bool> {
+        Box::pin(async move {
+            self.sessions
+                .get(task_id)
+                .is_ok_and(|session| session.parent_id.as_deref() == Some(parent))
+        })
+    }
+
+    fn agent_denies<'a>(&'a self, agent: &'a str) -> BoxFuture<'a, Vec<Rule>> {
+        Box::pin(async move {
+            self.agents
+                .get(agent)
+                .map(|found| {
+                    found
+                        .permission
+                        .iter()
+                        .filter(|rule| rule.action == PermissionV1Action::Deny)
+                        .map(|rule| Rule {
+                            permission: rule.permission.clone(),
+                            pattern: rule.pattern.clone(),
+                            action: "deny",
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
     }
 
     /// `sessions.get(ctx.sessionID).permission ?? []` (task.ts:124-138) —
@@ -632,6 +661,15 @@ mod tests {
         let build = e.ops.agent("build").await.unwrap().expect("build agent");
         assert_eq!(build.name, "build");
         assert!(e.ops.agent("nope").await.unwrap().is_none());
+        // Primary agents are marked, so the tool can refuse the model one.
+        assert!(build.primary);
+        assert!(!e.ops.agent("general").await.unwrap().unwrap().primary);
+        // The plan agent's edit ban is what a child of a plan session inherits.
+        let denies = e.ops.agent_denies("plan").await;
+        assert!(denies
+            .iter()
+            .any(|rule| rule.permission == "edit" && rule.pattern == "*" && rule.action == "deny"));
+        assert!(denies.iter().all(|rule| rule.action == "deny"));
     }
 
     #[tokio::test]
@@ -656,6 +694,12 @@ mod tests {
             .unwrap();
         assert_eq!(e.ops.depth(&parent.id).await.unwrap(), 0);
         assert_eq!(e.ops.depth(&child.id).await.unwrap(), 1);
+        // A task id is only the caller's own child.
+        let stranger = create_session(&e.services.sessions, &e.worktree);
+        assert!(e.ops.owns_session(&parent.id, &child.id).await);
+        assert!(!e.ops.owns_session(&parent.id, &stranger.id).await);
+        assert!(!e.ops.owns_session(&parent.id, &parent.id).await);
+        assert!(!e.ops.owns_session(&stranger.id, &child.id).await);
     }
 
     #[tokio::test]
