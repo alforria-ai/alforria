@@ -31,9 +31,13 @@
 //!   ([`ShellEnvPolicy::deny_names`]: every `provider.*.env[]` of the model
 //!   catalog and of the loaded configs, every `{env:NAME}` the host config
 //!   and each opened project's own config files refer to). `GH_TOKEN`,
-//!   `AWS_*`, `NPM_TOKEN`, `PGPASSWORD` and the
-//!   like are the user's, for the user's tools, and pass as they do
-//!   upstream;
+//!   `NPM_TOKEN`, `PGPASSWORD` and the like are the user's, for the
+//!   user's tools, and pass as they do upstream. A name passes only while
+//!   nothing has taught the policy otherwise: the catalog's names are
+//!   those of every provider it lists, used or not, and the models.dev
+//!   catalog lists `GITHUB_TOKEN` (GitHub Copilot) and the `AWS_*` access
+//!   keys (Amazon Bedrock), so a server with a cached catalog withholds
+//!   those in this posture too, until `allow` names them;
 //! * **restricted** ([`ShellEnvPolicy::restricted`]: the server is
 //!   unattended or reachable from another machine — bearer auth, a
 //!   non-loopback bind, an unattended answer, a webhook, a `webhook` or

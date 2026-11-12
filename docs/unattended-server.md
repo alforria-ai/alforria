@@ -300,12 +300,18 @@ The server runs the agent's processes in one of two postures.
 | When | a developer's own server: bound to loopback, with none of the inputs below | the server is unattended or reachable from another machine (below) |
 | A shell or helper starts from | the server's whole environment | an allowlist: `PATH`, `HOME`, `LANG`, `LC_*`, `TERM`, `TZ`, `USER`, `LOGNAME`, `SHELL`, `TMPDIR`, and the names in `allow` |
 | Withheld from it | what is alforria's own to protect: the server's secrets and the model providers' key variables | that, and every name that looks like a credential |
-| `GITHUB_TOKEN`, `GH_TOKEN`, `AWS_*`, `NPM_TOKEN`, `PGPASSWORD`, `SSH_AUTH_SOCK` | passed, as upstream | withheld unless `allow` names them |
+| The user's other credentials: `GH_TOKEN`, `NPM_TOKEN`, `PGPASSWORD`, `AWS_PROFILE`, `SSH_AUTH_SOCK`, … | passed, as upstream — unless the model catalog or a config lists the name as a provider's variable, which the catalog does for `GITHUB_TOKEN`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `AWS_REGION` (see [What is denied by default](#what-is-denied-by-default)) | withheld unless `allow` names them |
 
 **Standalone is upstream's behaviour with one exception**: alforria's own
-secrets and provider API keys are not passed to the agent's processes. `gh`,
-`aws`, `npm publish`, `psql` and an MCP server that reads a token from its
-environment work as they did.
+secrets and the variables model providers read their keys from are not
+passed to the agent's processes. `npm publish`, `psql`, `gh` with
+`GH_TOKEN` and an MCP server that reads such a token from its environment
+work as they did. The exception is wider than it sounds, because "a
+provider's variable" is every name any provider of the model catalog
+lists: once the catalog is cached, `gh` with `GITHUB_TOKEN` and `aws` with
+`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` find them missing in the
+agent's shell until `"allow": ["GITHUB_TOKEN", "AWS_ACCESS_KEY_ID",
+"AWS_SECRET_ACCESS_KEY", "AWS_REGION"]` hands them back.
 
 Nobody is at the terminal of a restricted server to own the credentials in
 its environment, and no list of secret-looking names is complete; so its
@@ -452,7 +458,15 @@ In **both postures** — alforria's own:
   `provider.*.env` in the host config and from the merged config of each
   project the server opens (a project can declare a provider of its own) —
   whatever it is called and whether or not it holds a secret (a provider
-  that lists an account id or a region there has it withheld too);
+  that lists an account id or a region there has it withheld too). The
+  catalog's names are taken from **every provider it lists, whether or not
+  you use that provider** (`state::learning_catalog`). The models.dev
+  catalog, which is what the server reads from its cache, lists
+  `GITHUB_TOKEN` for GitHub Copilot and `AWS_ACCESS_KEY_ID`,
+  `AWS_SECRET_ACCESS_KEY` and `AWS_REGION` for Amazon Bedrock, among
+  others: on a server with a cached catalog those are withheld in the
+  standalone posture too. A server that has never fetched the catalog
+  learns none of them;
 - every variable a config reads through `{env:NAME}`: the host's files (the
   managed directory, the global config directory, `~/.opencode`, and the
   `OPENCODE_CONFIG*` sources) and each opened project's own config files.
@@ -521,6 +535,11 @@ only if `allow` names `SSH_AUTH_SOCK`.
 - A provider key in a variable that is not shaped like an API key, of a
   provider that neither the catalog nor a loaded config lists, is not
   recognised.
+- In the other direction, the catalog's names over-reach: a variable is
+  withheld because some provider somewhere reads it, not because this
+  server does. `GITHUB_TOKEN` and the `AWS_*` access keys are the ones a
+  developer notices. `allow` is the remedy; there is no setting that turns
+  the catalog's names off.
 - The `{env:NAME}` references of a remote config (`.well-known/opencode`)
   are not learned; its providers' `env` names are.
 - Nothing relaxes the posture or releases a learned name while the server
