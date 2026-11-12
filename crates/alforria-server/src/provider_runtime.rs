@@ -881,14 +881,27 @@ impl RouteLlmSender {
     }
 }
 
+/// Whether a model whose capabilities say nothing about image input is
+/// sent images: no. A model that reads images says so — the catalog's and
+/// the config's models always carry `capabilities.input.image`
+/// (`provider.rs`, false when a custom model lists no `image` input
+/// modality, as upstream) — so a model that declares neither that nor
+/// `attachment` is text-only, and an image for it is replaced by a line
+/// saying so rather than dropped by the provider without a word.
+const UNDECLARED_IMAGE_INPUT: bool = false;
+
 /// What media a runtime model takes. An image goes to a model that lists
 /// the image modality, or that is declared to take attachments at all:
-/// catalogs differ on which of the two they fill in.
+/// catalogs differ on which of the two they fill in. One that declares
+/// neither: [`UNDECLARED_IMAGE_INPUT`].
 fn media_support(model: &Value) -> alforria_core::session::media::MediaSupport {
     let capabilities = &model["capabilities"];
+    let declared = [&capabilities["input"]["image"], &capabilities["attachment"]]
+        .into_iter()
+        .filter_map(Value::as_bool)
+        .reduce(|image, attachment| image || attachment);
     alforria_core::session::media::MediaSupport {
-        image: capabilities["input"]["image"].as_bool().unwrap_or(true)
-            || capabilities["attachment"].as_bool().unwrap_or(false),
+        image: declared.unwrap_or(UNDECLARED_IMAGE_INPUT),
     }
 }
 
@@ -1035,6 +1048,37 @@ fn interpolate_env(url: &str, origins: &alforria_core::config::HostStrings) -> S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A model takes images when it lists the image input or takes
+    /// attachments; one that declares neither is text-only (the CHANGELOG's
+    /// "a custom vision model must now say so").
+    #[test]
+    fn a_model_that_declares_no_image_input_is_text_only() {
+        let image = |model: Value| media_support(&model).image;
+        for (capabilities, expected) in [
+            (json!({ "input": { "image": true } }), true),
+            (json!({ "input": { "image": false } }), false),
+            (
+                json!({ "input": { "image": false }, "attachment": true }),
+                true,
+            ),
+            (
+                json!({ "input": { "image": true }, "attachment": false }),
+                true,
+            ),
+            (json!({ "attachment": true }), true),
+            (json!({ "attachment": false }), false),
+            (json!({ "input": { "text": true } }), false),
+            (json!({}), false),
+        ] {
+            assert_eq!(
+                image(json!({ "capabilities": capabilities })),
+                expected,
+                "{capabilities}"
+            );
+        }
+        assert_eq!(image(json!({})), UNDECLARED_IMAGE_INPUT);
+    }
 
     #[test]
     fn auth_store_never_erases_a_file_it_cannot_parse() {
