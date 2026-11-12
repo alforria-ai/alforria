@@ -444,13 +444,17 @@ the `memory` table, which every query can filter on):
   warning, wherever a tool prints them.
 - The origin is assigned by the server from who is calling. No request body,
   patch or tool argument sets it, over HTTP or through the tool.
-- The origin follows every change. An update that rewrites `content` or
-  `kind` makes the record its new author's: rewritten through the tool it is
+- The origin follows every change. An update that rewrites `content`
+  makes the record its new author's: rewritten through the tool it is
   a tool record of that session; rewritten through `/memory` by the operator
-  it is the user's, and verified. A model, or a token below `admin`,
-  rewriting an unverified record leaves it unverified; only the operator
-  vouches for one. `history` keeps the last 10
-  changes (who, when, which fields).
+  (content or `kind`) it is the user's, and verified. A model, or a token
+  below `admin`, rewriting an unverified record leaves it unverified, and
+  one rewriting a record from a restricted writer (a token below `admin`,
+  a restricted session) leaves it shown to restricted sessions only; only
+  the operator vouches for one. A change of `kind` alone by anyone else
+  leaves the words whose they were: the origin stands, and becomes
+  unverified or restricted if the one who changed it is. `history` keeps
+  the last 10 changes (who, when, which fields).
 - A session that has seen outside content writes unverified records. It
   may update, archive or forget only a record that it saved itself (the
   record's origin names the same session) and that is not verified. Any

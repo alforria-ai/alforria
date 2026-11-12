@@ -881,9 +881,14 @@ impl MemoryService {
             }
             record.metadata = metadata;
         }
+        // New words make the record their author's. A new label on the
+        // same words does not — they are still whoever wrote them's —
+        // except from the user, whose change through `/memory` is what
+        // vouches for a record.
         let rewritten = changed
             .iter()
-            .any(|field| field == "content" || field == "kind");
+            .any(|field| field == "content" || (field == "kind" && by.source == Source::Api));
+        let relabelled = !rewritten && changed.iter().any(|field| field == "kind");
         if patch
             .archived
             .is_some_and(|archived| archived != record.archived)
@@ -893,6 +898,7 @@ impl MemoryService {
         if !changed.is_empty() {
             let was = record.provenance.take();
             let was_verified = record.verified;
+            let was_restricted = was.as_ref().is_some_and(|was| was.restricted);
             let mut history = was
                 .as_ref()
                 .map(|was| was.history.clone())
@@ -918,11 +924,20 @@ impl MemoryService {
                         source: by.source,
                         session_id: by.session_id.clone(),
                         untrusted: by.untrusted || (by.source != Source::Api && unverified_before),
-                        restricted: by.restricted,
+                        // Likewise what a restricted writer's record
+                        // becomes when a model rewrites it.
+                        restricted: by.restricted || (by.source != Source::Api && was_restricted),
                         add_only: false,
                         history: Vec::new(),
                     }
                 }
+                // Relabelled, not rewritten: the origin stands, and can
+                // only lose standing by who touched it.
+                (false, Some(was)) if relabelled => Provenance {
+                    untrusted: was.untrusted || by.untrusted,
+                    restricted: was.restricted || by.restricted,
+                    ..was
+                },
                 (false, Some(was)) => was,
                 // Nothing known about it before, and nothing learned now.
                 (false, None) => Provenance {
@@ -2761,6 +2776,84 @@ mod tests {
 
     /// What a restricted writer saved is injected into restricted sessions
     /// only, and a client's rewrite never vouches for a record.
+    /// Changing only a record's kind does not make its words the changer's:
+    /// a client's note that a trusted session's tool re-kinds is still a
+    /// client's — restricted, not injected into the operator's sessions —
+    /// and an unverified record stays unverified. Only the user's own
+    /// change through `/memory` vouches.
+    #[test]
+    fn a_new_kind_alone_does_not_change_whose_record_it_is() {
+        let temp = TempDir::new("memory-relabel");
+        let storage = Arc::new(Storage::open(temp.path().join("db.sqlite")).unwrap());
+        let memory = service(storage, settings("proj"));
+        let kind = |kind: &str| MemoryPatch {
+            kind: Some(kind.to_string()),
+            ..Default::default()
+        };
+        let client = memory
+            .remember_from(None, "A client said so.", None, Provenance::client())
+            .unwrap();
+        let tool = Provenance::tool("ses_trusted", false);
+
+        let relabelled = memory
+            .update_by(&client.id, &kind("preference"), &tool)
+            .unwrap();
+        assert_eq!(relabelled.kind, "preference");
+        let origin = relabelled.provenance.clone().unwrap();
+        assert_eq!(origin.source, Source::Client);
+        assert!(origin.restricted);
+        assert_eq!(origin.history.last().unwrap().source, Source::Tool);
+        assert_eq!(origin.history.last().unwrap().changed, ["kind"]);
+        let operators = memory.injection_for(false).unwrap_or_default();
+        assert!(!operators.contains("A client said so."), "{operators}");
+
+        // A model's rewrite of it is the model's words, and stays where a
+        // restricted writer's record is shown.
+        let rewritten = memory
+            .update_by(
+                &client.id,
+                &MemoryPatch {
+                    content: Some("A client said so, roughly.".to_string()),
+                    ..Default::default()
+                },
+                &tool,
+            )
+            .unwrap();
+        let origin = rewritten.provenance.unwrap();
+        assert_eq!(origin.source, Source::Tool);
+        assert!(origin.restricted);
+        let operators = memory.injection_for(false).unwrap_or_default();
+        assert!(!operators.contains("A client said so"), "{operators}");
+
+        // An unverified record re-kinded by a trusted session, or by a
+        // client, stays unverified; a client's touch restricts.
+        let outside = memory
+            .remember_from(
+                None,
+                "A page said so.",
+                None,
+                Provenance::tool("ses_o", true),
+            )
+            .unwrap();
+        assert!(!outside.verified);
+        let by_tool = memory.update_by(&outside.id, &kind("fact"), &tool).unwrap();
+        assert!(!by_tool.verified);
+        let by_client = memory
+            .update_by(&outside.id, &kind("note"), &Provenance::client())
+            .unwrap();
+        assert!(!by_client.verified);
+        let origin = by_client.provenance.unwrap();
+        assert_eq!(origin.source, Source::Tool);
+        assert!(origin.untrusted && origin.restricted);
+
+        // The user's change of kind is the user's act, as before.
+        let vouched = memory
+            .update_by(&outside.id, &kind("fact"), &Provenance::api())
+            .unwrap();
+        assert!(vouched.verified);
+        assert_eq!(vouched.provenance.unwrap().source, Source::Api);
+    }
+
     #[test]
     fn a_restricted_writers_records_are_shown_to_its_own_kind_only() {
         let temp = TempDir::new("memory-restricted");

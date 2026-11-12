@@ -467,6 +467,12 @@ pre-1.0, so minor releases may include breaking changes.
   - `GET /memory/search` and `GET /memory/session` answer `400` to a query
     the index cannot read (a NUL character, a full-text syntax error)
     instead of `500`.
+  - A memory update that changes only `kind` no longer makes the record its
+    changer's: a note from a token below `admin` that a session's `memory`
+    tool re-kinded became a verified tool record, injected into the
+    operator's sessions. The origin now stands (and a model's rewrite of a
+    restricted writer's record stays restricted); the operator's own change
+    through `/memory` still vouches.
 
 ### Changed
 
