@@ -50,9 +50,11 @@ same care as any other tool that can execute code on your machine.
   shared or public network.
 - `server.auth.bearer` in the global config adds bearer credentials next to
   Basic: static tokens held as SHA-256 digests and Ed25519 JWTs checked
-  against public keys, each limited to a scope (`chat`, `connector`, `admin`)
-  and, below `admin`, to the directories in `server.directories`. See
-  `docs/unattended-server.md`.
+  against public keys, each limited to a scope (`hook`, `chat`, `connector`,
+  `admin`) and, below `admin`, to the directories in `server.directories`. A
+  `hook` credential calls one webhook trigger and nothing else. The threat
+  model — what each scope can cause, and what the write guard does and does
+  not cover — is in `docs/unattended-server.md`.
 - The server rejects foreign `Origin` headers, permits its own origin and
   loopback names, and accepts extra origins only through `--cors`.
 - PTY websockets refuse foreign origins.
@@ -69,11 +71,15 @@ same care as any other tool that can execute code on your machine.
   every possible secret.
 - `alforria export --sanitize` redacts sensitive transcript and file data.
   Plain `alforria export` does not sanitize anything.
-- The agent's shells (the `bash` tool, terminals, MCP stdio servers) do not
-  inherit the server password or provider API keys from the server's
-  environment; `shell_env` in the global config adjusts what they do inherit.
-  This is not a sandbox: a shell running as the same user can still read the
-  server's files and `/proc/<pid>/environ`. See `docs/unattended-server.md`.
+- The agent's shells and helper processes (the `bash` tool, terminals, MCP
+  stdio servers, language servers, `git`) do not inherit the server password,
+  provider API keys or any variable named `*_API_KEY` / `*_API_TOKEN` from
+  the server's environment. A server that is unattended or reachable from
+  another machine (bearer auth, a non-loopback bind, a webhook, a `webhook`
+  or `watch` trigger, …) starts them from a short allowlist instead.
+  `shell_env` in the global config adjusts both. This is not a sandbox: a
+  shell running as the same user can still read the server's files and
+  `/proc/<pid>/environ`. See `docs/unattended-server.md`.
 
 ### Plugins and MCP servers
 

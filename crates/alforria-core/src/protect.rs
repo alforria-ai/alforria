@@ -2,6 +2,11 @@
 //! must not touch, and that a server with bearer authentication must not
 //! serve as a project (alforria extension).
 //!
+//! A session is *guarded* when it is restricted or carries the
+//! outside-start mark (`SessionMark::OutsideStart`); the outside-content
+//! mark alone guards nothing, and the operator's own sessions have no
+//! guard.
+//!
 //! Two things are protected:
 //!
 //! * **loader names** — `opencode.json`, `.opencode/`, `AGENTS.md`,

@@ -41,11 +41,14 @@ database is.
 alforria's own tables (`session_restriction`, `session_mark`, `session_ceiling`, `outbox`, and the trigger and
 memory tables) are created by one set of migrations
 (`crates/alforria-core/src/storage/alforria_migration.rs`), beside the
-upstream schema and journal, which stay byte-compatible. A migration that
-has shipped is never edited (the tests pin each body's hash); what one got
-wrong is repaired by a later one, as `0008_session_mark_backfill` does for
-databases written by earlier builds of this branch (see "Upgrading a
-database" in `docs/assistant.md`).
+upstream schema and journal, which stay byte-compatible. They are applied
+to every database on first open, whether or not any of these features is
+configured. A migration that has shipped is never edited (the tests pin
+each body's hash); what one got wrong is repaired by a later one, as
+`0008_session_mark_backfill` does for databases written by earlier builds
+of this branch. What `0008`, `0009_memory_directory` and
+`0010_trigger_run_owner` change in an existing database is in
+[Upgrading a database](assistant.md#upgrading-a-database-from-an-earlier-build).
 
 Durations are strings with a unit (`"500ms"`, `"30s"`, `"5m"`, `"2h"`,
 `"1d"`) or a bare number of milliseconds.
@@ -131,8 +134,12 @@ process alone on its data directory can lose:
   The role is an advisory lock (`flock`) on
   `<data>/lock/scheduler-<hash of the directory>.lock`, taken by the first
   process that opens the directory with its scheduler on (`serve`, `web`,
-  the TUI). The same goes for maintenance — event retention and write-ahead
-  log checkpoints — under `<data>/lock/maintenance.lock`.
+  the TUI) — which, with `triggers.enabled` unset, a directory does only
+  once it has a trigger. The same goes for two roles that are the whole
+  data directory's: maintenance — event retention and write-ahead log
+  checkpoints — under `<data>/lock/maintenance.lock`, and webhook delivery
+  (`hook.webhook`) under `<data>/lock/outbox.lock`. The lock files are
+  empty and are left in place.
 - **A claim per fire.** A trigger has one unsettled run across all the
   processes, enforced by a unique index: the insert that records a run as
   queued is the claim, and of two servers that fire the same trigger at the
@@ -187,9 +194,74 @@ Limits:
 | Filesystems without `flock` (some network mounts) | Every process takes itself for the leader: ticks and other fires are still claimed in the database and run once, but each process watches the paths, so a watched change can run once per process if the first run has ended before the second server's debounce does |
 | Webhook deliveries (`hook.webhook`) on a filesystem without `flock` | Every process takes itself for the one that delivers: a delivery can be sent once per process, under the same delivery id, and a hook's order is not kept between them. Receivers deduplicate on the id either way |
 | The webhook rate limit | `triggers.webhook_min_interval` is counted per process: two servers accept one delivery each per interval. Only one runs while the first is unfinished |
+| The outbox's `dropped` counter | Counted per process, since that process started: `GET /attention` on one server does not show what another dropped. `pending` and `failed` are read from the shared table |
 | Different configs | Triggers declared in a config are scheduled by the leader from *its* config. Two servers meant to share a data directory should share the config |
 | A tick taken by a process that died before running it | Given back when the run is found queued under an owner that is gone, which is at the next start or takeover. Until then the trigger shows the run as queued |
 | A build older than this | Knows none of the above. Do not run it beside a newer one on the same data directory |
+
+## After a kill, and the event log: `server.resume`, `storage` (host)
+
+```jsonc
+{
+  "server": { "resume": "none" },        // "none" (default), "notify" or "continue"
+  "storage": {
+    "synchronous": "normal",             // "normal" (default, upstream's) or "full"
+    "retention": { "events": { "max_age": "30d", "keep_last": 2000 } }   // unset: nothing is dropped
+  }
+}
+```
+
+**Repair.** Every running turn leaves a small marker file
+(`<data>/running/`), removed when the turn ends. At startup, before the
+first request, a turn whose process is gone is repaired: its pending and
+running tool calls are closed as errors ("interrupted by a server
+restart"), its assistant message is completed, the session's status is
+idle, and `session.interrupted` is published. This happens on every
+server, whatever it has configured. `server.resume` says what comes next:
+nothing; a note the model reads with the next prompt (`notify`); or a
+prompt that carries the turn on (`continue`). A turn is resumed once — if
+the server dies again while resuming, the turn is left with a note —
+subagents and `!shell` commands are repaired and never resumed, and a
+`/goal` comes back paused. With several servers on the data directory the
+marker is claimed first, so one of them does this (above).
+
+**Durability.** `storage.synchronous: "full"` puts every commit on disk
+before it returns, for machines that are stopped by being killed;
+`"normal"` never corrupts the database but can lose the last few seconds on
+a power cut. The server folds the write-ahead log back into the database
+file every five minutes (a truncating checkpoint) and at a clean shutdown;
+of several servers on one data directory, the one holding the maintenance
+role does.
+
+**Retention.** `storage.retention.events` bounds the event log, which
+otherwise shrinks only when a session is deleted: `max_age` drops older
+events, `keep_last` keeps each session's newest N whatever their age (on
+its own, only those). It is applied at startup and daily, in batches;
+`alforria db prune` applies it on demand. Messages and sessions are never
+touched.
+
+**The reset marker.** `GET /api/session/{id}/event?after=<seq>` replays a
+session's durable events from the log, a page at a time, and then follows
+it live. Sequences are per session and gapless, so a reader can be told
+exactly when it has missed something: wherever the log no longer holds the
+event that follows the last one the reader was given, the stream sends one
+`event.reset` frame *ahead of* the first event after the hole —
+
+```jsonc
+{ "type": "event.reset",
+  "data": { "sessionID": "ses_…",
+            "after": 41,        // the last sequence this reader had (-1: from the start)
+            "earliest": 960,    // the first sequence the log still holds; latest + 1 when none
+            "latest": 1204 } }
+```
+
+— when the reader resumes from before what retention kept, between two
+pages, in the middle of a page a prune is still working through, or when
+nothing is left after the reader's place. A client that sees it must load
+the session afresh (`GET /session/{id}/message`) instead of applying what
+follows to what it has. The marker is not stored and has no sequence of its
+own. A log nothing was pruned from never yields one, so without
+`storage.retention` it does not appear.
 
 ## What the agent's shell can see: `shell_env` (host)
 
@@ -550,6 +622,18 @@ operator's permission policy, and it can never change that policy.**
 `admin` (and Basic auth, which is the operator) executes directly or sets
 policy.
 
+**The callers.** The auth layer attaches a *principal* to every request it
+lets through, and handlers ask one thing of it: whether the caller is
+confined (`Principal::confines`).
+
+| Caller | Credential | Confined | Reaches | May act in |
+| --- | --- | --- | --- | --- |
+| Operator | A server with no authentication; HTTP Basic; an `admin` token | no | every route | any session. In a restricted session its prompts are held to that session's restriction until it lifts it |
+| `connector` | a bearer token | yes | what [Scopes](#scopes) lists for `connector` | restricted sessions only; an operator's session it may read and fork |
+| `chat` | a bearer token | yes | what Scopes lists for `chat` | the same |
+| `hook` | a bearer token bound to one trigger | yes | `POST /trigger/{id}/hook` for that trigger | no session: what it posts is the payload of that trigger's run, in a session made for the run |
+| A request with no principal | none: a route mounted outside the auth layer, or a layer left out | yes | — | nothing more than the narrowest caller. It is never taken for the operator, and the mistake is logged |
+
 How it is enforced, in three layers:
 
 1. The scope table decides which routes a token reaches.
@@ -674,6 +758,19 @@ is shown: `GET /attention`, and the frozen `GET /permission` and
 `GET /question`, list it the ones it may answer and leave out an
 operator's session's. The lists keep upstream's shape.
 
+Every request by which a credential below `admin` names a session:
+
+| Request | In a restricted session | In an operator's session |
+| --- | --- | --- |
+| `GET` on a session route its scope opens (`/session/{id}`, `…/message`, `…/children`, `…/todo`, `…/diff`, `…/goal`), and `GET /api/session/{id}/event` | allowed | allowed: reads cross sessions within an allowed directory |
+| `POST /session/{id}/fork` | allowed | allowed; the fork is restricted, the source untouched |
+| Every other method on every route with a `{sessionID}` in it: `PATCH` and `DELETE /session/{id}`, `POST …/message`, `…/prompt_async`, `…/command`, `…/abort`, `…/init`, `…/summarize`, `…/revert`, `…/unrevert`, `…/permissions/{id}`, and any route of v1, v2 or alforria's own that the scope table opens later | allowed, under the session's restriction | `403`. (A session that does not exist is the handler's `404`; one that cannot be read is a `403`) |
+| `POST /permission/{id}/reply`, `POST /question/{id}/reply`, `…/reject` | allowed for an ask that belongs to it (`once` or `reject`; `always` needs `reply_always`) | `403`: the ask is looked up first and judged by its own session |
+| `GET /attention`, `GET /permission`, `GET /question` | its asks are listed | its asks are left out |
+| `POST /session` with `parentID` | the child is restricted, and is driven by its parent's turn, not by a prompt | the same: the child is restricted and cannot be prompted |
+| `/memory` writes and `GET /memory/session` with `?session=<id>` | judged by that session's policy | refused |
+| `POST` or `PATCH /trigger` with `session: "<id>"` | allowed (see [A trigger that names a session](#a-trigger-that-names-a-session)) | `403`, and again at each run if the session's restriction was lifted since |
+
 - **Forks** are the bridge: a fork made by a restricted caller is restricted
   whatever its source was (`restricted = source restricted || caller
   restricted`); the source is untouched.
@@ -715,9 +812,10 @@ exist. This holds for every caller.
 
 One shared step does the lookup-then-authorise for answers
 (`confine::authorise_answer`) and one for messages and parts
-(`require_owned`). Trigger and memory routes from other branches need the
-same: fetch by the inner id, compare its directory or session with the
-outer scope, then act.
+(`require_owned`). The trigger and memory routes follow the same order: a
+trigger is looked up among the request's directory's, a memory record
+within the instance's project (and, for the `global` project, its
+directory), and an id from elsewhere is a 404.
 
 #### Every field a `chat` token can send
 
@@ -726,7 +824,7 @@ outer scope, then act.
 | any | `?directory=`, `?location[directory]=`, `x-opencode-directory` | the project instance | one resolver (`middleware::directory`): the auth layer asks the allowlist about the value the route then acts in; every spelled directory must be a `server.directories` entry |
 | any | `?workspace=` | a workspace | refused (auth layer) |
 | any `/session/{id}/…` | the session id | the project (the session's own directory) | location layer, same allowlist |
-| any `/session/{id}/…` except `GET` and `fork` | the session id | whose rights later engine turns run with | location layer (403 early) and core (`Caller::may_act_on`): the session must be restricted |
+| any `/session/{id}/…` except `GET` and `fork` | the session id | whose rights later engine turns run with | the route guard (`confine::guard_session_writes`, 403 before the handler) and core (`Caller::may_act_on`): the session must be restricted |
 | `POST /session` | `title`, `metadata` | stored text | not restricted |
 | | `parentID` | a child session | allowed; the child cannot then be prompted by this token |
 | | `agent`, `model` | stored on the session | route: a hidden or subagent-only agent is refused; core: whatever agent a later turn resolves to is judged when it runs |
@@ -779,7 +877,7 @@ the session is.
 | Workflow agents started by the `workflow` tool | child sessions of the session that called the tool: inherited. (Starting a workflow over HTTP is `admin`.) |
 | A fork's notice to the model | the fork, which inherits from its source |
 | Compaction, titles and summaries | side calls to the model, not turns: no agent of anyone's choosing, no tools, no files |
-| Restart resume, triggers (other branches) | must pass `Caller::Session`, and create any session with `CreateInput::restricted` set from whoever the turn is for (a trigger made by a caller below `admin` runs in a restricted session, or is refused on an unrestricted one with `Caller::may_act_on`). A session created with a `parent_id` inherits without being asked |
+| A restart follow-up, a trigger's run | the session, and for a trigger also whoever created it: see [Turns nobody requests](#turns-nobody-requests-and-callers-that-are-not-people). A session a trigger makes is created with `CreateInput::restricted` set from its creator, in the transaction that inserts it; a session created with a `parent_id` inherits without being asked |
 
 `Caller` has no default value: every place that builds a prompt has to say
 which of the three it is, or it does not compile.
@@ -811,63 +909,117 @@ which of the three it is, or it does not compile.
   cannot be read) a project's or a remote config keeps only keys that cannot
   carry a capability — see `server.trust` below. Everything else is dropped
   with a warning naming the file.
-- **A restricted session, or one that outside input started (the *outside
-  start* mark), does not write what the loaders read** — as defence in depth. Every file operation
-  of `edit`, `write` and `apply_patch` (a patch's adds, updates, deletes,
-  and both ends of a move), and the upload route, put the path they are
-  about to modify to one guard (`alforria_core::protect`), at the write and
-  on where the path really leads. It refuses a loader name anywhere on the
-  path — `opencode.json`, `.opencode/`, `AGENTS.md`, `CLAUDE.md`, `.claude/`,
-  `.agents/`, `.git/`, in the project, in an ancestor directory (the loaders
-  walk up, to `/` for a directory that is not a repository) or in the home —
-  and every location the loaders and the server consult for the instance:
-  the global config directory, the managed directory, the data, state and
-  cache directories, the binary's directory, and what the config names
-  (`OPENCODE_CONFIG*`, `skills.paths`, `workflows.paths`, local
-  `instructions`, globs included). The path is resolved the way the kernel
-  resolves it; one that cannot be (a `..` after a directory that does not
-  exist), one whose last component is a symlink, and one through a dangling
-  link are refused outright in such a session: the guard does not guess
-  where they lead. The write is then made on the resolved path that was
-  judged — its parent directory is opened from the root one component at a
-  time with no link followed, and the file is created, replaced or removed
-  through that handle — so a rename or a link swapped in between the check
-  and the write makes the write fail instead of redirecting it.
-  The `edit_loader` permission in the host config hands back *project-level
-  loader files*, per path (`"edit_loader": { "docs/AGENTS.md": "allow" }`, or
-  `"allow"` for all of them) — a grant only a project wrote counts for
-  nothing, and no rule lifts a host location (the data, state, cache, global
-  and managed config directories, the binary's directory). The operator's
-  own sessions are not guarded. The guard goes with the session, not with
-  the server: a restricted or outside-started session continued from the
-  command line (`alforria run --session`) is held to the same set, built by
-  the same constructor (`Protected::for_loaded`). Session revert and
-  unrevert are held to it too: in such a session one that would rewrite or
-  delete a protected file is refused whole (`403`, naming the files) and
-  nothing is restored; the other reverts of the session go through, and
-  write exactly the files that were checked, through the same handle-based
-  write as the tools. To
-  revert past a change to a loader file, lift the restriction
-  (`DELETE /session/{id}/restriction`, `admin`) or restore the file by hand.
-
-  **This is not the control.** A session that may run `bash` writes any
-  file the server's user can, and the guard does not see it. What keeps a project
-  from carrying policy on an unattended server is the two points above —
-  the host's permission ceiling, and project config restricted to keys that
-  carry nothing. Deny `bash` (or run the agent as a user that cannot write
-  these places) if the files themselves must be safe.
-
-  What the write guard does not cover:
-
-  | Not covered | Who can use it | What it means |
-  | --- | --- | --- |
-  | Writes by anything but `write`, `edit`, `apply_patch` and the upload route: `bash`, a formatter, an LSP or MCP server, a workflow script | The session itself, when its policy lets it run them | The guard never sees these. Deny `bash` and do not hand the session such helpers, or run the server as a user that cannot write the loader files |
-  | A directory renamed after the write: the write lands in `plain/`, then `plain` is renamed `.opencode` | A process able to rename inside the project while the session runs — in practice the session's own shell (`bash` allowed) or another local process of the same user | No race is involved and no check at the write can see it. It needs exactly the capability of the row above, so it adds nothing to it. The window between the guard's check and its write is closed (the write goes through the judged directory's handle); names changing afterwards are not something a write-time guard decides |
-  | The last instant of the check-to-write window on a platform without `openat` (Windows) | The same process, racing the write | There is no directory handle to write through. The write is made by name, with the judged path resolved again immediately before each step (creating directories, creating the file, the rename, a removal) and the step refused when the path has changed: a link swapped in before that comparison is refused, one swapped in between the comparison and the system call after it is followed. Unattended deployments are expected on Unix, where the window is closed |
-  | Files a guarded session's revert does not restore | — | In a guarded session revert and unrevert judge every file they mean to write, refuse the whole revert (`403`, nothing written, the session not marked reverted) when one is a protected location, and then write exactly the judged files, each at its judged path through the directory handle — not `git checkout`, which writes by its own listing and by name. So the check and the write cannot disagree and the check-to-write window is closed as for a tool. It is narrower than an operator's revert: a file the snapshot listing leaves out (git-ignored files) and a path the snapshot holds as a symlink or a submodule stay as they are. No `edit_loader` grant is consulted: a revert has no agent |
-  | Sessions without a guard: the operator's own (not restricted, not started by outside input) | — | By design. They write by name, exactly as upstream does |
+- **A restricted session, or one that outside input started, does not write
+  what the loaders read** with `write`, `edit`, `apply_patch`, an upload or a
+  revert. That is defence in depth, described with its limits under
+  [The write guard](#the-write-guard).
 - The host config (`server.*`, `shell_env`, `hook.*`) is never read from the
   project, whatever the agent writes there.
+
+#### One path resolver
+
+Every decision of the form "is this path inside that place" is made on
+where the kernel would land the path, by one function,
+`protect::resolve_path` (`crates/alforria-core/src/protect.rs`): the path is
+walked component by component from the root, a symlink is read where it
+stands, `..` is applied to the *resolved* path so far and never to the
+spelling (`link/../x` with `link -> /elsewhere/dir` is `/elsewhere/x`, not
+`x`), and a path with no such reading — a `..` after a directory that does
+not exist, a link loop, an I/O error — is an error, which every caller
+treats as the refusing answer. It decides:
+
+- the write guard's protected set and the landing of a guarded write;
+- a restricted caller's prompt attachments, `GET /file`, `/file/content`,
+  `/file/raw`, `POST /file/ticket`, a ticket's scope, and uploads and the
+  upload area (`session::caller::resolve_for_access`);
+- the directory allowlist (`server.directories`) and the project roots;
+- a stored trigger's `watch` path, and the watcher's own check
+  (`protect::contains`);
+- whether `read`, `grep` or `glob` returned a file of the upload area.
+
+Code that folds `..` out of a spelling before reading links survives where
+it names things the way upstream does and decides nothing about
+confinement. Each site says so in a comment:
+
+| Lexical site | Why it is safe there |
+| --- | --- |
+| `tool::external_directory::contains_path` | Upstream's `containsPath`: it decides only whether the `external_directory` *ask* is raised for a path a tool was given. What a guarded session may write and what a restricted caller may read are decided by the resolver |
+| `tool::ripgrep::ts_resolve`, `git::lexical_normalize` | Upstream's `path.resolve`: how a tool spells a path in its output and its asks |
+| `path_contains` on the frozen `GET /file` and `GET /file/content` | Upstream's check, kept for the operator's clients only. A credential below `admin` and a file ticket are judged on the resolver's answer, and the read is made on the resolved path |
+| `FSUtil.contains` on the frozen v2 `/api/fs/*` routes | Those routes are `admin` only |
+| `state::resolve_directory` | Upstream's `FSUtil.resolve`, which names the instance. The allowlist is asked separately, with the resolver, and refuses a spelling the two readings disagree about |
+| `trigger::watch::WatchIgnore` | Filters which events of an already-installed watch are reported (`.git`, alforria's own directories); it admits no path |
+| `FileScope.directory` of a file ticket | Compared as a key with the request's directory; the file itself is resolved |
+
+#### The write guard
+
+A restricted session, or one that outside input started (the *outside
+start* mark), does not write what the loaders and the server read — as
+defence in depth. The guard goes with the session, not with the server and
+not with the outside-content mark, and the operator's own sessions have
+none.
+
+**What it covers.** Every one of these puts the path it is about to modify
+to one guard (`alforria_core::protect`, `InstanceContext::about_to_modify`)
+and then writes through it:
+
+| Guarded operation | |
+| --- | --- |
+| `write`, `edit`, `apply_patch` | Every file operation: a patch's adds, updates and deletes, both ends of a move, and the rewrite after formatting (`InstanceContext::write_file` / `remove_file`) |
+| Uploads (`PUT /file/content`) | The temporary file is created and renamed into place through the judged directory's handle, for every caller |
+| Session revert and unrevert | In a guarded session every file the restore means to write is judged first — a snapshot restore's listed files, the reverted patches' files, both ends of a rename, each deletion. One protected file refuses the whole revert (`403`, naming the files): nothing is restored and the session is not marked reverted. Otherwise exactly the judged files are written, each at its judged path through the directory handle; `git checkout` writes nothing |
+
+**What it protects.** A loader name anywhere on the resolved path —
+`opencode.json`, `.opencode/`, `AGENTS.md`, `CLAUDE.md`, `.claude/`,
+`.agents/`, `.git/`, in the project, in an ancestor directory (the loaders
+walk up, to `/` for a directory that is not a repository) or in the home —
+and every location the loaders and the server consult for the instance: the
+global config directory, the managed directory, the data, state and cache
+directories, the binary's directory, and what the config names
+(`OPENCODE_CONFIG*`, `skills.paths`, `workflows.paths`, local
+`instructions`, globs included, and the files a `formatter.<name>.command`
+or `lsp.<name>.command` is spelled with). The set is built by one
+constructor (`Protected::for_loaded`) for the server's instances and for
+`alforria run --session` alike, so a guarded session continued from the
+command line is held to the same set.
+
+**How a write is made.** The path is resolved the way the kernel resolves
+it ([One path resolver](#one-path-resolver)); one that cannot be resolved,
+one whose last component is a symlink, and one through a dangling link are
+refused outright: the guard does not guess where they lead. The write is
+then made on the resolved path that was judged — its parent directory is
+opened from the root one component at a time with no link followed
+(`O_NOFOLLOW`, creating what is missing), and the file is created, replaced
+or removed through that handle — so a rename or a link swapped in between
+the check and the write makes the write fail instead of redirecting it.
+
+**The grant.** The `edit_loader` permission in the host config hands back
+*project-level loader files*, per path
+(`"edit_loader": { "docs/AGENTS.md": "allow" }`, or `"allow"` for all of
+them). A grant only a project wrote counts for nothing, no rule lifts a
+host location (the data, state, cache, global and managed config
+directories, the binary's directory), and a revert consults no grant: it
+has no agent. To revert past a change to a loader file, lift the
+restriction (`DELETE /session/{id}/restriction`, `admin`) or restore the
+file by hand.
+
+**This is not the control.** A session that may run `bash` writes any file
+the server's user can, and the guard does not see it. What keeps a project
+from carrying policy on an unattended server is the host's permission
+ceiling and project config restricted to keys that carry nothing. Deny
+`bash` (or run the agent as a user that cannot write these places) if the
+files themselves must be safe.
+
+**What the write guard does NOT cover:**
+
+| Not covered | Who can use it | What it means |
+| --- | --- | --- |
+| `bash` and every other process: a formatter, a language server, an MCP server, a workflow script | The session itself, when its policy lets it run them | The guard never sees these writes. Deny `bash` and do not hand the session such helpers, or run the server as a user that cannot write the loader files |
+| Unguarded sessions: the operator's own (not restricted, not started by outside input) | — | By design. They write by name, exactly as upstream does, and revert with git's whole-tree restore |
+| A rename after the write: the write lands in `plain/`, then `plain` is renamed `.opencode` | A process able to rename inside the project while the session runs — in practice the session's own shell (`bash` allowed) or another local process of the same user | No race is involved and no check at the write can see it. It needs exactly the capability of the first row, so it adds nothing to it. The window between the check and the write is closed; names changing afterwards are not something a write-time guard decides |
+| The last instant before the write on a platform without `openat` (not Unix: Windows) | A process racing the write | There is no directory handle to write through. The write is made by name, with the judged path resolved again immediately before each step (creating directories, creating the file, the rename, a removal) and the step refused when it no longer resolves to itself. A link swapped in before that comparison is refused; one swapped in between the comparison and the system call after it is followed. Unattended deployments are expected on Unix, where the window is closed |
+| Files a guarded revert leaves alone | — | A guarded revert is narrower than an operator's: a file the snapshot listing leaves out (git-ignored files) and a path the snapshot holds as a symlink or a submodule stay as they are |
+| Names nobody listed | — | The agent's own edit tools are not refused the build and tool config names an upload is (`package.json`, `Makefile`, …): editing them is its work |
 
 #### `server.trust` (host)
 
@@ -960,11 +1112,14 @@ are already the right ones for the run:
 | --- | --- | --- |
 | A `webhook` or `watch` trigger, or any run that carries a payload | no session, ever | The read-only ceiling and the outside-start mark belong on a session made for the run. |
 | One a session's `schedule` tool made (it has creator's bounds) | only that very session — `current` — and only for `cron`, `interval`, `at`, `in` | The run is a turn of the conversation that asked for it, under that conversation's policy and marks as they then stand: the creator *is* the session, so there are no separate bounds to lose. Any other session would need the creator's bounds held over it. |
+| One with recorded creator's bounds and no creating session | no session | Its bounds can only be stored on a session of its own. |
 | One written after outside content was seen | only a session that already has the outside-content mark | With `current` that is the creating session itself. A session that has seen outside content cannot change a trigger that runs in a conversation that has not. |
 | One the operator wrote (the config, an `admin` request) | any session of this directory | It has no bounds of its own; the run is a turn under that session's policy. Its `permission` block is not applied there — the block becomes the rules of a session the trigger makes. |
 | One a `chat` or `connector` request created | a restricted session of this directory | `Caller::may_act_on`: it cannot schedule into an operator's session. |
 
-The rule is one function (`trigger::rules::check_named_session`), asked
+The same table, from the side of someone writing a trigger, is in
+[assistant.md](assistant.md#which-session-a-trigger-may-name). The rule is
+one function (`trigger::rules::check_named_session`), asked
 when a trigger is created, when its `session` or its kind is changed, and
 again when each run starts. A trigger stored by an earlier build, one
 whose target lost its restriction, or a run that arrives with a payload is
@@ -979,7 +1134,7 @@ which a client can write:
 | Mark | Cause | Effect |
 | --- | --- | --- |
 | **restricted** | A caller below `admin` created the session (this page). | Who may drive it, and what its turns may do. |
-| **outside start** | A `webhook` or `watch` trigger started a run in it, or a trigger run delivered a payload. | The read-only ceiling: the rules the run was given are a ceiling nothing widens. The project's standing `always` approvals do not apply, an `ask` is a deny at once, and `permission.unattended` never answers for it — `on_timeout: "allow"` included. It cannot change existing memory records or write loader files. A fork keeps its rules along with its text. |
+| **outside start** | A `webhook` or `watch` trigger started a run in it, a trigger run delivered a payload, or it was imported with `alforria import --untrusted`. | The read-only ceiling: the rules the run was given are a ceiling nothing widens. The project's standing `always` approvals do not apply, an `ask` is a deny at once, and `permission.unattended` never answers for it — `on_timeout: "allow"` included. It cannot change existing memory records or write loader files ([The write guard](#the-write-guard)), and its shells get the restricted environment. A fork keeps its rules along with its text. |
 | **outside content** | A tool that returns somebody else's content answered in the session (`webfetch`, `websearch`, any MCP tool, a read from the upload area or a search that returned a file of it, an unverified memory record, an excerpt of a marked session, a marked subagent's result — returned by the `task` tool or delivered later as a message when a background subagent finishes), a caller below `admin` attached a file to a prompt, or the run belongs to a trigger a marked session wrote. Always set together with *outside start*. | Provenance: memory it writes is unverified and not injected into later sessions; of existing memory it may change or delete only unverified records it saved itself; triggers it schedules carry the mark; its transcript excerpts are fenced. **No tool's permission changes**: an operator's interactive session keeps working as before after a web search. |
 
 The full list of causes, and the test that keeps the tool list complete, is
@@ -1442,13 +1597,17 @@ asked the model for:
   with each upload it writes; it does not walk per upload. What an upload
   replaces is read at the moment of its rename, under that directory's
   lock, so uploads racing for one file are each counted for what they
-  really replaced. What is added
-  or removed by other means (the agent's shell deleting old uploads) is
-  noticed when the directory is counted again: at most every 5 minutes,
-  and after a restart. A recount always counts, whatever is uploaded while
-  it runs: the new figure is what the walk saw plus what uploads added
-  meanwhile (so it can read high until the next one, never low). `admin` and the operator are held to `max_bytes`
-  only, and their uploads are likewise noticed at the next count.
+  really replaced, and directories made for an upload are counted when
+  they are made. What is added or removed by other means (the agent's
+  shell deleting old uploads) is noticed when the directory is counted
+  again: at most every 5 minutes, and after a restart. A recount's result
+  is always taken, whatever is uploaded while it runs: the new figure is
+  what the walk saw plus what uploads added since it began, so it can read
+  high until the next recount and never low. One recount runs at a time
+  per directory, with no lock held across the walk; uploads that arrive
+  meanwhile go by the running count. `admin` and the operator are held to
+  `max_bytes` only, and their uploads are likewise noticed at the next
+  count.
 
 While bearer tokens are configured, no language server is started on a
 file inside an upload directory — reading or editing `uploads/x.ts` gives
