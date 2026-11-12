@@ -73,12 +73,13 @@
 //!   exits — not deleting the trigger, not [`install`];
 //! * the per-run floor, [`apply_shell_for`]: a process started for a
 //!   session that is restricted or that outside input started gets the
-//!   restricted selection whatever the process-wide posture is. The bash
-//!   tool asks it for a session with a write guard (restricted, or the
-//!   outside-start mark); the session `shell` command and inline template
-//!   shell for a session with the outside-start mark. Terminals, worktree
-//!   start scripts and helpers have no session and follow the process-wide
-//!   posture.
+//!   restricted selection whatever the process-wide posture is. One
+//!   predicate, `SessionStore::runs_restricted` (the session is
+//!   restricted, or has the outside-start mark), decides it for the bash
+//!   tool (which reads it off the session's write guard, set by the same
+//!   predicate), the session `shell` command and inline template shell.
+//!   Terminals, worktree start scripts and helpers have no session and
+//!   follow the process-wide posture.
 //!
 //! The policy comes from `shell_env` in the host config
 //! (`config::host::load_host_config`) and is process-wide: [`install`] it

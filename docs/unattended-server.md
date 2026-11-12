@@ -345,7 +345,7 @@ The other controls on this page each follow their own, narrower condition:
 | Control | What governs it |
 | --- | --- |
 | The posture of the agent's shells and helpers, server-wide | `unattended_or_remote` (the table above), and the ratchet below |
-| The environment of one session's `bash` tool | That, or the floor below: the session is restricted or carries the outside-start mark |
+| The environment of one session's `bash` tool, `shell` command and inline template shell | That, or the floor below: the session is restricted or carries the outside-start mark |
 | What a project's or a remote config may set and read (capability keys, `{env:}`, `{file:}`) | `HostMode::restricted` (`config/precedence.rs`): `server.trust.project`, which defaults to `"restricted"` with bearer auth and `"full"` without; and always while the host config does not load. A non-loopback bind, a webhook or a trigger does **not** restrict project config. See [`server.trust`](#servertrust-host) |
 | Which routes a request reaches, and which directories | The credential: its scope (`hook`, `chat`, `connector`, `admin`; Basic auth and a server with no authentication are the operator) and `server.directories`. See [Scopes](#scopes) |
 | Which sessions a request may act in | `confine::may_act_on`: a credential below `admin` acts in restricted sessions only. See [Whose session it is](#whose-session-it-is) |
@@ -388,19 +388,17 @@ restart re-evaluates. The other inputs (`server.auth.bearer`,
 `server.trust`) are read when the server starts, like the rest of the host
 config, so changing them takes a restart in either direction.
 
-**The floor: a run that outside input started is always restricted.**
-Independently of the server's posture at that moment:
-
-- the `bash` tool of a session that is restricted (a `chat` or `connector`
-  credential created it, or an ancestor of it) or that carries the
-  outside-start mark (a webhook or watch trigger's run, its subagents and
-  forks) gets the restricted environment — the same condition as the write
-  guard;
-- the session `shell` command and inline shell in command templates get it
-  in a session that carries the outside-start mark. (A restricted session
-  runs no inline shell at all, and the `shell` command is the operator's
-  own: in a restricted session without the mark it follows the server's
-  posture.)
+**The floor: a restricted session, and a run that outside input started,
+always get the restricted environment.** Independently of the server's
+posture at that moment, one condition — the same as the write guard's
+(`SessionStore::runs_restricted`) — decides it for every shell a session
+starts: the session is restricted (a `chat` or `connector` credential
+created it, or an ancestor of it) or carries the outside-start mark (a
+webhook or watch trigger's run, its subagents and forks). Then its `bash`
+tool, the session `shell` command — the operator's own command included —
+and inline shell in command templates all get the restricted environment.
+(A restricted session runs no inline shell at all; the condition is the
+same there all the same.)
 
 The floor does not cover terminals (`/pty`, an `admin` route with no
 session) or worktree start scripts, nor the helpers shared by a whole

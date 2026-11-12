@@ -216,9 +216,10 @@ pre-1.0, so minor releases may include breaking changes.
   (`*_TOKEN`, `*_KEY`, `*_SECRET`, `AWS_*`, …) denied, for shells, MCP stdio
   servers, language servers and git alike. The posture is logged at startup,
   tightens (never relaxes) when such a trigger or listener appears while the
-  server runs, and is shown by `GET /server/posture` (admin). A run that a
-  webhook or watch trigger started, and the `bash` tool of a restricted
-  session, always get the restricted environment. In either posture the
+  server runs, and is shown by `GET /server/posture` (admin). The shells of
+  a run that a webhook or watch trigger started, and of a restricted
+  session — its `bash` tool, the `shell` command and inline template
+  shell — always get the restricted environment. In either posture the
   server's own secrets, provider key variables, `*_API_KEY` /
   `*_API_TOKEN` names, the names learned from configs and the key
   variables of the catalog providers in use are withheld (see Changed).

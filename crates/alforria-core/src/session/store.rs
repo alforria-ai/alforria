@@ -1019,6 +1019,18 @@ impl SessionStore {
         self.marked_or_unknown(session_id, SessionMark::OutsideStart)
     }
 
+    /// Whether what runs for the session is held to the restricted
+    /// session's floor: the session is restricted
+    /// ([`SessionStore::is_restricted`]) or outside input started a run in
+    /// it ([`SessionMark::OutsideStart`]). The one predicate behind the
+    /// write guard of the session's tools and the restricted shell
+    /// environment of its bash tool, `shell` command and inline template
+    /// shell (`shell_env::apply_shell_for`). Fails closed: a restriction or
+    /// a mark that cannot be read counts as one.
+    pub fn runs_restricted(&self, session_id: &str) -> bool {
+        self.started_by_outside_input(session_id) || self.is_restricted(session_id).unwrap_or(true)
+    }
+
     /// Set a mark, for life. Setting [`SessionMark::OutsideStart`] sets
     /// [`SessionMark::OutsideContent`] too.
     pub fn mark(&self, session_id: &str, mark: SessionMark) -> Result<(), SessionError> {

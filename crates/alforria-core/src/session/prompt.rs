@@ -351,12 +351,10 @@ impl SessionPrompt {
             return Err(PromptError::Forbidden { message });
         }
         let sh = preferred(deps.config.shell.as_deref());
-        // Inline shell of a session that outside input started runs in the
-        // restricted environment, whatever the server's posture.
-        let outside_run = deps
-            .services
-            .sessions
-            .started_by_outside_input(&input.session_id);
+        // Inline shell of a session that is restricted or that outside
+        // input started runs in the restricted environment, whatever the
+        // server's posture: the same floor as the session's bash tool.
+        let outside_run = deps.services.sessions.runs_restricted(&input.session_id);
         let template =
             expand_command_template(&cmd.template, &input.arguments, &sh, outside_run).await;
         let template = template.trim().to_string();
@@ -1117,13 +1115,12 @@ pub async fn shell_impl(
     let sh = preferred(deps.config.shell.as_deref());
     let cwd = deps.instance.directory.clone();
     let mut command = tokio::process::Command::new(&sh);
-    // The operator's own command, but in a session a webhook or a watch
-    // trigger started it still gets the restricted environment.
+    // The operator's own command, but in a restricted session, or one a
+    // webhook or a watch trigger started, it still gets the restricted
+    // environment: the same floor as the session's bash tool.
     crate::shell_env::apply_shell_for(
         command.as_std_mut(),
-        deps.services
-            .sessions
-            .started_by_outside_input(&input.session_id),
+        deps.services.sessions.runs_restricted(&input.session_id),
     );
     command
         .arg("-c")
@@ -1432,6 +1429,102 @@ mod substitution_tests {
         )
         .await;
         assert_eq!(out, "[x;y $(z)][`w`]");
+    }
+
+    /// The per-run floor follows one predicate
+    /// (`SessionStore::runs_restricted`) wherever a session starts a
+    /// shell: on a standalone server the `shell` command and the inline
+    /// template shell of a restricted session — one with no outside-start
+    /// mark — get the restricted environment, as its bash tool does
+    /// (`tool::shell`'s floor test), and so do those of a session with the
+    /// mark alone. A session of the user's own keeps the user's
+    /// environment.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_restricted_sessions_shell_command_and_inline_shell_get_the_restricted_environment() {
+        use super::{expand_command_template, ShellInput};
+        use crate::session::store::SessionMark;
+        use crate::session::test_support::{create_engine_session, engine_with_config};
+        use alforria_schema::session_v1::{V1Part, V1ToolState};
+
+        std::env::set_var("FLOORSHELL_GITHUB_TOKEN", "ghp-floor-leak");
+        std::env::set_var("FLOORSHELL_PLAIN", "plain-floor-leak");
+        assert!(
+            !crate::shell_env::current().is_restricted(),
+            "the server's own posture is standalone in this test"
+        );
+        let e = engine_with_config(
+            "prompt-floor-shell",
+            Vec::new(),
+            serde_json::json!({ "shell": "sh" }),
+        );
+        let sessions = &e.services.sessions;
+        let probe = "printf '[%s][%s][%s]' \"$FLOORSHELL_GITHUB_TOKEN\" \"$FLOORSHELL_PLAIN\" \"${PATH:+path}\"";
+        let template = format!("!`{probe}`");
+        let shell = |session_id: String| async {
+            let turn = e
+                .prompt
+                .shell(ShellInput {
+                    session_id,
+                    message_id: None,
+                    agent: "build".to_string(),
+                    model: None,
+                    command: probe.to_string(),
+                })
+                .await
+                .expect("the shell command runs");
+            turn.parts
+                .iter()
+                .find_map(|part| match part {
+                    V1Part::Tool {
+                        state: V1ToolState::Completed { output, .. },
+                        ..
+                    } => Some(output.trim().to_string()),
+                    _ => None,
+                })
+                .expect("a completed shell part")
+        };
+        const OWN: &str = "[ghp-floor-leak][plain-floor-leak][path]";
+        const FLOOR: &str = "[][][path]";
+
+        // The user's own session.
+        let own = create_engine_session(&e);
+        assert!(!sessions.runs_restricted(&own.id));
+        assert_eq!(shell(own.id.clone()).await, OWN);
+        assert_eq!(
+            expand_command_template(&template, "", "sh", sessions.runs_restricted(&own.id)).await,
+            OWN
+        );
+
+        // A restricted session that no outside input started.
+        let restricted = create_engine_session(&e);
+        sessions.restrict(&restricted.id).unwrap();
+        assert!(!sessions.started_by_outside_input(&restricted.id));
+        assert_eq!(shell(restricted.id.clone()).await, FLOOR, "shell command");
+        assert_eq!(
+            expand_command_template(
+                &template,
+                "",
+                "sh",
+                sessions.runs_restricted(&restricted.id)
+            )
+            .await,
+            FLOOR,
+            "inline template shell"
+        );
+
+        // The outside-start mark alone.
+        let marked = create_engine_session(&e);
+        sessions
+            .mark(&marked.id, SessionMark::OutsideStart)
+            .unwrap();
+        assert!(!sessions.is_restricted(&marked.id).unwrap());
+        assert_eq!(shell(marked.id.clone()).await, FLOOR, "a marked session");
+
+        assert!(
+            !crate::shell_env::current().is_restricted(),
+            "the floor did not go through the server's posture"
+        );
     }
 
     #[test]

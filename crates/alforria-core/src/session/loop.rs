@@ -669,9 +669,9 @@ pub async fn run_loop(
                     bypass_agent_check,
                     prompt_ops: deps.prompt_ops.clone(),
                     cancel: cancel.clone(),
-                    // A restriction that cannot be read counts as one.
-                    guard_loader_paths: deps.sessions.started_by_outside_input(&session.id)
-                        || deps.sessions.is_restricted(&session.id).unwrap_or(true),
+                    // The session's floor: with the guard its bash tool
+                    // gets the restricted shell environment too.
+                    guard_loader_paths: deps.sessions.runs_restricted(&session.id),
                 },
             )
             .await?;
