@@ -208,11 +208,16 @@ The key is `shell_env` rather than `shell.env` because upstream's `shell` is
 a string (the shell to run).
 
 Every process the agent or a client drives starts from this policy instead
-of the server's whole environment: the `bash` tool, the session `shell`
-command, `` !`cmd` `` substitutions in command templates, terminals (`/pty`)
-and worktree start scripts ("shells"), and the helpers the server starts —
-MCP stdio servers, language servers and the commands that look for one,
-and the server's own `git` calls.
+of the server's whole environment. There are two kinds:
+
+- **shells** — the `bash` tool, the session `shell` command, `` !`cmd` ``
+  substitutions in command templates, terminals (`/pty`) and worktree start
+  scripts;
+- **helpers** the server starts — MCP stdio servers, language servers and
+  the commands that look for one, and the server's own `git` calls.
+
+The implementation and its module documentation are
+`crates/alforria-core/src/shell_env.rs`; the two say the same thing.
 
 ### Two postures
 
@@ -220,7 +225,7 @@ The server runs the agent's processes in one of two postures.
 
 | | **Standalone** | **Restricted** |
 | --- | --- | --- |
-| When | a developer's own server: bound to loopback, with none of the features on the right | the server is unattended or reachable from another machine (below) |
+| When | a developer's own server: bound to loopback, with none of the inputs below | the server is unattended or reachable from another machine (below) |
 | A shell or helper starts from | the server's whole environment | an allowlist: `PATH`, `HOME`, `LANG`, `LC_*`, `TERM`, `TZ`, `USER`, `LOGNAME`, `SHELL`, `TMPDIR`, and the names in `allow` |
 | Withheld from it | what is alforria's own to protect: the server's secrets and the model providers' key variables | that, and every name that looks like a credential |
 | `GITHUB_TOKEN`, `GH_TOKEN`, `AWS_*`, `NPM_TOKEN`, `PGPASSWORD`, `SSH_AUTH_SOCK` | passed, as upstream | withheld unless `allow` names them |
@@ -230,73 +235,109 @@ secrets and provider API keys are not passed to the agent's processes. `gh`,
 `aws`, `npm publish`, `psql` and an MCP server that reads a token from its
 environment work as they did.
 
-**Restricted applies when any of these holds** — one predicate,
-`unattended_or_remote`:
-
-- `server.auth.bearer` is configured (`keys` or `tokens_sha256`);
-- the listener is bound to an address that is not loopback (`--hostname
-  0.0.0.0`, a LAN address, a host name other than `localhost`);
-- `permission.unattended` or `question.unattended` answers for nobody
-  (an `on_timeout` other than `wait`);
-- `hook.webhook` lists a webhook;
-- triggers are enabled and a `webhook` or `watch` trigger exists, in the host
-  config or stored;
-- the host says so: `server.trust.project: "restricted"`.
-
-Nobody is at the terminal of such a server to own the credentials in its
-environment, and no list of secret-looking names is complete; so its
+Nobody is at the terminal of a restricted server to own the credentials in
+its environment, and no list of secret-looking names is complete; so its
 processes get a fixed, small environment and the host adds to it by name.
 `allow` takes exact names, not patterns:
 `"allow": ["HTTPS_PROXY", "NO_PROXY", "CARGO_HOME"]`.
 
-This predicate decides the shell environment's posture and nothing else.
-What a project's config may set and read (`server.trust.project`, restricted
-by default with bearer auth only) and what a token may do (its scope) are
-decided separately, as described further down.
+### What selects the posture: `unattended_or_remote`
 
-The posture is logged once when the server starts, with its reasons, and an
-operator can read it from `GET /server/posture` (Basic auth or an `admin`
-token):
+One predicate, `ServerPolicy::unattended_or_remote`
+(`crates/alforria-server/src/policy.rs`). The posture is restricted when any
+of its inputs holds; each has a name, which is what the log and
+`GET /server/posture` report.
+
+| Input | Reported as | Read |
+| --- | --- | --- |
+| `server.auth.bearer` is configured (`keys` or `tokens_sha256`) | `bearer-auth` | when the server starts |
+| The host config says `server.trust.project: "restricted"` (written out; the default that bearer auth brings is the row above) | `trust-project-restricted` | when the server starts |
+| The listener is bound to something other than `localhost` or a loopback address (`127.0.0.0/8`, `::1`): `--hostname 0.0.0.0`, a LAN address, any other host name | `non-loopback-bind` | when the server starts, and again whenever a listener is bound |
+| `permission.unattended` answers for nobody (an `on_timeout` other than `wait`) | `permission-unattended` | when the server starts |
+| `question.unattended` answers for nobody (`on_timeout: "reject"`) | `question-unattended` | when the server starts |
+| `hook.webhook` lists a webhook | `hook-webhook` | when the server starts |
+| A `webhook` or `watch` trigger exists that is not `enabled: false`, and triggers are not switched off (`triggers.enabled: false`): declared in the host config, or stored in the database for any directory (stored ones are not counted under `OPENCODE_DISABLE_TRIGGERS`; if the table cannot be read, one is assumed) | `webhook-or-watch-trigger` | when the server starts, and whenever one appears (below) |
+
+A `cron`, `interval` or `at` trigger is not an input, and neither is memory.
+
+**This predicate decides the shell environment's posture and nothing else.**
+The other controls on this page each follow their own, narrower condition:
+
+| Control | What governs it |
+| --- | --- |
+| The posture of the agent's shells and helpers, server-wide | `unattended_or_remote` (the table above), and the ratchet below |
+| The environment of one session's `bash` tool | That, or the floor below: the session is restricted or carries the outside-start mark |
+| What a project's or a remote config may set and read (capability keys, `{env:}`, `{file:}`) | `HostMode::restricted` (`config/precedence.rs`): `server.trust.project`, which defaults to `"restricted"` with bearer auth and `"full"` without; and always while the host config does not load. A non-loopback bind, a webhook or a trigger does **not** restrict project config. See [`server.trust`](#servertrust-host) |
+| Which routes a request reaches, and which directories | The credential: its scope (`hook`, `chat`, `connector`, `admin`; Basic auth and a server with no authentication are the operator) and `server.directories`. See [Scopes](#scopes) |
+| Which sessions a request may act in | `confine::may_act_on`: a credential below `admin` acts in restricted sessions only. See [Whose session it is](#whose-session-it-is) |
+| What the turns of a session may do | The session's stored restriction (a caller below `admin` created it, or an ancestor of it) and its ceilings |
+| The write guard over loader files and host locations | The session: restricted, or the outside-start mark. Not the server's posture, not the outside-content mark. See [The write guard](#the-write-guard) |
+| The read-only ceiling of a run | The session's outside-start mark |
+| Whether memory a session writes is verified, and which records it may change | The session's outside-content mark |
+| The startup refusal for overlapping directories; no language server or formatter on files in an upload directory | `server.auth.bearer` being configured |
+| The upload area, its name lists and its quota | The credential being below `admin` |
+
+**It is logged and can be read.** The posture is logged once when the server
+starts, with its reasons, and an operator can read it from
+`GET /server/posture` — an alforria route outside the frozen tables; Basic
+auth, an `admin` token, or a server with no authentication:
 
 ```jsonc
 {
-  "unattendedOrRemote": true,
-  "reasons": ["bearer-auth", "non-loopback-bind"],  // at startup; also trust-project-restricted,
-                                                     // permission-unattended, question-unattended,
-                                                     // hook-webhook, webhook-or-watch-trigger
+  "unattendedOrRemote": true,                        // an input held at startup, or one appeared since
+  "reasons": ["bearer-auth", "non-loopback-bind"],   // as they stood at startup
   "tightened": [],                                   // reasons that appeared since
-  "shellEnv": { "posture": "restricted", "inherit": "default" }
+  "shellEnv": {
+    "posture": "restricted",                         // or "standalone": what the next process gets
+    "inherit": "default"                             // or "configured": the host set shell_env.inherit
+  }
 }
 ```
 
-**The posture only tightens while the server runs.** When a `webhook` or
-`watch` trigger is created after startup — over HTTP, by the `schedule`
-tool, or by a project config read when a directory is opened — or a listener
-is bound beyond loopback, the server switches to the restricted posture from
-the next process on, logs it once with the reason and lists it under
-`tightened`. Deleting the trigger does not switch it back; a restart
-re-evaluates. The other settings (`server.auth.bearer`,
+**The ratchet: the posture tightens while the server runs and never
+relaxes.** When a `webhook` or `watch` trigger is stored after startup —
+over HTTP or by the `schedule` tool — or is found in a config read when a
+directory is opened (your own config: the host files or an `OPENCODE_CONFIG*`
+source; a `trigger` block in a project's files is ignored), or a listener
+is bound beyond loopback, the process-wide policy switches to the restricted
+posture from the next process on. The reason is listed under `tightened`,
+and the switch is logged as a warning (a reason that arrives when the
+posture is already restricted is listed and not logged again). Deleting the
+trigger does not switch it back, and neither does anything else: only a
+restart re-evaluates. The other inputs (`server.auth.bearer`,
 `permission.unattended`, `question.unattended`, `hook.webhook`,
 `server.trust`) are read when the server starts, like the rest of the host
-config.
+config, so changing them takes a restart in either direction.
 
-**A run that outside input started is always restricted.** A process started
-for a session that carries the outside-start mark — a webhook or watch
-trigger's run, its subagents and forks — or for a restricted session (one a
-`chat` or `connector` credential created) gets the restricted environment
-whatever the server's posture is at that moment. This covers the `bash`
-tool, the session `shell` command and inline shell in command templates. It
-does not cover helpers shared by a whole project (MCP servers, language
-servers, `git`): those follow the server's posture.
+**The floor: a run that outside input started is always restricted.**
+Independently of the server's posture at that moment:
+
+- the `bash` tool of a session that is restricted (a `chat` or `connector`
+  credential created it, or an ancestor of it) or that carries the
+  outside-start mark (a webhook or watch trigger's run, its subagents and
+  forks) gets the restricted environment — the same condition as the write
+  guard;
+- the session `shell` command and inline shell in command templates get it
+  in a session that carries the outside-start mark. (A restricted session
+  runs no inline shell at all, and the `shell` command is the operator's
+  own: in a restricted session without the mark it follows the server's
+  posture.)
+
+The floor does not cover terminals (`/pty`, an `admin` route with no
+session) or worktree start scripts, nor the helpers shared by a whole
+project (MCP servers, language servers, `git`): those follow the server's
+posture.
 
 ### Choosing for yourself
 
 `shell_env` overrides the posture's defaults in either direction:
 
 - `inherit` set (`"all"`, `"none"` or a list) replaces the default selection
-  for shells in either posture, still minus the denied names. On a restricted
-  server helpers keep the allowlist in addition, so that `git` and a language
-  server still find `PATH` and `HOME` under `"inherit": "none"`.
+  for shells in either posture, still minus the denied names. Helpers do not
+  follow it downwards: on a standalone server they start from everything
+  that is not denied whatever `inherit` says, and on a restricted server
+  they keep the allowlist and gain what `inherit` adds, so that `git` and a
+  language server still find `PATH` and `HOME` under `"inherit": "none"`.
 - `allow` releases an exact name from every default denial, in the case it
   is written in, and adds it to the allowlist. It is how a restricted server
   hands the agent a credential (`"allow": ["GITHUB_TOKEN", "AWS_PROFILE"]`),
@@ -304,7 +345,8 @@ servers, `git`): those follow the server's posture.
 - `deny` withholds names or patterns in either posture and is the one thing
   `allow` does not lift. A standalone host that wants the restricted denials
   writes them: `"deny": ["*_TOKEN", "*_KEY", "*_SECRET", "AWS_*"]`.
-- `set` wins over everything, for shells.
+- `set` wins over everything, for shells; helpers take their own configured
+  `environment` instead.
 
 A variable reaches a shell when, in order:
 
@@ -340,20 +382,24 @@ In **both postures** — alforria's own:
   whatever it is called and whether or not it holds a secret (a provider
   that lists an account id or a region there has it withheld too);
 - every variable a config reads through `{env:NAME}`: the host's files (the
-  managed directory, the global config directory, `~/.opencode`) and each
-  opened project's own config files.
+  managed directory, the global config directory, `~/.opencode`, and the
+  `OPENCODE_CONFIG*` sources) and each opened project's own config files.
 
 `PATH`, `HOME` and the rest of the allowlist are never denied on account of
 the last two.
 
 The last two are *learned*: read from the host config and the catalog when
 the server starts, and again every time a directory is opened and every time
-the catalog is read. **A learned name stays withheld until the server
-restarts** — closing the project, or removing the provider from its config,
+the catalog is read. The learned names are an append-only registry for the
+life of the process: each reading adds to it and nothing takes a name out.
+**A learned name stays withheld until the server restarts** — closing the
+project, disposing its instance, or removing the provider from its config
 does not release it, because the project's turns, terminals and MCP servers
-can outlive both. A restart forgets the names no config or catalog mentions
-any more; `allow` is how the host passes on one that is still mentioned
-(like the rest of the host config it is read when the server starts).
+can outlive all three. Withholding a variable a little too long is
+harmless; releasing one early is a leak. A restart forgets the names no
+config or catalog mentions any more; `allow` is how the host passes on one
+that is still mentioned (like the rest of the host config it is read when
+the server starts).
 
 On a **restricted** server only — names that look like a credential
 (`CREDENTIAL_PATTERNS`, same file): `*_TOKEN`, `*_KEY`, `*_SECRET`,
@@ -369,20 +415,29 @@ itself.
 MCP stdio servers, language servers, the commands that look for a language
 server (`oxlint --help`, `java -version`, `xcrun --find`) and the server's
 own `git` calls follow the posture too: everything except the denied names
-on a standalone server, the allowlist on a restricted one. Their own
-configured `environment` is added on top in either case. An MCP server
-therefore gets one of the withheld variables only when its `environment`
-names it, for example
+on a standalone server, the allowlist (with `allow`, minus the denied
+names) on a restricted one. Their own configured `environment` is added on
+top in either case. An MCP server therefore gets one of the withheld
+variables only when its `environment` names it, for example
 `"environment": { "GITHUB_TOKEN": "{env:GITHUB_TOKEN}" }`, or when `allow`
 releases it to everything. On a restricted server `git` fetches over SSH
 only if `allow` names `SSH_AUTH_SOCK`.
 
-Not covered, on purpose: programs the *user* runs at their own terminal or
-desktop — the TUI's editor (`$EDITOR`), clipboard tool and browser opener,
-the pager, `alforria db`'s `sqlite3`, `alforria pr`'s `gh` and `git`, the
-command of `alforria providers login <url>`, and the desktop opener the
-server uses for a sign-in URL. They are the user's own tools and get the
-user's environment.
+### What the policy does not cover
+
+- **Programs the user runs at their own terminal or desktop**: the TUI's
+  editor (`$EDITOR`), clipboard tool and browser opener, the pager,
+  `alforria db`'s `sqlite3`, `alforria pr`'s `gh` and `git`, and the command
+  of `alforria providers login <url>`. They are the user's own tools and get
+  the user's environment.
+- **The desktop opener** the server uses for a sign-in URL (an MCP OAuth
+  flow): a fixed system program handed one URL, started with the server's
+  environment.
+- **The floor, for terminals and worktree start scripts.** `/pty` and
+  worktree creation are `admin` routes that belong to no session; they get
+  the server's posture, not a session's.
+- Each of these process starts carries a comment in the source saying why
+  it is outside the policy.
 
 ### Limits
 
@@ -396,10 +451,10 @@ user's environment.
   recognised.
 - The `{env:NAME}` references of a remote config (`.well-known/opencode`)
   are not learned; its providers' `env` names are.
-- Changing the posture's inputs in the host config takes a restart; only
-  triggers and listeners tighten it while it runs, and nothing relaxes it.
-  A project config that declares a `webhook` or `watch` trigger tightens the
-  whole server once that project is opened.
+- Nothing relaxes the posture or releases a learned name while the server
+  runs. One `webhook` or `watch` trigger, created by anyone who may create
+  triggers, puts the whole server in the restricted posture until it
+  restarts without it.
 - With `"inherit": "none"` a shell has no `PATH` or `HOME` unless `set`
   provides them.
 - This is not a sandbox. A process running as the server's user can still

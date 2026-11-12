@@ -10,12 +10,17 @@
 //!   [`ShellEnvPolicy::shell_env`]: the `inherit` selection, minus the denied
 //!   names, plus `set`;
 //! * helpers the server starts — MCP stdio servers, language servers and
-//!   the commands that probe for them, git, the desktop's URL opener — get
+//!   the commands that probe for them, git — get
 //!   [`ShellEnvPolicy::scrubbed_env`], then their own configured
 //!   environment on top. A project config can name a command, so it must
 //!   not be a way around the policy either.
 //!
-//! There are two postures, and the host config decides which:
+//! Outside the policy, on purpose: the user's own tooling at the user's
+//! terminal or desktop (the TUI's editor, pager and clipboard tool,
+//! `sqlite3`, `gh`, the command of `providers login`) and the fixed desktop
+//! opener handed a sign-in URL. Each such spawn says so where it is made.
+//!
+//! There are two postures, and the server decides which:
 //!
 //! * **standalone** (the default: a developer's own loopback server) — a
 //!   child inherits everything except
@@ -25,7 +30,8 @@
 //!   server learns it reads a key or a secret from
 //!   ([`ShellEnvPolicy::deny_names`]: every `provider.*.env[]` of the model
 //!   catalog and of the loaded configs, every `{env:NAME}` the host config
-//!   refers to). `GH_TOKEN`, `AWS_*`, `NPM_TOKEN`, `PGPASSWORD` and the
+//!   and each opened project's own config files refer to). `GH_TOKEN`,
+//!   `AWS_*`, `NPM_TOKEN`, `PGPASSWORD` and the
 //!   like are the user's, for the user's tools, and pass as they do
 //!   upstream;
 //! * **restricted** ([`ShellEnvPolicy::restricted`]: the server is
@@ -40,7 +46,33 @@
 //!
 //! Deny patterns match without regard to case. `allow` releases an exact
 //! name from all but the host's own `deny`; `deny` and `inherit` let a
-//! host choose either posture for itself, whatever the mode.
+//! host choose either posture for itself, whatever the mode. `inherit` and
+//! `set` are about shells: a helper on a standalone server starts from
+//! everything that is not denied whatever `inherit` says, and on a
+//! restricted one from [`RESTRICTED_INHERIT`], `allow` and what `inherit`
+//! adds.
+//!
+//! That predicate governs this module's posture and nothing else: what a
+//! project's config may set and read follows `config::HostMode::restricted`
+//! (bearer auth or `server.trust.project`), what a request may do follows
+//! its credential's scope, and the write guard and the read-only ceiling
+//! follow the session (`crate::protect`, `SessionMark`).
+//!
+//! Two things move the posture after startup, both towards restricted:
+//!
+//! * the ratchet, [`tighten`]: a `webhook` or `watch` trigger that is
+//!   stored or found in a config read at an instance boot, or a listener
+//!   bound beyond loopback, puts the process-wide policy in the restricted
+//!   posture from the next spawn on. Nothing relaxes it before the process
+//!   exits — not deleting the trigger, not [`install`];
+//! * the per-run floor, [`apply_shell_for`]: a process started for a
+//!   session that is restricted or that outside input started gets the
+//!   restricted selection whatever the process-wide posture is. The bash
+//!   tool asks it for a session with a write guard (restricted, or the
+//!   outside-start mark); the session `shell` command and inline template
+//!   shell for a session with the outside-start mark. Terminals, worktree
+//!   start scripts and helpers have no session and follow the process-wide
+//!   posture.
 //!
 //! The policy comes from `shell_env` in the host config
 //! (`config::host::load_host_config`) and is process-wide: [`install`] it
@@ -50,7 +82,8 @@
 //! and nothing takes a name out — not disposing an instance, whose
 //! processes can outlive it, and not a config that stopped mentioning it.
 //! Withholding a variable until the next restart is harmless; releasing
-//! one early is a leak. `allow` is the way out without a restart.
+//! one early is a leak. `allow` names the variables the host hands over
+//! all the same; like the rest of the host config it is read at startup.
 //!
 //! This is not a sandbox. A child running as the server's user can still
 //! read `/proc/<server pid>/environ` and the server's files; keeping those
