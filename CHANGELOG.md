@@ -37,6 +37,12 @@ Found by a review of v0.4.1.
 - Provider requests followed redirects to other hosts with `x-api-key` and
   `x-goog-api-key` attached.
 
+### Fixed
+
+- Web client: the `/` command menu could reopen after a message was sent and
+  cover the goal row; the providers list no longer wraps its status and
+  button onto two lines.
+
 ## [0.4.1] - 2026-11-12
 
 0.4.0 was tagged but shipped no binaries: its macOS verification caught the

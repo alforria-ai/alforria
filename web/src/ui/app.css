@@ -3047,7 +3047,7 @@ button.tool-row:hover {
   text-align: right;
 }
 .spec.providers .row {
-  grid-template-columns: minmax(110px, 0.7fr) 1.2fr 1fr 64px 104px;
+  grid-template-columns: minmax(110px, 0.7fr) 1.2fr 1fr 64px minmax(104px, max-content);
 }
 .spec.providers .row.head {
   min-height: 30px;
@@ -4262,7 +4262,9 @@ button.tool-row:hover {
 .settings-pair {
   display: inline-flex;
   align-items: center;
+  justify-content: flex-end;
   gap: 8px;
+  white-space: nowrap;
 }
 .settings nav button[aria-current="false"] {
   background: none;

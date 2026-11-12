@@ -164,6 +164,9 @@ export function Composer(props: { sessionID: string }) {
     }
     if (slash) {
       const commands = await commandsFor(dir())
+      // The box may have moved on while the list loaded (more typing, or the
+      // message was sent): a late answer must not reopen the menu.
+      if (ta.value.slice(0, ta.selectionStart) !== before) return
       const items = commands
         .filter((c) => c.name.startsWith(slash[1]!))
         .slice(0, 12)
@@ -244,6 +247,8 @@ export function Composer(props: { sessionID: string }) {
     // the box is still empty (never overwrite what was typed meanwhile).
     ta.value = ""
     setDraft({ text: "", files: [], attachments: [] })
+    setPop(null)
+    clearTimeout(findTimer)
     autosize()
     const restore = (err: unknown, what: string) => {
       toast(`Could not ${what}: ${err instanceof Error ? err.message : err}`, "error")
