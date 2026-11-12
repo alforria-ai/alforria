@@ -219,6 +219,9 @@ impl RuntimeModels {
         // past the recorded one, and the next lookup rebuilds.
         let generation = auth.generation();
         let state = build_state(&catalog, config, auth.as_ref())?;
+        // The key variables of the providers in use stay out of the
+        // agent's processes.
+        crate::provider::learn_catalog_names(&catalog, config, auth.as_ref());
         Ok(RuntimeModels(Arc::new(Inner {
             catalog,
             host_strings,
@@ -252,6 +255,8 @@ impl RuntimeModels {
         if current.0 >= generation {
             return current.1.clone();
         }
+        // A sign-in can have put another provider in use.
+        crate::provider::learn_catalog_names(&self.0.catalog, &self.0.config, self.0.auth.as_ref());
         match build_state(&self.0.catalog, &self.0.config, self.0.auth.as_ref()) {
             Ok(state) => *current = (generation, Arc::new(state)),
             Err(err) => {

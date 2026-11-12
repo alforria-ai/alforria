@@ -220,8 +220,8 @@ pre-1.0, so minor releases may include breaking changes.
   webhook or watch trigger started, and the `bash` tool of a restricted
   session, always get the restricted environment. In either posture the
   server's own secrets, provider key variables, `*_API_KEY` /
-  `*_API_TOKEN` names and the names learned from configs and the model
-  catalog are withheld (see Changed).
+  `*_API_TOKEN` names, the names learned from configs and the key
+  variables of the catalog providers in use are withheld (see Changed).
 - `compaction.default_context`: the context window, in tokens, assumed for a
   model that declares none (128,000 when unset).
 - A restart repairs the sessions the last process died in the middle of.
@@ -549,19 +549,24 @@ memory is configured.
   `_PASSWORD`); the built-in provider key variables (`ANTHROPIC_API_KEY`,
   `OPENAI_API_KEY`, `LIBERTAI_API_KEY`, …); **any variable named
   `*_API_KEY` or `*_API_TOKEN`**, a provider's or not (`STRIPE_API_KEY`
-  goes too); every `provider.*.env` name of a loaded config and of the
-  model catalog; and every variable a config file reads through
-  `{env:NAME}` — in any letter case. The catalog's names are those of
-  every provider it lists, used or not: with the models.dev catalog cached
-  that includes **`GITHUB_TOKEN`** (GitHub Copilot) and
-  **`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`** (Amazon
-  Bedrock), so `gh` and `aws` in the agent's shell can lose their
-  credentials. Everything else in the environment is passed as before
-  (`GH_TOKEN`, `NPM_TOKEN`, `PGPASSWORD`, `AWS_PROFILE`, …). A name learned
-  from a config or the catalog stays withheld until the server restarts.
-  To pass one through, name it in `shell_env.allow` in the global config
-  (`"shell_env": { "allow": ["GITHUB_TOKEN"] }`), or in an MCP server's own
-  `environment`.
+  goes too); every `provider.*.env` name of a loaded config; every
+  variable a config file reads through `{env:NAME}` — in any letter case;
+  and, of the names the model catalog lists, the credential-shaped ones
+  (`*_TOKEN`, `*_KEY`, `*_SECRET`, …) of the providers the install uses
+  (declared or selected in a config, or signed in to). Everything else in
+  the environment is passed as before: `GITHUB_TOKEN`, `GH_TOKEN`,
+  `GITLAB_TOKEN`, `AWS_*`, `AZURE_*`, `GOOGLE_APPLICATION_CREDENTIALS`,
+  `GOOGLE_CLOUD_*` and `GCLOUD_*` always — even when GitHub Copilot or
+  Amazon Bedrock, which the catalog lists them for, is the provider in
+  use, so `gh` and `aws` keep their credentials in the agent's shell —
+  and `NPM_TOKEN`, `PGPASSWORD`, `AWS_PROFILE` and the like; so are the
+  regions, projects and endpoints the catalog lists, and the variables of
+  providers you do not use. A name learned from a config or the catalog
+  stays withheld until the server restarts. To pass a withheld one
+  through, name it in `shell_env.allow` in the global config
+  (`"shell_env": { "allow": ["MY_PROVIDER_TOKEN"] }`), or in an MCP
+  server's own `environment`; to hide a passed one (a Copilot or Bedrock
+  user's `GITHUB_TOKEN` / `AWS_*`), name it in `shell_env.deny`.
 - **Binding beyond loopback restricts the shell environment further.**
   `alforria serve --hostname` with anything other than `localhost` or a
   loopback address (`0.0.0.0`, a LAN address) starts the agent's processes

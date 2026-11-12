@@ -300,18 +300,19 @@ The server runs the agent's processes in one of two postures.
 | When | a developer's own server: bound to loopback, with none of the inputs below | the server is unattended or reachable from another machine (below) |
 | A shell or helper starts from | the server's whole environment | an allowlist: `PATH`, `HOME`, `LANG`, `LC_*`, `TERM`, `TZ`, `USER`, `LOGNAME`, `SHELL`, `TMPDIR`, and the names in `allow` |
 | Withheld from it | what is alforria's own to protect: the server's secrets and the model providers' key variables | that, and every name that looks like a credential |
-| The user's other credentials: `GH_TOKEN`, `NPM_TOKEN`, `PGPASSWORD`, `AWS_PROFILE`, `SSH_AUTH_SOCK`, … | passed, as upstream — unless the model catalog or a config lists the name as a provider's variable, which the catalog does for `GITHUB_TOKEN`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `AWS_REGION` (see [What is denied by default](#what-is-denied-by-default)) | withheld unless `allow` names them |
+| The user's other credentials: `GH_TOKEN`, `NPM_TOKEN`, `PGPASSWORD`, `AWS_PROFILE`, `SSH_AUTH_SOCK`, … | passed, as upstream — `GITHUB_TOKEN`, `GH_TOKEN` and `AWS_*` included, whatever the model catalog lists (see [What is denied by default](#what-is-denied-by-default)) | withheld unless `allow` names them |
 
 **Standalone is upstream's behaviour with one exception**: alforria's own
 secrets and the variables model providers read their keys from are not
 passed to the agent's processes. `npm publish`, `psql`, `gh` with
 `GH_TOKEN` and an MCP server that reads such a token from its environment
-work as they did. The exception is wider than it sounds, because "a
-provider's variable" is every name any provider of the model catalog
-lists: once the catalog is cached, `gh` with `GITHUB_TOKEN` and `aws` with
-`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` find them missing in the
-agent's shell until `"allow": ["GITHUB_TOKEN", "AWS_ACCESS_KEY_ID",
-"AWS_SECRET_ACCESS_KEY", "AWS_REGION"]` hands them back.
+work as they did, and so do `gh` with `GITHUB_TOKEN` and `aws` with
+`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`: the model catalog lists
+those names too (GitHub Copilot and Amazon Bedrock read them), but they
+are the user's general-purpose credentials first and are not withheld on
+the catalog's account. A host that signs in to Copilot or Bedrock with
+one and wants it kept from the agent writes `"deny": ["GITHUB_TOKEN"]`
+(or `"AWS_*"`) in `shell_env`.
 
 Nobody is at the terminal of a restricted server to own the credentials in
 its environment, and no list of secret-looking names is complete; so its
@@ -454,19 +455,11 @@ In **both postures** — alforria's own:
 - names shaped like an API key: `*_API_KEY` and `*_API_TOKEN`
   (`API_KEY_PATTERNS`) — a provider no list knows keeps its key in
   `MY_CORP_API_KEY`;
-- every name in a provider's `env` list — from the model catalog, from
-  `provider.*.env` in the host config and from the merged config of each
-  project the server opens (a project can declare a provider of its own) —
-  whatever it is called and whether or not it holds a secret (a provider
-  that lists an account id or a region there has it withheld too). The
-  catalog's names are taken from **every provider it lists, whether or not
-  you use that provider** (`state::learning_catalog`). The models.dev
-  catalog, which is what the server reads from its cache, lists
-  `GITHUB_TOKEN` for GitHub Copilot and `AWS_ACCESS_KEY_ID`,
-  `AWS_SECRET_ACCESS_KEY` and `AWS_REGION` for Amazon Bedrock, among
-  others: on a server with a cached catalog those are withheld in the
-  standalone posture too. A server that has never fetched the catalog
-  learns none of them;
+- every name in a provider's `env` list in a config — `provider.*.env` in
+  the host config and in the merged config of each project the server
+  opens (a project can declare a provider of its own) — whatever it is
+  called and whether or not it holds a secret (a provider that lists an
+  account id or a region there has it withheld too);
 - every variable a config reads through `{env:NAME}`: the host's files (the
   managed directory, the global config directory, `~/.opencode`, and the
   `OPENCODE_CONFIG*` sources) and each opened project's own config files.
@@ -474,9 +467,40 @@ In **both postures** — alforria's own:
 `PATH`, `HOME` and the rest of the allowlist are never denied on account of
 the last two.
 
-The last two are *learned*: read from the host config and the catalog when
-the server starts, and again every time a directory is opened and every time
-the catalog is read. The learned names are an append-only registry for the
+On a **standalone** server only — the model catalog's names, narrowly. The
+catalog (models.dev, read from the server's cache) lists the variables of
+every provider there is, and many are not a model provider's alone. One of
+them is withheld only when all three hold:
+
+1. **its provider is in use on this install**: a loaded config declares it
+   (`provider.<id>`) or selects one of its models (`model`,
+   `small_model`), or credentials are stored for it (`alforria providers
+   login`, `PUT /auth/<id>`) — and `enabled_providers` /
+   `disabled_providers` do not switch it off. A provider the catalog
+   merely lists, or one whose variable merely happens to be set, withholds
+   nothing;
+2. **the name is shaped like a credential** (`CREDENTIAL_PATTERNS`, below:
+   `*_TOKEN`, `*_KEY`, `*_SECRET`, …). A region, a project, an account id,
+   an endpoint or a base URL the catalog lists is never withheld;
+3. **it is not a general-purpose credential** that other tools on a
+   developer's machine read (`GENERAL_PURPOSE_CREDENTIALS`, same file):
+   `GITHUB_TOKEN`, `GH_TOKEN`, `GITLAB_TOKEN`, `AWS_*`, `AZURE_*`,
+   `GOOGLE_APPLICATION_CREDENTIALS`, `GOOGLE_CLOUD_*`, `GCLOUD_*`. These
+   pass even when GitHub Copilot, Amazon Bedrock, Azure or Vertex is the
+   provider in use, so `gh`, `aws`, `az` and `gcloud` keep working in the
+   agent's shell. **To hide one from the agent, name it in
+   `shell_env.deny`** (`"deny": ["GITHUB_TOKEN"]`, `"deny": ["AWS_*"]`), or
+   list it in your own config under `provider.<id>.env`: what the host
+   writes itself is always withheld.
+
+(`AZURE_API_KEY`, `AZURE_OPENAI_API_KEY` and `AWS_BEARER_TOKEN_BEDROCK` are
+on the built-in list above and stay withheld.) On a restricted server
+every name the catalog lists is withheld, used or not, as before.
+
+The config's and the catalog's names are *learned*: read from the host
+config and the catalog when the server starts, and again every time a
+directory is opened, the catalog is read, or a sign-in puts another
+provider in use. The learned names are an append-only registry for the
 life of the process: each reading adds to it and nothing takes a name out.
 **A learned name stays withheld until the server restarts** — closing the
 project, disposing its instance, or removing the provider from its config
@@ -534,12 +558,14 @@ only if `allow` names `SSH_AUTH_SOCK`.
   server the default allowlist keeps it out.
 - A provider key in a variable that is not shaped like an API key, of a
   provider that neither the catalog nor a loaded config lists, is not
-  recognised.
-- In the other direction, the catalog's names over-reach: a variable is
-  withheld because some provider somewhere reads it, not because this
-  server does. `GITHUB_TOKEN` and the `AWS_*` access keys are the ones a
-  developer notices. `allow` is the remedy; there is no setting that turns
-  the catalog's names off.
+  recognised. Neither is the key of a catalog provider you use only
+  through a variable that is set, without declaring the provider,
+  selecting its model in a config or signing in, when the variable is not
+  named `*_API_KEY` (`HF_TOKEN`): declare the provider or `deny` the name.
+- A general-purpose credential that is also your model provider's key —
+  `GITHUB_TOKEN` with GitHub Copilot, the `AWS_*` keys with Amazon Bedrock
+  — reaches the agent's processes on a standalone server. `deny` is the
+  remedy.
 - The `{env:NAME}` references of a remote config (`.well-known/opencode`)
   are not learned; its providers' `env` names are.
 - Nothing relaxes the posture or releases a learned name while the server

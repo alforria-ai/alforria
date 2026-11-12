@@ -1,6 +1,5 @@
-//! The names the shell environment policy learns from the configs and the
-//! catalog: learned at every boot and read, and kept until the process
-//! exits.
+//! The names the shell environment policy learns from the configs:
+//! learned at every boot, and kept until the process exits.
 //!
 //! The policy is process-wide, so this file holds one test: it is the only
 //! one in its binary to install or teach a policy.
@@ -8,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use alforria_core::shell_env;
 use alforria_server::engine::EngineSeams;
@@ -32,7 +31,6 @@ fn shell_names() -> Vec<String> {
         "HOST_GATEWAY_AUTH",
         "HOST_REFERENCED",
         "CATALOG_ONE",
-        "CATALOG_TWO",
     ]
     .into_iter()
     .map(|name| (OsString::from(name), OsString::from("value")))
@@ -74,7 +72,8 @@ fn context(paths: &alforria_core::GlobalPaths) -> Arc<alforria_server::state::Se
 /// agent's shell once the instance has booted, and stay withheld when the
 /// instance is disposed (its processes can outlive it) and when the
 /// project stops naming them and its config is read again. What a later
-/// boot, the host config or the catalog names is added. `shell_env.allow`
+/// boot or the host config names is added; a catalog read alone adds
+/// nothing here. `shell_env.allow`
 /// releases a name; only a restart forgets one. `GITHUB_TOKEN` and
 /// `AWS_PROFILE` pass throughout.
 #[test]
@@ -103,7 +102,6 @@ fn learned_names_are_added_at_every_boot_and_kept_until_restart() {
     let everything = [
         "AWS_PROFILE",
         "CATALOG_ONE",
-        "CATALOG_TWO",
         "GITHUB_TOKEN",
         "HOST_GATEWAY_AUTH",
         "HOST_REFERENCED",
@@ -180,24 +178,16 @@ fn learned_names_are_added_at_every_boot_and_kept_until_restart() {
     });
     assert_eq!(shell_names(), without(&gone));
 
-    // The catalog: each read adds what it names now.
-    let providers = Arc::new(Mutex::new(BTreeMap::from([(
-        "catalog".to_string(),
-        provider("CATALOG_ONE"),
-    )])));
-    let catalog = alforria_server::state::learning_catalog({
-        let providers = providers.clone();
-        Arc::new(move || Ok(providers.lock().unwrap().clone()))
-    });
+    // The catalog: its providers' names are withheld only for a provider
+    // in use (`shell_env_catalog.rs`); reading it alone withholds nothing
+    // on a standalone server, whatever it lists.
+    let catalog = alforria_server::state::learning_catalog(Arc::new(|| {
+        Ok(BTreeMap::from([
+            ("catalog".to_string(), provider("CATALOG_ONE")),
+            ("github-copilot".to_string(), provider("GITHUB_TOKEN")),
+        ]))
+    }));
     catalog().unwrap();
-    gone.push("CATALOG_ONE");
-    assert_eq!(shell_names(), without(&gone));
-    providers
-        .lock()
-        .unwrap()
-        .insert("catalog".to_string(), provider("CATALOG_TWO"));
-    catalog().unwrap();
-    gone.push("CATALOG_TWO");
     assert_eq!(shell_names(), without(&gone));
 
     // A restart is a fresh registry: a policy loaded from the configs as

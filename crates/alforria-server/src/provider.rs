@@ -684,6 +684,70 @@ pub fn build_state(
     Ok(state)
 }
 
+/// `isProviderAllowed` (provider.ts:1410-1413): `enabled_providers` when
+/// set, minus `disabled_providers`.
+fn allowed(config: &Config, id: &str) -> bool {
+    if let Some(enabled) = &config.enabled_providers {
+        if !enabled.iter().any(|item| item == id) {
+            return false;
+        }
+    }
+    !config
+        .disabled_providers
+        .iter()
+        .flatten()
+        .any(|item| item == id)
+}
+
+/// The providers this install uses, as opposed to those the catalog merely
+/// lists: the ones `config` declares (`provider.<id>`), the ones its
+/// `model` and `small_model` select, and the ones with stored credentials
+/// (`AuthStore::ids`, what `GET /provider` reports as connected) — each
+/// only while `enabled_providers` / `disabled_providers` allow it.
+///
+/// Narrower than [`ProviderState::providers`] on purpose: that also holds
+/// every catalog provider one of whose variables happens to be set
+/// (`source: "env"`), which would make any variable the catalog names its
+/// own reason for being withheld.
+pub fn in_use(config: &Config, auth: &dyn AuthStore) -> std::collections::BTreeSet<String> {
+    let mut ids: std::collections::BTreeSet<String> = config
+        .provider
+        .iter()
+        .flatten()
+        .map(|(id, _)| id.clone())
+        .collect();
+    ids.extend(
+        [&config.model, &config.small_model]
+            .into_iter()
+            .flatten()
+            .map(|model| parse_model(model).0),
+    );
+    ids.extend(auth.ids());
+    ids.retain(|id| allowed(config, id));
+    ids
+}
+
+/// Teach the shell environment policy the catalog's variables of the
+/// providers in use ([`in_use`]): on a standalone server the
+/// credential-shaped ones among them are withheld from the agent's
+/// processes (`alforria_core::shell_env::learn_catalog`). Called whenever
+/// an instance's provider state is built, so a sign-in is covered from
+/// the next model lookup on.
+pub fn learn_catalog_names(
+    catalog: &alforria_core::catalog::Providers,
+    config: &Config,
+    auth: &dyn AuthStore,
+) {
+    let in_use = in_use(config, auth);
+    alforria_core::shell_env::learn_catalog(
+        in_use
+            .iter()
+            .filter_map(|id| catalog.get(id))
+            .flat_map(|provider| provider.env.iter()),
+        true,
+    );
+}
+
 /// The final model loop (provider.ts:1671-1719): allowed filtering, model
 /// deletion rules and the config variant merge.
 fn filter_providers(
@@ -691,19 +755,7 @@ fn filter_providers(
     config: &Config,
     config_providers: &BTreeMap<String, alforria_core::config::schema::ProviderInfo>,
 ) {
-    let enabled = config.enabled_providers.clone();
-    let allowed = |id: &str| -> bool {
-        if let Some(enabled) = &enabled {
-            if !enabled.iter().any(|item| item == id) {
-                return false;
-            }
-        }
-        !config
-            .disabled_providers
-            .iter()
-            .flatten()
-            .any(|item| item == id)
-    };
+    let allowed = |id: &str| allowed(config, id);
     let enable_experimental = std::env::var("OPENCODE_ENABLE_EXPERIMENTAL_MODELS")
         .map(|value| matches!(value.as_str(), "1" | "true" | "yes"))
         .unwrap_or(false);
@@ -918,6 +970,52 @@ mod tests {
         let provider = &state.providers["example"];
         assert_eq!(provider["source"], "api");
         assert_eq!(provider["key"], "sk-api");
+    }
+
+    /// A provider is in use when a config declares it or selects its
+    /// model, or credentials are stored for it — and the config does not
+    /// switch it off.
+    #[test]
+    fn in_use_is_declared_selected_or_signed_in() {
+        let ids = |config: Value, auth: &dyn AuthStore| -> Vec<String> {
+            let config = serde_json::from_value::<Config>(config).unwrap();
+            in_use(&config, auth).into_iter().collect()
+        };
+        assert!(ids(json!({}), &EmptyAuth).is_empty());
+        assert_eq!(ids(json!({}), &ApiKeyAuth), ["example"]);
+        assert_eq!(
+            ids(
+                json!({
+                    "provider": { "declared": {} },
+                    "model": "picked/model-a",
+                    "small_model": "small/model-b/with-slash"
+                }),
+                &ApiKeyAuth
+            ),
+            ["declared", "example", "picked", "small"]
+        );
+        assert_eq!(
+            ids(
+                json!({
+                    "provider": { "declared": {} },
+                    "model": "picked/model-a",
+                    "disabled_providers": ["declared", "example"]
+                }),
+                &ApiKeyAuth
+            ),
+            ["picked"]
+        );
+        assert_eq!(
+            ids(
+                json!({
+                    "provider": { "declared": {} },
+                    "model": "picked/model-a",
+                    "enabled_providers": ["declared"]
+                }),
+                &ApiKeyAuth
+            ),
+            ["declared"]
+        );
     }
 
     struct ApiKeyAuth;

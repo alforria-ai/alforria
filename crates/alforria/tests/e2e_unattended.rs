@@ -322,11 +322,32 @@ fn read_env_dump(path: &Path) -> String {
 /// server's own secrets), the variables the host's providers and config
 /// read theirs from, and whatever the host config denies. This server is
 /// standalone, so the user's own credentials (`GITHUB_TOKEN`, `AWS_*`)
-/// reach the shell as they do upstream.
+/// reach the shell as they do upstream — with a model catalog that lists
+/// GitHub Copilot and Amazon Bedrock, whose variables those are, as the
+/// models.dev one does.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_agents_shells_cannot_read_denied_variables() {
     let backend = MockBackend::new("u3_shell_env");
     let env = env_for(&backend, "u3");
+    let mut catalog: Value =
+        serde_json::from_str(&std::fs::read_to_string(&env.models_path).expect("read catalog"))
+            .expect("parse catalog");
+    for (id, names) in [
+        ("github-copilot", vec!["GITHUB_TOKEN"]),
+        (
+            "amazon-bedrock",
+            vec!["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION"],
+        ),
+        // A provider nobody here uses, with a token and a region.
+        ("u3-unused", vec!["U3_UNUSED_TOKEN", "U3_UNUSED_REGION"]),
+    ] {
+        catalog[id] = json!({ "id": id, "name": id, "env": names, "models": {} });
+    }
+    std::fs::write(
+        &env.models_path,
+        serde_json::to_string(&catalog).expect("serialize"),
+    )
+    .expect("write catalog");
     write_host_config(
         &env,
         json!({
@@ -346,6 +367,10 @@ async fn the_agents_shells_cannot_read_denied_variables() {
             // them on.
             .env("GITHUB_TOKEN", "github-kept")
             .env("AWS_SECRET_ACCESS_KEY", "aws-kept")
+            .env("AWS_ACCESS_KEY_ID", "aws-id-kept")
+            .env("AWS_REGION", "region-kept")
+            .env("U3_UNUSED_TOKEN", "unused-kept")
+            .env("U3_UNUSED_REGION", "unused-region-kept")
             .env("NPM_TOKEN", "npm-kept")
             .env("PGPASSWORD", "pg-kept")
             .env("U3_REFERENCED", "referenced-leak")
@@ -369,6 +394,10 @@ async fn the_agents_shells_cannot_read_denied_variables() {
             "U3_VISIBLE=visible",
             "GITHUB_TOKEN=github-kept",
             "AWS_SECRET_ACCESS_KEY=aws-kept",
+            "AWS_ACCESS_KEY_ID=aws-id-kept",
+            "AWS_REGION=region-kept",
+            "U3_UNUSED_TOKEN=unused-kept",
+            "U3_UNUSED_REGION=unused-region-kept",
             "NPM_TOKEN=npm-kept",
             "PGPASSWORD=pg-kept",
         ] {

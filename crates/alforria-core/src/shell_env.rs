@@ -28,16 +28,18 @@
 //!   secrets and the provider key variables of [`BUILTIN_DENY`]; names
 //!   shaped like an API key ([`API_KEY_PATTERNS`]); and the names the
 //!   server learns it reads a key or a secret from
-//!   ([`ShellEnvPolicy::deny_names`]: every `provider.*.env[]` of the model
-//!   catalog and of the loaded configs, every `{env:NAME}` the host config
-//!   and each opened project's own config files refer to). `GH_TOKEN`,
-//!   `NPM_TOKEN`, `PGPASSWORD` and the like are the user's, for the
-//!   user's tools, and pass as they do upstream. A name passes only while
-//!   nothing has taught the policy otherwise: the catalog's names are
-//!   those of every provider it lists, used or not, and the models.dev
-//!   catalog lists `GITHUB_TOKEN` (GitHub Copilot) and the `AWS_*` access
-//!   keys (Amazon Bedrock), so a server with a cached catalog withholds
-//!   those in this posture too, until `allow` names them;
+//!   ([`ShellEnvPolicy::deny_names`]: every `provider.*.env[]` of the
+//!   loaded configs, every `{env:NAME}` the host config and each opened
+//!   project's own config files refer to). The model catalog adds less
+//!   ([`ShellEnvPolicy::deny_catalog_names`]): of the names its providers
+//!   list, only those of a provider this install uses, only the ones
+//!   shaped like a credential ([`CREDENTIAL_PATTERNS`] — a region, a
+//!   project or an endpoint passes), and never a general-purpose one
+//!   ([`GENERAL_PURPOSE_CREDENTIALS`]: `GITHUB_TOKEN`, `AWS_*`, …).
+//!   `GITHUB_TOKEN`, `GH_TOKEN`, `AWS_*`, `NPM_TOKEN`, `PGPASSWORD` and
+//!   the like are the user's, for the user's tools, and pass as they do
+//!   upstream whatever the catalog lists; `deny` is how a host that
+//!   signs in to Copilot or Bedrock with one keeps it from the agent;
 //! * **restricted** ([`ShellEnvPolicy::restricted`]: the server is
 //!   unattended or reachable from another machine — bearer auth, a
 //!   non-loopback bind, an unattended answer, a webhook, a `webhook` or
@@ -82,7 +84,8 @@
 //! (`config::host::load_host_config`) and is process-wide: [`install`] it
 //! once at startup; until then [`current`] is the standalone default. The
 //! learned names are a registry that only grows for the life of the
-//! process: [`learn`] adds to it at every instance boot and catalog read,
+//! process: [`learn`] adds to it at every instance boot, [`learn_catalog`]
+//! at every catalog read and every build of an instance's provider state,
 //! and nothing takes a name out — not disposing an instance, whose
 //! processes can outlive it, and not a config that stopped mentioning it.
 //! Withholding a variable until the next restart is harmless; releasing
@@ -189,6 +192,26 @@ pub const CREDENTIAL_PATTERNS: &[&str] = &[
     "MYSQL_PWD",
 ];
 
+/// Credentials other tools on a developer's machine read (`gh`, `git`,
+/// `glab`, `aws`, `az`, `gcloud`, the cloud SDKs): never withheld on a
+/// standalone server on the model catalog's say-so, even when the install
+/// uses the provider that lists them (GitHub Copilot lists `GITHUB_TOKEN`,
+/// Amazon Bedrock the `AWS_*` access keys). They are not alforria's to
+/// take: the user's shell had them before a catalog was cached. A host
+/// that wants one kept from the agent says so itself — `shell_env.deny`,
+/// or the name in its own `provider.*.env` — and a restricted server
+/// withholds them all anyway ([`CREDENTIAL_PATTERNS`]).
+pub const GENERAL_PURPOSE_CREDENTIALS: &[&str] = &[
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
+    "GITLAB_TOKEN",
+    "AWS_*",
+    "AZURE_*",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "GOOGLE_CLOUD_*",
+    "GCLOUD_*",
+];
+
 /// What a shell or a helper inherits by default on a restricted server
 /// ([`ShellEnvPolicy::restricted`]), `allow` aside. Never denied on
 /// account of a `{env:}` reference or a provider's `env` either: a shell
@@ -224,6 +247,14 @@ pub struct ShellEnvPolicy {
     /// Names the server learned it reads a key or a secret from
     /// ([`ShellEnvPolicy::deny_names`]), upper-cased. Only ever added to.
     named: BTreeSet<String>,
+    /// The `env` names of every provider the model catalog lists
+    /// ([`ShellEnvPolicy::deny_catalog_names`]), upper-cased: denied on a
+    /// restricted server. Only ever added to.
+    catalog: BTreeSet<String>,
+    /// Those of `catalog` that belong to a provider the install uses:
+    /// what a standalone server withholds of them is decided in
+    /// [`ShellEnvPolicy::learned`]. Only ever added to.
+    catalog_in_use: BTreeSet<String>,
 }
 
 fn is_literal(name: &str) -> bool {
@@ -291,6 +322,8 @@ impl ShellEnvPolicy {
                 .map(|pattern| pattern.to_ascii_uppercase())
                 .collect(),
             named: BTreeSet::new(),
+            catalog: BTreeSet::new(),
+            catalog_in_use: BTreeSet::new(),
         }
     }
 
@@ -315,9 +348,9 @@ impl ShellEnvPolicy {
         self.inherit.is_some()
     }
 
-    /// Deny `names` too, whatever their case: the variables the server
-    /// reads a secret from (a provider's `env`, a `{env:NAME}` in a
-    /// config). [`RESTRICTED_INHERIT`] is left alone. Added to what is
+    /// Deny `names` too, whatever their case: the variables a config says
+    /// the server reads a secret from (a `provider.*.env` name, a
+    /// `{env:NAME}`). [`RESTRICTED_INHERIT`] is left alone. Added to what is
     /// already denied: there is no way to take a learned name out of a
     /// policy — `allow` is how a host releases one.
     pub fn deny_names<S: AsRef<str>>(&mut self, names: impl IntoIterator<Item = S>) {
@@ -329,8 +362,44 @@ impl ShellEnvPolicy {
         }
     }
 
+    /// Deny the `env` names a provider of the model catalog lists.
+    /// `in_use`: the install uses that provider (it is declared in a
+    /// loaded config, selected as a model, or has stored credentials).
+    ///
+    /// The catalog lists the variables of every provider there is, and
+    /// some are not a model provider's alone: a restricted server denies
+    /// them all, as it denies whatever looks like a credential. A
+    /// standalone one denies a name only when its provider is in use,
+    /// the name is shaped like a credential ([`CREDENTIAL_PATTERNS`]) and
+    /// it is not one of the [`GENERAL_PURPOSE_CREDENTIALS`].
+    pub fn deny_catalog_names<S: AsRef<str>>(
+        &mut self,
+        names: impl IntoIterator<Item = S>,
+        in_use: bool,
+    ) {
+        for name in names {
+            let name = name.as_ref();
+            if name.is_empty() || matches_any(name, RESTRICTED_INHERIT) {
+                continue;
+            }
+            let upper = name.to_ascii_uppercase();
+            if in_use {
+                self.catalog_in_use.insert(upper.clone());
+            }
+            self.catalog.insert(upper);
+        }
+    }
+
     fn learned(&self, upper: &str) -> bool {
-        self.named.contains(upper)
+        if self.named.contains(upper) {
+            return true;
+        }
+        if self.restricted {
+            return self.catalog.contains(upper);
+        }
+        self.catalog_in_use.contains(upper)
+            && matches_any(upper, CREDENTIAL_PATTERNS)
+            && !matches_any(upper, GENERAL_PURPOSE_CREDENTIALS)
     }
 
     fn allowed(&self, name: &str) -> bool {
@@ -474,6 +543,10 @@ pub fn install(mut policy: ShellEnvPolicy) {
     let mut current = CURRENT.write().unwrap_or_else(|p| p.into_inner());
     if let Some(previous) = current.as_deref() {
         policy.named.extend(previous.named.iter().cloned());
+        policy.catalog.extend(previous.catalog.iter().cloned());
+        policy
+            .catalog_in_use
+            .extend(previous.catalog_in_use.iter().cloned());
     }
     if !TIGHTENED
         .lock()
@@ -524,6 +597,19 @@ pub fn learn<S: AsRef<str>>(names: impl IntoIterator<Item = S>) {
     let mut current = CURRENT.write().unwrap_or_else(|p| p.into_inner());
     let mut policy = current.as_deref().cloned().unwrap_or_default();
     policy.deny_names(names);
+    if current.as_deref() != Some(&policy) {
+        *current = Some(Arc::new(policy));
+    }
+}
+
+/// [`ShellEnvPolicy::deny_catalog_names`] on the process-wide policy:
+/// called with each provider of the model catalog when the catalog is
+/// read (`in_use` false) and when an instance's provider state is built
+/// (`in_use` true for the providers it uses). Append-only like [`learn`].
+pub fn learn_catalog<S: AsRef<str>>(names: impl IntoIterator<Item = S>, in_use: bool) {
+    let mut current = CURRENT.write().unwrap_or_else(|p| p.into_inner());
+    let mut policy = current.as_deref().cloned().unwrap_or_default();
+    policy.deny_catalog_names(names, in_use);
     if current.as_deref() != Some(&policy) {
         *current = Some(Arc::new(policy));
     }
@@ -665,6 +751,109 @@ mod tests {
             ]
         );
         assert_eq!(ShellEnvPolicy::from_config(None), ShellEnvPolicy::default());
+    }
+
+    /// The model catalog lists the variables of every provider there is,
+    /// some of them the user's own tools' (`GITHUB_TOKEN` for GitHub
+    /// Copilot, the `AWS_*` keys for Amazon Bedrock). On a standalone
+    /// server a catalog name is withheld only for a provider in use, only
+    /// when shaped like a credential, and never when general-purpose; a
+    /// name a config lists, and the host's `deny`, are withheld whatever
+    /// they are. A restricted server withholds every catalog name.
+    #[test]
+    fn catalog_names_are_withheld_for_providers_in_use_and_credentials_only() {
+        let teach = |policy: &mut ShellEnvPolicy| {
+            // Unused providers.
+            policy.deny_catalog_names(
+                [
+                    "GITHUB_TOKEN",
+                    "AWS_ACCESS_KEY_ID",
+                    "OTHER_TOKEN",
+                    "HF_TOKEN",
+                ],
+                false,
+            );
+            // Providers in use.
+            policy.deny_catalog_names(
+                [
+                    "ACME_TOKEN",
+                    "ACME_REGION",
+                    "ACME_BASE_URL",
+                    "GITHUB_TOKEN",
+                    "GH_TOKEN",
+                    "GITLAB_TOKEN",
+                    "AWS_ACCESS_KEY_ID",
+                    "AWS_SECRET_ACCESS_KEY",
+                    "AWS_REGION",
+                    "AZURE_RESOURCE_NAME",
+                    "GOOGLE_APPLICATION_CREDENTIALS",
+                    "GOOGLE_CLOUD_PROJECT",
+                    "GCLOUD_PROJECT",
+                    "PATH",
+                ],
+                true,
+            );
+        };
+        let mut policy = ShellEnvPolicy::default();
+        teach(&mut policy);
+        let denied = |policy: &ShellEnvPolicy, names: &[&str]| -> Vec<String> {
+            names
+                .iter()
+                .filter(|name| policy.denied(name))
+                .map(|name| name.to_string())
+                .collect()
+        };
+        let all = [
+            "ACME_TOKEN",
+            "acme_token",
+            "ACME_REGION",
+            "ACME_BASE_URL",
+            "OTHER_TOKEN",
+            "HF_TOKEN",
+            "GITHUB_TOKEN",
+            "GH_TOKEN",
+            "GITLAB_TOKEN",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_REGION",
+            "AZURE_RESOURCE_NAME",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "GOOGLE_CLOUD_PROJECT",
+            "GCLOUD_PROJECT",
+            "PATH",
+        ];
+        assert_eq!(denied(&policy, &all), ["ACME_TOKEN", "acme_token"]);
+
+        // Explicit operator intent wins over the exemption: the host's
+        // `deny`, and a name its own config lists as a provider's.
+        let mut explicit = self::policy(serde_json::json!({ "deny": ["GITHUB_TOKEN"] }));
+        teach(&mut explicit);
+        explicit.deny_names(["AWS_SECRET_ACCESS_KEY", "ACME_REGION"]);
+        assert_eq!(
+            denied(&explicit, &all),
+            [
+                "ACME_TOKEN",
+                "acme_token",
+                "ACME_REGION",
+                "GITHUB_TOKEN",
+                "AWS_SECRET_ACCESS_KEY"
+            ]
+        );
+
+        // `allow` hands a catalog name back.
+        let mut allowing = self::policy(serde_json::json!({ "allow": ["ACME_TOKEN"] }));
+        teach(&mut allowing);
+        assert_eq!(denied(&allowing, &all), ["acme_token"]);
+
+        // Restricted: every catalog name but the basics, as before.
+        let restricted = policy.clone().restricted(true);
+        assert_eq!(
+            denied(&restricted, &all),
+            all.iter()
+                .filter(|name| **name != "PATH")
+                .map(|name| name.to_string())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

@@ -1516,13 +1516,18 @@ pub fn catalog_in(
 
 /// `source`, with every read teaching the shell environment policy the
 /// variables the catalog's providers read their keys from
-/// (`alforria_core::shell_env::learn`): a provider that appears in the
-/// catalog after the server started is covered too.
+/// (`alforria_core::shell_env::learn_catalog`): a provider that appears in
+/// the catalog after the server started is covered too. These are the
+/// names of every provider, used or not, and only a restricted server
+/// withholds them on that account; which of them a standalone server
+/// withholds is taught where the providers in use are known
+/// (`provider::learn_catalog_names`).
 pub fn learning_catalog(source: CatalogSource) -> CatalogSource {
     Arc::new(move || {
         let providers = source()?;
-        alforria_core::shell_env::learn(
+        alforria_core::shell_env::learn_catalog(
             providers.values().flat_map(|provider| provider.env.iter()),
+            false,
         );
         Ok(providers)
     })
