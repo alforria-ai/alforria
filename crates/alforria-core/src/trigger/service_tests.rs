@@ -2419,3 +2419,78 @@ async fn a_panic_in_a_run_is_a_failed_run_and_frees_the_trigger() {
     assert_eq!(theirs.status, RunStatus::Queued, "{:?}", theirs.cause);
     settle(&peer, &[theirs]).await;
 }
+
+/// A watch with no quiet period and a cron no date matches are refused
+/// wherever a spec comes in: created, changed, or read from the config
+/// (where the trigger is listed with the reason and never scheduled).
+#[tokio::test]
+async fn a_debounce_below_the_floor_and_a_cron_that_never_fires_are_refused_everywhere() {
+    let f = Fixture::new(
+        "trigger-floors",
+        "2027-01-01T00:00:00Z",
+        FakeOps::answering("ok"),
+    );
+    std::fs::create_dir_all(f.directory().join("inbox")).unwrap();
+    let service = f.service(json!({
+        "never": { "on": { "cron": "0 0 30 2 *" }, "prompt": "x" },
+        "eager": { "on": { "watch": { "path": "inbox", "debounce": "0ms" } }, "prompt": "x" },
+    }));
+    for (id, needle) in [("never", "never fires"), ("eager", "too short")] {
+        let record = service.get(id).unwrap();
+        assert!(
+            record.error.as_deref().is_some_and(|e| e.contains(needle)),
+            "{id}: {:?}",
+            record.error
+        );
+        assert_eq!(record.next, None);
+        assert!(matches!(service.run_now(id), Err(TriggerError::Invalid(_))));
+    }
+
+    for (on, needle) in [
+        (
+            json!({ "watch": { "path": "inbox", "debounce": "0ms" } }),
+            "too short",
+        ),
+        (json!({ "cron": "0 0 30 2 *" }), "never fires"),
+        (json!({ "interval": "0s" }), "too short"),
+    ] {
+        match service.create(None, spec(json!({ "on": on, "prompt": "x" })), None, None) {
+            Err(TriggerError::Invalid(error)) => assert!(error.contains(needle), "{error}"),
+            other => panic!("{on}: {other:?}"),
+        }
+    }
+    assert_eq!(service.list().len(), 2, "nothing was stored");
+
+    service
+        .create(
+            Some("w".to_string()),
+            spec(
+                json!({ "on": { "watch": { "path": "inbox", "debounce": "1s" } }, "prompt": "x" }),
+            ),
+            None,
+            None,
+        )
+        .unwrap();
+    service
+        .create(
+            Some("c".to_string()),
+            spec(json!({ "on": { "cron": "0 0 28 2 *" }, "prompt": "x" })),
+            None,
+            None,
+        )
+        .unwrap();
+    for (id, on, needle) in [
+        (
+            "w",
+            json!({ "watch": { "path": "inbox", "debounce": "0ms" } }),
+            "too short",
+        ),
+        ("c", json!({ "cron": "0 0 30 2 *" }), "never fires"),
+    ] {
+        match service.update(id, &json!({ "on": on })) {
+            Err(TriggerError::Invalid(error)) => assert!(error.contains(needle), "{error}"),
+            other => panic!("{id}: {other:?}"),
+        }
+        assert_eq!(service.get(id).unwrap().error, None, "{id} is unchanged");
+    }
+}

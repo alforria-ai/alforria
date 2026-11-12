@@ -339,6 +339,15 @@ pre-1.0, so minor releases may include breaking changes.
   closed, every fire is claimed in the database, and one process per
   directory schedules. See "Two servers on one data directory" in
   `docs/unattended-server.md`.
+- A trigger run whose turn panicked stayed `running` for as long as the
+  server lived, and every later fire of the trigger was skipped, in every
+  server sharing the data directory. It is now a failed run (`the run
+  panicked: …`) and the trigger is free again.
+- A trigger that could never run sensibly is refused when it is created,
+  changed or read from the config (where it is listed with the reason): a
+  `cron` expression no date matches (`0 0 30 2 *`), a `watch` `debounce`
+  under 1 second (`0ms` fired a run per file event), and an `interval` or
+  `debounce` over 366 days.
 
 - Routes naming a session and a message, part or permission request inside
   it acted on the inner id without checking it belonged to that session:

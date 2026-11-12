@@ -209,7 +209,7 @@ Actions:
   - `interval`: a repeat period such as "30m" or "2h" (minimum 10s);
   - `at`: one time, as RFC 3339 (for example 2027-01-31T09:00:00+01:00);
   - `in`: one time, relative to now, such as "20m";
-  - `watch`: a path inside the project; fires when it changes and then stays quiet for `debounce` (default 5s);
+  - `watch`: a path inside the project; fires when it changes and then stays quiet for `debounce` (default 5s, minimum 1s);
   - `webhook: true`: fires when POST /trigger/{id}/hook is called.
   Optional: `id` (a short name), `title`, `session`, `report`, `quiet_token`.
 - `list`: show every trigger, with its state and next run.

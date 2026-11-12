@@ -103,6 +103,10 @@ pub fn format_duration(ms: u64) -> String {
     out
 }
 
+/// 2000-01-01T00:00:00Z: where [`CronSchedule::parse`] looks from to tell
+/// whether an expression ever fires.
+const NEVER_FIRES_REFERENCE_MS: u64 = 946_684_800_000;
+
 /// A parsed 5-field cron expression (names and the `@hourly`-style macros
 /// included) in a timezone.
 #[derive(Debug, Clone)]
@@ -129,7 +133,18 @@ impl CronSchedule {
             .build()
             .parse(expression)
             .map_err(|error| format!("invalid cron expression \"{expression}\": {error}"))?;
-        Ok(CronSchedule { cron, zone })
+        let schedule = CronSchedule { cron, zone };
+        // An expression can be well formed and match no date at all
+        // ("0 0 30 2 *"): it would be listed as scheduled and never fire,
+        // and every look for its next occurrence would search the whole
+        // calendar. The calendar repeats, so one search from a fixed day
+        // answers for any.
+        if schedule.next_after(NEVER_FIRES_REFERENCE_MS).is_none() {
+            return Err(format!(
+                "cron expression \"{expression}\" never fires: no date matches it"
+            ));
+        }
+        Ok(schedule)
     }
 
     /// The first occurrence strictly after `after_ms`.
@@ -252,6 +267,34 @@ mod tests {
         }
         let error = CronSchedule::parse("0 9 * * *", Some("Mars/Olympus")).unwrap_err();
         assert!(error.contains("unknown timezone"), "{error}");
+    }
+
+    /// An expression that parses and matches no date is refused when it is
+    /// read, and telling so is quick; a rare one (29 February) is not.
+    #[test]
+    fn a_cron_that_never_fires_is_refused() {
+        for expression in ["0 0 30 2 *", "0 0 31 4,6,9,11 *", "0 0 31 2 *"] {
+            let started = std::time::Instant::now();
+            let error = CronSchedule::parse(expression, Some("Europe/Paris")).unwrap_err();
+            assert!(error.contains("never fires"), "{expression}: {error}");
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "{expression} took {:?}",
+                started.elapsed()
+            );
+        }
+        let leap = CronSchedule::parse("0 0 29 2 *", None).unwrap();
+        assert_eq!(
+            leap.next_after(at("2027-01-01T00:00:00Z")),
+            Some(at("2028-02-29T00:00:00Z"))
+        );
+        // Day of month and day of week are alternatives: the Mondays of
+        // February.
+        let either = CronSchedule::parse("59 23 29 2 1", Some("Europe/Paris")).unwrap();
+        assert_eq!(
+            either.next_after(at("2027-01-01T00:00:00Z")),
+            Some(at("2027-02-01T22:59:00Z"))
+        );
     }
 
     #[test]

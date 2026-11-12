@@ -215,6 +215,12 @@ impl Schedule {
 pub const MIN_INTERVAL_MS: u64 = 10_000;
 /// The debounce a `watch` gets when it names none.
 pub const DEFAULT_DEBOUNCE_MS: u64 = 5_000;
+/// The shortest debounce a `watch` may name: below it, one save of a file
+/// (several events) is several runs.
+pub const MIN_DEBOUNCE_MS: u64 = 1_000;
+/// The longest interval or debounce: past it the value is a mistake (a
+/// duration saturates at `u64::MAX` milliseconds), not a schedule.
+pub const MAX_PERIOD_MS: u64 = 366 * 24 * 60 * 60 * 1000;
 
 impl TriggerTurn {
     /// What to put on this run's session: its own rules and its ceilings
@@ -287,6 +293,12 @@ impl TriggerSpec {
                     format_duration(MIN_INTERVAL_MS)
                 ));
             }
+            if ms > MAX_PERIOD_MS {
+                return Err(format!(
+                    "interval \"{interval}\" is too long (the maximum is {})",
+                    format_duration(MAX_PERIOD_MS)
+                ));
+            }
             return Ok(Schedule::Interval(ms));
         }
         if let Some(at) = &on.at {
@@ -297,7 +309,22 @@ impl TriggerSpec {
                 return Err("watch needs a path".to_string());
             }
             let debounce_ms = match &watch.debounce {
-                Some(debounce) => parse_duration(debounce)?,
+                Some(debounce) => {
+                    let ms = parse_duration(debounce)?;
+                    if ms < MIN_DEBOUNCE_MS {
+                        return Err(format!(
+                            "debounce \"{debounce}\" is too short (the minimum is {})",
+                            format_duration(MIN_DEBOUNCE_MS)
+                        ));
+                    }
+                    if ms > MAX_PERIOD_MS {
+                        return Err(format!(
+                            "debounce \"{debounce}\" is too long (the maximum is {})",
+                            format_duration(MAX_PERIOD_MS)
+                        ));
+                    }
+                    ms
+                }
                 None => DEFAULT_DEBOUNCE_MS,
             };
             return Ok(Schedule::Watch {
@@ -655,12 +682,38 @@ mod tests {
                 json!({ "interval": "1h", "timezone": "UTC" }),
                 "only applies",
             ),
+            (json!({ "interval": "0" }), "too short"),
+            (json!({ "interval": "0.5ms" }), "too short"),
+            (
+                json!({ "interval": "99999999999999999999999w" }),
+                "too long",
+            ),
             (json!({ "cron": "nope" }), "invalid cron"),
+            (json!({ "cron": "0 0 30 2 *" }), "never fires"),
+            (
+                json!({ "watch": { "path": "inbox", "debounce": "0ms" } }),
+                "too short",
+            ),
+            (
+                json!({ "watch": { "path": "inbox", "debounce": "999ms" } }),
+                "too short",
+            ),
+            (
+                json!({ "watch": { "path": "inbox", "debounce": "9999999999w" } }),
+                "too long",
+            ),
             (json!({ "at": "soon" }), "RFC 3339"),
             (json!({ "watch": { "path": " " } }), "needs a path"),
         ] {
             let error = spec(on.clone()).schedule().unwrap_err();
             assert!(error.contains(needle), "{on}: {error}");
+        }
+        // The floors themselves are accepted.
+        for on in [
+            json!({ "interval": "10s" }),
+            json!({ "watch": { "path": "inbox", "debounce": "1s" } }),
+        ] {
+            spec(on).schedule().unwrap();
         }
         assert!(serde_json::from_value::<TriggerSpec>(
             json!({ "on": { "every": "1h" }, "prompt": "x" })

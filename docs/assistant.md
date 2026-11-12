@@ -82,7 +82,11 @@ project.
   the spring gap runs once right after it, and a time that happens twice in
   autumn runs once.
 - `interval` and `debounce` are durations: `90s`, `30m`, `2h`, `1d`, `1h30m`.
-  The shortest interval is 10 seconds.
+  The shortest interval is 10 seconds and the shortest debounce 1 second
+  (5 seconds when you name none); neither may be longer than 366 days.
+  A shorter or longer one is refused, not rounded.
+- A `cron` expression that parses but matches no date (`0 0 30 2 *`) is
+  refused as well.
 - `watch` paths are relative to the project directory. A stored trigger must
   stay inside it; your config may name any path. Symlinks are resolved before
   that check (through the nearest existing parent when the path does not
