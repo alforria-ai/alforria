@@ -7,6 +7,8 @@ pre-1.0, so minor releases may include breaking changes.
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-11-12
+
 ### Security
 
 Found by a review of v0.4.1.
@@ -257,7 +259,8 @@ First release.
 - The Rust workspace: schema, LLM, core, server, TUI, embedded UI, and CLI
   crates.
 
-[Unreleased]: https://github.com/alforria-ai/alforria/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/alforria-ai/alforria/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/alforria-ai/alforria/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/alforria-ai/alforria/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/alforria-ai/alforria/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/alforria-ai/alforria/compare/v0.2.1...v0.3.0
