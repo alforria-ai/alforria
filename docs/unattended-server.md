@@ -1383,7 +1383,10 @@ asked the model for:
   file counts the difference. The server counts a directory once — a
   bounded walk that gives up, and reports the directory full, past
   `max_files` entries or 8 levels — and then keeps the figure up to date
-  with each upload it writes; it does not walk per upload. What is added
+  with each upload it writes; it does not walk per upload. What an upload
+  replaces is read at the moment of its rename, under that directory's
+  lock, so uploads racing for one file are each counted for what they
+  really replaced. What is added
   or removed by other means (the agent's shell deleting old uploads) is
   noticed when the directory is counted again: at most every 5 minutes,
   and after a restart. `admin` and the operator are held to `max_bytes`

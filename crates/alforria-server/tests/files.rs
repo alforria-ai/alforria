@@ -910,6 +910,84 @@ async fn the_quota_counts_directories_and_is_not_a_walk_per_upload() {
     assert_eq!(body_json(refused).await["name"], "UploadQuotaError");
 }
 
+/// Many uploads replacing one file at once: each takes off the count what
+/// it really replaced, read in the same breath as its rename — so the
+/// count afterwards is what the directory holds, and the quota held
+/// throughout. (Read early, every one of them was credited with the same
+/// old file and the count sank below the truth.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_uploads_replacing_one_file_keep_the_count_true() {
+    use alforria_server::routes::file_ext::{upload_area_on_disk, upload_area_usage};
+
+    const TOTAL: u64 = 2000;
+    let signer = Signer::new();
+    let f = std::sync::Arc::new(quota_fixture(&signer, TOTAL, 10));
+    let chat = bearer(&signer.token(AUDIENCE, "chat"));
+    let uploads = f.dirs.repo.join("uploads");
+    std::fs::write(uploads.join("other.bin"), [b'o'; 700]).unwrap();
+    std::fs::write(uploads.join("one.bin"), [b'x'; 900]).unwrap();
+
+    for round in 0..4u64 {
+        let tasks: Vec<_> = (0..32u64)
+            .map(|n| {
+                let (f, chat) = (std::sync::Arc::clone(&f), chat.clone());
+                tokio::spawn(async move {
+                    // 100..=1030 bytes: some fit beside the other file,
+                    // some do not.
+                    let body = vec![b'a'; (100 + 30 * ((n + round) % 32)) as usize];
+                    put(&f, Some(&chat), "uploads/one.bin", "", &body)
+                        .await
+                        .status()
+                })
+            })
+            .collect();
+        for task in tasks {
+            let status = task.await.unwrap();
+            assert!(
+                [StatusCode::OK, StatusCode::PAYLOAD_TOO_LARGE].contains(&status),
+                "{status}"
+            );
+        }
+        let on_disk = upload_area_on_disk(&uploads, 1000);
+        assert_eq!(upload_area_usage(&uploads), Some(on_disk), "round {round}");
+        assert!(on_disk.0 <= TOTAL, "the quota held: {on_disk:?}");
+        assert_eq!(on_disk.1, 2, "no upload in progress is left behind");
+    }
+}
+
+/// The same for uploads that each make the same new directories and file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_uploads_of_one_new_file_count_it_once() {
+    use alforria_server::routes::file_ext::{upload_area_on_disk, upload_area_usage};
+
+    let signer = Signer::new();
+    let f = std::sync::Arc::new(quota_fixture(&signer, 100_000, 50));
+    let chat = bearer(&signer.token(AUDIENCE, "chat"));
+    let uploads = f.dirs.repo.join("uploads");
+    let tasks: Vec<_> = (0..16usize)
+        .map(|n| {
+            let (f, chat) = (std::sync::Arc::clone(&f), chat.clone());
+            tokio::spawn(async move {
+                put(
+                    &f,
+                    Some(&chat),
+                    "uploads/a/b/new.bin",
+                    "",
+                    &vec![b'n'; 10 + n],
+                )
+                .await
+                .status()
+            })
+        })
+        .collect();
+    for task in tasks {
+        assert!(task.await.unwrap().is_success());
+    }
+    let on_disk = upload_area_on_disk(&uploads, 1000);
+    assert_eq!(on_disk.1, 3);
+    assert_eq!(upload_area_usage(&uploads), Some(on_disk));
+}
+
 fn basic() -> String {
     use base64::Engine;
     format!(

@@ -156,8 +156,10 @@ pre-1.0, so minor releases may include breaking changes.
   directory — `server.upload.max_total_bytes` (default 1 GiB) and
   `server.upload.max_files` (default 1000 entries, directories included),
   at most 8 levels deep — answered `413` `UploadQuotaError` before
-  anything is written, from a running count that is re-read at most every
-  5 minutes. The write guard also protects the files a `formatter` or
+  anything is written, from a running count per directory that is re-read
+  at most every 5 minutes and after a restart (what an upload replaces is
+  read as it is renamed into place, so concurrent uploads to one file
+  cannot lower the count below what is there). The write guard also protects the files a `formatter` or
   `lsp` entry's `command` names, and while bearer tokens are configured no
   language server is started on a file in an upload directory (nor would a
   formatter be run on one), so nothing uploaded is read as a tool's config.

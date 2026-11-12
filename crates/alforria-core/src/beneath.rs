@@ -475,6 +475,37 @@ impl NoFollowDir {
         }
     }
 
+    /// The size of `name` in this directory as the directory lists it — a
+    /// link's own, never what it points to — or `None` when there is no
+    /// such name.
+    pub fn len_of(&self, name: &std::ffi::OsStr) -> io::Result<Option<u64>> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        let name = Self::name(name.as_bytes())?;
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: the directory is open, `name` a valid C string, `stat`
+        // room for one `struct stat`; the result is checked before it is
+        // read.
+        let status = unsafe {
+            libc::fstatat(
+                self.fd.as_raw_fd(),
+                name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if status != 0 {
+            let error = io::Error::last_os_error();
+            return match error.kind() {
+                io::ErrorKind::NotFound => Ok(None),
+                _ => Err(error),
+            };
+        }
+        // SAFETY: `fstatat` succeeded and filled it.
+        let stat = unsafe { stat.assume_init() };
+        Ok(Some(u64::try_from(stat.st_size).unwrap_or(0)))
+    }
+
     /// Remove the file `name` from this directory (a link itself, never
     /// what it points to).
     pub fn remove_file(&self, name: &std::ffi::OsStr) -> io::Result<()> {
@@ -510,6 +541,10 @@ impl NoFollowDir {
 
     pub fn remove_file(&self, name: &std::ffi::OsStr) -> io::Result<()> {
         by_name::remove_file(&self.path, name)
+    }
+
+    pub fn len_of(&self, name: &std::ffi::OsStr) -> io::Result<Option<u64>> {
+        by_name::len_of(&self.path, name)
     }
 }
 
@@ -590,6 +625,17 @@ mod by_name {
     pub(super) fn remove_file(dir: &Path, name: &OsStr) -> io::Result<()> {
         unchanged(dir)?;
         std::fs::remove_file(dir.join(name))
+    }
+
+    /// The name's own size, a link's included; `None` when there is none.
+    #[cfg_attr(unix, allow(dead_code))]
+    pub(super) fn len_of(dir: &Path, name: &OsStr) -> io::Result<Option<u64>> {
+        unchanged(dir)?;
+        match std::fs::symlink_metadata(dir.join(name)) {
+            Ok(meta) => Ok(Some(meta.len())),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(err),
+        }
     }
 }
 
