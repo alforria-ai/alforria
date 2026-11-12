@@ -277,7 +277,26 @@ pub fn token_digest(token: &str) -> String {
 }
 
 fn constant_time_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    #[cfg(test)]
+    COMPARISONS.with(|count| count.set(count.get() + 1));
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many constant-time comparisons this thread has made.
+    pub(crate) static COMPARISONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether two secrets are the same, in time that does not depend on where
+/// they differ or on their lengths: their SHA-256 digests are compared in
+/// full. For the Basic username and password (`AuthConfig::authorized`).
+pub(crate) fn secret_eq(a: &str, b: &str) -> bool {
+    let (a, b): ([u8; 32], [u8; 32]) = (
+        Sha256::digest(a.as_bytes()).into(),
+        Sha256::digest(b.as_bytes()).into(),
+    );
+    constant_time_eq(&a, &b)
 }
 
 fn decode_segment(segment: &str) -> Option<Vec<u8>> {

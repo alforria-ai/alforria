@@ -90,8 +90,12 @@ impl AuthConfig {
     /// configured a request can reach this check without.
     pub fn authorized(&self, username: &str, password: &str) -> bool {
         match &self.password {
+            // Both compared, in full, whatever the first says: the time
+            // taken tells nothing about which was wrong or how nearly
+            // right (`&`, not `&&`).
             Some(expected) if !expected.is_empty() => {
-                username == self.username && password == expected
+                crate::bearer::secret_eq(username, &self.username)
+                    & crate::bearer::secret_eq(password, expected)
             }
             _ => false,
         }
@@ -2032,6 +2036,44 @@ mod tests {
         }
         fn cancel(&self, _id: &str) -> Result<(), alforria_core::CoreError> {
             Ok(())
+        }
+    }
+
+    /// The Basic check compares the username and the password through the
+    /// constant-time comparison — both, whichever is wrong — and still
+    /// tells right from wrong.
+    #[test]
+    fn basic_credentials_are_compared_in_constant_time() {
+        let comparisons = || crate::bearer::COMPARISONS.with(std::cell::Cell::get);
+        let auth = AuthConfig {
+            username: "alforria".into(),
+            password: Some("hunter2".into()),
+            bearer: None,
+        };
+        for (username, password, expected) in [
+            ("alforria", "hunter2", true),
+            ("alforria", "hunter", false),
+            ("alforria", "hunter22", false),
+            ("alforria", "", false),
+            ("alforri", "hunter2", false),
+            ("", "hunter2", false),
+            ("x", "y", false),
+        ] {
+            let before = comparisons();
+            assert_eq!(
+                auth.authorized(username, password),
+                expected,
+                "{username}:{password}"
+            );
+            assert_eq!(comparisons() - before, 2, "{username}:{password}");
+        }
+        // No password, or an empty one, authorizes nobody.
+        for password in [None, Some(String::new())] {
+            let auth = AuthConfig {
+                password,
+                ..auth.clone()
+            };
+            assert!(!auth.authorized("alforria", ""));
         }
     }
 }
