@@ -578,7 +578,7 @@ fn inner_command_lines(node: &CommandNode) -> Vec<String> {
                 // In a cluster of short flags the value can start after any
                 // of them (`-iSrm`), so every split is tried.
                 if !word.starts_with("--") {
-                    for (split, _) in word.char_indices().skip(2).take(16) {
+                    for (split, _) in word.char_indices().skip(2) {
                         let mut line = unquote(&word[split..]).to_string();
                         for next in &rest[index + 1..] {
                             line.push(' ');
@@ -631,6 +631,7 @@ pub fn with_inner_commands(
 ) -> Result<Vec<CommandNode>, ToolError> {
     const MAX_NODES: usize = 256;
     const MAX_WRAPPER_WORDS: usize = 64;
+    const MAX_FLAG_LEN: usize = 200;
     let mut all = nodes;
     let mut index = 0;
     let too_many = || {
@@ -648,7 +649,13 @@ pub fn with_inner_commands(
             .map(|part| command_word(&part.text));
         let wraps =
             first.is_some_and(|first| first == "xargs" || WRAPPERS.contains(&first.as_str()));
-        if wraps && all[index].parts.len() > MAX_WRAPPER_WORDS {
+        // Likewise a flag cluster, which is split at every character.
+        let long_flag = all[index].parts.iter().any(|part| {
+            part.text.starts_with('-')
+                && !part.text.starts_with("--")
+                && part.text.len() > MAX_FLAG_LEN
+        });
+        if wraps && (all[index].parts.len() > MAX_WRAPPER_WORDS || long_flag) {
             return Err(too_many());
         }
         for line in inner_command_lines(&all[index]) {
@@ -1696,6 +1703,7 @@ mod tests {
             "env -S\"rm -rf build\"",
             "env -Srm -rf build",
             "env -iSrm -rf build",
+            "env -iiiiiiiiiiiiiiiiiiiiiiiiSrm -rf build",
             // Past any number of flags and settings.
             "env -i A=1 B=2 C=3 D=4 E=5 F=6 G=7 H=8 I=9 J=10 K=11 L=12 M=13 rm -rf build",
         ] {
@@ -1710,6 +1718,8 @@ mod tests {
         // Too long to unwrap is refused, not waved through.
         let parser = parse::parser_for("bash");
         let long = format!("env {} rm -rf build", "A=1 ".repeat(80));
+        assert!(with_inner_commands(parser.as_ref(), parser.parse(&long).unwrap()).is_err());
+        let long = format!("env -{}Srm -rf build", "i".repeat(300));
         assert!(with_inner_commands(parser.as_ref(), parser.parse(&long).unwrap()).is_err());
         // A plain command is asked about once, as before.
         let scan = scan_sync("rm -rf build", &dir, &dir);
