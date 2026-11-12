@@ -1389,7 +1389,9 @@ asked the model for:
   really replaced. What is added
   or removed by other means (the agent's shell deleting old uploads) is
   noticed when the directory is counted again: at most every 5 minutes,
-  and after a restart. `admin` and the operator are held to `max_bytes`
+  and after a restart. A recount always counts, whatever is uploaded while
+  it runs: the new figure is what the walk saw plus what uploads added
+  meanwhile (so it can read high until the next one, never low). `admin` and the operator are held to `max_bytes`
   only, and their uploads are likewise noticed at the next count.
 
 While bearer tokens are configured, no language server is started on a

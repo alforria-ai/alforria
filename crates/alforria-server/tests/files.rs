@@ -926,6 +926,14 @@ async fn concurrent_uploads_replacing_one_file_keep_the_count_true() {
     let uploads = f.dirs.repo.join("uploads");
     std::fs::write(uploads.join("other.bin"), [b'o'; 700]).unwrap();
     std::fs::write(uploads.join("one.bin"), [b'x'; 900]).unwrap();
+    // The directory's first count, on its own: counts taken while uploads
+    // land may read high until the next one (see the recount test).
+    assert_eq!(
+        put(&f, Some(&chat), "uploads/one.bin", "", &[b'x'; 900])
+            .await
+            .status(),
+        StatusCode::OK
+    );
 
     for round in 0..4u64 {
         let tasks: Vec<_> = (0..32u64)
@@ -964,6 +972,12 @@ async fn concurrent_uploads_of_one_new_file_count_it_once() {
     let f = std::sync::Arc::new(quota_fixture(&signer, 100_000, 50));
     let chat = bearer(&signer.token(AUDIENCE, "chat"));
     let uploads = f.dirs.repo.join("uploads");
+    assert_eq!(
+        put(&f, Some(&chat), "uploads/first.bin", "", b"1")
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
     let tasks: Vec<_> = (0..16usize)
         .map(|n| {
             let (f, chat) = (std::sync::Arc::clone(&f), chat.clone());
@@ -984,8 +998,94 @@ async fn concurrent_uploads_of_one_new_file_count_it_once() {
         assert!(task.await.unwrap().is_success());
     }
     let on_disk = upload_area_on_disk(&uploads, 1000);
-    assert_eq!(on_disk.1, 3);
+    assert_eq!(on_disk.1, 4);
     assert_eq!(upload_area_usage(&uploads), Some(on_disk));
+}
+
+/// The recount is the backstop for a count that has gone wrong, and it
+/// holds under load: uploads that land while the directory is being walked
+/// do not make the walk's result worthless. A count set far too low is
+/// corrected by a walk that an upload overtook, and the quota is enforced
+/// on the corrected figure. (The upload is made to land mid-walk by a
+/// seam, not by timing.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recount_overtaken_by_uploads_still_corrects_the_count() {
+    use alforria_server::routes::file_ext::{
+        upload_area_on_disk, upload_area_skew, upload_area_usage, upload_area_walk_hook,
+        upload_area_walks,
+    };
+    use std::sync::mpsc;
+
+    let signer = Signer::new();
+    let f = std::sync::Arc::new(quota_fixture(&signer, 1000, 20));
+    let chat = bearer(&signer.token(AUDIENCE, "chat"));
+    let uploads = f.dirs.repo.join("uploads");
+    std::fs::write(uploads.join("other.bin"), [b'o'; 700]).unwrap();
+    assert_eq!(
+        put(&f, Some(&chat), "uploads/first.bin", "", &[b'1'; 10])
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(upload_area_usage(&uploads), Some((710, 2)));
+
+    for round in 0..3u64 {
+        // The count is wrong — as if it had drifted — and due a recount.
+        upload_area_skew(&uploads, 0, 0);
+        let walks = upload_area_walks(&uploads);
+        let (reached, at_hook) = mpsc::channel::<()>();
+        let (release, go) = mpsc::channel::<()>();
+        let (reached, go) = (std::sync::Mutex::new(reached), std::sync::Mutex::new(go));
+        upload_area_walk_hook(
+            &uploads,
+            Some(std::sync::Arc::new(move || {
+                reached.lock().unwrap().send(()).unwrap();
+                go.lock().unwrap().recv().unwrap();
+            })),
+        );
+        // This upload starts the walk, which stops having read the
+        // directory …
+        let walker = {
+            let (f, chat) = (std::sync::Arc::clone(&f), chat.clone());
+            let path = format!("uploads/walker-{round}.bin");
+            tokio::spawn(async move { put(&f, Some(&chat), &path, "", &[b'w'; 20]).await.status() })
+        };
+        tokio::task::spawn_blocking(move || at_hook.recv().unwrap())
+            .await
+            .unwrap();
+        // … and these land meanwhile, on the running count.
+        for n in 0..3 {
+            let path = format!("uploads/during-{round}-{n}.bin");
+            assert_eq!(
+                put(&f, Some(&chat), &path, "", &[b'd'; 5]).await.status(),
+                StatusCode::CREATED
+            );
+        }
+        release.send(()).unwrap();
+        assert_eq!(walker.await.unwrap(), StatusCode::CREATED);
+        upload_area_walk_hook(&uploads, None);
+
+        assert_eq!(upload_area_walks(&uploads), walks + 1, "one walk");
+        let on_disk = upload_area_on_disk(&uploads, 1000);
+        assert_eq!(
+            upload_area_usage(&uploads),
+            Some(on_disk),
+            "round {round}: the walk's result counted, with what landed during it"
+        );
+        // And the quota is the true figure's: what is left is under 300.
+        let refused = put(&f, Some(&chat), "uploads/big.bin", "", &[b'b'; 300]).await;
+        assert_eq!(refused.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    // A walk that finds the directory over its cap fills it, uploads
+    // landing meanwhile or not.
+    for n in 0..30 {
+        std::fs::write(uploads.join(format!("shell-{n}")), b"").unwrap();
+    }
+    upload_area_skew(&uploads, 0, 0);
+    let refused = put(&f, Some(&chat), "uploads/late.bin", "", b"x").await;
+    assert_eq!(refused.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(body_json(refused).await["name"], "UploadQuotaError");
 }
 
 fn basic() -> String {

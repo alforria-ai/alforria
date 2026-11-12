@@ -121,9 +121,6 @@ pub const UPLOAD_MAX_DEPTH: usize = 8;
 /// on restart.
 const USAGE_MAX_AGE: Duration = Duration::from_secs(300);
 
-/// How long after a count that an upload overtook the next one is tried.
-const USAGE_RETRY: Duration = Duration::from_secs(10);
-
 /// What an upload directory holds, as the server last counted it and has
 /// kept up to date since with every upload it wrote.
 #[derive(Clone, Copy)]
@@ -148,10 +145,61 @@ struct Area {
 struct AreaState {
     /// `None` until the directory has been counted.
     usage: Option<Usage>,
-    /// Moves with every change the server makes to the count: a walk that
-    /// one of them overtook is not written over it.
-    changes: u64,
+    /// Everything uploads have added since this process started — bytes
+    /// written, entries made — never lowered: what a walk adds to what it
+    /// saw for the uploads that landed while it ran ([`refresh`]).
+    added: (u64, u64),
+    /// A recount is under way: others go by the running count meanwhile
+    /// instead of walking too.
+    walking: bool,
+    /// The count is to be taken again whatever its age.
+    stale: bool,
     walks: u64,
+}
+
+/// Clears `walking` however the recount ends — a request dropped half-way
+/// included.
+struct Walking<'a>(&'a Area);
+
+impl Drop for Walking<'_> {
+    fn drop(&mut self) {
+        self.0.lock().walking = false;
+    }
+}
+
+type WalkHook = Arc<dyn Fn() + Send + Sync>;
+
+static WALK_HOOKS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, WalkHook>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Test seam: run `hook` each time a walk of `area` has finished reading
+/// the directory and before its result is taken — which is where uploads
+/// that land "during the walk" land. `None` removes it.
+#[doc(hidden)]
+pub fn upload_area_walk_hook(area: &Path, hook: Option<WalkHook>) {
+    let mut hooks = WALK_HOOKS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match hook {
+        Some(hook) => hooks.insert(area.to_path_buf(), hook),
+        None => hooks.remove(area),
+    };
+}
+
+/// Test seam: make the running count of `area` wrong — `bytes`, `entries`
+/// — and due for a recount.
+#[doc(hidden)]
+pub fn upload_area_skew(area: &Path, bytes: u64, entries: u64) {
+    let area = area_of(area);
+    let mut state = area.lock();
+    state.usage = Some(Usage {
+        bytes,
+        entries,
+        over: false,
+        counted: std::time::Instant::now(),
+    });
+    state.stale = true;
 }
 
 impl Area {
@@ -242,38 +290,58 @@ fn count_area(root: &Path, max_entries: u64) -> Usage {
 /// directory is walked — outside the lock — when this process has not
 /// counted it yet (so after every start) or last did too long ago, which is
 /// what corrects the running count for files the agent's shell added or
-/// removed. A walk that an upload overtook saw the directory half-way
-/// through that upload: it is dropped and the running count stands until
-/// the next one. A walk that hits its cap leaves the directory full.
+/// removed, and for anything else that made it wrong.
+///
+/// The walk's result always counts, however many uploads landed while it
+/// ran: the new count is what the walk saw plus everything uploads added
+/// since it began. An upload that landed during the walk may be in both —
+/// seen by the walk and added again — and what it replaced is not taken
+/// off: the count then errs high, which is the safe side, until the next
+/// walk. A walk that hit its cap leaves the directory full.
+///
+/// While a recount runs, other uploads go by the running count; a
+/// directory that has no count yet is walked by each upload that needs it.
 async fn refresh(ctx: &ServerContext, root: &Path, area: &Arc<Area>) -> Result<(), FileError> {
     let before = {
-        let state = area.lock();
-        if state
+        let mut state = area.lock();
+        let fresh = state
             .usage
-            .is_some_and(|usage| usage.counted.elapsed() < USAGE_MAX_AGE)
-        {
+            .is_some_and(|usage| usage.counted.elapsed() < USAGE_MAX_AGE);
+        if state.usage.is_some() && ((fresh && !state.stale) || state.walking) {
             return Ok(());
         }
-        state.changes
+        state.walking = true;
+        state.added
     };
+    let _walking = Walking(area);
     let max_entries = ctx.policy.upload_max_files;
     let walked = root.to_path_buf();
-    let counted = tokio::task::spawn_blocking(move || count_area(&walked, max_entries))
-        .await
-        .map_err(|join| storage_error(&std::io::Error::other(join.to_string())))?;
+    let counted = tokio::task::spawn_blocking(move || {
+        let counted = count_area(&walked, max_entries);
+        let hook = WALK_HOOKS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&walked)
+            .cloned();
+        if let Some(hook) = hook {
+            hook();
+        }
+        counted
+    })
+    .await
+    .map_err(|join| storage_error(&std::io::Error::other(join.to_string())))?;
     let mut state = area.lock();
     state.walks += 1;
-    let overtaken = state.changes != before;
-    match &mut state.usage {
-        Some(usage) if overtaken => {
-            // Not again on every upload of a busy directory.
-            let now = std::time::Instant::now();
-            usage.counted = now
-                .checked_sub(USAGE_MAX_AGE.saturating_sub(USAGE_RETRY))
-                .unwrap_or(now);
-        }
-        usage => *usage = Some(counted),
-    }
+    state.stale = false;
+    state.usage = Some(Usage {
+        bytes: counted
+            .bytes
+            .saturating_add(state.added.0.saturating_sub(before.0)),
+        entries: counted
+            .entries
+            .saturating_add(state.added.1.saturating_sub(before.1)),
+        ..counted
+    });
     Ok(())
 }
 
@@ -355,7 +423,7 @@ fn begin(
         if let Some(usage) = &mut state.usage {
             usage.entries += missing;
         }
-        state.changes += 1;
+        state.added.1 += missing;
     }
     Ok(directory.map(|directory| (directory, left)))
 }
@@ -388,7 +456,8 @@ fn commit(
     if let Err(err) = directory.rename(temporary, name) {
         return Ok(Err(err));
     }
-    state.changes += 1;
+    state.added.0 = state.added.0.saturating_add(written);
+    state.added.1 += addition.entries;
     if let Some(usage) = &mut state.usage {
         usage.bytes = usage
             .bytes
