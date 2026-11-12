@@ -526,6 +526,61 @@ const WRAPPERS: &[&str] = &[
 ];
 const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "ash"];
 
+/// The flags of a wrapper that are followed by a value, which is not the
+/// command it runs (`sudo -u root rm` runs `rm`, not `root`).
+fn wrapper_value_flags(wrapper: &str) -> &'static [&'static str] {
+    match wrapper {
+        "sudo" | "doas" => &[
+            "-u",
+            "-g",
+            "-C",
+            "-D",
+            "-h",
+            "-p",
+            "-r",
+            "-t",
+            "-T",
+            "-U",
+            "-R",
+            "--user",
+            "--group",
+            "--chdir",
+            "--host",
+            "--prompt",
+            "--role",
+            "--type",
+            "--other-user",
+            "--chroot",
+        ],
+        "env" => &["-u", "-C", "--unset", "--chdir"],
+        "xargs" => &[
+            "-I",
+            "-n",
+            "-P",
+            "-d",
+            "-a",
+            "-E",
+            "-s",
+            "-L",
+            "--max-args",
+            "--max-procs",
+            "--delimiter",
+            "--arg-file",
+            "--eof",
+            "--max-chars",
+            "--max-lines",
+            "--replace",
+        ],
+        "timeout" => &["-s", "-k", "--signal", "--kill-after"],
+        "nice" => &["-n", "--adjustment"],
+        "ionice" => &["-c", "-n", "-p", "--class", "--classdata", "--pid"],
+        "stdbuf" => &["-i", "-o", "-e", "--input", "--output", "--error"],
+        "exec" => &["-a"],
+        "time" => &["-f", "-o", "--format", "--output"],
+        _ => &[],
+    }
+}
+
 /// The command lines a node runs through another program: `sh -c '…'`,
 /// `eval …`, `env X=1 cmd`, `sudo cmd`, `xargs cmd`, `find … -exec cmd ;`.
 /// A `bash` rule such as `"rm *": "deny"` is matched against these too;
@@ -555,16 +610,32 @@ fn inner_command_lines(node: &CommandNode) -> Vec<String> {
                 .join(" "),
         );
     } else if first == "xargs" || WRAPPERS.contains(&first.as_str()) {
-        // Past the wrapper's own flags, their values where they look like
-        // one, and `VAR=value` settings.
-        let start = rest
-            .iter()
-            .position(|word| {
-                !word.starts_with('-')
-                    && !word.contains('=')
-                    && !word.chars().all(|c| c.is_ascii_digit() || c == '.')
-            })
-            .unwrap_or(rest.len());
+        // Past the wrapper's own flags (with the value of those that take
+        // one), `VAR=value` settings, and a leading number (`timeout 5`,
+        // `nice 10`).
+        let valued = wrapper_value_flags(&first);
+        let mut start = 0;
+        while start < rest.len() {
+            let word = rest[start].as_str();
+            if word == "--" {
+                start += 1;
+                break;
+            }
+            if valued.contains(&word) {
+                start += 2;
+            } else if word.starts_with('-')
+                || word.contains('=')
+                // A number or a duration: `5`, `0.5`, `10s`.
+                || (word.starts_with(|c: char| c.is_ascii_digit())
+                    && word
+                        .chars()
+                        .all(|c| c.is_ascii_digit() || matches!(c, '.' | 's' | 'm' | 'h' | 'd')))
+            {
+                start += 1;
+            } else {
+                break;
+            }
+        }
         if start < rest.len() {
             out.push(join(&rest[start..]));
         }
@@ -593,22 +664,42 @@ fn inner_command_lines(node: &CommandNode) -> Vec<String> {
 
 /// `nodes` plus the commands they run through wrappers, shells and `eval`,
 /// so those are scanned and asked about like any other.
+///
+/// Fails rather than guess: a command nested deeper than this unwraps is
+/// refused, and an inner line that will not parse is kept whole as its own
+/// pattern so rules still see it.
 pub fn with_inner_commands(
     parser: &dyn parse::ShellParser,
     nodes: Vec<CommandNode>,
-) -> Vec<CommandNode> {
+) -> Result<Vec<CommandNode>, ToolError> {
+    const MAX_NODES: usize = 256;
     let mut all = nodes;
     let mut index = 0;
-    // Bounded: each pass can only add what the previous one unwrapped.
-    while index < all.len() && all.len() < 256 {
+    while index < all.len() {
         for line in inner_command_lines(&all[index]) {
-            if let Ok(inner) = parser.parse(&line) {
-                all.extend(inner);
+            match parser.parse(&line) {
+                Ok(inner) => all.extend(inner),
+                Err(_) => all.push(CommandNode {
+                    parts: line
+                        .split_whitespace()
+                        .map(|word| Part {
+                            kind: "word".to_string(),
+                            text: word.to_string(),
+                        })
+                        .collect(),
+                    source: line,
+                }),
             }
+        }
+        if all.len() > MAX_NODES {
+            return Err(ToolError::Failed(
+                "Command nests too many commands to check against the bash permission rules; run it in smaller steps"
+                    .to_string(),
+            ));
         }
         index += 1;
     }
-    all
+    Ok(all)
 }
 
 /// `collect` (shell.ts:378-414): scan every command node for external
@@ -1309,7 +1400,7 @@ impl ShellTool {
                     let nodes = if ps || id::to_kind(&name) == "cmd" {
                         nodes
                     } else {
-                        with_inner_commands(parser.as_ref(), nodes)
+                        with_inner_commands(parser.as_ref(), nodes)?
                     };
                     let mut scan = collect(&nodes, &cwd, ps, &shell, ctx.instance).await;
                     let redirects = parser
@@ -1543,7 +1634,8 @@ mod tests {
 
     fn scan_sync(command: &str, directory: &Path, worktree: &Path) -> Scan {
         let parser = parse::parser_for("bash");
-        let nodes = with_inner_commands(parser.as_ref(), parser.parse(command).expect("parse"));
+        let nodes = with_inner_commands(parser.as_ref(), parser.parse(command).expect("parse"))
+            .expect("unwrap");
         let cwd = directory.to_path_buf();
         let instance = InstanceContext {
             directory: directory.to_path_buf(),
@@ -1615,6 +1707,12 @@ mod tests {
             "echo a | xargs rm -rf build",
             "find . -name x -exec rm -rf build ;",
             "sudo env X=1 sh -c 'rm -rf build'",
+            // A flag's value is not the command.
+            "sudo -u root rm -rf build",
+            "env -u HOME rm -rf build",
+            "echo a | xargs -n 1 -I {} rm -rf build",
+            "timeout -s KILL 5s rm -rf build",
+            "nice -n 10 rm -rf build",
         ] {
             let scan = scan_sync(command, &dir, &dir);
             assert!(
