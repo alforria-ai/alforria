@@ -38,13 +38,23 @@ same care as any other tool that can execute code on your machine.
   lose.
 - Repeated identical tool calls can trigger the `doom_loop` permission gate.
 - Review repository-level config and agent files before running alforria in an
-  untrusted checkout. Project config can change allowed tools and permissions.
+  untrusted checkout. Project config is trusted like your own: it can change
+  allowed tools and permissions, start MCP server commands, point a provider
+  or session sharing at another host, and read `{env:}` and `{file:}` values.
+  Set `OPENCODE_DISABLE_PROJECT_CONFIG=1` to ignore it.
+- The `external_directory` and `bash` rules read shell commands; they do not
+  confine them. Paths and commands built at run time (a variable the command
+  sets itself, an interpreter such as `python -c`) are not seen. They guard
+  against mistakes, not against a model that is trying to get around them.
+  Use a container or VM for that.
 
 ### Local server
 
 - `alforria serve` binds to `127.0.0.1` by default.
-- With `OPENCODE_SERVER_PASSWORD` unset, the CLI generates a random password,
-  prints the username and password once, and requires HTTP Basic auth.
+- With `OPENCODE_SERVER_PASSWORD` unset, `serve` and `web` generate a random
+  password, print the username and password once, and require HTTP Basic
+  auth. `acp` and a TUI that opens its own listener do the same and keep the
+  password to themselves.
 - Setting `OPENCODE_SERVER_PASSWORD` to an empty string is an explicit opt-out:
   the server prints a warning and runs unauthenticated. Do not do this on a
   shared or public network.

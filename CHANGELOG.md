@@ -7,6 +7,36 @@ pre-1.0, so minor releases may include breaking changes.
 
 ## [Unreleased]
 
+### Security
+
+Found by a review of v0.4.1.
+
+- A symlink inside the project that points out of it was read, written,
+  searched and patched without the `external_directory` prompt.
+- The shell tool's `external_directory` check missed most commands: it only
+  looked at a short list (`cat`, `rm`, `cp`, …), dropped `$HOME` and `~user`
+  arguments, ignored `--opt=path`, and did not follow `cd`.
+- `bash` permission rules were matched against the command's source text, so
+  `X=1 rm`, `/bin/rm`, quoting, `sh -c`, `eval`, `env`, `sudo`, `command`,
+  `xargs` and `find -exec` all bypassed a rule for `rm *`.
+- The `task` tool accepted any session id as `task_id`, let the model pick a
+  primary agent, and did not pass the parent agent's deny rules to the child,
+  so a plan session could start a `build` subagent and edit. A prompt written
+  by the model attached any `@`-mentioned file without a permission check.
+- `DELETE /experimental/worktree` deleted any directory it was given.
+- Undoing a turn could delete files outside the worktree named by an imported
+  session.
+- `alforria web`, `alforria acp` and a TUI started with `--port`/`--hostname`
+  ran an unauthenticated server when `OPENCODE_SERVER_PASSWORD` was unset.
+  They now generate a password, as `serve` does; `web` prints it.
+- `/api/fs/read` served project `.svg` and `.html` files as documents in the
+  server's origin; they are now sandboxed.
+- `GET /file` listed directories outside the location.
+- The TUI printed the session title after exit without removing control
+  characters.
+- Provider requests followed redirects to other hosts with `x-api-key` and
+  `x-goog-api-key` attached.
+
 ## [0.4.1] - 2026-11-12
 
 0.4.0 was tagged but shipped no binaries: its macOS verification caught the
