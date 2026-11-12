@@ -7,6 +7,8 @@ pre-1.0, so minor releases may include breaking changes.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-12
+
 ### Added
 
 - Dynamic workflows: saved JavaScript orchestrations that fan work out to many
@@ -90,6 +92,22 @@ pre-1.0, so minor releases may include breaking changes.
   `node_modules`, no longer costs tens of GB of memory and disk. Each turn keeps
   at most 4 MB of patches, with line counts for every file, the event log no
   longer stores patches, and agent steps no longer reload them.
+- A provider answering with an empty response no longer makes a session call it
+  in a tight loop forever: the turn fails after three such responses.
+- A provider that goes silent is timed out after `chunkTimeout` (default 5
+  minutes) and retried, instead of holding the session indefinitely.
+- Pasted line breaks no longer submit the prompt on terminals without bracketed
+  paste.
+- A prompt naming no agent no longer switches a subagent to the default agent.
+- TUI: the `view subagents` hint names its key, and up in a child session no
+  longer recalls the prompt history.
+- Signing in or out can no longer erase the other providers' saved keys: a
+  credential file that cannot be read or parsed is left alone, and it is
+  replaced in one step. Every credential change is recorded, without the key,
+  in `auth-audit.log` beside `auth.json`.
+- Running the test suite no longer rewrites the developer's own `auth.json`.
+- Web client: a provider connected through config or the environment offers
+  Sign in (or Set key), so a missing key can be restored from the browser.
 
 ### Changed
 
@@ -108,18 +126,6 @@ pre-1.0, so minor releases may include breaking changes.
   starts a turn on it.
 - Quitting the TUI while a workflow runs asks for a second press.
 - The web client's overview keeps sessions for 7 days instead of 3.
-
-### Fixed
-
-- A provider answering with an empty response no longer makes a session call it
-  in a tight loop forever: the turn fails after three such responses.
-- A provider that goes silent is timed out after `chunkTimeout` (default 5
-  minutes) and retried, instead of holding the session indefinitely.
-- Pasted line breaks no longer submit the prompt on terminals without bracketed
-  paste.
-- A prompt naming no agent no longer switches a subagent to the default agent.
-- TUI: the `view subagents` hint names its key, and up in a child session no
-  longer recalls the prompt history.
 
 ## [0.3.0] - 2026-10-27
 
@@ -204,7 +210,9 @@ First release.
 - The Rust workspace: schema, LLM, core, server, TUI, embedded UI, and CLI
   crates.
 
-[Unreleased]: https://github.com/alforria-ai/alforria/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/alforria-ai/alforria/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/alforria-ai/alforria/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/alforria-ai/alforria/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/alforria-ai/alforria/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/alforria-ai/alforria/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/alforria-ai/alforria/releases/tag/v0.1.0
