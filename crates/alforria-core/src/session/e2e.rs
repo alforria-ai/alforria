@@ -1388,6 +1388,8 @@ mod tests {
         assert!(e.prompt.goals().read(&session.id).is_none());
     }
 
+    // Windows cannot tell whether the owner is gone, and leaves the goal.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_goal_left_active_by_another_process_comes_back_paused() {
         use crate::session::goal::{GoalState, GoalStatus};

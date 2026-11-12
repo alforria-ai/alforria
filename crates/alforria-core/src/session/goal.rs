@@ -119,9 +119,23 @@ impl GoalState {
 /// owner is taken to be alive: wrongly pausing a live goal is the worse
 /// mistake.
 fn process_alive(pid: u32) -> bool {
-    if cfg!(target_os = "linux") {
-        std::path::Path::new("/proc").join(pid.to_string()).exists()
-    } else {
+    #[cfg(unix)]
+    {
+        // Signal 0 only checks. A pid that is not a positive `pid_t` names
+        // no process (and 0 or -1 would address a whole group).
+        let Some(pid) = libc::pid_t::try_from(pid).ok().filter(|pid| *pid > 0) else {
+            return false;
+        };
+        // SAFETY: `kill` with signal 0 sends nothing.
+        if unsafe { libc::kill(pid, 0) } == 0 {
+            return true;
+        }
+        // EPERM: it exists and belongs to someone else.
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
         true
     }
 }
