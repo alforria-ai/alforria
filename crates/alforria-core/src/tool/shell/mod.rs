@@ -632,6 +632,7 @@ pub fn with_inner_commands(
     const MAX_NODES: usize = 256;
     const MAX_WRAPPER_WORDS: usize = 64;
     const MAX_FLAG_LEN: usize = 200;
+    const MAX_WRAPPER_BYTES: usize = 8 * 1024;
     let mut all = nodes;
     let mut index = 0;
     let too_many = || {
@@ -655,7 +656,9 @@ pub fn with_inner_commands(
                 && !part.text.starts_with("--")
                 && part.text.len() > MAX_FLAG_LEN
         });
-        if wraps && (all[index].parts.len() > MAX_WRAPPER_WORDS || long_flag) {
+        // And its size: each candidate copies the rest of the command.
+        let long_source = all[index].source.len() > MAX_WRAPPER_BYTES;
+        if wraps && (all[index].parts.len() > MAX_WRAPPER_WORDS || long_flag || long_source) {
             return Err(too_many());
         }
         for line in inner_command_lines(&all[index]) {
@@ -1718,6 +1721,8 @@ mod tests {
         // Too long to unwrap is refused, not waved through.
         let parser = parse::parser_for("bash");
         let long = format!("env {} rm -rf build", "A=1 ".repeat(80));
+        assert!(with_inner_commands(parser.as_ref(), parser.parse(&long).unwrap()).is_err());
+        let long = format!("env rm -rf '{}'", "x".repeat(9000));
         assert!(with_inner_commands(parser.as_ref(), parser.parse(&long).unwrap()).is_err());
         let long = format!("env -{}Srm -rf build", "i".repeat(300));
         assert!(with_inner_commands(parser.as_ref(), parser.parse(&long).unwrap()).is_err());
