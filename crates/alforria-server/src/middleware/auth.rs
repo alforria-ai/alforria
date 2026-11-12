@@ -446,16 +446,13 @@ fn check(
     method: &Method,
     uri: &Uri,
     headers: &HeaderMap,
-) -> Result<Option<Principal>, Rejection> {
+) -> Result<Principal, Rejection> {
     let path = uri.path();
-    if is_openapi(method, path) {
-        return Ok(None);
-    }
-    if is_public_ui_path(method, path) {
-        return Ok(None);
+    if is_openapi(method, path) || is_public_ui_path(method, path) {
+        return Ok(Principal::operator(Via::Public));
     }
     if is_file_read(method, path) && file_ticketed(file_tickets, uri, headers) {
-        return Ok(Some(Principal::operator(Via::Ticket)));
+        return Ok(Principal::operator(Via::Ticket));
     }
     let surface = surface(method, path);
     if surface != Surface::Raw {
@@ -474,15 +471,15 @@ fn check(
             })
         });
         if ticketed {
-            return Ok(Some(Principal::operator(Via::Ticket)));
+            return Ok(Principal::operator(Via::Ticket));
         }
     }
     // A bearer credential is judged as one: it never falls back to Basic.
     if let Some(token) = bearer_token(headers) {
-        return check_bearer(auth, directories, token, method, uri, headers).map(Some);
+        return check_bearer(auth, directories, token, method, uri, headers);
     }
     if is_authorized(auth, uri, headers) {
-        return Ok(Some(Principal::operator(Via::Basic)));
+        return Ok(Principal::operator(Via::Basic));
     }
     Err(match surface {
         Surface::V2Api => Rejection::V2,
@@ -634,6 +631,10 @@ where
                 .insert(directory::RequestDirectory(resolved.directory));
         }
         if !self.auth.required() {
+            // No authentication is configured: whoever reaches the server
+            // is its operator, and says so like any other caller. A
+            // handler never has to read an absent principal as one.
+            req.extensions_mut().insert(Principal::operator(Via::Open));
             return Box::pin(async move { inner.call(req).await });
         }
         let result = check(
@@ -655,10 +656,10 @@ where
             match result {
                 Ok(principal) => {
                     // Handlers and the location layer read who is calling
-                    // from here; absent means the operator.
-                    if let Some(principal) = principal {
-                        req.extensions_mut().insert(principal);
-                    }
+                    // from here. Every request let through has one; a
+                    // request without is not the operator
+                    // (`Principal::confines`).
+                    req.extensions_mut().insert(principal);
                     inner.call(req).await
                 }
                 Err(Rejection::Empty) => Ok(unauthorized_raw(challenge)),

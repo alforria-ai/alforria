@@ -30,12 +30,12 @@ pub fn caller(principal: &Option<Extension<Principal>>) -> alforria_core::sessio
     }
 }
 
-/// Whether the request's credential is confined to the project. No
-/// principal means the operator (no authentication, or a public route).
+/// Whether the request's credential is confined to the project. The
+/// operator of a server with no authentication has a principal too
+/// (`Via::Open`, from the auth layer); a request with none was not judged
+/// by that layer and is confined, not trusted (`Principal::confines`).
 pub fn restricted(principal: &Option<Extension<Principal>>) -> bool {
-    principal
-        .as_ref()
-        .is_some_and(|principal| principal.0.restricted())
+    Principal::confines(principal.as_ref().map(|principal| &principal.0))
 }
 
 /// The project a location stands for: its directory, and its git worktree
@@ -174,10 +174,7 @@ pub async fn guard_session_writes(
 ) -> axum::response::Response {
     use axum::extract::FromRequestParts;
     use axum::response::IntoResponse;
-    let is_restricted = request
-        .extensions()
-        .get::<Principal>()
-        .is_some_and(|principal| principal.restricted());
+    let is_restricted = Principal::confines(request.extensions().get::<Principal>());
     let method = request.method().clone();
     if !is_restricted || matches!(method, axum::http::Method::GET | axum::http::Method::HEAD) {
         return next.run(request).await;
@@ -356,6 +353,23 @@ pub fn instance_allowed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A request that carries no principal was not judged by the auth
+    /// layer: it is not the operator. The operator of a server with no
+    /// authentication carries one, from that layer.
+    #[test]
+    fn a_request_without_a_principal_is_confined_not_the_operator() {
+        use crate::bearer::Via;
+        use alforria_core::session::caller::Caller;
+        assert!(restricted(&None));
+        assert!(matches!(caller(&None), Caller::Restricted));
+        assert!(Principal::confines(None));
+        for via in [Via::Open, Via::Basic] {
+            let operator = Some(Extension(Principal::operator(via)));
+            assert!(!restricted(&operator));
+            assert!(matches!(caller(&operator), Caller::Operator));
+        }
+    }
 
     #[test]
     fn resolution_lands_where_the_kernel_does() {

@@ -478,6 +478,11 @@ pre-1.0, so minor releases may include breaking changes.
   - `{:?}` of a webhook (and so of the host config and the server policy) no
     longer prints its `secret`, its `signing_key`, or more of its URL than
     the host.
+  - A request that reaches a handler without a principal is no longer taken
+    for the operator: the auth layer now names the caller on every request
+    it lets through (the operator, on a server with no password and no
+    tokens), and a request without one is held to what a token below `admin`
+    may do, and logged.
 
 ### Changed
 

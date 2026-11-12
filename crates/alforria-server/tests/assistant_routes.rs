@@ -874,6 +874,20 @@ async fn memory_records_are_managed_over_http() {
     assert_eq!(found["hits"], json!([]));
 }
 
+/// A server with no password and no tokens — the standalone default — is
+/// its operator's: the auth layer says so on every request, and the
+/// routes that are the operator's alone answer.
+#[tokio::test]
+async fn a_server_with_no_authentication_serves_its_operator() {
+    let f = fixture("ok", json!({ "memory": { "enabled": true } }));
+    let (status, list) = call(&f, "GET", "/memory/unattributed", "").await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let (status, saved) = call(&f, "POST", "/memory", r#"{"content":"Mine."}"#).await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    assert_eq!(saved["provenance"]["source"], "api", "{saved}");
+    assert_eq!(saved["verified"], true);
+}
+
 #[tokio::test]
 async fn memory_is_off_unless_the_config_turns_it_on() {
     let f = fixture("ok", json!({}));

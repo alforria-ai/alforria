@@ -812,9 +812,10 @@ pub async fn file_content(
     // project, and a request admitted on a file ticket reads that ticket's
     // file only (`routes::file_ext`) — both judged where the kernel lands
     // the spelling, and the read is then made on that resolved path.
-    let confined = principal.as_ref().is_some_and(|principal| {
-        principal.0.restricted() || principal.0.via == crate::bearer::Via::Ticket
-    });
+    let confined = crate::confine::restricted(&principal)
+        || principal
+            .as_ref()
+            .is_some_and(|principal| principal.0.via == crate::bearer::Via::Ticket);
     let file = if confined {
         let Some(resolved) = confined_read(&location, &file) else {
             return Err(ServerError::Api(crate::error::ApiError::Forbidden {

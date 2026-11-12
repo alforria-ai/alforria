@@ -97,10 +97,15 @@ pub enum Via {
     Jwt,
     /// A single-purpose ticket in the URL (a terminal or a file).
     Ticket,
+    /// A route the auth layer serves without a credential on a server
+    /// that asks for one: the web UI's static files and the OpenAPI
+    /// document.
+    Public,
 }
 
 impl Principal {
-    /// The operator: Basic auth, or a server with no authentication.
+    /// The operator: Basic auth, a server with no authentication, or one
+    /// of the auth layer's own bypasses (a ticket, a public route).
     pub fn operator(via: Via) -> Principal {
         Principal {
             scope: Scope::Admin,
@@ -127,6 +132,26 @@ impl Principal {
             // `connector` (and `admin`); `chat` does not.
             Scope::Hook => self.scope != Scope::Chat,
             _ => self.scope >= required,
+        }
+    }
+
+    /// Whether a request is to be held to what a credential below `admin`
+    /// may do. The auth layer gives every request it lets through a
+    /// principal — the operator's on a server with no authentication
+    /// ([`Via::Open`]) — so a request without one did not pass its
+    /// judgement: a route mounted outside it, a layer left out. That is
+    /// not the operator. It is confined like the narrowest caller, and
+    /// the mistake is logged.
+    pub fn confines(principal: Option<&Principal>) -> bool {
+        match principal {
+            Some(principal) => principal.restricted(),
+            None => {
+                tracing::error!(
+                    "a request reached a handler without a principal: the auth layer did not \
+                     judge it; treating it as a caller below admin"
+                );
+                true
+            }
         }
     }
 

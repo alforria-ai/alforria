@@ -365,10 +365,8 @@ impl<S> LocationService<S> {
         req: &Request<Body>,
         directory: &str,
     ) -> Result<Arc<SessionServices>, Rejection> {
-        let restricted = req
-            .extensions()
-            .get::<crate::bearer::Principal>()
-            .is_some_and(|principal| principal.restricted());
+        let restricted =
+            crate::bearer::Principal::confines(req.extensions().get::<crate::bearer::Principal>());
         if restricted && !self.ctx.policy.directories.allows(Path::new(directory)) {
             return Err(Rejection::Forbidden(format!(
                 "{directory}: it is outside server.directories"
