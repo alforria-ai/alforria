@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use alforria_schema::permission_v1::PermissionV1Ruleset;
+use futures::FutureExt;
 use serde_json::{json, Value};
 
 use crate::event::{EventBus, PublishOptions};
@@ -76,6 +77,8 @@ const MAX_RUN_TEXT: usize = 64 * 1024;
 const KEEP_FINISHED_MS: u64 = 24 * 60 * 60 * 1000;
 /// How often a follower asks whether the scheduler's place is free.
 pub const FOLLOWER_RETRY_MS: u64 = 5_000;
+/// How a run whose turn panicked starts its error.
+pub const RUN_PANICKED: &str = "the run panicked";
 /// Why a queued run did not start: the server was shutting down by the
 /// time a slot was free.
 pub const STOPPED_BEFORE_START: &str = "the server was shutting down before this run's turn came";
@@ -1655,7 +1658,29 @@ impl TriggerService {
         };
         run.status = RunStatus::Running;
         let _ = self.store.put_run(&run);
-        let result = self.ops.run_turn(&turn).await;
+        // A panic in the turn is a failed run like any other. Left to
+        // unwind, it would end this task with the run still `running` and
+        // its claim held by a process that is alive: every later fire of
+        // the trigger, here and in any process sharing the database, would
+        // be skipped until this one exits.
+        let result = std::panic::AssertUnwindSafe(async { self.ops.run_turn(&turn).await })
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|panic| {
+                let what = panic
+                    .downcast_ref::<&str>()
+                    .map(|text| text.to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "no message".to_string());
+                tracing::error!(
+                    "trigger \"{}\" panicked in its run: {what}",
+                    turn.trigger_id
+                );
+                Err(crate::trigger::TurnFailure {
+                    session_id: None,
+                    message: format!("{RUN_PANICKED}: {what}"),
+                })
+            });
         drop(started);
         drop(slot);
         let now = self.clock.now_ms();

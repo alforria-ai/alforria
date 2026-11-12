@@ -34,6 +34,8 @@ struct FakeOps {
     answer: Mutex<Result<String, String>>,
     gate: Option<tokio::sync::Semaphore>,
     sessions: AtomicU64,
+    /// The turn panics instead of answering.
+    panics: AtomicBool,
     /// What `target` answers for a session id; unlisted ids are found,
     /// unrestricted.
     targets: Mutex<BTreeMap<String, crate::trigger::SessionTarget>>,
@@ -46,6 +48,7 @@ impl FakeOps {
             answer: Mutex::new(Ok(text.to_string())),
             gate: None,
             sessions: AtomicU64::new(0),
+            panics: AtomicBool::new(false),
             targets: Mutex::new(BTreeMap::new()),
         })
     }
@@ -56,6 +59,7 @@ impl FakeOps {
             answer: Mutex::new(Ok(text.to_string())),
             gate: Some(tokio::sync::Semaphore::new(0)),
             sessions: AtomicU64::new(0),
+            panics: AtomicBool::new(false),
             targets: Mutex::new(BTreeMap::new()),
         })
     }
@@ -88,6 +92,9 @@ impl TriggerOps for FakeOps {
     ) -> crate::tool::def::BoxFuture<'a, Result<TurnOutcome, TurnFailure>> {
         Box::pin(async move {
             self.turns.lock().unwrap().push(turn.clone());
+            if self.panics.load(Ordering::SeqCst) {
+                panic!("boom in run_turn");
+            }
             if let Some(gate) = &self.gate {
                 gate.acquire().await.unwrap().forget();
             }
@@ -2366,4 +2373,49 @@ async fn a_one_shot_whose_tick_was_taken_by_a_process_that_died_is_fired_after_a
         .unwrap()
         .last_scheduled
         .is_some());
+}
+
+/// A turn that panics is a failed run: the trigger is free again, here and
+/// for every process that shares the database. (The run used to stay
+/// `running`, owned by a live process, and every later fire was skipped.)
+#[tokio::test]
+async fn a_panic_in_a_run_is_a_failed_run_and_frees_the_trigger() {
+    let f = Fixture::new(
+        "trigger-panic",
+        "2027-01-01T00:00:00Z",
+        FakeOps::answering("ok"),
+    );
+    let service = f.service(two_hooks());
+    let mut events = f.events.all();
+    f.ops.panics.store(true, Ordering::SeqCst);
+    let run = service.hook("a", b"x").unwrap();
+    let run = settle(&service, &[run]).await.remove(0);
+    assert_eq!(run.status, RunStatus::Failed);
+    assert!(
+        run.error
+            .as_deref()
+            .is_some_and(|error| error.starts_with(RUN_PANICKED) && error.contains("boom")),
+        "{:?}",
+        run.error
+    );
+    assert!(run.time.ended.is_some());
+    assert!(!service.get("a").unwrap().running);
+    assert_eq!(service.in_flight(), 0);
+    assert!(drain(&mut events)
+        .iter()
+        .any(|(kind, data)| kind == "trigger.failed" && data["runID"] == run.id.as_str()));
+
+    // The claim is released: the next delivery runs, in this process and
+    // in another over the same database.
+    f.ops.panics.store(false, Ordering::SeqCst);
+    let again = service.hook("a", b"x").unwrap();
+    assert_eq!(again.status, RunStatus::Queued, "{:?}", again.cause);
+    assert_eq!(
+        settle(&service, &[again]).await[0].status,
+        RunStatus::Completed
+    );
+    let peer = f.service(two_hooks());
+    let theirs = peer.hook("a", b"x").unwrap();
+    assert_eq!(theirs.status, RunStatus::Queued, "{:?}", theirs.cause);
+    settle(&peer, &[theirs]).await;
 }
