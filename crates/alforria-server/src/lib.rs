@@ -305,30 +305,52 @@ pub async fn listen(opts: &ListenOptions) -> io::Result<Listener> {
     listen_with(opts, ctx).await
 }
 
-/// Boot the instances that have something scheduled, so triggers fire
-/// without a client having to open the directory first: the server's own
-/// directory (its config may declare triggers) and every directory the
-/// trigger tables know. Runs in the background; a directory that fails to
-/// boot is logged and skipped.
+/// The directories `serve` boots at startup so that their triggers fire
+/// without a client having to open them first. None unless triggers are in
+/// use: a server whose owner has no trigger starts as it did before
+/// triggers existed, and boots an instance when a client asks for one.
+///
+/// * `triggers.enabled: false` (or `OPENCODE_DISABLE_TRIGGERS`): none.
+/// * The config asks for triggers (`triggers.enabled: true`, or it declares
+///   one): the server's own directory, and every directory the trigger
+///   tables know — a config trigger runs in each directory that was opened.
+/// * Otherwise: the directories that have a stored trigger, and no other.
+pub fn scheduled_directories(ctx: &ServerContext) -> Vec<std::path::PathBuf> {
+    if !ctx.policy.triggers_enabled || engine::bool_env("OPENCODE_DISABLE_TRIGGERS") {
+        return Vec::new();
+    }
+    let configured = ctx.policy.triggers_configured;
+    let mut directories = Vec::new();
+    if configured {
+        directories.push(state::resolve_directory(&state::cwd()));
+    }
+    let known = ctx.storage.with_connection(|conn| {
+        let mut stmt = conn.prepare(if configured {
+            "SELECT directory FROM \"trigger\" UNION SELECT directory FROM trigger_state"
+        } else {
+            "SELECT DISTINCT directory FROM \"trigger\""
+        })?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok::<_, rusqlite::Error>(rows)
+    });
+    for directory in known.unwrap_or_default() {
+        let directory = std::path::PathBuf::from(directory);
+        if directory.is_dir() && !directories.contains(&directory) {
+            directories.push(directory);
+        }
+    }
+    directories
+}
+
+/// Boot the instances that have something scheduled
+/// ([`scheduled_directories`]). Runs in the background; a directory that
+/// fails to boot is logged and skipped.
 pub fn boot_scheduled(ctx: &Arc<ServerContext>) {
     let ctx = ctx.clone();
     tokio::spawn(async move {
-        let mut directories = vec![state::resolve_directory(&state::cwd())];
-        let known = ctx.storage.with_connection(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT directory FROM \"trigger\" UNION SELECT directory FROM trigger_state",
-            )?;
-            let rows = stmt
-                .query_map([], |row| row.get::<_, String>(0))?
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok::<_, rusqlite::Error>(rows)
-        });
-        for directory in known.unwrap_or_default() {
-            let directory = std::path::PathBuf::from(directory);
-            if directory.is_dir() && !directories.contains(&directory) {
-                directories.push(directory);
-            }
-        }
+        let directories = scheduled_directories(&ctx);
         for directory in directories {
             let instances = ctx.clone();
             let booted = tokio::task::spawn_blocking(move || {

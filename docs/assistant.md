@@ -124,6 +124,13 @@ stored in the `trigger` table and survive restarts. A stored trigger cannot
 take the id of a config trigger. Config triggers can be paused and resumed at
 run time, but only the config changes or removes them.
 
+So that triggers fire without a client opening their directory first,
+`alforria serve` boots at startup the directories that hold a stored
+trigger; when your config asks for triggers (it declares one, or sets
+`triggers.enabled: true`) it also boots its own working directory and
+every directory a config trigger has run in. With no trigger anywhere it
+boots nothing at startup, and with `triggers.enabled: false` nothing either.
+
 ### How runs behave
 
 - A trigger has at most one run at a time. A tick that arrives while the last

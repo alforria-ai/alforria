@@ -52,7 +52,10 @@ pre-1.0, so minor releases may include breaking changes.
   Triggers are off until there is one: with `triggers.enabled` unset, a
   directory with no trigger (in the config or stored) runs no scheduler,
   and the first `POST /trigger` starts it; `triggers.enabled: true` starts
-  it with nothing scheduled, and `false` turns the feature off. See
+  it with nothing scheduled, and `false` turns the feature off. At startup
+  `alforria serve` boots the directories that hold a stored trigger (and,
+  when the config asks for triggers, its own directory) so they fire
+  without a client; with no trigger it boots none, as before. See
   `docs/assistant.md`.
 - A `schedule` tool, so an agent can create, list, change, pause and delete
   its own triggers and one-shot reminders, gated by a `schedule` permission.

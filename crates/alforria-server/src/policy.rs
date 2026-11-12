@@ -246,6 +246,11 @@ pub struct ServerPolicy {
     /// Whether triggers are enabled (`triggers.enabled`, on by default):
     /// what a stored trigger needs to count ([`ServerPolicy::observe`]).
     pub triggers_enabled: bool,
+    /// Triggers are asked for in the config itself: `triggers.enabled` is
+    /// `true`, or the config declares a trigger. Only then does `serve`
+    /// boot its own directory for them at startup
+    /// ([`crate::scheduled_directories`]).
+    pub triggers_configured: bool,
     /// Why the host config could not be used, if it could not. A listener
     /// refuses to bind with this set ([`crate::listen_with`]): the policy
     /// in force would not be the one written down.
@@ -270,6 +275,7 @@ impl Default for ServerPolicy {
             shell_env: alforria_core::shell_env::ShellEnvPolicy::default(),
             posture: Vec::new(),
             triggers_enabled: true,
+            triggers_configured: false,
             config_error: None,
         }
     }
@@ -365,6 +371,13 @@ impl ServerPolicy {
             .as_ref()
             .and_then(|triggers| triggers.enabled)
             .unwrap_or(true);
+        let triggers_configured = triggers_enabled
+            && (config
+                .triggers
+                .as_ref()
+                .and_then(|triggers| triggers.enabled)
+                == Some(true)
+                || config.trigger.as_ref().is_some_and(|map| !map.is_empty()));
         let mut posture = Vec::new();
         if bearer.is_some() {
             posture.push(PostureReason::Bearer);
@@ -445,6 +458,7 @@ impl ServerPolicy {
             shell_env,
             posture,
             triggers_enabled,
+            triggers_configured,
             config_error: None,
         })
     }

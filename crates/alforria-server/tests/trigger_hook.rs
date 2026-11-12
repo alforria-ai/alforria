@@ -201,3 +201,94 @@ async fn a_webhook_trigger_takes_one_delivery_per_interval_and_a_bounded_body() 
         .unwrap();
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }
+
+/// P5.3. `serve` boots a directory at startup for its triggers only when
+/// triggers are in use: nothing by default, the directories that hold a
+/// stored trigger when there are some, the server's own directory too when
+/// the config asks for triggers, and nothing at all when they are off.
+#[tokio::test]
+async fn serve_boots_directories_for_triggers_only_when_triggers_are_in_use() {
+    let cwd = alforria_server::state::resolve_directory(&alforria_server::state::cwd());
+    let seed = |f: &Fixture| {
+        let (stored, state_only) = (
+            f.dirs.repo.display().to_string(),
+            f.dirs.other.display().to_string(),
+        );
+        f.ctx
+            .storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "INSERT INTO \"trigger\"
+                        (directory, id, project_id, spec, origin_session_id, time_created, time_updated)
+                     VALUES (?1, 'nightly', 'global', ?2, NULL, 1, 1)",
+                    rusqlite::params![
+                        stored,
+                        json!({ "on": { "interval": "1h" }, "prompt": "Tidy", "restricted": false })
+                            .to_string()
+                    ],
+                )?;
+                // What a config trigger leaves in a directory it ran in.
+                conn.execute(
+                    "INSERT INTO trigger_state (directory, trigger_id, time_seen)
+                     VALUES (?1, 'from-config', 1)",
+                    [&state_only],
+                )?;
+                Ok::<_, rusqlite::Error>(())
+            })
+            .unwrap();
+    };
+
+    // A default config and empty tables: no instance is booted.
+    let f = fixture_with(|_| json!({}), None, Vec::new());
+    assert!(f.ctx.policy.triggers_enabled && !f.ctx.policy.triggers_configured);
+    assert_eq!(
+        alforria_server::scheduled_directories(&f.ctx),
+        Vec::<std::path::PathBuf>::new()
+    );
+    // A stored trigger: its directory, and no other — not the server's own
+    // directory, not one that only has a config trigger's leftover state.
+    seed(&f);
+    assert_eq!(
+        alforria_server::scheduled_directories(&f.ctx),
+        vec![f.dirs.repo.clone()]
+    );
+
+    // The config asks for triggers: the server's directory and every
+    // directory the trigger tables know.
+    for config in [
+        json!({ "triggers": { "enabled": true } }),
+        json!({ "trigger": { "inbox": { "on": { "webhook": true }, "prompt": "Triage" } } }),
+    ] {
+        let f = fixture_with(|_| config.clone(), None, Vec::new());
+        assert!(f.ctx.policy.triggers_configured, "{config}");
+        assert_eq!(
+            alforria_server::scheduled_directories(&f.ctx),
+            vec![cwd.clone()]
+        );
+        seed(&f);
+        let mut booted = alforria_server::scheduled_directories(&f.ctx);
+        assert_eq!(booted.remove(0), cwd);
+        booted.sort();
+        let mut expected = vec![f.dirs.repo.clone(), f.dirs.other.clone()];
+        expected.sort();
+        assert_eq!(booted, expected, "{config}");
+    }
+
+    // Off wins over what is stored and what is declared.
+    let f = fixture_with(
+        |_| {
+            json!({
+                "triggers": { "enabled": false },
+                "trigger": { "inbox": { "on": { "webhook": true }, "prompt": "Triage" } }
+            })
+        },
+        None,
+        Vec::new(),
+    );
+    seed(&f);
+    assert!(!f.ctx.policy.triggers_configured);
+    assert_eq!(
+        alforria_server::scheduled_directories(&f.ctx),
+        Vec::<std::path::PathBuf>::new()
+    );
+}
