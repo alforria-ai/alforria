@@ -475,6 +475,9 @@ pre-1.0, so minor releases may include breaking changes.
     operator's sessions. The origin now stands (and a model's rewrite of a
     restricted writer's record stays restricted); the operator's own change
     through `/memory` still vouches.
+  - `{:?}` of a webhook (and so of the host config and the server policy) no
+    longer prints its `secret`, its `signing_key`, or more of its URL than
+    the host.
 
 ### Changed
 

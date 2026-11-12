@@ -308,7 +308,11 @@ pub struct QuestionInfo {
 
 /// One webhook: where selected events are delivered, and how each delivery
 /// is signed.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+///
+/// `Debug` shows neither `secret` nor `signing_key`, and of the URL only
+/// where it goes — a path or query often carries a token: this value sits
+/// inside every config and server policy that gets logged.
+#[derive(Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct WebhookInfo {
     /// A label for this hook; defaults to its URL. Deliveries are tied to
     /// it, so renaming a hook abandons its undelivered events.
@@ -333,6 +337,30 @@ pub struct WebhookInfo {
     /// exception, for a receiver whose job is to pass that answer on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trigger_text: Option<bool>,
+}
+
+impl std::fmt::Debug for WebhookInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redacted = |value: &Option<String>| value.as_ref().map(|_| "[redacted]");
+        f.debug_struct("WebhookInfo")
+            .field("name", &self.name)
+            .field("url", &url_origin(&self.url))
+            .field("events", &self.events)
+            .field("secret", &redacted(&self.secret))
+            .field("signing_key", &redacted(&self.signing_key))
+            .field("trigger_text", &self.trigger_text)
+            .finish()
+    }
+}
+
+/// `scheme://host[:port]/…` of a URL: no user, password, path or query.
+fn url_origin(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return "[redacted]".to_string();
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = authority.rsplit('@').next().unwrap_or_default();
+    format!("{scheme}://{host}/…")
 }
 
 /// `hook.outbox` — how deliveries are retried and how long they are kept.
@@ -507,5 +535,39 @@ mod tests {
 
         std::fs::write(paths.config.join("opencode.json"), "{ not json").unwrap();
         assert!(load_host_config(&paths).is_err());
+    }
+
+    /// A webhook's secrets do not reach a log through `{:?}` — its own, or
+    /// that of anything holding it.
+    #[test]
+    fn debug_of_a_webhook_shows_no_secret() {
+        let hook = HookInfo {
+            webhook: Some(vec![WebhookInfo {
+                name: Some("ops".into()),
+                url: "https://user:hunter2@hooks.example.com:8443/T0/s3cr3t-path?key=q-s3cret"
+                    .into(),
+                events: vec!["session.*".into()],
+                secret: Some("shared-s3cret".into()),
+                signing_key: Some("c2lnbmluZy1rZXk".into()),
+                trigger_text: None,
+            }]),
+            outbox: None,
+        };
+        let shown = format!("{hook:?} {hook:#?}");
+        for secret in [
+            "shared-s3cret",
+            "c2lnbmluZy1rZXk",
+            "hunter2",
+            "s3cr3t-path",
+            "q-s3cret",
+        ] {
+            assert!(!shown.contains(secret), "{secret}: {shown}");
+        }
+        assert!(shown.contains("https://hooks.example.com:8443/"), "{shown}");
+        assert!(
+            shown.contains("ops") && shown.contains("[redacted]"),
+            "{shown}"
+        );
+        assert_eq!(url_origin("not a url"), "[redacted]");
     }
 }

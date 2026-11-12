@@ -540,6 +540,30 @@ mod tests {
         serde_json::from_value(value).unwrap()
     }
 
+    /// The policy is logged and carried in errors: `{:?}` of it shows no
+    /// webhook secret, signing key or URL token.
+    #[test]
+    fn debug_of_the_policy_shows_no_secret() {
+        let policy = ServerPolicy {
+            hook: Some(alforria_core::config::host::HookInfo {
+                webhook: Some(vec![alforria_core::config::host::WebhookInfo {
+                    url: "https://hooks.example.com/T0/s3cr3t-path".into(),
+                    events: vec!["*".into()],
+                    secret: Some("shared-s3cret".into()),
+                    signing_key: Some("c2lnbmluZy1rZXk".into()),
+                    ..Default::default()
+                }]),
+                outbox: None,
+            }),
+            ..ServerPolicy::default()
+        };
+        let shown = format!("{policy:?} {policy:#?}");
+        for secret in ["shared-s3cret", "c2lnbmluZy1rZXk", "s3cr3t-path"] {
+            assert!(!shown.contains(secret), "{secret}: {shown}");
+        }
+        assert!(shown.contains("hooks.example.com"), "{shown}");
+    }
+
     /// The allowlist is asked where the kernel lands a spelling, and where
     /// the kernel finds the directory a handler would act in for it; a
     /// spelling the two disagree about is not allowed.
