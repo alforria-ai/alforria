@@ -274,6 +274,12 @@ pub fn cli() -> Command {
                             .help("openai-chat: validate and report what would be imported, without writing"),
                     )
                     .arg(
+                        Arg::new("untrusted")
+                            .long("untrusted")
+                            .action(ArgAction::SetTrue)
+                            .help("openai-chat: the transcript is not your own conversation: mark the session as started by outside input (read-only ceiling, its memory unverified)"),
+                    )
+                    .arg(
                         Arg::new("import-id")
                             .long("import-id")
                             .value_name("ID")

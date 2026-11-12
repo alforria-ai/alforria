@@ -808,6 +808,7 @@ fn import_openai_chat_transcript_dry_run_import_and_idempotence() {
             "title": "Old harness chat",
             "summary": "They counted lines.",
             "import_id": "legacy-1",
+            "metadata": { "source": "old-harness", "triggerID": "nightly" },
             "messages": messages,
         })
         .to_string(),
@@ -866,8 +867,17 @@ fn import_openai_chat_transcript_dry_run_import_and_idempotence() {
     assert_eq!(exported.len(), 14);
     assert_eq!(exported[0]["parts"][0]["text"], "line 0");
     assert_eq!(exported[12]["parts"][0]["type"], "compaction");
-    assert_eq!(exported[13]["parts"][0]["text"], "They counted lines.");
-    assert_eq!(document["info"]["metadata"]["import"]["id"], "legacy-1");
+    // The file's summary is carried as data from outside, and its metadata
+    // does not reach the keys the server keeps for itself.
+    let summary = exported[13]["parts"][0]["text"].as_str().unwrap();
+    assert!(
+        summary.ends_with("<untrusted_data>\nThey counted lines.\n</untrusted_data>"),
+        "{summary}"
+    );
+    let metadata = &document["info"]["metadata"];
+    assert_eq!(metadata["import"]["id"], "legacy-1");
+    assert_eq!(metadata["source"], "old-harness");
+    assert!(metadata.get("triggerID").is_none(), "{metadata}");
 
     // The same import id again changes nothing.
     let again = env.run(&[&base[..], &[path]].concat());
@@ -887,13 +897,20 @@ fn import_openai_chat_transcript_dry_run_import_and_idempotence() {
         "{}",
         refused.stderr
     );
-    let wrong = env.run(&["import", "--live-tail", "4", path]);
-    assert_eq!(wrong.code, Some(1));
-    assert!(
-        wrong
-            .stderr
-            .contains("only applies with --format openai-chat"),
-        "{}",
-        wrong.stderr
-    );
+    for flags in [&["--live-tail", "4"][..], &["--untrusted"][..]] {
+        let wrong = env.run(&[&["import"][..], flags, &[path]].concat());
+        assert_eq!(wrong.code, Some(1));
+        assert!(
+            wrong
+                .stderr
+                .contains("only applies with --format openai-chat"),
+            "{}",
+            wrong.stderr
+        );
+    }
+    // `--untrusted` is accepted with the format (the marks it sets are
+    // tested where they are read, `session::import`).
+    std::fs::write(&bad, r#"[{"role":"user","content":"hello"}]"#).unwrap();
+    let marked = env.run(&[&base[..], &["--untrusted", bad.to_str().unwrap()]].concat());
+    assert_eq!(marked.code, Some(0), "stderr={}", marked.stderr);
 }

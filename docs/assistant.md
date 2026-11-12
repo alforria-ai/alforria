@@ -723,6 +723,7 @@ The input is a JSON array of messages, a JSON object, or JSONL (a line with a
 | `--import-id <id>` | A name for this import (overrides the file's). Importing the same id again prints the existing session and changes nothing. |
 | `--model <provider/model>` | The model recorded on the imported messages. Default: the file's `model`, then the configured `model`. One is required, because a session continues with the model of its messages. |
 | `--agent`, `--title` | The agent recorded on the messages (default: the default agent) and the session title. |
+| `--untrusted` | The transcript is not your own conversation (a customer's chat, something downloaded): the session is created marked as started by outside input — both server marks and the outside-input ceiling, as for a webhook's run — so it is held to reading, what it saves to memory is unverified, and excerpts of it are fenced. |
 
 How messages map:
 
@@ -741,6 +742,9 @@ How messages map:
 - `system` messages are not imported: the session has its own system prompt.
 - The file's `directory` is not acted on: the session is created in the
   directory the command runs in.
+- The file's `metadata` becomes the session's, except the keys the server
+  keeps for itself (`triggerID`, `untrustedInput`), which are dropped, and
+  `import`, which the command writes.
 
 A long history must not be sent to the model whole on the first prompt. With
 a cutoff, the messages before it are stored as ordinary messages (readable in
@@ -748,7 +752,9 @@ any client, searchable with `session_search`) and a compaction boundary is
 written after the live ones, exactly as a compaction leaves it: a user
 message with a `compaction` part whose `tail_start_id` names the first live
 message, answered by a `summary: true` assistant message carrying the file's
-`summary`. The next prompt then sends the summary, the live messages and the
+`summary` — between `<untrusted_data>` tags, introduced as text that came
+with the transcript and is not an instruction, since the model reads that
+message on every later turn. The next prompt then sends the summary, the live messages and the
 new message, and nothing older. The live part always starts at a user
 message, so the cutoff moves forward to the next one if needed. Counts are in
 imported messages (user and assistant).

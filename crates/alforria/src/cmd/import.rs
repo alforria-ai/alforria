@@ -407,16 +407,13 @@ fn run_transcript(matches: &ArgMatches, file: &str, ui: &mut Ui) -> Result<(), T
         .sessions
         .create(
             &context,
-            &alforria_core::CreateInput {
-                id: Some(session_id.clone()),
-                title: parsed
-                    .title
-                    .clone()
-                    .filter(|title| !title.trim().is_empty()),
-                agent: Some(agent),
-                metadata: Some(transcript::import_metadata(&parsed, &plan.report)),
-                ..Default::default()
-            },
+            &transcript::create_input(
+                &parsed,
+                &plan.report,
+                &session_id,
+                &agent,
+                matches.get_flag("untrusted"),
+            ),
         )
         .map_err(|err| cli(err.to_string()))?;
     if let Err(err) = transcript::write(storage, &session.id, &plan, now_ms) {
@@ -452,10 +449,12 @@ pub fn run(matches: &ArgMatches, ui: &mut Ui) -> Result<(), TypedError> {
             ))));
         }
     }
-    if matches.get_flag("dry-run") {
-        return Err(TypedError::Cli(CliError::new(
-            "--dry-run only applies with --format openai-chat",
-        )));
+    for flag in ["dry-run", "untrusted"] {
+        if matches.get_flag(flag) {
+            return Err(TypedError::Cli(CliError::new(format!(
+                "--{flag} only applies with --format openai-chat"
+            ))));
+        }
     }
     let runtime = super::runtime()?;
     runtime.block_on(run_async(file, ui))

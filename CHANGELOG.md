@@ -79,10 +79,12 @@ pre-1.0, so minor releases may include breaking changes.
   tool_call_id, created_at}` messages. Tool calls become tool parts with
   their results, images become file parts. `--live-tail <n>` or
   `--archive-before <n|time>` keeps older messages as readable, searchable
-  history behind a compaction boundary carrying the transcript's `summary`,
-  so the next prompt sends only the summary and the live messages.
-  `--dry-run` reports what would be imported, and an `import_id` makes the
-  import idempotent.
+  history behind a compaction boundary carrying the transcript's `summary`
+  (fenced as text from outside), so the next prompt sends only the summary
+  and the live messages. `--dry-run` reports what would be imported, an
+  `import_id` makes the import idempotent, and `--untrusted` marks the
+  session as started by outside input. The file's `metadata` is kept except
+  for the keys the server reserves (`triggerID`, `untrustedInput`).
 - Persona controls for products that embed alforria: `prompt.environment`
   (`true`, `false` or a template) for the `<env>` block,
   `prompt.model_identity` and `prompt.empty_skills` for the other fixed
