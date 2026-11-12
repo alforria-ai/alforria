@@ -28,18 +28,36 @@ struct Received {
 /// next scripted status (200 once the script runs out).
 struct Receiver {
     url: String,
-    port: u16,
     received: Arc<Mutex<Vec<Received>>>,
     statuses: Arc<Mutex<Vec<u16>>>,
     task: tokio::task::JoinHandle<()>,
 }
 
+impl Drop for Receiver {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 impl Receiver {
     async fn start() -> Receiver {
-        Receiver::start_on(0).await
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        Receiver::start_on(listener)
     }
 
-    async fn start_on(port: u16) -> Receiver {
+    /// A receiver that is down, on a port nobody else can take meanwhile:
+    /// a socket bound to it and not listening refuses every connection.
+    /// [`Receiver::start_on`] its `listen` brings the receiver up there.
+    fn down() -> (tokio::net::TcpSocket, String) {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind(([127, 0, 0, 1], 0).into()).unwrap();
+        let port = socket.local_addr().unwrap().port();
+        (socket, format!("http://127.0.0.1:{port}/hook"))
+    }
+
+    fn start_on(listener: tokio::net::TcpListener) -> Receiver {
         let received: Arc<Mutex<Vec<Received>>> = Arc::default();
         let statuses: Arc<Mutex<Vec<u16>>> = Arc::default();
         let (sink, script) = (received.clone(), statuses.clone());
@@ -59,16 +77,12 @@ impl Receiver {
                 }
             }),
         );
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
-            .await
-            .unwrap();
         let port = listener.local_addr().unwrap().port();
         let task = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
         Receiver {
             url: format!("http://127.0.0.1:{port}/hook"),
-            port,
             received,
             statuses,
             task,
@@ -97,12 +111,6 @@ impl Receiver {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-    }
-
-    async fn stop(self) -> u16 {
-        self.task.abort();
-        let _ = self.task.await;
-        self.port
     }
 }
 
@@ -380,10 +388,10 @@ async fn deliveries_can_be_signed_with_ed25519() {
 /// deliveries for the next one, which completes them under the same ids.
 #[tokio::test]
 async fn deliveries_survive_a_restart_mid_backoff() {
-    // A receiver that is down: find a port, then free it.
-    let down = Receiver::start().await;
-    let url = down.url.clone();
-    let port = down.stop().await;
+    // A receiver that is down, on a port that stays its own. (Freeing a
+    // port and binding it again later let another test's listener take it
+    // in between.)
+    let (down, url) = Receiver::down();
     let dir = tempfile::tempdir().unwrap();
     let config = hook(json!({
         "webhook": [{ "name": "control-plane", "url": url, "secret": "s", "events": ["session.*"] }],
@@ -416,12 +424,21 @@ async fn deliveries_survive_a_restart_mid_backoff() {
     };
 
     // The next process, over the same database, with the receiver back.
-    let receiver = Receiver::start_on(port).await;
+    let receiver = Receiver::start_on(down.listen(1024).unwrap());
     let outbox = Outbox::new(storage(&dir), Some(&config)).unwrap();
     let rows = outbox.deliveries();
     assert_eq!(rows.len(), 2, "the deliveries were on disk");
     let worker = tokio::spawn(outbox.clone().run());
     let requests = receiver.wait_for(2).await;
+    // The receiver has a request before the outbox has its answer, and a
+    // stop drops an attempt in flight (its row stays due, by design):
+    // stopping now could leave the second row undelivered. Wait for the
+    // outbox to have recorded both.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !outbox.deliveries().iter().all(|row| row.delivered) {
+        assert!(std::time::Instant::now() < deadline, "not recorded");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     outbox.stop();
     let _ = worker.await;
 

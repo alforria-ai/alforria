@@ -396,17 +396,25 @@ pub fn wait(child: &mut Child, timeout: Duration) -> ProcOutput {
     }
 }
 
-fn pump<R: Read + Send + 'static>(mut pipe: R) -> std::sync::Arc<std::sync::Mutex<String>> {
-    let buffer = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-    let shared = buffer.clone();
+/// Read a child's pipe to its end on a thread of its own; the text is
+/// handed over when the pipe closes.
+fn pump<R: Read + Send + 'static>(mut pipe: R) -> std::sync::mpsc::Receiver<String> {
+    let (done, text_of) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut text = String::new();
         pipe.read_to_string(&mut text).ok();
-        *shared.lock().unwrap() = text;
+        let _ = done.send(text);
     });
-    buffer
+    text_of
 }
 
-fn read_pump(buffer: std::sync::Arc<std::sync::Mutex<String>>) -> String {
-    std::mem::take(&mut *buffer.lock().unwrap())
+/// Everything the child wrote. The child having exited does not mean its
+/// reader has finished: the reader is waited for (it used to be read at
+/// once, and a reader that had not got there yet gave an empty string — a
+/// command "printed nothing" under load). Bounded, for a pipe a grandchild
+/// still holds open.
+fn read_pump(text_of: std::sync::mpsc::Receiver<String>) -> String {
+    text_of
+        .recv_timeout(Duration::from_secs(30))
+        .unwrap_or_default()
 }

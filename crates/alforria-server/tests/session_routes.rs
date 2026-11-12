@@ -506,9 +506,37 @@ async fn create_body_semantics() {
     assert_eq!(created["parentID"], "ses_01JDY");
 }
 
+/// Make `dir` a git repository with one commit: a project of its own,
+/// whatever the directory the tests run in is.
+fn git_init(dir: &std::path::Path) {
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .status()
+            .expect("git");
+        assert!(status.success(), "git {args:?}");
+    };
+    git(&["init", "--quiet", "-b", "main"]);
+    git(&["config", "user.email", "test@alforria.test"]);
+    git(&["config", "user.name", "Test"]);
+    std::fs::write(dir.join("seed.txt"), dir.display().to_string()).unwrap();
+    git(&["add", "."]);
+    git(&["commit", "--quiet", "-m", "root"]);
+}
+
 #[tokio::test]
 async fn list_scopes_to_the_directory_param() {
     let f = fixture();
+    // The last check below compares this project with the one of the
+    // directory the test process runs in. A plain temp directory is the
+    // `global` project — and so is the process's directory when the tests
+    // do not run from a git checkout (a source tarball), which made the two
+    // one project and the check fail. A repository of its own is a project
+    // of its own either way.
+    git_init(&f.worktree);
     let router = routes::build_router(f.ctx.clone());
     let worktree = f.worktree.to_string_lossy().into_owned();
     let session = create_session_in(&router, &worktree).await;
