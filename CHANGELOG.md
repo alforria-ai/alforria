@@ -7,6 +7,18 @@ pre-1.0, so minor releases may include breaking changes.
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-11-12
+
+0.4.2 was tagged but shipped no binaries: its macOS verification caught the
+first item below. Everything listed under 0.4.2 is in this release.
+
+### Fixed
+
+- A project whose path goes through a symlink (on macOS, anything under
+  `/home` or `/tmp`) had its own files judged outside it.
+- `bash` rules also see a command glued to a wrapper's flag (`env -S"rm …"`,
+  `env -iSrm …`), and a wrapper command too long to check is refused.
+
 ## [0.4.2] - 2026-11-12
 
 ### Security
@@ -259,7 +271,8 @@ First release.
 - The Rust workspace: schema, LLM, core, server, TUI, embedded UI, and CLI
   crates.
 
-[Unreleased]: https://github.com/alforria-ai/alforria/compare/v0.4.2...HEAD
+[Unreleased]: https://github.com/alforria-ai/alforria/compare/v0.4.3...HEAD
+[0.4.3]: https://github.com/alforria-ai/alforria/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/alforria-ai/alforria/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/alforria-ai/alforria/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/alforria-ai/alforria/compare/v0.3.0...v0.4.0
