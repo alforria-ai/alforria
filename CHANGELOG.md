@@ -250,8 +250,6 @@ pre-1.0, so minor releases may include breaking changes.
   `after` are gone, and in the middle of a replay when retention drops
   events the reader had not reached yet. The frame comes before the first
   event after the hole. Without retention it never appears.
-- The server folds the write-ahead log back into the database every five
-  minutes, so the `-wal` file no longer sits at its high-water mark.
 - Scoped tokens reach the assistant features. A `chat` or `connector` token
   manages its own schedules (`/trigger*`) under the `schedule` tool's rules —
   it never sets a trigger's `permission`, `agent` or `model`, names only
@@ -542,6 +540,18 @@ pre-1.0, so minor releases may include breaking changes.
   token is refused. A webhook trigger accepts one delivery per
   `triggers.webhook_min_interval` (default `"1s"`).
 
+- The server folds the write-ahead log back into the database every five
+  minutes (a truncating checkpoint), so the `-wal` file no longer sits at
+  its high-water mark. It used to be folded back only as SQLite saw fit
+  and when the database was closed. This applies to every server, whatever
+  it has configured.
+- A request to a model that declares no context window (`limit.context`
+  of 0 — a model you added to the config without one) is now sized against
+  a window of 128,000 tokens: what is sent to it is bounded to that, where
+  the whole conversation used to go out whatever its length. Such a model
+  is still not treated as overflowing for automatic compaction.
+  `compaction.default_context` sets another size; models that declare a
+  window are unaffected.
 - `alforria serve` / `web` refuse to listen on a host config that does not
   parse **or cannot be read** (an unreadable file in the global config
   directory, `~/.opencode` or the managed directory used to count as empty,
