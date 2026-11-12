@@ -46,8 +46,9 @@ to every database on first open, whether or not any of these features is
 configured. A migration that has shipped is never edited (the tests pin
 each body's hash); what one got wrong is repaired by a later one, as
 `0008_session_mark_backfill` does for databases written by earlier builds
-of this branch. What `0008`, `0009_memory_directory` and
-`0010_trigger_run_owner` change in an existing database is in
+of this branch. What `0008`, `0009_memory_directory`,
+`0010_trigger_run_owner` and `0011_trigger_run_settle_unowned` change in an
+existing database is in
 [Upgrading a database](assistant.md#upgrading-a-database-from-an-earlier-build).
 
 Durations are strings with a unit (`"500ms"`, `"30s"`, `"5m"`, `"2h"`,

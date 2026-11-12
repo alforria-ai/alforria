@@ -624,7 +624,7 @@ memory is configured.
   after a kill is briefly renamed `running/<session>.….claim`. A process
   alone on its data directory always holds the locks and wins every claim.
 - **New tables in the database.** alforria's own migrations
-  (`0001`–`0010`, journal table `alforria_migration`) run on first open;
+  (`0001`–`0011`, journal table `alforria_migration`) run on first open;
   the upstream schema is untouched. On a database that used none of the
   features they create empty tables. A session gets one row in
   `session_mark` the first time a web, MCP or plugin tool answers in it;
@@ -721,7 +721,9 @@ memory is configured.
   each directory's triggers and one maintains the database, the others are
   followers and take over within seconds of the leader's exit; every fire
   is claimed once. Migration `0010_trigger_run_owner` adds two columns and
-  an index to `trigger_run`. When a directory's instance is booted again
+  an index to `trigger_run`, and `0011_trigger_run_settle_unowned` closes
+  as failed the runs an earlier build left `queued` or `running`, which
+  the startup pass no longer reads. When a directory's instance is booted again
   inside one server (after `/instance/dispose` or a config change), the new
   instance's scheduler takes the place of the old one's, which stops
   firing. On macOS and other non-Linux Unix systems a restart marker's

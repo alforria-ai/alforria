@@ -779,8 +779,18 @@ processes that share the database. Rows written before it get neither
 column. A run an earlier build left `queued` or `running` (a server killed
 mid-run, then upgraded) is therefore not a claim: it does not block its
 trigger, and the startup pass that closes orphaned runs, which reads the
-claims, does not see it — it stays in `GET /trigger/{id}/runs` as it was
-until the run history rolls over.
+claims, does not see it.
+
+**`0011_trigger_run_settle_unowned`** closes those: every run without the
+`active` flag that still says `queued` or `running` becomes `failed`, with
+the error `interrupted: an earlier version of the server stopped before
+this run finished; the run was closed when the database was upgraded` and
+the time of the upgrade as its end. Such a row has no owner, so no running
+process can still be working on it; the unfinished runs of the owner scheme
+(`active = 1`) are not touched. A scheduled run closed this way does not
+get its tick back — nothing fires to make up for it. **What you can
+notice:** an old run that showed as still going in
+`GET /trigger/{id}/runs` now shows as failed.
 
 **Stored triggers, without a migration.** Earlier builds left `restricted`
 out of a stored trigger's record when it was false. A record that does not

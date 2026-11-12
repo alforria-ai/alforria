@@ -543,9 +543,11 @@ impl TriggerStore {
     }
 
     /// Runs that can never finish: close them. Those are the unsettled runs
-    /// of processes that are gone (and of builds that recorded no owner).
-    /// A run another live process owns is that process's, and is left
-    /// alone. Where a platform cannot tell whether a process is alive (not
+    /// (`active = 1`) of processes that are gone. A run another live
+    /// process owns is that process's, and is left alone. A run written
+    /// before runs had owners has no `active` flag and is not read here:
+    /// migration `0011_trigger_run_settle_unowned` closed the unfinished
+    /// ones when the database was upgraded. Where a platform cannot tell whether a process is alive (not
     /// a Unix), every other process's run counts as abandoned.
     ///
     /// A run that answered a scheduled tick and was still queued never

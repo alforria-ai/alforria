@@ -74,6 +74,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "0010_trigger_run_owner",
         include_str!("alforria_migrations/0010_trigger_run_owner.sql"),
     ),
+    (
+        "0011_trigger_run_settle_unowned",
+        include_str!("alforria_migrations/0011_trigger_run_settle_unowned.sql"),
+    ),
 ];
 
 /// The journal table.
@@ -676,6 +680,10 @@ mod tests {
                 "0010_trigger_run_owner",
                 "419cba696e7b4215b0fd9160e4a00d4779b3135573c8b8183bd9183d3a39fbb8",
             ),
+            (
+                "0011_trigger_run_settle_unowned",
+                "018724b57ff56d39bd735d418b107678f6d8a24cb0b5fb0559176aac164c0e26",
+            ),
         ];
         for (id, sql) in MIGRATIONS {
             let hash = format!("{:x}", Sha256::digest(sql.replace("\r\n", "\n")));
@@ -698,6 +706,128 @@ mod tests {
             MIGRATIONS.len(),
             "a pinned migration is gone from MIGRATIONS: shipped migrations are never removed"
         );
+    }
+
+    /// A run a build before `0010_trigger_run_owner` left `queued` or
+    /// `running` has no `active` flag, so the startup sweep
+    /// (`TriggerStore::fail_orphaned`) never reads it: the upgrade closes
+    /// it as failed, with an error that says why. Settled runs, rows that
+    /// are not a run this build can read, and the unfinished runs of the
+    /// owner scheme are left as they are; a second pass changes nothing;
+    /// and the upgraded database has the objects of a fresh one.
+    #[test]
+    fn runs_an_earlier_build_left_unfinished_are_closed_by_the_upgrade() {
+        const OWNER: &str = "0010_trigger_run_owner";
+        const SETTLE: &str = "0011_trigger_run_settle_unowned";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.sqlite");
+        let fresh = {
+            let mut conn = upstream();
+            apply(&mut conn).unwrap();
+            // A fresh database: nothing to close.
+            let runs: i64 = conn
+                .query_row("SELECT COUNT(*) FROM trigger_run", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(runs, 0);
+            own_objects(&conn)
+        };
+        let run = |id: &str, status: &str| {
+            serde_json::json!({
+                "id": id, "triggerID": "nightly", "status": status, "reason": "schedule",
+                "scheduled": 1000, "time": { "started": 1000 }
+            })
+            .to_string()
+        };
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            crate::storage::migration::apply(&mut conn).unwrap();
+            // The database of a build without the owner columns.
+            apply_set(&mut conn, &until(OWNER)).unwrap();
+            for (id, data) in [
+                ("run_old_running", run("run_old_running", "running")),
+                ("run_old_queued", run("run_old_queued", "queued")),
+                ("run_old_completed", run("run_old_completed", "completed")),
+                ("run_old_junk", "not json".to_string()),
+            ] {
+                conn.execute(
+                    "INSERT INTO trigger_run (id, directory, trigger_id, data, time_started)
+                     VALUES (?1, '/p', 'nightly', ?2, 1000)",
+                    [id, &data],
+                )
+                .unwrap();
+            }
+            // The database of the build that added them: one of its
+            // processes is in the middle of a run.
+            apply_set(&mut conn, &until(SETTLE)).unwrap();
+            conn.execute(
+                "INSERT INTO trigger_run (id, directory, trigger_id, data, time_started, owner, active)
+                 VALUES ('run_live', '/p', 'weekly', ?1, 1000, '{}', 1)",
+                [run("run_live", "running")],
+            )
+            .unwrap();
+        }
+        // This build opens it, twice.
+        let storage = std::sync::Arc::new(crate::storage::Storage::open(&path).unwrap());
+        let read = |storage: &crate::storage::Storage| -> Vec<(String, String)> {
+            storage
+                .with_connection(|conn| {
+                    let mut stmt = conn.prepare("SELECT id, data FROM trigger_run ORDER BY id")?;
+                    let rows = stmt
+                        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok::<_, crate::CoreError>(rows)
+                })
+                .unwrap()
+        };
+        let upgraded = read(&storage);
+        storage.with_connection_mut(apply).unwrap();
+        assert_eq!(read(&storage), upgraded, "a second pass changes nothing");
+        storage
+            .with_connection(|conn| {
+                assert_eq!(own_objects(conn), fresh);
+                assert_eq!(journal(conn), all_ids());
+                Ok::<_, crate::CoreError>(())
+            })
+            .unwrap();
+
+        let data = |id: &str| -> String {
+            upgraded
+                .iter()
+                .find(|(row, _)| row == id)
+                .map(|(_, data)| data.clone())
+                .unwrap_or_else(|| panic!("no row {id}"))
+        };
+        for id in ["run_old_running", "run_old_queued"] {
+            let closed: crate::trigger::TriggerRun = serde_json::from_str(&data(id)).unwrap();
+            assert_eq!(closed.status, crate::trigger::RunStatus::Failed, "{id}");
+            assert!(closed.status.settled());
+            let error = closed.error.as_deref().unwrap_or_default();
+            assert!(
+                error.starts_with("interrupted: an earlier version of the server stopped"),
+                "{id}: {error}"
+            );
+            assert!(closed.time.ended.is_some_and(|ended| ended > 1000), "{id}");
+            // The rest of the run is as it was.
+            assert_eq!(
+                (closed.id.as_str(), closed.scheduled, closed.time.started),
+                (id, Some(1000), 1000)
+            );
+        }
+        assert_eq!(
+            data("run_old_completed"),
+            run("run_old_completed", "completed")
+        );
+        assert_eq!(data("run_old_junk"), "not json");
+        assert_eq!(data("run_live"), run("run_live", "running"));
+
+        // And the startup sweep still has the owner scheme's run to judge:
+        // the one row with the flag.
+        let store = crate::trigger::store::TriggerStore::new(
+            storage.clone(),
+            std::path::Path::new("/p"),
+            "proj",
+        );
+        assert_eq!(store.unsettled_rows().unwrap(), 1);
     }
 
     /// M7. Records of the `global` project get the directory of the
