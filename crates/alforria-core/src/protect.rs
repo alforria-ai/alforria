@@ -650,13 +650,13 @@ impl WriteGuard {
         }
         Err(match refusal.class {
             Class::Loader => format!(
-                "{}. This session is restricted or has read outside content, so it may not \
+                "{}. This session is restricted or was started by outside input, so it may not \
                  write there; the operator can allow that path with the `{grant}` permission \
                  in the host config.",
                 refusal.reason
             ),
             Class::Host => format!(
-                "{}. This session is restricted or has read outside content, so it may not \
+                "{}. This session is restricted or was started by outside input, so it may not \
                  write there.",
                 refusal.reason
             ),
@@ -1363,6 +1363,19 @@ mod tests {
         assert!(none.check(&agents).is_err());
         assert!(none.check(&config).is_err());
         assert!(none.check(&t.project.join("src/main.rs")).is_ok());
+        // The refusal says what the guard follows: the session's
+        // restriction and the outside-start mark — not the outside-content
+        // mark, which a session of the user's own that read a web page
+        // carries too, unguarded.
+        for (refused, grant) in [(&agents, true), (&host_file, false)] {
+            let why = none.check(refused).unwrap_err();
+            assert!(
+                why.contains("This session is restricted or was started by outside input"),
+                "{why}"
+            );
+            assert!(!why.contains("outside content"), "{why}");
+            assert_eq!(why.contains("`edit_loader` permission"), grant, "{why}");
+        }
 
         // A grant for one path lifts that path — relative to the project or
         // absolute — and nothing else.

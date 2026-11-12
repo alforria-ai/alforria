@@ -583,7 +583,11 @@ pub fn install(mut policy: ShellEnvPolicy) {
 /// reachable appeared after it started (a `webhook` or `watch` trigger
 /// was created, a listener was bound beyond loopback). A ratchet — the
 /// posture only tightens while the process lives, and deleting the
-/// trigger does not relax it. Each reason is logged once.
+/// trigger does not relax it. The switch is logged once, with the reason
+/// that made it; a reason that arrives when the posture is already
+/// restricted (from startup, or from an earlier reason) is recorded and
+/// not logged — every reason is in [`tightened`], which
+/// `GET /server/posture` shows.
 pub fn tighten(reason: &str) {
     let mut current = CURRENT.write().unwrap_or_else(|p| p.into_inner());
     let mut reasons = TIGHTENED.lock().unwrap_or_else(|p| p.into_inner());
