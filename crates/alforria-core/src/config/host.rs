@@ -125,7 +125,8 @@ impl OneOrMany {
 }
 
 /// A static bearer token, held as the SHA-256 of the token: a bare hex
-/// digest (scope `admin`), or a digest with the scope it grants.
+/// digest (scope `admin`), or a digest with the scope it grants — `hook`
+/// (with the `trigger` it is bound to), `chat`, `connector` or `admin`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum BearerTokenInfo {

@@ -458,7 +458,8 @@ streams included (`?auth_token=` remains a Basic-only form).
 - `aud` must contain one of the configured audiences.
 - `iss` must equal `issuer` when `issuer` is configured.
 - `scope` is a space-separated string or an array; it must name at least one
-  of `chat`, `connector`, `admin`. The widest one named applies. `sub` is
+  of `hook`, `chat`, `connector`, `admin`. The widest one named applies
+  (`hook` only when it is alone, see below). `sub` is
   kept for logs.
 
 A refused credential gets `401` with `WWW-Authenticate: Bearer

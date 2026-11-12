@@ -151,7 +151,7 @@ pub enum BearerError {
     NotYetValid,
     Audience,
     Issuer,
-    /// No `chat`, `connector` or `admin` in `scope`.
+    /// No `hook`, `chat`, `connector` or `admin` in `scope`.
     Scope,
 }
 
