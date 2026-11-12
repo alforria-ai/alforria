@@ -7,6 +7,7 @@
 
 pub mod agent;
 pub mod command;
+pub mod duration;
 pub mod extension;
 pub mod host;
 pub mod precedence;

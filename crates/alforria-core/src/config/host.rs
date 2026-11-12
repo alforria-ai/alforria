@@ -7,75 +7,16 @@
 //! directory, see [`load_host_config`]): a project `opencode.json` — a file
 //! the agent itself can write — never weakens them.
 
-use std::time::Duration;
-
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::config::{Config, ConfigFlags, ConfigLoader, LoadParams};
 use crate::{CoreError, GlobalPaths};
 
 /// A duration written as `"500ms"`, `"30s"`, `"5m"`, `"2h"`, `"1d"`, or as a
-/// bare number of milliseconds (upstream's convention for timeouts).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DurationSetting(pub Duration);
-
-impl DurationSetting {
-    pub fn get(&self) -> Duration {
-        self.0
-    }
-
-    /// Parse the string form; `None` when the text is not a duration.
-    pub fn parse(text: &str) -> Option<DurationSetting> {
-        let text = text.trim();
-        let split = text
-            .find(|c: char| !(c.is_ascii_digit() || c == '.'))
-            .unwrap_or(text.len());
-        let (number, unit) = text.split_at(split);
-        let number: f64 = number.parse().ok()?;
-        if !number.is_finite() || number < 0.0 {
-            return None;
-        }
-        let millis = match unit.trim() {
-            "ms" => 1.0,
-            "s" | "sec" | "secs" => 1_000.0,
-            "m" | "min" | "mins" => 60_000.0,
-            "h" | "hr" | "hrs" => 3_600_000.0,
-            "d" | "day" | "days" => 86_400_000.0,
-            _ => return None,
-        };
-        Some(DurationSetting(Duration::from_millis(
-            (number * millis).round() as u64,
-        )))
-    }
-}
-
-impl Serialize for DurationSetting {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_u64(self.0.as_millis() as u64)
-    }
-}
-
-impl<'de> Deserialize<'de> for DurationSetting {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let value = serde_json::Value::deserialize(deserializer)?;
-        match &value {
-            serde_json::Value::Number(number) => number
-                .as_u64()
-                .map(|millis| DurationSetting(Duration::from_millis(millis)))
-                .ok_or_else(|| {
-                    serde::de::Error::custom("expected a non-negative number of milliseconds")
-                }),
-            serde_json::Value::String(text) => DurationSetting::parse(text).ok_or_else(|| {
-                serde::de::Error::custom(format!(
-                    "invalid duration {text:?}: expected a number followed by ms, s, m, h or d"
-                ))
-            }),
-            _ => Err(serde::de::Error::custom(
-                "expected a duration string such as \"30s\" or a number of milliseconds",
-            )),
-        }
-    }
-}
+/// bare number of milliseconds (upstream's convention for timeouts): the
+/// config's one duration type in its [`Millis`](crate::config::duration::Millis)
+/// notation.
+pub type DurationSetting = crate::config::duration::DurationOf<crate::config::duration::Millis>;
 
 // ---------------------------------------------------------------------------
 // server.shutdown
@@ -482,6 +423,7 @@ pub fn load_host_config(paths: &GlobalPaths) -> Result<Config, CoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn durations_parse_units_and_milliseconds() {

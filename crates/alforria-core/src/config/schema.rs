@@ -307,60 +307,9 @@ pub struct WorkflowsInfo {
 // ---------------------------------------------------------------------------
 
 /// A length of time written as a number and a unit: `45s`, `90m`, `12h`,
-/// `30d`, `2w`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ConfigDuration(pub std::time::Duration);
-
-impl ConfigDuration {
-    pub fn parse(text: &str) -> Option<ConfigDuration> {
-        let text = text.trim();
-        let digits = text.bytes().take_while(u8::is_ascii_digit).count();
-        let amount: u64 = text[..digits].parse().ok()?;
-        let unit = match text[digits..].trim() {
-            "s" => 1,
-            "m" => 60,
-            "h" => 60 * 60,
-            "d" => 24 * 60 * 60,
-            "w" => 7 * 24 * 60 * 60,
-            _ => return None,
-        };
-        Some(ConfigDuration(std::time::Duration::from_secs(
-            amount.checked_mul(unit)?,
-        )))
-    }
-
-    pub fn as_millis(self) -> u64 {
-        self.0.as_millis() as u64
-    }
-}
-
-impl Serialize for ConfigDuration {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let seconds = self.0.as_secs();
-        let text = [
-            (7 * 24 * 60 * 60, "w"),
-            (24 * 60 * 60, "d"),
-            (60 * 60, "h"),
-            (60, "m"),
-        ]
-        .iter()
-        .find(|(unit, _)| seconds > 0 && seconds.checked_rem(*unit) == Some(0))
-        .map(|(unit, name)| format!("{}{name}", seconds / unit))
-        .unwrap_or_else(|| format!("{seconds}s"));
-        serializer.serialize_str(&text)
-    }
-}
-
-impl<'de> Deserialize<'de> for ConfigDuration {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let text = String::deserialize(deserializer)?;
-        ConfigDuration::parse(&text).ok_or_else(|| {
-            serde::de::Error::custom(format!(
-                "expected a duration such as \"30d\", \"12h\" or \"90m\", got {text:?}"
-            ))
-        })
-    }
-}
+/// `30d`, `2w`: the config's one duration type in its
+/// [`Calendar`](crate::config::duration::Calendar) notation.
+pub type ConfigDuration = crate::config::duration::DurationOf<crate::config::duration::Calendar>;
 
 /// `storage.retention.events` — which durable events the log may drop.
 /// Unset, nothing is dropped. An event is kept when either rule keeps it.
