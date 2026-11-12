@@ -526,61 +526,6 @@ const WRAPPERS: &[&str] = &[
 ];
 const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "ash"];
 
-/// The flags of a wrapper that are followed by a value, which is not the
-/// command it runs (`sudo -u root rm` runs `rm`, not `root`).
-fn wrapper_value_flags(wrapper: &str) -> &'static [&'static str] {
-    match wrapper {
-        "sudo" | "doas" => &[
-            "-u",
-            "-g",
-            "-C",
-            "-D",
-            "-h",
-            "-p",
-            "-r",
-            "-t",
-            "-T",
-            "-U",
-            "-R",
-            "--user",
-            "--group",
-            "--chdir",
-            "--host",
-            "--prompt",
-            "--role",
-            "--type",
-            "--other-user",
-            "--chroot",
-        ],
-        "env" => &["-u", "-C", "--unset", "--chdir"],
-        "xargs" => &[
-            "-I",
-            "-n",
-            "-P",
-            "-d",
-            "-a",
-            "-E",
-            "-s",
-            "-L",
-            "--max-args",
-            "--max-procs",
-            "--delimiter",
-            "--arg-file",
-            "--eof",
-            "--max-chars",
-            "--max-lines",
-            "--replace",
-        ],
-        "timeout" => &["-s", "-k", "--signal", "--kill-after"],
-        "nice" => &["-n", "--adjustment"],
-        "ionice" => &["-c", "-n", "-p", "--class", "--classdata", "--pid"],
-        "stdbuf" => &["-i", "-o", "-e", "--input", "--output", "--error"],
-        "exec" => &["-a"],
-        "time" => &["-f", "-o", "--format", "--output"],
-        _ => &[],
-    }
-}
-
 /// The command lines a node runs through another program: `sh -c '…'`,
 /// `eval …`, `env X=1 cmd`, `sudo cmd`, `xargs cmd`, `find … -exec cmd ;`.
 /// A `bash` rule such as `"rm *": "deny"` is matched against these too;
@@ -613,31 +558,25 @@ fn inner_command_lines(node: &CommandNode) -> Vec<String> {
         // Past the wrapper's own flags (with the value of those that take
         // one), `VAR=value` settings, and a leading number (`timeout 5`,
         // `nice 10`).
-        let valued = wrapper_value_flags(&first);
-        let mut start = 0;
-        while start < rest.len() {
-            let word = rest[start].as_str();
-            if word == "--" {
-                start += 1;
-                break;
+        // Which word starts the wrapped command depends on the wrapper's
+        // flags and which of them take a value (`sudo -u root rm`,
+        // `sudo -nu root rm`, `env -S "rm -rf x"`). Rather than model each
+        // one, every word that could start it is tried: the extra patterns
+        // are noise, a missed one is a bypass.
+        for (index, word) in rest.iter().enumerate().take(12) {
+            if word.starts_with('-') {
+                // `--split-string=rm -rf x`, `-S"rm -rf x"` glued to a flag.
+                if let Some((_, value)) = word.split_once('=') {
+                    out.push(unquote(value).to_string());
+                }
+                continue;
             }
-            if valued.contains(&word) {
-                start += 2;
-            } else if word.starts_with('-')
-                || word.contains('=')
-                // A number or a duration: `5`, `0.5`, `10s`.
-                || (word.starts_with(|c: char| c.is_ascii_digit())
-                    && word
-                        .chars()
-                        .all(|c| c.is_ascii_digit() || matches!(c, '.' | 's' | 'm' | 'h' | 'd')))
-            {
-                start += 1;
-            } else {
-                break;
+            let mut line = unquote(word).to_string();
+            for next in &rest[index + 1..] {
+                line.push(' ');
+                line.push_str(next);
             }
-        }
-        if start < rest.len() {
-            out.push(join(&rest[start..]));
+            out.push(line);
         }
     } else if first == "find" {
         let mut index = 0;
@@ -1713,6 +1652,9 @@ mod tests {
             "echo a | xargs -n 1 -I {} rm -rf build",
             "timeout -s KILL 5s rm -rf build",
             "nice -n 10 rm -rf build",
+            "sudo -nu root rm -rf build",
+            "env -S \"rm -rf build\"",
+            "env --split-string=\"rm -rf build\"",
         ] {
             let scan = scan_sync(command, &dir, &dir);
             assert!(
