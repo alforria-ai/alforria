@@ -563,11 +563,25 @@ fn inner_command_lines(node: &CommandNode) -> Vec<String> {
         // `sudo -nu root rm`, `env -S "rm -rf x"`). Rather than model each
         // one, every word that could start it is tried: the extra patterns
         // are noise, a missed one is a bypass.
-        for (index, word) in rest.iter().enumerate().take(12) {
+        // Every word is tried: the caller refuses a command that unwraps
+        // into too many, so nothing is skipped quietly.
+        for (index, word) in rest.iter().enumerate() {
             if word.starts_with('-') {
-                // `--split-string=rm -rf x`, `-S"rm -rf x"` glued to a flag.
+                // A value glued to its flag can be the command itself:
+                // `--split-string=rm -rf x`, `-S"rm -rf x"`, `-Srm`.
                 if let Some((_, value)) = word.split_once('=') {
                     out.push(unquote(value).to_string());
+                }
+                if let Some(quote) = word.find(['"', '\'']) {
+                    out.push(unquote(&word[quote..]).to_string());
+                }
+                if !word.starts_with("--") && word.len() > 2 && word.is_char_boundary(2) {
+                    let mut line = unquote(&word[2..]).to_string();
+                    for next in &rest[index + 1..] {
+                        line.push(' ');
+                        line.push_str(next);
+                    }
+                    out.push(line);
                 }
                 continue;
             }
@@ -1592,6 +1606,7 @@ mod tests {
         let dir = temp("collect-escapes");
         let home = dirs::home_dir().unwrap();
         let home_glob = home.display().to_string();
+        let root_home = user_home("root").display().to_string();
         let cases: &[(&str, &str)] = &[
             // Not in the file-command list.
             ("head /etc/hostname", "/etc"),
@@ -1599,7 +1614,8 @@ mod tests {
             // Environment and home expansion.
             ("cat $HOME/.profile", &home_glob),
             ("cat ${HOME}/.profile", &home_glob),
-            ("cat ~root/.profile", "/root"),
+            // Wherever this system keeps root's home (`/var/root` on macOS).
+            ("cat ~root/.profile", &root_home),
             // `--opt=path`.
             ("cp --target-directory=/etc payload", "/etc"),
             // `cd` moves where later arguments resolve.
@@ -1655,6 +1671,10 @@ mod tests {
             "sudo -nu root rm -rf build",
             "env -S \"rm -rf build\"",
             "env --split-string=\"rm -rf build\"",
+            "env -S\"rm -rf build\"",
+            "env -Srm -rf build",
+            // Past any number of flags and settings.
+            "env -i A=1 B=2 C=3 D=4 E=5 F=6 G=7 H=8 I=9 J=10 K=11 L=12 M=13 rm -rf build",
         ] {
             let scan = scan_sync(command, &dir, &dir);
             assert!(
