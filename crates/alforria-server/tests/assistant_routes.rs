@@ -833,6 +833,26 @@ async fn memory_records_are_managed_over_http() {
             StatusCode::BAD_REQUEST,
         ),
         ("GET", "/memory/search", "", StatusCode::BAD_REQUEST),
+        // A query the index cannot read is the caller's mistake.
+        (
+            "GET",
+            "/memory/search?q=%00alpha",
+            "",
+            StatusCode::BAD_REQUEST,
+        ),
+        ("GET", "/memory/search?q=a%00b", "", StatusCode::BAD_REQUEST),
+        (
+            "GET",
+            "/memory/session?q=%00alpha",
+            "",
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "GET",
+            "/memory/session?q=a%00b",
+            "",
+            StatusCode::BAD_REQUEST,
+        ),
         ("GET", "/memory/mem_missing", "", StatusCode::NOT_FOUND),
         (
             "PATCH",

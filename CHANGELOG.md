@@ -462,6 +462,11 @@ pre-1.0, so minor releases may include breaking changes.
   session is caught by this starts a fresh one once that session is
   archived. Migration bodies are now pinned by hash in the tests, so an
   edit to a shipped migration fails CI.
+- Smaller findings of the security review:
+  - The Basic username and password are compared in constant time.
+  - `GET /memory/search` and `GET /memory/session` answer `400` to a query
+    the index cannot read (a NUL character, a full-text syntax error)
+    instead of `500`.
 
 ### Changed
 

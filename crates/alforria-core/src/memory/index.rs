@@ -257,10 +257,7 @@ impl MemoryService {
         if !self.enabled() {
             return Err(MemoryError::Disabled);
         }
-        let query = query.trim();
-        if query.is_empty() {
-            return Err(MemoryError::Invalid("search needs a query".to_string()));
-        }
+        let query = crate::memory::search_text(query)?;
         let building = self.index_within(SEARCH_BUDGET, SETTLE_MS);
         let limit = limit.clamp(1, 50);
         // The sessions of the `global` project are every non-repository
@@ -272,9 +269,11 @@ impl MemoryService {
             let Some(expression) = fts_query(query, operator) else {
                 break;
             };
-            let hits = self.storage().with_connection(|conn| {
-                let mut stmt = conn.prepare(&format!(
-                    "SELECT transcript_fts.session_id, s.title, transcript_fts.message_id,
+            let hits = self
+                .storage()
+                .with_connection(|conn| {
+                    let mut stmt = conn.prepare(&format!(
+                        "SELECT transcript_fts.session_id, s.title, transcript_fts.message_id,
                             transcript_fts.role, p.time_created,
                             snippet(transcript_fts, 0, '[', ']', '…', 32),
                             {untrusted}
@@ -285,33 +284,34 @@ impl MemoryService {
                        AND (?2 OR (s.project_id = ?3 AND (?6 IS NULL OR s.directory = ?6)))
                        AND (?4 IS NULL OR transcript_fts.session_id != ?4)
                      ORDER BY rank LIMIT ?5",
-                    untrusted = crate::session::store::SessionMark::OutsideContent.sql("s.id")
-                ))?;
-                let rows = stmt
-                    .query_map(
-                        params![
-                            expression,
-                            self.settings().global,
-                            project_id,
-                            exclude_session,
-                            limit as i64,
-                            directory
-                        ],
-                        |row| {
-                            Ok(SessionHit {
-                                session_id: row.get(0)?,
-                                title: row.get(1)?,
-                                message_id: row.get(2)?,
-                                role: row.get(3)?,
-                                time: row.get::<_, i64>(4)?.max(0) as u64,
-                                snippet: row.get(5)?,
-                                untrusted: row.get::<_, i64>(6)? != 0,
-                            })
-                        },
-                    )?
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok::<_, MemoryError>(rows)
-            })?;
+                        untrusted = crate::session::store::SessionMark::OutsideContent.sql("s.id")
+                    ))?;
+                    let rows = stmt
+                        .query_map(
+                            params![
+                                expression,
+                                self.settings().global,
+                                project_id,
+                                exclude_session,
+                                limit as i64,
+                                directory
+                            ],
+                            |row| {
+                                Ok(SessionHit {
+                                    session_id: row.get(0)?,
+                                    title: row.get(1)?,
+                                    message_id: row.get(2)?,
+                                    role: row.get(3)?,
+                                    time: row.get::<_, i64>(4)?.max(0) as u64,
+                                    snippet: row.get(5)?,
+                                    untrusted: row.get::<_, i64>(6)? != 0,
+                                })
+                            },
+                        )?
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok::<_, MemoryError>(rows)
+                })
+                .map_err(crate::memory::search_error)?;
             if !hits.is_empty() {
                 return Ok((hits, building));
             }

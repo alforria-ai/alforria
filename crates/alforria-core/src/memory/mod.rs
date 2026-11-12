@@ -431,6 +431,37 @@ pub fn fts_query(text: &str, operator: &str) -> Option<String> {
     (!terms.is_empty()).then(|| terms.join(&format!(" {operator} ")))
 }
 
+/// The text of a search, checked: empty, or holding a NUL (which ends the
+/// text for the full-text index and so leaves a phrase open), is the
+/// caller's mistake.
+pub(crate) fn search_text(query: &str) -> Result<&str, MemoryError> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Err(MemoryError::Invalid("search needs a query".to_string()));
+    }
+    if query.contains('\0') {
+        return Err(MemoryError::Invalid(
+            "a search query cannot contain a NUL character".to_string(),
+        ));
+    }
+    Ok(query)
+}
+
+/// A full-text query the index could not read is the caller's mistake too,
+/// not a failure of the store.
+pub(crate) fn search_error(error: MemoryError) -> MemoryError {
+    match error {
+        MemoryError::Failed(message)
+            if ["fts5:", "unterminated string", "malformed MATCH"]
+                .iter()
+                .any(|sign| message.contains(sign)) =>
+        {
+            MemoryError::Invalid(format!("the search query cannot be read: {message}"))
+        }
+        other => other,
+    }
+}
+
 fn escape_like(text: &str) -> String {
     text.replace('\\', "\\\\")
         .replace('%', "\\%")
@@ -1038,10 +1069,7 @@ impl MemoryService {
         limit: usize,
     ) -> Result<Vec<MemoryHit>, MemoryError> {
         self.require_enabled()?;
-        let query = query.trim();
-        if query.is_empty() {
-            return Err(MemoryError::Invalid("search needs a query".to_string()));
-        }
+        let query = search_text(query)?;
         let kind = match kind {
             Some(kind) => Some(check_kind(Some(kind))?),
             None => None,
@@ -1051,35 +1079,38 @@ impl MemoryService {
             let Some(expression) = fts_query(query, operator) else {
                 break;
             };
-            let hits = self.storage.with_connection(|conn| {
-                let mut stmt = conn.prepare(&format!(
-                    "SELECT {COLUMNS}, snippet(memory_fts, 0, '[', ']', '…', 24) AS snippet
+            let hits = self
+                .storage
+                .with_connection(|conn| {
+                    let mut stmt = conn.prepare(&format!(
+                        "SELECT {COLUMNS}, snippet(memory_fts, 0, '[', ']', '…', 24) AS snippet
                      FROM memory_fts JOIN memory m ON m.id = memory_fts.id
                      WHERE memory_fts MATCH ?1 AND {}
                        AND (?3 OR m.archived = 0) AND (?4 IS NULL OR m.kind = ?4)
                      ORDER BY rank LIMIT ?5",
-                    scope_sql("m", 2, 6)
-                ))?;
-                let rows = stmt
-                    .query_map(
-                        params![
-                            expression,
-                            self.settings.project_id,
-                            include_archived,
-                            kind,
-                            limit as i64,
-                            self.settings.directory_key()
-                        ],
-                        |row| {
-                            Ok(MemoryHit {
-                                record: row_to_record(row)?,
-                                snippet: row.get("snippet")?,
-                            })
-                        },
-                    )?
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok::<_, MemoryError>(rows)
-            })?;
+                        scope_sql("m", 2, 6)
+                    ))?;
+                    let rows = stmt
+                        .query_map(
+                            params![
+                                expression,
+                                self.settings.project_id,
+                                include_archived,
+                                kind,
+                                limit as i64,
+                                self.settings.directory_key()
+                            ],
+                            |row| {
+                                Ok(MemoryHit {
+                                    record: row_to_record(row)?,
+                                    snippet: row.get("snippet")?,
+                                })
+                            },
+                        )?
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok::<_, MemoryError>(rows)
+                })
+                .map_err(search_error)?;
             if !hits.is_empty() {
                 return Ok(hits);
             }
@@ -2521,6 +2552,60 @@ mod tests {
         assert!(!two.forget(&mine.id).unwrap());
         assert!(one.get(&mine.id).unwrap().is_some());
         assert_eq!(global.list(&ListQuery::default()).unwrap().len(), 1);
+    }
+
+    /// Nothing a caller types into a search is a failure of the store: it
+    /// is searched for, or it is an invalid request.
+    #[test]
+    fn a_search_the_index_cannot_read_is_invalid_not_a_failure() {
+        let (_temp, storage) = storage("memory-fts-errors");
+        let memory = service(storage, settings("proj"));
+        memory.remember(None, "alpha beta gamma", None).unwrap();
+        for query in ["\u{0}alpha", "alp\u{0}ha", "alpha \u{0}"] {
+            assert!(
+                matches!(
+                    memory.search(query, None, false, 10),
+                    Err(MemoryError::Invalid(_))
+                ),
+                "{query:?}"
+            );
+            assert!(
+                matches!(
+                    memory.search_sessions(query, 10, None, "proj"),
+                    Err(MemoryError::Invalid(_))
+                ),
+                "{query:?}"
+            );
+        }
+        for query in [
+            "\"",
+            "a\"b",
+            "NEAR(alpha beta)",
+            "content:alpha",
+            "^alpha",
+            "alp*",
+            "-alpha",
+            "{content id}:alpha",
+            "alpha AND",
+            "alpha OR NOT",
+            "(((",
+            "*",
+            "a* b* c*",
+            "\"\"\"alpha",
+            "alpha\\",
+            "%",
+            "_",
+        ] {
+            assert!(memory.search(query, None, false, 10).is_ok(), "{query:?}");
+            assert!(
+                memory.search_sessions(query, 10, None, "proj").is_ok(),
+                "{query:?}"
+            );
+        }
+        let syntax = MemoryError::Failed("fts5: syntax error near \"(\"".to_string());
+        assert!(matches!(search_error(syntax), MemoryError::Invalid(_)));
+        let other = MemoryError::Failed("disk I/O error".to_string());
+        assert_eq!(search_error(other.clone()), other);
     }
 
     #[test]
