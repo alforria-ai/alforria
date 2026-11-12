@@ -121,6 +121,67 @@ fn home(text: &str) -> String {
     text.to_string()
 }
 
+/// A user's home directory, for `~name`.
+fn user_home(name: &str) -> PathBuf {
+    std::fs::read_to_string("/etc/passwd")
+        .ok()
+        .and_then(|passwd| {
+            passwd.lines().find_map(|line| {
+                let mut fields = line.split(':');
+                (fields.next() == Some(name))
+                    .then(|| fields.nth(4).map(PathBuf::from))
+                    .flatten()
+            })
+        })
+        .unwrap_or_else(|| Path::new("/home").join(name))
+}
+
+/// What a POSIX shell would make of `text` as far as it can be told without
+/// running anything: `~`, `~name`, and `$VAR` / `${VAR}` for variables the
+/// shell inherits. Without this `cat $HOME/.ssh/id_rsa` and
+/// `cat ~root/.ssh/id_rsa` named no directory at all. Anything else that is
+/// dynamic is left for [`dynamic`] to report.
+fn posix_expand(text: &str) -> String {
+    use std::sync::OnceLock;
+    static VAR: OnceLock<regex::Regex> = OnceLock::new();
+    let var = VAR.get_or_init(|| {
+        regex::Regex::new(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))").unwrap()
+    });
+    let text = var.replace_all(text, |caps: &regex::Captures<'_>| {
+        let name = caps.get(1).or(caps.get(2)).map_or("", |m| m.as_str());
+        match std::env::var(name) {
+            Ok(value) => value,
+            // Not inherited: the command set it itself, so it stays dynamic.
+            Err(_) => caps[0].to_string(),
+        }
+    });
+    if let Some(rest) = text.strip_prefix('~') {
+        let (name, tail) = rest.split_once('/').unwrap_or((rest, ""));
+        if !name.is_empty()
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_-.".contains(&b))
+        {
+            return user_home(name).join(tail).display().to_string();
+        }
+    }
+    home(&text)
+}
+
+/// Whether an argument of a command we know nothing about reads as a path
+/// that could leave the project: absolute, home-relative, or climbing with
+/// `..`. URLs are not paths.
+fn path_like(text: &str) -> bool {
+    if text.contains("://") {
+        return false;
+    }
+    text.starts_with('/')
+        || text.starts_with('~')
+        || Path::new(text)
+            .components()
+            .any(|part| part == std::path::Component::ParentDir)
+}
+
 /// `envValue` (shell.ts:141-145) — non-win32: a plain case-sensitive lookup.
 fn env_value(key: &str) -> String {
     std::env::var(key).unwrap_or_default()
@@ -375,7 +436,7 @@ fn arg_path(arg: &str, cwd: &Path, ps: bool, shell: &str) -> Option<PathBuf> {
     let text = if ps {
         expand(arg, &cwd.display().to_string(), shell)
     } else {
-        home(unquote(arg))
+        posix_expand(unquote(arg))
     };
     let file = if text.is_empty() {
         None
@@ -457,6 +518,7 @@ pub async fn collect(
 ) -> Scan {
     let mut scan = Scan::default();
     let shell_kind = id::to_kind(&shell_name(shell));
+    let mut cwd = cwd.to_path_buf();
 
     for node in nodes {
         let tokens: Vec<&str> = node.parts.iter().map(|p| p.text.as_str()).collect();
@@ -469,22 +531,66 @@ pub async fn collect(
         });
 
         if let Some(cmd) = &cmd {
-            if FILES.contains(&cmd.as_str())
-                || (shell_kind == "cmd" && CMD_FILES.contains(&cmd.as_str()))
-            {
-                for arg in path_args(&node.parts, ps, shell_kind == "cmd") {
-                    let Some(resolved) = arg_path(&arg, cwd, ps, shell) else {
-                        continue;
-                    };
-                    if contains_path(&resolved, instance) {
-                        continue;
+            let posix = !ps && shell_kind != "cmd";
+            let listed = FILES.contains(&cmd.as_str())
+                || (shell_kind == "cmd" && CMD_FILES.contains(&cmd.as_str()));
+            // Outside the listed file commands, any POSIX command's arguments
+            // are still looked at when they read as a path out of the
+            // project (`head /etc/shadow`, `tar -C ~/x`, `cp --target-directory=/etc`).
+            let mut args: Vec<(String, bool)> = if listed {
+                path_args(&node.parts, ps, shell_kind == "cmd")
+                    .into_iter()
+                    .map(|arg| (arg, true))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            if posix {
+                for part in node.parts.iter().skip(1) {
+                    let text = part.text.as_str();
+                    if let Some((flag, value)) = text.split_once('=') {
+                        // `--opt=path`
+                        if flag.starts_with('-') && !value.is_empty() {
+                            args.push((value.to_string(), false));
+                        }
+                    } else if !listed
+                        && !text.starts_with('-')
+                        // These print their arguments; they open nothing.
+                        && !matches!(cmd.as_str(), "echo" | "printf")
+                    {
+                        args.push((text.to_string(), false));
                     }
-                    let dir = if is_dir(&resolved).await {
-                        resolved
-                    } else {
-                        dirname(&resolved)
-                    };
-                    scan.push_dir(dir.display().to_string());
+                }
+            }
+            let mut first = None;
+            for (arg, known) in args {
+                if !known && !path_like(&posix_expand(unquote(&arg))) {
+                    continue;
+                }
+                let Some(resolved) = arg_path(&arg, &cwd, ps, shell) else {
+                    continue;
+                };
+                first.get_or_insert_with(|| resolved.clone());
+                if contains_path(&resolved, instance) {
+                    continue;
+                }
+                let directory = is_dir(&resolved).await;
+                // A guess about an unknown command only counts when it names
+                // something real (`grep -r /api/v1 .` does not).
+                if !known && !directory && !is_dir(&dirname(&resolved)).await {
+                    continue;
+                }
+                let dir = if directory {
+                    resolved
+                } else {
+                    dirname(&resolved)
+                };
+                scan.push_dir(dir.display().to_string());
+            }
+            // `cd elsewhere && cat x`: later arguments resolve from there.
+            if posix && matches!(cmd.as_str(), "cd" | "pushd") {
+                if let Some(target) = first {
+                    cwd = target;
                 }
             }
         }
@@ -1323,6 +1429,47 @@ mod tests {
             tokio::runtime::Handle::current()
                 .block_on(collect(&nodes, &cwd, false, "bash", &instance))
         })
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn collect_sees_paths_the_file_list_missed() {
+        let dir = temp("collect-escapes");
+        let home = dirs::home_dir().unwrap();
+        let home_glob = home.display().to_string();
+        let cases: &[(&str, &str)] = &[
+            // Not in the file-command list.
+            ("head /etc/hostname", "/etc"),
+            ("tar -C /etc -cf out.tar .", "/etc"),
+            // Environment and home expansion.
+            ("cat $HOME/.profile", &home_glob),
+            ("cat ${HOME}/.profile", &home_glob),
+            ("cat ~root/.profile", "/root"),
+            // `--opt=path`.
+            ("cp --target-directory=/etc payload", "/etc"),
+            // `cd` moves where later arguments resolve.
+            ("cd /etc && cat hostname", "/etc"),
+        ];
+        for (command, expected) in cases {
+            let scan = scan_sync(command, &dir, &dir);
+            assert!(
+                scan.dirs.iter().any(|d| d == expected),
+                "{command}: {:?}",
+                scan.dirs
+            );
+        }
+        // Not paths out of the project, or not real ones.
+        for command in [
+            "grep -r /api/v1 .",
+            "curl https://example.com/etc/passwd",
+            "sed s/a/b/ file.txt",
+            "git log origin/main",
+            "cat src/../file.txt",
+        ] {
+            let scan = scan_sync(command, &dir, &dir);
+            assert!(scan.dirs.is_empty(), "{command}: {:?}", scan.dirs);
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test(flavor = "multi_thread")]

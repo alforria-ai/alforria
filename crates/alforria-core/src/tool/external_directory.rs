@@ -31,22 +31,72 @@ fn fs_contains(parent: &Path, child: &Path) -> bool {
     child.strip_prefix(parent).is_ok()
 }
 
+/// Where `path` really is: symlinks resolved through the longest part of it
+/// that exists, the rest appended as written. A link whose target is missing
+/// is followed too, since a write through it creates the target.
+pub fn real_path(path: &Path) -> std::path::PathBuf {
+    let mut current = crate::git::lexical_normalize(path);
+    // Bounds a symlink loop.
+    for _ in 0..40 {
+        let mut tail: Vec<std::ffi::OsString> = Vec::new();
+        let mut probe = current.clone();
+        let dangling = loop {
+            if let Ok(real) = std::fs::canonicalize(&probe) {
+                let mut out = real;
+                out.extend(tail.iter().rev());
+                return out;
+            }
+            if std::fs::symlink_metadata(&probe).is_ok_and(|meta| meta.file_type().is_symlink()) {
+                break Some(probe);
+            }
+            match (probe.parent(), probe.file_name()) {
+                (Some(parent), Some(name)) => {
+                    tail.push(name.to_os_string());
+                    probe = parent.to_path_buf();
+                }
+                _ => break None,
+            }
+        };
+        let Some(link) = dangling else {
+            return current;
+        };
+        let Ok(target) = std::fs::read_link(&link) else {
+            return current;
+        };
+        let mut next = link.parent().unwrap_or(Path::new("/")).join(target);
+        next.extend(tail.iter().rev());
+        current = crate::git::lexical_normalize(&next);
+    }
+    current
+}
+
+/// Whether `child`, already resolved, lies in `root` or in where `root`
+/// really is (a project reached through a symlinked path).
+fn real_contains(root: &Path, child: &Path) -> bool {
+    fs_contains(root, child)
+        || std::fs::canonicalize(root).is_ok_and(|real| fs_contains(&real, child))
+}
+
 /// `containsPath` (instance-context.ts:18-24): true when the path is inside
 /// `ctx.directory` or `ctx.worktree`. Non-git projects set worktree to `"/"`,
 /// which would match ANY absolute path, so the worktree check is skipped.
 ///
 /// The path is normalised lexically first: `strip_prefix` compares
 /// components literally, so `/project/../etc/passwd` would otherwise count
-/// as inside `/project`.
+/// as inside `/project`. It must also really be inside: a symlink in the
+/// project that points out of it is outside, whatever its spelling.
 pub fn contains_path(filepath: &Path, ctx: &InstanceContext) -> bool {
     let filepath = &crate::git::lexical_normalize(filepath);
-    if fs_contains(&ctx.directory, filepath) {
-        return true;
-    }
-    if ctx.worktree == Path::new("/") {
+    let git = ctx.worktree != Path::new("/");
+    let lexical =
+        fs_contains(&ctx.directory, filepath) || (git && fs_contains(&ctx.worktree, filepath));
+    if !lexical {
         return false;
     }
-    fs_contains(&ctx.worktree, filepath)
+    let real = &real_path(filepath);
+    real == filepath
+        || real_contains(&ctx.directory, real)
+        || (git && real_contains(&ctx.worktree, real))
 }
 
 /// `path.dirname` semantics: the parent of a bare filename is `"."`.
@@ -84,10 +134,22 @@ pub async fn assert_external_directory(
     } else {
         Path::new(target).to_path_buf()
     };
-    let full = normalized.as_path();
-    if contains_path(full, instance) {
+    if contains_path(&normalized, instance) {
         return Ok(false);
     }
+    // Ask about the directory actually touched: for a symlink that leaves
+    // the project, that is where it points.
+    let lexically_inside = {
+        let git = instance.worktree != Path::new("/");
+        fs_contains(&instance.directory, &normalized)
+            || (git && fs_contains(&instance.worktree, &normalized))
+    };
+    let resolved = if lexically_inside {
+        real_path(&normalized)
+    } else {
+        normalized
+    };
+    let full = resolved.as_path();
 
     let dir = match options.kind {
         Kind::Directory => full,
@@ -243,6 +305,53 @@ mod tests {
                 "parentDir": "/tmp/outside",
             })
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlink_out_of_the_project_is_outside() {
+        let root = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+        let project = root.join("project");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret"), "s").unwrap();
+        std::os::unix::fs::symlink(outside.join("secret"), project.join("notes.txt")).unwrap();
+        std::os::unix::fs::symlink(&outside, project.join("docs")).unwrap();
+        // A link to a file that does not exist yet: writing creates it.
+        std::os::unix::fs::symlink(outside.join("new"), project.join("dangling")).unwrap();
+        std::fs::write(project.join("real.txt"), "r").unwrap();
+        std::os::unix::fs::symlink(project.join("real.txt"), project.join("alias")).unwrap();
+
+        let instance = InstanceContext {
+            directory: project.clone(),
+            worktree: project.clone(),
+        };
+        let extra = Extra::default();
+        let glob = format!("{}/*", outside.display());
+        for name in ["notes.txt", "docs/secret", "docs/not-there", "dangling"] {
+            let ask = RecordingAsk::new();
+            let c = ctx(&ask, &instance, &extra);
+            let target = project.join(name);
+            let asked = assert_external_directory(
+                &c,
+                Some(target.to_string_lossy().as_ref()),
+                ExternalOptions::default(),
+            )
+            .await
+            .unwrap();
+            assert!(asked, "{name}");
+            assert_eq!(
+                ask.requests.lock().unwrap()[0].patterns,
+                vec![glob.clone()],
+                "{name}"
+            );
+        }
+        // Links that stay inside, and plain files, are still inside.
+        for name in ["alias", "real.txt", "new-file", "sub/new-file"] {
+            assert!(contains_path(&project.join(name), &instance), "{name}");
+        }
     }
 
     #[tokio::test]
