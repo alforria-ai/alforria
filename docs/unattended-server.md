@@ -470,13 +470,19 @@ catalog (models.dev, read from the server's cache) lists the variables of
 every provider there is, and many are not a model provider's alone. One of
 them is withheld only when all three hold:
 
-1. **its provider is in use on this install**: a loaded config declares it
-   (`provider.<id>`) or selects one of its models (`model`,
-   `small_model`), or credentials are stored for it (`alforria providers
-   login`, `PUT /auth/<id>`) — and `enabled_providers` /
-   `disabled_providers` do not switch it off. A provider the catalog
-   merely lists, or one whose variable merely happens to be set, withholds
-   nothing;
+1. **its provider is in use on this server** — the server may
+   authenticate with it: a loaded config declares it (`provider.<id>`) or
+   selects one of its models (`model`, `small_model`); credentials are
+   stored for it (`alforria providers login`, `PUT /auth/<id>`); one of
+   the variables the catalog lists for it is set in the server's
+   environment (that is how a provider is connected from the
+   environment); or a session selects one of its models. The host's
+   config, the stored credentials and the environment are read when the
+   server starts, each project's config when its directory is opened. A
+   project's config adds to the set and never takes from it:
+   `enabled_providers` / `disabled_providers` decide what is offered for
+   use, not what is withheld. A provider the catalog merely lists
+   withholds nothing;
 2. **the name is shaped like a credential** (`CREDENTIAL_PATTERNS`, below:
    `*_TOKEN`, `*_KEY`, `*_SECRET`, …). A region, a project, an account id,
    an endpoint or a base URL the catalog lists is never withheld;
@@ -494,6 +500,19 @@ them is withheld only when all three hold:
 (`AZURE_API_KEY`, `AZURE_OPENAI_API_KEY` and `AWS_BEARER_TOKEN_BEDROCK` are
 on the built-in list above and stay withheld.) On a restricted server
 every name the catalog lists is withheld, used or not, as before.
+
+Put together, for a variable that is set in a standalone server's
+environment: being set already puts its provider in use, so the rule
+comes down to the other two conditions. **A set variable the catalog
+lists is withheld when it is shaped like a credential and is not a
+general-purpose one** — `HF_TOKEN`, `DATABRICKS_TOKEN` or a
+`*_SERVICE_KEY` go, as the key the server itself would sign in with;
+`GITHUB_TOKEN`, the `AWS_*` and `AZURE_*` names and the Google ones stay,
+although Copilot, Bedrock, Azure and Vertex are then keyed from them and
+in use. Where the two rules meet — a provider's key that is also the
+user's `gh` or `aws` credential — the exemption wins on a standalone
+server, and `deny` is the host's way to choose otherwise. `allow` hands
+back one of the first kind (`"allow": ["HF_TOKEN"]`).
 
 The config's and the catalog's names are *learned*: read from the host
 config and the catalog when the server starts, and again every time a
@@ -556,10 +575,7 @@ only if `allow` names `SSH_AUTH_SOCK`.
   server the default allowlist keeps it out.
 - A provider key in a variable that is not shaped like an API key, of a
   provider that neither the catalog nor a loaded config lists, is not
-  recognised. Neither is the key of a catalog provider you use only
-  through a variable that is set, without declaring the provider,
-  selecting its model in a config or signing in, when the variable is not
-  named `*_API_KEY` (`HF_TOKEN`): declare the provider or `deny` the name.
+  recognised.
 - A general-purpose credential that is also your model provider's key —
   `GITHUB_TOKEN` with GitHub Copilot, the `AWS_*` keys with Amazon Bedrock
   — reaches the agent's processes on a standalone server. `deny` is the

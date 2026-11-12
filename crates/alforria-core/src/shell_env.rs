@@ -32,7 +32,9 @@
 //!   loaded configs, every `{env:NAME}` the host config and each opened
 //!   project's own config files refer to). The model catalog adds less
 //!   ([`ShellEnvPolicy::deny_catalog_names`]): of the names its providers
-//!   list, only those of a provider this install uses, only the ones
+//!   list, only those of a provider in use (declared or selected in a
+//!   config, signed in to, keyed from the environment, or selected by a
+//!   session), only the ones
 //!   shaped like a credential ([`CREDENTIAL_PATTERNS`] — a region, a
 //!   project or an endpoint passes), and never a general-purpose one
 //!   ([`GENERAL_PURPOSE_CREDENTIALS`]: `GITHUB_TOKEN`, `AWS_*`, …).
@@ -364,8 +366,10 @@ impl ShellEnvPolicy {
     }
 
     /// Deny the `env` names a provider of the model catalog lists.
-    /// `in_use`: the install uses that provider (it is declared in a
-    /// loaded config, selected as a model, or has stored credentials).
+    /// `in_use`: the server may authenticate with that provider — a
+    /// loaded config declares it or selects its model, credentials are
+    /// stored for it, one of its variables is set in the server's
+    /// environment, or a session selected one of its models.
     ///
     /// The catalog lists the variables of every provider there is, and
     /// some are not a model provider's alone: a restricted server denies
@@ -389,6 +393,21 @@ impl ShellEnvPolicy {
             }
             self.catalog.insert(upper);
         }
+    }
+
+    /// Whether [`ShellEnvPolicy::deny_catalog_names`] would add nothing.
+    fn knows_catalog_names<S: AsRef<str>>(&self, names: &[S], in_use: bool) -> bool {
+        let known = if in_use {
+            &self.catalog_in_use
+        } else {
+            &self.catalog
+        };
+        names.iter().all(|name| {
+            let name = name.as_ref();
+            name.is_empty()
+                || matches_any(name, RESTRICTED_INHERIT)
+                || known.contains(&name.to_ascii_uppercase())
+        })
     }
 
     fn learned(&self, upper: &str) -> bool {
@@ -605,9 +624,22 @@ pub fn learn<S: AsRef<str>>(names: impl IntoIterator<Item = S>) {
 
 /// [`ShellEnvPolicy::deny_catalog_names`] on the process-wide policy:
 /// called with each provider of the model catalog when the catalog is
-/// read (`in_use` false) and when an instance's provider state is built
-/// (`in_use` true for the providers it uses). Append-only like [`learn`].
+/// read (`in_use` false), and with the providers in use when an
+/// instance's provider state is built and when a session selects a model
+/// (`in_use` true). Append-only like [`learn`].
 pub fn learn_catalog<S: AsRef<str>>(names: impl IntoIterator<Item = S>, in_use: bool) {
+    // Every model lookup comes through here: nothing new is the usual
+    // case, and takes the read lock only.
+    let names: Vec<S> = names.into_iter().collect();
+    {
+        let current = CURRENT.read().unwrap_or_else(|p| p.into_inner());
+        if current
+            .as_deref()
+            .is_some_and(|policy| policy.knows_catalog_names(&names, in_use))
+        {
+            return;
+        }
+    }
     let mut current = CURRENT.write().unwrap_or_else(|p| p.into_inner());
     let mut policy = current.as_deref().cloned().unwrap_or_default();
     policy.deny_catalog_names(names, in_use);

@@ -523,8 +523,14 @@ pub fn production_context(
     alforria_core::shell_env::install(ctx.policy.shell_env.clone());
     // The variables the catalog's providers read their keys from are kept
     // from the agent's processes, whatever they are called: learned now,
-    // and again at every later read (`state::learning_catalog`).
-    let _ = (runtime.catalog)();
+    // and again at every later read (`state::learning_catalog`). So are
+    // those of the providers already in use — in the host config, signed
+    // in to, or keyed from the server's environment — before any
+    // directory is opened (`provider::learn_catalog_names`, again at each
+    // instance's provider state).
+    if let Ok(catalog) = (runtime.catalog)() {
+        provider::learn_catalog_names(&catalog, &[&global], runtime.auth.as_ref());
+    }
     ctx.hosts = middleware::host::HostAllowlist::new(&opts.hostname, &opts.hosts, &opts.cors);
     ctx.engine_factory = engines.factory();
     ctx.tools = engines.tools();

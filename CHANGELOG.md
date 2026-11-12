@@ -553,19 +553,20 @@ memory is configured.
   goes too); every `provider.*.env` name of a loaded config; every
   variable a config file reads through `{env:NAME}` — in any letter case;
   and, of the names the model catalog lists, the credential-shaped ones
-  (`*_TOKEN`, `*_KEY`, `*_SECRET`, …) of the providers the install uses
-  (declared or selected in a config, or signed in to). Everything else in
+  (`*_TOKEN`, `*_KEY`, `*_SECRET`, …) of the providers in use (declared
+  or selected in a config, signed in to, keyed from a variable set in the
+  server's environment, or selected by a session — `HF_TOKEN` goes when
+  it is set). Everything else in
   the environment is passed as before: `GITHUB_TOKEN`, `GH_TOKEN`,
   `GITLAB_TOKEN`, `AWS_*`, `AZURE_*`, `GOOGLE_APPLICATION_CREDENTIALS`,
   `GOOGLE_CLOUD_*` and `GCLOUD_*` always — even when GitHub Copilot or
   Amazon Bedrock, which the catalog lists them for, is the provider in
   use, so `gh` and `aws` keep their credentials in the agent's shell —
   and `NPM_TOKEN`, `PGPASSWORD`, `AWS_PROFILE` and the like; so are the
-  regions, projects and endpoints the catalog lists, and the variables of
-  providers you do not use. A name learned from a config or the catalog
+  regions, projects and endpoints the catalog lists. A name learned from a config or the catalog
   stays withheld until the server restarts. To pass a withheld one
   through, name it in `shell_env.allow` in the global config
-  (`"shell_env": { "allow": ["MY_PROVIDER_TOKEN"] }`), or in an MCP
+  (`"shell_env": { "allow": ["HF_TOKEN"] }`), or in an MCP
   server's own `environment`; to hide a passed one (a Copilot or Bedrock
   user's `GITHUB_TOKEN` / `AWS_*`), name it in `shell_env.deny`.
 - **Binding beyond loopback restricts the shell environment further.**

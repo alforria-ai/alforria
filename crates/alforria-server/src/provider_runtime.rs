@@ -169,6 +169,9 @@ struct Inner {
     /// change.
     catalog: alforria_core::catalog::Providers,
     config: alforria_core::config::schema::Config,
+    /// The config as the host's own sources alone have it: with `config`,
+    /// what `provider::in_use` is read from.
+    host_config: alforria_core::config::schema::Config,
     /// The strings the host wrote: see [`interpolate_env`].
     host_strings: alforria_core::config::HostStrings,
     auth: Arc<dyn AuthStore>,
@@ -221,11 +224,12 @@ impl RuntimeModels {
         let state = build_state(&catalog, config, auth.as_ref())?;
         // The key variables of the providers in use stay out of the
         // agent's processes.
-        crate::provider::learn_catalog_names(&catalog, config, auth.as_ref());
+        crate::provider::learn_catalog_names(&catalog, &[config, host_config], auth.as_ref());
         Ok(RuntimeModels(Arc::new(Inner {
             catalog,
             host_strings,
             config: config.clone(),
+            host_config: host_config.clone(),
             auth,
             state: RwLock::new((generation, Arc::new(state))),
             config_model: config.model.clone(),
@@ -256,7 +260,11 @@ impl RuntimeModels {
             return current.1.clone();
         }
         // A sign-in can have put another provider in use.
-        crate::provider::learn_catalog_names(&self.0.catalog, &self.0.config, self.0.auth.as_ref());
+        crate::provider::learn_catalog_names(
+            &self.0.catalog,
+            &[&self.0.config, &self.0.host_config],
+            self.0.auth.as_ref(),
+        );
         match build_state(&self.0.catalog, &self.0.config, self.0.auth.as_ref()) {
             Ok(state) => *current = (generation, Arc::new(state)),
             Err(err) => {
@@ -364,6 +372,10 @@ impl RuntimeModels {
     }
 
     fn resolve(&self, provider_id: &str, model_id: &str) -> Result<ResolvedModel, String> {
+        // A session selecting a provider's model puts the provider in
+        // use: its key variables stay out of the shells started from here
+        // on, whether or not the model resolves.
+        crate::provider::learn_provider(&self.0.catalog, provider_id);
         let state = self.state();
         let model = self.model_value_in(&state, provider_id, model_id)?;
         let provider = state
@@ -1133,6 +1145,49 @@ mod tests {
             names.iter().all(|name| !name.ends_with(".tmp")),
             "{names:?}"
         );
+    }
+
+    /// A session that selects a model of a provider nothing had put in
+    /// use — no config, no stored credentials, no key in the environment —
+    /// puts it in use: its token is withheld from the next shell, on a
+    /// standalone server too, whether or not the model resolves.
+    #[tokio::test]
+    async fn selecting_a_model_withholds_its_providers_key_variables() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = alforria_core::GlobalPaths {
+            home: dir.path().join("home"),
+            config: dir.path().join("config"),
+            data: dir.path().join("data"),
+            cache: dir.path().join("cache"),
+            state: dir.path().join("state"),
+        };
+        let catalog: alforria_core::catalog::Providers = serde_json::from_value(json!({
+            "fresh": {
+                "id": "fresh", "name": "Fresh", "models": {},
+                "env": ["FRESHTEST_TOKEN", "FRESHTEST_REGION", "GITHUB_TOKEN"]
+            },
+        }))
+        .unwrap();
+        let config: alforria_core::config::schema::Config =
+            serde_json::from_value(json!({})).unwrap();
+        let models = RuntimeModels::new(
+            catalog,
+            &config,
+            &config,
+            Arc::new(crate::state::MemoryAuthStore::default()),
+            &paths,
+        )
+        .unwrap();
+        let policy = alforria_core::shell_env::current;
+        assert!(!policy().is_restricted());
+        assert!(!policy().denied("FRESHTEST_TOKEN"));
+
+        let selected = ModelSource::get_model(&models, "fresh", "fresh-1", "ses_1").await;
+        assert!(selected.is_err(), "nothing connects the provider");
+        assert!(policy().denied("FRESHTEST_TOKEN"));
+        // The region is no credential, and `GITHUB_TOKEN` is the user's.
+        assert!(!policy().denied("FRESHTEST_REGION"));
+        assert!(!policy().denied("GITHUB_TOKEN"));
     }
 
     #[test]

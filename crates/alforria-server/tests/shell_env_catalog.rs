@@ -1,7 +1,8 @@
 //! What the model catalog has the shell environment policy withhold on a
 //! standalone server: the credential-shaped variables of the providers
-//! the install uses, and never the general-purpose ones (`GITHUB_TOKEN`,
-//! `AWS_*`) that `gh` and `aws` read.
+//! in use — declared or selected in a config, signed in to, keyed from the
+//! server's environment, or selected by a session — and never the
+//! general-purpose ones (`GITHUB_TOKEN`, `AWS_*`) that `gh` and `aws` read.
 //!
 //! The policy is process-wide, so this file holds one test: it is the only
 //! one in its binary to install or teach a policy.
@@ -26,6 +27,8 @@ const SERVER_ENV: &[&str] = &[
     "AWS_ACCESS_KEY_ID",
     "AWS_REGION",
     "AWS_SECRET_ACCESS_KEY",
+    "ENVONLY_REGION",
+    "ENVONLY_TOKEN",
     "GH_TOKEN",
     "GITHUB_TOKEN",
     "MISTRAL_API_KEY",
@@ -35,6 +38,7 @@ const SERVER_ENV: &[&str] = &[
     "PICKED_PROJECT",
     "STORED_ENDPOINT",
     "STORED_SECRET",
+    "SWITCHED_OFF_TOKEN",
     "UNUSED_TOKEN",
 ];
 
@@ -80,8 +84,11 @@ fn context(paths: &alforria_core::GlobalPaths) -> Arc<alforria_server::state::Se
 /// withheld once the install uses it — a config declares it or selects
 /// its model, or credentials are stored for it — and then only the ones
 /// shaped like a credential: a region, a project or an endpoint passes.
-/// `GITHUB_TOKEN` and `AWS_*` pass even with Copilot and Bedrock
-/// configured; `shell_env.deny` is how a host withholds them.
+/// A provider whose key is in the server's environment alone is in use
+/// too, from startup, and a project's `disabled_providers` takes nothing
+/// out of the set. `GITHUB_TOKEN` and `AWS_*` pass even when they are set
+/// in the server's environment and Copilot and Bedrock are configured;
+/// `shell_env.deny` is how a host withholds them.
 #[test]
 fn the_catalog_withholds_only_the_keys_of_the_providers_in_use() {
     let dir = tempfile::tempdir().unwrap();
@@ -105,8 +112,17 @@ fn the_catalog_withholds_only_the_keys_of_the_providers_in_use() {
             "picked": provider("picked", &["PICKED_KEY", "PICKED_PROJECT"]),
             "stored": provider("stored", &["STORED_SECRET", "STORED_ENDPOINT"]),
             "unused": provider("unused", &["UNUSED_TOKEN"]),
+            "envonly": provider("envonly", &["ENVONLY_TOKEN", "ENVONLY_REGION"]),
+            "switched-off": provider("switched-off", &["SWITCHED_OFF_TOKEN"]),
         }),
     );
+    // The server's real environment: a key for a provider no config
+    // names and no credentials are stored for, and the user's own `gh`
+    // and `aws` credentials, which Copilot and Bedrock would be keyed
+    // from. (This binary holds this one test.)
+    std::env::set_var("ENVONLY_TOKEN", "sk-envonly");
+    std::env::set_var("GITHUB_TOKEN", "ghp-the-users");
+    std::env::set_var("AWS_ACCESS_KEY_ID", "AKIA-the-users");
     let repo = |name: &str, config: serde_json::Value| {
         let repo = root.join(name);
         write(&repo.join("opencode.json"), config);
@@ -117,13 +133,15 @@ fn the_catalog_withholds_only_the_keys_of_the_providers_in_use() {
     assert!(!shell_env::current().is_restricted());
     assert_eq!(
         (ctx.catalog)().unwrap().len(),
-        8,
+        10,
         "the catalog fixture and the built-in provider are read"
     );
 
-    // No provider configured: only the name shaped like an API key is
-    // withheld, as it is without any catalog.
-    let mut gone = vec!["MISTRAL_API_KEY"];
+    // No provider configured: the name shaped like an API key is
+    // withheld, as it is without any catalog, and so is the token of the
+    // provider keyed from the environment — not its region, and not
+    // `GITHUB_TOKEN` or the `AWS_*` keys, set though they are.
+    let mut gone = vec!["MISTRAL_API_KEY", "ENVONLY_TOKEN"];
     assert_eq!(shell_names(), without(&gone), "before any instance");
     ctx.instances.load(&repo("plain", json!({}))).unwrap();
     assert_eq!(shell_names(), without(&gone), "no provider configured");
@@ -163,10 +181,35 @@ fn the_catalog_withholds_only_the_keys_of_the_providers_in_use() {
     gone.push("STORED_SECRET");
     assert_eq!(shell_names(), without(&gone), "credentials stored");
 
+    // A project's config cannot take a provider out of the set: one the
+    // user signs in to is withheld although the project that is open
+    // switches it off.
+    ctx.auth_store
+        .set("switched-off", json!({ "type": "api", "key": "sk-off" }))
+        .unwrap();
+    ctx.instances
+        .load(&repo(
+            "switching-off",
+            json!({
+                "disabled_providers": ["switched-off", "envonly"],
+                "enabled_providers": ["acme"]
+            }),
+        ))
+        .unwrap();
+    gone.push("SWITCHED_OFF_TOKEN");
+    assert_eq!(shell_names(), without(&gone), "disabled by a project");
+
     // The restricted posture is as it was: every name the catalog lists
     // is withheld there, used or not, credential or not.
     let restricted = shell_env::current().as_ref().clone().restricted(true);
-    for name in ["ACME_REGION", "UNUSED_TOKEN", "GITHUB_TOKEN", "AWS_REGION"] {
+    for name in [
+        "ACME_REGION",
+        "ENVONLY_TOKEN",
+        "ENVONLY_REGION",
+        "UNUSED_TOKEN",
+        "GITHUB_TOKEN",
+        "AWS_REGION",
+    ] {
         assert!(restricted.denied(name), "{name} on a restricted server");
     }
 
