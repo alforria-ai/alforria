@@ -700,6 +700,11 @@ pub async fn file_list(
     };
     let directory = &location.directory;
     let target = directory.join(&path);
+    // Like `/file/content`: an absolute path or `..` must not list a
+    // directory outside the location.
+    if !path_contains(directory, &target) {
+        return Err(defect("Path escapes the location"));
+    }
     let entries = std::fs::read_dir(&target).map_err(defect)?;
     let ignore = CombinedIgnore::load(directory);
     let mut out: Vec<Value> = Vec::new();

@@ -157,8 +157,10 @@ impl Subscription {
 
     /// The SSE consumer (`consume`, event.ts:152-165).
     async fn consume(&self) {
-        let http = reqwest::Client::new();
-        let Ok(response) = http
+        // The server's own client: it carries the server's password.
+        let Ok(response) = self
+            .server
+            .http()
             .get(self.server.global_event_url())
             .header("accept", "text/event-stream")
             .send()

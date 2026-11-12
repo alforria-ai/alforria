@@ -304,7 +304,15 @@ pub fn run(matches: &ArgMatches, ui: &mut Ui, raw: &[OsString]) -> Result<(), Ty
     let resolved = network::resolve(&options, raw, &network::empty_server_config());
     let external = has_arg(argv, "--port") || has_arg(argv, "--hostname") || resolved.mdns;
 
-    let password = std::env::var("OPENCODE_SERVER_PASSWORD").ok();
+    let env_password = std::env::var("OPENCODE_SERVER_PASSWORD").ok();
+    // A listener the TUI opens for itself gets a password when none is set,
+    // as `serve` does: the port is reachable by more than this TUI.
+    let generated = if external {
+        super::serve::generated_password_for(env_password.as_deref())
+    } else {
+        None
+    };
+    let password = generated.clone().or(env_password);
     let username = std::env::var("OPENCODE_SERVER_USERNAME").ok();
     let headers = auth_header(password.as_deref(), username.as_deref())
         .map(|header| vec![("authorization".to_string(), header)])
@@ -319,7 +327,11 @@ pub fn run(matches: &ArgMatches, ui: &mut Ui, raw: &[OsString]) -> Result<(), Ty
     let mut _listener = None;
     let (target, directory) = if external {
         let listener = runtime
-            .block_on(alforria_server::listen(&resolved.listen_options()))
+            .block_on(alforria_server::listen(&{
+                let mut listen = resolved.listen_options();
+                listen.password = generated.clone();
+                listen
+            }))
             .map_err(|err| TypedError::Unknown {
                 raw: err.to_string(),
             })?;

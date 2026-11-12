@@ -433,6 +433,18 @@ async fn file_list_and_content() {
         .iter()
         .any(|e| e["name"] == "a.txt" && e["type"] == "file"));
 
+    // Listing stays inside the location.
+    for escape in ["..", "%2Fetc", "sub%2F..%2F.."] {
+        let response = send(
+            &router,
+            "GET",
+            &format!("{}&path={escape}", instance_uri(&f.worktree, "file")),
+            "",
+        )
+        .await;
+        assert_ne!(response.status(), StatusCode::OK, "{escape}");
+    }
+
     let response = send(
         &router,
         "GET",

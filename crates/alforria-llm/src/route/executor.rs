@@ -182,10 +182,39 @@ pub struct RequestExecutor<S = TokioSleeper, J = XorshiftJitter> {
     jitter: Arc<J>,
 }
 
+/// Follow a redirect only within the origin the request was sent to. A
+/// provider request carries the API key, and reqwest strips `Authorization`
+/// when a redirect changes host but not `x-api-key` or `x-goog-api-key`: a
+/// redirect elsewhere would hand over the key and the conversation. It is
+/// answered with the 3xx instead, which surfaces as a provider error.
+pub fn same_origin_redirects() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        let origin = |url: &reqwest::Url| {
+            (
+                url.scheme().to_string(),
+                url.host_str().map(str::to_string),
+                url.port_or_known_default(),
+            )
+        };
+        let same = attempt
+            .previous()
+            .first()
+            .is_some_and(|first| origin(first) == origin(attempt.url()));
+        if same && attempt.previous().len() < 5 {
+            attempt.follow()
+        } else {
+            attempt.stop()
+        }
+    })
+}
+
 impl RequestExecutor<TokioSleeper, XorshiftJitter> {
     pub fn new() -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .redirect(same_origin_redirects())
+                .build()
+                .unwrap_or_default(),
             retry: RetryConfig::default(),
             sleeper: Arc::new(TokioSleeper),
             jitter: Arc::new(XorshiftJitter::default()),

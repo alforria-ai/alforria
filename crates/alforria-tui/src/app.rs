@@ -443,7 +443,15 @@ pub fn epilogue(app: &App) -> Option<String> {
         return None;
     };
     let session = app.state.sync.session(session_id)?;
-    let title = truncate(&session.title, 50);
+    // The title is model output and is printed to the bare terminal after
+    // exit: control characters would be read as escape sequences (OSC 52
+    // writes the clipboard).
+    let title: String = session
+        .title
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let title = truncate(&title, 50);
     Some(session_epilogue(&title, Some(&session.id)))
 }
 

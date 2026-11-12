@@ -787,6 +787,16 @@ async fn fs_read(
             header::CONTENT_TYPE,
             crate::routes::v1::global_control::mime_type(&real),
         )
+        // Project files are untrusted content served from the API's own
+        // origin. Opened as a document (a link in model output to an .svg
+        // or .html file), one must not run script with the server's
+        // credentials: the sandbox gives it an opaque origin and no script,
+        // and nosniff keeps an untyped file from being read as HTML.
+        .header(
+            header::CONTENT_SECURITY_POLICY,
+            "sandbox; default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'",
+        )
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
         .body(Body::from(bytes))
         .map_err(defect)
 }

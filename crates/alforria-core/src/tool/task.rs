@@ -562,12 +562,16 @@ async fn run(
                     )));
                 }
             }
+            // The same denies a child created now would inherit.
             let held = ops.session_permission(task_id).await;
-            let missing = ops
-                .agent_denies(ctx.agent)
+            let mut inherited: Vec<Rule> = ops
+                .session_permission(ctx.session_id)
                 .await
                 .into_iter()
-                .any(|deny| !held.contains(&deny));
+                .filter(|rule| rule.action == "deny")
+                .collect();
+            inherited.extend(ops.agent_denies(ctx.agent).await);
+            let missing = inherited.iter().any(|deny| !held.contains(deny));
             if missing {
                 return Err(ToolError::Failed(format!(
                     "Task {task_id} was started with wider permissions than this session now has; start a new task"

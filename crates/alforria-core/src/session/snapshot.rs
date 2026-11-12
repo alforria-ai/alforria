@@ -822,12 +822,17 @@ impl GitSnapshot {
                 if !seen.insert(file.clone()) {
                     continue;
                 }
-                if !Path::new(file).is_absolute()
-                    || !crate::tool::external_directory::contains_path(Path::new(file), &instance)
+                // Checked and acted on in one spelling: `..` is folded
+                // away first, so what git and `remove_file` are handed is
+                // the path that was judged.
+                let normal = crate::git::lexical_normalize(Path::new(file));
+                if !normal.is_absolute()
+                    || !crate::tool::external_directory::contains_path(&normal, &instance)
                 {
                     tracing::warn!("not reverting a file outside the worktree: file={file}");
                     continue;
                 }
+                let file = &normal.to_string_lossy().into_owned();
                 ops.push(Op {
                     hash: item.hash.clone(),
                     file: file.clone(),

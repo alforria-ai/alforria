@@ -27,11 +27,28 @@ pub struct ServerClient {
 }
 
 impl ServerClient {
-    pub fn new(port: u16) -> ServerClient {
+    /// `authorization` is the header the server expects, when it has a
+    /// password.
+    pub fn new(port: u16, authorization: Option<String>) -> ServerClient {
+        let mut headers = reqwest::header::HeaderMap::new();
+        if let Some(value) = authorization
+            .as_deref()
+            .and_then(|value| reqwest::header::HeaderValue::from_str(value).ok())
+        {
+            headers.insert(reqwest::header::AUTHORIZATION, value);
+        }
         ServerClient {
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .default_headers(headers)
+                .build()
+                .unwrap_or_default(),
             base: format!("http://127.0.0.1:{port}"),
         }
+    }
+
+    /// The HTTP client, with the server's credentials on every request.
+    pub fn http(&self) -> &reqwest::Client {
+        &self.http
     }
 
     async fn request(

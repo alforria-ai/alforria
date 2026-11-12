@@ -790,6 +790,13 @@ async fn v2_misc_envelopes() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
+    // A project file opened as a document must not run as the API's origin.
+    let csp = response.headers()["content-security-policy"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(csp.starts_with("sandbox;"), "{csp}");
+    assert_eq!(response.headers()["x-content-type-options"], "nosniff");
     assert_eq!(body_string(response).await, "x");
 
     // fs.find — matches by subsequence, entries are relative to the

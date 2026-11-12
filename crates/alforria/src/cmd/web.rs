@@ -134,7 +134,11 @@ fn open_browser(url: &str) {
 }
 
 pub fn run(matches: &ArgMatches, ui: &mut Ui, raw: &[OsString]) -> Result<(), TypedError> {
-    if !serve::password_set() {
+    // Unset means generate one, as `serve` does; an empty value is the
+    // explicit opt-out and gets the warning.
+    let env_password = std::env::var("OPENCODE_SERVER_PASSWORD").ok();
+    let generated = serve::generated_password_for(env_password.as_deref());
+    if generated.is_none() && !serve::password_set() {
         ui.println(&warning_line());
     }
     let args = NetworkOptions::from_matches(matches);
@@ -142,7 +146,11 @@ pub fn run(matches: &ArgMatches, ui: &mut Ui, raw: &[OsString]) -> Result<(), Ty
     let opts = network::resolve(&args, raw, &config);
     let runtime = super::runtime()?;
     let listener = runtime
-        .block_on(alforria_server::listen(&opts.listen_options()))
+        .block_on(alforria_server::listen(&{
+            let mut listen = opts.listen_options();
+            listen.password = generated.clone();
+            listen
+        }))
         .map_err(|err| TypedError::Unknown {
             raw: err.to_string(),
         })?;
@@ -157,6 +165,13 @@ pub fn run(matches: &ArgMatches, ui: &mut Ui, raw: &[OsString]) -> Result<(), Ty
     );
     for line in lines {
         ui.println(&line);
+    }
+    if let Some(password) = &generated {
+        let username = alforria_server::AuthConfig::from_env().username;
+        ui.println("  The browser will ask for these:");
+        for line in serve::credentials_lines(&username, password).lines() {
+            ui.println(line);
+        }
     }
     open_browser(&url);
     // web.ts:78 `Effect.never` — run until interrupted.

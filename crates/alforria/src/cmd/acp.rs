@@ -28,16 +28,29 @@ pub fn run(matches: &ArgMatches, _ui: &mut Ui, raw: &[OsString]) -> Result<(), T
     let resolved = network::resolve(&options, raw, &network::global_server_config());
     let runtime = super::runtime()?;
     runtime.block_on(async move {
-        let listener = alforria_server::listen(&resolved.listen_options())
-            .await
-            .map_err(|err| TypedError::Unknown {
-                raw: err.to_string(),
-            })?;
+        // The server is this process's own, but its port is open to
+        // everything else on the machine: without a password any local
+        // process could drive the agent. Unset means generate one, as
+        // `serve` does; an empty value stays the explicit opt-out.
+        let env_password = std::env::var("OPENCODE_SERVER_PASSWORD").ok();
+        let generated = super::serve::generated_password_for(env_password.as_deref());
+        let mut listen = resolved.listen_options();
+        listen.password = generated.clone();
+        let authorization = crate::client::auth_header(
+            generated.as_deref().or(env_password.as_deref()),
+            std::env::var("OPENCODE_SERVER_USERNAME").ok().as_deref(),
+        );
+        let listener =
+            alforria_server::listen(&listen)
+                .await
+                .map_err(|err| TypedError::Unknown {
+                    raw: err.to_string(),
+                })?;
 
         let connection = Arc::new(crate::acp::jsonrpc::Connection::new(Arc::new(
             crate::acp::jsonrpc::StdioTransport::new(),
         )));
-        let server = crate::acp::server::ServerClient::new(listener.port);
+        let server = crate::acp::server::ServerClient::new(listener.port, authorization);
         let _ = cwd;
         let agent = crate::acp::AcpAgent::new(server, connection);
         agent.run().await;
