@@ -7,6 +7,17 @@ pre-1.0, so minor releases may include breaking changes.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-12
+
+0.4.0 was tagged but shipped no binaries: its macOS verification caught the
+bug below.
+
+### Fixed
+
+- macOS: a `/goal` left active by a server that has since exited now comes
+  back paused. Its owner was always taken to be alive, so the goal stayed
+  "active" with nothing driving it.
+
 ## [0.4.0] - 2026-11-12
 
 ### Added
@@ -210,7 +221,8 @@ First release.
 - The Rust workspace: schema, LLM, core, server, TUI, embedded UI, and CLI
   crates.
 
-[Unreleased]: https://github.com/alforria-ai/alforria/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/alforria-ai/alforria/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/alforria-ai/alforria/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/alforria-ai/alforria/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/alforria-ai/alforria/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/alforria-ai/alforria/compare/v0.2.0...v0.2.1
