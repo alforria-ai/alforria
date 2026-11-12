@@ -351,6 +351,9 @@ pre-1.0, so minor releases may include breaking changes.
 - A stored trigger whose record does not say whether a restricted caller
   created it is read as restricted, not as the operator's. `restricted` is
   now always written, `false` included.
+- Starting an instance read and parsed every trigger run its directory had
+  kept (up to 200 a trigger) to find the unfinished ones. It now reads the
+  unsettled runs only, through the index that already marks them.
 
 - Routes naming a session and a message, part or permission request inside
   it acted on the inner id without checking it belonged to that session:

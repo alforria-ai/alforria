@@ -2547,3 +2547,80 @@ async fn a_stored_spec_that_does_not_say_is_restricted() {
     assert!(turn.restricted);
     assert!(!turn.operator_authored);
 }
+
+/// B4. Starting an instance closes the runs an earlier process left
+/// unfinished. Finding them reads the unsettled runs only, through the
+/// index that is the claim — not every run the directory has kept.
+#[tokio::test]
+async fn closing_orphaned_runs_at_startup_does_not_read_the_settled_history() {
+    let f = Fixture::new(
+        "trigger-orphans-bounded",
+        "2027-01-01T00:00:00Z",
+        FakeOps::answering("ok"),
+    );
+    let store = f.store();
+    let now = f.clock.now_ms();
+    // A history: 40 triggers with 50 finished runs each.
+    for trigger in 0..40 {
+        for n in 0..50u64 {
+            let mut run =
+                TriggerService::new_run(&format!("t{trigger}"), "schedule", None, now + n);
+            run.status = RunStatus::Completed;
+            run.time.ended = Some(now + n + 1);
+            store.put_run(&run).unwrap();
+        }
+    }
+    // And what is unsettled: one run of a process that is gone, one of
+    // this (live) process.
+    let orphan = TriggerService::new_run("t0", "webhook", None, now + 100);
+    assert!(f
+        .store()
+        .with_owner(dead_owner())
+        .claim_run(&orphan)
+        .unwrap());
+    let live = TriggerService::new_run("t1", "webhook", None, now + 100);
+    assert!(store.claim_run(&live).unwrap());
+
+    let total: i64 = f
+        .storage
+        .with_connection(|conn| {
+            Ok::<_, crate::CoreError>(conn.query_row(
+                "SELECT COUNT(*) FROM trigger_run",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(total, 2002);
+    assert_eq!(store.unsettled_rows().unwrap(), 2, "rows read at startup");
+    let plan: Vec<String> = f
+        .storage
+        .with_connection(|conn| {
+            let mut stmt = conn.prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                crate::trigger::store::UNSETTLED_RUNS_SQL
+            ))?;
+            let rows = stmt
+                .query_map(["x"], |row| row.get::<_, String>(3))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok::<_, crate::CoreError>(rows)
+        })
+        .unwrap();
+    assert!(
+        plan.iter()
+            .any(|step| step.contains("trigger_run_active_idx")),
+        "{plan:?}"
+    );
+
+    assert_eq!(store.fail_orphaned(now + 200).unwrap(), 1);
+    assert_eq!(
+        store.run(&orphan.id).unwrap().unwrap().status,
+        RunStatus::Failed
+    );
+    assert_eq!(
+        store.run(&live.id).unwrap().unwrap().status,
+        RunStatus::Queued
+    );
+    assert_eq!(store.unsettled_rows().unwrap(), 1);
+    assert_eq!(store.fail_orphaned(now + 300).unwrap(), 0);
+}

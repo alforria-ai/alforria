@@ -91,6 +91,10 @@ pub fn any_outside_trigger(storage: &Storage) -> Result<bool, CoreError> {
     })
 }
 
+/// What [`TriggerStore::fail_orphaned`] reads: see `TriggerStore::unsettled`.
+pub(crate) const UNSETTLED_RUNS_SQL: &str =
+    "SELECT data, owner FROM trigger_run WHERE directory = ?1 AND active = 1";
+
 /// One directory's slice of the trigger tables.
 #[derive(Clone)]
 pub struct TriggerStore {
@@ -514,6 +518,30 @@ impl TriggerStore {
         })
     }
 
+    /// The directory's runs that hold their trigger (`active = 1`: queued
+    /// or running), as stored: `(data, owner)`. Read through the partial
+    /// index that is the claim (`trigger_run_active_idx`), so it costs what
+    /// is unsettled — at most one row a trigger — and not the history: a
+    /// directory keeps up to [`MAX_RUNS_KEPT`] runs for each trigger, and
+    /// every start of an instance used to read and parse them all.
+    fn unsettled(&self) -> Result<Vec<(String, Option<String>)>, CoreError> {
+        self.storage.with_connection(|conn| {
+            let mut stmt = conn.prepare(UNSETTLED_RUNS_SQL)?;
+            let rows = stmt
+                .query_map([&self.directory], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
+    /// How many rows [`Self::fail_orphaned`] reads.
+    #[cfg(test)]
+    pub(crate) fn unsettled_rows(&self) -> Result<usize, CoreError> {
+        Ok(self.unsettled()?.len())
+    }
+
     /// Runs that can never finish: close them. Those are the unsettled runs
     /// of processes that are gone (and of builds that recorded no owner).
     /// A run another live process owns is that process's, and is left
@@ -526,30 +554,21 @@ impl TriggerStore {
     /// with `catch_up`, fires it after all. One that was running is the
     /// restart sweep's to resume, and its tick stays taken.
     pub fn fail_orphaned(&self, now_ms: u64) -> Result<usize, CoreError> {
-        let unfinished: Vec<TriggerRun> = self.storage.with_connection(|conn| {
-            let mut stmt =
-                conn.prepare("SELECT data, owner FROM trigger_run WHERE directory = ?1")?;
-            let rows = stmt
-                .query_map([&self.directory], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok::<_, CoreError>(
-                rows.into_iter()
-                    .filter_map(|(data, owner)| {
-                        Some((serde_json::from_str::<TriggerRun>(&data).ok()?, owner))
-                    })
-                    .filter(|(run, _)| !run.status.settled())
-                    .filter(|(_, owner)| {
-                        owner
-                            .as_deref()
-                            .and_then(|owner| serde_json::from_str::<ProcessOwner>(owner).ok())
-                            .is_none_or(|owner| owner.liveness() != Liveness::Alive)
-                    })
-                    .map(|(run, _)| run)
-                    .collect(),
-            )
-        })?;
+        let unfinished: Vec<TriggerRun> = self
+            .unsettled()?
+            .into_iter()
+            .filter_map(|(data, owner)| {
+                Some((serde_json::from_str::<TriggerRun>(&data).ok()?, owner))
+            })
+            .filter(|(run, _)| !run.status.settled())
+            .filter(|(_, owner)| {
+                owner
+                    .as_deref()
+                    .and_then(|owner| serde_json::from_str::<ProcessOwner>(owner).ok())
+                    .is_none_or(|owner| owner.liveness() != Liveness::Alive)
+            })
+            .map(|(run, _)| run)
+            .collect();
         for mut run in unfinished.iter().cloned() {
             let never_started = run.status == RunStatus::Queued && run.scheduled.is_some();
             interrupt(&mut run, now_ms);
