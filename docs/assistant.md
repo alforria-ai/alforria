@@ -876,18 +876,22 @@ from ≈ 7,069 to ≈ 4,662 tokens, a saving of ≈ 2,407 tokens on every reques
 
 Upstream offers the `websearch` tool only to its own hosted providers or
 when `OPENCODE_ENABLE_EXA` / `OPENCODE_ENABLE_PARALLEL` is set. alforria adds
-a backend of its own, which offers the tool to every model:
+a backend of its own, which offers the tool to every model once you name
+it. Nothing is switched for you: with no `websearch.provider`, the tool is
+offered and answered exactly as upstream does it, and a search setup you
+already have keeps working unchanged — signing in to LibertAI does not
+move your searches.
 
-- With the `libertai` provider signed in (`LIBERTAI_API_KEY`, or a stored
-  key), searches go to LibertAI search
-  (`POST https://search.libertai.io/search`, bearer key) unless `websearch`
-  says otherwise.
+- `websearch: { "provider": "libertai" }` sends searches to LibertAI search
+  (`POST https://search.libertai.io/search`) with the `libertai` provider's
+  key (`LIBERTAI_API_KEY`, or a stored key). Without a key there is no
+  backend, and a warning is logged.
 - `websearch: { "provider": "http", "url": …, "headers": … }` sends them to
   any endpoint that speaks the same small contract: it receives
   `{ "query": "…", "max_results": n }` and answers
   `{ "results": [{ "title", "url", "snippet" }] }`.
-- `websearch.provider` set to anything else (for example `"exa"`) keeps
-  upstream's behaviour.
+- `websearch.provider` unset, or set to anything else (for example
+  `"exa"`), keeps upstream's behaviour.
 
 The tool asks for the `websearch` permission either way. `websearch` is read
 from your own config only: a project cannot point searches, or the headers

@@ -114,7 +114,8 @@ pub struct ToolInfo {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct WebsearchInfo {
     /// `"libertai"` (LibertAI search, with the libertai provider's key) or
-    /// `"http"` (`url` and `headers` below). Absent: upstream's choice.
+    /// `"http"` (`url` and `headers` below). Absent: upstream's choice,
+    /// whether or not a LibertAI key is present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
     /// For `"http"`: the endpoint. It receives

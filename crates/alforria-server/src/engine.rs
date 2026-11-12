@@ -890,9 +890,14 @@ fn prompt_options(
 }
 
 /// The search backend the `websearch` tool uses instead of upstream's
-/// providers: what `websearch` in the config names, or LibertAI search when
-/// the libertai provider has a key. `websearch` is read from the user's own
-/// config only (`EXTENSION_KEYS`), so the address and headers are theirs.
+/// providers: what `websearch.provider` in the config names — `"libertai"`
+/// (LibertAI search, with the libertai provider's key) or `"http"`. With
+/// no `websearch.provider` there is none, and the tool is upstream's:
+/// offered to the same models, answered by the same providers. A LibertAI
+/// key alone does not switch it (it used to: someone who already searched
+/// through Exa or Parallel was moved to LibertAI search by signing in).
+/// `websearch` is read from the user's own config only (`EXTENSION_KEYS`),
+/// so the address and headers are theirs.
 fn search_backend(
     config: &alforria_core::config::schema::Config,
     auth: &dyn crate::state::AuthStore,
@@ -933,9 +938,17 @@ fn search_backend(
                 headers: websearch.headers.unwrap_or_default().into_iter().collect(),
             })
         }
-        Some("libertai") | None => libertai_key().map(|key| HttpSearch::libertai(&key)),
-        // Any other value (for example "exa") leaves upstream's choice alone.
-        Some(_) => None,
+        Some("libertai") => {
+            let backend = libertai_key().map(|key| HttpSearch::libertai(&key));
+            if backend.is_none() {
+                tracing::warn!(
+                    "websearch.provider is \"libertai\" but the libertai provider has no key"
+                );
+            }
+            backend
+        }
+        // Unset, or any other value (for example "exa"): upstream's choice.
+        None | Some(_) => None,
     }
 }
 
@@ -1826,6 +1839,66 @@ impl alforria_core::tool::mcp_websearch::McpHttpClient for ReqwestMcpHttpClient 
 
 #[cfg(test)]
 mod generate_name_tests {
+    /// P5.2. LibertAI search answers `websearch` only when the config names
+    /// it. A LibertAI key by itself — in the environment or stored by a
+    /// sign-in — leaves the tool as upstream has it.
+    #[test]
+    fn libertai_search_is_a_backend_only_when_the_config_names_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = |value: serde_json::Value| {
+            serde_json::from_value::<alforria_core::config::schema::Config>(value).unwrap()
+        };
+        let empty = crate::state::FileAuthStore::new(dir.path().join("none.json"));
+        let signed_in = crate::state::FileAuthStore::new(dir.path().join("auth.json"));
+        crate::state::AuthStore::set(
+            &signed_in,
+            alforria_core::libertai::LIBERTAI_PROVIDER_ID,
+            serde_json::json!({ "type": "api", "key": "ltai-stored" }),
+        )
+        .unwrap();
+        let with_env = EngineSeams {
+            env: Some(Arc::new(|name: &str| {
+                (name == "LIBERTAI_API_KEY").then(|| "ltai-env".to_string())
+            })),
+            ..EngineSeams::default()
+        };
+        let no_env = EngineSeams {
+            env: no_ambient_env(),
+            ..EngineSeams::default()
+        };
+
+        // A key and no `websearch.provider`: no backend of ours.
+        for value in [
+            serde_json::json!({}),
+            serde_json::json!({ "websearch": {} }),
+            serde_json::json!({ "websearch": { "provider": "exa" } }),
+        ] {
+            assert_eq!(
+                search_backend(&config(value.clone()), &empty, &with_env),
+                None,
+                "{value}"
+            );
+            assert_eq!(
+                search_backend(&config(value.clone()), &signed_in, &no_env),
+                None,
+                "{value}"
+            );
+        }
+        // Named: LibertAI search, with whichever key there is.
+        let named = config(serde_json::json!({ "websearch": { "provider": "libertai" } }));
+        let backend = search_backend(&named, &empty, &with_env).unwrap();
+        assert_eq!(backend.id, "libertai");
+        assert!(backend
+            .headers
+            .contains(&("authorization".to_string(), "Bearer ltai-env".to_string())));
+        let backend = search_backend(&named, &signed_in, &no_env).unwrap();
+        assert!(backend.headers.contains(&(
+            "authorization".to_string(),
+            "Bearer ltai-stored".to_string()
+        )));
+        // Named without a key: nothing to search with.
+        assert_eq!(search_backend(&named, &empty, &no_env), None);
+    }
 
     use super::*;
     use alforria_core::session::llm::{LlmEventStream, LlmModel, StreamInput};

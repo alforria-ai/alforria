@@ -99,10 +99,13 @@ pre-1.0, so minor releases may include breaking changes.
 - `provider.<id>.models.<name>.family` picks the default system prompt for a
   model whose id does not say what it is (a family name or the underlying
   model id).
-- The `websearch` tool can use LibertAI search (on by itself when the
-  `libertai` provider has a key) or any endpoint with the same contract
+- The `websearch` tool can use LibertAI search
+  (`websearch: { provider: "libertai" }`, with the `libertai` provider's
+  key) or any endpoint with the same contract
   (`websearch: { provider: "http", url, headers }`), and is then offered to
-  every model.
+  every model. Without `websearch.provider` nothing changes: the tool is
+  offered to the same models and answered by the same providers as before,
+  whether or not a LibertAI key is present.
 - The built-in `libertai` provider accepts its catalog's aliases
   (`claw-flash`, `claw-core`, `deep-claw`, …) as model ids, with the target
   model's limits, cost, capabilities and prompt, and lists
