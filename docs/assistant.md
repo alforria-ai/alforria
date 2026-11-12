@@ -141,8 +141,12 @@ boots nothing at startup, and with `triggers.enabled: false` nothing either.
 - Ticks missed while the server was down are not replayed. With
   `catch_up: true` the most recent missed tick runs once at startup. A machine
   that slept through several ticks also fires once.
-- Two servers sharing a database run each scheduled tick once: the tick is
-  claimed in the database before it fires.
+- Two servers sharing a data directory run each fire once — a scheduled
+  tick, a webhook call, a watched change or a manual run: the run is
+  claimed in the database before it starts, the server that loses records
+  a `skipped` run, and one of them schedules each directory (see "Two
+  servers on one data directory" in
+  [unattended-server.md](unattended-server.md)).
 - A run cut short by a restart is closed as `failed`, with an error that
   starts with `interrupted`. Its turn is repaired like any interrupted turn
   and, under `server.resume: "continue"`, resumed once in its session. The
@@ -151,37 +155,35 @@ boots nothing at startup, and with `triggers.enabled: false` nothing either.
   was down.
 - A run whose turn is stopped (an abort, or the server shutting down) is
   `failed`, not completed with half an answer. A server that is shutting
-  down fires nothing.
+  down fires nothing, and a run still waiting for its slot then is
+  `skipped`, its tick given back.
+- A run whose turn panics is `failed` too, with an error that starts with
+  `the run panicked`, and its claim is released: the trigger fires again at
+  its next tick instead of being skipped for as long as the server lives.
 - Nobody is attached to a run. An ask or a question raised in one follows
   `permission.unattended` / `question.unattended`
   ([unattended-server.md](unattended-server.md)); with the default, `wait`,
   it waits for an answer and the trigger skips its ticks meanwhile. On a
   run that carries outside text an ask is a deny at once, whatever that
   policy says, and the project's standing `always` approvals do not apply.
-- A trigger remembers whether a restricted caller created it (`restricted:
-  true` on the record: a `chat` or `connector` token, or the `schedule`
-  tool in a restricted session). Such a trigger runs only in restricted
-  sessions and creates its sessions restricted.
+- A trigger remembers whether a restricted caller created it (`restricted`
+  on the record, always written: `true` for a `chat` or `connector` token,
+  or the `schedule` tool in a restricted session). Such a trigger runs only
+  in restricted sessions and creates its sessions restricted. It is
+  recorded at creation and never changed. A stored trigger whose record
+  does not say reads as restricted (see
+  [Upgrading a database](#upgrading-a-database-from-an-earlier-build)).
 - `@file` and `@agent` mentions in a prompt are resolved only when the
   operator wrote the trigger (the config, or an `admin` request). In a
   trigger a model scheduled or a restricted caller created they are text:
   resolving one attaches a file or names a subagent with no permission
   asked.
 - A session a trigger names (`session: "ses_…"`) must belong to the
-  trigger's own directory, and the run there is a turn under that
-  session's own policy and marks: nothing is stored for it. Which trigger
-  may name which session follows from that. One you wrote (the config, an
-  `admin` request) may name any session; one a `chat` or `connector` token
-  created, a restricted session; one the `schedule` tool made, only the
-  conversation that scheduled it (`current`); and a `webhook` or `watch`
-  trigger, or one written after outside content was seen, runs in a
-  session of its own, where its ceiling and marks are stored. The check is
-  made at create, at update and again at each run: a run that may not land
-  where its trigger points is recorded as `failed` with the reason. The
-  table is in "A trigger that names a session" in
-  [unattended-server.md](unattended-server.md).
-- The scheduler runs in `alforria serve`, `alforria web` and the TUI. `serve`
-  and `web` boot every directory that has triggers at startup. One-shot
+  trigger's own directory, and only some triggers may name one: see
+  [Which session a trigger may name](#which-session-a-trigger-may-name).
+- The scheduler runs in `alforria serve`, `alforria web` and the TUI, for
+  the directories that have a trigger (see
+  [Off until there is a trigger](#off-until-there-is-a-trigger)). One-shot
   commands (`alforria run`, `acp`) never fire triggers.
 - The turn's user message is marked: each text part of the prompt carries
   `metadata.trigger = { "id": "<trigger id>", "run": "<run id>" }`, and the
@@ -189,6 +191,36 @@ boots nothing at startup, and with `triggers.enabled: false` nothing either.
 - A webhook body (up to 256 KB) and the list of changed paths of a `watch`
   reach the model as a separate synthetic part, fenced in `<untrusted_data>`
   tags with every `<` escaped, and described as data, not instructions.
+
+### Which session a trigger may name
+
+`session` is `"new"`, `"reuse"`, or a session id (the `schedule` tool's
+`current` is the id of the conversation that scheduled it). The bounds of a
+run are always carried by the session it runs in: stored for it by the
+server, inherited by its subagents and forks, and read wherever a
+permission policy is assembled. Nothing holds a bound beside a session for
+the length of a run — it would end with the run's turn while a background
+subagent it started carried on. So a trigger whose run needs bounds of its
+own runs in a session of its own, and a named session is only ever one
+whose own policy and marks are already right for the run, which is then an
+ordinary turn of that session (nothing is stored for it, and the trigger's
+`permission` block is not applied):
+
+| Trigger | May name |
+| --- | --- |
+| A `webhook` or `watch` trigger, or any run that arrives with a payload | No session, ever: the read-only ceiling and the outside-start mark belong on a session made for the run. |
+| One a session's `schedule` tool made | Only that very session (`current`), and only for `cron`, `interval`, `at` and `in`. The run is a turn of the conversation that asked for it, under that conversation's policy as it then stands, so there are no separate creator's bounds to lose. It cannot be moved to another session by an update. |
+| One with recorded creator's bounds and no creating session | No session: it runs in a session of its own. |
+| One created or changed after outside content was seen (`outsideContent`) | Only a session that already has the outside-content mark; with `current` that is the creating session itself. A marked session cannot change a `current` trigger of an unmarked one. |
+| One you wrote (the config, an `admin` request) | Any session of the trigger's directory. |
+| One a `chat` or `connector` token created | A restricted session of the trigger's directory. |
+
+The rule is one function (`trigger::rules::check_named_session`), asked
+when a trigger is created, when its `session` or its kind is changed, and
+again when each run starts. A run that may not land where its trigger
+points — a trigger stored by an earlier build, a session whose restriction
+was lifted since, a payload — is recorded as `failed` with the reason, and
+nothing is written to the session.
 
 ### Routes
 
@@ -221,8 +253,14 @@ such a token never sets `permission`, `agent` or `model`, names only
 sessions it may act in, and changes, fires or deletes only triggers a
 restricted caller created (it can read the others). The webhook route has a
 scope of its own, `hook`: give the outside caller a token with that scope,
-which opens `POST /trigger/{id}/hook` and nothing else. `connector` and
-`admin` tokens may call it too; a `chat` token may not.
+which opens `POST /trigger/{id}/hook` and nothing else. A `hook` token is
+bound to **one** trigger — the `trg` claim of a JWT, or `trigger` on a
+static token — and is refused on every other; one that names no trigger is
+refused everywhere. `connector` and `admin` tokens may call any webhook
+trigger (a `trg` on them narrows it the same way); a `chat` token may not.
+Whoever calls, a trigger accepts one delivery per
+`triggers.webhook_min_interval` (default `"1s"`; sooner is a `429` with
+`Retry-After`), and the body is refused beyond 256 KiB before it is read.
 
 Errors: 400 for an invalid trigger (a session that is not this directory's
 included), 403 when triggers are disabled or the caller may not do this to
@@ -274,7 +312,10 @@ The bounds and the outside-input ceiling are stored for the run's session by
 the server (`session_ceiling`; `GET /session/{id}/restriction` lists their
 names as `ceilings`), are inherited by its subagents and forks, and are
 sealed: neither a rule added to the session nor a standing `always`
-approval reaches them. The run session's own `permission` holds only the
+approval reaches them. They are a **persistent** ceiling on that session,
+not something held for the length of the run: a background subagent or
+workflow the run started, and any later turn in the session — a person's
+included — stays under them. The run session's own `permission` holds only the
 trigger's `permission` block. The tool cannot set `agent`, `model` or
 `permission`.
 
@@ -383,7 +424,9 @@ A record shows its key as `directory` (absent on a project's record).
 and reads every `global` record whatever its directory; it still records
 where each one was written.
 
-**Records from before this.** Earlier builds kept one shared set for all
+**Records from before this** (see also
+[Upgrading a database](#upgrading-a-database-from-an-earlier-build)).
+Earlier builds kept one shared set for all
 non-repository directories. On first open the `0009_memory_directory`
 migration gives each existing `global` record the directory of the session
 that wrote it (the `memory` tool and the compaction flush record their
@@ -442,6 +485,12 @@ neither the slots nor the characters of the operator's three short ones,
 and the reverse. A record that does not fit what is left for it is cut and
 ends in `…`. An ordinary session, which is shown one class, reads as
 before: newest first until a budget is spent.
+
+Records are ordered by recency; there is no relevance ranking against the
+current prompt. Record content was written by a model that may have been
+reading an untrusted page, so every `<` in it is escaped and the block says
+it is data. The same holds wherever a tool prints records or transcript
+excerpts.
 
 Only records of a verified origin are injected. Every record carries where
 it came from, in `provenance` (and in the `trust` and `provenance` columns of
@@ -514,10 +563,10 @@ and `outsideStart`.
 | | **Outside content** (provenance) | **Outside start** (ceiling) |
 | --- | --- | --- |
 | Means | The session has seen content somebody else wrote. | A run in the session was started by outside input. |
-| Set when | A tool that returns outside content answers in it — `webfetch`, `websearch`, every MCP or plugin tool, code mode (`execute`); `memory` when it returns an unverified record; `session_search` when a hit comes from a marked session; `read` of a file in the upload area (`server.upload.directories`); a `grep` or `glob` that returned a line or the name of a file in that area (see [Searches and the upload area](#searches-and-the-upload-area)); `task`, `subagents` and `workflow` when a child session is marked. Also: a marked subagent's result delivered as a message instead of a tool result (a background task finishing, a subagent the user continued directly) — only this mark is carried up, never the outside-start one; a prompt from a caller below `admin` that brings a file part; a run of a trigger that a marked session created or changed. And always together with the other mark. | A `webhook` or `watch` trigger starts a run in it, or any trigger run delivers a payload. |
-| Where it is set | At the one place a tool's result is appended to the session (the processor), from a table that classifies every built-in tool (`tool::outside::BUILTIN`); a tool that is not in the table is treated as returning outside content. A test walks the server's registry and fails on an unclassified tool. | Where a trigger's run gets its session (`session::trigger_ops`). |
-| Effect | Memory the session writes — with the `memory` tool or by the flush before a compaction — is recorded `untrusted`, is unverified and is not injected; of existing records it may change or delete only unverified ones it saved itself. A trigger it creates or changes with `schedule` carries the mark into its runs' sessions. Its `session_search` excerpts are fenced and labelled `trust="untrusted"`. | The read-only ceiling of [Declaring triggers](#declaring-triggers): the stricter of the run's rules and read-only, standing `always` approvals ignored, an `ask` denied at once, `permission.unattended` never answering. Existing memory records cannot be changed. Loader files cannot be written. |
-| Does not | Change the permission of any tool. An interactive session works as before after its first web search: asks are asked, approvals apply, tools are offered. The one thing it loses is the integrity-sensitive part of `memory` above. | — |
+| Set when | A tool that returns outside content answers in it — `webfetch`, `websearch`, every MCP or plugin tool, code mode (`execute`); `memory` when it returns an unverified record; `session_search` when a hit comes from a marked session; `read` of a file in the upload area (`server.upload.directories`); a `grep` or `glob` that returned a line or the name of a file in that area (see [Searches and the upload area](#searches-and-the-upload-area)); `task`, `subagents` and `workflow` when a child session is marked. Also: a marked subagent's result delivered as a message instead of a tool result (a background task finishing, a subagent the user continued directly); a prompt from a caller below `admin` that brings a file part; a run of a trigger that a marked session created or changed. And always together with the other mark. | A `webhook` or `watch` trigger starts a run in it, or any trigger run delivers a payload; or the session was imported with `alforria import --untrusted`. A child or fork of a marked session is created with it. |
+| Where it is set | At the one place a tool's result is appended to the session (the processor, `SessionStore::note_tool_result`), from a table that classifies every built-in tool (`tool::outside::BUILTIN`); a tool that is not in the table is treated as returning outside content. A test walks the server's registry and fails on an unclassified tool. For a result delivered as a message, where it is injected into the parent: if the parent cannot be marked, the text is not delivered. | Where a trigger's run gets its session (`session::trigger_ops`), in the transaction that creates the session. |
+| Causes | Memory the session writes — with the `memory` tool or by the flush before a compaction — is recorded `untrusted`, is unverified and is not injected; of existing records it may change or delete only unverified ones it saved itself. A trigger it creates or changes with `schedule` carries the mark into its runs' sessions, and may name only a session that has the mark. Its `session_search` excerpts are fenced and labelled `trust="untrusted"`. | The read-only ceiling of [Declaring triggers](#declaring-triggers), stored for the session: the stricter of the run's rules and read-only, standing `always` approvals ignored, an `ask` denied at once, `permission.unattended` never answering. Existing memory records cannot be changed. The write guard: loader files and host locations cannot be written with the edit tools, an upload or a revert. The restricted shell environment for its `bash` tool, `shell` command and inline template shell, whatever the server's posture. |
+| Does not cause | Any change to the permission of any tool: an interactive session works as before after its first web search — asks are asked, approvals apply, tools are offered. No ceiling, no write guard, no change to its shell environment. The one thing it loses is the integrity-sensitive part of `memory` above. | Anything in a parent: only the outside-content mark is carried up from a child's result, never this one, so a result coming back does not put the read-only ceiling on a session the operator works in. It is not set by any tool result, and nothing sets it on an existing conversation: a run that would is refused ([Which session a trigger may name](#which-session-a-trigger-may-name)). |
 
 #### Searches and the upload area
 
@@ -592,42 +641,6 @@ README is somebody else's text too). A session that only ever used those
 writes verified memory. Deployments that need more can deny `memory` to the
 agents that browse, or set `memory.inject.unverified: false` (the default)
 and review what `/memory` lists as unverified.
-
-Records written by an earlier build of this branch are classified by the
-`memory_0002_provenance` migration; any whose origin cannot be told become
-unverified.
-
-**Upgrading a database from an earlier build of this branch.** Two things
-those builds got wrong are repaired on first open by the
-`0008_session_mark_backfill` migration, which fails closed:
-
-- A session a trigger started (`metadata.triggerID`) gets both marks and the
-  read-only `outside-input` ceiling, unless its trigger is still stored in
-  the database and is plainly started by the clock (`cron`, `interval` or
-  `at`, with no `watch` and no `webhook: true`). A trigger that has been
-  deleted, that only the config declares (those have no row), whose stored
-  spec does not parse, or that belongs to another directory proves nothing.
-  Every descendant of a session with the ceiling mark is marked too, and
-  any session with that mark and no `outside-input` ceiling gets the
-  read-only one (without the trigger's own `permission` grants; a trigger's
-  next run in a session it reuses writes its own ceiling again).
-- A memory record whose writing session carries the provenance mark, or no
-  longer exists, becomes unverified. It stays searchable; the operator
-  vouches for it again by rewriting it through `/memory`.
-
-This is deliberately wider than what went wrong. After the upgrade, the
-earlier runs of a *scheduled* trigger declared in the config are read-only
-sessions, and so is the session such a trigger keeps with
-`session: "reuse"`: archive that session and the trigger starts a new,
-unmarked one. Records the `memory` tool wrote in sessions that were deleted
-since are no longer injected. The migration runs once per database and
-changes nothing on one with no sessions.
-
-A record that does not fit the character budget whole is cut. Records are
-ordered by recency; there is no relevance ranking against the current
-prompt. Record content was written by a model that may have been reading an
-untrusted page, so every `<` in it is escaped and the block says it is data.
-The same holds wherever a tool prints records or transcript excerpts.
 
 ### Tools
 
@@ -715,6 +728,73 @@ which also lists the `admin`-only `/memory/unattributed` routes).
 A record is `{ id, projectID, directory?, kind, content, metadata?, archived,
 provenance?, verified, time: { created, updated } }`. Changes are announced by `memory.updated`
 (`{ id, action }`, `action` being `remembered`, `updated` or `forgotten`).
+
+## Upgrading a database from an earlier build
+
+alforria's own tables are created and changed by its own migrations, applied
+in order on first open and recorded in the `alforria_migration` journal; the
+upstream schema is not touched. A database that has never used these
+features gets the (empty) tables and nothing else. A database written by an
+earlier build of this branch is changed by three of them. Each runs once.
+
+**`0008_session_mark_backfill`** repairs two things those builds got wrong,
+and fails closed:
+
+- A session a trigger started (`metadata.triggerID`) gets both marks and the
+  read-only `outside-input` ceiling, unless its trigger is still stored in
+  the database and is plainly started by the clock (`cron`, `interval` or
+  `at`, with no `watch` and no `webhook: true`). A trigger that has been
+  deleted, that only the config declares (those have no row), whose stored
+  spec does not parse, or that belongs to another directory proves nothing.
+  Every descendant of a session with the outside-start mark is marked too,
+  and any session with that mark and no `outside-input` ceiling gets the
+  read-only one (without the trigger's own `permission` grants; a trigger's
+  next run in a session it reuses writes its own ceiling again).
+- A memory record whose writing session carries the outside-content mark,
+  or no longer exists, becomes unverified. It stays searchable; the
+  operator vouches for it again by rewriting it through `/memory`.
+
+This is deliberately wider than what went wrong. **What you can notice:**
+after the upgrade, the earlier runs of a *scheduled* (`cron`, `interval`,
+`at`) trigger declared in the config are read-only sessions, and so is the
+session such a trigger keeps with `session: "reuse"` — archive that session
+and the trigger starts a new, unmarked one. Records the `memory` tool wrote
+in sessions that were deleted since are no longer injected. It changes
+nothing on a database with no sessions. (Records written before provenance
+existed were classified earlier, by `memory_0002_provenance`; any whose
+origin cannot be told are unverified.)
+
+**`0009_memory_directory`** keys the memory of the `global` project — every
+directory that is not a repository — by directory. Each existing `global`
+record gets the directory of the session that wrote it; one with no session
+to go by is *unattributed* and shown in no directory until the operator
+files or deletes it. **What you can notice:** a non-repository directory no
+longer shows records saved in another one, and records saved through
+`POST /memory` are gone from every list until filed. See
+[Whose records](#whose-records).
+
+**`0010_trigger_run_owner`** adds the `owner` and `active` columns and a
+unique index to `trigger_run`: one unsettled run per trigger across the
+processes that share the database. Rows written before it get neither
+column. A run an earlier build left `queued` or `running` (a server killed
+mid-run, then upgraded) is therefore not a claim: it does not block its
+trigger, and the startup pass that closes orphaned runs, which reads the
+claims, does not see it — it stays in `GET /trigger/{id}/runs` as it was
+until the run history rolls over.
+
+**Stored triggers, without a migration.** Earlier builds left `restricted`
+out of a stored trigger's record when it was false. A record that does not
+say now reads as **restricted**: a trigger you created with those builds
+through `POST /trigger` or the `schedule` tool in your own session creates
+its sessions restricted, resolves no `@file` or `@agent` mention, counts
+towards the 50 triggers agents may hold, can be changed, fired and deleted
+by a `chat` or `connector` token, and — if it names a session of yours —
+fails its runs with the reason. `restricted` is never changed on an
+existing trigger: delete such a trigger and create it again as the
+operator. Triggers declared in the config are not stored and are
+unaffected. Likewise, a stored trigger that names a session it may no
+longer name under [the rule above](#which-session-a-trigger-may-name) is
+not rewritten: its runs fail with the reason until it is changed.
 
 ## Importing a transcript
 
