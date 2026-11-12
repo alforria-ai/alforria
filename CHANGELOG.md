@@ -483,6 +483,9 @@ pre-1.0, so minor releases may include breaking changes.
     it lets through (the operator, on a server with no password and no
     tokens), and a request without one is held to what a token below `admin`
     may do, and logged.
+  - The `/memory` and `/trigger` routes do their storage work on blocking
+    threads instead of the runtime's workers, so a slow write or a busy
+    trigger service no longer stalls unrelated requests.
 
 ### Changed
 

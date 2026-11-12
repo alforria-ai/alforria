@@ -195,3 +195,52 @@ mod tests {
         assert_eq!(v2::ROUTES.len(), 61, "v2 route count (spec §2.1)");
     }
 }
+
+/// Run a handler's storage work off the runtime's worker threads.
+///
+/// SQLite calls block, and so does waiting for a `std::sync::Mutex` a
+/// service holds across them: made on a worker thread they stall every
+/// other request that thread is driving. The memory and trigger routes do
+/// their work through here (the same `spawn_blocking` the transcript
+/// search and the provider logout use). The runtime's context is still
+/// entered, so the work may spawn tasks.
+pub(crate) async fn blocking<T, F>(work: F) -> Result<T, crate::error::ServerError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, crate::error::ServerError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(work).await.map_err(|join| {
+        crate::error::ServerError::Core(alforria_core::CoreError::Storage(format!(
+            "a storage task did not finish: {join}"
+        )))
+    })?
+}
+
+#[cfg(test)]
+mod blocking_tests {
+    /// The work runs on a blocking thread, not on the runtime's worker —
+    /// here the only one, which stays free to drive other tasks meanwhile
+    /// — and inside the runtime, so it can spawn.
+    #[tokio::test]
+    async fn storage_work_runs_off_the_runtime_worker() {
+        let worker = std::thread::current().id();
+        let (started, wait) = std::sync::mpsc::channel::<()>();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let work = tokio::spawn(super::blocking(move || {
+            started.send(()).unwrap();
+            // Held until the test, on the worker, lets go: a handler doing
+            // this on the worker would never get there.
+            held.recv().unwrap();
+            let spawned = tokio::runtime::Handle::current().spawn(async { 7 });
+            Ok((std::thread::current().id(), spawned))
+        }));
+        tokio::task::yield_now().await;
+        tokio::task::spawn_blocking(move || wait.recv().unwrap())
+            .await
+            .unwrap();
+        release.send(()).unwrap();
+        let (thread, spawned) = work.await.unwrap().unwrap();
+        assert_ne!(thread, worker);
+        assert_eq!(spawned.await.unwrap(), 7);
+    }
+}

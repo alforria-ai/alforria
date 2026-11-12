@@ -251,17 +251,20 @@ async fn list(
     uri: Uri,
     axum::Extension(directory): axum::Extension<RequestDirectory>,
 ) -> Result<Json<Vec<MemoryRecord>>, ServerError> {
-    let (memory, _) = memory(&ctx, &directory)?;
-    memory
-        .list(&ListQuery {
-            kind: query_param(uri.query(), "kind"),
-            archived: flag(&uri, "archived"),
-            limit: number(&uri, "limit"),
-            offset: number(&uri, "offset").unwrap_or(0),
-            verified_only: false,
-        })
-        .map(Json)
-        .map_err(memory_error)
+    crate::routes::blocking(move || {
+        let (memory, _) = memory(&ctx, &directory)?;
+        memory
+            .list(&ListQuery {
+                kind: query_param(uri.query(), "kind"),
+                archived: flag(&uri, "archived"),
+                limit: number(&uri, "limit"),
+                offset: number(&uri, "offset").unwrap_or(0),
+                verified_only: false,
+            })
+            .map(Json)
+            .map_err(memory_error)
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -280,11 +283,14 @@ async fn create(
     axum::Extension(directory): axum::Extension<RequestDirectory>,
     Json(body): Json<CreateBody>,
 ) -> Result<Json<MemoryRecord>, ServerError> {
-    let (memory, _, by) = writer(&ctx, &directory, &principal, &uri, "memory", "remember")?;
-    memory
-        .remember_from(body.kind.as_deref(), &body.content, body.metadata, by)
-        .map(Json)
-        .map_err(memory_error)
+    crate::routes::blocking(move || {
+        let (memory, _, by) = writer(&ctx, &directory, &principal, &uri, "memory", "remember")?;
+        memory
+            .remember_from(body.kind.as_deref(), &body.content, body.metadata, by)
+            .map(Json)
+            .map_err(memory_error)
+    })
+    .await
 }
 
 async fn search(
@@ -292,17 +298,20 @@ async fn search(
     uri: Uri,
     axum::Extension(directory): axum::Extension<RequestDirectory>,
 ) -> Result<Json<Vec<MemoryHit>>, ServerError> {
-    let (memory, _) = memory(&ctx, &directory)?;
-    let query = query_text(&uri)?;
-    memory
-        .search(
-            &query,
-            query_param(uri.query(), "kind").as_deref(),
-            flag(&uri, "archived"),
-            number(&uri, "limit").unwrap_or(20),
-        )
-        .map(Json)
-        .map_err(memory_error)
+    crate::routes::blocking(move || {
+        let (memory, _) = memory(&ctx, &directory)?;
+        let query = query_text(&uri)?;
+        memory
+            .search(
+                &query,
+                query_param(uri.query(), "kind").as_deref(),
+                flag(&uri, "archived"),
+                number(&uri, "limit").unwrap_or(20),
+            )
+            .map(Json)
+            .map_err(memory_error)
+    })
+    .await
 }
 
 async fn search_sessions(
@@ -331,12 +340,15 @@ async fn read(
     axum::Extension(directory): axum::Extension<RequestDirectory>,
     Path(id): Path<String>,
 ) -> Result<Json<MemoryRecord>, ServerError> {
-    let (memory, _) = memory(&ctx, &directory)?;
-    memory
-        .get(&id)
-        .map_err(memory_error)?
-        .map(Json)
-        .ok_or_else(|| memory_error(MemoryError::NotFound(format!("memory not found: {id}"))))
+    crate::routes::blocking(move || {
+        let (memory, _) = memory(&ctx, &directory)?;
+        memory
+            .get(&id)
+            .map_err(memory_error)?
+            .map(Json)
+            .ok_or_else(|| memory_error(MemoryError::NotFound(format!("memory not found: {id}"))))
+    })
+    .await
 }
 
 async fn update(
@@ -347,11 +359,14 @@ async fn update(
     Path(id): Path<String>,
     Json(patch): Json<MemoryPatch>,
 ) -> Result<Json<MemoryRecord>, ServerError> {
-    let (memory, _, by) = writer(&ctx, &directory, &principal, &uri, "memory", "update")?;
-    memory
-        .update_by(&id, &patch, &by)
-        .map(Json)
-        .map_err(memory_error)
+    crate::routes::blocking(move || {
+        let (memory, _, by) = writer(&ctx, &directory, &principal, &uri, "memory", "update")?;
+        memory
+            .update_by(&id, &patch, &by)
+            .map(Json)
+            .map_err(memory_error)
+    })
+    .await
 }
 
 async fn remove(
@@ -361,9 +376,12 @@ async fn remove(
     axum::Extension(directory): axum::Extension<RequestDirectory>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ServerError> {
-    let (memory, _, by) = writer(&ctx, &directory, &principal, &uri, "memory", "forget")?;
-    let deleted = memory.forget_by(&id, &by).map_err(memory_error)?;
-    Ok(Json(json!({ "deleted": deleted })))
+    crate::routes::blocking(move || {
+        let (memory, _, by) = writer(&ctx, &directory, &principal, &uri, "memory", "forget")?;
+        let deleted = memory.forget_by(&id, &by).map_err(memory_error)?;
+        Ok(Json(json!({ "deleted": deleted })))
+    })
+    .await
 }
 
 /// The operator's memory, for the records no directory has. The scope table
@@ -389,10 +407,13 @@ async fn list_unattributed(
     uri: Uri,
     axum::Extension(directory): axum::Extension<RequestDirectory>,
 ) -> Result<Json<Vec<MemoryRecord>>, ServerError> {
-    operator(&ctx, &directory, &principal)?
-        .list_unattributed(number(&uri, "limit"), number(&uri, "offset").unwrap_or(0))
-        .map(Json)
-        .map_err(memory_error)
+    crate::routes::blocking(move || {
+        operator(&ctx, &directory, &principal)?
+            .list_unattributed(number(&uri, "limit"), number(&uri, "offset").unwrap_or(0))
+            .map(Json)
+            .map_err(memory_error)
+    })
+    .await
 }
 
 async fn claim_unattributed(
@@ -401,10 +422,13 @@ async fn claim_unattributed(
     axum::Extension(directory): axum::Extension<RequestDirectory>,
     Path(id): Path<String>,
 ) -> Result<Json<MemoryRecord>, ServerError> {
-    operator(&ctx, &directory, &principal)?
-        .claim_unattributed(&id)
-        .map(Json)
-        .map_err(memory_error)
+    crate::routes::blocking(move || {
+        operator(&ctx, &directory, &principal)?
+            .claim_unattributed(&id)
+            .map(Json)
+            .map_err(memory_error)
+    })
+    .await
 }
 
 async fn remove_unattributed(
@@ -413,8 +437,11 @@ async fn remove_unattributed(
     axum::Extension(directory): axum::Extension<RequestDirectory>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ServerError> {
-    let deleted = operator(&ctx, &directory, &principal)?
-        .forget_unattributed(&id)
-        .map_err(memory_error)?;
-    Ok(Json(json!({ "deleted": deleted })))
+    crate::routes::blocking(move || {
+        let deleted = operator(&ctx, &directory, &principal)?
+            .forget_unattributed(&id)
+            .map_err(memory_error)?;
+        Ok(Json(json!({ "deleted": deleted })))
+    })
+    .await
 }

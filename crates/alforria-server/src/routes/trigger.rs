@@ -143,7 +143,7 @@ async fn list(
     State(ctx): State<Arc<ServerContext>>,
     axum::Extension(directory): axum::Extension<RequestDirectory>,
 ) -> Result<Json<Vec<TriggerRecord>>, ServerError> {
-    Ok(Json(triggers(&ctx, &directory)?.list()))
+    crate::routes::blocking(move || Ok(Json(triggers(&ctx, &directory)?.list()))).await
 }
 
 async fn create(
@@ -152,30 +152,33 @@ async fn create(
     axum::Extension(directory): axum::Extension<RequestDirectory>,
     Json(mut body): Json<Value>,
 ) -> Result<Json<TriggerRecord>, ServerError> {
-    let restricted = crate::confine::restricted(&principal);
-    check_fields(restricted, &body)?;
-    let service = triggers(&ctx, &directory)?;
-    let id = match body.as_object_mut().and_then(|object| object.remove("id")) {
-        None | Some(Value::Null) => None,
-        Some(Value::String(id)) => Some(id),
-        Some(_) => return Err(invalid("`id` must be a string".to_string())),
-    };
-    let spec: TriggerSpec =
-        serde_json::from_value(body).map_err(|error| invalid(error.to_string()))?;
-    service
-        .create_as(
-            id,
-            spec,
-            alforria_core::trigger::Creator {
-                // The request is its caller's own words.
-                outside_content: false,
-                origin_session_id: None,
-                inherited: None,
-                restricted,
-            },
-        )
-        .map(Json)
-        .map_err(trigger_error)
+    crate::routes::blocking(move || {
+        let restricted = crate::confine::restricted(&principal);
+        check_fields(restricted, &body)?;
+        let service = triggers(&ctx, &directory)?;
+        let id = match body.as_object_mut().and_then(|object| object.remove("id")) {
+            None | Some(Value::Null) => None,
+            Some(Value::String(id)) => Some(id),
+            Some(_) => return Err(invalid("`id` must be a string".to_string())),
+        };
+        let spec: TriggerSpec =
+            serde_json::from_value(body).map_err(|error| invalid(error.to_string()))?;
+        service
+            .create_as(
+                id,
+                spec,
+                alforria_core::trigger::Creator {
+                    // The request is its caller's own words.
+                    outside_content: false,
+                    origin_session_id: None,
+                    inherited: None,
+                    restricted,
+                },
+            )
+            .map(Json)
+            .map_err(trigger_error)
+    })
+    .await
 }
 
 async fn read(
@@ -183,10 +186,15 @@ async fn read(
     axum::Extension(directory): axum::Extension<RequestDirectory>,
     Path(id): Path<String>,
 ) -> Result<Json<TriggerRecord>, ServerError> {
-    triggers(&ctx, &directory)?
-        .get(&id)
-        .map(Json)
-        .ok_or_else(|| trigger_error(TriggerError::NotFound(format!("trigger not found: {id}"))))
+    crate::routes::blocking(move || {
+        triggers(&ctx, &directory)?
+            .get(&id)
+            .map(Json)
+            .ok_or_else(|| {
+                trigger_error(TriggerError::NotFound(format!("trigger not found: {id}")))
+            })
+    })
+    .await
 }
 
 async fn update(
@@ -196,13 +204,16 @@ async fn update(
     Path(id): Path<String>,
     Json(patch): Json<Value>,
 ) -> Result<Json<TriggerRecord>, ServerError> {
-    let restricted = crate::confine::restricted(&principal);
-    check_fields(restricted, &patch)?;
-    let service = triggers(&ctx, &directory)?;
-    service
-        .check_actor(&id, restricted)
-        .map_err(trigger_error)?;
-    service.update(&id, &patch).map(Json).map_err(trigger_error)
+    crate::routes::blocking(move || {
+        let restricted = crate::confine::restricted(&principal);
+        check_fields(restricted, &patch)?;
+        let service = triggers(&ctx, &directory)?;
+        service
+            .check_actor(&id, restricted)
+            .map_err(trigger_error)?;
+        service.update(&id, &patch).map(Json).map_err(trigger_error)
+    })
+    .await
 }
 
 async fn remove(
@@ -211,12 +222,15 @@ async fn remove(
     axum::Extension(directory): axum::Extension<RequestDirectory>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ServerError> {
-    let service = triggers(&ctx, &directory)?;
-    service
-        .check_actor(&id, crate::confine::restricted(&principal))
-        .map_err(trigger_error)?;
-    let deleted = service.delete(&id).map_err(trigger_error)?;
-    Ok(Json(json!({ "deleted": deleted })))
+    crate::routes::blocking(move || {
+        let service = triggers(&ctx, &directory)?;
+        service
+            .check_actor(&id, crate::confine::restricted(&principal))
+            .map_err(trigger_error)?;
+        let deleted = service.delete(&id).map_err(trigger_error)?;
+        Ok(Json(json!({ "deleted": deleted })))
+    })
+    .await
 }
 
 async fn run(
@@ -225,13 +239,16 @@ async fn run(
     axum::Extension(directory): axum::Extension<RequestDirectory>,
     Path(id): Path<String>,
 ) -> Result<Json<TriggerRun>, ServerError> {
-    let service = triggers(&ctx, &directory)?;
-    // Firing a trigger starts a turn with the rights of whoever created
-    // it: a caller below `admin` fires its own kind only.
-    service
-        .check_actor(&id, crate::confine::restricted(&principal))
-        .map_err(trigger_error)?;
-    service.run_now(&id).map(Json).map_err(trigger_error)
+    crate::routes::blocking(move || {
+        let service = triggers(&ctx, &directory)?;
+        // Firing a trigger starts a turn with the rights of whoever created
+        // it: a caller below `admin` fires its own kind only.
+        service
+            .check_actor(&id, crate::confine::restricted(&principal))
+            .map_err(trigger_error)?;
+        service.run_now(&id).map(Json).map_err(trigger_error)
+    })
+    .await
 }
 
 /// The webhook entry.
@@ -278,7 +295,13 @@ async fn hook(
     let Ok(body) = axum::body::to_bytes(request.into_body(), MAX_PAYLOAD_BYTES).await else {
         return Ok(too_large());
     };
-    match triggers(&ctx, &directory)?.hook(&id, &body) {
+    // The delivery writes to the store and takes the service's lock: off
+    // the runtime, like the other trigger routes.
+    let delivered = {
+        let id = id.clone();
+        crate::routes::blocking(move || Ok(triggers(&ctx, &directory)?.hook(&id, &body))).await?
+    };
+    match delivered {
         Ok(run) => Ok(Json(run).into_response()),
         Err(TriggerError::TooSoon { retry_after_ms }) => Ok(Response::builder()
             .status(axum::http::StatusCode::TOO_MANY_REQUESTS)
@@ -312,11 +335,14 @@ async fn runs(
     axum::Extension(directory): axum::Extension<RequestDirectory>,
     Path(id): Path<String>,
 ) -> Result<Json<Vec<TriggerRun>>, ServerError> {
-    let limit = crate::middleware::auth::query_param(uri.query(), "limit")
-        .and_then(|limit| limit.parse::<usize>().ok())
-        .unwrap_or(50);
-    triggers(&ctx, &directory)?
-        .runs(&id, limit)
-        .map(Json)
-        .map_err(trigger_error)
+    crate::routes::blocking(move || {
+        let limit = crate::middleware::auth::query_param(uri.query(), "limit")
+            .and_then(|limit| limit.parse::<usize>().ok())
+            .unwrap_or(50);
+        triggers(&ctx, &directory)?
+            .runs(&id, limit)
+            .map(Json)
+            .map_err(trigger_error)
+    })
+    .await
 }
