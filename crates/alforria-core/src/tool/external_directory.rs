@@ -73,8 +73,10 @@ pub fn real_path(path: &Path) -> std::path::PathBuf {
 /// Whether `child`, already resolved, lies in `root` or in where `root`
 /// really is (a project reached through a symlinked path).
 fn real_contains(root: &Path, child: &Path) -> bool {
-    fs_contains(root, child)
-        || std::fs::canonicalize(root).is_ok_and(|real| fs_contains(&real, child))
+    // The root is resolved the same way as the child, missing parts and
+    // all: on macOS `/home` and `/tmp` are themselves symlinks, so a root
+    // that cannot be canonicalized whole still has a real location.
+    fs_contains(root, child) || fs_contains(&real_path(root), child)
 }
 
 /// `containsPath` (instance-context.ts:18-24): true when the path is inside
@@ -348,6 +350,29 @@ mod tests {
                 "{name}"
             );
         }
+        // A project reached through a symlinked path contains its files,
+        // whether or not they exist yet.
+        std::os::unix::fs::symlink(&root, root.join("alias-root")).unwrap();
+        let through = InstanceContext {
+            directory: root.join("alias-root/project"),
+            worktree: root.join("alias-root/project"),
+        };
+        for name in ["real.txt", "new-file", "sub/new-file"] {
+            assert!(
+                contains_path(&through.directory.join(name), &through),
+                "{name}"
+            );
+        }
+        assert!(!contains_path(
+            &through.directory.join("notes.txt"),
+            &through
+        ));
+        let missing = InstanceContext {
+            directory: root.join("alias-root/not-created"),
+            worktree: root.join("alias-root/not-created"),
+        };
+        assert!(contains_path(&missing.directory.join("a/b.txt"), &missing));
+
         // Links that stay inside, and plain files, are still inside.
         for name in ["alias", "real.txt", "new-file", "sub/new-file"] {
             assert!(contains_path(&project.join(name), &instance), "{name}");
