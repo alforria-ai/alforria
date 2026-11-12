@@ -302,6 +302,27 @@ action as the pattern:
 `"schedule": "deny"` removes the tool from the request. `triggers.enabled:
 false` (or `OPENCODE_DISABLE_TRIGGERS=1`) turns the whole feature off.
 
+#### Off until there is a trigger
+
+Triggers cost nothing until you use them. With `triggers.enabled` unset, a
+directory that has no trigger — none in your config, none stored — has no
+scheduler running and its requests carry no `schedule` tool: the model is
+sent what it was sent before triggers existed. Both appear with the first
+trigger:
+
+- a `trigger` entry in your config, or a stored trigger, is in use from the
+  start;
+- the first `POST /trigger` on a running server starts that directory's
+  scheduler and adds the tool to the next request, without a restart;
+- `"triggers": { "enabled": true }` turns both on with nothing scheduled
+  yet. Set it when you want the agent to be able to schedule its first
+  trigger itself: the tool cannot create a trigger before it is offered.
+
+Once in use, a directory stays so until its instance is rebuilt, even if
+its last trigger is deleted. Two servers on one data directory: a server
+that started with no trigger does not notice one created through the
+other until it is restarted, unless `triggers.enabled` is `true`.
+
 ## Memory
 
 Memory is what an agent keeps across sessions. It is off by default:

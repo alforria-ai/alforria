@@ -148,6 +148,7 @@ impl Fixture {
             project_id: "global".to_string(),
             home: self.temp.path().to_path_buf(),
             enabled: true,
+            on_demand: false,
             concurrency: 1,
             max_watched: 1000,
             ignore: Vec::new(),
@@ -2623,4 +2624,99 @@ async fn closing_orphaned_runs_at_startup_does_not_read_the_settled_history() {
     );
     assert_eq!(store.unsettled_rows().unwrap(), 1);
     assert_eq!(store.fail_orphaned(now + 300).unwrap(), 0);
+}
+
+/// P5.1. With `triggers.enabled` unwritten, a directory that has no trigger
+/// has no scheduler either: `start` starts nothing — no loop, no watcher,
+/// no claim on the scheduler's place — and triggers are not in use. The
+/// first trigger created starts it then. A trigger in the config, a stored
+/// one, or `triggers.enabled: true` is in use from the start, and
+/// `triggers.enabled: false` wins over all of them.
+#[tokio::test]
+async fn the_scheduler_waits_for_a_first_trigger_unless_told_otherwise() {
+    let f = Fixture::new(
+        "trigger-on-demand",
+        "2027-01-01T00:00:00Z",
+        FakeOps::answering("ok"),
+    );
+    let on_demand = |config: Value| {
+        let mut settings = f.shared(config);
+        settings.on_demand = true;
+        settings
+    };
+
+    // Nothing configured, nothing stored: dormant.
+    let service = f.service_with(on_demand(json!({})));
+    assert!(service.enabled());
+    assert!(!service.active());
+    service.start();
+    assert!(!service.started.load(Ordering::SeqCst));
+    assert!(!service.scheduling(), "the scheduler's place is not taken");
+    assert!(service.list().is_empty());
+
+    // The first trigger, created on the running service, starts it: the
+    // watch is live and the scheduler's place is taken.
+    std::fs::create_dir_all(f.directory().join("inbox")).unwrap();
+    service
+        .create(
+            Some("first".to_string()),
+            spec(json!({ "on": { "watch": { "path": "inbox", "debounce": "1s" } }, "prompt": "File it" })),
+            None,
+            None,
+        )
+        .unwrap();
+    assert!(service.active());
+    assert!(service.started.load(Ordering::SeqCst));
+    assert!(service.scheduling());
+    assert!(service.lock().get("first").unwrap().watcher.is_some());
+    // Deleting the last one does not stop what is running.
+    assert!(service.delete("first").unwrap());
+    assert!(service.active());
+    service.stop();
+    drop(service);
+
+    // A service that was never asked to schedule (a one-shot command)
+    // does not start one because a trigger was created.
+    let quiet = f.service_with(on_demand(json!({})));
+    quiet
+        .create(
+            Some("kept".to_string()),
+            spec(json!({ "on": { "interval": "1h" }, "prompt": "Check" })),
+            None,
+            None,
+        )
+        .unwrap();
+    assert!(quiet.active());
+    assert!(!quiet.started.load(Ordering::SeqCst));
+    drop(quiet);
+
+    // A stored trigger, or one in the config, is in use from the start.
+    let stored = f.service_with(on_demand(json!({})));
+    assert!(stored.active());
+    stored.start();
+    assert!(stored.started.load(Ordering::SeqCst));
+    stored.stop();
+    assert!(stored.delete("kept").unwrap());
+    drop(stored);
+    let configured = f.service_with(on_demand(json!({
+        "hook": { "on": { "webhook": true }, "prompt": "x" }
+    })));
+    assert!(configured.active());
+    drop(configured);
+
+    // `triggers.enabled: true` with nothing to schedule yet.
+    let explicit = f.service_with(f.shared(json!({})));
+    assert!(explicit.active());
+    explicit.start();
+    assert!(explicit.started.load(Ordering::SeqCst));
+    explicit.stop();
+    drop(explicit);
+
+    // `triggers.enabled: false` wins, whatever exists.
+    let mut off = f.shared(json!({ "hook": { "on": { "webhook": true }, "prompt": "x" } }));
+    off.enabled = false;
+    let off = f.service_with(off);
+    assert!(!off.enabled() && !off.active());
+    off.start();
+    assert!(!off.started.load(Ordering::SeqCst));
 }

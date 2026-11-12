@@ -1052,6 +1052,10 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
             home: input.paths.home.clone(),
             enabled: trigger_config.enabled.unwrap_or(true)
                 && !bool_env("OPENCODE_DISABLE_TRIGGERS"),
+            // Unless `triggers.enabled` says so, triggers wait for there to
+            // be one: no scheduler and no `schedule` tool for a directory
+            // that has none.
+            on_demand: trigger_config.enabled.is_none(),
             concurrency: trigger_config
                 .concurrency
                 .map(|value| value.max(1) as usize)
@@ -1398,6 +1402,13 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
         )
         .map_err(|err| ServerError::Core(CoreError::Storage(err.to_string())))?
         .with_websearch_backend(search_backend.is_some())
+        // `schedule` is offered while triggers are in use here: asked at
+        // each request, so the first trigger created over HTTP brings the
+        // tool with it.
+        .with_gate("schedule", {
+            let triggers = triggers.clone();
+            Arc::new(move || triggers.active())
+        })
         .with_descriptions(
             input
                 .config
@@ -1815,6 +1826,7 @@ impl alforria_core::tool::mcp_websearch::McpHttpClient for ReqwestMcpHttpClient 
 
 #[cfg(test)]
 mod generate_name_tests {
+
     use super::*;
     use alforria_core::session::llm::{LlmEventStream, LlmModel, StreamInput};
     use alforria_core::session::prompt_input::Models;

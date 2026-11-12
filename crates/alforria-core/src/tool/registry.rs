@@ -87,7 +87,13 @@ pub struct ToolRegistry {
     /// A search backend of alforria's own is configured: `websearch` is
     /// offered whatever the model's provider.
     websearch_backend: bool,
+    /// Tools that are registered and offered only while their condition
+    /// holds, asked at each request ([`Self::with_gate`]).
+    gates: std::collections::BTreeMap<&'static str, ToolGate>,
 }
+
+/// Whether a registered tool is offered right now.
+pub type ToolGate = Arc<dyn Fn() -> bool + Send + Sync>;
 
 fn find_tool<'a>(builtin: &'a [ToolDef], custom: &'a [ToolDef], id: &str) -> Option<&'a ToolDef> {
     builtin.iter().chain(custom.iter()).find(|t| t.id == id)
@@ -118,7 +124,16 @@ impl ToolRegistry {
             code_mode: None,
             descriptions: Default::default(),
             websearch_backend: false,
+            gates: Default::default(),
         })
+    }
+
+    /// Offer the tool `id` only while `open` says so. It stays registered;
+    /// a closed gate keeps it out of [`Self::all`], so out of the ids and
+    /// out of every request's tool list.
+    pub fn with_gate(mut self, id: &'static str, open: ToolGate) -> Self {
+        self.gates.insert(id, open);
+        self
     }
 
     /// Offer `websearch` to every model: a backend of alforria's own
@@ -155,7 +170,11 @@ impl ToolRegistry {
 
     /// All registered tools: builtin then custom (registry.ts:256-259).
     pub fn all(&self) -> Vec<&ToolDef> {
-        self.builtin.iter().chain(self.custom.iter()).collect()
+        self.builtin
+            .iter()
+            .chain(self.custom.iter())
+            .filter(|tool| self.gates.get(tool.id).is_none_or(|open| open()))
+            .collect()
     }
 
     /// The `task` and `read` defs (registry.ts:342-345).

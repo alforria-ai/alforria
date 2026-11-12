@@ -397,9 +397,14 @@ async fn experimental_tool_lists_production_registry() {
             "todowrite",
             "skill",
             "workflow",
-            "schedule",
         ]
     );
+    // Nothing this branch added is offered to someone who configured none
+    // of it: `schedule` waits for a trigger (or `triggers.enabled: true`),
+    // the memory tools for `memory.enabled: true`.
+    for added in ["schedule", "memory", "session_search"] {
+        assert!(!ids.contains(&added), "{added} in {ids:?}");
+    }
 }
 
 /// `/experimental/tool/ids` (handlers/experimental.ts:101-103).

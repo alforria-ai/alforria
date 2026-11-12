@@ -588,7 +588,7 @@ async fn every_registered_tool_is_classified_as_returning_outside_content_or_not
     let f = fixture(
         "ok",
         json!({
-            "triggers": { "concurrency": 2 },
+            "triggers": { "enabled": true, "concurrency": 2 },
             "memory": { "enabled": true },
             "workflows": { "enabled": true },
         }),
@@ -704,6 +704,80 @@ async fn a_manual_run_of_a_reusing_trigger_keeps_one_session_and_stays_quiet_on_
     assert!(record["time"]["lastFired"].is_u64());
     let (_, runs) = call(&f, "GET", "/trigger/heartbeat/runs?limit=1", "").await;
     assert_eq!(runs.as_array().unwrap().len(), 1);
+}
+
+/// P5.1. Someone who configured no trigger is not sent a `schedule` tool:
+/// it is offered once the directory has a trigger — one in the config, or
+/// the first one created over HTTP on the running server, without a
+/// restart — or when `triggers.enabled` is `true`.
+#[tokio::test]
+async fn the_schedule_tool_is_offered_once_there_is_a_trigger_or_triggers_are_enabled() {
+    async fn offered(f: &Fixture) -> bool {
+        let (status, tools) = call(f, "GET", "/experimental/tool/ids", "").await;
+        assert_eq!(status, StatusCode::OK);
+        tools.as_array().unwrap().contains(&json!("schedule"))
+    }
+    /// The tools of the request the model was last sent.
+    async fn sent(f: &Fixture) -> Vec<String> {
+        let (status, session) = call(f, "POST", "/session", "{}").await;
+        assert_eq!(status, StatusCode::OK, "{session}");
+        let id = session["id"].as_str().unwrap();
+        let (status, body) = call(
+            f,
+            "POST",
+            &format!("/session/{id}/message"),
+            r#"{"parts":[{"type":"text","text":"hello"}]}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let inputs = f.llm.inputs.lock().unwrap();
+        let input = inputs.last().expect("a request was sent");
+        input.tools.iter().map(|tool| tool.name.clone()).collect()
+    }
+
+    // A default config: no tool, in the ids or in the request.
+    let f = fixture("ok", json!({}));
+    assert!(!offered(&f).await);
+    let tools = sent(&f).await;
+    for added in ["schedule", "memory", "session_search"] {
+        assert!(
+            !tools.iter().any(|tool| tool == added),
+            "{added} in {tools:?}"
+        );
+    }
+    // The routes still answer: nothing is disabled.
+    let (status, list) = call(&f, "GET", "/trigger", "").await;
+    assert_eq!((status, list), (StatusCode::OK, json!([])));
+    // The first trigger brings the tool with it, on the same instance.
+    let (status, created) = call(
+        &f,
+        "POST",
+        "/trigger",
+        r#"{"on":{"interval":"1h"},"prompt":"Check in"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    assert!(offered(&f).await);
+    assert!(sent(&f).await.iter().any(|tool| tool == "schedule"));
+
+    // A trigger in the config, or the switch, from the start.
+    let f = fixture(
+        "ok",
+        json!({ "trigger": { "inbox": { "on": { "webhook": true }, "prompt": "Triage" } } }),
+    );
+    assert!(offered(&f).await);
+    let f = fixture("ok", json!({ "triggers": { "enabled": true } }));
+    assert!(offered(&f).await);
+    assert!(sent(&f).await.iter().any(|tool| tool == "schedule"));
+    // And `false` wins over a trigger that exists.
+    let f = fixture(
+        "ok",
+        json!({
+            "triggers": { "enabled": false },
+            "trigger": { "inbox": { "on": { "webhook": true }, "prompt": "Triage" } }
+        }),
+    );
+    assert!(!offered(&f).await);
 }
 
 #[tokio::test]

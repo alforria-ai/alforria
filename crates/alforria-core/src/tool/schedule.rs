@@ -685,6 +685,7 @@ mod tests {
                 project_id: "global".to_string(),
                 home: dir.path().to_path_buf(),
                 enabled,
+                on_demand: false,
                 concurrency: 1,
                 max_watched: 100,
                 ignore: Vec::new(),

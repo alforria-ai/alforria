@@ -48,12 +48,18 @@ pre-1.0, so minor releases may include breaking changes.
   latest one), and `quiet_token` lets a check that found nothing stay silent.
   Runs are announced by `trigger.fired`, `trigger.completed`, `trigger.failed`
   and `trigger.skipped`. Triggers are read from your own config, never from a
-  project's, and a webhook run cannot act unless its trigger allows it. See
+  project's, and a webhook run cannot act unless its trigger allows it.
+  Triggers are off until there is one: with `triggers.enabled` unset, a
+  directory with no trigger (in the config or stored) runs no scheduler,
+  and the first `POST /trigger` starts it; `triggers.enabled: true` starts
+  it with nothing scheduled, and `false` turns the feature off. See
   `docs/assistant.md`.
 - A `schedule` tool, so an agent can create, list, change, pause and delete
   its own triggers and one-shot reminders, gated by a `schedule` permission.
   It only changes triggers its own conversation scheduled, and what it
-  schedules runs under the rules its creator had.
+  schedules runs under the rules its creator had. It is offered once the
+  directory has a trigger, or with `triggers.enabled: true`: a request from
+  someone who uses no trigger carries the same tools as before.
 - Long-term memory (`memory.enabled`, off by default): a `memory` tool that
   saves typed records (fact, preference, task, note) and searches them, the
   most recent of which are added to the system context of every step in a

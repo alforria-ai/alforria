@@ -12,7 +12,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct TriggersInfo {
     /// `false` turns scheduling off: nothing fires and the `schedule` tool
-    /// is not offered.
+    /// is not offered. `true` turns it on with nothing to schedule yet: the
+    /// scheduler runs and the tool is offered. Unset, both wait for the
+    /// directory's first trigger (in the config, or created at run time).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
     /// How many trigger runs go at once (default 1).

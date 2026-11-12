@@ -38,7 +38,16 @@ pub struct TriggerSettings {
     pub directory: PathBuf,
     pub project_id: String,
     pub home: PathBuf,
+    /// `false` when `triggers.enabled` is `false` (or the environment
+    /// turns triggers off): nothing is accepted, fired or offered.
     pub enabled: bool,
+    /// `triggers.enabled` is not written. Triggers are then off until
+    /// there is one: the scheduler does not start and the `schedule` tool
+    /// is not offered ([`TriggerService::active`]) while the directory has
+    /// no trigger, in the config or stored — a server whose owner uses
+    /// none of this runs as it did before triggers existed. The first one
+    /// created (`POST /trigger`) starts the scheduler.
+    pub on_demand: bool,
     /// How many runs go at once, across all triggers.
     pub concurrency: usize,
     /// The most entries one `watch` may cover.
@@ -270,6 +279,13 @@ pub struct TriggerService {
     wake: tokio::sync::Notify,
     settled: tokio::sync::Notify,
     started: AtomicBool,
+    /// [`Self::start`] was called: a scheduler is wanted here, and one that
+    /// was waiting for a first trigger starts when it is created.
+    start_requested: AtomicBool,
+    /// Triggers are in use here ([`Self::active`]). Set, never cleared: a
+    /// directory whose last trigger is deleted keeps its scheduler and its
+    /// tool until the instance is rebuilt.
+    activated: AtomicBool,
     /// Set by [`TriggerService::stop`]: nothing fires any more.
     stopped: AtomicBool,
     /// When each webhook trigger last accepted a delivery.
@@ -373,7 +389,10 @@ impl TriggerService {
             .lock_dir
             .as_ref()
             .map(|dir| RoleLock::new(scheduler_lock(dir, &settings.directory)));
+        let activated = settings.enabled && (!settings.on_demand || !entries.is_empty());
         Arc::new(TriggerService {
+            start_requested: AtomicBool::new(false),
+            activated: AtomicBool::new(activated),
             role,
             follower: AtomicBool::new(false),
             in_flight: Arc::default(),
@@ -453,8 +472,27 @@ impl TriggerService {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// Triggers are not turned off: requests are accepted.
     pub fn enabled(&self) -> bool {
         self.settings.enabled
+    }
+
+    /// Triggers are in use here: `triggers.enabled` is `true`, or it is not
+    /// written and the directory has (or has had, since this instance was
+    /// built) a trigger. What the scheduler and the `schedule` tool wait
+    /// for (`TriggerSettings::on_demand`).
+    pub fn active(&self) -> bool {
+        self.settings.enabled && self.activated.load(Ordering::SeqCst)
+    }
+
+    /// A trigger exists from now on: what was waiting for one starts.
+    fn activate(self: &Arc<Self>) {
+        if !self.settings.enabled || self.activated.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        if self.start_requested.load(Ordering::SeqCst) {
+            self.start();
+        }
     }
 
     pub fn now_ms(&self) -> u64 {
@@ -927,6 +965,10 @@ impl TriggerService {
             entries.insert(id.clone(), entry);
             record
         };
+        // The first trigger of a directory that had none starts its
+        // scheduler (`TriggerSettings::on_demand`); the watch below needs
+        // it to have taken the scheduler's place.
+        self.activate();
         self.sync_watch(&id);
         self.changed(&id);
         Ok(self.get(&id).unwrap_or(record))
@@ -1243,9 +1285,12 @@ impl TriggerService {
 
     /// Start the watchers and the loop that calls [`Self::tick`]. Needs a
     /// tokio runtime; without one (or when triggers are disabled) nothing
-    /// is scheduled.
+    /// is scheduled. While triggers are not in use ([`Self::active`]) the
+    /// call is remembered and nothing starts: no loop, no watcher, no claim
+    /// on the scheduler's place. The first trigger created starts it.
     pub fn start(self: &Arc<Self>) {
-        if !self.settings.enabled {
+        self.start_requested.store(true, Ordering::SeqCst);
+        if !self.active() {
             return;
         }
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
