@@ -7,6 +7,8 @@ pre-1.0, so minor releases may include breaking changes.
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-11-13
+
 ### Fixed
 
 - A turn in a project with many ignored or changed files could hang for good
@@ -278,7 +280,8 @@ First release.
 - The Rust workspace: schema, LLM, core, server, TUI, embedded UI, and CLI
   crates.
 
-[Unreleased]: https://github.com/alforria-ai/alforria/compare/v0.4.3...HEAD
+[Unreleased]: https://github.com/alforria-ai/alforria/compare/v0.4.4...HEAD
+[0.4.4]: https://github.com/alforria-ai/alforria/compare/v0.4.3...v0.4.4
 [0.4.3]: https://github.com/alforria-ai/alforria/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/alforria-ai/alforria/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/alforria-ai/alforria/compare/v0.4.0...v0.4.1
