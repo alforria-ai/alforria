@@ -7,6 +7,13 @@ pre-1.0, so minor releases may include breaking changes.
 
 ## [Unreleased]
 
+### Fixed
+
+- Two alforria processes starting at the same moment on a fresh install could
+  both try to create the database, and the second failed with `table
+  workspace already exists`. The second now waits and uses the database the
+  first one created.
+
 ## [0.4.4] - 2026-11-13
 
 ### Fixed

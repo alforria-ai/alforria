@@ -79,6 +79,21 @@ fn list_tables(conn: &Connection) -> Result<Vec<String>, CoreError> {
     Ok(tables)
 }
 
+/// Whether the database has no tables yet. One with tables but no
+/// `session` table is not ours, and is an error.
+fn is_fresh(conn: &Connection) -> Result<bool, CoreError> {
+    let tables = list_tables(conn)?;
+    if tables.iter().any(|table| table == "session") {
+        return Ok(false);
+    }
+    if !tables.is_empty() {
+        return Err(CoreError::Storage(
+            "Database is not empty and has no session table".into(),
+        ));
+    }
+    Ok(true)
+}
+
 fn insert_migration(tx: &Connection, id: &str) -> Result<(), CoreError> {
     tx.execute(
         "INSERT INTO migration (id, time_completed) VALUES (?1, ?2)",
@@ -103,21 +118,22 @@ fn select_completed(conn: &Connection) -> Result<HashSet<String>, CoreError> {
 /// a fresh install. A database that already has a `session` table is handed
 /// to [`apply_only`]; any other non-empty database is fatal.
 ///
-/// Concurrency: TS guards this with a semaphore; in the Rust port the
-/// `Mutex` inside [`crate::storage::connection::Storage`] serializes access
-/// for a single process (spec: cross-connection apply is out of scope).
+/// Concurrency: within a process the `Mutex` inside
+/// [`crate::storage::connection::Storage`] serializes access. Across
+/// processes, a fresh database is checked again once the write lock is
+/// held, so only the first opener creates the schema.
 pub fn apply(conn: &mut Connection) -> Result<(), CoreError> {
-    let tables = list_tables(conn)?;
-    if tables.iter().any(|table| table == "session") {
+    if !is_fresh(conn)? {
         return apply_only(conn, MIGRATION_IDS);
-    }
-    if !tables.is_empty() {
-        return Err(CoreError::Storage(
-            "Database is not empty and has no session table".into(),
-        ));
     }
 
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    // Another process may have created the schema while this one waited
+    // for the lock.
+    if !is_fresh(&tx)? {
+        drop(tx);
+        return apply_only(conn, MIGRATION_IDS);
+    }
     for statement in SCHEMA_SQL {
         tx.execute_batch(statement)?;
     }
@@ -259,6 +275,34 @@ mod tests {
         let mut sorted = MIGRATION_IDS.to_vec();
         sorted.sort_unstable();
         assert_eq!(ids, sorted);
+    }
+
+    /// Two processes opening a database that does not exist yet (a TUI and
+    /// `alforria web` on a fresh install) both saw it empty, and the one
+    /// that waited for the write lock then created the schema again.
+    #[test]
+    fn concurrent_first_opens_create_the_schema_once() {
+        let dir = TempDir::new("fresh-race");
+        let path = dir.path().join("db.sqlite");
+        let start = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let opens: Vec<_> = (0..8)
+            .map(|_| {
+                let (path, start) = (path.clone(), start.clone());
+                std::thread::spawn(move || {
+                    let mut conn = Connection::open(path).unwrap();
+                    conn.busy_timeout(std::time::Duration::from_secs(30))
+                        .unwrap();
+                    start.wait();
+                    apply(&mut conn).map_err(|err| err.to_string())
+                })
+            })
+            .collect();
+        for open in opens {
+            open.join()
+                .unwrap()
+                .expect("every concurrent open succeeds");
+        }
+        assert_eq!(journal(&conn_in(&dir)).len(), MIGRATION_IDS.len());
     }
 
     #[test]
