@@ -7,6 +7,13 @@ pre-1.0, so minor releases may include breaking changes.
 
 ## [Unreleased]
 
+### Fixed
+
+- A turn in a project with many ignored or changed files could hang for good
+  before reaching the model, and every later turn in that project with it:
+  the snapshot fed git its file list before reading git's answer, and both
+  sides blocked once the answer filled the pipe.
+
 ## [0.4.3] - 2026-11-12
 
 0.4.2 was tagged but shipped no binaries: its macOS verification caught the

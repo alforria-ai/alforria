@@ -192,10 +192,19 @@ impl SnapshotRunner for SubprocessSnapshotRunner {
                 stderr: "git failed to spawn".to_string(),
             };
         };
-        if let (Some(mut handle), Some(data)) = (child.stdin.take(), stdin) {
-            let _ = handle.write_all(data.as_bytes());
-        }
-        match child.wait_with_output() {
+        // Feed stdin from its own thread while stdout and stderr drain.
+        // `check-ignore --stdin` and `cat-file --batch` answer as they read,
+        // so writing everything first deadlocks once their output fills the
+        // pipe: git blocks on stdout and stops reading the rest.
+        let output = std::thread::scope(|scope| {
+            if let (Some(mut handle), Some(data)) = (child.stdin.take(), stdin) {
+                scope.spawn(move || {
+                    let _ = handle.write_all(data.as_bytes());
+                });
+            }
+            child.wait_with_output()
+        });
+        match output {
             Ok(output) => SnapshotOutput {
                 code: output.status.code().unwrap_or(1),
                 stdout: output.stdout,
@@ -1823,6 +1832,28 @@ mod git_tests {
             std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
             "before\n"
         );
+    }
+
+    /// `check-ignore --stdin` echoes each ignored path as it reads on, so a
+    /// list whose ignored part overflows the pipe hung the runner for good
+    /// when it wrote all of stdin before reading anything back.
+    #[test]
+    fn ignore_answers_for_more_paths_than_a_pipe_holds() {
+        let dir = TempDir::new("snap-ignore-many");
+        init_repo(dir.path());
+        std::fs::write(dir.path().join(".gitignore"), "*.log\n").unwrap();
+        let (snap, _data) = snapshot(dir.path());
+        let files: Vec<String> = (0..20_000)
+            .map(|i| format!("logs/run-{i:05}.log"))
+            .collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(snap.ignore(&files));
+        });
+        let ignored = rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("check-ignore deadlocked on a long path list");
+        assert_eq!(ignored.len(), 20_000);
     }
 
     #[tokio::test]
