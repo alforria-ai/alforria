@@ -7,6 +7,12 @@ pre-1.0, so minor releases may include breaking changes.
 
 ## [Unreleased]
 
+### Changed
+
+- TUI: `/copy` now copies the last assistant message as Markdown. Use
+  `/copythread` for the full conversation, or set `"copy_mode": "thread"`
+  in `tui.json` to restore the old default.
+
 ### Fixed
 
 - Two alforria processes starting at the same moment on a fresh install could

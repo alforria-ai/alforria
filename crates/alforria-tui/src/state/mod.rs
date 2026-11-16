@@ -667,8 +667,7 @@ pub enum Effect {
     SessionBackground {
         session_id: String,
     },
-    /// `session.copy` — clipboard write of `formatTranscript(...)`
-    /// (TODO(M8.8): the transcript formatter).
+    /// Full transcript for `/copythread` or `/copy` in thread mode.
     SessionCopyTranscript {
         thinking: bool,
         tool_details: bool,
