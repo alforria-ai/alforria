@@ -364,6 +364,66 @@ async fn global_event_heartbeat() {
 // ------------------------------------------------------------ v2 /api/event
 
 #[tokio::test]
+async fn v1_streams_close_on_broadcast_gaps_and_can_reconnect() {
+    for uri in ["/event?directory=/repo", "/global/event"] {
+        let ctx = fixture();
+        let (_, _, mut frames) = open(&ctx, uri).await;
+        frames.next().await.unwrap();
+        // No await: the pump cannot drain the broadcast ring during this burst.
+        for _ in 0..alforria_core::event::bus::CHANNEL_CAPACITY * 2 {
+            publish(&ctx, Some("/repo"), None);
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while frames.next().await.is_some() {}
+        })
+        .await
+        .expect("lag must terminate the stream so clients resnapshot");
+        let (_, _, mut frames) = open(&ctx, uri).await;
+        assert!(frames.next().await.unwrap().contains("server.connected"));
+        publish(&ctx, Some("/repo"), None);
+        assert!(frames
+            .next_event()
+            .await
+            .unwrap()
+            .contains("models-dev.refreshed"));
+    }
+}
+
+#[tokio::test]
+async fn api_event_overflow_closes_instead_of_sending_heartbeats_forever() {
+    let ctx = fixture();
+    let (_, _, mut frames) = open(&ctx, "/api/event").await;
+    frames.next().await.unwrap();
+    frames.next().await.unwrap();
+    for _ in 0..500 {
+        publish(&ctx, Some("/repo"), None);
+        tokio::task::yield_now().await;
+    }
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while frames.next().await.is_some() {}
+    })
+    .await
+    .expect("an overflowed stream must close");
+}
+
+#[tokio::test]
+async fn api_event_disconnect_releases_idle_subscription() {
+    let ctx = fixture();
+    let baseline = ctx.global_bus.receiver_count();
+    let (_, _, mut frames) = open(&ctx, "/api/event").await;
+    frames.next().await.unwrap();
+    assert_eq!(ctx.global_bus.receiver_count(), baseline + 1);
+    drop(frames);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while ctx.global_bus.receiver_count() != baseline {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("disconnect must release the listener without another publish");
+}
+
+#[tokio::test]
 async fn api_event_stream() {
     let ctx = fixture();
     let (status, headers, mut frames) = open(&ctx, "/api/event").await;
@@ -560,6 +620,45 @@ fn located_fixture() -> Arc<ServerContext> {
         v2: HEARTBEAT,
     };
     Arc::new(ctx)
+}
+
+#[tokio::test]
+async fn chained_bus_releases_its_sender_when_owners_drop() {
+    let global = alforria_server::sse::GlobalBus::new();
+    let core = Arc::new(EventBus::new(Storage::open_in_memory().unwrap(), None));
+    let mut receiver = global.subscribe();
+    let bridge = global.chain(core.clone());
+    drop(global);
+    drop(core);
+    drop(bridge);
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Closed)
+    ));
+}
+
+#[tokio::test]
+async fn disposed_instances_stop_forwarding_even_with_external_service_owners() {
+    let ctx = located_fixture();
+    let mut receiver = ctx.global_bus.subscribe();
+    for _ in 0..20 {
+        let services = ctx.instances.load(Path::new("/repo")).unwrap();
+        receiver.try_recv().unwrap(); // project.updated
+        ctx.instances.dispose_directory(Path::new("/repo"));
+        receiver.try_recv().unwrap(); // server.instance.disposed
+        services
+            .events
+            .publish(
+                &alforria_core::MODELS_DEV_REFRESHED,
+                serde_json::json!({}),
+                PublishOptions::default(),
+            )
+            .unwrap();
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
 }
 
 #[tokio::test]

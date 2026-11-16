@@ -227,10 +227,15 @@ fn unwired_engine_factory(
 #[derive(Clone)]
 pub struct InstanceStore {
     factory: InstanceFactory,
-    entries: Arc<Mutex<HashMap<PathBuf, Arc<SessionServices>>>>,
+    entries: Arc<Mutex<HashMap<PathBuf, InstanceEntry>>>,
     /// Disposal emissions feed the GlobalBus (`disposeContext`,
     /// `instance-store.ts:78-93`).
     global_bus: Arc<Mutex<Option<GlobalBus>>>,
+}
+
+struct InstanceEntry {
+    services: Arc<SessionServices>,
+    _bridge: Option<alforria_core::event::bus::Subscription>,
 }
 
 impl InstanceStore {
@@ -276,17 +281,23 @@ impl InstanceStore {
         let directory = resolve_directory(directory);
         let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(existing) = entries.get(&directory) {
-            return Ok(existing.clone());
+            return Ok(existing.services.clone());
         }
         let services = (self.factory)(&directory)?;
         // M7.1: the instance bus feeds the global bus so per-instance
         // events reach `/global/event` and `/event` with their location
         // (`event-v2-bridge.ts:26-62`).
         let global_bus = self.global_bus.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(global_bus) = global_bus.as_ref() {
-            global_bus.chain(services.events.clone());
-        }
-        entries.insert(directory.clone(), services.clone());
+        let bridge = global_bus
+            .as_ref()
+            .map(|global_bus| global_bus.chain(services.events.clone()));
+        entries.insert(
+            directory.clone(),
+            InstanceEntry {
+                services: services.clone(),
+                _bridge: bridge,
+            },
+        );
         // M7.1: every instance boot emits `project.updated` with directory
         // "global" (`project.ts:305` → `GlobalEvents.publish`). The
         // production factory resolves the project with a no-op sink, so
@@ -313,7 +324,7 @@ impl InstanceStore {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .values()
-            .cloned()
+            .map(|entry| entry.services.clone())
             .collect()
     }
 
