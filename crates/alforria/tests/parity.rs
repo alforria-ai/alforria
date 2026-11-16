@@ -1,7 +1,7 @@
 //! Cross-parity harness (spec PARITY §2.1): drives the Rust binary and
 //! the pinned TS reference side by side against the same scripted mock
-//! LLM and diffs normalized captures. Every test is gated behind
-//! `OPENCODE_PARITY=1` and early-returns in <1s without it.
+//! LLM and diffs normalized captures. Live comparisons are ignored by default and explicitly enabled with
+//! `OPENCODE_PARITY=1 cargo test -p alforria --test parity -- --ignored`.
 
 #[path = "e2e_agent/backend.rs"]
 mod backend;

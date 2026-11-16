@@ -51,7 +51,10 @@ fn temp() -> (tempfile::TempDir, PathBuf) {
     // test does not depend on it already existing on the machine.
     let parent = std::env::temp_dir().join("opencode");
     std::fs::create_dir_all(&parent).expect("create opencode tmp parent");
-    let dir = tempfile::tempdir_in(&parent).expect("tempdir");
+    let dir = tempfile::Builder::new()
+        .prefix("lsp workspace ")
+        .tempdir_in(&parent)
+        .expect("tempdir");
     std::fs::write(dir.path().join("a.rs"), "fn main() {}\nlet x = 1;\n").unwrap();
     let file = dir.path().join("a.rs");
     (dir, file)
@@ -132,7 +135,7 @@ async fn initialize_handshake_and_dispatch() {
         client.connection.send_request(
             "textDocument/hover",
             json!({
-                "textDocument": { "uri": format!("file://{}", a_rs.to_string_lossy()) },
+                "textDocument": { "uri": reqwest::Url::from_file_path(&a_rs).unwrap().as_str() },
                 "position": { "line": 0, "character": 0 },
             }),
         ),
@@ -150,7 +153,7 @@ async fn initialize_handshake_and_dispatch() {
     let params = &initialize["params"];
     assert_eq!(
         params["rootUri"],
-        format!("file://{}", dir.path().to_string_lossy())
+        reqwest::Url::from_file_path(dir.path()).unwrap().as_str()
     );
     assert!(params["processId"].is_number());
     assert_eq!(params["initializationOptions"]["a"]["b"], 5);
@@ -170,7 +173,7 @@ async fn initialize_handshake_and_dispatch() {
     assert_eq!(folders.len(), 1, "{messages:?}");
     assert_eq!(
         folders[0]["result"][0]["uri"],
-        format!("file://{}", dir.path().to_string_lossy())
+        reqwest::Url::from_file_path(dir.path()).unwrap().as_str()
     );
     // initialization is pushed as didChangeConfiguration (client.ts:607-613).
     assert!(messages.iter().any(

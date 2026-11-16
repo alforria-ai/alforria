@@ -322,17 +322,21 @@ pub fn wait(child: &mut Child, timeout: Duration) -> ProcOutput {
     }
 }
 
-fn pump<R: Read + Send + 'static>(mut pipe: R) -> std::sync::Arc<std::sync::Mutex<String>> {
-    let buffer = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-    let shared = buffer.clone();
+fn pump<R: Read + Send + 'static>(mut pipe: R) -> std::sync::mpsc::Receiver<String> {
+    let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut text = String::new();
         pipe.read_to_string(&mut text).ok();
-        *shared.lock().unwrap() = text;
+        let _ = sender.send(text);
     });
-    buffer
+    receiver
 }
 
-fn read_pump(buffer: std::sync::Arc<std::sync::Mutex<String>>) -> String {
-    std::mem::take(&mut *buffer.lock().unwrap())
+fn read_pump(receiver: std::sync::mpsc::Receiver<String>) -> String {
+    // Child exit does not guarantee its reader threads have published the
+    // captured output yet. Wait for EOF, bounded in case a descendant retains
+    // an inherited pipe after the child exits or is killed on timeout.
+    receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("child output reader did not finish after exit")
 }

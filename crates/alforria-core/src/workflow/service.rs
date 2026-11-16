@@ -1494,6 +1494,9 @@ mod tests {
         assert!(std::fs::read_to_string(&path).unwrap().contains("running"));
 
         // It died without finishing.
+        // Release explicitly: concurrent subprocess startup can briefly
+        // inherit this descriptor before closing it on exec.
+        lock.unlock().unwrap();
         drop(lock);
         assert_eq!(service.get("theirs").unwrap().state, WorkflowState::Failed);
         std::fs::remove_dir_all(temp.path()).ok();

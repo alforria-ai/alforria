@@ -4,7 +4,10 @@
 //! `/experimental/tool` registry listing and `sessionBackground`
 //! promotion.
 
+mod support;
+
 use std::sync::Arc;
+use support::encode_query_value as urlencode;
 
 use alforria_core::session::llm::{LlmEventStream, LlmStream, StreamInput};
 use alforria_core::session::prompt_input::Models as InputModels;
@@ -243,10 +246,6 @@ async fn body_string(response: axum::http::Response<Body>) -> String {
             .to_vec(),
     )
     .unwrap()
-}
-
-fn urlencode(value: &str) -> String {
-    value.replace('/', "%2F")
 }
 
 /// Create a session through the real HTTP surface (`?directory=` boots the

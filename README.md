@@ -89,9 +89,9 @@ setup, model selection, and the first session.
 - **Web client.** A multi-session supervision surface embedded in the binary
   and served at `/` by `alforria serve`.
 - **Compatible configuration and storage.** alforria uses `opencode.json`,
-  XDG config paths, and SQLite session storage. Compatibility is tested
-  against frozen fixtures from the upstream project; user-facing surfaces use
-  the alforria name.
+  its own XDG directories, and SQLite session storage. Compatibility targets
+  the pinned upstream revision, with the coverage and limits described in the
+  [compatibility matrix](docs/compatibility.md).
 
 ## Documentation
 

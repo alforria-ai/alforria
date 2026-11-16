@@ -7,6 +7,7 @@
     "dev": "vite",
     "build": "vite build",
     "pack": "bun script/pack.ts",
+    "verify:bundle": "bun script/verify-bundle.ts",
     "test": "vitest run",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.bun.json",
     "gen:api": "openapi-typescript ../fixtures/openapi/openapi.json -o src/api/schema.d.ts",

@@ -5,7 +5,7 @@
 use crate::catalog;
 use crate::differ::Deviation;
 use crate::harness::Env;
-use crate::parity_harness::{gated, golden_mode, TsServe, TsSource};
+use crate::parity_harness::{golden_mode, require_enabled, TsServe, TsSource};
 use crate::report::Report;
 
 use crate::harness::Serve;
@@ -34,12 +34,14 @@ async fn surface() -> Surface {
 }
 
 #[tokio::test]
+#[ignore = "requires the pinned reference; run with OPENCODE_PARITY=1 and --ignored"]
 async fn p0_route_inventory_parity() {
-    // P0 compares live TS docs: no golden replay exists for it, so the
-    // golden mode (no TS clone) skips like the un-gated default run.
-    if !gated() || golden_mode() {
-        return;
-    }
+    // P0 requires the live pinned source; it has no offline golden mode.
+    require_enabled();
+    assert!(
+        !golden_mode(),
+        "static parity requires a live pinned reference"
+    );
     let surface = surface().await;
     let ts_v1 = catalog::route_inventory(&surface.ts_v1);
     let rs_v1 = catalog::route_inventory(&surface.rs_v1);
@@ -51,12 +53,14 @@ async fn p0_route_inventory_parity() {
 }
 
 #[tokio::test]
+#[ignore = "requires the pinned reference; run with OPENCODE_PARITY=1 and --ignored"]
 async fn p0_openapi_schema_shape_parity() {
-    // P0 compares live TS docs: no golden replay exists for it, so the
-    // golden mode (no TS clone) skips like the un-gated default run.
-    if !gated() || golden_mode() {
-        return;
-    }
+    // P0 requires the live pinned source; it has no offline golden mode.
+    require_enabled();
+    assert!(
+        !golden_mode(),
+        "static parity requires a live pinned reference"
+    );
     let report = Report::open("p0_openapi_schema_shape");
     let surface = surface().await;
 
@@ -72,12 +76,14 @@ async fn p0_openapi_schema_shape_parity() {
 }
 
 #[tokio::test]
+#[ignore = "requires the pinned reference; run with OPENCODE_PARITY=1 and --ignored"]
 async fn p0_event_type_inventory_parity() {
-    // P0 compares live TS docs: no golden replay exists for it, so the
-    // golden mode (no TS clone) skips like the un-gated default run.
-    if !gated() || golden_mode() {
-        return;
-    }
+    // P0 requires the live pinned source; it has no offline golden mode.
+    require_enabled();
+    assert!(
+        !golden_mode(),
+        "static parity requires a live pinned reference"
+    );
     let surface = surface().await;
     for (union, expected) in [("Event", 89), ("V2Event", 88)] {
         let ts = catalog::event_types(&surface.ts_v1, union);
