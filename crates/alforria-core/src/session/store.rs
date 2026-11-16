@@ -1053,6 +1053,23 @@ impl SessionStore {
         Ok(result)
     }
 
+    /// A turn's metadata and snapshot step parts, for computing its diff.
+    pub(crate) fn turn_snapshots(
+        &self,
+        session_id: &str,
+        message_id: &str,
+    ) -> Result<Vec<WithParts>, SessionError> {
+        self.messages.turn_snapshots(session_id, message_id)
+    }
+
+    pub(crate) fn message_info(
+        &self,
+        session_id: &str,
+        message_id: &str,
+    ) -> Result<V1Message, SessionError> {
+        self.messages.get_info(session_id, message_id)
+    }
+
     /// One message with its parts (`MessageV2.get`, message-v2.ts:506-519).
     pub fn get_message(
         &self,

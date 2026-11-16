@@ -980,14 +980,15 @@ mod tests {
     #[test]
     fn schema_sql_statement_shape() {
         // Byte-compare sqlite_master against SCHEMA_SQL (spec §7). The
-        // journal table (created afterwards by `migration::apply`) is
-        // excluded.
+        // journal table and the additive local query index are excluded;
+        // neither changes the pinned upstream table/index definitions.
         let temp = TempDir::new("schema");
         let storage = crate::storage::Storage::open(temp.path().join("db.sqlite")).unwrap();
         let actual = storage
             .with_connection(|conn| -> rusqlite::Result<Vec<String>> {
                 let mut stmt = conn.prepare(
-                    "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL AND name != 'migration'",
+                    "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL
+                     AND name NOT IN ('migration', 'alforria_message_session_parent_idx')",
                 )?;
                 let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()
