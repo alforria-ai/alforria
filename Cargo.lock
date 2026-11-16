@@ -71,6 +71,7 @@ dependencies = [
  "futures",
  "globset",
  "gray_matter",
+ "grep-matcher",
  "grep-regex",
  "grep-searcher",
  "hex",
