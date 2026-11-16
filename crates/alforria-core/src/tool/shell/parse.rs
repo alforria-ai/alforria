@@ -150,6 +150,47 @@ impl BashParser {
     }
 }
 
+/// A complete literal argv for command-specific option parsing. The flat
+/// parts intentionally omit expansions, so they cannot safely identify an
+/// implicit search pattern. Redirections are inspected separately.
+pub(super) fn literal_command(source: &str) -> Option<Vec<String>> {
+    fn literal(node: tree_sitter::Node<'_>, source: &str) -> bool {
+        match node.kind() {
+            "word" => !source[node.byte_range()].contains(['*', '?', '[', '{', '}']),
+            "raw_string" | "string_content" => true,
+            "command_name" | "string" | "concatenation" => {
+                let mut cursor = node.walk();
+                let all_literal = node
+                    .named_children(&mut cursor)
+                    .all(|child| literal(child, source));
+                all_literal
+            }
+            _ => false,
+        }
+    }
+
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_bash::LANGUAGE.into())
+        .ok()?;
+    let tree = parser.parse(source, None)?;
+    if tree.root_node().has_error() {
+        return None;
+    }
+    let nodes = commands(tree.root_node());
+    let [command] = nodes.as_slice() else {
+        return None;
+    };
+    let name = command.child_by_field_name("name")?;
+    let mut nodes = vec![name];
+    let mut cursor = command.walk();
+    nodes.extend(command.children_by_field_name("argument", &mut cursor));
+    nodes
+        .into_iter()
+        .map(|node| literal(node, source).then(|| source[node.byte_range()].to_string()))
+        .collect()
+}
+
 impl ShellParser for BashParser {
     fn parse(&self, command: &str) -> Result<Vec<CommandNode>> {
         let mut parser = tree_sitter::Parser::new();
