@@ -1697,6 +1697,27 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn grep_posix_operands_after_the_pattern_still_need_permission() {
+        let root = temp("grep-posix-operands");
+        let project = root.join("project");
+        let outside = root.join("outside files");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let outside = outside.display().to_string();
+        for command in [
+            format!(r#"POSIXLY_CORRECT=1 grep pattern -e "{outside}/file""#),
+            format!(r#"POSIXLY_CORRECT=1 grep pattern --regexp "{outside}/file""#),
+            format!(r#"POSIXLY_CORRECT=1 grep pattern -A "{outside}/file""#),
+            format!(r#"export POSIXLY_CORRECT=1; grep pattern -e "{outside}/file""#),
+        ] {
+            let scan = redirect_scan(&command, &project);
+            assert!(scan.dirs.contains(&outside), "{command}: {:?}", scan.dirs);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn grep_dev_directory_operands_still_need_permission() {
         let dir = temp("grep-dev-operands");
         for command in [

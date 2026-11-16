@@ -31,6 +31,7 @@ pub(super) fn path_args(node: &parse::CommandNode) -> Option<Vec<String>> {
     }
     let mut files = Vec::new();
     let mut operands = Vec::new();
+    let mut posix_files = None;
     let mut explicit = false;
     let mut options = true;
     while let Some(argument) = arguments.next() {
@@ -114,11 +115,16 @@ pub(super) fn path_args(node: &parse::CommandNode) -> Option<Vec<String>> {
                 break;
             }
         } else {
+            // POSIXLY_CORRECT stops option parsing at the first operand.
+            // The shell can set it before this command, so retain the raw
+            // tail as possible files as well as parsing permuted options.
+            posix_files.get_or_insert_with(|| arguments.as_slice().to_vec());
             operands.push(argument);
         }
     }
     // -e/-f anywhere in the option list makes every positional operand a
     // file. Otherwise the first positional operand is the implicit pattern.
     files.extend(operands.into_iter().skip(usize::from(!explicit)));
+    files.extend(posix_files.unwrap_or_default());
     Some(files)
 }
