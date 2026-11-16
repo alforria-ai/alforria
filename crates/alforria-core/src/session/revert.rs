@@ -453,6 +453,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_git_restoration_preserves_session_recovery_state() {
+        use crate::session::snapshot::{GitSnapshot, GitSnapshotInput};
+        let (h, session) = scenario("revert-missing-recovery").await;
+        let snapshot = GitSnapshot::with_cleanup(
+            GitSnapshotInput {
+                directory: h.worktree.clone(),
+                worktree: h.worktree.clone(),
+                project_id: "test".into(),
+                vcs_is_git: true,
+                snapshot_enabled: true,
+                data: h.temp.path().to_path_buf(),
+            },
+            std::time::Duration::from_secs(3600),
+            std::time::Duration::from_secs(3600),
+        );
+        snapshot.track().await.unwrap();
+        let recovery = V1SessionRevert {
+            message_id: "msg_u1".into(),
+            part_id: None,
+            snapshot: Some("0000000000000000000000000000000000000001".into()),
+            diff: Some("saved recovery diff".into()),
+        };
+        h.services
+            .sessions
+            .set_revert(&session.id, Some(recovery.clone()), None)
+            .unwrap();
+        let mut service = revert_service(&h);
+        service.deps.snapshot = snapshot;
+        assert!(service.unrevert(&session.id).await.is_err());
+        assert_eq!(
+            h.services.sessions.get(&session.id).unwrap().revert,
+            Some(recovery.clone())
+        );
+        assert!(service
+            .revert(RevertInput {
+                session_id: session.id.clone(),
+                message_id: "msg_u1".into(),
+                part_id: None
+            })
+            .await
+            .is_err());
+        assert_eq!(
+            h.services.sessions.get(&session.id).unwrap().revert,
+            Some(recovery)
+        );
+        assert_eq!(
+            std::fs::read_to_string(h.worktree.join("a.txt")).unwrap(),
+            "goodbye\n"
+        );
+    }
+
+    #[tokio::test]
     async fn unrevert_restores_the_tracked_snapshot() {
         let (h, session) = scenario("revert-unrevert").await;
         let service = revert_service(&h);
