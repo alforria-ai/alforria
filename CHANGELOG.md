@@ -9,6 +9,10 @@ pre-1.0, so minor releases may include breaking changes.
 
 ### Fixed
 
+- Built-in `/review` and `/init` commands now work without a custom command
+  configuration. Review arguments, including short and full commit hashes,
+  reach the built-in review prompt.
+
 - Two alforria processes starting at the same moment on a fresh install could
   both try to create the database, and the second failed with `table
   workspace already exists`. The second now waits and uses the database the
