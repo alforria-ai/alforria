@@ -47,20 +47,20 @@ pub(crate) fn border_highlight(app: &App, theme: &Theme) -> Rgba {
     }
 }
 
-fn prompt_block() -> Block<'static> {
+pub(crate) fn prompt_block(top_padding: u16) -> Block<'static> {
     Block::new()
         .borders(ratatui::widgets::Borders::LEFT)
         .padding(Padding {
             left: 2,
             right: 2,
-            top: 0,
+            top: top_padding,
             bottom: 0,
         })
 }
 
 /// The textarea width after the frame's border and padding.
 fn inner_width(area: Rect) -> u16 {
-    prompt_block().inner(area).width.max(1)
+    prompt_block(0).inner(area).width.max(1)
 }
 
 /// The wrapped textarea rows (`Textarea::display`).
@@ -531,7 +531,7 @@ pub fn render(app: &App, frame: &mut ratatui::Frame, theme: &Theme, area: Rect) 
     }
     Paragraph::new(text)
         .block(
-            prompt_block()
+            prompt_block(0)
                 .border_set(split_border_set())
                 .border_style(border_highlight(app, theme).to_color())
                 .style(Style::new().bg(theme.background_element.to_color())),
