@@ -579,28 +579,42 @@ pub(crate) fn render_autocomplete(
     area: Rect,
 ) {
     let autocomplete = &app.ui.prompt.autocomplete;
+    if area.y == 0 {
+        return;
+    }
     let empty = autocomplete.options.is_empty();
+    let hint = autocomplete.reviewing() && area.y > 1;
     let count = autocomplete
         .options
         .len()
         .min(AUTOCOMPLETE_HEIGHT)
-        .min(area.y as usize);
+        .min(area.y.saturating_sub(u16::from(hint)) as usize);
     if count == 0 && !empty {
         return;
     }
     // `options().length || 1` — the empty popup still occupies one row
     // (`autocomplete.tsx:713, 730-735`).
     let count = count.max(1);
+    let height = count as u16 + u16::from(hint);
     // `top={position().y - height()} left={position().x}
     // width={position().width}` — the anchor spans the prompt area
     // (`autocomplete.tsx:725-728`).
     let popup = Rect {
         x: area.x,
-        y: area.y.saturating_sub(count as u16),
+        y: area.y.saturating_sub(height),
         width: area.width,
-        height: count as u16,
+        height,
     };
-    let scroll = autocomplete.scroll.min(autocomplete.options.len());
+    let scroll = autocomplete
+        .scroll
+        .min(autocomplete.selected)
+        .max(
+            autocomplete
+                .selected
+                .saturating_add(1)
+                .saturating_sub(count),
+        )
+        .min(autocomplete.options.len().saturating_sub(count));
     let lines: Vec<Line> = autocomplete
         .options
         .iter()
@@ -608,7 +622,8 @@ pub(crate) fn render_autocomplete(
         .take(count)
         .enumerate()
         .map(|(index, option)| {
-            let selected = index + scroll == autocomplete.selected;
+            let selected =
+                index + scroll == autocomplete.selected && autocomplete.highlights_selection();
             let fg = if selected {
                 super::super::theme::selected_foreground(theme, Some(theme.primary))
             } else {
@@ -636,14 +651,43 @@ pub(crate) fn render_autocomplete(
         .collect();
     // The zero-match fallback row keeps the popup visible
     // (`autocomplete.tsx:730-735`).
-    let lines = if empty {
+    let mut lines = if empty {
         vec![Line::from(Span::styled(
-            " No matching items",
+            if autocomplete.review_loading() {
+                " Loading commits…"
+            } else {
+                " No matching items"
+            },
             Style::new().fg(theme.text_muted.to_color()),
         ))]
     } else {
         lines
     };
+    if hint {
+        lines.push(Line::styled(
+            if autocomplete.review_loading() {
+                format!(" {} Loading commits…", app.session_spinner())
+            } else {
+                let mut hints = Vec::new();
+                if let (Some(prev), Some(next)) = (
+                    key_hint(app, "prompt.autocomplete.prev"),
+                    key_hint(app, "prompt.autocomplete.next"),
+                ) {
+                    hints.push(format!("{prev}/{next} choose"));
+                }
+                for (binding, action) in [
+                    ("prompt.autocomplete.complete", "complete"),
+                    ("prompt.autocomplete.select", "review"),
+                ] {
+                    if let Some(key) = key_hint(app, binding) {
+                        hints.push(format!("{key} {action}"));
+                    }
+                }
+                format!(" {}", hints.join(" · "))
+            },
+            Style::new().fg(theme.text_muted.to_color()),
+        ));
+    }
     Paragraph::new(lines)
         .block(
             Block::new()

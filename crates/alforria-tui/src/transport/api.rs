@@ -88,7 +88,7 @@ pub struct HttpClientConfig {
 /// The per-request `{ directory, workspace }` members of every generated
 /// SDK client call (`{ workspace }` at every TS call site, `{ directory }`
 /// only in the move flow — `prompt/index.tsx:1000-1015`).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Location {
     pub directory: Option<String>,
     pub workspace: Option<String>,
@@ -243,6 +243,12 @@ pub struct Goal {
 
 #[async_trait]
 pub trait ServerApi: Send + Sync {
+    /// Recent commits from the server's selected repository (alforria extension).
+    async fn vcs_commits(&self, loc: &Location) -> Result<Vec<alforria_schema::vcs::CommitInfo>> {
+        let _ = loc;
+        Err(anyhow!("vcs.commits is not supported by this server API"))
+    }
+
     async fn path_get(&self, loc: &Location) -> Result<Value>;
     async fn project_current(&self, loc: &Location) -> Result<Value>;
     async fn project_directories(&self, loc: &Location, project_id: &str) -> Result<Value>;
@@ -563,6 +569,11 @@ impl HttpServerApi {
 
 #[async_trait]
 impl ServerApi for HttpServerApi {
+    async fn vcs_commits(&self, loc: &Location) -> Result<Vec<alforria_schema::vcs::CommitInfo>> {
+        self.json(Method::GET, "/experimental/vcs/commits", loc, &[], None)
+            .await
+    }
+
     async fn fs_find(&self, loc: &Location, query: &str, limit: u32) -> Result<Value> {
         // v2 routes read `location[…]`, not the v1 `directory` param.
         let mut extra: Vec<(&str, String)> = vec![
