@@ -14,7 +14,6 @@ use std::env;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::catalog::{Cost, Modalities, Modality, Model, ModelLimit, Provider};
-use crate::GlobalPaths;
 use serde::{Deserialize, Serialize};
 
 /// Built-in provider id (wire identity: `libertai/<model>`).
@@ -99,7 +98,36 @@ struct AggregateCapabilitiesText {
 struct LtaiPricing {
     #[serde(default)]
     models: Vec<AggregateModel>,
+    /// Aliases the API accepts: `from` is served by the model `to`.
+    #[serde(default)]
+    redirections: Vec<AggregateRedirection>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AggregateRedirection {
+    from: String,
+    to: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    category: Option<String>,
+}
+
+/// Dated ids the API serves for a model the aggregate lists under its plain
+/// name: `(dated id, aggregate id, display name)`.
+///
+/// The API's `/v1/models` advertises a 1,048,576-token context for these,
+/// while the aggregate has listed DeepSeek at 262,144. The aggregate is the
+/// catalog of record, so when it lists the plain id its numbers are used for
+/// the dated ids too; only when it lists neither does the fallback below
+/// apply.
+const DATED_VARIANTS: [(&str, &str, &str); 1] = [(
+    "deepseek-v4.1-flash-1017",
+    "deepseek-v4.1-flash",
+    "DeepSeek V4.1 Flash (1017)",
+)];
+
+/// The context window of [`DATED_VARIANTS`] when the aggregate lists neither
+/// id (the size `/v1/models` advertises).
+const DATED_FALLBACK_CONTEXT: u32 = 1_048_576;
 
 // ---------------------------------------------------------------------------
 // conversion
@@ -175,6 +203,60 @@ fn models_from_pricing(pricing: &LtaiPricing) -> BTreeMap<String, Model> {
         thinking.id = format!("{base}-thinking");
         thinking.name = format!("{} (thinking)", model.name);
         models.insert(thinking.id.clone(), thinking);
+    }
+    for (dated, base, name) in DATED_VARIANTS {
+        let mut model = match (models.get(dated), models.get(base)) {
+            (Some(listed), _) => listed.clone(),
+            (None, Some(base)) => {
+                let mut model = base.clone();
+                model.name = name.to_string();
+                model
+            }
+            (None, None) => {
+                let mut model = fallback_model(dated, name, 0.25, 1.75);
+                model.limit.context = f64::from(DATED_FALLBACK_CONTEXT);
+                model
+            }
+        };
+        model.id = dated.to_string();
+        models
+            .entry(dated.to_string())
+            .or_insert_with(|| model.clone());
+        let thinking_id = format!("{dated}-thinking");
+        models.entry(thinking_id.clone()).or_insert_with(|| {
+            let mut thinking = model;
+            thinking.name = format!("{} (thinking)", thinking.name);
+            thinking.reasoning = true;
+            thinking.id = thinking_id;
+            thinking
+        });
+    }
+    // Aliases: accepted under their own id, with everything else (limits,
+    // cost, capabilities) the target's. The prompt follows the target too:
+    // an alias id says nothing about the model behind it.
+    for redirection in &pricing.redirections {
+        if redirection
+            .category
+            .as_deref()
+            .is_some_and(|category| category != "text")
+        {
+            continue;
+        }
+        let Some(target) = models.get(&redirection.to) else {
+            continue;
+        };
+        if models.contains_key(&redirection.from) {
+            continue;
+        }
+        let mut alias = target.clone();
+        alias.id = redirection.from.clone();
+        alias.name = format!("{} ({})", redirection.from, target.name);
+        models.insert(alias.id.clone(), alias);
+        crate::session::system::set_family_hint(
+            LIBERTAI_PROVIDER_ID,
+            &redirection.from,
+            Some(&redirection.to),
+        );
     }
     models
 }
@@ -254,6 +336,58 @@ fn catalog_url() -> Option<String> {
     }
 }
 
+/// Where the built-in provider's model list comes from: the disk cache
+/// directory and the aggregate URL. Both are explicit so that a server
+/// context reads and writes the cache under the paths it was built over,
+/// and a fixture reaches neither a file nor the network.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct LibertaiCatalog {
+    /// The directory holding `ltai-pricing.json`; `None` keeps no cache.
+    pub cache: Option<std::path::PathBuf>,
+    /// The LTAI_PRICING aggregate; `None` never fetches.
+    pub url: Option<String>,
+}
+
+impl LibertaiCatalog {
+    /// The embedded snapshot only: no file, no network. The default for
+    /// every context that is not a process entry point.
+    pub fn offline() -> LibertaiCatalog {
+        LibertaiCatalog {
+            cache: None,
+            url: None,
+        }
+    }
+
+    /// The production source: `cache` plus the env-resolved aggregate URL
+    /// (`LIBERTAI_MODEL_CATALOG_URL`; empty disables the fetch).
+    pub fn from_env(cache: &std::path::Path) -> LibertaiCatalog {
+        LibertaiCatalog {
+            cache: Some(cache.to_path_buf()),
+            url: catalog_url(),
+        }
+    }
+
+    /// The built-in `libertai` catalog provider.
+    pub fn provider(&self) -> Provider {
+        Provider {
+            api: Some(api_base()),
+            name: "LibertAI".to_string(),
+            env: vec!["LIBERTAI_API_KEY".to_string()],
+            id: LIBERTAI_PROVIDER_ID.to_string(),
+            npm: Some("@ai-sdk/openai-compatible".to_string()),
+            models: self.resolve_models(),
+        }
+    }
+
+    /// Merge the built-in provider into a provider map — only when absent,
+    /// a models.dev or opencode.json entry is never clobbered.
+    pub fn merge(&self, providers: &mut crate::catalog::Providers) {
+        if !providers.contains_key(LIBERTAI_PROVIDER_ID) {
+            providers.insert(LIBERTAI_PROVIDER_ID.to_string(), self.provider());
+        }
+    }
+}
+
 fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -303,15 +437,15 @@ fn write_cache(path: &std::path::Path, pricing: &LtaiPricing) {
 /// The blocking client owns a tokio runtime; building or dropping it inside
 /// an async worker panics, so the whole fetch runs on a plain thread.
 /// `builtin_provider` is called from async request handlers.
-fn fetch_pricing() -> Option<LtaiPricing> {
-    std::thread::spawn(|| {
+fn fetch_pricing(url: String) -> Option<LtaiPricing> {
+    std::thread::spawn(move || {
         let client = reqwest::blocking::Client::builder()
             .connect_timeout(Duration::from_secs(2))
             .timeout(Duration::from_secs(5))
             .build()
             .ok()?;
         let text = client
-            .get(catalog_url()?)
+            .get(url)
             .send()
             .ok()?
             .error_for_status()
@@ -325,92 +459,226 @@ fn fetch_pricing() -> Option<LtaiPricing> {
     .flatten()
 }
 
-/// Fresh 24h cache → fetch (rewrites the cache) → stale cache → embedded
-/// snapshot → hardcoded fallback pair. Result memoized for the process so
-/// at most one fetch attempt happens per TTL window. The memo lock is held
-/// only for the read/write — never across the fetch — so concurrent
-/// callers race the fetch instead of serializing behind it (both compute
-/// the same answer; the disk cache write is idempotent).
-fn resolve_models() -> BTreeMap<String, Model> {
-    static MEMO: std::sync::Mutex<Option<(u64, BTreeMap<String, Model>)>> =
-        std::sync::Mutex::new(None);
-    let now = now_unix();
-    if let Ok(memo) = MEMO.lock() {
-        if let Some((fetched_at, models)) = memo.as_ref() {
-            if now.saturating_sub(*fetched_at) < CACHE_TTL_SECS {
-                return models.clone();
+impl LibertaiCatalog {
+    /// Fresh 24h cache → fetch (rewrites the cache) → stale cache → embedded
+    /// snapshot → hardcoded fallback pair. Result memoized per source for
+    /// the process so at most one fetch attempt happens per TTL window. The
+    /// memo lock is held only for the read/write — never across the fetch —
+    /// so concurrent callers race the fetch instead of serializing behind it
+    /// (both compute the same answer; the disk cache write is idempotent).
+    fn resolve_models(&self) -> BTreeMap<String, Model> {
+        type Memo = std::collections::HashMap<LibertaiCatalog, (u64, BTreeMap<String, Model>)>;
+        static MEMO: std::sync::Mutex<Option<Memo>> = std::sync::Mutex::new(None);
+        let now = now_unix();
+        if let Ok(memo) = MEMO.lock() {
+            if let Some((fetched_at, models)) = memo.as_ref().and_then(|memo| memo.get(self)) {
+                if now.saturating_sub(*fetched_at) < CACHE_TTL_SECS {
+                    return models.clone();
+                }
             }
         }
+        let models = self.compute_models();
+        if let Ok(mut memo) = MEMO.lock() {
+            memo.get_or_insert_with(Default::default)
+                .insert(self.clone(), (now, models.clone()));
+        }
+        models
     }
-    let models = compute_models();
-    if let Ok(mut memo) = MEMO.lock() {
-        *memo = Some((now, models.clone()));
-    }
-    models
-}
 
-fn compute_models() -> BTreeMap<String, Model> {
-    let path = GlobalPaths::from_env().cache.join(CACHE_FILE);
-    let cached = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|text| serde_json::from_str::<CacheFile>(&text).ok());
-    if let Some(cached) = &cached {
-        if now_unix().saturating_sub(cached.fetched_at_unix) < CACHE_TTL_SECS {
+    fn compute_models(&self) -> BTreeMap<String, Model> {
+        let path = self.cache.as_ref().map(|cache| cache.join(CACHE_FILE));
+        let cached = path
+            .as_ref()
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .and_then(|text| serde_json::from_str::<CacheFile>(&text).ok());
+        if let Some(cached) = &cached {
+            if now_unix().saturating_sub(cached.fetched_at_unix) < CACHE_TTL_SECS {
+                let models = models_from_pricing(&cached.catalog);
+                if !models.is_empty() {
+                    return models;
+                }
+            }
+        }
+        if let Some(pricing) = self.url.clone().and_then(fetch_pricing) {
+            let models = models_from_pricing(&pricing);
+            if !models.is_empty() {
+                if let Some(path) = &path {
+                    write_cache(path, &pricing);
+                }
+                return models;
+            }
+        }
+        if let Some(cached) = cached {
             let models = models_from_pricing(&cached.catalog);
             if !models.is_empty() {
                 return models;
             }
         }
-    }
-    if let Some(pricing) = fetch_pricing() {
-        let models = models_from_pricing(&pricing);
-        if !models.is_empty() {
-            write_cache(&path, &pricing);
-            return models;
+        let snapshot: LtaiPricing = serde_json::from_str(include_str!("libertai/snapshot.json"))
+            .expect("embedded snapshot parses");
+        let models = models_from_pricing(&snapshot);
+        if models.is_empty() {
+            fallback_models()
+        } else {
+            models
         }
     }
-    if let Some(cached) = cached {
-        let models = models_from_pricing(&cached.catalog);
-        if !models.is_empty() {
-            return models;
-        }
-    }
-    let snapshot: LtaiPricing = serde_json::from_str(include_str!("libertai/snapshot.json"))
-        .expect("embedded snapshot parses");
-    let models = models_from_pricing(&snapshot);
-    if models.is_empty() {
-        fallback_models()
-    } else {
-        models
-    }
-}
-
-/// The built-in `libertai` catalog provider.
-pub fn builtin_provider() -> Provider {
-    Provider {
-        api: Some(api_base()),
-        name: "LibertAI".to_string(),
-        env: vec!["LIBERTAI_API_KEY".to_string()],
-        id: LIBERTAI_PROVIDER_ID.to_string(),
-        npm: Some("@ai-sdk/openai-compatible".to_string()),
-        models: resolve_models(),
-    }
-}
-
-/// Merge the built-in provider into a provider map — only when absent, a
-/// models.dev or opencode.json entry is never clobbered.
-pub fn merge_builtin_provider(providers: &mut crate::catalog::Providers) {
-    providers
-        .entry(LIBERTAI_PROVIDER_ID.to_string())
-        .or_insert_with(builtin_provider);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn an_offline_catalog_is_the_snapshot_and_a_cache_is_read_where_it_was_put() {
+        let offline = LibertaiCatalog::offline().provider();
+        assert_eq!(offline.models, models_from_pricing(&snapshot_pricing()));
+
+        // A fresh cache under the given directory wins over the snapshot,
+        // and with no URL nothing is fetched or rewritten.
+        let cache = tempfile::tempdir().unwrap();
+        let pricing: LtaiPricing = serde_json::from_value(serde_json::json!({
+            "models": [{ "id": "only-in-cache", "name": "Cached",
+                "pricing": { "text": { "price_per_million_input_tokens": 1.0, "price_per_million_output_tokens": 2.0 } },
+                "capabilities": { "text": { "vision": false, "reasoning": false, "context_window": 1000, "function_calling": true } } }],
+        }))
+        .unwrap();
+        write_cache(&cache.path().join(CACHE_FILE), &pricing);
+        let before = std::fs::read(cache.path().join(CACHE_FILE)).unwrap();
+        let source = LibertaiCatalog {
+            cache: Some(cache.path().to_path_buf()),
+            url: None,
+        };
+        assert!(source.provider().models.contains_key("only-in-cache"));
+        assert_eq!(
+            std::fs::read(cache.path().join(CACHE_FILE)).unwrap(),
+            before
+        );
+        // A stale cache with no URL is still preferred to the snapshot,
+        // and stays untouched.
+        let stale = tempfile::tempdir().unwrap();
+        std::fs::write(
+            stale.path().join(CACHE_FILE),
+            serde_json::to_string(&CacheFile {
+                fetched_at_unix: 1,
+                catalog: pricing,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let source = LibertaiCatalog {
+            cache: Some(stale.path().to_path_buf()),
+            url: None,
+        };
+        assert!(source.provider().models.contains_key("only-in-cache"));
+    }
+
     fn snapshot_pricing() -> LtaiPricing {
         serde_json::from_str(include_str!("libertai/snapshot.json")).unwrap()
+    }
+
+    #[test]
+    fn redirections_become_aliases_that_take_after_their_target() {
+        let pricing: LtaiPricing = serde_json::from_value(serde_json::json!({
+            "models": [
+                { "id": "qwen3.6-35b-a3b", "name": "Qwen 3.6 35B",
+                  "pricing": { "text": { "price_per_million_input_tokens": 0.1, "price_per_million_output_tokens": 0.4 } },
+                  "capabilities": { "text": { "vision": true, "reasoning": true, "context_window": 131072, "function_calling": true } } },
+                { "id": "deepseek-v4.1-flash", "name": "DeepSeek V4.1 Flash",
+                  "pricing": { "text": { "price_per_million_input_tokens": 0.25, "price_per_million_output_tokens": 1.75 } },
+                  "capabilities": { "text": { "vision": false, "reasoning": true, "context_window": 262144, "function_calling": true } } },
+            ],
+            "redirections": [
+                { "from": "claw-flash", "to": "qwen3.6-35b-a3b", "type": "INTERNAL", "category": "text" },
+                { "from": "claw-deep", "to": "deepseek-v4.1-flash" },
+                { "from": "claw-image", "to": "qwen3.6-35b-a3b", "category": "image" },
+                { "from": "claw-lost", "to": "no-such-model", "category": "text" },
+                { "from": "deepseek-v4.1-flash", "to": "qwen3.6-35b-a3b", "category": "text" },
+            ],
+        }))
+        .unwrap();
+        let models = models_from_pricing(&pricing);
+        let alias = &models["claw-flash"];
+        let target = &models["qwen3.6-35b-a3b"];
+        assert_eq!(alias.id, "claw-flash");
+        assert_eq!(alias.name, "claw-flash (Qwen 3.6 35B)");
+        assert_eq!(alias.limit, target.limit);
+        assert_eq!(alias.cost, target.cost);
+        assert_eq!(
+            (alias.attachment, alias.reasoning, alias.tool_call),
+            (target.attachment, target.reasoning, target.tool_call)
+        );
+        // Image gating (`session::media`) reads these two: an alias takes
+        // images exactly when the model behind it does, whatever its name
+        // suggests.
+        assert_eq!(alias.modalities, target.modalities);
+        assert!(alias.attachment, "claw-flash is served by a vision model");
+        let deep = &models["claw-deep"];
+        assert_eq!(deep.modalities, models["deepseek-v4.1-flash"].modalities);
+        assert!(!deep.attachment, "claw-deep is served by a text-only model");
+        assert!(
+            !deep
+                .modalities
+                .as_ref()
+                .is_some_and(|modalities| modalities.input.contains(&Modality::Image)),
+            "{:?}",
+            deep.modalities
+        );
+        assert!(!models.contains_key("claw-image") && !models.contains_key("claw-lost"));
+        // A listed model is never replaced by an alias of the same name.
+        assert_eq!(models["deepseek-v4.1-flash"].name, "DeepSeek V4.1 Flash");
+        // The prompt follows the target: a DeepSeek alias gets the DeepSeek prompt.
+        use crate::session::system::{prompt_for, provider_for, PromptFamily};
+        assert_eq!(
+            provider_for("claw-deep", "claw-deep", LIBERTAI_PROVIDER_ID),
+            vec![prompt_for(PromptFamily::DeepSeek).to_string()]
+        );
+        assert_eq!(
+            provider_for("claw-flash", "claw-flash", LIBERTAI_PROVIDER_ID),
+            vec![prompt_for(PromptFamily::Default).to_string()]
+        );
+    }
+
+    #[test]
+    fn dated_deepseek_ids_follow_the_aggregate_and_fall_back_to_the_api_size() {
+        // The aggregate lists the plain id: its numbers win.
+        let listed: LtaiPricing = serde_json::from_value(serde_json::json!({
+            "models": [
+                { "id": "deepseek-v4.1-flash", "name": "DeepSeek V4.1 Flash",
+                  "pricing": { "text": { "price_per_million_input_tokens": 0.25, "price_per_million_output_tokens": 1.75 } },
+                  "capabilities": { "text": { "vision": false, "reasoning": true, "context_window": 262144, "function_calling": true } } },
+            ],
+        }))
+        .unwrap();
+        let models = models_from_pricing(&listed);
+        for id in [
+            "deepseek-v4.1-flash-1017",
+            "deepseek-v4.1-flash-1017-thinking",
+        ] {
+            assert_eq!(models[id].id, id);
+            assert_eq!(models[id].limit.context, 262_144.0, "{id}");
+            assert_eq!(models[id].cost, models["deepseek-v4.1-flash"].cost, "{id}");
+        }
+        assert!(models["deepseek-v4.1-flash-1017-thinking"].reasoning);
+        // It lists neither: the size /v1/models advertises.
+        let empty: LtaiPricing =
+            serde_json::from_value(serde_json::json!({ "models": [] })).unwrap();
+        let models = models_from_pricing(&empty);
+        for id in [
+            "deepseek-v4.1-flash-1017",
+            "deepseek-v4.1-flash-1017-thinking",
+        ] {
+            assert_eq!(models[id].limit.context, 1_048_576.0, "{id}");
+        }
+        // The shipped snapshot carries them, and the aliases.
+        let models = models_from_pricing(&snapshot_pricing());
+        assert_eq!(
+            models["deepseek-v4.1-flash-1017"].limit.context,
+            1_048_576.0
+        );
+        assert!(models.contains_key("deepseek-v4.1-flash-1017-thinking"));
+        assert_eq!(models["claw-flash"].limit, models["qwen3.6-35b-a3b"].limit);
+        assert!(models.contains_key("claw-core") && models.contains_key("deep-claw"));
     }
 
     #[test]

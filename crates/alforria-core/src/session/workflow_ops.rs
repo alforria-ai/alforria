@@ -18,7 +18,6 @@ use crate::session::prompt_input::{ModelRef, PromptInput, PromptPartInput};
 use crate::session::store::{CreateInput, SessionContext, SessionStore};
 use crate::session::task_ops::PromptFacade;
 use crate::tool::def::BoxFuture;
-use crate::tool::permission::evaluate;
 use crate::tool::task::{derive_subagent_session_permission, Rule};
 use crate::workflow::{WorkflowAgentOutcome, WorkflowAgentRequest, WorkflowOps};
 
@@ -100,6 +99,7 @@ impl ProductionWorkflowOps {
             })
             .or(parent_model);
         let input = PromptInput {
+            caller: crate::session::caller::Caller::Session,
             session_id: session_id.to_string(),
             message_id: Some(
                 crate::session::ids::MessageId::ascending(None)
@@ -169,12 +169,8 @@ impl ProductionWorkflowOps {
     /// The model and variant of a session's latest turn. A fresh run session
     /// has none, and its agents use the default model.
     fn session_model(&self, session_id: &str) -> (Option<ModelRef>, Option<String>) {
-        // `stream` is newest-first.
-        let messages = self
-            .messages
-            .stream_without_diffs(session_id)
-            .unwrap_or_default();
-        match messages.first().map(|message| &message.info) {
+        let newest = self.messages.newest(session_id).unwrap_or_default();
+        match newest.as_ref().map(|message| &message.info) {
             Some(V1Message::Assistant {
                 model_id,
                 provider_id,
@@ -273,12 +269,15 @@ impl WorkflowOps for ProductionWorkflowOps {
                 .as_ref()
                 .and_then(|session| session.agent.as_deref())
                 .and_then(|name| self.agents.get(name));
-            let no_rules = Vec::new();
-            let rulesets = [
-                parent_agent.map_or(&no_rules, |agent| &agent.permission),
-                &parent_permission,
-            ];
-            if evaluate("task", &request.agent, &rulesets).action == PermissionV1Action::Deny {
+            // Judged as any turn of the parent session is: its agent's
+            // rules, its own, and its ceilings (`SessionStore::policy`).
+            let policy = self.sessions.policy(
+                &request.parent_session_id,
+                &parent_agent
+                    .map(|agent| agent.permission.clone())
+                    .unwrap_or_default(),
+            );
+            if policy.evaluate("task", &request.agent).action == PermissionV1Action::Deny {
                 return Err(format!(
                     "permission denied: agent {} may not be run as a subagent here",
                     request.agent
@@ -286,7 +285,7 @@ impl WorkflowOps for ProductionWorkflowOps {
             }
             let mut permission = derive_subagent_session_permission(
                 &rules_of(&parent_permission),
-                &rules_of(&agent.permission),
+                &rules_of(&agent.permission.render()),
                 &self.primary_tools,
             );
             permission.push(Rule {
@@ -417,6 +416,7 @@ mod tests {
         for model_id in ["first-model", "second-model"] {
             e.prompt
                 .prompt(PromptInput {
+                    caller: crate::session::caller::Caller::Operator,
                     session_id: session.id.clone(),
                     message_id: None,
                     model: Some(ModelRef {

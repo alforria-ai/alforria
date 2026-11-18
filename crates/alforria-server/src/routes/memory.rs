@@ -1,0 +1,447 @@
+//! Long-term memory (alforria extension).
+//!
+//! Project-scoped like the v1 API (`?directory=`), plain JSON, outside the
+//! frozen v1/v2 route tables.
+//!
+//! - `GET    /memory`              records, newest first
+//!   (`?kind=`, `?archived=true`, `?limit=`, `?offset=`)
+//! - `POST   /memory`              save `{ content, kind?, metadata? }`
+//! - `GET    /memory/search`       `?q=` (`?kind=`, `?archived=true`, `?limit=`);
+//!   records with a `snippet`
+//! - `GET    /memory/session`      `?q=` (`?limit=`): excerpts from past
+//!   sessions, `{ hits, indexing }`
+//! - `GET    /memory/{id}`         one record
+//! - `PATCH  /memory/{id}`         `{ content?, kind?, metadata?, archived? }`
+//! - `DELETE /memory/{id}`         `{ deleted }`
+//! - `GET    /memory/unattributed`       records that belong to no directory
+//!   (`?limit=`, `?offset=`) — `admin`
+//! - `PATCH  /memory/unattributed/{id}`  file one under this request's
+//!   directory — `admin`
+//! - `DELETE /memory/unattributed/{id}`  `{ deleted }` — `admin`
+//!
+//! Changes are announced by `memory.updated` (`{ id, action }`). With
+//! `memory.enabled` off every route answers 403.
+//!
+//! # Who may do what
+//!
+//! Basic auth and an `admin` token are the operator: what they write is the
+//! user's own act (`Source::Api`), and their rewrite is the one thing that
+//! vouches for a record.
+//!
+//! A credential below `admin` (`chat`, `connector`) reads and writes through
+//! the rules a turn of its own would meet with the `memory` and
+//! `session_search` tools:
+//!
+//! * a write needs the `memory` permission for the action (`remember`,
+//!   `update`, `forget`) to be `allow`, and `GET /memory/session` needs
+//!   `session_search`. An `ask` is a refusal: nobody is there to answer
+//!   one for an HTTP call. The rules are a session's when the request
+//!   names one (`?session=<id>`, a session of this directory the caller
+//!   may act in): that session's policy, with its own rules and its
+//!   ceilings, exactly what the tool would meet there. With no session
+//!   they are the default agent's — what a session the caller creates now
+//!   starts from;
+//! * what it writes is recorded as a client's (`Source::Client`), from a
+//!   restricted writer: shown to restricted sessions, never injected into
+//!   the operator's, and its rewrite of an unverified record leaves it
+//!   unverified. Nothing in a body sets a record's origin or trust.
+//!
+//! A record id is looked up within the instance's memory: an id from
+//! elsewhere is a 404.
+//!
+//! # Whose records
+//!
+//! A repository's records are its project's, shared by its worktrees and
+//! subdirectories. A directory that is not a repository has no project of
+//! its own — all of them are the project `global` — so there the key is the
+//! request's directory as the allowlist resolved it
+//! ([`RequestDirectory`]): a token confined to one directory lists, reads,
+//! searches, changes and deletes that directory's records, and
+//! `/memory/session` reads that directory's sessions. `scope: "global"` is
+//! the user asking for one memory across everything, and is that.
+//!
+//! A `global` record with no directory (saved before this, with no session
+//! to tell where) is no directory's. The `/memory/unattributed` routes are
+//! the operator's — Basic auth or an `admin` token, the same line that
+//! makes a write the user's own act — to list them, file one under a
+//! directory, or delete it.
+
+use std::sync::Arc;
+
+use axum::extract::{Path, State};
+use axum::http::Uri;
+use axum::routing::get;
+use axum::{Json, Router};
+use serde::Deserialize;
+use serde_json::{json, Value};
+
+use alforria_core::memory::{
+    ListQuery, MemoryError, MemoryHit, MemoryPatch, MemoryRecord, MemoryService, Provenance,
+};
+use alforria_core::CoreError;
+
+use crate::bearer::Principal;
+use crate::error::{ApiError, ServerError};
+use crate::middleware::auth::query_param;
+use crate::middleware::directory::RequestDirectory;
+use crate::middleware::location::LocationContext;
+use crate::state::ServerContext;
+
+pub fn register(router: Router<Arc<ServerContext>>) -> Router<Arc<ServerContext>> {
+    router
+        .route("/memory", get(list).post(create))
+        .route("/memory/search", get(search))
+        .route("/memory/session", get(search_sessions))
+        .route("/memory/unattributed", get(list_unattributed))
+        .route(
+            "/memory/unattributed/{id}",
+            axum::routing::patch(claim_unattributed).delete(remove_unattributed),
+        )
+        .route("/memory/{id}", get(read).patch(update).delete(remove))
+}
+
+fn memory(
+    ctx: &ServerContext,
+    directory: &RequestDirectory,
+) -> Result<(Arc<MemoryService>, String), ServerError> {
+    located(ctx, directory).map(|(memory, project_id, _)| (memory, project_id))
+}
+
+fn located(
+    ctx: &ServerContext,
+    directory: &RequestDirectory,
+) -> Result<
+    (
+        Arc<MemoryService>,
+        String,
+        Arc<alforria_core::SessionServices>,
+    ),
+    ServerError,
+> {
+    // The directory the auth layer resolved and the allowlist admitted
+    // (`middleware::directory`): a handler never reads it off the request.
+    let directory = directory.0.clone();
+    let services = ctx.instances.load(&directory)?;
+    let location = LocationContext {
+        directory,
+        workspace_id: None,
+        services: services.clone(),
+    };
+    let (memory, project_id) = (ctx.engine_factory)(&location)?.memory().ok_or_else(|| {
+        ServerError::Core(CoreError::Storage(
+            "memory is not available on this engine".to_string(),
+        ))
+    })?;
+    Ok((memory, project_id, services))
+}
+
+/// The policy a credential below `admin` is judged by here.
+///
+/// * With `?session=<id>` it is that session's
+///   (`SessionStore::policy`): its agent's rules, its own, and its
+///   ceilings — what a turn there would meet with the tool. The session
+///   must be one of this directory's that the caller may act in; one that
+///   is not there reads as missing.
+/// * With no session it is the default agent's policy, the host's ceiling
+///   included: what a session the caller creates now starts from, since
+///   such a session has no rules or ceilings of its own (a credential
+///   below `admin` cannot give it any).
+///
+/// `None` when there is no agent to judge by: nothing is allowed.
+fn caller_policy(
+    ctx: &ServerContext,
+    services: &alforria_core::SessionServices,
+    directory: &RequestDirectory,
+    uri: &Uri,
+) -> Result<Option<alforria_core::tool::permission::Policy>, ServerError> {
+    let Some(session_id) = query_param(uri.query(), "session") else {
+        return Ok(services
+            .agents
+            .default_info()
+            .ok()
+            .map(|agent| agent.permission));
+    };
+    let not_found = || {
+        memory_error(MemoryError::NotFound(format!(
+            "session not found: {session_id}"
+        )))
+    };
+    let session = services
+        .sessions
+        .get(&session_id)
+        .map_err(|_| not_found())?;
+    if std::path::Path::new(&session.directory) != directory.0.as_path() {
+        return Err(not_found());
+    }
+    crate::confine::may_act_on(ctx, &session_id)
+        .map_err(|message| ServerError::Api(ApiError::Forbidden { message }))?;
+    let agent = match session.agent.as_deref() {
+        Some(name) => services.agents.get(name).cloned(),
+        None => services.agents.default_info().ok(),
+    };
+    Ok(agent.map(|agent| services.sessions.policy(&session_id, &agent.permission)))
+}
+
+/// Who is writing, and whether it may: the operator freely, a credential
+/// below `admin` when the rules it is judged by ([`caller_policy`]) allow
+/// `permission` for `pattern` outright (see the module docs).
+fn writer(
+    ctx: &ServerContext,
+    directory: &RequestDirectory,
+    principal: &Option<axum::Extension<Principal>>,
+    uri: &Uri,
+    permission: &str,
+    pattern: &str,
+) -> Result<(Arc<MemoryService>, String, Provenance), ServerError> {
+    let (memory, project_id, services) = located(ctx, directory)?;
+    if !crate::confine::restricted(principal) {
+        return Ok((memory, project_id, Provenance::api()));
+    }
+    let allowed = caller_policy(ctx, &services, directory, uri)?.is_some_and(|policy| {
+        policy.evaluate(permission, pattern).action
+            == alforria_schema::permission_v1::PermissionV1Action::Allow
+    });
+    if !allowed {
+        return Err(ServerError::Api(ApiError::Forbidden {
+            message: format!(
+                "the `{permission}` permission does not allow `{pattern}` outright here, and \
+                 nobody can be asked for an HTTP call: this needs the admin scope"
+            ),
+        }));
+    }
+    Ok((memory, project_id, Provenance::client()))
+}
+
+fn memory_error(error: MemoryError) -> ServerError {
+    let message = error.to_string();
+    match error {
+        MemoryError::Disabled => ServerError::Api(ApiError::Forbidden {
+            message: "memory is disabled: set `memory.enabled` to true in the config".to_string(),
+        }),
+        MemoryError::Invalid(_) => ServerError::Api(ApiError::InvalidRequest {
+            message,
+            kind: None,
+            field: None,
+        }),
+        MemoryError::Forbidden(_) => ServerError::Api(ApiError::Forbidden { message }),
+        MemoryError::NotFound(_) => ServerError::Api(ApiError::not_found(message)),
+        MemoryError::Failed(_) => ServerError::Core(CoreError::Storage(message)),
+    }
+}
+
+fn flag(uri: &Uri, name: &str) -> bool {
+    matches!(
+        query_param(uri.query(), name).as_deref(),
+        Some("true" | "1")
+    )
+}
+
+fn number(uri: &Uri, name: &str) -> Option<usize> {
+    query_param(uri.query(), name).and_then(|value| value.parse().ok())
+}
+
+fn query_text(uri: &Uri) -> Result<String, ServerError> {
+    query_param(uri.query(), "q")
+        .or_else(|| query_param(uri.query(), "query"))
+        .ok_or_else(|| memory_error(MemoryError::Invalid("search needs `?q=`".to_string())))
+}
+
+async fn list(
+    State(ctx): State<Arc<ServerContext>>,
+    uri: Uri,
+    axum::Extension(directory): axum::Extension<RequestDirectory>,
+) -> Result<Json<Vec<MemoryRecord>>, ServerError> {
+    crate::routes::blocking(move || {
+        let (memory, _) = memory(&ctx, &directory)?;
+        memory
+            .list(&ListQuery {
+                kind: query_param(uri.query(), "kind"),
+                archived: flag(&uri, "archived"),
+                limit: number(&uri, "limit"),
+                offset: number(&uri, "offset").unwrap_or(0),
+                verified_only: false,
+            })
+            .map(Json)
+            .map_err(memory_error)
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct CreateBody {
+    content: String,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    metadata: Option<Value>,
+}
+
+async fn create(
+    State(ctx): State<Arc<ServerContext>>,
+    principal: Option<axum::Extension<Principal>>,
+    uri: Uri,
+    axum::Extension(directory): axum::Extension<RequestDirectory>,
+    Json(body): Json<CreateBody>,
+) -> Result<Json<MemoryRecord>, ServerError> {
+    crate::routes::blocking(move || {
+        let (memory, _, by) = writer(&ctx, &directory, &principal, &uri, "memory", "remember")?;
+        memory
+            .remember_from(body.kind.as_deref(), &body.content, body.metadata, by)
+            .map(Json)
+            .map_err(memory_error)
+    })
+    .await
+}
+
+async fn search(
+    State(ctx): State<Arc<ServerContext>>,
+    uri: Uri,
+    axum::Extension(directory): axum::Extension<RequestDirectory>,
+) -> Result<Json<Vec<MemoryHit>>, ServerError> {
+    crate::routes::blocking(move || {
+        let (memory, _) = memory(&ctx, &directory)?;
+        let query = query_text(&uri)?;
+        memory
+            .search(
+                &query,
+                query_param(uri.query(), "kind").as_deref(),
+                flag(&uri, "archived"),
+                number(&uri, "limit").unwrap_or(20),
+            )
+            .map(Json)
+            .map_err(memory_error)
+    })
+    .await
+}
+
+async fn search_sessions(
+    State(ctx): State<Arc<ServerContext>>,
+    principal: Option<axum::Extension<Principal>>,
+    uri: Uri,
+    axum::Extension(directory): axum::Extension<RequestDirectory>,
+) -> Result<Json<Value>, ServerError> {
+    // The tool asks for `session_search` before it reads other sessions.
+    let (memory, project_id, _) =
+        writer(&ctx, &directory, &principal, &uri, "session_search", "*")?;
+    let query = query_text(&uri)?;
+    let limit = number(&uri, "limit").unwrap_or(20);
+    // The search may index a backlog first: keep it off the runtime.
+    let (hits, indexing) = tokio::task::spawn_blocking(move || {
+        memory.search_sessions(&query, limit, None, &project_id)
+    })
+    .await
+    .map_err(|error| ServerError::Core(CoreError::Storage(error.to_string())))?
+    .map_err(memory_error)?;
+    Ok(Json(json!({ "hits": hits, "indexing": indexing })))
+}
+
+async fn read(
+    State(ctx): State<Arc<ServerContext>>,
+    axum::Extension(directory): axum::Extension<RequestDirectory>,
+    Path(id): Path<String>,
+) -> Result<Json<MemoryRecord>, ServerError> {
+    crate::routes::blocking(move || {
+        let (memory, _) = memory(&ctx, &directory)?;
+        memory
+            .get(&id)
+            .map_err(memory_error)?
+            .map(Json)
+            .ok_or_else(|| memory_error(MemoryError::NotFound(format!("memory not found: {id}"))))
+    })
+    .await
+}
+
+async fn update(
+    State(ctx): State<Arc<ServerContext>>,
+    principal: Option<axum::Extension<Principal>>,
+    uri: Uri,
+    axum::Extension(directory): axum::Extension<RequestDirectory>,
+    Path(id): Path<String>,
+    Json(patch): Json<MemoryPatch>,
+) -> Result<Json<MemoryRecord>, ServerError> {
+    crate::routes::blocking(move || {
+        let (memory, _, by) = writer(&ctx, &directory, &principal, &uri, "memory", "update")?;
+        memory
+            .update_by(&id, &patch, &by)
+            .map(Json)
+            .map_err(memory_error)
+    })
+    .await
+}
+
+async fn remove(
+    State(ctx): State<Arc<ServerContext>>,
+    principal: Option<axum::Extension<Principal>>,
+    uri: Uri,
+    axum::Extension(directory): axum::Extension<RequestDirectory>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ServerError> {
+    crate::routes::blocking(move || {
+        let (memory, _, by) = writer(&ctx, &directory, &principal, &uri, "memory", "forget")?;
+        let deleted = memory.forget_by(&id, &by).map_err(memory_error)?;
+        Ok(Json(json!({ "deleted": deleted })))
+    })
+    .await
+}
+
+/// The operator's memory, for the records no directory has. The scope table
+/// asks for `admin` already; the handler does not rely on a table row.
+fn operator(
+    ctx: &ServerContext,
+    directory: &RequestDirectory,
+    principal: &Option<axum::Extension<Principal>>,
+) -> Result<Arc<MemoryService>, ServerError> {
+    if crate::confine::restricted(principal) {
+        return Err(ServerError::Api(ApiError::Forbidden {
+            message: "records that belong to no directory are the operator's: this needs the \
+                      admin scope"
+                .to_string(),
+        }));
+    }
+    memory(ctx, directory).map(|(memory, _)| memory)
+}
+
+async fn list_unattributed(
+    State(ctx): State<Arc<ServerContext>>,
+    principal: Option<axum::Extension<Principal>>,
+    uri: Uri,
+    axum::Extension(directory): axum::Extension<RequestDirectory>,
+) -> Result<Json<Vec<MemoryRecord>>, ServerError> {
+    crate::routes::blocking(move || {
+        operator(&ctx, &directory, &principal)?
+            .list_unattributed(number(&uri, "limit"), number(&uri, "offset").unwrap_or(0))
+            .map(Json)
+            .map_err(memory_error)
+    })
+    .await
+}
+
+async fn claim_unattributed(
+    State(ctx): State<Arc<ServerContext>>,
+    principal: Option<axum::Extension<Principal>>,
+    axum::Extension(directory): axum::Extension<RequestDirectory>,
+    Path(id): Path<String>,
+) -> Result<Json<MemoryRecord>, ServerError> {
+    crate::routes::blocking(move || {
+        operator(&ctx, &directory, &principal)?
+            .claim_unattributed(&id)
+            .map(Json)
+            .map_err(memory_error)
+    })
+    .await
+}
+
+async fn remove_unattributed(
+    State(ctx): State<Arc<ServerContext>>,
+    principal: Option<axum::Extension<Principal>>,
+    axum::Extension(directory): axum::Extension<RequestDirectory>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ServerError> {
+    crate::routes::blocking(move || {
+        let deleted = operator(&ctx, &directory, &principal)?
+            .forget_unattributed(&id)
+            .map_err(memory_error)?;
+        Ok(Json(json!({ "deleted": deleted })))
+    })
+    .await
+}

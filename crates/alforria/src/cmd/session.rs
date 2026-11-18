@@ -30,6 +30,8 @@ impl Pager for ProcessPager {
         let Some((head, args)) = command.split_first() else {
             return Err("empty pager command".to_string());
         };
+        // shell_env: not routed. The user's own pager ($PAGER / less) in the
+        // user's terminal, for a list the user asked for.
         let mut child = std::process::Command::new(head)
             .args(args)
             .stdin(Stdio::piped())

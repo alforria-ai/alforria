@@ -90,8 +90,11 @@ pub struct StdioTransport {
 impl StdioTransport {
     /// `connectLocal` env (index.ts:352-356): the process env, the
     /// `opencode`-command `BUN_BE_BUN` marker, then the configured
-    /// `environment`. `directory` is the `roots` capability root
-    /// (index.ts:77-79).
+    /// `environment`. The process env goes through the shell environment
+    /// policy first (`crate::shell_env`): a server gets one of alforria's
+    /// secrets — and, on a restricted server, anything outside the
+    /// allowlist — only when its own `environment` names it. `directory`
+    /// is the `roots` capability root (index.ts:77-79).
     pub async fn spawn(
         command: &str,
         args: &[String],
@@ -99,7 +102,22 @@ impl StdioTransport {
         environment: Option<&BTreeMap<String, String>>,
         directory: &Path,
     ) -> Result<StdioTransport, McpError> {
+        let inherited = crate::shell_env::current().scrubbed_env();
+        Self::spawn_from(command, args, cwd, environment, directory, inherited).await
+    }
+
+    /// [`StdioTransport::spawn`] over `inherited` — what the policy leaves
+    /// of the server's environment — and nothing else of this process's.
+    async fn spawn_from(
+        command: &str,
+        args: &[String],
+        cwd: Option<&Path>,
+        environment: Option<&BTreeMap<String, String>>,
+        directory: &Path,
+        inherited: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    ) -> Result<StdioTransport, McpError> {
         let mut command_builder = tokio::process::Command::new(command);
+        command_builder.env_clear().envs(inherited);
         command_builder
             .args(args)
             .current_dir(cwd.unwrap_or_else(|| Path::new(".")))
@@ -423,6 +441,121 @@ pub fn initialize_params() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stdio server inherits the environment minus the denied names, and
+    /// gets a denied one only when its own `environment` supplies it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_servers_do_not_inherit_denied_secrets() {
+        std::env::set_var("OPENCODE_SERVER_PASSWORD", "hunter2");
+        std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-leak");
+        std::env::set_var("MCPENVTEST_PLAIN", "visible");
+        let dir = std::env::temp_dir().join(format!("alforria-mcp-env-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut environment = BTreeMap::new();
+        environment.insert("ANTHROPIC_API_KEY".to_string(), "sk-configured".to_string());
+        let transport = StdioTransport::spawn(
+            "sh",
+            &["-c".to_string(), "env > env.txt; cat".to_string()],
+            Some(&dir),
+            Some(&environment),
+            &dir,
+        )
+        .await
+        .unwrap();
+        let mut env = String::new();
+        for _ in 0..200 {
+            env = std::fs::read_to_string(dir.join("env.txt")).unwrap_or_default();
+            if env.contains("MCPENVTEST_PLAIN") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        transport.close().await;
+        assert!(env.contains("MCPENVTEST_PLAIN=visible"), "{env}");
+        assert!(!env.contains("hunter2"), "{env}");
+        assert!(!env.contains("sk-ant-leak"), "{env}");
+        assert!(env.contains("ANTHROPIC_API_KEY=sk-configured"), "{env}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// On a restricted server (bearer auth, or the host switch) a stdio
+    /// server starts from the allowlist like a shell does: the user's
+    /// credentials and whatever else the server process holds stay behind,
+    /// and the server's own configured `environment` is still passed —
+    /// that is how a host hands it the one token it needs.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_restricted_stdio_server_gets_the_allowlist_and_its_configured_environment() {
+        use crate::shell_env::ShellEnvPolicy;
+        let base: Vec<(std::ffi::OsString, std::ffi::OsString)> = [
+            ("PATH", "/usr/bin:/bin"),
+            ("HOME", "/home/agent"),
+            ("LANG", "C.UTF-8"),
+            ("GITHUB_TOKEN", "ghp-leak"),
+            ("github_token", "ghp-lower-leak"),
+            ("AWS_ACCESS_KEY_ID", "aws-leak"),
+            ("PGPASSWORD", "pg-leak"),
+            ("DATABASE_URL", "postgres://user:url-leak@db/app"),
+            ("OPENAI_API_KEY", "sk-leak"),
+            ("ACME_GATEWAY_AUTH", "provider-leak"),
+            ("MCP_UNLISTED", "unlisted-leak"),
+            ("MCP_ALLOWED", "allowed"),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.into(), value.into()))
+        .collect();
+        let info = serde_json::from_value(serde_json::json!({ "allow": ["MCP_ALLOWED"] })).unwrap();
+        let mut policy = ShellEnvPolicy::from_config(Some(&info)).restricted(true);
+        policy.deny_names(["ACME_GATEWAY_AUTH"]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut environment = BTreeMap::new();
+        environment.insert("GITHUB_TOKEN".to_string(), "ghp-configured".to_string());
+        environment.insert("MCP_CONFIGURED".to_string(), "configured".to_string());
+        let transport = StdioTransport::spawn_from(
+            "sh",
+            &[
+                "-c".to_string(),
+                "env > env.tmp; mv env.tmp env.txt; cat".to_string(),
+            ],
+            Some(dir.path()),
+            Some(&environment),
+            dir.path(),
+            policy.scrubbed_env_from(base),
+        )
+        .await
+        .unwrap();
+        let mut dump = String::new();
+        for _ in 0..500 {
+            if let Ok(text) = std::fs::read_to_string(dir.path().join("env.txt")) {
+                dump = text;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        transport.close().await;
+        let mut names: Vec<&str> = dump
+            .lines()
+            .filter_map(|line| line.split_once('=').map(|(name, _)| name))
+            // What `sh` sets for itself.
+            .filter(|name| !["PWD", "OLDPWD", "SHLVL", "_"].contains(name))
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "GITHUB_TOKEN",
+                "HOME",
+                "LANG",
+                "MCP_ALLOWED",
+                "MCP_CONFIGURED",
+                "PATH"
+            ]
+        );
+        assert!(dump.contains("GITHUB_TOKEN=ghp-configured"));
+        assert!(!dump.contains("leak"));
+    }
 
     #[test]
     fn sse_response_matches_the_request_id() {

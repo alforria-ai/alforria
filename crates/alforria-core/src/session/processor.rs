@@ -26,7 +26,6 @@ use alforria_llm::schema::errors::{LlmError, LlmErrorReason, ProviderFailureClas
 use alforria_llm::schema::events::{LlmEvent, Usage};
 use alforria_llm::schema::ids::FinishReason;
 use alforria_llm::schema::messages::ToolResultValue;
-use alforria_schema::permission_v1::PermissionV1Ruleset;
 use alforria_schema::session_status::SessionStatusInfo;
 use alforria_schema::session_v1::{
     AssistantError, ReasoningTime, TextPartTime, ToolStateCompletedTime, ToolStateErrorTime,
@@ -102,7 +101,8 @@ pub struct PermissionAsk {
     pub patterns: Vec<String>,
     pub always: Vec<String>,
     pub metadata: Value,
-    pub ruleset: PermissionV1Ruleset,
+    /// The policy the ask is judged by (`tool::permission::Policy`).
+    pub ruleset: crate::tool::permission::Policy,
     pub tool: PermissionAskTool,
 }
 
@@ -566,6 +566,17 @@ fn source_error(error: &LlmError) -> SourceError {
     }
 }
 
+/// The wire error a failed request outside a processor run surfaces as.
+pub(crate) fn assistant_error(error: &LlmError, provider_id: &str) -> AssistantError {
+    from_error(
+        &source_error(error),
+        FromErrorCtx {
+            provider_id: provider_id.to_string(),
+            aborted: false,
+        },
+    )
+}
+
 /// The `APICallError` ai-sdk's `createJsonErrorResponseHandler` builds for
 /// a failed response: the provider's `error.message` when the body parses
 /// (the openai, openai-compatible, anthropic and google error schemas),
@@ -685,6 +696,26 @@ impl Handle {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// alforria extension: a tool's own report of what it opened and
+    /// returned for one call, handed to where the call's result will be
+    /// judged
+    /// (`SessionStore::report_returned_paths`).
+    pub fn report_returned_paths(
+        &self,
+        call_id: &str,
+        tool: &str,
+        input: &Value,
+        paths: crate::tool::outside::ReturnedPaths,
+    ) {
+        self.inner.deps.sessions.report_returned_paths(
+            &self.inner.session_id,
+            call_id,
+            tool,
+            input,
+            paths,
+        );
+    }
+
     /// The assistant message under construction (live: mutations of the
     /// returned clone are not reflected; [`Handle::process`] updates it).
     pub fn message(&self) -> V1Message {
@@ -778,6 +809,19 @@ impl Handle {
         };
         let (input, start) = (input.clone(), time.start);
         let now = self.now_ms();
+        // alforria extension: every tool result is appended here, so this
+        // is where a result that brings outside content marks the session
+        // (`tool::outside`) — before it is stored.
+        inner.deps.sessions.note_tool_result(
+            &call.session_id,
+            &crate::tool::outside::ToolResult {
+                call_id: Some(tool_call_id),
+                tool: tool_name(&part),
+                input: &Value::Object(input.clone()),
+                metadata: Some(&output.metadata),
+                output: &output.output,
+            },
+        )?;
         inner.deps.sessions.update_part(&V1Part::Tool {
             id: call.part_id.clone(),
             session_id: call.session_id.clone(),
@@ -1314,12 +1358,16 @@ impl Handle {
         if !identical {
             return Ok(());
         }
-        let ruleset = inner
-            .deps
-            .agents
-            .get(&agent_name)
-            .map(|agent| agent.permission.clone())
-            .unwrap_or_default();
+        // As the session is held to it (`SessionStore::policy`).
+        let ruleset = inner.deps.sessions.policy(
+            &session_id,
+            &inner
+                .deps
+                .agents
+                .get(&agent_name)
+                .map(|agent| agent.permission.clone())
+                .unwrap_or_default(),
+        );
         let ask = PermissionAsk {
             session_id: session_id.clone(),
             permission: "doom_loop".to_string(),
@@ -1824,6 +1872,25 @@ impl Handle {
             return Ok(false);
         };
         let (input, start, state_metadata) = (input.clone(), time.start, state_metadata(state));
+        // A failure's message is a result too: an MCP server's error text
+        // was written elsewhere. A rejection is the permission system's
+        // own words.
+        if let FailError::Error { message } = &error {
+            inner
+                .deps
+                .sessions
+                .note_tool_result(
+                    &call.session_id,
+                    &crate::tool::outside::ToolResult {
+                        call_id: Some(tool_call_id),
+                        tool: tool_name(&part),
+                        input: &Value::Object(input.clone()),
+                        metadata: None,
+                        output: message,
+                    },
+                )
+                .map_err(storage_failure)?;
+        }
         inner
             .deps
             .sessions

@@ -125,6 +125,8 @@ fn open_browser(url: &str) {
     } else {
         "xdg-open"
     };
+    // shell_env: not routed. `alforria web` opens the user's own browser on
+    // the user's desktop: a fixed opener that needs the session's variables.
     let _ = ProcessCommand::new(program)
         .arg(url)
         .stdin(Stdio::null())
@@ -135,10 +137,16 @@ fn open_browser(url: &str) {
 
 pub fn run(matches: &ArgMatches, ui: &mut Ui, raw: &[OsString]) -> Result<(), TypedError> {
     // Unset means generate one, as `serve` does; an empty value is the
-    // explicit opt-out and gets the warning.
+    // explicit opt-out and gets the warning. With bearer authentication
+    // configured there is neither: the tokens are the access control.
     let env_password = std::env::var("OPENCODE_SERVER_PASSWORD").ok();
-    let generated = serve::generated_password_for(env_password.as_deref());
-    if generated.is_none() && !serve::password_set() {
+    let bearer = serve::bearer_configured();
+    let generated = if bearer {
+        None
+    } else {
+        serve::generated_password_for(env_password.as_deref())
+    };
+    if generated.is_none() && !serve::password_set() && !bearer {
         ui.println(&warning_line());
     }
     let args = NetworkOptions::from_matches(matches);
@@ -146,10 +154,10 @@ pub fn run(matches: &ArgMatches, ui: &mut Ui, raw: &[OsString]) -> Result<(), Ty
     let opts = network::resolve(&args, raw, &config);
     let runtime = super::runtime()?;
     let listener = runtime
-        .block_on(alforria_server::listen(&{
-            let mut listen = opts.listen_options();
-            listen.password = generated.clone();
-            listen
+        .block_on(alforria_server::listen(&alforria_server::ListenOptions {
+            schedule: true,
+            password: generated.clone(),
+            ..opts.listen_options()
         }))
         .map_err(|err| TypedError::Unknown {
             raw: err.to_string(),
@@ -174,8 +182,8 @@ pub fn run(matches: &ArgMatches, ui: &mut Ui, raw: &[OsString]) -> Result<(), Ty
         }
     }
     open_browser(&url);
-    // web.ts:78 `Effect.never` — run until interrupted.
-    runtime.block_on(tokio::signal::ctrl_c()).ok();
+    // web.ts:78 `Effect.never` — run until told to stop.
+    super::serve::run_until_stopped(runtime, listener);
     Ok(())
 }
 

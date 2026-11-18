@@ -12,6 +12,9 @@ pub fn spawn(
     env: Option<&std::collections::BTreeMap<String, String>>,
 ) -> std::io::Result<Handle> {
     let mut command = Command::new(cmd);
+    // A project config can name a server command; it gets the scrubbed
+    // environment, not the server's secrets.
+    crate::shell_env::apply_scrubbed(command.as_std_mut());
     command
         .args(args)
         .current_dir(cwd)

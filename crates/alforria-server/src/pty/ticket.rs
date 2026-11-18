@@ -5,17 +5,18 @@
 //! stored scope (ptyID + directory + workspaceID) matches the request scope
 //! (`ticket.ts:20-56`).
 
-use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use alforria_core::Clock;
 use alforria_schema::pty_ticket::PtyTicketConnectToken;
 
+use crate::ticket::Tickets;
+
 /// `DEFAULT_TTL` (`ticket.ts:9`).
 pub const DEFAULT_TTL: Duration = Duration::from_secs(60);
 /// `CAPACITY` (`ticket.ts:10`).
-pub const CAPACITY: usize = 10_000;
+pub const CAPACITY: usize = crate::ticket::CAPACITY;
 
 /// `Scope` (`ticket.ts:14-18`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,59 +26,27 @@ pub struct Scope {
     pub workspace_id: Option<String>,
 }
 
-#[derive(Debug, Clone)]
-struct Ticket {
-    expires_at_ms: u64,
-    scope: Scope,
-}
-
-#[derive(Default)]
-struct Entries {
-    order: VecDeque<String>,
-    map: HashMap<String, Ticket>,
-}
-
-/// `PtyTicket.Service` — the process-wide single-use connect-ticket cache.
+/// `PtyTicket.Service` — the process-wide single-use connect-ticket cache,
+/// over the scope-generic [`Tickets`] (`crate::ticket`).
 #[derive(Clone)]
 pub struct TicketCache {
     ttl: Duration,
-    clock: Arc<dyn Clock>,
-    entries: Arc<Mutex<Entries>>,
+    tickets: Tickets<Scope>,
 }
 
 impl TicketCache {
     pub fn new(ttl: Duration, clock: Arc<dyn Clock>) -> TicketCache {
         TicketCache {
             ttl,
-            clock,
-            entries: Arc::new(Mutex::new(Entries::default())),
+            tickets: Tickets::new(clock),
         }
     }
 
     /// `issue` (`ticket.ts:43-47`): fresh UUIDv4 ticket, `expires_in` in
     /// seconds (at least 1).
     pub fn issue(&self, scope: Scope) -> PtyTicketConnectToken {
-        let ticket = uuid::Uuid::new_v4().to_string();
-        let now = self.clock.now_ms();
-        let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
-        prune_expired(&mut entries, now);
-        while entries.map.len() >= CAPACITY {
-            if let Some(oldest) = entries.order.pop_front() {
-                entries.map.remove(&oldest);
-            } else {
-                break;
-            }
-        }
-        entries.order.push_back(ticket.clone());
-        entries.map.insert(
-            ticket.clone(),
-            Ticket {
-                expires_at_ms: now + self.ttl.as_millis() as u64,
-                scope,
-            },
-        );
         PtyTicketConnectToken {
-            ticket,
+            ticket: self.tickets.issue(scope, self.ttl),
             expires_in: self.ttl.as_secs().max(1),
         }
     }
@@ -86,28 +55,15 @@ impl TicketCache {
     /// consuming it. The auth middleware lets a ticketed websocket through
     /// only on this (the handler consumes it against the full scope).
     pub fn is_live_for(&self, ticket: &str, pty_id: &str) -> bool {
-        let now = self.clock.now_ms();
-        let entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
-        entries
-            .map
-            .get(ticket)
-            .is_some_and(|stored| stored.expires_at_ms > now && stored.scope.pty_id == pty_id)
+        self.tickets
+            .peek(ticket)
+            .is_some_and(|scope| scope.pty_id == pty_id)
     }
 
     /// `consume` (`ticket.ts:48-50`): removes the ticket iff it is live and
     /// the stored scope matches; a mismatched ticket is *not* consumed.
     pub fn consume(&self, ticket: &str, scope: &Scope) -> bool {
-        let now = self.clock.now_ms();
-        let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
-        prune_expired(&mut entries, now);
-        match entries.map.get(ticket) {
-            Some(stored) if stored.expires_at_ms > now && stored.scope == *scope => {
-                entries.map.remove(ticket);
-                entries.order.retain(|entry| entry != ticket);
-                true
-            }
-            _ => false,
-        }
+        self.tickets.consume(ticket, |stored| stored == scope)
     }
 }
 
@@ -117,22 +73,11 @@ impl Default for TicketCache {
     }
 }
 
-fn prune_expired(entries: &mut Entries, now: u64) {
-    let expired: Vec<String> = entries
-        .map
-        .iter()
-        .filter(|(_, ticket)| ticket.expires_at_ms <= now)
-        .map(|(ticket, _)| ticket.clone())
-        .collect();
-    for ticket in expired {
-        entries.map.remove(&ticket);
-        entries.order.retain(|entry| entry != &ticket);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::sync::Mutex;
 
     struct MutableClock(Mutex<u64>);
 

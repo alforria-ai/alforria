@@ -103,6 +103,7 @@ fn session_error(err: SessionError) -> ServerError {
             message: e.message,
         }
         .into(),
+        SessionError::Refused(message) => ApiError::Forbidden { message }.into(),
         other => defect(other),
     }
 }

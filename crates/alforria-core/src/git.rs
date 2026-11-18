@@ -158,6 +158,11 @@ pub struct SubprocessGit;
 impl GitRunner for SubprocessGit {
     fn run(&self, cwd: Option<&Path>, args: &[&str]) -> GitResult {
         let mut command = Command::new("git");
+        // git runs what a repository's own config and attributes name
+        // (filters, textconv, hooks): files the agent can write. It gets
+        // the environment a config-named helper gets, without the
+        // server's secrets (`shell_env`).
+        crate::shell_env::apply_scrubbed(&mut command);
         // The TS global config (git/index.ts:6-13): no lock contention,
         // raw paths, and quotepath=false so non-ASCII filenames decode.
         command
@@ -279,5 +284,25 @@ mod tests {
             resolve_path(Path::new("/a"), "b/../c"),
             PathBuf::from("/a/c")
         );
+    }
+
+    /// A repository's config can make git run a command (an alias here; a
+    /// filter, a textconv or a hook in a real one). Whatever it runs sees
+    /// the scrubbed environment, not the server's secrets.
+    #[cfg(unix)]
+    #[test]
+    fn git_does_not_hand_the_servers_secrets_to_what_a_repository_runs() {
+        if !which_git() {
+            return;
+        }
+        std::env::set_var("ALFORRIA_GITENVTEST_SECRET", "s3cret-value");
+        std::env::set_var("ALFORRIA_GITENVTEST_PLAIN", "plain-value");
+        let dir = tempfile::tempdir().unwrap();
+        let result = SubprocessGit.run(Some(dir.path()), &["-c", "alias.leak=!env", "leak"]);
+        assert_eq!(result.exit_code, 0, "{}", result.stderr);
+        assert!(result
+            .text
+            .contains("ALFORRIA_GITENVTEST_PLAIN=plain-value"));
+        assert!(!result.text.contains("s3cret-value"), "{}", result.text);
     }
 }

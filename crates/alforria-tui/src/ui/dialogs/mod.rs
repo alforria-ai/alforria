@@ -1655,6 +1655,8 @@ fn describe_os() -> String {
         "linux" => "Linux",
         other => other,
     };
+    // shell_env: not routed. A fixed system tool with a fixed argument, run
+    // by the TUI for its own status dialog.
     let release = std::process::Command::new("uname")
         .arg("-r")
         .output()

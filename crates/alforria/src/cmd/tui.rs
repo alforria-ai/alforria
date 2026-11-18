@@ -52,7 +52,7 @@ fn default_tui_runner(
 ) -> Result<(), TypedError> {
     // `paths.state` (`global.ts:14`): TUI state (pinned sessions, recent
     // models, favorites, prompt history) persists under the XDG state dir.
-    let paths = alforria_core::paths::GlobalPaths::from_env();
+    let paths = tui_boot().paths();
     let state_dir = paths.state.clone();
     let log_file = paths.data.join("log").join("tui.log");
     // Config warnings land in the log, not over the TUI.
@@ -78,6 +78,66 @@ fn default_tui_runner(
         raw: err.to_string(),
     })?;
     Ok(())
+}
+
+/// What the TUI's own server is booted over. The default is the process's:
+/// its global directories, with the trigger scheduler and the restart sweep
+/// on. A test passes a temporary home and turns both off — the bootstrap
+/// used to open (and migrate) the developer's database, sweep its run
+/// markers and start its scheduler from a unit test.
+#[derive(Debug, Clone)]
+pub struct TuiBoot {
+    /// `None` resolves the process's directories (the entry point).
+    pub paths: Option<alforria_core::GlobalPaths>,
+    pub schedule: bool,
+    pub sweep: bool,
+}
+
+impl Default for TuiBoot {
+    fn default() -> Self {
+        TuiBoot {
+            paths: None,
+            schedule: true,
+            sweep: true,
+        }
+    }
+}
+
+impl TuiBoot {
+    /// A boot over `home`, with nothing running in the background.
+    pub fn isolated(home: &Path) -> TuiBoot {
+        TuiBoot {
+            paths: Some(alforria_core::GlobalPaths::resolve_with(
+                home.to_path_buf(),
+                |_| None,
+            )),
+            schedule: false,
+            sweep: false,
+        }
+    }
+
+    fn paths(&self) -> alforria_core::GlobalPaths {
+        // The TUI entry point: the process's own directories.
+        self.paths
+            .clone()
+            .unwrap_or_else(alforria_core::GlobalPaths::from_env)
+    }
+}
+
+thread_local! {
+    static TUI_BOOT: std::cell::RefCell<TuiBoot> = std::cell::RefCell::new(TuiBoot::default());
+}
+
+fn tui_boot() -> TuiBoot {
+    TUI_BOOT.with(|cell| cell.borrow().clone())
+}
+
+/// Boot the TUI's server over `boot` for the duration of `f`.
+pub fn with_tui_boot<T>(boot: TuiBoot, f: impl FnOnce() -> T) -> T {
+    let previous = TUI_BOOT.with(|cell| std::mem::replace(&mut *cell.borrow_mut(), boot));
+    let result = f();
+    TUI_BOOT.with(|cell| *cell.borrow_mut() = previous);
+    result
 }
 
 thread_local! {
@@ -323,15 +383,20 @@ pub fn run(matches: &ArgMatches, ui: &mut Ui, raw: &[OsString]) -> Result<(), Ty
     // network flags bind a real socket. The runtime stays alive for the
     // whole TUI: tasks the server spawns while booting run on it.
     let runtime = super::runtime()?;
+    let boot = tui_boot();
+    let listen_options = alforria_server::ListenOptions {
+        schedule: boot.schedule,
+        sweep: boot.sweep,
+        paths: Some(boot.paths()),
+        // `None` unless the TUI opens its own listener (see above).
+        password: generated.clone(),
+        ..resolved.listen_options()
+    };
     // Held until the TUI exits: dropping it stops the server.
     let mut _listener = None;
     let (target, directory) = if external {
         let listener = runtime
-            .block_on(alforria_server::listen(&{
-                let mut listen = resolved.listen_options();
-                listen.password = generated.clone();
-                listen
-            }))
+            .block_on(alforria_server::listen(&listen_options))
             .map_err(|err| TypedError::Unknown {
                 raw: err.to_string(),
             })?;
@@ -340,7 +405,7 @@ pub fn run(matches: &ArgMatches, ui: &mut Ui, raw: &[OsString]) -> Result<(), Ty
         (TuiTarget::Url(url), None)
     } else {
         let router = runtime
-            .block_on(async { alforria_server::in_process_router(&resolved.listen_options()) })
+            .block_on(async { alforria_server::in_process_router(&listen_options) })
             .map_err(|err| TypedError::Unknown {
                 raw: err.to_string(),
             })?;
@@ -542,6 +607,7 @@ mod tests {
             assert!(status.success(), "the isolated run failed");
             return;
         }
+        let home = tempfile::tempdir().unwrap();
         let before = listening_inodes();
         let matches = parse_args(&[]);
         let (mut ui, _captured) = crate::ui::Ui::capture(false);
@@ -569,9 +635,21 @@ mod tests {
                 *record.lock().unwrap() = Some((status, directory.is_some(), listening_inodes()));
                 Ok(())
             }),
-            || run(&matches, &mut ui, &[]),
+            || {
+                // Over a temporary home: this is the real bootstrap, and
+                // it once opened the developer's database from here.
+                with_tui_boot(TuiBoot::isolated(home.path()), || {
+                    run(&matches, &mut ui, &[])
+                })
+            },
         );
         result.expect("tui run");
+        assert!(
+            home.path()
+                .join(".local/share/alforria/opencode.db")
+                .exists(),
+            "the bootstrap did not use the injected home"
+        );
         let (status, has_directory, during) = seen.lock().unwrap().take().expect("runner ran");
         assert_eq!(status, 200);
         assert!(has_directory, "the in-process TUI is scoped to the cwd");

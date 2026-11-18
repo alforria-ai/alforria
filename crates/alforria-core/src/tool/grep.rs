@@ -108,9 +108,23 @@ fn run(
             _ => ts_dirname(&search),
         };
 
+        // alforria extension: what is walked, and then the files a line
+        // of which is returned, for the session's provenance mark
+        // (`tool::outside`). Both from `cwd`, the variable the walker
+        // gets — not `base` below, which follows the path as requested
+        // and differs when that is, or goes through, a link. The walked
+        // directory is reported before the walk, so a search that fails
+        // is judged by it; a result cut at the limit lists no files.
+        let reported = &ctx.extra.returned_paths;
+        reported.report(&cwd, std::iter::empty::<&str>(), false);
         let result = ripgrep
             .grep(&cwd, &params.pattern, params.include.as_deref(), LIMIT)
             .map_err(ToolError::Failed)?;
+        reported.report(
+            &cwd,
+            result.iter().map(|item| item.path.as_str()),
+            result.len() < LIMIT,
+        );
         if result.is_empty() {
             return empty_result(&params.pattern);
         }

@@ -160,17 +160,35 @@ pub struct OpenAiChatBody {
     pub tool_choice: Option<OpenAiChatToolChoice>,
     pub stream: bool,
     pub stream_options: OpenAiChatStreamOptions,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "alforria_schema::js_number::js_opt_f64"
+    )]
     pub max_tokens: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "alforria_schema::js_number::js_opt_f64"
+    )]
     pub temperature: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "alforria_schema::js_number::js_opt_f64"
+    )]
     pub top_p: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "alforria_schema::js_number::js_opt_f64"
+    )]
     pub frequency_penalty: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "alforria_schema::js_number::js_opt_f64"
+    )]
     pub presence_penalty: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "alforria_schema::js_number::js_opt_f64"
+    )]
     pub seed: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop: Option<Vec<String>>,

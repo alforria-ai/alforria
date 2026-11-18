@@ -224,9 +224,14 @@ pub trait TaskOps: Send + Sync {
     /// `injectBackgroundResult` (task.ts:236-252) — a synthetic text prompt
     /// into the parent session (parent's agent, captured variant),
     /// fire-and-forget (`Effect.ignore`).
+    ///
+    /// alforria extension: `child_session_id` is the subagent whose result
+    /// this is. What it read comes with what it says: the parent gets the
+    /// child's outside-content mark before the text is delivered.
     fn inject_background_result<'a>(
         &'a self,
         parent_session_id: &'a str,
+        child_session_id: &'a str,
         variant: Option<&'a str>,
         text: &'a str,
     ) -> BoxFuture<'a, ()>;
@@ -724,6 +729,7 @@ async fn run(
                     };
                     ops.inject_background_result(
                         &parent_session,
+                        &session_id,
                         variant.as_deref(),
                         &render_output(RenderOutput {
                             session_id: &session_id,
@@ -1034,6 +1040,7 @@ mod tests {
         fn inject_background_result<'a>(
             &'a self,
             _parent_session_id: &'a str,
+            _child_session_id: &'a str,
             _variant: Option<&'a str>,
             _text: &'a str,
         ) -> BoxFuture<'a, ()> {

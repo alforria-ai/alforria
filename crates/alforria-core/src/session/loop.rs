@@ -33,8 +33,11 @@ use crate::session::error::SessionError;
 use crate::session::event_definitions::SESSION_ERROR;
 use crate::session::instruction::Instruction;
 use crate::session::llm::{LlmModel, LlmStream, LlmTool, LlmToolOutput, StreamInput, ToolFailure};
-use crate::session::message::{filter_compacted, latest, MessageStore, WithParts};
-use crate::session::overflow::{is_overflow, IsOverflowInput, ModelLimits};
+use crate::session::message::{latest, MessageStore, WithParts};
+use crate::session::overflow::{
+    estimate_overhead, estimate_request, is_overflow, recorded_tokens, request_budget,
+    IsOverflowInput, ModelLimits, RequestSize,
+};
 use crate::session::processor::{
     AskPermission, Handle as ProcessorHandle, ProcessResult, Processor, ProcessorDeps,
     ProcessorInput, ProcessorModel, SummarySummarize,
@@ -84,6 +87,18 @@ const MAX_OUTPUT_LENGTH_CONTINUES: u32 = 3;
 /// many times a second, forever.
 const MAX_UNFINISHED_RESPONSES: u32 = 3;
 
+/// Compactions in a row with no model response between them. A request that
+/// still does not fit after this many has something in it compaction cannot
+/// shrink (the system prompt, the tools, one enormous message), and trying
+/// again would loop forever.
+const MAX_COMPACTIONS_WITHOUT_PROGRESS: u32 = 3;
+
+/// The stored size of message parts a turn reads back before it stops and
+/// compacts instead. At four bytes a token this is twice the largest context
+/// window any model offers, so a history cut off here could not have been
+/// sent; it bounds what one step holds in memory whatever the session's size.
+pub const HISTORY_WINDOW_BYTES: usize = 8 * 1024 * 1024;
+
 const STRUCTURED_OUTPUT_DESCRIPTION: &str =
     "Use this tool to return your final response in the requested structured format.
 
@@ -113,6 +128,8 @@ pub struct ResolvedModel {
     pub cost: ModelCost,
     pub limits: ModelLimits,
     pub output_token_max: Option<f64>,
+    /// The media the model takes as input.
+    pub media: crate::session::media::MediaSupport,
 }
 
 impl ResolvedModel {
@@ -168,6 +185,12 @@ pub struct CompactionCreate {
 #[derive(Debug, Clone)]
 pub struct CompactionProcess {
     pub messages: Vec<WithParts>,
+    /// Whether `messages` reaches back to the last compaction (or the start
+    /// of the session). When not, the older history is still in the
+    /// database and the service reads it from there, a page at a time.
+    pub complete: bool,
+    /// Stops a compaction that takes several requests between them.
+    pub cancel: CancellationToken,
     pub parent_id: String,
     pub session_id: String,
     pub auto: bool,
@@ -212,6 +235,15 @@ pub trait SystemPrompts: Send + Sync {
         agent: &'a str,
         permission: &'a Option<alforria_schema::permission_v1::PermissionV1Ruleset>,
     ) -> BoxFuture<'a, Option<String>>;
+    /// The `<memory>` block (alforria extension): saved records, read again
+    /// each step like the instruction files. `None` when memory is off or
+    /// empty.
+    ///
+    /// `session_id` is the session the turn runs in: what is shown depends
+    /// on whether it is restricted (`MemoryService::injection_for`).
+    fn memory(&self, _session_id: &str) -> Option<String> {
+        None
+    }
 }
 
 /// No-op default (M5.2 not landed).
@@ -312,6 +344,7 @@ pub async fn run_loop(
     let mut step: u64 = 0;
     let mut length_continues: u32 = 0;
     let mut unfinished_responses: u32 = 0;
+    let mut compactions: u32 = 0;
     let session = deps.sessions.get(session_id)?;
 
     let result: Result<WithParts, LoopError> = loop {
@@ -320,7 +353,18 @@ pub async fn run_loop(
             alforria_schema::session_status::SessionStatusInfo::Busy,
         )?;
 
-        let msgs = filter_compacted(deps.messages.stream_without_diffs(session_id)?);
+        // With auto-compaction off nothing may be left out of the request,
+        // so the whole history is read.
+        let window = deps.messages.window(
+            session_id,
+            if auto_compaction_disabled(&deps.config) {
+                usize::MAX
+            } else {
+                HISTORY_WINDOW_BYTES
+            },
+        )?;
+        let complete = window.complete;
+        let msgs = window.messages;
         let latest = latest(&msgs);
         let last_user = latest.user.clone().ok_or_else(|| {
             LoopError::Unknown(
@@ -378,7 +422,11 @@ pub async fn run_loop(
 
         step += 1;
         if step == 1 {
-            fork_title(deps, session.clone(), msgs.clone(), &last_user);
+            // Only an untitled top-level session gets a title: do not copy
+            // the history for the others.
+            if session.parent_id.is_none() && is_default_title(&session.title) {
+                fork_title(deps, session.clone(), msgs.clone(), &last_user);
+            }
             // TS forks `summary.summarize` at the same step
             // (prompt.ts:1253, after the title fork at :1133), and
             // Effect's cooperative scheduler runs it as soon as the
@@ -427,6 +475,8 @@ pub async fn run_loop(
                     .compaction
                     .process(CompactionProcess {
                         messages: msgs.clone(),
+                        complete,
+                        cancel: cancel.clone(),
                         parent_id: last_user_id.clone(),
                         session_id: session_id.to_string(),
                         auto: *auto,
@@ -438,6 +488,21 @@ pub async fn run_loop(
                 }
                 continue;
             }
+        }
+
+        // More history than can be held, let alone sent: compact it from
+        // the database before anything else.
+        if !complete {
+            if compactions >= MAX_COMPACTIONS_WITHOUT_PROGRESS {
+                fail_context_overflow(deps, session_id)?;
+                break last_assistant(deps, session_id).await;
+            }
+            compactions += 1;
+            tracing::info!("history exceeds the window, compacting first");
+            deps.compaction
+                .create(compaction_create(session_id, &last_user, true, None))
+                .await?;
+            continue;
         }
 
         // Overflow → auto-compaction (prompt.ts:1165-1170).
@@ -453,6 +518,11 @@ pub async fn run_loop(
                     output_token_max: model.output_token_max,
                 })
             {
+                if compactions >= MAX_COMPACTIONS_WITHOUT_PROGRESS {
+                    fail_context_overflow(deps, session_id)?;
+                    break last_assistant(deps, session_id).await;
+                }
+                compactions += 1;
                 deps.compaction
                     .create(compaction_create(session_id, &last_user, true, None))
                     .await?;
@@ -465,7 +535,7 @@ pub async fn run_loop(
             V1Message::User { agent, .. } => agent.clone(),
             _ => return Err(LoopError::Unknown("user message required".to_string())),
         };
-        let Some(agent) = deps.agents.get(&user_agent).cloned() else {
+        let Some(mut agent) = deps.agents.get(&user_agent).cloned() else {
             let available: Vec<String> = deps
                 .agents
                 .list()
@@ -488,6 +558,12 @@ pub async fn run_loop(
                 user_agent, hint
             )));
         };
+        // alforria extension: from here on `agent.permission` is the
+        // session's policy — the agent's, the session's own rules, and the
+        // session's stored ceilings (`SessionStore::policy`).
+        // Everything below reads the agent's rules from here, so the tool
+        // list, every ask and the system prompt agree.
+        agent.permission = deps.sessions.policy(session_id, &agent.permission);
         let max_steps = agent.steps.unwrap_or(f64::INFINITY);
         let is_last_step = step as f64 >= max_steps;
 
@@ -533,7 +609,6 @@ pub async fn run_loop(
             finish: None,
         };
         let assistant_id = crate::session::message::message_id(&assistant).to_string();
-        deps.sessions.update_message(&assistant)?;
 
         let processor = Processor::create(
             ProcessorDeps {
@@ -550,7 +625,7 @@ pub async fn run_loop(
                 clock: deps.clock.clone(),
             },
             ProcessorInput {
-                assistant_message: assistant,
+                assistant_message: assistant.clone(),
                 session_id: session_id.to_string(),
                 model: model.processor_model(),
             },
@@ -581,7 +656,9 @@ pub async fn run_loop(
                 instance: InstanceContext {
                     directory: deps.instance.directory.clone(),
                     worktree: deps.instance.worktree.clone(),
+                    write_guard: None,
                 },
+                protected: deps.agents.protected(),
                 clock: deps.clock.clone(),
                 mcp: deps.mcp_tools.clone(),
                 truncate: deps.truncate.clone(),
@@ -598,6 +675,9 @@ pub async fn run_loop(
                     bypass_agents,
                     prompt_ops: deps.prompt_ops.clone(),
                     cancel: cancel.clone(),
+                    // The session's floor: with the guard its bash tool
+                    // gets the restricted shell environment too.
+                    guard_loader_paths: deps.sessions.runs_restricted(&session.id),
                 },
             )
             .await?;
@@ -624,14 +704,62 @@ pub async fn run_loop(
             if let Some(skills) = deps.systems.skills(&agent.name).await {
                 system.push(skills);
             }
+            // Last, so a new memory does not unsettle the prefix before it.
+            let mut memory_block = 0usize;
+            if let Some(memory) = deps.systems.memory(session_id) {
+                memory_block = memory.len();
+                system.push(memory);
+            }
             if json_schema_format {
                 system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT.to_string());
             }
 
             let mut model_messages = to_model_messages(&msgs, &model.render(), None);
+            // An image the model cannot read would be dropped by the
+            // provider without a word: say so in its place, and tell the
+            // client.
+            let omitted =
+                crate::session::media::omit_unreadable_media(&mut model_messages, &model.media);
+            crate::session::media::surface_omitted_media(
+                &deps.sessions,
+                &deps.events,
+                &crate::session::media::MediaRequest {
+                    session_id,
+                    provider_id: &model.llm.provider_id,
+                    model_id: &model.llm.id,
+                    history: &msgs,
+                    support: &model.media,
+                },
+                &omitted,
+            )?;
             if is_last_step {
                 model_messages.push(Message::assistant(MAX_STEPS_PROMPT));
             }
+
+            // Size the request before sending it: a session whose history
+            // no provider has counted (imported, or never compacted) would
+            // otherwise go out whole.
+            if compactions == 0
+                && request_overflows(
+                    deps,
+                    &model,
+                    latest.finished.as_ref(),
+                    &msgs,
+                    &model_messages,
+                    &FixedPart {
+                        system: &system,
+                        tools: &tools,
+                        memory_block,
+                    },
+                )
+            {
+                compactions += 1;
+                deps.compaction
+                    .create(compaction_create(session_id, &last_user, true, None))
+                    .await?;
+                continue;
+            }
+            deps.sessions.update_message(&assistant)?;
 
             let result = processor
                 .process(
@@ -702,6 +830,11 @@ pub async fn run_loop(
                                 _ => None,
                             };
                             deps.instruction.clear(&assistant_id);
+                            if compactions >= MAX_COMPACTIONS_WITHOUT_PROGRESS {
+                                fail_context_overflow(deps, session_id)?;
+                                break last_assistant(deps, session_id).await;
+                            }
+                            compactions += 1;
                             deps.compaction
                                 .create(compaction_create(
                                     session_id,
@@ -713,6 +846,7 @@ pub async fn run_loop(
                             Outcome::Continue
                         }
                         ProcessResult::Continue => {
+                            compactions = 0;
                             deps.instruction.clear(&assistant_id);
                             let called_tools = deps
                                 .messages
@@ -812,6 +946,109 @@ fn append_output_length_continue(
 // -------------------------------------------------------------------------
 // Helpers
 // -------------------------------------------------------------------------
+
+/// The part of a request that is not conversation.
+struct FixedPart<'a> {
+    system: &'a [String],
+    tools: &'a [LlmTool],
+    /// The size of the `<memory>` block within `system`, in bytes.
+    memory_block: usize,
+}
+
+/// Whether the request about to be sent is larger than the model can take.
+/// The newest finished response's recorded tokens count for everything
+/// before it; what no provider has counted is estimated from its size.
+fn request_overflows(
+    deps: &LoopDeps,
+    model: &ResolvedModel,
+    finished: Option<&V1Message>,
+    msgs: &[WithParts],
+    model_messages: &[Message],
+    fixed: &FixedPart<'_>,
+) -> bool {
+    let FixedPart {
+        system,
+        tools,
+        memory_block,
+    } = *fixed;
+    if auto_compaction_disabled(&deps.config) {
+        return false;
+    }
+    let budget = request_budget(&deps.config, &model.limits, model.output_token_max);
+    // The response's own count is only good while the history it counted is
+    // still what gets sent: a summary replaces that history.
+    let anchor = finished.and_then(|finished| match finished {
+        V1Message::Assistant {
+            id,
+            summary,
+            tokens,
+            ..
+        } if *summary != Some(true) && recorded_tokens(tokens) > 0.0 => {
+            let index = msgs
+                .iter()
+                .position(|msg| crate::session::message::message_id(&msg.info) == id)?;
+            Some((recorded_tokens(tokens), index))
+        }
+        _ => None,
+    });
+    let estimate = match anchor {
+        Some((recorded, index)) => {
+            let since = to_model_messages(&msgs[index..], &model.render(), None);
+            estimate_request(&RequestSize {
+                recorded: Some(recorded),
+                since: &since,
+                // The recorded count covers the system prompt as it was
+                // then. The `<memory>` block is the one part of it that
+                // grows between two steps (a turn saves a record, another
+                // session does): it is counted again in full, which can
+                // only overstate. A trigger's payload needs nothing of the
+                // kind: it is a part of the user message, in `since`.
+                overhead: crate::session::overflow::conservative_tokens(memory_block),
+            })
+        }
+        None => estimate_request(&RequestSize {
+            recorded: None,
+            since: model_messages,
+            overhead: estimate_overhead(
+                system,
+                tools.iter().map(|tool| {
+                    (
+                        tool.name.as_str(),
+                        tool.description.as_str(),
+                        &tool.input_schema,
+                    )
+                }),
+            ),
+        }),
+    };
+    if estimate < budget {
+        return false;
+    }
+    tracing::info!(estimate, budget, "request would not fit, compacting first");
+    true
+}
+
+fn auto_compaction_disabled(config: &crate::config::schema::Config) -> bool {
+    config.compaction.as_ref().and_then(|c| c.auto) == Some(false)
+}
+
+/// End the turn when compacting keeps not making the request fit.
+fn fail_context_overflow(deps: &LoopDeps, session_id: &str) -> Result<(), LoopError> {
+    let error = AssistantError::ContextOverflow {
+        message: format!(
+            "The request still exceeds the model's context limit after {MAX_COMPACTIONS_WITHOUT_PROGRESS} compactions"
+        ),
+        response_body: None,
+    };
+    deps.events
+        .publish(
+            &SESSION_ERROR,
+            serde_json::json!({ "sessionID": session_id, "error": error }),
+            PublishOptions::default(),
+        )
+        .map_err(SessionError::from)?;
+    Ok(())
+}
 
 /// `compaction.create` input builder (`prompt.ts:1300-1305`).
 #[allow(clippy::too_many_arguments)]
@@ -1191,7 +1428,9 @@ async fn generate_title(deps: &TitleDeps, input: TitleInput) {
             .join("\n");
         vec![Message::user(prompts)]
     } else {
-        to_model_messages(context, &model.render(), None)
+        let mut msgs = to_model_messages(context, &model.render(), None);
+        crate::session::media::omit_unreadable_media(&mut msgs, &model.media);
+        msgs
     };
 
     let mut stream = deps.llm.stream(StreamInput {
@@ -1580,6 +1819,7 @@ mod tests {
                 context_limit: 1000.0,
                 output_limit: 100.0,
                 output_token_max: None,
+                family: None,
             },
             cost: ModelCost {
                 input: 0.0,
@@ -1597,6 +1837,7 @@ mod tests {
                 output: 100.0,
             },
             output_token_max: None,
+            media: Default::default(),
         }
     }
 
@@ -1672,6 +1913,7 @@ mod tests {
         fn inject_background_result<'a>(
             &'a self,
             _parent_session_id: &'a str,
+            _child_session_id: &'a str,
             _variant: Option<&'a str>,
             _text: &'a str,
         ) -> BoxFuture<'a, ()> {
@@ -1753,6 +1995,8 @@ mod tests {
             data_dir: temp.path().to_path_buf(),
             tmp_dir: temp.path().to_path_buf(),
             home: temp.path().to_path_buf(),
+            host_config: None,
+            protected: None,
         };
         let services = crate::session::SessionServices::new(
             Arc::new(crate::storage::Storage::open(temp.path().join("db.sqlite")).unwrap()),
@@ -1894,6 +2138,7 @@ mod tests {
             instance: InstanceContext {
                 directory: h.worktree.clone(),
                 worktree: h.worktree.clone(),
+                write_guard: None,
             },
             experimental_plan_mode: false,
             vcs: false,

@@ -7,6 +7,9 @@
 
 pub mod agent;
 pub mod command;
+pub mod duration;
+pub mod extension;
+pub mod host;
 pub mod precedence;
 pub mod schema;
 pub mod v2_compat;
@@ -18,4 +21,7 @@ pub use precedence::{
     NoopDiscovery,
 };
 pub use schema::Config;
-pub use variable::{substitute, Missing, Source};
+pub use variable::{
+    env_references, interpolate_dollar, interpolate_dollar_final, substitute, HostStrings, Missing,
+    Source,
+};

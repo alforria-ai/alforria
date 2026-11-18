@@ -153,7 +153,7 @@ pub async fn list(
     State(ctx): State<Arc<ServerContext>>,
     axum::Extension(location): axum::Extension<LocationContext>,
 ) -> Result<Response, ServerError> {
-    let config = load_config(&location.directory)?;
+    let config = load_config(&ctx.paths, &location.directory)?;
     Ok(json_ok(list_result(&ctx, &config)?))
 }
 

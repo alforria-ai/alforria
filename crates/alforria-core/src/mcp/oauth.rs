@@ -132,6 +132,11 @@ impl McpBrowser for SystemBrowser {
             };
             match tokio::time::timeout(
                 Duration::from_millis(500),
+                // shell_env: not routed. A fixed desktop opener handed the
+                // authorization URL as an argument, for the person at this
+                // machine; it needs the desktop session's variables and runs
+                // nothing the agent or a config names. A failure to open is
+                // reported with the URL.
                 tokio::process::Command::new(command)
                     .args(&args)
                     .stdout(std::process::Stdio::null())

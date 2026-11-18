@@ -56,6 +56,8 @@ fn fixture() -> Fixture {
         data_dir: dir.path().to_path_buf(),
         tmp_dir: dir.path().to_path_buf(),
         home: dir.path().to_path_buf(),
+        host_config: None,
+        protected: None,
     };
     let services = Arc::new(SessionServices::new(
         storage.clone(),
@@ -738,6 +740,8 @@ fn git_fixture(_tag: &str) -> Fixture {
         data_dir: dir.path().to_path_buf(),
         tmp_dir: dir.path().to_path_buf(),
         home: dir.path().to_path_buf(),
+        host_config: None,
+        protected: None,
     };
     let services = Arc::new(SessionServices::new(
         storage.clone(),
@@ -757,6 +761,14 @@ fn git_fixture(_tag: &str) -> Fixture {
         Arc::new(EmptyUiBackend),
     );
     ctx.vcs = Arc::new(alforria_server::state::CoreVcs::default());
+    // Worktrees go under the fixture, whatever XDG_DATA_HOME says: the
+    // default is the process's own data directory.
+    ctx.worktree_deps = Arc::new(alforria_server::state::WorktreeDeps {
+        data_dir: dir.path().join("data"),
+        global_bus: ctx.global_bus.clone(),
+        instances: ctx.instances.clone(),
+        projects: ctx.projects.clone(),
+    });
     Fixture {
         _dir: dir,
         ctx: Arc::new(ctx),
@@ -889,7 +901,6 @@ async fn vcs_apply_route_round_trips_and_errors() {
 
 #[tokio::test]
 async fn experimental_worktree_routes() {
-    std::env::set_var("OPENCODE_TEST_HOME", tempfile::tempdir().unwrap().path());
     let f = git_fixture("worktree-routes");
     let router = routes::build_router(f.ctx.clone());
 

@@ -203,7 +203,9 @@ impl SessionSummary {
         if self.deps.config.snapshot == Some(false) {
             return Ok(());
         }
-        let all = self.deps.sessions.messages_without_diffs(session_id)?;
+        // The turn is the user message and what follows it; nothing older
+        // is read, so a step costs the same however long the session is.
+        let all = self.deps.sessions.messages_since(session_id, message_id)?;
         if all.is_empty() {
             return Ok(());
         }

@@ -32,7 +32,7 @@ async fn at_mention_finds_a_file_and_attaches_a_line_range() {
     std::fs::write(repo.join("src/main.rs"), "fn main() {}\n").unwrap();
     std::fs::write(repo.join("README.md"), "hi\n").unwrap();
 
-    let paths = alforria_core::GlobalPaths::resolve(dir.path().to_path_buf());
+    let paths = alforria_core::GlobalPaths::resolve_with(dir.path().to_path_buf(), |_| None);
     let mut ctx = alforria_server::production_context(
         &ListenOptions::default(),
         paths,

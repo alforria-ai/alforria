@@ -185,6 +185,86 @@ pub struct WebSearchEnv {
     pub parallel_api_key: Option<String>,
     pub websearch_provider: Option<String>,
     pub version: String,
+    /// A search backend of alforria's own (`websearch` in the config, or
+    /// LibertAI search). When set it answers every query, and the upstream
+    /// providers are not used.
+    pub backend: Option<HttpSearch>,
+}
+
+/// A plain HTTP search backend (alforria extension).
+///
+/// The contract is LibertAI search's, which is small enough to be anyone's:
+/// `POST <url>` with `{ "query": "...", "max_results": n }` and the
+/// configured headers, answered by
+/// `{ "results": [{ "title", "url", "snippet" }] }`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpSearch {
+    /// What the tool calls itself in titles and metadata.
+    pub id: String,
+    pub label: String,
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+}
+
+/// The LibertAI search endpoint (`libertai search` in the LibertAI CLI).
+pub const LIBERTAI_SEARCH_URL: &str = "https://search.libertai.io/search";
+
+impl HttpSearch {
+    /// LibertAI search, with the libertai provider's API key.
+    pub fn libertai(api_key: &str) -> HttpSearch {
+        HttpSearch {
+            id: "libertai".to_string(),
+            label: "LibertAI Web Search".to_string(),
+            url: LIBERTAI_SEARCH_URL.to_string(),
+            headers: vec![("authorization".to_string(), format!("Bearer {api_key}"))],
+        }
+    }
+
+    async fn search(
+        &self,
+        http: &dyn McpHttpClient,
+        params: &WebSearchParameters,
+    ) -> Result<Option<String>, ToolError> {
+        let limit = params
+            .num_results
+            .map(|n| n.clamp(1.0, 20.0) as u64)
+            .unwrap_or(8);
+        let body = json!({ "query": params.query, "max_results": limit }).to_string();
+        let mut headers = self.headers.clone();
+        headers.push(("content-type".to_string(), "application/json".to_string()));
+        let response = http.post(&self.url, headers, &body).await?;
+        let parsed: Value = serde_json::from_str(&response.body).map_err(|_| {
+            ToolError::Failed("the search backend did not answer with JSON".to_string())
+        })?;
+        let results = parsed
+            .get("results")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut lines = Vec::new();
+        for result in results.iter().take(limit as usize) {
+            let field = |name: &str| {
+                result
+                    .get(name)
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+            };
+            let Some(url) = field("url") else {
+                continue;
+            };
+            lines.push(format!("Title: {}", field("title").unwrap_or(url)));
+            lines.push(format!("URL: {url}"));
+            if let Some(snippet) = field("snippet") {
+                lines.push(format!("Text: {snippet}"));
+            }
+            lines.push(String::new());
+        }
+        if lines.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(lines.join("\n").trim_end().to_string()))
+    }
 }
 
 impl Default for WebSearchEnv {
@@ -194,6 +274,7 @@ impl Default for WebSearchEnv {
             parallel_api_key: std::env::var("PARALLEL_API_KEY").ok(),
             websearch_provider: std::env::var("OPENCODE_WEBSEARCH_PROVIDER").ok(),
             version: "0.1.0".to_string(),
+            backend: None,
         }
     }
 }
@@ -231,6 +312,9 @@ async fn run(
     flags: WebSearchFlags,
     env: WebSearchEnv,
 ) -> Result<ExecuteResult, ToolError> {
+    if let Some(backend) = &env.backend {
+        return run_backend(backend, params, ctx, &*http).await;
+    }
     let provider =
         select_websearch_provider(ctx.session_id, flags, env.websearch_provider.as_deref());
     let label = websearch_provider_label(provider);
@@ -266,6 +350,43 @@ async fn run(
         }),
         title: format!("{label}: {}", params.query),
         metadata: json!({ "provider": provider_value(provider) }),
+        attachments: None,
+    })
+}
+
+/// The same tool over alforria's own backend: same permission, same shape
+/// of result.
+async fn run_backend(
+    backend: &HttpSearch,
+    params: WebSearchParameters,
+    ctx: ToolCtxRef<'_>,
+    http: &dyn McpHttpClient,
+) -> Result<ExecuteResult, ToolError> {
+    ctx.metadata
+        .metadata(crate::tool::def::MetadataInput {
+            title: Some(format!("{} \"{}\"", backend.label, params.query)),
+            metadata: Some(json!({ "provider": backend.id })),
+        })
+        .await?;
+    ctx.ask
+        .ask(AskRequest {
+            permission: "websearch".to_string(),
+            patterns: vec![params.query.clone()],
+            always: vec!["*".to_string()],
+            metadata: json!({
+                "query": params.query,
+                "numResults": params.num_results.map(wire_number),
+                "provider": backend.id,
+            }),
+        })
+        .await?;
+    let result = backend.search(http, &params).await;
+    Ok(ExecuteResult {
+        output: result.ok().flatten().unwrap_or_else(|| {
+            "No search results found. Please try a different query.".to_string()
+        }),
+        title: format!("{}: {}", backend.label, params.query),
+        metadata: json!({ "provider": backend.id }),
         attachments: None,
     })
 }
@@ -403,6 +524,7 @@ mod tests {
             parallel_api_key: None,
             websearch_provider: None,
             version: "1.18.31".to_string(),
+            backend: None,
         }
     }
 
@@ -441,6 +563,93 @@ mod tests {
 
     fn exa_result(text: &str) -> String {
         format!(r#"{{"result":{{"content":[{{"type":"text","text":"{text}"}}]}}}}"#)
+    }
+
+    /// alforria's own backend: one POST in the LibertAI search shape, the
+    /// same permission, results as plain text.
+    #[tokio::test]
+    async fn a_configured_backend_answers_instead_of_the_upstream_providers() {
+        let http = Arc::new(FakeHttp::new(vec![json!({
+            "results": [
+                { "title": "Tides", "url": "https://example.org/tides", "snippet": "High at noon.", "engine": "x" },
+                { "url": "https://example.org/bare" },
+                { "title": "No link" },
+            ],
+            "meta": { "took": 12 },
+        })
+        .to_string()]));
+        let mut e = env();
+        e.backend = Some(HttpSearch::libertai("ltai-key"));
+        // The upstream flags and env choice no longer matter.
+        e.websearch_provider = Some("exa".to_string());
+        let (result, asks, metadata) = call(
+            http.clone(),
+            WebSearchFlags {
+                exa: true,
+                parallel: true,
+            },
+            e,
+            json!({ "query": "tide times", "numResults": 3 }),
+        )
+        .await;
+        let result = result.unwrap();
+        assert_eq!(
+            result.output,
+            "Title: Tides\nURL: https://example.org/tides\nText: High at noon.\n\nTitle: https://example.org/bare\nURL: https://example.org/bare"
+        );
+        assert_eq!(result.title, "LibertAI Web Search: tide times");
+        assert_eq!(result.metadata["provider"], "libertai");
+        assert_eq!(
+            metadata[0].title.as_deref(),
+            Some("LibertAI Web Search \"tide times\"")
+        );
+        assert_eq!(asks.len(), 1);
+        assert_eq!(asks[0].permission, "websearch");
+        assert_eq!(asks[0].patterns, ["tide times"]);
+        let calls = http.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, LIBERTAI_SEARCH_URL);
+        assert!(calls[0]
+            .1
+            .contains(&("authorization".to_string(), "Bearer ltai-key".to_string())));
+        assert_eq!(
+            serde_json::from_str::<Value>(&calls[0].2).unwrap(),
+            json!({ "query": "tide times", "max_results": 3 })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_backend_that_fails_or_finds_nothing_says_so() {
+        let custom = HttpSearch {
+            id: "http".to_string(),
+            label: "Web Search".to_string(),
+            url: "https://search.internal/query".to_string(),
+            headers: vec![("x-team".to_string(), "docs".to_string())],
+        };
+        for body in [
+            r#"{"results":[]}"#.to_string(),
+            "<html>502</html>".to_string(),
+        ] {
+            let http = Arc::new(FakeHttp::new(vec![body]));
+            let mut e = env();
+            e.backend = Some(custom.clone());
+            let (result, _, _) = call(
+                http.clone(),
+                WebSearchFlags::default(),
+                e,
+                json!({ "query": "x" }),
+            )
+            .await;
+            assert_eq!(
+                result.unwrap().output,
+                "No search results found. Please try a different query."
+            );
+            let calls = http.calls.lock().unwrap();
+            assert_eq!(calls[0].0, "https://search.internal/query");
+            assert!(calls[0]
+                .1
+                .contains(&("x-team".to_string(), "docs".to_string())));
+        }
     }
 
     #[test]

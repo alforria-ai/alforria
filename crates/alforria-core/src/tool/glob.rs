@@ -98,19 +98,26 @@ fn run(
         )
         .await?;
 
+        // alforria extension: what is walked, and then the files named in
+        // the result, for the session's provenance mark (`tool::outside`).
+        // Both from `search`, the variable the walker gets. A result cut
+        // at the limit lists no files.
+        let reported = &ctx.extra.returned_paths;
+        reported.report(&search, std::iter::empty::<&str>(), false);
         let files = ripgrep.glob(&search, &params.pattern, LIMIT);
         let truncated = files.len() == LIMIT;
+        let listed: Vec<std::path::PathBuf> = files
+            .iter()
+            .map(|file| ts_resolve(&search, file.to_string_lossy().as_ref()))
+            .collect();
+        reported.report(&search, files.iter(), !truncated);
 
         let mut output: Vec<String> = Vec::new();
         if files.is_empty() {
             output.push("No files found".to_string());
         } else {
-            for file in &files {
-                output.push(
-                    ts_resolve(&search, file.to_string_lossy().as_ref())
-                        .display()
-                        .to_string(),
-                );
+            for file in &listed {
+                output.push(file.display().to_string());
             }
             if truncated {
                 output.push(String::new());

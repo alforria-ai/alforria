@@ -35,6 +35,7 @@ fn test_model() -> ResolvedModel {
             context_limit: 200_000.0,
             output_limit: 100.0,
             output_token_max: None,
+            family: None,
         },
         cost: ModelCost {
             input: 0.0,
@@ -52,6 +53,7 @@ fn test_model() -> ResolvedModel {
             output: 100.0,
         },
         output_token_max: None,
+        media: Default::default(),
     }
 }
 
@@ -360,7 +362,7 @@ struct Server {
 async fn spawn_server(scripts: Vec<Vec<Result<LlmEvent, alforria_llm::LlmError>>>) -> Server {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("repo")).unwrap();
-    let paths = alforria_core::GlobalPaths::resolve(dir.path().to_path_buf());
+    let paths = alforria_core::GlobalPaths::resolve_with(dir.path().to_path_buf(), |_| None);
     let seams = EngineSeams {
         llm: Some(Arc::new(ScriptLlm {
             scripts: std::sync::Mutex::new(scripts),
@@ -368,6 +370,8 @@ async fn spawn_server(scripts: Vec<Vec<Result<LlmEvent, alforria_llm::LlmError>>
         models: Some(Arc::new(FixedModels)),
         input_models: Some(Arc::new(FixedInputModels)),
         share_http: Some(Arc::new(StubShareHttp)),
+        env: alforria_server::engine::no_ambient_env(),
+        ..EngineSeams::default()
     };
     let mut ctx = alforria_server::production_context(&ListenOptions::default(), paths, seams)
         .expect("server context");

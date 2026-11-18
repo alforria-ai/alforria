@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 
 /// `Opts` (`pty.ts:10-16`) — the overrides the caller needs; the backend
-/// layers them over its inherited process environment.
+/// layers them over the environment the host's `shell_env` policy allows.
 pub struct SpawnOpts {
     pub cwd: PathBuf,
     pub env: BTreeMap<String, String>,
@@ -62,6 +62,12 @@ impl SpawnBackend for PortableBackend {
             cmd.arg(arg);
         }
         cmd.cwd(&opts.cwd);
+        // A terminal is a shell the agent's user drives: it starts from the
+        // host's `shell_env` policy, not the server's whole environment.
+        cmd.env_clear();
+        for (key, value) in alforria_core::shell_env::current().shell_env() {
+            cmd.env(key, value);
+        }
         for (key, value) in &opts.env {
             cmd.env(key, value);
         }
@@ -79,7 +85,9 @@ impl SpawnBackend for PortableBackend {
 
         let listeners = Arc::new(Listeners::default());
         spawn_reader(reader, Arc::clone(&listeners));
-        spawn_waiter(child, Arc::clone(&listeners));
+        // The child leads its own session, hence its own process group.
+        let group = alforria_core::process_group::register(pid);
+        spawn_waiter(child, Arc::clone(&listeners), group);
         Ok(Box::new(PortableProc {
             pid,
             master: Mutex::new(pair.master),
@@ -183,12 +191,17 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>, listeners: Arc<Listeners>) {
     });
 }
 
-fn spawn_waiter(mut child: Box<dyn portable_pty::Child + Send + Sync>, listeners: Arc<Listeners>) {
+fn spawn_waiter(
+    mut child: Box<dyn portable_pty::Child + Send + Sync>,
+    listeners: Arc<Listeners>,
+    group: alforria_core::process_group::Registration,
+) {
     std::thread::spawn(move || {
         let exit_code = match child.wait() {
             Ok(status) => Some(u64::from(status.exit_code())),
             Err(_) => None,
         };
+        drop(group);
         listeners.emit_exit(Exit { exit_code });
     });
 }

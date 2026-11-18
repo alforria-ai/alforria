@@ -186,6 +186,7 @@ impl SessionSubtask {
             bypass_agent_check: true,
             bypass_agents: Vec::new(),
             model: None,
+            returned_paths: Default::default(),
         };
         let messages: Vec<Value> = input
             .messages
@@ -197,10 +198,10 @@ impl SessionSubtask {
                 })
             })
             .collect();
-        let ruleset = crate::tool::permission::merge(&[
-            task_agent.permission.as_ref(),
-            input.session.permission.as_ref().unwrap_or(&Vec::new()),
-        ]);
+        let ruleset = self
+            .deps
+            .sessions
+            .policy(&input.session.id, &task_agent.permission);
         let ask = SessionAsk::new(
             self.deps.permission.clone(),
             input.session_id.clone(),

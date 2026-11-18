@@ -288,6 +288,7 @@ pub enum AnthropicToolChoice {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct AnthropicThinking {
     pub r#type: EnabledTag,
+    #[serde(serialize_with = "alforria_schema::js_number::js_f64")]
     pub budget_tokens: f64,
 }
 
@@ -302,12 +303,22 @@ pub struct AnthropicMessagesBody {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<AnthropicToolChoice>,
     pub stream: bool,
+    #[serde(serialize_with = "alforria_schema::js_number::js_f64")]
     pub max_tokens: f64,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "alforria_schema::js_number::js_opt_f64"
+    )]
     pub temperature: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "alforria_schema::js_number::js_opt_f64"
+    )]
     pub top_p: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "alforria_schema::js_number::js_opt_f64"
+    )]
     pub top_k: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_sequences: Option<Vec<String>>,
@@ -1666,7 +1677,7 @@ mod tests {
         let mut request = request();
         request.messages = vec![Message::user("Hi")];
         let body = AnthropicMessages.lower_body(&request).unwrap();
-        assert_eq!(body["max_tokens"], json!(4096.0));
+        assert_eq!(body["max_tokens"], json!(4096));
 
         request.model.defaults = Some(ModelDefaults {
             limits: Some(ModelLimits {
@@ -1678,7 +1689,7 @@ mod tests {
             http: None,
         });
         let body = AnthropicMessages.lower_body(&request).unwrap();
-        assert_eq!(body["max_tokens"], json!(64.0));
+        assert_eq!(body["max_tokens"], json!(64));
 
         request.generation = Some(GenerationOptions {
             max_tokens: Some(8.0),
@@ -1691,7 +1702,7 @@ mod tests {
             stop: None,
         });
         let body = AnthropicMessages.lower_body(&request).unwrap();
-        assert_eq!(body["max_tokens"], json!(8.0));
+        assert_eq!(body["max_tokens"], json!(8));
     }
 
     #[test]
@@ -1735,7 +1746,7 @@ mod tests {
         let body = AnthropicMessages.lower_body(&request).unwrap();
         assert_eq!(
             body["thinking"],
-            json!({"type": "enabled", "budget_tokens": 1024.0})
+            json!({"type": "enabled", "budget_tokens": 1024})
         );
 
         request.provider_options = Some(

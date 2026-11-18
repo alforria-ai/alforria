@@ -1028,9 +1028,10 @@ fn run(
                 &content_new,
             ));
             ask_edit(&ctx, &instance, &file_path, &diff).await?;
-            bom::write_with_dirs(&file_path, &bom::join(&content_new, desired_bom)).await?;
+            bom::write_with_dirs(&instance, &file_path, &bom::join(&content_new, desired_bom))
+                .await?;
             if format_file(&format, &file_str).await {
-                content_new = bom::sync_file(&file_path, desired_bom).await?;
+                content_new = bom::sync_file(&instance, &file_path, desired_bom).await?;
             }
             publish_edited(&events, &file_str).await;
             publish_updated(&events, &file_str, "add").await;
@@ -1066,9 +1067,10 @@ fn run(
             ));
             ask_edit(&ctx, &instance, &file_path, &diff).await?;
 
-            bom::write_with_dirs(&file_path, &bom::join(&content_new, desired_bom)).await?;
+            bom::write_with_dirs(&instance, &file_path, &bom::join(&content_new, desired_bom))
+                .await?;
             if format_file(&format, &file_str).await {
-                content_new = bom::sync_file(&file_path, desired_bom).await?;
+                content_new = bom::sync_file(&instance, &file_path, desired_bom).await?;
             }
             publish_edited(&events, &file_str).await;
             publish_updated(&events, &file_str, "change").await;
@@ -1784,7 +1786,7 @@ mod tests {
             lsp: Some(crate::config::schema::LspInfo::Entries(entries)),
             directory: temp.path().to_path_buf(),
             worktree: temp.path().to_path_buf(),
-            paths: crate::paths::GlobalPaths::resolve(temp.path().to_path_buf()),
+            paths: crate::paths::GlobalPaths::resolve_with(temp.path().to_path_buf(), |_| None),
             events: None,
             flags: crate::lsp::server::Flags::default(),
         };

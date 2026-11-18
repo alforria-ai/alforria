@@ -19,7 +19,7 @@ mod transcript;
 mod wire;
 
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Stdio};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -41,21 +41,10 @@ struct AcpChild {
 
 impl AcpChild {
     fn spawn(env: &Env) -> AcpChild {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_alforria"));
+        // The harness's command: a cleared environment over temporary
+        // home and XDG directories.
+        let mut command = env.command(&["acp", "--port", "0"]);
         command
-            .args(["acp", "--port", "0"])
-            .env("OPENCODE_TEST_HOME", &env.home)
-            .env("PWD", env.project_dir())
-            .env("XDG_CONFIG_HOME", env.home.join(".config"))
-            .env("XDG_DATA_HOME", env.home.join(".local/share"))
-            .env("XDG_CACHE_HOME", env.home.join(".cache"))
-            .env("XDG_STATE_HOME", env.home.join(".local/state"))
-            .env("OPENCODE_MODELS_PATH", &env.models_path)
-            .env("OPENCODE_DISABLE_MODELS_FETCH", "1")
-            .env("LIBERTAI_MODEL_CATALOG_URL", "")
-            .env_remove("OPENCODE_SERVER_PASSWORD")
-            .env_remove("LIBERTAI_API_KEY")
-            .current_dir(env.project_dir())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

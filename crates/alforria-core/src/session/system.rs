@@ -7,7 +7,6 @@
 //! * `mcp` — the `<mcp_instructions>` block (system.ts:121-137).
 
 use crate::session::agents::AgentInfo;
-use crate::tool::permission::{disabled, merge};
 use crate::tool::skill::SkillInfo;
 
 use alforria_schema::permission_v1::PermissionV1Ruleset;
@@ -117,6 +116,194 @@ pub fn provider(api_id: &str, provider_id: &str) -> Vec<String> {
         return vec![PROMPT_META.replace("{{MODEL_NAME}}", name)];
     }
     vec![prompt_for(family).to_string()]
+}
+
+// ---------------------------------------------------------------------------
+// Prompt family hints (alforria extension)
+// ---------------------------------------------------------------------------
+
+/// What a model really is, for models whose id does not say: a provider-side
+/// alias such as `claw-flash`. Keyed by provider id and model id; the value
+/// is a family name ([`family_named`]) or the id of the underlying model.
+///
+/// Process-wide, so it holds only what is the same for every project: the
+/// alias table a provider publishes. What a config declares
+/// (`provider.<id>.models.<name>.family`) is one instance's, and travels on
+/// the model that instance resolves (`LlmModel::family`) — in this table,
+/// one project's config decided the prompt of every other project's model
+/// of the same name.
+static FAMILY_HINTS: std::sync::RwLock<
+    Option<std::collections::HashMap<(String, String), String>>,
+> = std::sync::RwLock::new(None);
+
+/// Record (or, with `None`, forget) the family hint of a model. Set from
+/// the alias table a provider publishes, never from a config.
+pub fn set_family_hint(provider_id: &str, model_id: &str, hint: Option<&str>) {
+    let Ok(mut hints) = FAMILY_HINTS.write() else {
+        return;
+    };
+    let map = hints.get_or_insert_with(Default::default);
+    let key = (provider_id.to_string(), model_id.to_string());
+    match hint.map(str::trim).filter(|hint| !hint.is_empty()) {
+        Some(hint) => {
+            map.insert(key, hint.to_string());
+        }
+        None => {
+            map.remove(&key);
+        }
+    }
+}
+
+pub fn family_hint(provider_id: &str, model_id: &str) -> Option<String> {
+    FAMILY_HINTS
+        .read()
+        .ok()?
+        .as_ref()?
+        .get(&(provider_id.to_string(), model_id.to_string()))
+        .cloned()
+}
+
+/// A prompt family by name, as the config writes it.
+pub fn family_named(name: &str) -> Option<PromptFamily> {
+    Some(match name.to_ascii_lowercase().as_str() {
+        "anthropic" | "claude" => PromptFamily::Anthropic,
+        "astra" => PromptFamily::Astra,
+        "beast" => PromptFamily::Beast,
+        "codex" => PromptFamily::Codex,
+        "deepseek" => PromptFamily::DeepSeek,
+        "default" => PromptFamily::Default,
+        "gemini" => PromptFamily::Gemini,
+        "gpt" | "openai" => PromptFamily::Gpt,
+        "kimi" => PromptFamily::Kimi,
+        "meta" => PromptFamily::Meta,
+        "trinity" => PromptFamily::Trinity,
+        _ => return None,
+    })
+}
+
+/// [`provider`] for a model that may carry a family hint: the hint decides
+/// when there is one (a family name, or an underlying model id classified
+/// like any other); otherwise the API id does, as upstream.
+pub fn provider_for(model_id: &str, api_id: &str, provider_id: &str) -> Vec<String> {
+    provider_for_model(None, model_id, api_id, provider_id)
+}
+
+/// [`provider_for`] for a model as an instance resolved it: what that
+/// instance's config declares the model to be (`declared`,
+/// `LlmModel::family`) comes first, then the provider's published aliases.
+pub fn provider_for_model(
+    declared: Option<&str>,
+    model_id: &str,
+    api_id: &str,
+    provider_id: &str,
+) -> Vec<String> {
+    let declared = declared
+        .map(str::trim)
+        .filter(|hint| !hint.is_empty())
+        .map(String::from);
+    let Some(hint) = declared
+        .or_else(|| family_hint(provider_id, model_id))
+        .or_else(|| family_hint(provider_id, api_id))
+    else {
+        return provider(api_id, provider_id);
+    };
+    match family_named(&hint) {
+        Some(PromptFamily::Meta) | None => provider(&hint, provider_id),
+        Some(named) => vec![prompt_for(named).to_string()],
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Prompt options (alforria extension)
+// ---------------------------------------------------------------------------
+
+/// `prompt.environment`: the `<env>` block as is, none, or one of the
+/// product's own.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum EnvironmentBlock {
+    #[default]
+    Standard,
+    Off,
+    /// Text with `{{directory}}`, `{{worktree}}`, `{{git}}`, `{{platform}}`,
+    /// `{{date}}`, `{{model}}` and `{{provider}}` filled in.
+    Template(String),
+}
+
+/// The fixed additions to the system prompt a product may switch off or
+/// replace (`prompt.*` in the config). The default is upstream's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptOptions {
+    pub environment: EnvironmentBlock,
+    /// The "You are powered by the model named…" line.
+    pub model_identity: bool,
+    /// The skills paragraph when no skill exists ("No skills are currently
+    /// available.").
+    pub empty_skills: bool,
+}
+
+impl Default for PromptOptions {
+    fn default() -> Self {
+        PromptOptions {
+            environment: EnvironmentBlock::Standard,
+            model_identity: true,
+            empty_skills: true,
+        }
+    }
+}
+
+/// [`environment`] under [`PromptOptions`].
+pub fn environment_with(
+    options: &PromptOptions,
+    model: &EnvironmentModel,
+    ctx: &EnvironmentContext,
+    references: Vec<EnvironmentReference>,
+    now_ms: u64,
+) -> Vec<String> {
+    let mut standard = environment(model, ctx, references, now_ms);
+    if options.environment == EnvironmentBlock::Standard && options.model_identity {
+        return standard;
+    }
+    let first = standard.remove(0);
+    let (identity, block) = first.split_once('\n').unwrap_or((first.as_str(), ""));
+    let mut lines = Vec::new();
+    if options.model_identity {
+        lines.push(identity.to_string());
+    }
+    match &options.environment {
+        EnvironmentBlock::Standard => lines.push(block.to_string()),
+        EnvironmentBlock::Off => {}
+        EnvironmentBlock::Template(template) => lines.push(
+            template
+                .replace("{{directory}}", &ctx.directory)
+                .replace("{{worktree}}", &ctx.worktree)
+                .replace("{{git}}", if ctx.vcs { "yes" } else { "no" })
+                .replace("{{platform}}", platform())
+                .replace("{{date}}", &to_date_string(now_ms))
+                .replace("{{model}}", &model.api_id)
+                .replace("{{provider}}", &model.provider_id),
+        ),
+    }
+    let mut out = Vec::new();
+    let head = lines.join("\n");
+    if !head.trim().is_empty() {
+        out.push(head);
+    }
+    // Project references are the project's own and stay.
+    out.extend(standard);
+    out
+}
+
+/// [`skills`] under [`PromptOptions`]: with `empty_skills` off, an instance
+/// with no skill says nothing about skills.
+pub fn skills_with(
+    options: &PromptOptions,
+    agent: &AgentInfo,
+    available: &[SkillInfo],
+) -> Option<String> {
+    if !options.empty_skills && !available.iter().any(|skill| skill.description.is_some()) {
+        return None;
+    }
+    skills(agent, available)
 }
 
 /// The model identity lines of `environment` (system.ts:74-104).
@@ -257,7 +444,7 @@ fn escape_html(value: &str) -> String {
 /// `skills(agent)` (system.ts:107-119): `None` when the `skill` permission
 /// is disabled for the agent.
 pub fn skills(agent: &AgentInfo, available: &[SkillInfo]) -> Option<String> {
-    if disabled(&["skill"], &agent.permission).contains("skill") {
+    if agent.permission.disabled(&["skill"]).contains("skill") {
         return None;
     }
     Some(
@@ -284,8 +471,6 @@ pub fn mcp(
     permission: Option<&PermissionV1Ruleset>,
     items: &[McpInstruction],
 ) -> Option<String> {
-    let empty = PermissionV1Ruleset::new();
-    let ruleset = merge(&[&agent.permission, permission.unwrap_or(&empty)]);
     let instructions: Vec<&McpInstruction> = items
         .iter()
         .filter(|item| {
@@ -293,7 +478,7 @@ pub fn mcp(
                 return true;
             }
             let tools: Vec<&str> = item.tools.iter().map(|t| t.as_str()).collect();
-            disabled(&tools, &ruleset).len() < item.tools.len()
+            agent.permission.disabled_with(&tools, permission).len() < item.tools.len()
         })
         .collect();
     if instructions.is_empty() {
@@ -333,7 +518,7 @@ mod tests {
             top_p: None,
             temperature: None,
             color: None,
-            permission,
+            permission: permission.into(),
             model: None,
             variant: None,
             prompt: None,
@@ -384,6 +569,166 @@ mod tests {
             vec![PROMPT_DEEPSEEK.to_string()]
         );
         assert_eq!(provider("whatever", "x"), vec![PROMPT_DEFAULT.to_string()]);
+    }
+
+    #[test]
+    fn a_family_hint_decides_the_prompt_of_an_alias() {
+        // A provider-side alias says nothing about the model behind it.
+        assert_eq!(
+            provider("claw-flash", "hint-test"),
+            vec![PROMPT_DEFAULT.to_string()]
+        );
+        assert_eq!(
+            provider_for("claw-flash", "claw-flash", "hint-test"),
+            vec![PROMPT_DEFAULT.to_string()]
+        );
+        // The underlying model id is classified like any other id.
+        set_family_hint("hint-test", "claw-flash", Some("deepseek-v4.1-flash"));
+        assert_eq!(
+            provider_for("claw-flash", "claw-flash", "hint-test"),
+            vec![PROMPT_DEEPSEEK.to_string()]
+        );
+        // A family can be named outright, whatever the API id looks like.
+        set_family_hint("hint-test", "house-model", Some("Anthropic"));
+        assert_eq!(
+            provider_for("house-model", "gpt-oss-120b", "hint-test"),
+            vec![PROMPT_ANTHROPIC.to_string()]
+        );
+        // The hint can sit on the API id too, and is per provider.
+        set_family_hint("hint-test", "upstream-id", Some("gemini"));
+        assert_eq!(
+            provider_for("alias", "upstream-id", "hint-test"),
+            vec![PROMPT_GEMINI.to_string()]
+        );
+        assert_eq!(
+            provider_for("claw-flash", "claw-flash", "other-provider"),
+            vec![PROMPT_DEFAULT.to_string()]
+        );
+        set_family_hint("hint-test", "claw-flash", None);
+        assert_eq!(
+            provider_for("claw-flash", "claw-flash", "hint-test"),
+            vec![PROMPT_DEFAULT.to_string()]
+        );
+        // What an instance's config declares comes with the model, ahead of
+        // the published aliases, and is not kept anywhere.
+        set_family_hint("hint-test", "claw-flash", Some("deepseek-v4.1-flash"));
+        assert_eq!(
+            provider_for_model(Some(" gemini "), "claw-flash", "claw-flash", "hint-test"),
+            vec![PROMPT_GEMINI.to_string()]
+        );
+        assert_eq!(
+            provider_for_model(Some(" "), "claw-flash", "claw-flash", "hint-test"),
+            vec![PROMPT_DEEPSEEK.to_string()]
+        );
+        assert_eq!(
+            provider_for("claw-flash", "claw-flash", "hint-test"),
+            vec![PROMPT_DEEPSEEK.to_string()]
+        );
+        set_family_hint("hint-test", "claw-flash", None);
+        assert_eq!(family_named("nonsense"), None);
+    }
+
+    #[test]
+    fn default_prompts_say_alforria() {
+        for family in [
+            PromptFamily::Anthropic,
+            PromptFamily::Astra,
+            PromptFamily::Beast,
+            PromptFamily::Codex,
+            PromptFamily::DeepSeek,
+            PromptFamily::Default,
+            PromptFamily::Gemini,
+            PromptFamily::Gpt,
+            PromptFamily::Kimi,
+            PromptFamily::Meta,
+            PromptFamily::Trinity,
+        ] {
+            let prompt = prompt_for(family).to_lowercase();
+            assert!(!prompt.contains("opencode"), "{family:?}");
+        }
+    }
+
+    #[test]
+    fn the_environment_block_can_be_switched_off_or_replaced() {
+        let model = EnvironmentModel {
+            provider_id: "libertai".to_string(),
+            id: "claw-core".to_string(),
+            api_id: "claw-core".to_string(),
+        };
+        let ctx = EnvironmentContext {
+            directory: "/home/u/assistant".to_string(),
+            worktree: "/".to_string(),
+            vcs: false,
+        };
+        let build =
+            |options: &PromptOptions| environment_with(options, &model, &ctx, Vec::new(), 0);
+        let standard = build(&PromptOptions::default());
+        assert_eq!(standard, environment(&model, &ctx, Vec::new(), 0));
+        assert!(standard[0].starts_with("You are powered by the model named claw-core."));
+        assert!(standard[0].contains("<env>"));
+
+        let off = PromptOptions {
+            environment: EnvironmentBlock::Off,
+            ..Default::default()
+        };
+        assert_eq!(
+            build(&off),
+            ["You are powered by the model named claw-core. The exact model ID is libertai/claw-core"]
+        );
+        let bare = PromptOptions {
+            environment: EnvironmentBlock::Off,
+            model_identity: false,
+            ..Default::default()
+        };
+        assert!(build(&bare).is_empty());
+        let no_identity = PromptOptions {
+            model_identity: false,
+            ..Default::default()
+        };
+        let out = build(&no_identity);
+        assert!(
+            out[0].starts_with("Here is some useful information"),
+            "{out:?}"
+        );
+        assert!(!out[0].contains("powered by"));
+
+        let template = PromptOptions {
+            environment: EnvironmentBlock::Template(
+                "Today is {{date}}. Your files are in {{directory}} ({{platform}}, git: {{git}}). Model {{provider}}/{{model}}.".to_string(),
+            ),
+            model_identity: false,
+            ..Default::default()
+        };
+        assert_eq!(
+            build(&template),
+            [format!(
+                "Today is {}. Your files are in /home/u/assistant ({}, git: no). Model libertai/claw-core.",
+                to_date_string(0),
+                platform()
+            )]
+        );
+        // The project's references are kept whatever the block says.
+        let references = vec![EnvironmentReference {
+            name: "docs".to_string(),
+            path: "/docs".to_string(),
+            description: Some("The handbook".to_string()),
+        }];
+        let out = environment_with(&bare, &model, &ctx, references, 0);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].contains("<available_references>"));
+    }
+
+    #[test]
+    fn the_skills_paragraph_can_be_left_out_when_there_are_no_skills() {
+        let agent = agent_with(Vec::new());
+        let quiet = PromptOptions {
+            empty_skills: false,
+            ..Default::default()
+        };
+        assert!(skills_with(&PromptOptions::default(), &agent, &[])
+            .unwrap()
+            .contains("No skills are currently available."));
+        assert_eq!(skills_with(&quiet, &agent, &[]), None);
     }
 
     #[test]

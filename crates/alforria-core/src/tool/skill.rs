@@ -200,7 +200,7 @@ impl SkillService {
             .map(|v| !v.is_empty() && v != "0")
             .unwrap_or(false)
         {
-            let mut external = vec![".agents".to_string()];
+            let mut external = vec![crate::project_files::AGENTS_DIR.to_string()];
             let claude_disabled = [
                 "OPENCODE_DISABLE_CLAUDE_CODE",
                 "OPENCODE_DISABLE_CLAUDE_CODE_SKILLS",
@@ -212,7 +212,7 @@ impl SkillService {
                     .unwrap_or(false)
             });
             if !claude_disabled {
-                external.push(".claude".to_string());
+                external.push(crate::project_files::CLAUDE_DIR.to_string());
             }
             for dir in &external {
                 let root = input.home.join(dir);

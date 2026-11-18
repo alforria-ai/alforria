@@ -178,6 +178,11 @@ impl WellKnown for HttpWellKnown {
         let Some((head, args)) = command.split_first() else {
             return Err("empty command".to_string());
         };
+        // shell_env: not routed. `alforria providers login <url>` is typed by the
+        // user at their own terminal; the command comes from that URL's
+        // `.well-known/opencode` (upstream's well-known auth) and prints the token
+        // the user asked to store. It runs with the user's environment, as it
+        // does upstream — no agent and no project config is involved.
         let child = std::process::Command::new(head)
             .args(args)
             .stdout(std::process::Stdio::piped())
@@ -218,6 +223,10 @@ impl LoginArgs {
 pub struct LoginDeps<'a> {
     pub auth: &'a FileAuthStore,
     pub catalog: &'a CatalogService,
+    /// The LibertAI account endpoints and session sidecar a sign-in uses.
+    pub endpoints: alforria_core::libertai::auth::Endpoints,
+    /// The source of the built-in LibertAI model list.
+    pub libertai: alforria_core::libertai::LibertaiCatalog,
     pub wellknown: &'a mut dyn WellKnown,
     pub prompter: &'a mut dyn Prompter,
     pub disabled_providers: Vec<String>,
@@ -417,7 +426,9 @@ fn login_libertai_sso(ui: &mut Ui, deps: &mut LoginDeps) -> Result<(), (TypedErr
     let pkce = auth::Pkce::generate();
     let server = auth::CallbackServer::bind().map_err(|err| (cli_error(err.to_string()), false))?;
     let redirect_uri = server.redirect_uri();
-    let url = auth::authorize_url(&pkce, "Alforria", &redirect_uri);
+    let url = deps
+        .endpoints
+        .authorize_url(&pkce, "Alforria", &redirect_uri);
     log_info(ui, "Opening your browser to sign in…");
     log_info(ui, &format!("If it doesn't open, visit:\n  {url}"));
     auth::open_browser(&url);
@@ -437,7 +448,8 @@ fn login_libertai_sso(ui: &mut Ui, deps: &mut LoginDeps) -> Result<(), (TypedErr
         ));
     }
 
-    let created = auth::Endpoints::from_env()
+    let created = deps
+        .endpoints
         .complete_login(&code, &pkce.verifier)
         .map_err(|err| (cli_error(err), stdin_armed))?;
 
@@ -576,7 +588,7 @@ fn login_provider(ui: &mut Ui, deps: &mut LoginDeps, args: &LoginArgs) -> Result
     // `Effect.ignore(modelsDev.refresh(true))` — refresh errors are swallowed.
     deps.catalog.refresh(true);
     let mut catalog = deps.catalog.get().map_err(core_error)?;
-    alforria_core::libertai::merge_builtin_provider(&mut catalog);
+    deps.libertai.merge(&mut catalog);
     let providers = ordered_providers(deps, &catalog);
     let provider = match &args.provider {
         Some(input) => {
@@ -636,6 +648,7 @@ pub fn logout(
     auth: &FileAuthStore,
     catalog: &CatalogService,
     prompter: &mut dyn Prompter,
+    libertai: &alforria_core::libertai::auth::Endpoints,
     arg: Option<&str>,
 ) -> Result<(), TypedError> {
     ui.empty();
@@ -679,7 +692,7 @@ pub fn logout(
         ))));
     };
     if provider == "libertai" {
-        alforria_core::libertai::auth::Endpoints::from_env().logout();
+        libertai.logout();
     }
     auth.remove(&provider).map_err(server_error)?;
     outro(ui, "Logout successful");
@@ -702,7 +715,8 @@ fn config_provider_filters(
         raw: err.to_string(),
     })?;
     let (config, _) = ConfigLoader::new()
-        .load(&LoadParams::new(directory))
+        // The CLI entry point: the process's own directories.
+        .load(&LoadParams::new(directory, GlobalPaths::from_env()))
         .map_err(core_error)?;
     Ok((
         config.disabled_providers.clone().unwrap_or_default(),
@@ -711,13 +725,17 @@ fn config_provider_filters(
 }
 
 pub fn run(matches: &ArgMatches, ui: &mut Ui) -> Result<(), TypedError> {
+    // `alforria auth …` entry point: the process's own directories, handed
+    // to everything below.
     let paths = GlobalPaths::from_env();
+    let endpoints = alforria_core::libertai::auth::Endpoints::from_env_in(&paths);
     let auth = FileAuthStore::new(paths.data.join("auth.json"));
-    let catalog = crate::catalog::catalog_service();
+    let catalog = crate::catalog::catalog_service_in(&paths);
+    let libertai = alforria_core::libertai::LibertaiCatalog::from_env(&paths.cache);
     match matches.subcommand_name() {
         Some("list") => {
             let mut providers = catalog.get().map_err(core_error)?;
-            alforria_core::libertai::merge_builtin_provider(&mut providers);
+            libertai.merge(&mut providers);
             list(
                 ui,
                 &auth,
@@ -734,6 +752,8 @@ pub fn run(matches: &ArgMatches, ui: &mut Ui) -> Result<(), TypedError> {
             let mut deps = LoginDeps {
                 auth: &auth,
                 catalog: &catalog,
+                endpoints: endpoints.clone(),
+                libertai,
                 wellknown: &mut *wellknown,
                 prompter: &mut *prompter,
                 disabled_providers,
@@ -745,7 +765,14 @@ pub fn run(matches: &ArgMatches, ui: &mut Ui) -> Result<(), TypedError> {
             let logout_matches = matches.subcommand_matches("logout").expect("logout");
             let arg = logout_matches.get_one::<String>("provider").cloned();
             let mut prompter: Box<dyn Prompter> = Box::new(StdinPrompter);
-            logout(ui, &auth, &catalog, &mut *prompter, arg.as_deref())
+            logout(
+                ui,
+                &auth,
+                &catalog,
+                &mut *prompter,
+                &endpoints,
+                arg.as_deref(),
+            )
         }
         _ => unreachable!("providers requires a subcommand"),
     }
@@ -869,10 +896,8 @@ mod tests {
     }
 
     fn fixture_catalog(dir: &Path) -> Arc<CatalogService> {
-        // The built-in libertai provider merge must stay deterministic:
-        // empty cache + no fetch → embedded snapshot.
-        std::env::set_var("XDG_CACHE_HOME", dir.join("cache-home"));
-        std::env::set_var("LIBERTAI_MODEL_CATALOG_URL", "");
+        // The built-in libertai provider is deterministic here: the tests
+        // pass `LibertaiCatalog::offline()` (the embedded snapshot).
         let fixture = dir.join("models.json");
         std::fs::write(&fixture, FIXTURE).unwrap();
         let cfg = alforria_core::CatalogConfig {
@@ -902,6 +927,8 @@ mod tests {
         LoginDeps {
             auth,
             catalog,
+            endpoints: alforria_core::libertai::auth::Endpoints::offline(std::path::PathBuf::new()),
+            libertai: alforria_core::libertai::LibertaiCatalog::offline(),
             wellknown,
             prompter,
             disabled_providers: Vec::new(),
@@ -922,7 +949,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         std::env::remove_var("OCPROVIDERS_TEST_ENV_KEY");
         let dir = tempfile::tempdir().unwrap();
-        let paths = GlobalPaths::resolve(PathBuf::from(dir.path()).join("home"));
+        let paths = GlobalPaths::resolve_with(PathBuf::from(dir.path()).join("home"), |_| None);
         let auth = FileAuthStore::new(paths.data.join("auth.json"));
         auth.set("anthropic", serde_json::json!({"type": "api", "key": "sk"}))
             .unwrap();
@@ -1371,7 +1398,15 @@ mod tests {
             let catalog = fixture_catalog(dir.path());
             let mut prompter = ScriptPrompter::new("", "", "");
             let (mut ui, captured) = Ui::capture(false);
-            logout(&mut ui, &auth, &catalog, &mut prompter, Some(input)).unwrap();
+            logout(
+                &mut ui,
+                &auth,
+                &catalog,
+                &mut prompter,
+                &alforria_core::libertai::auth::Endpoints::offline(std::path::PathBuf::new()),
+                Some(input),
+            )
+            .unwrap();
             assert!(auth.all().unwrap().is_empty(), "{input}");
             assert!(captured.stderr().contains("└ Logout successful"), "{input}");
         }
@@ -1386,7 +1421,15 @@ mod tests {
         let catalog = fixture_catalog(dir.path());
         let mut prompter = ScriptPrompter::new("", "", "");
         let (mut ui, _captured) = Ui::capture(false);
-        let err = logout(&mut ui, &auth, &catalog, &mut prompter, Some("nope")).unwrap_err();
+        let err = logout(
+            &mut ui,
+            &auth,
+            &catalog,
+            &mut prompter,
+            &alforria_core::libertai::auth::Endpoints::offline(std::path::PathBuf::new()),
+            Some("nope"),
+        )
+        .unwrap_err();
         assert_eq!(
             crate::error::format_error(&err),
             Some("Unknown configured provider \"nope\"".to_string())
@@ -1401,7 +1444,15 @@ mod tests {
         let catalog = fixture_catalog(dir.path());
         let mut prompter = ScriptPrompter::new("", "", "");
         let (mut ui, captured) = Ui::capture(false);
-        logout(&mut ui, &auth, &catalog, &mut prompter, Some("anthropic")).unwrap();
+        logout(
+            &mut ui,
+            &auth,
+            &catalog,
+            &mut prompter,
+            &alforria_core::libertai::auth::Endpoints::offline(std::path::PathBuf::new()),
+            Some("anthropic"),
+        )
+        .unwrap();
         let stderr = captured.stderr();
         assert!(stderr.contains("│ No credentials found"), "{stderr}");
         assert!(!stderr.contains("└ Logout successful"), "{stderr}");
@@ -1416,7 +1467,15 @@ mod tests {
         let catalog = fixture_catalog(dir.path());
         let mut prompter = ScriptPrompter::new("anthropic", "", "");
         let (mut ui, _captured) = Ui::capture(false);
-        logout(&mut ui, &auth, &catalog, &mut prompter, None).unwrap();
+        logout(
+            &mut ui,
+            &auth,
+            &catalog,
+            &mut prompter,
+            &alforria_core::libertai::auth::Endpoints::offline(std::path::PathBuf::new()),
+            None,
+        )
+        .unwrap();
         assert!(auth.all().unwrap().is_empty());
         assert_eq!(prompter.selects.load(Ordering::SeqCst), 1);
     }

@@ -155,6 +155,8 @@ impl GitCli {
     /// `Git.run` (`git/index.ts:110-132`).
     pub fn run(&self, cwd: &Path, args: &[&str], max_output_bytes: Option<usize>) -> RunResult {
         let mut command = Command::new("git");
+        // See `git::SubprocessGit::run`.
+        crate::shell_env::apply_scrubbed(&mut command);
         command
             .args(CFG)
             .args(args)
@@ -191,6 +193,7 @@ impl GitCli {
     /// `git.applyPatch` (`git/index.ts:322-324`) — needs stdin.
     fn apply_patch(&self, cwd: &Path, patch: &str) -> i32 {
         let mut command = Command::new("git");
+        crate::shell_env::apply_scrubbed(&mut command);
         command
             .args(CFG)
             .args(["apply", "-"])

@@ -58,8 +58,8 @@ pub fn permission_json(permission: &alforria_schema::permission_v1::PermissionV1
 pub fn list(ui: &mut Ui, registry: &AgentRegistry) {
     for agent in sort_agents(registry.list()) {
         ui.write_stdout(&format!("{} ({})\n", agent.name, agent_mode(agent.mode)));
-        let permission =
-            serde_json::to_string_pretty(&agent.permission).unwrap_or_else(|_| "[]".to_string());
+        let permission = serde_json::to_string_pretty(&agent.permission.render())
+            .unwrap_or_else(|_| "[]".to_string());
         let indented = permission
             .lines()
             .map(|line| format!("  {line}"))
@@ -308,7 +308,10 @@ pub fn agent_json(agent: &alforria_core::session::agents::AgentInfo) -> Value {
     if let Some(steps) = agent.steps {
         object.insert("steps".to_string(), json!(steps));
     }
-    object.insert("permission".to_string(), permission_json(&agent.permission));
+    object.insert(
+        "permission".to_string(),
+        permission_json(&agent.permission.render()),
+    );
     out
 }
 
@@ -332,7 +335,7 @@ mod tests {
             top_p: None,
             temperature: None,
             color: None,
-            permission: PermissionV1Ruleset::new(),
+            permission: PermissionV1Ruleset::new().into(),
             model: None,
             variant: None,
             prompt: None,

@@ -457,16 +457,23 @@ pub fn from_request(request: &LlmRequest) -> Result<Value, LlmError> {
     }
     body.insert("stream".into(), json!(true));
     if let Some(max_tokens) = generation.and_then(|options| options.max_tokens) {
-        body.insert("max_output_tokens".into(), json!(max_tokens));
+        body.insert("max_output_tokens".into(), js_number(max_tokens));
     }
     if let Some(temperature) = generation.and_then(|options| options.temperature) {
-        body.insert("temperature".into(), json!(temperature));
+        body.insert("temperature".into(), js_number(temperature));
     }
     if let Some(top_p) = generation.and_then(|options| options.top_p) {
-        body.insert("top_p".into(), json!(top_p));
+        body.insert("top_p".into(), js_number(top_p));
     }
     body.extend(lower_options(request)?);
     Ok(Value::Object(body))
+}
+
+/// A number as `JSON.stringify` writes it: whole values without a fraction.
+/// Some servers reject `"max_output_tokens": 4096.0`.
+fn js_number(value: f64) -> Value {
+    alforria_schema::js_number::js_f64(&value, serde_json::value::Serializer)
+        .unwrap_or_else(|_| json!(value))
 }
 
 // =============================================================================
@@ -1361,7 +1368,7 @@ mod tests {
                 }],
                 "tool_choice": {"type": "function", "name": "get_weather"},
                 "stream": true,
-                "max_output_tokens": 80.0,
+                "max_output_tokens": 80,
             }),
         );
     }

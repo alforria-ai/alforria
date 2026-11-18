@@ -113,11 +113,27 @@ impl PtyService {
     }
 
     /// `create` (`pty.ts:165-244`).
+    ///
+    /// Without a command the shell is the platform default; a server uses
+    /// [`PtyService::create_in`] so the configured one applies.
     pub fn create(&self, input: &PtyCreateInput) -> Result<PtyInfo, ServerError> {
+        self.create_in(input, None)
+    }
+
+    /// [`PtyService::create`], reading the configured shell from the config
+    /// under `paths` (the server context's global paths).
+    pub fn create_in(
+        &self,
+        input: &PtyCreateInput,
+        paths: Option<&alforria_core::GlobalPaths>,
+    ) -> Result<PtyInfo, ServerError> {
         let id = format!("pty_{}", ulid::Ulid::new());
         let command = match input.command.as_deref() {
             Some(command) if !command.is_empty() => command.to_string(),
-            _ => preferred_shell(&self.directory.clone())?,
+            _ => match paths {
+                Some(paths) => preferred_shell(paths, &self.directory.clone())?,
+                None => select_shell(None),
+            },
         };
         let mut args = input.args.clone().unwrap_or_default();
         if is_login_shell(&command) {
@@ -233,6 +249,21 @@ impl PtyService {
             serde_json::json!({ "id": id }),
         );
         Ok(())
+    }
+
+    /// Kill every running terminal (server shutdown). Returns how many
+    /// were still running.
+    pub fn kill_all(&self) -> usize {
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let running: Vec<&Session> = inner
+            .sessions
+            .values()
+            .filter(|session| matches!(session.info.status, PtyStatus::Running))
+            .collect();
+        for session in &running {
+            session.proc.kill();
+        }
+        running.len()
     }
 
     /// `write` (`pty.ts:254-257`).
@@ -480,8 +511,11 @@ fn is_login_shell(file: &str) -> bool {
 
 /// `Shell.preferred(configShell?)` (`shell.ts:205-212`) — the caller passes
 /// the location directory so the configured shell can be resolved.
-fn preferred_shell(directory: &Path) -> Result<String, ServerError> {
-    let config = crate::routes::v1::util::load_config(directory)?;
+fn preferred_shell(
+    paths: &alforria_core::GlobalPaths,
+    directory: &Path,
+) -> Result<String, ServerError> {
+    let config = crate::routes::v1::util::load_config(paths, directory)?;
     Ok(select_shell(config.shell.as_deref()))
 }
 
@@ -608,6 +642,20 @@ impl PtyRegistry {
         });
         entries.insert(key, Arc::clone(&service));
         service
+    }
+}
+
+impl PtyRegistry {
+    /// Kill every running terminal in every location (server shutdown).
+    pub fn kill_all(&self) -> usize {
+        let services: Vec<Arc<PtyService>> = self
+            .entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        services.iter().map(|service| service.kill_all()).sum()
     }
 }
 

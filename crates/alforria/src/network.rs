@@ -87,6 +87,8 @@ impl ResolvedNetworkOptions {
                 Vec::new()
             },
             password: None,
+            schedule: false,
+            ..alforria_server::ListenOptions::default()
         }
     }
 }
@@ -215,6 +217,8 @@ pub fn empty_server_config() -> ServerConfig {
 
 /// `resolveNetworkOptions` (network.ts:56-59): the `Config.getGlobal()` view.
 pub fn global_server_config() -> ServerConfig {
+    // CLI entry point (`serve`/`web`/`acp` flag resolution): the process's
+    // own global config.
     let paths = GlobalPaths::from_env();
     seed_global_config(&paths);
     server_config(&paths)

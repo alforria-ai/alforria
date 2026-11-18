@@ -189,17 +189,13 @@ impl SessionPrompt {
     /// the model waits for results that never arrive or redoes the work.
     /// The note is for the model only and starts no turn.
     pub async fn fork_notice(&self, session_id: &str) -> Result<(), PromptError> {
-        let has_history = !self
-            .deps
-            .services
-            .messages
-            .stream_without_diffs(session_id)?
-            .is_empty();
+        let has_history = self.deps.services.messages.newest(session_id)?.is_some();
         if !has_history {
             return Ok(());
         }
         let agent = self.deps.services.sessions.get(session_id)?.agent.clone();
         self.prompt(PromptInput {
+            caller: crate::session::caller::Caller::Session,
             session_id: session_id.to_string(),
             message_id: None,
             model: None,
@@ -278,6 +274,13 @@ impl SessionPrompt {
     /// `command` (prompt.ts:1361-1481).
     pub async fn command(&self, input: CommandInput) -> Result<WithParts, PromptError> {
         let deps = &self.deps;
+        // Before anything else — `/goal` arms an autonomous loop before it
+        // ever builds a prompt: a caller below `admin` runs commands in
+        // restricted sessions only (`Caller::may_act_on`).
+        input
+            .caller
+            .may_act_on(deps.services.sessions.is_restricted(&input.session_id)?)
+            .map_err(|message| PromptError::Forbidden { message })?;
         if input.command == "goal" {
             return match self.goal_command(&input).await {
                 Ok(Some(turn)) => turn,
@@ -286,10 +289,7 @@ impl SessionPrompt {
                 Ok(None) => deps
                     .services
                     .messages
-                    .stream_without_diffs(&input.session_id)?
-                    // Newest first.
-                    .into_iter()
-                    .next()
+                    .newest(&input.session_id)?
                     .ok_or_else(|| PromptError::Unknown {
                         message: "The session has no messages.".to_string(),
                     }),
@@ -322,40 +322,41 @@ impl SessionPrompt {
         };
         let agent_name = cmd.agent.clone().or_else(|| input.agent.clone());
 
-        // `$N` / `$ARGUMENTS` substitution (prompt.ts:1378-1408).
-        let mut template = substitute_arguments(&cmd.template, &input.arguments);
-
-        // Backtick-shell substitution (prompt.ts:1411-1421).
-        let shell_matches: Vec<String> = bash_regex()
-            .captures_iter(&template)
-            .map(|captures| {
-                captures
-                    .get(1)
-                    .map(|m| m.as_str().to_string())
-                    .unwrap_or_default()
-            })
-            .collect();
-        if !shell_matches.is_empty() {
-            let sh = preferred(deps.config.shell.as_deref());
-            let mut results = Vec::new();
-            for command in &shell_matches {
-                results.push(run_shell_text(&sh, command).await);
-            }
-            let mut replaced = String::new();
-            let mut offset = 0;
-            for captures in bash_regex().captures_iter(&template) {
-                let whole = captures.get(0).expect("whole match");
-                let next = results
-                    .get(captures_count(&template[..whole.start()]))
-                    .cloned()
-                    .unwrap_or_default();
-                replaced.push_str(&template[offset..whole.start()]);
-                replaced.push_str(&next);
-                offset = whole.end();
-            }
-            replaced.push_str(&template[offset..]);
-            template = replaced;
+        // `$N` / `$ARGUMENTS` substitution and backtick-shell substitution
+        // (prompt.ts:1378-1421), in an order upstream does not use.
+        //
+        // Upstream pastes the arguments into the template first and then
+        // runs every `` !`…` `` it finds, so an argument that *contains*
+        // `` !`…` `` — or that lands inside a configured one — is run as
+        // shell, with no permission check. Here the shell spans are taken
+        // from the configured template alone. Each runs as written, with
+        // the arguments handed to the shell as data (`$1`…, `$ARGUMENTS`
+        // are real shell parameters), and the text around them is filled
+        // in one pass. Neither the arguments nor a command's output is
+        // ever scanned again.
+        // A command with inline shell is execution outside the model. The
+        // operator wrote it and may run it; for a caller below `admin`
+        // there is no reading of "the bash permission allows this" that
+        // survives the arguments, so the command is refused whole, before
+        // anything runs.
+        let bounds = input
+            .caller
+            .bounds(deps.services.sessions.is_restricted(&input.session_id)?);
+        if bounds.restricted && bash_regex().is_match(&cmd.template) {
+            let message = format!(
+                "The /{} command runs inline shell, which is not allowed in this session: it needs the admin scope and an unrestricted session.",
+                input.command
+            );
+            publish_error(deps, &input.session_id, &message)?;
+            return Err(PromptError::Forbidden { message });
         }
+        let sh = preferred(deps.config.shell.as_deref());
+        // Inline shell of a session that is restricted or that outside
+        // input started runs in the restricted environment, whatever the
+        // server's posture: the same floor as the session's bash tool.
+        let outside_run = deps.services.sessions.runs_restricted(&input.session_id);
+        let template =
+            expand_command_template(&cmd.template, &input.arguments, &sh, outside_run).await;
         let template = template.trim().to_string();
 
         // Task model resolution (prompt.ts:1423-1433).
@@ -416,7 +417,27 @@ impl SessionPrompt {
             return Err(PromptError::Unknown { message });
         };
 
-        let template_parts = self.resolve_prompt_parts(&template);
+        // The agent this command will run as — configured on the command,
+        // named by the caller, or the default — is the one that is judged.
+        bounds
+            .check_agent(&agent)
+            .map_err(|message| PromptError::Forbidden { message })?;
+
+        // `@file` / `@agent` mentions. For the operator they are resolved
+        // in the expanded text, arguments included (upstream). A caller
+        // below `admin` only supplies text: mentions are resolved in the
+        // operator's template alone, and an `@agent` there does not become
+        // an agent part (which would skip the `task` permission ask).
+        let template_parts = if bounds.restricted {
+            let mut parts = self.resolve_prompt_parts(&cmd.template);
+            parts.retain(|part| !matches!(part, PromptPartInput::Agent { .. }));
+            if let Some(PromptPartInput::Text { text, .. }) = parts.first_mut() {
+                *text = template.clone();
+            }
+            parts
+        } else {
+            self.resolve_prompt_parts(&template)
+        };
         let input_files: Vec<String> = input
             .parts
             .iter()
@@ -511,6 +532,7 @@ impl SessionPrompt {
                 system: None,
                 variant: input.variant.clone(),
                 parts,
+                caller: input.caller,
             })
             .await?;
 
@@ -568,10 +590,7 @@ impl crate::session::task_ops::PromptFacade for SessionPrompt {
                 &self.deps.services.agents,
                 &self.deps.instance.worktree,
                 template,
-                Some(&crate::tool::def::InstanceContext {
-                    directory: self.deps.instance.directory.clone(),
-                    worktree: self.deps.instance.worktree.clone(),
-                }),
+                Some(&self.deps.instance),
             ))
         })
     }
@@ -592,7 +611,9 @@ fn prompt_error(error: PromptError) -> SessionError {
     match error {
         PromptError::Core(error) => error.into(),
         PromptError::Session(error) => error,
-        PromptError::Unknown { message } => crate::CoreError::Storage(message).into(),
+        PromptError::Unknown { message } | PromptError::Forbidden { message } => {
+            crate::CoreError::Storage(message).into()
+        }
     }
 }
 
@@ -609,6 +630,7 @@ fn prompt_deps_snapshot(deps: &SessionPromptDeps) -> PromptDeps<'_> {
         lsp: deps.lsp.as_ref(),
         images: deps.images.as_ref(),
         worktree: deps.instance.worktree.clone(),
+        directory: deps.instance.directory.clone(),
         now_ms: deps.clock.now_ms(),
     }
 }
@@ -727,61 +749,136 @@ fn placeholder_regex() -> &'static regex::Regex {
     PLACEHOLDER.get_or_init(|| regex::Regex::new(r"\$(\d+)").expect("valid placeholder regex"))
 }
 
-/// Fill a command template's `$N` and `$ARGUMENTS` placeholders; when the
-/// template has neither, the arguments are appended.
-fn substitute_arguments(template: &str, arguments: &str) -> String {
-    let args: Vec<String> = match_args(arguments)
-        .iter()
-        .map(|arg| quote_trim(arg))
-        .collect();
+/// How a command's arguments fill its template: worked out once from the
+/// *configured* template, then applied to its text and handed to its inline
+/// shell as parameters.
+struct ArgumentPlan {
+    /// The arguments as typed.
+    raw: String,
+    /// The arguments split and unquoted (`argsRegex` + `quoteTrimRegex`).
+    args: Vec<String>,
+    /// The highest `$N` the template uses; it takes every argument from
+    /// there on.
+    last: u64,
+    /// Whether the template names any argument at all.
+    placed: bool,
+}
 
-    let template_command = template;
-    let mut placeholders: Vec<u64> = Vec::new();
-    let mut last = 0u64;
-    for item in placeholder_regex().find_iter(template_command) {
-        let value: u64 = item
-            .as_str()
-            .get(1..)
-            .and_then(|m| m.parse().ok())
-            .unwrap_or(0);
-        // `$0` is not a positional argument; it stays literal.
-        if value == 0 {
-            continue;
+impl ArgumentPlan {
+    fn new(template: &str, arguments: &str) -> ArgumentPlan {
+        let args: Vec<String> = match_args(arguments)
+            .iter()
+            .map(|arg| quote_trim(arg))
+            .collect();
+        let mut last = 0u64;
+        for item in placeholder_regex().find_iter(template) {
+            let value: u64 = item
+                .as_str()
+                .get(1..)
+                .and_then(|m| m.parse().ok())
+                .unwrap_or(0);
+            // `$0` is not a positional argument; it stays literal.
+            if value > last {
+                last = value;
+            }
         }
-        placeholders.push(value);
-        if value > last {
-            last = value;
+        ArgumentPlan {
+            raw: arguments.to_string(),
+            args,
+            last,
+            placed: last > 0 || template.contains("$ARGUMENTS"),
         }
     }
 
-    // One pass over the template for both `$N` and `$ARGUMENTS`: text the
-    // user typed is inserted exactly once and never re-scanned, so an
-    // argument containing `$1` or `$ARGUMENTS` stays as written.
-    let mut out = substitution_regex()
-        .replace_all(template_command, |captures: &regex::Captures| {
-            let Some(position) = captures.get(1) else {
-                return arguments.to_string();
-            };
-            let position: u64 = position.as_str().parse().unwrap_or(0);
-            if position == 0 {
-                return captures[0].to_string();
-            }
-            let arg_index = (position as usize) - 1;
-            if arg_index >= args.len() {
-                return String::new();
-            }
-            if position == last {
-                args[arg_index..].join(" ")
-            } else {
-                args[arg_index].clone()
-            }
+    /// What `$position` stands for (`position >= 1`).
+    fn positional(&self, position: u64) -> String {
+        let index = (position as usize) - 1;
+        if index >= self.args.len() {
+            String::new()
+        } else if position == self.last {
+            self.args[index..].join(" ")
+        } else {
+            self.args[index].clone()
+        }
+    }
+
+    /// `$1`, `$2`, … as an inline shell command receives them.
+    fn positionals(&self) -> Vec<String> {
+        (1..=self.last)
+            .map(|position| self.positional(position))
+            .collect()
+    }
+
+    /// Fill the placeholders in a stretch of template text. One pass for
+    /// both `$N` and `$ARGUMENTS`: text the user typed is inserted exactly
+    /// once and never re-scanned, so an argument containing `$1` or
+    /// `$ARGUMENTS` stays as written.
+    fn fill(&self, text: &str) -> String {
+        substitution_regex()
+            .replace_all(text, |captures: &regex::Captures| {
+                let Some(position) = captures.get(1) else {
+                    return self.raw.clone();
+                };
+                let position: u64 = position.as_str().parse().unwrap_or(0);
+                if position == 0 {
+                    return captures[0].to_string();
+                }
+                self.positional(position)
+            })
+            .into_owned()
+    }
+
+    /// A template that names no argument gets them appended.
+    fn append_unplaced(&self, out: &mut String) {
+        if !self.placed && !self.raw.trim().is_empty() {
+            out.push_str("\n\n");
+            out.push_str(&self.raw);
+        }
+    }
+}
+
+/// Expand a configured command template with the arguments a caller typed:
+/// fill `$N` / `$ARGUMENTS` in its text and replace each inline shell span
+/// with the command's output.
+///
+/// Only shell the *template* contains ever runs, exactly as the template
+/// has it. Arguments reach it as shell parameters, and neither they nor a
+/// command's output are scanned for `` !`…` `` or placeholders afterwards.
+async fn expand_command_template(
+    template: &str,
+    arguments: &str,
+    shell: &str,
+    outside_run: bool,
+) -> String {
+    let plan = ArgumentPlan::new(template, arguments);
+    let spans: Vec<(std::ops::Range<usize>, &str)> = bash_regex()
+        .captures_iter(template)
+        .map(|captures| {
+            let whole = captures.get(0).expect("whole match");
+            let command = captures.get(1).map(|m| m.as_str()).unwrap_or_default();
+            (whole.range(), command)
         })
-        .into_owned();
-    let uses_arguments_placeholder = template_command.contains("$ARGUMENTS");
-
-    if placeholders.is_empty() && !uses_arguments_placeholder && !arguments.trim().is_empty() {
-        out = format!("{out}\n\n{arguments}");
+        .collect();
+    let mut out = String::new();
+    let mut offset = 0;
+    for (range, command) in spans {
+        out.push_str(&plan.fill(&template[offset..range.start]));
+        out.push_str(&run_shell_text(shell, command, &plan, outside_run).await);
+        offset = range.end;
     }
+    out.push_str(&plan.fill(&template[offset..]));
+    plan.append_unplaced(&mut out);
+    out
+}
+
+/// Fill a command template's `$N` and `$ARGUMENTS` placeholders; when the
+/// template has neither, the arguments are appended. (A template with
+/// inline shell is expanded piecewise in `SessionPrompt::command`.)
+#[cfg(test)]
+fn substitute_arguments(template: &str, arguments: &str) -> String {
+    let plan = ArgumentPlan::new(template, arguments);
+    let mut out = plan.fill(template);
+    plan.append_unplaced(&mut out);
     out
 }
 
@@ -812,12 +909,6 @@ fn quote_trim(arg: &str) -> String {
     quote_trim_regex().replace_all(arg, "").into_owned()
 }
 
-/// How many `!`...`` backtick matches precede `offset` bytes of the
-/// template — the index of the next shell substitution.
-fn captures_count(template: &str) -> usize {
-    bash_regex().find_iter(template).count()
-}
-
 /// `Shell.preferred` (core/shell.ts:205-208) — config value, else
 /// `$SHELL`, else the platform default.
 fn preferred(config_shell: Option<&str>) -> String {
@@ -830,11 +921,24 @@ fn preferred(config_shell: Option<&str>) -> String {
 }
 
 /// `Process.text([cmd], { shell: sh, nothrow: true }).text` — stdout of
-/// `sh -c cmd`.
-async fn run_shell_text(shell: &str, command: &str) -> String {
-    tokio::process::Command::new(shell)
+/// `sh -c cmd`, the command exactly as the template has it. The command's
+/// arguments reach it as shell parameters (`$1`…, and `ARGUMENTS` in the
+/// environment), never as shell source.
+async fn run_shell_text(
+    shell: &str,
+    command: &str,
+    plan: &ArgumentPlan,
+    outside_run: bool,
+) -> String {
+    let mut process = tokio::process::Command::new(shell);
+    crate::shell_env::apply_shell_for(process.as_std_mut(), outside_run);
+    process
         .arg("-c")
         .arg(command)
+        // `$0`, as it would be without parameters.
+        .arg(shell)
+        .args(plan.positionals())
+        .env("ARGUMENTS", &plan.raw)
         .output()
         .await
         .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
@@ -856,7 +960,7 @@ pub struct ShellInput {
 }
 
 /// `CommandInput` (prompt.ts:1551-1581) — `parts` is the file-part array.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct CommandInput {
     pub session_id: String,
     pub message_id: Option<String>,
@@ -866,6 +970,11 @@ pub struct CommandInput {
     pub arguments: String,
     pub command: String,
     pub parts: Vec<CommandFilePart>,
+    /// Where the command comes from (alforria extension,
+    /// [`crate::session::caller`]). In a restricted turn a command whose
+    /// template has inline shell is refused, and the arguments are text
+    /// only.
+    pub caller: crate::session::caller::Caller,
 }
 
 #[derive(Debug, Clone)]
@@ -1013,17 +1122,31 @@ pub async fn shell_impl(
     // stdin ignored, force kill after 3 seconds.
     let sh = preferred(deps.config.shell.as_deref());
     let cwd = deps.instance.directory.clone();
-    let mut child = tokio::process::Command::new(&sh)
+    let mut command = tokio::process::Command::new(&sh);
+    // The operator's own command, but in a restricted session, or one a
+    // webhook or a watch trigger started, it still gets the restricted
+    // environment: the same floor as the session's bash tool.
+    crate::shell_env::apply_shell_for(
+        command.as_std_mut(),
+        deps.services.sessions.runs_restricted(&input.session_id),
+    );
+    command
         .arg("-c")
         .arg(&input.command)
         .current_dir(&cwd)
         .env("TERM", "dumb")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    // Its own process group: `kill_process_group` signals the group, which
+    // only exists when the child leads one.
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command
         .spawn()
         .map_err(|err| crate::CoreError::Storage(format!("Failed to spawn command: {err}")))?;
     let pid = child.id().unwrap_or(0);
+    let _group = crate::process_group::register(pid);
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -1151,6 +1274,8 @@ fn kill_process_group(pid: u32, force_after: Duration) {
     #[cfg(not(unix))]
     {
         let _ = force_after;
+        // shell_env: not routed. A fixed Windows system tool that kills a process
+        // tree by pid; nothing the agent or a config names.
         let _ = std::process::Command::new("taskkill")
             .args(["/PID", &pid.to_string(), "/T", "/F"])
             .stdin(std::process::Stdio::null())
@@ -1218,6 +1343,196 @@ mod substitution_tests {
             "first: $ARGUMENTS, then: x | all: $ARGUMENTS x"
         );
         assert_eq!(substitute_arguments("all: $ARGUMENTS", "$1"), "all: $1");
+    }
+
+    /// The injection this ordering closes: an argument that carries inline
+    /// shell, or that lands inside a configured inline command, must reach
+    /// the model (or the command) as text and never run.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn arguments_never_run_as_shell() {
+        use super::expand_command_template;
+        let dir = crate::storage::test_support::TempDir::new("command-injection");
+        let pwned = dir.path().join("pwned");
+        let touch = format!("touch {}", pwned.display());
+
+        // An argument that is itself an inline command.
+        let out = expand_command_template(
+            "Review this: $ARGUMENTS",
+            &format!("!`{touch}`"),
+            "sh",
+            false,
+        )
+        .await;
+        assert_eq!(out, format!("Review this: !`{touch}`"));
+        assert!(!pwned.exists(), "the argument was executed");
+
+        // The same through `$1`, and appended to a template without
+        // placeholders.
+        for template in ["Look at $1", "No placeholders here"] {
+            let out = expand_command_template(template, &format!("!`{touch}`"), "sh", false).await;
+            assert!(out.contains(&format!("!`{touch}`")), "{out}");
+            assert!(!pwned.exists(), "{template}: the argument was executed");
+        }
+
+        // An argument substituted *into* a configured inline command cannot
+        // break out of it: `;`, `$(…)` and backticks arrive as data.
+        for payload in [
+            format!("x; {touch}"),
+            format!("$({touch})"),
+            format!("`{touch}`"),
+            format!("x\n{touch}"),
+            format!("x && {touch}"),
+        ] {
+            for template in [
+                "out: !`echo $1`",
+                "out: !`echo $ARGUMENTS`",
+                "out: !`echo \"$1\"`",
+            ] {
+                let out = expand_command_template(template, &payload, "sh", false).await;
+                assert!(!pwned.exists(), "{template} ran {payload:?}: {out}");
+            }
+        }
+
+        // The configured command still runs, with its arguments.
+        let out = expand_command_template(
+            "branch: !`printf '%s|%s' \"$1\" \"$ARGUMENTS\"` end $2",
+            "main 'two words'",
+            "sh",
+            false,
+        )
+        .await;
+        assert_eq!(out, "branch: main|main 'two words' end two words");
+
+        // A command's output is not scanned again either.
+        let note = dir.path().join("note.txt");
+        std::fs::write(&note, format!("!`{touch}` $1 $ARGUMENTS")).unwrap();
+        let out =
+            expand_command_template(&format!("!`cat {}`", note.display()), "arg", "sh", false)
+                .await;
+        assert_eq!(out, format!("!`{touch}` $1 $ARGUMENTS\n\narg"));
+        assert!(!pwned.exists(), "a command's output was executed");
+    }
+
+    /// An argument full of shell metacharacters reaches an inline command
+    /// as one literal value.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_argument_reaches_inline_shell_as_a_single_literal() {
+        use super::expand_command_template;
+        let nasty = "a;b|c&d$(e)`f`>g<h*?~'i'\\j";
+        let out =
+            expand_command_template("!`printf '%s' \"$ARGUMENTS\"`", nasty, "sh", false).await;
+        assert_eq!(out, nasty);
+        // As `$1`, the split-and-unquoted first argument, still literal.
+        let out =
+            expand_command_template("!`printf '[%s]' \"$1\"`", "'x;y $(z)' tail", "sh", false)
+                .await;
+        assert_eq!(out, "[x;y $(z) tail]");
+        let out = expand_command_template(
+            "!`printf '[%s][%s]' \"$1\" \"$2\"`",
+            "'x;y $(z)' `w`",
+            "sh",
+            false,
+        )
+        .await;
+        assert_eq!(out, "[x;y $(z)][`w`]");
+    }
+
+    /// The per-run floor follows one predicate
+    /// (`SessionStore::runs_restricted`) wherever a session starts a
+    /// shell: on a standalone server the `shell` command and the inline
+    /// template shell of a restricted session — one with no outside-start
+    /// mark — get the restricted environment, as its bash tool does
+    /// (`tool::shell`'s floor test), and so do those of a session with the
+    /// mark alone. A session of the user's own keeps the user's
+    /// environment.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_restricted_sessions_shell_command_and_inline_shell_get_the_restricted_environment() {
+        use super::{expand_command_template, ShellInput};
+        use crate::session::store::SessionMark;
+        use crate::session::test_support::{create_engine_session, engine_with_config};
+        use alforria_schema::session_v1::{V1Part, V1ToolState};
+
+        std::env::set_var("FLOORSHELL_GITHUB_TOKEN", "ghp-floor-leak");
+        std::env::set_var("FLOORSHELL_PLAIN", "plain-floor-leak");
+        assert!(
+            !crate::shell_env::current().is_restricted(),
+            "the server's own posture is standalone in this test"
+        );
+        let e = engine_with_config(
+            "prompt-floor-shell",
+            Vec::new(),
+            serde_json::json!({ "shell": "sh" }),
+        );
+        let sessions = &e.services.sessions;
+        let probe = "printf '[%s][%s][%s]' \"$FLOORSHELL_GITHUB_TOKEN\" \"$FLOORSHELL_PLAIN\" \"${PATH:+path}\"";
+        let template = format!("!`{probe}`");
+        let shell = |session_id: String| async {
+            let turn = e
+                .prompt
+                .shell(ShellInput {
+                    session_id,
+                    message_id: None,
+                    agent: "build".to_string(),
+                    model: None,
+                    command: probe.to_string(),
+                })
+                .await
+                .expect("the shell command runs");
+            turn.parts
+                .iter()
+                .find_map(|part| match part {
+                    V1Part::Tool {
+                        state: V1ToolState::Completed { output, .. },
+                        ..
+                    } => Some(output.trim().to_string()),
+                    _ => None,
+                })
+                .expect("a completed shell part")
+        };
+        const OWN: &str = "[ghp-floor-leak][plain-floor-leak][path]";
+        const FLOOR: &str = "[][][path]";
+
+        // The user's own session.
+        let own = create_engine_session(&e);
+        assert!(!sessions.runs_restricted(&own.id));
+        assert_eq!(shell(own.id.clone()).await, OWN);
+        assert_eq!(
+            expand_command_template(&template, "", "sh", sessions.runs_restricted(&own.id)).await,
+            OWN
+        );
+
+        // A restricted session that no outside input started.
+        let restricted = create_engine_session(&e);
+        sessions.restrict(&restricted.id).unwrap();
+        assert!(!sessions.started_by_outside_input(&restricted.id));
+        assert_eq!(shell(restricted.id.clone()).await, FLOOR, "shell command");
+        assert_eq!(
+            expand_command_template(
+                &template,
+                "",
+                "sh",
+                sessions.runs_restricted(&restricted.id)
+            )
+            .await,
+            FLOOR,
+            "inline template shell"
+        );
+
+        // The outside-start mark alone.
+        let marked = create_engine_session(&e);
+        sessions
+            .mark(&marked.id, SessionMark::OutsideStart)
+            .unwrap();
+        assert!(!sessions.is_restricted(&marked.id).unwrap());
+        assert_eq!(shell(marked.id.clone()).await, FLOOR, "a marked session");
+
+        assert!(
+            !crate::shell_env::current().is_restricted(),
+            "the floor did not go through the server's posture"
+        );
     }
 
     #[test]

@@ -6,6 +6,7 @@
 //! `EventV2` bus. Wire compatibility with the pinned TS commit is the law:
 //! every JSON shape emitted here must match what the TS reference accepts.
 
+pub mod beneath;
 pub mod browser;
 pub mod catalog;
 pub mod config;
@@ -21,17 +22,24 @@ pub mod jsonc;
 pub mod libertai;
 pub mod lsp;
 pub mod mcp;
+pub mod memory;
 pub mod merge;
+pub mod owner;
 pub mod paths;
+pub mod process_group;
 pub mod project;
 pub mod project_copy;
+pub mod project_files;
+pub mod protect;
 pub mod provider;
 pub mod repository;
 pub mod session;
 pub mod share;
+pub mod shell_env;
 pub mod skill;
 pub mod storage;
 pub mod tool;
+pub mod trigger;
 pub mod vcs;
 pub mod workflow;
 pub mod worktree;

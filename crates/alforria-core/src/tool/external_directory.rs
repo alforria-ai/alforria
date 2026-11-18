@@ -87,6 +87,13 @@ fn real_contains(root: &Path, child: &Path) -> bool {
 /// components literally, so `/project/../etc/passwd` would otherwise count
 /// as inside `/project`. It must also really be inside: a symlink in the
 /// project that points out of it is outside, whatever its spelling.
+///
+/// This is not confinement: all it decides is whether the
+/// `external_directory` *ask* is raised for a path a tool was given — a
+/// prompt to the user. What a guarded session may write is decided where
+/// the write lands (`crate::protect`), and what a restricted caller may
+/// read by `session::caller::Bounds::check_read`; both use
+/// `protect::resolve_path`.
 pub fn contains_path(filepath: &Path, ctx: &InstanceContext) -> bool {
     let filepath = &crate::git::lexical_normalize(filepath);
     let git = ctx.worktree != Path::new("/");
@@ -230,6 +237,7 @@ mod tests {
         InstanceContext {
             directory: Path::new("/home/u/project").to_path_buf(),
             worktree: Path::new("/home/u/project").to_path_buf(),
+            write_guard: None,
         }
     }
 
@@ -238,6 +246,7 @@ mod tests {
         let ctx = InstanceContext {
             directory: Path::new("/home/u/project").to_path_buf(),
             worktree: Path::new("/home/u/wt").to_path_buf(),
+            write_guard: None,
         };
         assert!(contains_path(Path::new("/home/u/project"), &ctx));
         assert!(contains_path(
@@ -260,6 +269,7 @@ mod tests {
         let non_git = InstanceContext {
             directory: Path::new("/home/u/project").to_path_buf(),
             worktree: Path::new("/").to_path_buf(),
+            write_guard: None,
         };
         assert!(!contains_path(Path::new("/etc/passwd"), &non_git));
     }
@@ -329,6 +339,7 @@ mod tests {
         let instance = InstanceContext {
             directory: project.clone(),
             worktree: project.clone(),
+            write_guard: None,
         };
         let extra = Extra::default();
         let glob = format!("{}/*", outside.display());
@@ -356,6 +367,7 @@ mod tests {
         let through = InstanceContext {
             directory: root.join("alias-root/project"),
             worktree: root.join("alias-root/project"),
+            write_guard: None,
         };
         for name in ["real.txt", "new-file", "sub/new-file"] {
             assert!(
@@ -370,6 +382,7 @@ mod tests {
         let missing = InstanceContext {
             directory: root.join("alias-root/not-created"),
             worktree: root.join("alias-root/not-created"),
+            write_guard: None,
         };
         assert!(contains_path(&missing.directory.join("a/b.txt"), &missing));
 

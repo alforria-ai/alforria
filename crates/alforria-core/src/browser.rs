@@ -35,6 +35,10 @@ pub fn open_url(url: &str) -> bool {
     } else {
         ("xdg-open", vec![url])
     };
+    // shell_env: not routed. A fixed desktop opener handed a URL as one
+    // argument, for the person signing in at this machine; it needs the
+    // desktop session's variables (DISPLAY, DBUS_SESSION_BUS_ADDRESS), which
+    // no allowlist carries, and runs nothing the agent or a config names.
     std::process::Command::new(program)
         .args(args)
         .stdin(std::process::Stdio::null())

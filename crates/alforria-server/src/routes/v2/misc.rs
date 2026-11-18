@@ -112,7 +112,7 @@ async fn agent_list(
             hidden: agent.hidden.unwrap_or(false),
             color: agent.color.clone(),
             steps: agent.steps.map(|steps| steps as u64),
-            permissions: super::util::relabel_ruleset(&agent.permission),
+            permissions: super::util::relabel_ruleset(&agent.permission.render()),
         })
         .collect::<Vec<_>>();
     envelope(&location, agents)
@@ -520,6 +520,7 @@ const PROMPT_REVIEW: &str = include_str!("command_review.txt");
 /// `commands` record (merged with the markdown-discovered ones by the M3
 /// loader).
 async fn command_list(
+    State(ctx): State<Arc<ServerContext>>,
     axum::Extension(location): axum::Extension<LocationContext>,
 ) -> Result<Response, ServerError> {
     let directory = location.directory.display().to_string();
@@ -554,8 +555,7 @@ async fn command_list(
             subtask: None,
         },
     ];
-    let params = alforria_core::LoadParams::new(location.directory.clone())
-        .paths(alforria_core::GlobalPaths::from_env());
+    let params = alforria_core::LoadParams::new(location.directory.clone(), ctx.paths.clone());
     let (config, _) = match alforria_core::ConfigLoader::new().load(&params) {
         Ok(loaded) => loaded,
         // Config load failures degrade to the built-ins only (the v1
@@ -594,10 +594,10 @@ async fn command_list(
 /// the `skills` config entries (`core/src/config/plugin/skill.ts`), deduped
 /// by name (later sources win).
 async fn skill_list(
+    State(ctx): State<Arc<ServerContext>>,
     axum::Extension(location): axum::Extension<LocationContext>,
 ) -> Result<Response, ServerError> {
-    let params = alforria_core::LoadParams::new(location.directory.clone())
-        .paths(alforria_core::GlobalPaths::from_env());
+    let params = alforria_core::LoadParams::new(location.directory.clone(), ctx.paths.clone());
     let (config, directories) = match alforria_core::ConfigLoader::new().load(&params) {
         Ok(loaded) => loaded,
         Err(_) => return envelope(&location, Vec::<alforria_schema::skill::SkillInfo>::new()),
@@ -620,11 +620,7 @@ async fn skill_list(
                 continue;
             }
             let path = if let Some(rest) = item.strip_prefix("~/") {
-                if let Ok(home) = std::env::var("HOME") {
-                    PathBuf::from(home).join(rest)
-                } else {
-                    continue;
-                }
+                ctx.paths.home.join(rest)
             } else {
                 location.directory.join(item)
             };
@@ -735,6 +731,12 @@ fn parse_markdown(content: &str) -> Option<(serde_json::Map<String, Value>, Stri
 // ---------------------------------------------------------------------------
 
 /// `FSUtil.contains` — a lexical child check.
+///
+/// Upstream's check for the frozen `/api/fs/*` routes, kept as it is: they
+/// are `admin`-only (`middleware::scope`), so no confined credential
+/// reaches them, and the operator's clients get upstream's behaviour. It
+/// is applied to the spelling and again to the `canonicalize`d path, which
+/// is the kernel's own answer for a path that exists.
 fn contains(root: &Path, target: &Path) -> bool {
     target.starts_with(root)
 }
