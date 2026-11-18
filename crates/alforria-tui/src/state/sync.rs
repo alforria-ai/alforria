@@ -736,9 +736,9 @@ fn relative_path(from: &str, to: &str) -> String {
         segments.push("..".to_string());
     }
     segments.extend(to[common..].iter().map(|s| s.to_string()));
-    if segments.is_empty() {
-        return ".".to_string();
-    }
+    // `path.relative` is empty for equal paths. Keep that empty: the list
+    // request then omits `path` and covers every session of the project,
+    // including ones opencode stored with an empty path.
     segments.join("/").replace('\\', "/")
 }
 
@@ -2239,6 +2239,14 @@ mod tests {
         assert_eq!(query.scope, None);
         assert_eq!(query.path.as_deref(), Some("sub dir"));
 
+        // In the worktree root the relative path is empty, and the request
+        // omits `path` entirely (`path.relative` parity) — this is what
+        // matches sessions opencode created.
+        project.instance_path.directory = Some("/repo".into());
+        let query = session_list_query(&kv, &project);
+        assert_eq!(query.scope, None);
+        assert_eq!(query.path.as_deref(), Some(""));
+
         project.instance_path.worktree = None;
         assert_eq!(
             session_list_query(&kv, &project).scope.as_deref(),
@@ -2248,7 +2256,7 @@ mod tests {
 
     #[test]
     fn relative_path_matches_posix_relative() {
-        assert_eq!(relative_path("/a/b", "/a/b"), ".");
+        assert_eq!(relative_path("/a/b", "/a/b"), "");
         assert_eq!(relative_path("/a/b", "/a/b/c"), "c");
         assert_eq!(relative_path("/a/b", "/a/b/c/d"), "c/d");
         assert_eq!(relative_path("/a/b/c", "/a/x"), "../../x");

@@ -90,6 +90,12 @@ pub fn post_update(app: &mut App) -> Vec<Effect> {
                     prompt: None,
                 });
             }
+        } else if app.state.sync.status == Some(SyncStatus::Complete) {
+            // Nothing to continue: the `--continue` route sits on the
+            // placeholder, which renders no session. Land on home instead
+            // of leaving a blank screen.
+            app.ui.continued = true;
+            app.state.route.navigate(Route::Home { prompt: None });
         }
     }
 
@@ -694,6 +700,27 @@ mod tests {
                 prompt: None,
             }
         );
+    }
+
+    #[test]
+    fn continue_without_a_session_lands_on_home() {
+        let mut app = app_with(Args {
+            continue_: true,
+            ..Args::default()
+        });
+        app.state.sync.status = Some(SyncStatus::Partial);
+        assert!(post_update(&mut app).is_empty());
+        // The placeholder route stays until the list is final.
+        assert_eq!(
+            app.state.route.data,
+            Route::Session {
+                session_id: "dummy".into(),
+                prompt: None,
+            }
+        );
+        app.state.sync.status = Some(SyncStatus::Complete);
+        assert!(post_update(&mut app).is_empty());
+        assert_eq!(app.state.route.data, Route::Home { prompt: None });
     }
 
     #[test]
