@@ -595,6 +595,14 @@ impl crate::session::task_ops::PromptFacade for SessionPrompt {
         })
     }
 
+    fn resolve_operator_prompt_parts<'a>(
+        &'a self,
+        template: &'a str,
+    ) -> futures::future::BoxFuture<'a, Result<Vec<PromptPartInput>, SessionError>> {
+        // What the operator wrote resolves like what the user typed.
+        Box::pin(async move { Ok(SessionPrompt::resolve_prompt_parts(self, template)) })
+    }
+
     fn prompt<'a>(
         &'a self,
         input: PromptInput,

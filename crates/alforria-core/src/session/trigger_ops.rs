@@ -294,7 +294,7 @@ impl TriggerOps for ProductionTriggerOps {
             // is text and nothing else.
             let mut parts = if turn.operator_authored {
                 facade
-                    .resolve_prompt_parts(&turn.prompt)
+                    .resolve_operator_prompt_parts(&turn.prompt)
                     .await
                     .unwrap_or_else(|_| plain())
             } else {

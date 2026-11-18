@@ -42,6 +42,18 @@ pub trait PromptFacade: Send + Sync {
         &'a self,
         template: &'a str,
     ) -> BoxFuture<'a, Result<Vec<crate::session::prompt_input::PromptPartInput>, SessionError>>;
+    /// [`PromptFacade::resolve_prompt_parts`] for a prompt the operator
+    /// wrote (a trigger from the host config or an `admin` request): like a
+    /// prompt typed by the user, its mentions attach files wherever they
+    /// are. The default is the confined resolution, so an implementation
+    /// that does not say otherwise attaches nothing outside the project.
+    fn resolve_operator_prompt_parts<'a>(
+        &'a self,
+        template: &'a str,
+    ) -> BoxFuture<'a, Result<Vec<crate::session::prompt_input::PromptPartInput>, SessionError>>
+    {
+        self.resolve_prompt_parts(template)
+    }
     /// `prompt(input).pipe(Effect.catch(Effect.die))` (prompt.ts:1052-1071).
     fn prompt<'a>(
         &'a self,
