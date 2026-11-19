@@ -86,7 +86,11 @@ async fn v1_routes_reject_with_an_empty_401() {
 #[tokio::test]
 async fn raw_routes_reject_with_an_empty_401() {
     let router = router(Some(PASSWORD));
-    for path in ["/doc", "/definitely-not-a-route"] {
+    for path in [
+        "/doc",
+        "/definitely-not-a-route",
+        "/experimental/vcs/commits",
+    ] {
         let response = router
             .clone()
             .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())

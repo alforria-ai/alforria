@@ -9,6 +9,10 @@ pre-1.0, so minor releases may include breaking changes.
 
 ### Added
 
+- TUI: `/review ` offers recent commits with their subjects and an
+  uncommitted-changes option. Tab completes a target; arrow keys and Enter
+  select and review it. Suggestions come from the server's repository,
+  including when attached remotely.
 - Triggers: turns that start on a schedule or an event instead of a person.
   A `trigger` map in the config (or `POST /trigger`) pairs a prompt with a
   5-field cron expression in a real timezone, an interval, a one-shot time, a
@@ -445,6 +449,9 @@ pre-1.0, so minor releases may include breaking changes.
   project was restored or removed where the link led. Such a revert is now
   refused (`403`, nothing restored), naming the files. Other sessions'
   reverts already stayed inside the worktree.
+- Built-in `/review` and `/init` commands now work without a custom command
+  configuration. Review arguments, including short and full commit hashes,
+  reach the built-in review prompt.
 - `alforria -c` on a project whose sessions were created by opencode showed a
   blank screen: a session in the worktree root stores an empty path (`""`,
   like `path.relative`), but alforria stored and queried `"."`, so the

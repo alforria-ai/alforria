@@ -81,6 +81,7 @@ ring = "0.17"
 sha1 = "0.10"
 hex = "0.4"
 walkdir = "2"
+same-file = "1"
 dirs = "6"
 rand = "0.8"
 

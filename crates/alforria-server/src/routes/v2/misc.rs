@@ -513,8 +513,7 @@ async fn provider_get(
 // command (`handlers/command.ts` + `core/src/config/plugin/command.ts`)
 // ---------------------------------------------------------------------------
 
-const PROMPT_INITIALIZE: &str = include_str!("command_initialize.txt");
-const PROMPT_REVIEW: &str = include_str!("command_review.txt");
+use alforria_core::session::commands::{INITIALIZE as PROMPT_INITIALIZE, REVIEW as PROMPT_REVIEW};
 
 /// `command.list` — the built-in init/review commands plus the config
 /// `commands` record (merged with the markdown-discovered ones by the M3

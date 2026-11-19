@@ -854,7 +854,9 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
 /// * `@ai-sdk/google` → gemini (`x-goog-api-key`)
 /// * everything else → openai-compatible-chat (bearer, `baseURL`)
 #[derive(Default)]
-pub struct RouteLlmSender;
+pub struct RouteLlmSender {
+    executor: alforria_llm::route::executor::RequestExecutor,
+}
 
 impl RouteLlmSender {
     fn option(model: &LlmModel, key: &str) -> Option<String> {
@@ -934,6 +936,7 @@ fn media_support(model: &Value) -> alforria_core::session::media::MediaSupport {
 
 impl RouteLlmSender {
     fn route_send(
+        &self,
         request: alforria_llm::schema::messages::LlmRequest,
         cancel: tokio_util::sync::CancellationToken,
         retries: u32,
@@ -941,18 +944,19 @@ impl RouteLlmSender {
         'static,
         Result<alforria_core::session::llm::LlmEventStream, alforria_llm::LlmError>,
     > {
+        // The executor's own default (two retries) would triple every
+        // attempt of the session's retry policy. The clone shares the
+        // sender's connection pool.
+        let shared =
+            self.executor
+                .clone()
+                .with_retry_config(alforria_llm::route::executor::RetryConfig {
+                    max_retries: retries as usize,
+                    ..Default::default()
+                });
         Box::pin(async move {
             let handle = request.model.route.clone();
-            // The executor's own default (two retries) would triple every
-            // attempt of the session's retry policy.
-            let executor = || {
-                alforria_llm::route::executor::RequestExecutor::new().with_retry_config(
-                    alforria_llm::route::executor::RetryConfig {
-                        max_retries: retries as usize,
-                        ..Default::default()
-                    },
-                )
-            };
+            let executor = || shared.clone();
             match handle.protocol_id.as_str() {
                 "anthropic-messages" => {
                     let route = Route {
@@ -1024,7 +1028,7 @@ impl LlmRequestSender for RouteLlmSender {
         'static,
         Result<alforria_core::session::llm::LlmEventStream, alforria_llm::LlmError>,
     > {
-        Self::route_send(request, tokio_util::sync::CancellationToken::new(), 0)
+        self.route_send(request, tokio_util::sync::CancellationToken::new(), 0)
     }
 
     fn send_with_cancel(
@@ -1035,7 +1039,7 @@ impl LlmRequestSender for RouteLlmSender {
         'static,
         Result<alforria_core::session::llm::LlmEventStream, alforria_llm::LlmError>,
     > {
-        Self::route_send(request, cancel, 0)
+        self.route_send(request, cancel, 0)
     }
 
     fn send_with_retries(
@@ -1047,7 +1051,7 @@ impl LlmRequestSender for RouteLlmSender {
         'static,
         Result<alforria_core::session::llm::LlmEventStream, alforria_llm::LlmError>,
     > {
-        Self::route_send(request, cancel, retries)
+        self.route_send(request, cancel, retries)
     }
 }
 
@@ -1105,6 +1109,58 @@ mod tests {
             );
         }
         assert_eq!(image(json!({})), UNDECLARED_IMAGE_INPUT);
+    }
+
+    #[tokio::test]
+    async fn consecutive_model_requests_reuse_the_http_connection() {
+        use axum::extract::{ConnectInfo, State};
+        use futures::StreamExt;
+        use std::net::SocketAddr;
+        use std::sync::Mutex;
+        let peers = Arc::new(Mutex::new(Vec::<SocketAddr>::new()));
+        let app = axum::Router::new()
+            .route(
+                "/chat",
+                axum::routing::post(
+                    |ConnectInfo(peer): ConnectInfo<SocketAddr>,
+                     State(peers): State<Arc<Mutex<Vec<SocketAddr>>>>| async move {
+                        peers.lock().unwrap().push(peer);
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"
+                    },
+                ),
+            )
+            .with_state(peers.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        let mut handle = alforria_llm::protocols::openai_chat::route_handle();
+        handle.endpoint.base_url = Some(format!("http://{address}"));
+        handle.endpoint.path = "/chat".into();
+        let model =
+            alforria_llm::schema::messages::ModelRef::new("model", "test", Arc::new(handle));
+        let sender = RouteLlmSender::default();
+        for _ in 0..2 {
+            let mut stream = sender
+                .send(alforria_llm::schema::messages::LlmRequest::new(
+                    model.clone(),
+                ))
+                .await
+                .unwrap();
+            while let Some(event) = stream.next().await {
+                event.unwrap();
+            }
+        }
+        let peers = peers.lock().unwrap();
+        assert_eq!(peers.len(), 2);
+        assert_eq!(peers[0], peers[1], "turns must share the connection pool");
+        server.abort();
     }
 
     #[test]

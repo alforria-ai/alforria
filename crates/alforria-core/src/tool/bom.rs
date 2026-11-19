@@ -64,6 +64,40 @@ pub async fn write_with_dirs(
         .map_err(|error| error.into_tool_error(|_, e| e.to_string(), |e| e.to_string()))
 }
 
+/// Replace the directory entry at `file_path` with a new file holding
+/// `contents`, rather than truncating an inode that may have another
+/// protected hard-link name. Callers pin symlink resolution. This is the
+/// write of a session with no write guard (`InstanceContext::write_file`).
+pub(crate) fn replace_file(file_path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let parent = file_path.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    // Match normal file creation permissions, including the umask.
+    let mut staged = tempfile::Builder::new().make_in(parent, |path| {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)
+    })?;
+    match std::fs::metadata(file_path) {
+        Ok(meta) => {
+            if meta.permissions().readonly() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "file is read-only",
+                ));
+            }
+            staged.as_file().set_permissions(meta.permissions())?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    staged.write_all(contents)?;
+    staged.persist(file_path).map_err(|error| error.error)?;
+    Ok(())
+}
+
 /// `Bom.syncFile` (bom.ts:22-27): re-writes the file when its BOM-ness
 /// differs from `bom`; returns the current (post-format) text either way.
 pub async fn sync_file(
@@ -103,6 +137,34 @@ mod tests {
         assert_eq!(join("\u{feff}hi", false), "hi");
         assert_eq!(join("hi", true), "\u{feff}hi");
         assert_eq!(join("hi", false), "hi");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn atomic_writes_preserve_normal_creation_and_existing_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new("bom-permissions");
+        let normal = temp.path().join("normal");
+        let written = temp.path().join("written");
+        std::fs::write(&normal, "normal").unwrap();
+        let instance = crate::tool::def::InstanceContext {
+            directory: temp.path().to_path_buf(),
+            worktree: temp.path().to_path_buf(),
+            write_guard: None,
+        };
+        write_with_dirs(&instance, &written, "new").await.unwrap();
+        assert_eq!(
+            std::fs::metadata(&written).unwrap().permissions().mode(),
+            std::fs::metadata(&normal).unwrap().permissions().mode(),
+        );
+        std::fs::set_permissions(&written, std::fs::Permissions::from_mode(0o750)).unwrap();
+        write_with_dirs(&instance, &written, "replacement")
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&written).unwrap().permissions().mode() & 0o777,
+            0o750
+        );
     }
 
     #[tokio::test]

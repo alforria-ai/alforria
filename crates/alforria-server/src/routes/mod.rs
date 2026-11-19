@@ -9,6 +9,7 @@ pub mod goal;
 pub mod memory;
 pub mod posture;
 pub mod restriction;
+pub mod review;
 pub mod trigger;
 pub mod ui;
 pub mod v1;
@@ -46,6 +47,7 @@ pub fn build_router(ctx: Arc<ServerContext>) -> Router {
     router = trigger::register(router);
     router = memory::register(router);
     router = posture::register(router);
+    router = review::register(router);
     // alforria extension: one guard over every route registered above
     // that names a session, on the route as matched and the id as decoded
     // (`confine::guard_session_writes`). A route added above is under it.

@@ -200,9 +200,13 @@ impl InstanceContext {
                     .await
                     .map_err(|error| ModifyError::CreateDir(parent.to_path_buf(), error))?;
             }
-            return tokio::fs::write(path, contents)
-                .await
-                .map_err(ModifyError::Io);
+            let (path, contents) = (path.to_path_buf(), contents.to_vec());
+            return tokio::task::spawn_blocking(move || {
+                crate::tool::bom::replace_file(&path, &contents)
+            })
+            .await
+            .unwrap_or_else(|join| Err(std::io::Error::other(join.to_string())))
+            .map_err(ModifyError::Io);
         };
         let landing = guard.admit(path).map_err(ModifyError::Refused)?;
         let contents = contents.to_vec();

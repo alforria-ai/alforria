@@ -1049,6 +1049,10 @@ pub async fn execute_effect(
             let mut app = app.lock().await;
             crate::state::prompt::files_found(&mut app, &query, &directory, entries);
         }
+        Effect::ReviewCommits { location } => {
+            let commits = api.vcs_commits(&location).await.unwrap_or_default();
+            crate::state::prompt::review_commits_found(&mut *app.lock().await, &location, commits);
+        }
         Effect::SessionStatusRefresh => {
             let workspace = app.lock().await.state.project.workspace.current.clone();
             let loc = Location {

@@ -15,8 +15,8 @@ use crate::schema::errors::{LlmError, LlmErrorReason};
 use crate::schema::events::{LlmEvent, LlmResponse};
 use crate::schema::messages::LlmRequest;
 use crate::schema::options::{
-    merge_generation_options, merge_http_options, merge_provider_options, GenerationOptions,
-    HttpOptions, ModelLimits, ProviderOptions,
+    merge_generation_options, merge_http_options, merge_json_records, merge_provider_options,
+    GenerationOptions, HttpOptions, ModelLimits, ProviderOptions,
 };
 
 /// Static per-route defaults merged under model defaults and request options.
@@ -121,11 +121,23 @@ impl<P: Protocol> Route<P> {
 
     /// Compile a request into a prepared HTTP request: merge options,
     /// apply the cache policy, lower the body, and prepare transport.
+    /// HTTP overlays override protocol body fields, endpoint query keys and
+    /// static headers. Authentication and the JSON content type apply last;
+    /// signers receive the final body, URL and overlaid headers.
     #[allow(clippy::result_large_err)]
     pub fn compile(&self, request: &LlmRequest) -> Result<PreparedRequest, LlmError> {
         let resolved = self.resolve_request_options(request);
         let resolved = apply_cache_policy(&self.handle.id, &resolved);
-        let body = self.protocol.lower_body(&resolved)?;
+        let mut body = self.protocol.lower_body(&resolved)?;
+        let http = resolved.http.as_ref();
+        if let Some(overlay) = http.and_then(|http| http.body.as_ref()) {
+            let original = body
+                .as_object()
+                .ok_or_else(|| LlmError::invalid("HTTP body overlays require a JSON object"))?;
+            body = serde_json::Value::Object(
+                merge_json_records(&[Some(original), Some(overlay)]).unwrap_or_default(),
+            );
+        }
         let body_text = serde_json::to_string(&body)
             .map_err(|e| LlmError::invalid(format!("Route.compile: {e}")))?;
 
@@ -133,9 +145,26 @@ impl<P: Protocol> Route<P> {
             request: &resolved,
             body: &body,
         };
-        let url = render(&self.handle.endpoint, &input)?.as_str().to_string();
+        let mut url = render(&self.handle.endpoint, &input)?;
+        if let Some(query) = http.and_then(|http| http.query.as_ref()) {
+            let existing: Vec<_> = url
+                .query_pairs()
+                .filter(|(key, _)| !query.contains_key(key.as_ref()))
+                .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                .collect();
+            url.set_query(None);
+            url.query_pairs_mut()
+                .extend_pairs(existing)
+                .extend_pairs(query);
+        }
+        let url = url.as_str().to_string();
 
         let mut headers = self.handle.defaults.headers.clone();
+        if let Some(overlay) = http.and_then(|http| http.headers.as_ref()) {
+            for (name, value) in overlay {
+                upsert_header(&mut headers, name.clone(), value.clone());
+            }
+        }
         let auth_headers = self.handle.auth.apply(&AuthInput {
             request: &resolved,
             method: "POST",
@@ -434,6 +463,68 @@ mod tests {
         };
         assert_eq!(kind.as_deref(), Some(BODY_READ_ERROR));
         assert!(message.contains("error reading a body"), "{message}");
+    }
+
+    #[test]
+    fn compile_applies_all_http_overlays_with_case_insensitive_precedence() {
+        let mut route = echo_route("https://api.example.com".into());
+        let options = |body, headers, query| {
+            serde_json::from_value::<HttpOptions>(
+                json!({"body":body, "headers":headers, "query":query}),
+            )
+            .unwrap()
+        };
+        let handle = Arc::get_mut(&mut route.handle).unwrap();
+        handle.endpoint.path = "/v1/chat?keep=yes&replace=old".into();
+        handle.defaults.headers = vec![("X-Mode".into(), "static".into())];
+        handle.defaults.http = Some(options(
+            json!({"nested":{"route":true}, "ok":false}),
+            json!({"x-mode":"route"}),
+            json!({"replace":"route"}),
+        ));
+        let mut model =
+            crate::schema::messages::ModelRef::new("echo-model", "echo", route.handle.clone());
+        model.defaults = Some(
+            serde_json::from_value(
+                json!({"http":{"body":{"nested":{"model":true}}, "headers":{"X-MODE":"model"}}}),
+            )
+            .unwrap(),
+        );
+        let mut request = LlmRequest::new(model);
+        request.http = Some(options(
+            json!({"nested":{"request":true}, "extra":"sent"}),
+            json!({"X-Mode":"request", "X-Session":"ses_test"}),
+            json!({"replace":"request & encoded", "new":"✓"}),
+        ));
+        let prepared = route.compile(&request).unwrap();
+        let body: serde_json::Value = serde_json::from_str(&prepared.body).unwrap();
+        assert_eq!(
+            body,
+            json!({"ok":false,"extra":"sent","nested":{"route":true,"model":true,"request":true}})
+        );
+        let modes: Vec<_> = prepared
+            .headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("x-mode"))
+            .collect();
+        assert_eq!(modes.len(), 1);
+        assert_eq!(modes[0].1, "request");
+        assert!(prepared
+            .headers
+            .contains(&("x-session".into(), "ses_test".into())));
+        let url = reqwest::Url::parse(&prepared.url).unwrap();
+        let query: std::collections::BTreeMap<_, _> = url
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        assert_eq!(
+            query,
+            std::collections::BTreeMap::from([
+                ("keep".into(), "yes".into()),
+                ("replace".into(), "request & encoded".into()),
+                ("new".into(), "✓".into())
+            ])
+        );
     }
 
     #[test]

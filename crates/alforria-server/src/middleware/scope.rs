@@ -85,6 +85,9 @@ pub const ROUTES: &[(&str, &str, Scope)] = &[
     ("GET", "/vcs", Chat),
     ("GET", "/vcs/status", Chat),
     ("GET", "/vcs/diff", Chat),
+    // Recent commits for `/review` completion: hashes and subjects, less
+    // than `/vcs/diff` already shows.
+    ("GET", "/experimental/vcs/commits", Chat),
     // Durable replay of one session's events (`?after=`), with the
     // `event.reset` frame when retention dropped what the client missed.
     // The one `/api` route below `admin`: its handler checks the session's
@@ -329,6 +332,7 @@ mod tests {
             ("POST", "/workflow/run/{runID}/wait"),
             ("POST", "/workflow/run/{runID}/abort"),
             ("GET", "/session/{sessionID}/goal"),
+            ("GET", "/experimental/vcs/commits"),
             ("GET", "/attention"),
             ("POST", "/file/ticket"),
             ("GET", "/file/raw"),

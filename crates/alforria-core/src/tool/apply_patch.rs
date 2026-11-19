@@ -43,9 +43,11 @@ pub fn parameters() -> Value {
 #[derive(Debug)]
 struct FileChange {
     file_path: String,
+    io_path: String,
     new_content: String,
     kind: &'static str, // "add" | "update" | "delete" | "move"
     move_path: Option<String>,
+    move_io_path: Option<String>,
     diff: String,
     additions: usize,
     deletions: usize,
@@ -130,6 +132,9 @@ async fn run(
         };
         let file_path = ts_resolve(&instance.directory, hunk_path);
         let file_path_str = file_path.to_string_lossy().to_string();
+        let io_path = crate::tool::file_path::resolve(&file_path)
+            .to_string_lossy()
+            .into_owned();
         assert_external_directory(
             &ctx,
             Some(&file_path_str),
@@ -152,9 +157,11 @@ async fn run(
                 let (additions, deletions) = crate::tool::diff::diff_line_counts("", &next.text);
                 file_changes.push(FileChange {
                     file_path: file_path_str,
+                    io_path,
                     new_content: next.text.clone(),
                     kind: "add",
                     move_path: None,
+                    move_io_path: None,
                     diff: diff.clone(),
                     additions,
                     deletions,
@@ -166,13 +173,13 @@ async fn run(
             Hunk::Update {
                 move_path, chunks, ..
             } => {
-                let stat = tokio::fs::metadata(&file_path).await;
+                let stat = tokio::fs::metadata(&io_path).await;
                 if stat.map(|s| s.is_dir()).unwrap_or(true) {
                     return Err(ToolError::Failed(format!(
                         "apply_patch verification failed: Failed to read file to update: {file_path_str}"
                     )));
                 }
-                let raw = tokio::fs::read(&file_path)
+                let raw = tokio::fs::read(&io_path)
                     .await
                     .map_err(|error| {
                         ToolError::Failed(format!(
@@ -208,6 +215,7 @@ async fn run(
                     // move would write the file and then delete it.
                     .filter(|move_path| *move_path != file_path);
                 if let Some(move_path) = &move_path {
+                    crate::tool::file_path::reject_move_aliases(&file_path, move_path)?;
                     let move_str = move_path.to_string_lossy().to_string();
                     assert_external_directory(
                         &ctx,
@@ -222,12 +230,18 @@ async fn run(
 
                 file_changes.push(FileChange {
                     file_path: file_path_str,
+                    io_path,
                     new_content: update.content,
                     kind: if move_path.is_some() {
                         "move"
                     } else {
                         "update"
                     },
+                    move_io_path: move_path.as_ref().map(|path| {
+                        crate::tool::file_path::resolve(path)
+                            .to_string_lossy()
+                            .into_owned()
+                    }),
                     move_path: move_path.map(|path| path.to_string_lossy().to_string()),
                     diff: diff.clone(),
                     additions,
@@ -238,7 +252,7 @@ async fn run(
                 total_diff.push('\n');
             }
             Hunk::Delete { .. } => {
-                let raw = tokio::fs::read(&file_path).await.map_err(|error| {
+                let raw = tokio::fs::read(&io_path).await.map_err(|error| {
                     ToolError::Failed(format!("apply_patch verification failed: {error}"))
                 })?;
                 let source = bom::split(&String::from_utf8_lossy(&raw));
@@ -247,9 +261,11 @@ async fn run(
                 let deletions = source.text.split('\n').count();
                 file_changes.push(FileChange {
                     file_path: file_path_str,
+                    io_path,
                     new_content: String::new(),
                     kind: "delete",
                     move_path: None,
+                    move_io_path: None,
                     diff: delete_diff.clone(),
                     additions: 0,
                     deletions,
@@ -284,11 +300,21 @@ async fn run(
         })
         .collect();
 
-    // One ask with all relative paths (apply_patch.ts:205-215).
-    let relative_paths: Vec<String> = file_changes
-        .iter()
-        .map(|change| relative(&instance.worktree, &change.file_path))
-        .collect();
+    // Authorize every mutation before writing anything. Moves replace the
+    // destination contents, so both endpoints require edit permission.
+    let relative_paths = crate::tool::file_path::edit_patterns(
+        &instance.worktree,
+        file_changes.iter().flat_map(|change| {
+            [
+                Some(Path::new(&change.file_path)),
+                Some(Path::new(&change.io_path)),
+                change.move_path.as_deref().map(Path::new),
+                change.move_io_path.as_deref().map(Path::new),
+            ]
+            .into_iter()
+            .flatten()
+        }),
+    );
     ctx.ask
         .ask(AskRequest {
             permission: "edit".to_string(),
@@ -303,14 +329,22 @@ async fn run(
         .await?;
 
     // Every path the patch is about to write, create, rename onto or
-    // delete — a move's destination as much as its source — is put to the
-    // write guard before anything is applied, so a refused patch changes
-    // nothing. (The ask above carries paths for display; it is not what
-    // enforces this.)
+    // delete — a move's destination as much as its source, as requested and
+    // as resolved — is put to the write guard before anything is applied,
+    // so a refused patch changes nothing. (The ask above carries paths for
+    // display; it is not what enforces this.)
     for change in &file_changes {
+        crate::tool::file_path::verify(Path::new(&change.file_path), Path::new(&change.io_path))?;
         instance.about_to_modify(Path::new(&change.file_path))?;
-        if let Some(move_path) = &change.move_path {
-            instance.about_to_modify(Path::new(move_path))?;
+        instance.about_to_modify(Path::new(&change.io_path))?;
+        if let (Some(destination), Some(resolved)) = (&change.move_path, &change.move_io_path) {
+            crate::tool::file_path::reject_move_aliases(
+                Path::new(&change.file_path),
+                Path::new(destination),
+            )?;
+            crate::tool::file_path::verify(Path::new(destination), Path::new(resolved))?;
+            instance.about_to_modify(Path::new(destination))?;
+            instance.about_to_modify(Path::new(resolved))?;
         }
     }
 
@@ -321,15 +355,15 @@ async fn run(
             None
         } else {
             change
-                .move_path
+                .move_io_path
                 .as_deref()
-                .or(Some(change.file_path.as_str()))
+                .or(Some(change.io_path.as_str()))
         };
         match change.kind {
             "add" => {
                 write_all(
                     instance,
-                    &change.file_path,
+                    &change.io_path,
                     &bom::join(&change.new_content, change.bom),
                 )
                 .await?;
@@ -338,23 +372,23 @@ async fn run(
             "update" => {
                 write_all(
                     instance,
-                    &change.file_path,
+                    &change.io_path,
                     &bom::join(&change.new_content, change.bom),
                 )
                 .await?;
                 updates.push((change.file_path.clone(), "change"));
             }
             "move" => {
-                if let Some(move_path) = &change.move_path {
+                if let Some(move_path) = &change.move_io_path {
                     write_all(
                         instance,
                         move_path,
                         &bom::join(&change.new_content, change.bom),
                     )
                     .await?;
-                    remove(instance, &change.file_path).await?;
+                    remove(instance, &change.io_path).await?;
                     updates.push((change.file_path.clone(), "unlink"));
-                    updates.push((move_path.clone(), "add"));
+                    updates.push((change.move_path.clone().unwrap(), "add"));
                 }
             }
             "delete" => {
@@ -715,6 +749,60 @@ mod tests {
             .unwrap();
         assert!(root.join(".opencode/agent/sneaky.md").exists());
         std::fs::remove_dir_all(temp.path()).ok();
+    }
+
+    #[tokio::test]
+    async fn move_authorizes_both_endpoints_before_any_mutation() {
+        use crate::event::bus::EventBus;
+        use crate::session::permission::{PermissionService, SessionAsk};
+        use crate::storage::Storage;
+        for denied in [Some("a.txt"), Some("b.txt"), None] {
+            let temp = crate::storage::test_support::TempDir::new("apply-move-rules");
+            std::fs::write(temp.path().join("a.txt"), "source\n").unwrap();
+            std::fs::write(temp.path().join("b.txt"), "protected\n").unwrap();
+            let events = Arc::new(EventBus::new(Storage::open_in_memory().unwrap(), None));
+            let service = Arc::new(PermissionService::new(events));
+            let mut rules = json!([{"permission":"edit", "pattern":"*", "action":"allow"}]);
+            if let Some(path) = denied {
+                rules
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"permission":"edit", "pattern":path, "action":"deny"}));
+            }
+            let ask = SessionAsk::new(
+                service,
+                "session",
+                "message",
+                "call",
+                serde_json::from_value::<crate::tool::permission::Ruleset>(rules).unwrap(),
+            );
+            let recorder = RecordingAsk::new();
+            let inst = instance(temp.path());
+            let extra = Extra::default();
+            let mut context = ctx(&recorder, &inst, &extra);
+            context.ask = &ask;
+            let patch = "*** Begin Patch\n*** Add File: new.txt\n+new\n*** Update File: a.txt\n*** Move to: ./sub/../b.txt\n@@\n-source\n+replacement\n*** End Patch";
+            let result = (tool().execute)(json!({"patchText":patch}), context).await;
+            if denied.is_some() {
+                assert!(result.is_err(), "{denied:?}");
+                assert_eq!(
+                    std::fs::read_to_string(temp.path().join("a.txt")).unwrap(),
+                    "source\n"
+                );
+                assert_eq!(
+                    std::fs::read_to_string(temp.path().join("b.txt")).unwrap(),
+                    "protected\n"
+                );
+                assert!(!temp.path().join("new.txt").exists());
+            } else {
+                result.unwrap();
+                assert!(!temp.path().join("a.txt").exists());
+                assert_eq!(
+                    std::fs::read_to_string(temp.path().join("b.txt")).unwrap(),
+                    "replacement\n"
+                );
+            }
+        }
     }
 
     #[tokio::test]

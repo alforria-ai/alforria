@@ -18,6 +18,7 @@ thiserror = { workspace = true }
 jsonc-parser = { workspace = true }
 fs4 = { workspace = true }
 walkdir = { workspace = true }
+same-file = { workspace = true }
 sha2 = { workspace = true }
 sha1 = { workspace = true }
 hex = { workspace = true }
@@ -41,6 +42,7 @@ ulid = { workspace = true }
 regex = { workspace = true }
 rust_decimal = { workspace = true }
 tracing = { workspace = true }
+tempfile = "3"
 rquickjs = { workspace = true }
 croner = "4.0.3"
 chrono-tz = "0.10.4"
@@ -48,7 +50,6 @@ chrono-tz = "0.10.4"
 [dev-dependencies]
 # `start_paused` for the M5.8 retry tests (deterministic clocks, no sleeps)
 tokio = { workspace = true, features = ["test-util"] }
-tempfile = "3"
 
 [features]
 # Test instrumentation only: `protect::fail_point`, a hook between the write
