@@ -44,7 +44,9 @@ and the markdown agents, commands and modes beside them — loaded as at
 startup, and how far project config is believed, and uses that for every
 directory opened later. Editing a host file on such a server takes a restart,
 and a host file that was not there at startup (a `~/.opencode/opencode.json`
-created later) is not read at all.
+created later) is not read at all. A host source the startup could not read
+is never an empty one: the server has a config error and refuses to listen,
+and a directory opened on it anyway fails with that error.
 The one exception is the server's own `PATCH /global/config` (an operator
 route): what the request sends is merged into what the server remembers of
 the global config, and applies to the directories opened after it. Nothing
@@ -60,7 +62,9 @@ A developer's own server — loopback, none of the unattended features,
 project config trusted — reads its host files again for each directory it
 opens, as before, so an edit applies without a restart. When a host file
 stops loading there, the last reading that loaded is kept (with a warning)
-instead of an empty config. `alforria run` and the other one-shot commands
+instead of an empty config; when the global config has never loaded in this
+process (it was already broken at startup), opening a directory fails with
+the parse error instead of running on defaults. `alforria run` and the other one-shot commands
 are one load and are unchanged. The code is
 `crates/alforria-core/src/config/snapshot.rs`.
 

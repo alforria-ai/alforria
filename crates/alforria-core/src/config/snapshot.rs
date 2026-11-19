@@ -22,8 +22,14 @@
 //!   exactly what the operator sent ([`HostSnapshot::apply_patch`]):
 //!   nothing is read from disk for it, so a host file rewritten in the
 //!   meantime — the one written or any other — is not adopted with it. A
-//!   host source that was not there at startup (a `~/.opencode` created
-//!   later) stays absent.
+//!   host source the startup found absent (a `~/.opencode` created later)
+//!   stays absent; one it did not manage to read is an error for every
+//!   load, never an empty config — and a server whose startup loads
+//!   failed is not frozen at all (it refuses to listen).
+//!
+//! With a snapshot registered, frozen or not, a global config that has
+//! never loaded is an error too, where a one-shot command still degrades
+//! it to an empty config as upstream does.
 //! * **Not frozen**: a developer's own server. Sources are read at every
 //!   load, as before, so an edit applies to the next directory opened; a
 //!   source that stops loading keeps its last good reading.
@@ -42,14 +48,17 @@ use crate::CoreError;
 
 /// One host source: a file or directory, and which reading of it (the
 /// loader substitutes with a different environment for the trusted load).
-pub(crate) type SourceKey = (PathBuf, &'static str);
+pub type SourceKey = (PathBuf, &'static str);
 
 #[derive(Default)]
 struct State {
     /// `Some`: frozen, with the mode to answer.
     frozen: Option<HostMode>,
-    /// The last good reading of each source.
+    /// The last good reading of each source. A source that was read and
+    /// found absent is here, empty.
     sources: HashMap<SourceKey, Value>,
+    /// Sources whose last read failed with no good reading before it.
+    failed: std::collections::HashSet<SourceKey>,
 }
 
 /// See the module documentation.
@@ -87,9 +96,30 @@ impl HostSnapshot {
     }
 
     /// From here on nothing is read again, and `mode` is the answer to
-    /// how far a project's config is believed.
-    pub fn freeze(&self, mode: HostMode) {
-        self.state.lock().unwrap_or_else(|p| p.into_inner()).frozen = Some(mode);
+    /// how far a project's config is believed. `absent` are the sources
+    /// the startup loads could have asked for and did not, because their
+    /// directory was not there: remembered as empty. A source whose read
+    /// failed is not made absent by this — it stays an error.
+    pub fn freeze(&self, mode: HostMode, absent: impl IntoIterator<Item = SourceKey>) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        for key in absent {
+            if !state.failed.contains(&key) {
+                state
+                    .sources
+                    .entry(key)
+                    .or_insert_with(|| Value::Object(Default::default()));
+            }
+        }
+        state.frozen = Some(mode);
+    }
+
+    /// The sources whose read failed with nothing good to fall back to.
+    pub fn failed(&self) -> Vec<PathBuf> {
+        let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let mut failed: Vec<PathBuf> = state.failed.iter().map(|(path, _)| path.clone()).collect();
+        failed.sort();
+        failed.dedup();
+        failed
     }
 
     /// The mode a frozen snapshot answers with.
@@ -124,8 +154,8 @@ impl HostSnapshot {
         }
     }
 
-    /// The reading of `key`: the remembered one when frozen (empty for a
-    /// source the freeze did not read),
+    /// The reading of `key`: the remembered one when frozen (an error
+    /// for a source the startup did not read),
     /// else `load`'s — remembered when it succeeds, and replaced by the
     /// last good one when it fails.
     pub(crate) fn read(
@@ -136,13 +166,15 @@ impl HostSnapshot {
         {
             let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
             if state.frozen.is_some() {
-                // What was not read by the freeze was not there: a host
-                // file that appears afterwards is nobody's startup config.
-                return Ok(state
-                    .sources
-                    .get(&key)
-                    .cloned()
-                    .unwrap_or_else(|| Value::Object(Default::default())));
+                // Read at startup (or found absent then), or an error:
+                // a source the startup did not read is not an empty one.
+                return state.sources.get(&key).cloned().ok_or_else(|| {
+                    CoreError::invalid(
+                        &key.0,
+                        "this host config source was not read when the server started; \
+                         restart the server to apply it",
+                    )
+                });
             }
         }
         // Not under the lock: a load reads files and may take a while.
@@ -150,6 +182,7 @@ impl HostSnapshot {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         match loaded {
             Ok(value) => {
+                state.failed.remove(&key);
                 state.sources.insert(key, value.clone());
                 Ok(value)
             }
@@ -161,7 +194,10 @@ impl HostSnapshot {
                     );
                     Ok(value.clone())
                 }
-                None => Err(error),
+                None => {
+                    state.failed.insert(key);
+                    Err(error)
+                }
             },
         }
     }
@@ -206,17 +242,31 @@ mod tests {
         assert_eq!(snapshot.read(key("x"), || Ok(json!(1))).unwrap(), json!(1));
         // Not frozen: a patch is nothing, the next load reads the file.
         snapshot.apply_patch(&dir, &json!({ "a": 9 }));
-        snapshot.freeze(HostMode {
-            restricted: true,
-            ..HostMode::default()
-        });
+        // A source whose read failed before the freeze.
+        assert!(snapshot.read(key("broken"), broken).is_err());
+        assert_eq!(snapshot.failed(), [PathBuf::from("broken")]);
+        snapshot.freeze(
+            HostMode {
+                restricted: true,
+                ..HostMode::default()
+            },
+            // What the startup could have read and found no directory for
+            // — and, wrongly, the one that failed.
+            [key("absent"), key("broken")],
+        );
         let unreachable = || -> Result<Value, CoreError> { panic!("read again") };
         assert_eq!(
             snapshot.read(global("load"), unreachable).unwrap(),
             json!({ "a": 1, "b": 2 })
         );
-        // A source first seen after the freeze was not there at startup.
-        assert_eq!(snapshot.read(key("y"), unreachable).unwrap(), json!({}));
+        // Confirmed absent at startup: empty, and never read.
+        assert_eq!(
+            snapshot.read(key("absent"), unreachable).unwrap(),
+            json!({})
+        );
+        // Failed at startup, or never asked for: an error, not empty.
+        assert!(snapshot.read(key("broken"), unreachable).is_err());
+        assert!(snapshot.read(key("never"), unreachable).is_err());
 
         snapshot.apply_patch(&dir, &json!({ "a": null, "c": 3 }));
         for reading in ["load", "trusted"] {

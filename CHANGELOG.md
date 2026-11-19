@@ -280,7 +280,10 @@ pre-1.0, so minor releases may include breaking changes.
   what the request sends, and nothing read back from disk). A
   developer's own server reads its host files at each open as before, and
   keeps the last reading that loaded when one stops parsing instead of
-  running with none.
+  running with none. In a server process (the TUI's own included) a global
+  config that has never loaded is now an error when a directory is opened,
+  where it used to be an empty config with a warning; `alforria run` and
+  the other one-shot commands still degrade it as upstream does.
 - On a server where project config is restricted (bearer auth, or
   `server.trust.project: "restricted"`), a project file could still step
   around the rules the host wrote per agent: define an agent of its own

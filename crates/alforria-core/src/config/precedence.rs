@@ -1102,9 +1102,10 @@ impl ConfigLoader {
             self.load_global(params, &auth_env)
         }) {
             Ok(global) => global,
-            // (A server that froze its host config answers from what it
-            // read at startup; one that keeps reading gets here only when
-            // no reading ever loaded.)
+            // A server process (`config::snapshot`): a global config that
+            // never loaded is an error, not a server without the host's
+            // rules. (One that loaded before is answered from that.)
+            Err(err) if snapshot.is_some() => return Err(err),
             Err(err) => {
                 tracing::warn!("failed to load global config, using defaults: {err}");
                 Value::Object(Map::new())
@@ -1408,6 +1409,30 @@ impl ConfigLoader {
 
         let config = decode_config(&result, &params.directory)?;
         Ok((config, directories))
+    }
+
+    /// Every host source a load over `params.paths` can ask a
+    /// [`HostSnapshot`] for: what `HostSnapshot::freeze` marks absent
+    /// when the startup loads did not find its directory.
+    pub fn host_source_keys(&self, params: &LoadParams) -> Vec<super::snapshot::SourceKey> {
+        let mut keys = Vec::new();
+        let config = &params.paths.config;
+        let dot = params.paths.home.join(crate::project_files::CONFIG_DIR);
+        let managed = managed_config_dir(params);
+        for reading in ["load", "trusted"] {
+            keys.push((config.clone(), reading));
+            for name in ["opencode.json", "opencode.jsonc"] {
+                keys.push((dot.join(name), reading));
+            }
+        }
+        for kind in ["commands", "agents", "modes"] {
+            keys.push((config.clone(), kind));
+            keys.push((dot.clone(), kind));
+        }
+        for name in ["opencode.json", "opencode.jsonc"] {
+            keys.push((managed.join(name), "managed"));
+        }
+        keys
     }
 
     /// Fail when a global config file does not load. [`ConfigLoader::load`]

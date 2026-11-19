@@ -481,7 +481,10 @@ pub fn production_context(
         });
     policy.observe(&opts.hostname, outside_trigger);
     tracing::info!("{}", policy.posture_summary());
-    freeze_host_config(&host_snapshot, &policy, &paths);
+    if let Err(error) = freeze_host_config(&host_snapshot, &policy, &paths) {
+        tracing::warn!("host config not applied: {error}");
+        policy.config_error.get_or_insert(error);
+    }
     // `hook.webhook`: the outbox captures from every instance's bus. A
     // hook that does not resolve is a host config error like any other.
     let outbox = match outbox::Outbox::new(storage.clone(), policy.hook.as_ref()) {
@@ -597,14 +600,16 @@ fn apply_synchronous(storage: &Storage, config: &alforria_core::config::schema::
 /// files as they were read at startup, with the access policy, and not as
 /// they are on disk by then. A developer's own server keeps reading them
 /// (and keeps the last reading that loaded). A host config that did not
-/// load at all is not frozen: `listen` refuses to serve it.
+/// load — at all, or in one of the readings taken here — is not frozen:
+/// the error is the policy's `config_error`, and `listen` refuses to
+/// serve it.
 fn freeze_host_config(
     snapshot: &alforria_core::config::HostSnapshot,
     policy: &ServerPolicy,
     paths: &alforria_core::GlobalPaths,
-) {
+) -> Result<(), String> {
     if policy.config_error.is_some() {
-        return;
+        return Ok(());
     }
     let loader = alforria_core::ConfigLoader::new();
     let params = || {
@@ -617,19 +622,25 @@ fn freeze_host_config(
     };
     let mode = loader.host_mode(&params());
     if !(policy.unattended_or_remote() || mode.restricted) {
-        return;
+        return Ok(());
     }
     // Both readings of every host source, before anything the agent does
     // can change the files: the merged one, and the one the permission
-    // ceiling is built from. What these do not read is not host config
-    // for as long as the process lives.
-    if let Err(error) = loader.load(&params()) {
-        tracing::warn!("host config: {error}");
+    // ceiling is built from. One that fails is not frozen as if it were
+    // good: the server has a config error and does not listen.
+    loader.load(&params()).map_err(|error| error.to_string())?;
+    loader
+        .load_trusted(&params())
+        .map_err(|error| error.to_string())?;
+    if let Some(failed) = snapshot.failed().first() {
+        return Err(format!(
+            "the host config source {} could not be read",
+            failed.display()
+        ));
     }
-    if let Err(error) = loader.load_trusted(&params()) {
-        tracing::warn!("host config: {error}");
-    }
-    snapshot.freeze(mode);
+    // What those loads found no directory for was not there.
+    snapshot.freeze(mode, loader.host_source_keys(&params()));
+    Ok(())
 }
 
 /// The merged global config, for what the server decides once rather than

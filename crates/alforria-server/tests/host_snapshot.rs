@@ -222,3 +222,43 @@ async fn a_standalone_server_rereads_and_keeps_the_last_good_config_on_a_parse_e
         PermissionV1Action::Ask
     );
 }
+
+/// A host source that does not parse at startup: the policy carries the
+/// error (so `listen` refuses), and a directory opened anyway — the
+/// in-process server has no listener to refuse — fails with it instead of
+/// booting under no ceiling at all.
+#[tokio::test]
+async fn a_host_source_that_does_not_load_at_startup_boots_no_instance() {
+    for broken in ["global", "dot-opencode"] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let (home, repo) = (root.join("home"), root.join("repo"));
+        std::fs::create_dir_all(&repo).unwrap();
+        let paths = alforria_core::GlobalPaths::resolve_with(home.clone(), |_| None);
+        std::fs::create_dir_all(&paths.config).unwrap();
+        let good = json!({ "permission": { "bash": "deny" } }).to_string();
+        let (global, dot) = match broken {
+            "global" => ("{ not json".to_string(), good),
+            _ => (good, "{ not json".to_string()),
+        };
+        std::fs::write(paths.config.join("opencode.json"), global).unwrap();
+        std::fs::create_dir_all(home.join(".opencode")).unwrap();
+        std::fs::write(home.join(".opencode").join("opencode.json"), dot).unwrap();
+
+        let seams = alforria_server::engine::EngineSeams {
+            env: alforria_server::engine::no_ambient_env(),
+            ..Default::default()
+        };
+        let ctx = alforria_server::production_context(
+            &alforria_server::ListenOptions::default(),
+            paths,
+            seams,
+        )
+        .unwrap();
+        assert!(ctx.policy.config_error.is_some(), "{broken}");
+        assert!(
+            ctx.instances.load(&repo).is_err(),
+            "{broken}: an instance booted without the host config"
+        );
+    }
+}
