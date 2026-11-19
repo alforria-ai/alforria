@@ -930,15 +930,19 @@ async fn ask_edit(
     ctx: &ToolCtxRef<'_>,
     instance: &InstanceContext,
     file_path: &Path,
+    requested: &Path,
     diff: &str,
 ) -> Result<(), ToolError> {
     ctx.ask
         .ask(AskRequest {
             permission: "edit".to_string(),
-            patterns: vec![ts_relative(&instance.worktree, file_path)],
+            patterns: crate::tool::file_path::edit_patterns(
+                &instance.worktree,
+                [requested, file_path],
+            ),
             always: vec!["*".to_string()],
             metadata: json!({
-                "filepath": file_path.to_string_lossy(),
+                "filepath": requested.to_string_lossy(),
                 "diff": diff,
             }),
         })
@@ -967,7 +971,12 @@ pub(crate) fn file_was_observed(ctx: &ToolCtxRef<'_>, target: &Path) -> bool {
                     }
                     part.pointer("/state/input/filePath")
                         .and_then(Value::as_str)
-                        .map(|path| ts_resolve(&ctx.instance.directory, path) == target)
+                        .map(|path| {
+                            crate::tool::file_path::resolve(&ts_resolve(
+                                &ctx.instance.directory,
+                                path,
+                            )) == crate::tool::file_path::resolve(target)
+                        })
                         .unwrap_or(false)
                 })
             })
@@ -992,8 +1001,9 @@ fn run(
         }
 
         let instance = ctx.instance.clone();
-        let file_path = ts_resolve(&instance.directory, &params.file_path);
-        let file_str = file_path.to_string_lossy().to_string();
+        let requested = ts_resolve(&instance.directory, &params.file_path);
+        let file_path = crate::tool::file_path::resolve(&requested);
+        let file_str = requested.to_string_lossy().to_string();
         assert_external_directory(&ctx, Some(&file_str), ExternalOptions::default()).await?;
 
         if !params.old_string.is_empty()
@@ -1027,9 +1037,10 @@ fn run(
                 &content_old,
                 &content_new,
             ));
-            ask_edit(&ctx, &instance, &file_path, &diff).await?;
+            ask_edit(&ctx, &instance, &file_path, &requested, &diff).await?;
+            crate::tool::file_path::verify(&requested, &file_path)?;
             bom::write_with_dirs(&file_path, &bom::join(&content_new, desired_bom)).await?;
-            if format_file(&format, &file_str).await {
+            if format_file(&format, &file_path.to_string_lossy()).await {
                 content_new = bom::sync_file(&file_path, desired_bom).await?;
             }
             publish_edited(&events, &file_str).await;
@@ -1064,10 +1075,11 @@ fn run(
                 &normalize_line_endings(&content_old),
                 &normalize_line_endings(&content_new),
             ));
-            ask_edit(&ctx, &instance, &file_path, &diff).await?;
+            ask_edit(&ctx, &instance, &file_path, &requested, &diff).await?;
+            crate::tool::file_path::verify(&requested, &file_path)?;
 
             bom::write_with_dirs(&file_path, &bom::join(&content_new, desired_bom)).await?;
-            if format_file(&format, &file_str).await {
+            if format_file(&format, &file_path.to_string_lossy()).await {
                 content_new = bom::sync_file(&file_path, desired_bom).await?;
             }
             publish_edited(&events, &file_str).await;
@@ -1115,7 +1127,7 @@ fn run(
         }
 
         Ok(ExecuteResult {
-            title: ts_relative(&instance.worktree, &file_path),
+            title: ts_relative(&instance.worktree, &requested),
             metadata: json!({
                 "diagnostics": diagnostics,
                 "diff": diff,

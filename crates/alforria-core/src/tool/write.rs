@@ -75,8 +75,9 @@ fn run(
 ) -> BoxFuture<'_, Result<ExecuteResult, ToolError>> {
     Box::pin(async move {
         let instance = ctx.instance.clone();
-        let file_path = ts_resolve(&instance.directory, &params.file_path);
-        let file_str = file_path.to_string_lossy().to_string();
+        let requested = ts_resolve(&instance.directory, &params.file_path);
+        let file_path = crate::tool::file_path::resolve(&requested);
+        let file_str = requested.to_string_lossy().to_string();
         assert_external_directory(&ctx, Some(&file_str), ExternalOptions::default()).await?;
 
         let exists = tokio::fs::metadata(&file_path).await.is_ok();
@@ -103,7 +104,10 @@ fn run(
         ctx.ask
             .ask(AskRequest {
                 permission: "edit".to_string(),
-                patterns: vec![ts_relative(&instance.worktree, &file_path)],
+                patterns: crate::tool::file_path::edit_patterns(
+                    &instance.worktree,
+                    [requested.as_path(), file_path.as_path()],
+                ),
                 always: vec!["*".to_string()],
                 metadata: json!({
                     "filepath": file_str,
@@ -112,9 +116,10 @@ fn run(
             })
             .await?;
 
+        crate::tool::file_path::verify(&requested, &file_path)?;
         bom::write_with_dirs(&file_path, &bom::join(&content_new, desired_bom)).await?;
         if let Some(formatter) = &format {
-            if formatter.file(&file_str).await {
+            if formatter.file(&file_path.to_string_lossy()).await {
                 bom::sync_file(&file_path, desired_bom).await?;
             }
         }
@@ -158,7 +163,7 @@ fn run(
         }
 
         Ok(ExecuteResult {
-            title: ts_relative(&instance.worktree, &file_path),
+            title: ts_relative(&instance.worktree, &requested),
             metadata: json!({
                 "diagnostics": diagnostics,
                 "filepath": file_str,
