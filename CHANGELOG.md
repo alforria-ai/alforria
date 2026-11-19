@@ -246,12 +246,6 @@ pre-1.0, so minor releases may include breaking changes.
   host, user or project. See "Which config may set what" in
   `docs/assistant.md`.
 
-### Changed
-
-- TUI: `/copy` now copies the last assistant message as Markdown. Use
-  `/copythread` for the full conversation, or set `"copy_mode": "thread"`
-  in `tui.json` to restore the old default.
-
 ### Fixed
 
 - A guarded session's revert restored and removed its files one at a time
@@ -669,6 +663,9 @@ pre-1.0, so minor releases may include breaking changes.
 
 ### Changed
 
+- TUI: `/copy` now copies the last assistant message as Markdown. Use
+  `/copythread` for the full conversation, or set `"copy_mode": "thread"`
+  in `tui.json` to restore the old default.
 - A server whose shell posture is restricted (bound beyond loopback,
   `permission.unattended`, a webhook, a `webhook` or `watch` trigger) while
   project config is still fully trusted — no bearer auth, no
