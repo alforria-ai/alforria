@@ -1651,6 +1651,18 @@ else: another path, another directory, another route or a write with it gets
 than once); it stops working when it expires. `404` when the file does not
 exist, `400` when it is a directory.
 
+The server holds at most 10 000 live tickets, and at most 1 000 minted by
+one credential (a JWT's `sub` or a static token's `name`; tokens that name
+neither share one allowance): one more evicts that credential's own oldest
+ticket, so a client minting tickets in a loop invalidates its own links
+and nobody else's.
+
+A ticket is not tied to the life of the token that minted it: one minted
+just before a JWT expires stays good for its own `ttl`, up to 600 seconds
+after. Tokens cannot be revoked while the server runs (the keys and static
+tokens are read at startup), and a restart drops every ticket, so expiry is
+the only case; mint tickets with a short `ttl` where that matters.
+
 ### `GET /file/raw?path=…[&ticket=…][&download=1]`
 
 The file's bytes, with its media type, `Content-Length`, single-range

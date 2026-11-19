@@ -244,6 +244,10 @@ pre-1.0, so minor releases may include breaking changes.
 
 ### Fixed
 
+- File tickets shared one cache of 10 000 with oldest-first eviction, so
+  one token minting tickets in a loop invalidated everybody else's. A
+  credential now holds at most 1 000 live tickets and evicts its own
+  oldest beyond that.
 - `GET /file/content` checked that the path existed and then read it by
   name on an async worker, into memory, whatever it was: a FIFO in the
   project (the agent's shell can make one) parked a server thread for

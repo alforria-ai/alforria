@@ -17,9 +17,16 @@ use alforria_core::Clock;
 /// `CAPACITY` (`ticket.ts:10`): the oldest tickets are evicted beyond it.
 pub const CAPACITY: usize = 10_000;
 
+/// How many live tickets one minter holds: beyond it, its own oldest are
+/// evicted. A tenth of the whole, so one credential cannot fill the cache
+/// and push everybody else's tickets out.
+pub const PER_MINTER: usize = 1_000;
+
 struct Ticket<S> {
     expires_at_ms: u64,
     scope: S,
+    /// Who it was minted for; empty for the server's own.
+    minter: String,
 }
 
 struct Entries<S> {
@@ -69,10 +76,36 @@ impl<S: Clone> Tickets<S> {
     /// Mint a UUIDv4 ticket for `scope`, live for `ttl`
     /// (`issue`, `ticket.ts:43-47`).
     pub fn issue(&self, scope: S, ttl: Duration) -> String {
+        self.issue_as("", scope, ttl)
+    }
+
+    /// [`Tickets::issue`] on behalf of `minter` — the credential that
+    /// asked. A minter holds at most [`PER_MINTER`] live tickets: one more
+    /// evicts its own oldest, so the whole-cache eviction below is not
+    /// something one credential can turn on everybody else's tickets. (An
+    /// empty `minter` — the terminal tickets, an operator's route — has
+    /// the whole-cache bound only.)
+    pub fn issue_as(&self, minter: &str, scope: S, ttl: Duration) -> String {
         let ticket = uuid::Uuid::new_v4().to_string();
         let now = self.clock.now_ms();
         let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
         prune_expired(&mut entries, now);
+        if !minter.is_empty() {
+            let own: Vec<String> = entries
+                .order
+                .iter()
+                .filter(|id| entries.map.get(*id).is_some_and(|t| t.minter == minter))
+                .cloned()
+                .collect();
+            let excess = (own.len() + 1).saturating_sub(PER_MINTER);
+            if excess > 0 {
+                let evicted: std::collections::HashSet<&String> = own[..excess].iter().collect();
+                for id in &evicted {
+                    entries.map.remove(*id);
+                }
+                entries.order.retain(|id| !evicted.contains(id));
+            }
+        }
         while entries.map.len() >= CAPACITY {
             match entries.order.pop_front() {
                 Some(oldest) => entries.map.remove(&oldest),
@@ -85,6 +118,7 @@ impl<S: Clone> Tickets<S> {
             Ticket {
                 expires_at_ms: now + ttl.as_millis() as u64,
                 scope,
+                minter: minter.to_string(),
             },
         );
         ticket
@@ -149,8 +183,10 @@ impl FileTickets {
         }
     }
 
-    pub fn issue(&self, scope: FileScope, ttl: Duration) -> String {
-        self.inner.issue(scope, ttl)
+    /// A ticket for `scope`, minted by `minter` (who authenticated the
+    /// request: [`PER_MINTER`]).
+    pub fn issue(&self, minter: &str, scope: FileScope, ttl: Duration) -> String {
+        self.inner.issue_as(minter, scope, ttl)
     }
 
     /// Whether `ticket` is live and was issued for exactly this file of
@@ -191,7 +227,7 @@ mod tests {
     fn a_file_ticket_admits_its_own_file_until_it_expires() {
         let clock = Arc::new(MutableClock(Mutex::new(1_000)));
         let tickets = FileTickets::new(clock.clone());
-        let ticket = tickets.issue(scope("/repo/a.png"), Duration::from_secs(60));
+        let ticket = tickets.issue("me", scope("/repo/a.png"), Duration::from_secs(60));
         assert!(tickets.admits(&ticket, &scope("/repo/a.png")));
         assert!(
             tickets.admits(&ticket, &scope("/repo/a.png")),
@@ -211,6 +247,33 @@ mod tests {
         assert!(tickets.admits(&ticket, &scope("/repo/a.png")));
         *clock.0.lock().unwrap() += 1;
         assert!(!tickets.admits(&ticket, &scope("/repo/a.png")));
+    }
+
+    /// One credential minting tickets as fast as it can evicts its own
+    /// oldest, never another's: the cache is bounded per minter before it
+    /// is bounded as a whole.
+    #[test]
+    fn one_minter_cannot_evict_another_minters_tickets() {
+        let clock = Arc::new(MutableClock(Mutex::new(1_000)));
+        let tickets = FileTickets::new(clock);
+        let ttl = Duration::from_secs(600);
+        let theirs = tickets.issue("Jwt:alice", scope("/repo/theirs.png"), ttl);
+        let first = tickets.issue("Jwt:mallory", scope("/repo/0"), ttl);
+        let mut last = String::new();
+        for n in 0..CAPACITY + 10 {
+            last = tickets.issue("Jwt:mallory", scope(&format!("/repo/{n}")), ttl);
+        }
+        assert!(
+            tickets.admits(&theirs, &scope("/repo/theirs.png")),
+            "another minter's ticket was evicted"
+        );
+        // The flood cost its own minter its oldest tickets.
+        assert!(!tickets.admits(&first, &scope("/repo/0")));
+        assert!(tickets.admits(&last, &scope(&format!("/repo/{}", CAPACITY + 9))));
+        let held = tickets.inner.entries.lock().unwrap().map.len();
+        assert_eq!(held, PER_MINTER + 1);
+        // Minters with no subject of their own share one allowance.
+        assert!(tickets.admits(&theirs, &scope("/repo/theirs.png")));
     }
 
     #[test]

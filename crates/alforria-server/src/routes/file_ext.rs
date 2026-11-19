@@ -1050,6 +1050,7 @@ struct TicketRequest {
 /// `POST /file/ticket` — mint a read ticket for one existing file.
 async fn ticket(
     State(ctx): State<Arc<ServerContext>>,
+    principal: Option<Extension<Principal>>,
     axum::Extension(directory): axum::Extension<RequestDirectory>,
     Json(request): Json<TicketRequest>,
 ) -> Result<Json<serde_json::Value>, FileError> {
@@ -1064,7 +1065,11 @@ async fn ticket(
         .ttl
         .map(|seconds| Duration::from_secs(seconds.max(1)).min(FILE_TICKET_MAX_TTL))
         .unwrap_or(FILE_TICKET_TTL);
-    let ticket = ctx.file_tickets.issue(file_scope(&location, &file), ttl);
+    let ticket = ctx.file_tickets.issue(
+        &principal_key(&principal),
+        file_scope(&location, &file),
+        ttl,
+    );
     let encode = |value: &str| -> String {
         value
             .bytes()
