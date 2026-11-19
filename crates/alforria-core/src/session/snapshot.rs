@@ -54,6 +54,15 @@ pub struct CheckedWrite {
     pub delete_missing: bool,
 }
 
+/// What [`Snapshot::write_checked`] does for one file, once everything has
+/// been read.
+enum CheckedStep {
+    /// The snapshot does not hold the file: remove it.
+    Remove(CheckedWrite),
+    /// Write these bytes, executable or not.
+    Restore(CheckedWrite, Vec<u8>, bool),
+}
+
 /// `Snapshot.FileDiff` — the schema crate owns the wire shape.
 pub type FileDiff = alforria_schema::file_diff::SnapshotFileDiff;
 
@@ -989,11 +998,17 @@ impl GitSnapshot {
     /// [`Snapshot::write_checked`]: per file, what the snapshot holds
     /// (`ls-tree`), its bytes (`cat-file`), and the write through the
     /// judged landing's directory handle. git writes nothing here.
+    ///
+    /// All or nothing, as far as reading goes: every file is looked up and
+    /// every blob read before the first write or removal, so a snapshot
+    /// that cannot be listed or a blob that cannot be read leaves the
+    /// working tree as it was, not half reverted.
     fn write_checked_impl(&self, writes: Vec<CheckedWrite>) -> Result<(), CoreError> {
         let _guard = self.lock();
         let failed = |what: &str, file: &str, why: &dyn std::fmt::Display| {
             CoreError::Storage(format!("snapshot restore failed: {what} {file}: {why}"))
         };
+        let mut steps: Vec<CheckedStep> = Vec::new();
         for write in writes {
             let rel = relative(&self.worktree, &write.file);
             let args = self.args(&CFG, &["ls-tree", "-z", &write.hash, "--", &rel]);
@@ -1014,15 +1029,7 @@ impl GitSnapshot {
                 .next();
             let Some(entry) = entry else {
                 if write.delete_missing {
-                    tracing::info!(
-                        "file did not exist in snapshot, deleting: file={}",
-                        write.file
-                    );
-                    match crate::protect::remove_at(&write.landing) {
-                        Ok(()) => {}
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(error) => return Err(failed("remove", &write.file, &error)),
-                    }
+                    steps.push(CheckedStep::Remove(write));
                 }
                 continue;
             };
@@ -1045,8 +1052,27 @@ impl GitSnapshot {
             if blob.code != 0 {
                 return Err(failed("cat-file", &write.file, &blob.stderr));
             }
-            crate::protect::restore_at(&write.landing, &blob.stdout, mode == "100755")
-                .map_err(|error| failed("write", &write.file, &error))?;
+            steps.push(CheckedStep::Restore(write, blob.stdout, mode == "100755"));
+        }
+        // Everything was found and read: now the working tree is touched.
+        for step in steps {
+            match step {
+                CheckedStep::Remove(write) => {
+                    tracing::info!(
+                        "file did not exist in snapshot, deleting: file={}",
+                        write.file
+                    );
+                    match crate::protect::remove_at(&write.landing) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(failed("remove", &write.file, &error)),
+                    }
+                }
+                CheckedStep::Restore(write, contents, executable) => {
+                    crate::protect::restore_at(&write.landing, &contents, executable)
+                        .map_err(|error| failed("write", &write.file, &error))?;
+                }
+            }
         }
         Ok(())
     }
@@ -1750,9 +1776,11 @@ impl InMemorySnapshot {
     fn write_checked_sync(&self, writes: Vec<CheckedWrite>) -> Result<(), CoreError> {
         let failed =
             |error: std::io::Error| CoreError::Storage(format!("snapshot restore failed: {error}"));
-        for write in writes {
-            let content = {
-                let state = self.lock_state();
+        // Read everything first, as the git-backed one does.
+        let mut steps = Vec::new();
+        {
+            let state = self.lock_state();
+            for write in writes {
                 let Some(snapshot) = state.get(&write.hash) else {
                     return Err(CoreError::Storage(format!(
                         "snapshot {} not found",
@@ -1762,8 +1790,11 @@ impl InMemorySnapshot {
                 let Ok(rel) = Path::new(&write.file).strip_prefix(&self.worktree) else {
                     continue;
                 };
-                snapshot.get(rel.to_string_lossy().as_ref()).cloned()
-            };
+                let content = snapshot.get(rel.to_string_lossy().as_ref()).cloned();
+                steps.push((write, content));
+            }
+        }
+        for (write, content) in steps {
             match content {
                 Some(content) => {
                     crate::protect::write_at(&write.landing, content.as_bytes()).map_err(failed)?
@@ -1972,6 +2003,101 @@ mod git_tests {
             !dir.path().join("new.txt").exists(),
             "file absent from the snapshot is deleted"
         );
+    }
+
+    /// A guarded revert writes all of its files or none: every file is
+    /// looked up and every blob read before the first one is written. A
+    /// blob that is missing in the middle of the list (or a snapshot that
+    /// cannot be listed) used to leave the files before it restored and
+    /// the rest not.
+    #[tokio::test]
+    async fn a_checked_restore_with_an_unreadable_blob_writes_nothing() {
+        let dir = TempDir::new("snap-checked");
+        let root = dir.path().canonicalize().unwrap();
+        init_repo(&root);
+        std::fs::write(root.join("seed.txt"), "seed\n").unwrap();
+        commit_all(&root);
+        // Not committed: their blobs are the snapshot store's own.
+        std::fs::write(root.join("a.txt"), "a as snapshotted\n").unwrap();
+        std::fs::write(root.join("b.txt"), "b as snapshotted\n").unwrap();
+        let (snap, data) = snapshot(&root);
+        let base = snap.track().await.expect("snapshot hash");
+
+        std::fs::write(root.join("a.txt"), "a changed\n").unwrap();
+        std::fs::write(root.join("b.txt"), "b changed\n").unwrap();
+        std::fs::write(root.join("new.txt"), "made since\n").unwrap();
+        let write = |name: &str, hash: &str| CheckedWrite {
+            hash: hash.to_string(),
+            file: root.join(name).to_string_lossy().into_owned(),
+            landing: root.join(name),
+            delete_missing: true,
+        };
+        let untouched = || {
+            let read = |name: &str| std::fs::read_to_string(root.join(name)).unwrap();
+            assert_eq!(read("a.txt"), "a changed\n", "half a revert was applied");
+            assert_eq!(read("b.txt"), "b changed\n");
+            assert_eq!(read("new.txt"), "made since\n", "half a revert was applied");
+        };
+
+        // The second entry's snapshot cannot be listed.
+        let bogus = "0123456789abcdef0123456789abcdef01234567";
+        let listed = vec![
+            write("new.txt", &base),
+            write("a.txt", &base),
+            write("b.txt", bogus),
+        ];
+        assert!(snap.write_checked(listed).await.is_err());
+        untouched();
+
+        // The second entry's blob is gone from the store.
+        let object = {
+            let listing = SubprocessGit.run(
+                Some(&gitdir(data.path(), &root)),
+                &["ls-tree", &base, "--", "b.txt"],
+            );
+            assert_eq!(listing.exit_code, 0, "{}", listing.stderr);
+            listing.text.split_whitespace().nth(2).unwrap().to_string()
+        };
+        let loose = gitdir(data.path(), &root)
+            .join("objects")
+            .join(&object[..2])
+            .join(&object[2..]);
+        std::fs::remove_file(&loose).expect("the blob is a loose object of the store");
+        let all = || {
+            vec![
+                write("new.txt", &base),
+                write("a.txt", &base),
+                write("b.txt", &base),
+            ]
+        };
+        assert!(snap.write_checked(all()).await.is_err());
+        untouched();
+
+        // With everything readable, all of it is written.
+        let original = data.path().join("b-original");
+        std::fs::write(&original, "b as snapshotted\n").unwrap();
+        let store = gitdir(data.path(), &root);
+        let stored = SubprocessGit.run(
+            Some(&root),
+            &[
+                "--git-dir",
+                &store.to_string_lossy(),
+                "hash-object",
+                "-w",
+                &original.to_string_lossy(),
+            ],
+        );
+        assert_eq!(stored.text.trim(), object, "{}", stored.stderr);
+        snap.write_checked(all()).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "a as snapshotted\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("b.txt")).unwrap(),
+            "b as snapshotted\n"
+        );
+        assert!(!root.join("new.txt").exists());
     }
 
     #[tokio::test]

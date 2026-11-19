@@ -244,6 +244,11 @@ pre-1.0, so minor releases may include breaking changes.
 
 ### Fixed
 
+- A guarded session's revert restored and removed its files one at a time
+  as it read them from the snapshot, so a blob that was missing or a
+  snapshot that could not be listed part-way through left the working tree
+  half reverted. Every file is now looked up and every blob read before
+  the first write; if any of that fails, nothing is written.
 - A guarded write truncated the existing file in place, so a name that is
   a hard link to a loader file or to a host file (`notes.md` linked to
   `AGENTS.md`) passed the write guard by name and rewrote the protected
