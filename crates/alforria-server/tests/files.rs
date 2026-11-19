@@ -801,6 +801,18 @@ async fn narrow_tokens_cannot_upload_formatter_or_language_server_config() {
     );
 }
 
+/// An upload, sent again for as long as the upload directory is receiving
+/// as many as it takes at a time (`429`).
+async fn put_when_admitted(f: &Fixture, auth: &str, path: &str, body: &[u8]) -> StatusCode {
+    loop {
+        let status = put(f, Some(auth), path, "", body).await.status();
+        if status != StatusCode::TOO_MANY_REQUESTS {
+            return status;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+}
+
 fn quota_fixture(signer: &Signer, total: u64, files: u64) -> Fixture {
     let f = fixture_with(
         |dirs| {
@@ -1021,9 +1033,7 @@ async fn concurrent_uploads_replacing_one_file_keep_the_count_true() {
                     // 100..=1030 bytes: some fit beside the other file,
                     // some do not.
                     let body = vec![b'a'; (100 + 30 * ((n + round) % 32)) as usize];
-                    put(&f, Some(&chat), "uploads/one.bin", "", &body)
-                        .await
-                        .status()
+                    put_when_admitted(&f, &chat, "uploads/one.bin", &body).await
                 })
             })
             .collect();
@@ -1060,15 +1070,7 @@ async fn concurrent_uploads_of_one_new_file_count_it_once() {
         .map(|n| {
             let (f, chat) = (std::sync::Arc::clone(&f), chat.clone());
             tokio::spawn(async move {
-                put(
-                    &f,
-                    Some(&chat),
-                    "uploads/a/b/new.bin",
-                    "",
-                    &vec![b'n'; 10 + n],
-                )
-                .await
-                .status()
+                put_when_admitted(&f, &chat, "uploads/a/b/new.bin", &vec![b'n'; 10 + n]).await
             })
         })
         .collect();

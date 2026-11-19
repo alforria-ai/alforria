@@ -102,6 +102,28 @@ fn too_large(limit: u64) -> FileError {
     )
 }
 
+fn too_many_uploads() -> FileError {
+    FileError::Status(
+        StatusCode::TOO_MANY_REQUESTS,
+        "TooManyUploadsError",
+        format!(
+            "{UPLOAD_MAX_IN_FLIGHT} uploads into this upload directory are already being \
+             received; try again when one has finished"
+        ),
+    )
+}
+
+fn stalled() -> FileError {
+    FileError::Status(
+        StatusCode::REQUEST_TIMEOUT,
+        "UploadTimeoutError",
+        format!(
+            "the upload sent nothing for {} seconds and was ended",
+            idle_timeout().as_secs()
+        ),
+    )
+}
+
 fn over_quota(message: String) -> FileError {
     FileError::Status(StatusCode::PAYLOAD_TOO_LARGE, "UploadQuotaError", message)
 }
@@ -115,6 +137,37 @@ const TEMPORARY_PREFIX: &str = ".alforria-upload-";
 /// How deep below its upload directory a credential below `admin` may
 /// upload, in path components, and how deep the count goes.
 pub const UPLOAD_MAX_DEPTH: usize = 8;
+
+/// How many uploads below `admin` one upload directory receives at a time.
+pub const UPLOAD_MAX_IN_FLIGHT: u32 = 8;
+
+/// How long an upload may send nothing before it is ended.
+const UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A temporary file that no upload of this process is writing and that is
+/// older than this is a leftover (a server that was killed mid-upload):
+/// the next recount removes it. Older than any live upload's last write,
+/// in this process or another one on the same directory
+/// ([`UPLOAD_IDLE_TIMEOUT`]).
+const TEMPORARY_MAX_AGE: Duration = Duration::from_secs(600);
+
+static IDLE_TIMEOUT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn idle_timeout() -> Duration {
+    match IDLE_TIMEOUT_MS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => UPLOAD_IDLE_TIMEOUT,
+        millis => Duration::from_millis(millis),
+    }
+}
+
+/// Test seam: how long an upload may send nothing, for the whole process.
+#[doc(hidden)]
+pub fn upload_idle_timeout(timeout: Duration) {
+    IDLE_TIMEOUT_MS.store(
+        timeout.as_millis() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
 
 /// How long a directory's usage is trusted before it is counted again:
 /// files the agent's shell adds or removes are noticed after this long, or
@@ -164,6 +217,75 @@ struct AreaState {
     /// The files uploads made while a walk was under way: put back over
     /// what the walk recorded, which may have missed them.
     landed: Vec<(PathBuf, u64)>,
+    /// What the uploads being received hold of the quota — bytes, entries
+    /// — from [`begin`] until each is committed or dropped ([`InFlight`]).
+    reserved: (u64, u64),
+    /// How many are being received.
+    in_flight: u32,
+    /// Their temporary files: not leftovers ([`refresh`]).
+    temporaries: std::collections::HashSet<PathBuf>,
+}
+
+/// An upload being received: its temporary file, and what it holds of its
+/// upload directory's quota. Dropping it — the upload finished, failed, or
+/// the request was dropped half-way — unlinks the temporary file if it is
+/// still there and gives back what was held.
+struct InFlight {
+    /// The upload directory's count, below `admin`.
+    area: Option<Arc<Area>>,
+    directory: alforria_core::beneath::NoFollowDir,
+    temporary: std::ffi::OsString,
+    /// Where the temporary file is, as the count's walk would name it.
+    path: PathBuf,
+    /// The temporary file may exist.
+    created: bool,
+    /// Held of the quota: bytes, entries.
+    held: (u64, u64),
+    /// What replacing the target takes off the count, as [`begin`] read it.
+    credit: u64,
+}
+
+impl InFlight {
+    fn new(
+        area: Option<Arc<Area>>,
+        directory: alforria_core::beneath::NoFollowDir,
+        target: &Path,
+    ) -> InFlight {
+        let temporary = std::ffi::OsString::from(format!(
+            "{TEMPORARY_PREFIX}{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        InFlight {
+            area,
+            path: target.with_file_name(&temporary),
+            directory,
+            temporary,
+            created: false,
+            held: (0, 0),
+            credit: 0,
+        }
+    }
+
+    /// Give back what is held, under the area's lock the caller holds.
+    fn release(&mut self, state: &mut AreaState) {
+        state.reserved.0 = state.reserved.0.saturating_sub(self.held.0);
+        state.reserved.1 = state.reserved.1.saturating_sub(self.held.1);
+        self.held = (0, 0);
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        if self.created {
+            let _ = self.directory.remove_file(&self.temporary);
+        }
+        if let Some(area) = self.area.take() {
+            let mut state = area.lock();
+            self.release(&mut state);
+            state.in_flight = state.in_flight.saturating_sub(1);
+            state.temporaries.remove(&self.path);
+        }
+    }
 }
 
 /// What replacing `target`, now `on_disk` bytes, takes off the count: what
@@ -268,8 +390,27 @@ pub fn upload_area_usage(area: &Path) -> Option<(u64, u64)> {
 /// What `area` holds on disk, counted the way the quota counts it.
 #[doc(hidden)]
 pub fn upload_area_on_disk(area: &Path, max_entries: u64) -> (u64, u64) {
-    let (usage, _) = count_area(area, max_entries);
+    let usage = count_area(area, max_entries).usage;
     (usage.bytes, usage.entries)
+}
+
+/// The uploads into `area` being received: how many, and the bytes they
+/// hold of the quota (for tests).
+#[doc(hidden)]
+pub fn upload_area_in_flight(area: &Path) -> (u32, u64) {
+    let area = area_of(area);
+    let state = area.lock();
+    (state.in_flight, state.reserved.0)
+}
+
+/// What a walk of an upload directory found.
+struct Walk {
+    usage: Usage,
+    /// Each file's size.
+    sizes: std::collections::HashMap<PathBuf, u64>,
+    /// The files named like an upload in progress, and when each was last
+    /// written.
+    temporaries: Vec<(PathBuf, Option<std::time::SystemTime>)>,
 }
 
 /// Count what `root` holds: every entry, directories included, no link
@@ -278,14 +419,17 @@ pub fn upload_area_on_disk(area: &Path, max_entries: u64) -> (u64, u64) {
 /// [`UPLOAD_MAX_DEPTH`]. A directory or an entry that is there and cannot
 /// be read is not an empty one: what it holds is unknown, and the count is
 /// `over` too.
-fn count_area(root: &Path, max_entries: u64) -> (Usage, std::collections::HashMap<PathBuf, u64>) {
-    let mut usage = Usage {
-        bytes: 0,
-        entries: 0,
-        over: false,
-        counted: std::time::Instant::now(),
+fn count_area(root: &Path, max_entries: u64) -> Walk {
+    let mut walk = Walk {
+        usage: Usage {
+            bytes: 0,
+            entries: 0,
+            over: false,
+            counted: std::time::Instant::now(),
+        },
+        sizes: std::collections::HashMap::new(),
+        temporaries: Vec::new(),
     };
-    let mut sizes = std::collections::HashMap::new();
     let gone = |err: &std::io::Error| err.kind() == std::io::ErrorKind::NotFound;
     let mut pending = vec![(root.to_path_buf(), 0usize)];
     while let Some((directory, depth)) = pending.pop() {
@@ -294,41 +438,49 @@ fn count_area(root: &Path, max_entries: u64) -> (Usage, std::collections::HashMa
             // Not made yet, or removed since it was listed.
             Err(err) if gone(&err) => continue,
             Err(_) => {
-                usage.over = true;
-                return (usage, sizes);
+                walk.usage.over = true;
+                return walk;
             }
         };
         for entry in entries {
             let Ok(entry) = entry else {
-                usage.over = true;
-                return (usage, sizes);
+                walk.usage.over = true;
+                return walk;
             };
-            usage.entries += 1;
-            if usage.entries > max_entries {
-                usage.over = true;
-                return (usage, sizes);
+            walk.usage.entries += 1;
+            if walk.usage.entries > max_entries {
+                walk.usage.over = true;
+                return walk;
             }
             let meta = match entry.metadata() {
                 Ok(meta) => meta,
                 Err(err) if gone(&err) => continue,
                 Err(_) => {
-                    usage.over = true;
-                    return (usage, sizes);
+                    walk.usage.over = true;
+                    return walk;
                 }
             };
             if meta.is_dir() {
                 if depth + 1 >= UPLOAD_MAX_DEPTH {
-                    usage.over = true;
-                    return (usage, sizes);
+                    walk.usage.over = true;
+                    return walk;
                 }
                 pending.push((entry.path(), depth + 1));
             } else {
-                usage.bytes = usage.bytes.saturating_add(meta.len());
-                sizes.insert(entry.path(), meta.len());
+                walk.usage.bytes = walk.usage.bytes.saturating_add(meta.len());
+                walk.sizes.insert(entry.path(), meta.len());
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(TEMPORARY_PREFIX)
+                    && meta.is_file()
+                {
+                    walk.temporaries.push((entry.path(), meta.modified().ok()));
+                }
             }
         }
     }
-    (usage, sizes)
+    walk
 }
 
 /// Make sure `area` has a count no older than [`USAGE_MAX_AGE`]: the
@@ -376,8 +528,27 @@ async fn refresh(ctx: &ServerContext, root: &Path, area: &Arc<Area>) -> Result<(
     })
     .await
     .map_err(|join| storage_error(&std::io::Error::other(join.to_string())))?;
-    let (counted, mut sizes) = counted;
+    let Walk {
+        usage: mut counted,
+        mut sizes,
+        temporaries,
+    } = counted;
     let mut state = area.lock();
+    // Leftovers of uploads nobody is receiving any more (a server killed
+    // mid-upload): removed, and not counted. One being written — here, or
+    // by another process on this directory, whose last write is recent —
+    // stays.
+    for (path, modified) in temporaries {
+        let old = modified
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age > TEMPORARY_MAX_AGE);
+        if old && !state.temporaries.contains(&path) && std::fs::remove_file(&path).is_ok() {
+            if let Some(size) = sizes.remove(&path) {
+                counted.bytes = counted.bytes.saturating_sub(size);
+            }
+            counted.entries = counted.entries.saturating_sub(1);
+        }
+    }
     state.walks += 1;
     state.stale = false;
     sizes.extend(std::mem::take(&mut state.landed));
@@ -405,13 +576,15 @@ struct Addition {
     entries: u64,
 }
 
-/// Whether `usage` has room for `addition` (`server.upload.max_total_bytes`,
+/// Whether `usage`, with what the uploads being received hold of it
+/// (`reserved`), has room for `addition` (`server.upload.max_total_bytes`,
 /// `server.upload.max_files`); the bytes left for the upload when it has.
 /// A directory that has no count, or whose count did not finish, is full.
 fn room(
     ctx: &ServerContext,
     area: &Path,
     usage: Option<&Usage>,
+    reserved: (u64, u64),
     addition: Addition,
 ) -> Result<u64, FileError> {
     let (max_bytes, max_entries) = (
@@ -420,13 +593,19 @@ fn room(
     );
     let shown = area.display();
     let usage = usage.filter(|usage| !usage.over);
-    let Some(usage) = usage.filter(|usage| usage.entries + addition.entries <= max_entries) else {
+    let Some(usage) =
+        usage.filter(|usage| usage.entries + reserved.1 + addition.entries <= max_entries)
+    else {
         return Err(over_quota(format!(
             "the upload directory {shown} may hold {max_entries} files and directories, \
              no more than {UPLOAD_MAX_DEPTH} deep, and is full (server.upload.max_files)"
         )));
     };
-    let used = usage.bytes.saturating_sub(addition.replaced);
+    // What is there, and what the uploads being received hold.
+    let used = usage
+        .bytes
+        .saturating_add(reserved.0)
+        .saturating_sub(addition.replaced);
     let left = max_bytes.saturating_sub(used);
     if addition.bytes > left {
         return Err(over_quota(format!(
@@ -438,20 +617,26 @@ fn room(
 }
 
 /// The start of an upload below `admin`, in one hold of the area's lock:
-/// a first look at the quota — so that an upload that cannot fit is refused
-/// before anything is made or received — then the target's directories,
-/// which count from the moment they exist whatever becomes of the upload.
-/// Returns the handle the upload is written through and the bytes it may
-/// receive before it is cut off. Neither is the decision: that is
-/// [`commit`]'s, on what is there then.
+/// a place among the uploads being received ([`UPLOAD_MAX_IN_FLIGHT`]); a
+/// first look at the quota — so that an upload that cannot fit is refused
+/// before anything is made or received; the target's directories, which
+/// count from the moment they exist whatever becomes of the upload; and
+/// the upload's hold on the quota: the bytes it declares and the entry it
+/// will be, held until it is committed or dropped, so that uploads still
+/// being received count against each other. Returns the upload
+/// ([`InFlight`]: the handle it is written through, what it holds). The
+/// decision is still [`commit`]'s, on what is there then.
 fn begin(
     ctx: &ServerContext,
     root: &Path,
-    area: &Area,
+    area: &Arc<Area>,
     target: &Path,
     declared: u64,
-) -> Result<std::io::Result<(alforria_core::beneath::NoFollowDir, u64)>, FileError> {
+) -> Result<std::io::Result<InFlight>, FileError> {
     let mut state = area.lock();
+    if state.in_flight >= UPLOAD_MAX_IN_FLIGHT {
+        return Err(too_many_uploads());
+    }
     let missing = target
         .ancestors()
         .skip(1)
@@ -464,12 +649,13 @@ fn begin(
         target,
         existing.as_ref().map(std::fs::Metadata::len),
     );
+    let new = u64::from(existing.is_none());
     let addition = Addition {
         bytes: declared,
         replaced,
-        entries: missing + u64::from(existing.is_none()),
+        entries: missing + new,
     };
-    let left = room(ctx, root, state.usage.as_ref(), addition)?;
+    room(ctx, root, state.usage.as_ref(), state.reserved, addition)?;
     let directory = alforria_core::protect::open_parent_of(target);
     if missing > 0 {
         // Made or not, in whole or in part: counted, and corrected by the
@@ -479,7 +665,52 @@ fn begin(
         }
         state.added.1 += missing;
     }
-    Ok(directory.map(|directory| (directory, left)))
+    let directory = match directory {
+        Ok(directory) => directory,
+        Err(err) => return Ok(Err(err)),
+    };
+    let mut upload = InFlight::new(Some(Arc::clone(area)), directory, target);
+    upload.held = (declared, new);
+    upload.credit = replaced;
+    state.reserved.0 = state.reserved.0.saturating_add(declared);
+    state.reserved.1 += new;
+    state.in_flight += 1;
+    state.temporaries.insert(upload.path.clone());
+    Ok(Ok(upload))
+}
+
+/// An upload has received `written` bytes, more than it holds: hold the
+/// difference too, if the directory has room for it (a body that declared
+/// no length, or more than it declared).
+fn grow(
+    ctx: &ServerContext,
+    root: &Path,
+    upload: &mut InFlight,
+    written: u64,
+) -> Result<(), FileError> {
+    let Some(area) = upload.area.clone() else {
+        return Ok(());
+    };
+    let more = written.saturating_sub(upload.held.0);
+    if more == 0 {
+        return Ok(());
+    }
+    let mut state = area.lock();
+    let addition = Addition {
+        bytes: more,
+        replaced: upload.credit,
+        entries: 0,
+    };
+    room(ctx, root, state.usage.as_ref(), state.reserved, addition).map_err(|_| {
+        over_quota(format!(
+            "the upload does not fit in what is left of the upload directory's \
+             {} bytes (server.upload.max_total_bytes)",
+            ctx.policy.upload_max_total_bytes
+        ))
+    })?;
+    state.reserved.0 = state.reserved.0.saturating_add(more);
+    upload.held.0 = written;
+    Ok(())
 }
 
 /// Make a received upload the file `name`, and count it — one hold of the
@@ -489,19 +720,22 @@ fn begin(
 /// more than the count holds for that file): two uploads replacing one
 /// file cannot both be credited with it, and a file grown behind the
 /// count's back credits nothing it did not count.
-#[allow(clippy::too_many_arguments)]
 fn commit(
     ctx: &ServerContext,
     root: &Path,
-    area: &Area,
-    directory: &alforria_core::beneath::NoFollowDir,
-    temporary: &std::ffi::OsStr,
+    upload: &mut InFlight,
     name: &std::ffi::OsStr,
     target: &Path,
     written: u64,
 ) -> Result<std::io::Result<()>, FileError> {
+    let Some(area) = upload.area.clone() else {
+        return Ok(upload.directory.rename(&upload.temporary, name));
+    };
     let mut state = area.lock();
-    let replaced = match directory.len_of(name) {
+    // What this upload held becomes what it is: judged against the count
+    // and what the *other* uploads hold.
+    upload.release(&mut state);
+    let replaced = match upload.directory.len_of(name) {
         Ok(replaced) => replaced,
         Err(err) => return Ok(Err(err)),
     };
@@ -510,10 +744,11 @@ fn commit(
         replaced: credit(&mut state, target, replaced),
         entries: u64::from(replaced.is_none()),
     };
-    room(ctx, root, state.usage.as_ref(), addition)?;
-    if let Err(err) = directory.rename(temporary, name) {
+    room(ctx, root, state.usage.as_ref(), state.reserved, addition)?;
+    if let Err(err) = upload.directory.rename(&upload.temporary, name) {
         return Ok(Err(err));
     }
+    upload.created = false;
     state.added.0 = state.added.0.saturating_add(written);
     state.added.1 += addition.entries;
     state.sizes.insert(target.to_path_buf(), written);
@@ -1056,86 +1291,71 @@ async fn upload(
             tokio::task::spawn_blocking(move || begin(&ctx, &root, &area, &target, declared))
                 .await
                 .unwrap_or_else(|join| Ok(Err(std::io::Error::other(join.to_string()))))?
-                .map(|(directory, left)| (directory, Some(left)))
         }
         None => {
             let target = target.clone();
-            tokio::task::spawn_blocking(move || alforria_core::protect::open_parent_of(&target))
-                .await
-                .unwrap_or_else(|join| Err(std::io::Error::other(join.to_string())))
-                .map(|directory| (directory, None))
+            tokio::task::spawn_blocking(move || {
+                alforria_core::protect::open_parent_of(&target)
+                    .map(|directory| InFlight::new(None, directory, &target))
+            })
+            .await
+            .unwrap_or_else(|join| Err(std::io::Error::other(join.to_string())))
         }
     };
-    let (directory, room_left) = opened.map_err(|err| match err.kind() {
+    // From here the upload cleans up after itself however it ends — a
+    // refusal, an error, a client that went away (the request future is
+    // dropped): its temporary file is unlinked and its hold on the quota
+    // given back (`InFlight`).
+    let mut upload = opened.map_err(|err| match err.kind() {
         std::io::ErrorKind::PermissionDenied => {
             forbidden(format!("{path} changed while it was being written: {err}"))
         }
         _ => io(err),
     })?;
-    let temporary = std::ffi::OsString::from(format!(
-        "{TEMPORARY_PREFIX}{}",
-        uuid::Uuid::new_v4().simple()
-    ));
-    let mut file = tokio::fs::File::from_std(directory.create(&temporary, true).map_err(io)?);
+    upload.created = true;
+    let mut file = tokio::fs::File::from_std(
+        upload
+            .directory
+            .create(&upload.temporary, true)
+            .map_err(io)?,
+    );
     let mut written: u64 = 0;
     let mut stream = body.into_data_stream();
-    let outcome: Result<(), Option<std::io::Error>> = async {
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|err| Some(std::io::Error::other(err.to_string())))?;
-            written += chunk.len() as u64;
-            if written > limit || room_left.is_some_and(|left| written > left) {
-                return Err(None);
-            }
-            file.write_all(&chunk).await.map_err(Some)?;
+    loop {
+        // A body that stops arriving does not hold its place for ever.
+        let chunk = match tokio::time::timeout(idle_timeout(), stream.next()).await {
+            Err(_) => return Err(stalled()),
+            Ok(None) => break,
+            Ok(Some(chunk)) => chunk.map_err(|err| io(std::io::Error::other(err.to_string())))?,
+        };
+        written += chunk.len() as u64;
+        if written > limit {
+            return Err(too_large(limit));
         }
-        file.flush().await.map_err(Some)?;
-        file.sync_all().await.map_err(Some)
+        if let Some((root, _)) = &area {
+            grow(&ctx, root, &mut upload, written)?;
+        }
+        file.write_all(&chunk).await.map_err(io)?;
     }
-    .await;
+    file.flush().await.map_err(io)?;
+    file.sync_all().await.map_err(io)?;
     drop(file);
-    match outcome {
-        Ok(()) => {}
-        Err(cause) => {
-            let _ = directory.remove_file(&temporary);
-            return Err(match cause {
-                None if written > limit => too_large(limit),
-                None => over_quota(format!(
-                    "the upload does not fit in what is left of the upload directory's \
-                     {} bytes (server.upload.max_total_bytes)",
-                    ctx.policy.upload_max_total_bytes
-                )),
-                Some(err) => io(err),
-            });
-        }
-    }
     // Decided now, on what was received and what is there: see `commit`.
-    let renamed = match &area {
-        Some((root, area)) => {
-            match commit(
-                &ctx, root, area, &directory, &temporary, &name, &target, written,
-            ) {
-                Ok(renamed) => renamed,
-                Err(refusal) => {
-                    let _ = directory.remove_file(&temporary);
-                    return Err(refusal);
-                }
-            }
-        }
+    match &area {
+        Some((root, _)) => commit(&ctx, root, &mut upload, &name, &target, written)?.map_err(io)?,
         None => {
-            let renamed = directory.rename(&temporary, &name);
+            upload
+                .directory
+                .rename(&upload.temporary, &name)
+                .map_err(io)?;
+            upload.created = false;
             // The operator's upload into an upload directory is part of
             // what that directory holds: counted again before the next
             // upload below `admin`.
-            if renamed.is_ok() {
-                mark_stale_areas(&ctx, &location, &target);
-            }
-            renamed
+            mark_stale_areas(&ctx, &location, &target);
         }
-    };
-    if let Err(err) = renamed {
-        let _ = directory.remove_file(&temporary);
-        return Err(io(err));
     }
+    drop(upload);
     // Clients watching the project learn of the file like any other edit.
     let _ = location.services.events.publish(
         &alforria_core::tool::edit::FILE_EDITED,

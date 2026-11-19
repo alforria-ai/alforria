@@ -1679,6 +1679,8 @@ oversized upload leaves the old file as it was.
 
 - `413` when the body exceeds `server.upload.max_bytes` (host config,
   default 32 MiB = 33554432), declared or not.
+- `408` (`UploadTimeoutError`) when the body sends nothing for 30 seconds:
+  the upload is ended and its temporary file removed.
 - `409` with `overwrite=false` when the file exists.
 - `400` when the path is a directory; `403` when it leaves the project.
 
@@ -1753,6 +1755,18 @@ asked the model for:
   meanwhile go by the running count. `admin` and the operator are held to
   `max_bytes` only; an upload of theirs into an upload directory has it
   counted again before the next upload below `admin`.
+
+- an upload still being received counts: the bytes it declared (or has
+  sent so far, when that is more or it declared none) and the file it will
+  be are held against the quota from its first byte until it is committed
+  or ends, so several slow uploads cannot each be admitted into the same
+  free space. One upload directory receives at most 8 uploads below
+  `admin` at a time; one more is answered `429` with
+  `{"name": "TooManyUploadsError"}` and can be sent again. However an
+  upload ends — refused, failed, timed out, or the client gone — its
+  temporary file is unlinked and what it held is given back. A temporary
+  file that survives a killed server (`.alforria-upload-*`, not written for
+  10 minutes) is removed at the next count.
 
 While bearer tokens are configured, no language server is started on a
 file inside an upload directory — reading or editing `uploads/x.ts` gives
