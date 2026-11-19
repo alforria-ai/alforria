@@ -124,6 +124,19 @@ fn interrupt(run: &mut TriggerRun, now_ms: u64) {
     run.time.ended = Some(now_ms);
 }
 
+/// Tighten the process-wide shell posture because a trigger that outside
+/// input starts now exists ([`OUTSIDE_TRIGGER_REASON`]).
+///
+/// The posture is one per process and never relaxes, so this crate's own
+/// unit tests leave it alone: run in one process (`cargo test`), a trigger
+/// test would otherwise restrict the shell of every test after it. The
+/// ratchet itself is tested where a test owns its process
+/// (`alforria-server/tests/shell_env_ratchet.rs`).
+pub(crate) fn tighten_for_outside_trigger() {
+    #[cfg(not(test))]
+    crate::shell_env::tighten(OUTSIDE_TRIGGER_REASON);
+}
+
 impl TriggerStore {
     pub fn new(storage: Arc<Storage>, directory: &std::path::Path, project_id: &str) -> Self {
         TriggerStore {
@@ -182,7 +195,7 @@ impl TriggerStore {
         // HTTP route, the `schedule` tool): the shell environment's
         // posture tightens before the trigger can fire.
         if trigger.stored.spec.starts_from_outside() {
-            crate::shell_env::tighten(OUTSIDE_TRIGGER_REASON);
+            tighten_for_outside_trigger();
         }
         let spec = serde_json::to_string(&trigger.stored)
             .map_err(|error| CoreError::Storage(error.to_string()))?;

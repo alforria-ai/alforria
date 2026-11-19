@@ -17,24 +17,8 @@ fn basic() -> String {
     format!("Basic {encoded}")
 }
 
-/// A developer's own loopback server with none of the unattended
-/// features: standalone, and it says so.
-#[tokio::test]
-async fn a_local_server_reports_the_standalone_posture() {
-    let f = fixture_with(|_| json!({}), None, Vec::new());
-    assert!(!f.ctx.policy.unattended_or_remote());
-    let response = call(&f.router, "GET", "/server/posture", None, None).await;
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        body_json(response).await,
-        json!({
-            "unattendedOrRemote": false,
-            "reasons": [],
-            "tightened": [],
-            "shellEnv": { "posture": "standalone", "inherit": "default" }
-        })
-    );
-}
+// The standalone case is in `posture_standalone.rs`: the posture is one per
+// process, so it needs a process no other test has restricted.
 
 /// A server with bearer auth and a webhook trigger reports the restricted
 /// posture and each reason for it — to the operator and to an `admin`

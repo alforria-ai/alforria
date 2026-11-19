@@ -731,7 +731,13 @@ async fn the_schedule_tool_is_offered_once_there_is_a_trigger_or_triggers_are_en
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let inputs = f.llm.inputs.lock().unwrap();
-        let input = inputs.last().expect("a request was sent");
+        // The turn's own request: the session's title is generated beside
+        // it, by a request with no tools that may be recorded after it.
+        let input = inputs
+            .iter()
+            .rev()
+            .find(|input| input.session_id == id && !input.small)
+            .expect("the turn's request was sent");
         input.tools.iter().map(|tool| tool.name.clone()).collect()
     }
 

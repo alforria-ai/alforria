@@ -332,7 +332,7 @@ impl TriggerService {
                 .values()
                 .any(|spec| spec.starts_from_outside())
         {
-            crate::shell_env::tighten(crate::trigger::store::OUTSIDE_TRIGGER_REASON);
+            crate::trigger::store::tighten_for_outside_trigger();
         }
         let mut entries = BTreeMap::new();
         for (id, spec) in &settings.config {
