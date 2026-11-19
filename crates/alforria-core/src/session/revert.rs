@@ -134,9 +134,13 @@ impl SessionRevert {
             return Ok(session);
         };
 
-        rev.snapshot = match &session.revert {
-            Some(previous) => previous.snapshot.clone(),
-            None => self.deps.snapshot.track().await,
+        rev.snapshot = match session
+            .revert
+            .as_ref()
+            .and_then(|previous| previous.snapshot.as_ref())
+        {
+            Some(previous) => Some(previous.clone()),
+            None => self.deps.snapshot.checkpoint().await?,
         };
         if let Some(previous) = session
             .revert
@@ -450,6 +454,49 @@ mod tests {
             std::fs::read_to_string(h.worktree.join("a.txt")).unwrap(),
             before
         );
+    }
+
+    #[tokio::test]
+    async fn revert_aborts_when_an_enabled_snapshot_cannot_capture_an_undo_point() {
+        use crate::session::snapshot::{GitSnapshot, GitSnapshotInput};
+        let (h, session) = scenario("revert-failed-capture").await;
+        let unavailable = h.temp.path().join("unavailable");
+        std::fs::write(&unavailable, "").unwrap();
+        let mut service = revert_service(&h);
+        service.deps.snapshot = GitSnapshot::with_cleanup(
+            GitSnapshotInput {
+                directory: h.worktree.clone(),
+                worktree: h.worktree.clone(),
+                project_id: "test".into(),
+                vcs_is_git: true,
+                snapshot_enabled: true,
+                data: unavailable,
+            },
+            std::time::Duration::from_secs(3600),
+            std::time::Duration::from_secs(3600),
+        );
+        let error = service
+            .revert(RevertInput {
+                session_id: session.id.clone(),
+                message_id: "msg_u1".into(),
+                part_id: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("could not capture an undo snapshot"));
+        assert_eq!(
+            std::fs::read_to_string(h.worktree.join("a.txt")).unwrap(),
+            "goodbye\n"
+        );
+        assert!(h
+            .services
+            .sessions
+            .get(&session.id)
+            .unwrap()
+            .revert
+            .is_none());
     }
 
     #[tokio::test]

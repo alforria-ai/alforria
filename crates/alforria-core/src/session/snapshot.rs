@@ -48,6 +48,11 @@ pub type FileDiff = alforria_schema::file_diff::SnapshotFileDiff;
 pub trait Snapshot: Send + Sync {
     /// Capture the current worktree; returns the snapshot id.
     fn track(&self) -> BoxFuture<'static, Option<String>>;
+    /// Capture an undo point. Disabled snapshots have no undo point to save.
+    fn checkpoint(&self) -> BoxFuture<'static, Result<Option<String>, CoreError>> {
+        let track = self.track();
+        Box::pin(async move { Ok(track.await) })
+    }
     /// Files changed since the snapshot.
     fn patch(&self, id: &str) -> BoxFuture<'static, Result<SnapshotPatch, CoreError>>;
     /// Check the snapshot out over the worktree.
@@ -271,6 +276,18 @@ pub struct GitSnapshot {
     cleanup: Arc<(Mutex<bool>, Condvar)>,
 }
 
+struct RecoveryStage {
+    area: tempfile::TempDir,
+    files: HashSet<String>,
+    gitlinks: HashSet<PathBuf>,
+}
+
+impl RecoveryStage {
+    fn source(&self, file: &str) -> PathBuf {
+        self.area.path().join("tree").join(file)
+    }
+}
+
 impl Drop for GitSnapshot {
     fn drop(&mut self) {
         let (lock, cvar) = &*self.cleanup;
@@ -410,9 +427,9 @@ impl GitSnapshot {
     }
 
     /// `drop` (`snapshot/index.ts:132-144`).
-    fn drop_files(&self, files: &[String]) {
+    fn drop_files(&self, files: &[String]) -> Result<(), CoreError> {
         if files.is_empty() {
-            return;
+            return Ok(());
         }
         let args = self.args(
             &CFG,
@@ -426,13 +443,17 @@ impl GitSnapshot {
             ],
         );
         let stdin = encode_pathspecs(files);
-        self.git(&args, Some(&self.worktree), Some(&stdin));
+        let result = self.git(&args, Some(&self.worktree), Some(&stdin));
+        if result.exit_code != 0 {
+            return Err(snapshot_error("drop ignored files", "index", &result));
+        }
+        Ok(())
     }
 
     /// `stage` (`snapshot/index.ts:146-160`).
-    fn stage(&self, files: &[String]) {
+    fn stage(&self, files: &[String]) -> Result<(), CoreError> {
         if files.is_empty() {
-            return;
+            return Ok(());
         }
         let args = self.args(
             &CFG,
@@ -446,14 +467,10 @@ impl GitSnapshot {
         );
         let stdin = encode_pathspecs(files);
         let result = self.git(&args, Some(&self.worktree), Some(&stdin));
-        if result.exit_code == 0 {
-            return;
+        if result.exit_code != 0 {
+            return Err(snapshot_error("stage files", "index", &result));
         }
-        tracing::warn!(
-            "failed to add snapshot files: exitCode={} stderr={}",
-            result.exit_code,
-            result.stderr
-        );
+        Ok(())
     }
 
     /// `excludes` (`snapshot/index.ts:172-180`).
@@ -483,11 +500,14 @@ impl GitSnapshot {
     fn sync(&self, list: &[String]) {
         let file = self.excludes();
         let target = self.gitdir.join("info").join("exclude");
-        let mut parts: Vec<String> = Vec::new();
+        // A checkpoint left by a crash or failed rollback may hold the
+        // only copy of a user's work. Leave it in place and out of snapshots.
+        let mut parts = Vec::new();
         if let Some(file) = file {
             let text = std::fs::read_to_string(&file).unwrap_or_default();
             parts.push(text.trim_end().to_string());
         }
+        parts.push(format!("**/{}*/", recovery::CHECKPOINT_PREFIX));
         for item in list {
             parts.push(format!("/{}", item.replace('\\', "/")));
         }
@@ -631,46 +651,62 @@ impl GitSnapshot {
         } else {
             input + "\n"
         };
-        let prefix = self.pack_prefix()?;
-        let packed = self.git(
+        let reachable = self.git(
             &self.args(
                 &CORE,
                 &[
-                    "pack-objects",
-                    "--revs",
+                    "rev-list",
+                    "--objects",
+                    "--no-object-names",
+                    "--missing=print",
+                    "--ignore-missing",
                     "--all",
                     "--reflog",
                     "--indexed-objects",
-                    "--non-empty",
-                    "--quiet",
-                    &prefix,
+                    "--stdin",
                 ],
             ),
             Some(&self.worktree),
             Some(&input),
         );
+        if reachable.exit_code != 0 {
+            return Err(snapshot_error(
+                "list borrowed objects",
+                "migration",
+                &reachable,
+            ));
+        }
+        let mut pack_input = String::new();
+        let mut missing = 0;
+        for oid in reachable.text.lines() {
+            if oid.starts_with('?') {
+                missing += 1;
+            } else {
+                pack_input.push_str(oid);
+                pack_input.push('\n');
+            }
+        }
+        if missing > 0 {
+            tracing::warn!(
+                missing,
+                "some legacy snapshot objects are no longer available"
+            );
+        }
+        let prefix = self.pack_prefix()?;
+        let packed = self.git(
+            &self.args(&CORE, &["pack-objects", "--non-empty", "--quiet", &prefix]),
+            Some(&self.worktree),
+            Some(&pack_input),
+        );
         if packed.exit_code != 0 {
             return Err(snapshot_error("own borrowed objects", "migration", &packed));
         }
-        let entries = self.git(
-            &self.args(&CORE, &["ls-files", "--stage", "-z"]),
-            Some(&self.worktree),
-            None,
-        );
-        if entries.exit_code != 0 {
-            return Err(snapshot_error("read migrated index", "migration", &entries));
-        }
-        let refreshed = self.git(
-            &self.args(&CORE, &["update-index", "-z", "--index-info"]),
-            Some(&self.worktree),
-            Some(&entries.text),
-        );
-        if refreshed.exit_code != 0 {
-            return Err(snapshot_error(
-                "refresh migrated index",
-                "migration",
-                &refreshed,
-            ));
+        // Rebuild from the current source index on the next capture. The
+        // old index can still reference missing blobs or cached tree IDs.
+        match std::fs::remove_file(self.gitdir.join("index")) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
         // Preserve read-only access for old hashes held only in session data,
         // which may never have had a local object or a retention reference.
@@ -701,7 +737,7 @@ impl GitSnapshot {
     }
 
     /// `add` (`snapshot/index.ts:235-298`).
-    fn add(&self) {
+    fn add(&self) -> Result<(), CoreError> {
         self.sync(&[]);
         let diff = self.git(
             &self.args(&QUOTE, &["diff-files", "--name-only", "-z", "--", "."]),
@@ -716,6 +752,7 @@ impl GitSnapshot {
                     "--full-name",
                     "--others",
                     "--exclude-standard",
+                    &format!("--exclude=**/{}*/", recovery::CHECKPOINT_PREFIX),
                     "-z",
                     "--",
                     ".",
@@ -724,9 +761,11 @@ impl GitSnapshot {
             Some(&self.directory),
             None,
         );
-        if diff.exit_code != 0 || other.exit_code != 0 {
-            tracing::warn!("failed to list snapshot files");
-            return;
+        if diff.exit_code != 0 {
+            return Err(snapshot_error("list changed files", "index", &diff));
+        }
+        if other.exit_code != 0 {
+            return Err(snapshot_error("list untracked files", "index", &other));
         }
         let tracked = split_nul(&diff.text);
         let untracked = split_nul(&other.text);
@@ -738,7 +777,7 @@ impl GitSnapshot {
             }
         }
         if all.is_empty() {
-            return;
+            return Ok(());
         }
         // Resolve source-repo ignore rules against the exact candidate set.
         // --no-index keeps this pattern-based even when a path is already
@@ -750,7 +789,7 @@ impl GitSnapshot {
                 "removing gitignored files from snapshot: count={}",
                 ignored_files.len()
             );
-            self.drop_files(&ignored_files);
+            self.drop_files(&ignored_files)?;
         }
         let allow: Vec<String> = all
             .iter()
@@ -758,7 +797,7 @@ impl GitSnapshot {
             .cloned()
             .collect();
         if allow.is_empty() {
-            return;
+            return Ok(());
         }
         let mut large = HashSet::new();
         for item in &allow {
@@ -782,7 +821,7 @@ impl GitSnapshot {
             .filter(|item| !block_set.contains(*item))
             .cloned()
             .collect();
-        self.stage(&stage);
+        self.stage(&stage)
     }
 
     /// `cleanup` (`snapshot/index.ts:300-316`).
@@ -854,6 +893,10 @@ impl GitSnapshot {
             }
             tracing::info!("initialized");
         }
+        if let Err(error) = self.dissociate() {
+            tracing::warn!(%error, "snapshot object migration failed");
+            return None;
+        }
         if !self.gitdir.join("index").exists() {
             if let Err(error) = self.seed() {
                 let _ = std::fs::remove_file(self.gitdir.join("index"));
@@ -861,11 +904,10 @@ impl GitSnapshot {
                 return None;
             }
         }
-        if let Err(error) = self.dissociate() {
-            tracing::warn!(%error, "snapshot object migration failed");
+        if let Err(error) = self.add() {
+            tracing::warn!(%error, "snapshot capture failed");
             return None;
         }
-        self.add();
         let result = self.git(
             &self.args(&[], &["write-tree"]),
             Some(&self.directory),
@@ -901,7 +943,13 @@ impl GitSnapshot {
     /// `patch` (`snapshot/index.ts:349-380`).
     fn patch_impl(&self, hash: &str) -> SnapshotPatch {
         let _guard = self.lock();
-        self.add();
+        if let Err(error) = self.add() {
+            tracing::warn!(%error, "failed to stage snapshot patch");
+            return SnapshotPatch {
+                hash: hash.to_string(),
+                files: Vec::new(),
+            };
+        }
         let result = self.git(
             &self.args(
                 &QUOTE,
@@ -1002,7 +1050,7 @@ impl GitSnapshot {
         &self,
         hash: &str,
         files: Option<&[String]>,
-    ) -> Result<(tempfile::TempDir, Vec<String>), CoreError> {
+    ) -> Result<RecoveryStage, CoreError> {
         let mut env = self.recovery_env()?;
         self.own_recovery_tree(hash, &env)?;
         let stage = tempfile::Builder::new()
@@ -1011,47 +1059,84 @@ impl GitSnapshot {
         let tree = stage.path().join("tree");
         std::fs::create_dir(&tree)?;
         env.push(("GIT_INDEX_FILE", git_path(&stage.path().join("index"))));
-        let args = |cmd: &[&str]| {
+        let stage_args = |cmd: &[&str]| {
             let mut args = self.args(&CORE, cmd);
             let index = args.iter().position(|arg| arg == "--work-tree").unwrap() + 1;
             args[index] = git_path(&tree);
             args
         };
-        let read = self.git_env(&args(&["read-tree", hash]), Some(&tree), &env, None);
-        if read.exit_code != 0 {
-            return Err(snapshot_error("read recovery tree", hash, &read));
-        }
-        let listed = self.git_env(
-            &args(&["ls-files", "--stage", "-z"]),
-            Some(&tree),
+        let read = self.git_env(
+            &self.args(&CORE, &["read-tree", "--end-of-options", hash]),
+            Some(&self.worktree),
             &env,
             None,
         );
-        if listed.exit_code != 0 {
-            return Err(snapshot_error("list recovery files", hash, &listed));
+        if read.exit_code != 0 {
+            return Err(snapshot_error("read recovery tree", hash, &read));
         }
-        let have: Vec<String> = listed
-            .text
-            .split('\0')
-            .filter_map(|entry| {
-                let (meta, file) = entry.split_once('\t')?;
-                (!meta.starts_with("160000 ")).then(|| file.to_string())
-            })
-            .collect();
-        let selected: Vec<String> = match files {
-            None => have,
-            Some(files) => {
-                let have: HashSet<_> = have.into_iter().collect();
-                files
-                    .iter()
-                    .filter(|file| have.contains(*file))
-                    .cloned()
-                    .collect()
+        let mut gitlinks = HashSet::new();
+        let selected = if let Some(files) = files {
+            let listed = self.git_env(
+                &self.args(&CORE, &["ls-files", "--stage", "-z"]),
+                Some(&self.worktree),
+                &env,
+                None,
+            );
+            if listed.exit_code != 0 {
+                return Err(snapshot_error("list recovery files", hash, &listed));
             }
+            let mut have = HashSet::new();
+            for (mode, file) in index_entries(&listed.text) {
+                if mode == "160000" {
+                    gitlinks.insert(PathBuf::from(file));
+                } else {
+                    have.insert(file);
+                }
+            }
+            files
+                .iter()
+                .filter(|file| have.contains(file.as_str()))
+                .cloned()
+                .collect()
+        } else {
+            // read-tree starts with empty stat information. Refresh the
+            // temporary index against the worktree before asking what
+            // actually differs, so unchanged files stay in place.
+            let refresh = self.git_env(
+                &self.args(
+                    &CFG,
+                    &["update-index", "-q", "--refresh", "--ignore-submodules"],
+                ),
+                Some(&self.worktree),
+                &env,
+                None,
+            );
+            if refresh.exit_code != 0 {
+                return Err(snapshot_error("refresh recovery index", hash, &refresh));
+            }
+            let diff = self.git_env(
+                &self.args(
+                    &CFG,
+                    &[
+                        "diff-files",
+                        "--name-only",
+                        "--no-renames",
+                        "--ignore-submodules=all",
+                        "-z",
+                    ],
+                ),
+                Some(&self.worktree),
+                &env,
+                None,
+            );
+            if diff.exit_code != 0 {
+                return Err(snapshot_error("list changed recovery files", hash, &diff));
+            }
+            split_nul(&diff.text)
         };
         if !selected.is_empty() {
             let checkout = self.git_env(
-                &args(&["checkout-index", "-f", "-z", "--stdin"]),
+                &stage_args(&["checkout-index", "-f", "-z", "--stdin"]),
                 Some(&tree),
                 &env,
                 Some(&encode_nul_paths(&selected)),
@@ -1060,23 +1145,58 @@ impl GitSnapshot {
                 return Err(snapshot_error("stage recovery contents", hash, &checkout));
             }
         }
-        Ok((stage, selected))
+        Ok(RecoveryStage {
+            area: stage,
+            files: selected.into_iter().collect(),
+            gitlinks,
+        })
     }
 
     fn restore_impl(&self, snapshot: &str) -> Result<(), CoreError> {
         let _guard = self.lock();
-        let (stage, files) = self.prepare_recovery(snapshot, None)?;
-        let mut changes = Vec::new();
-        for file in files {
-            let source = stage.path().join("tree").join(&file);
-            // Gitlinks denote submodule directories, not file contents.
-            if std::fs::symlink_metadata(&source).is_ok_and(|meta| meta.is_dir()) {
-                continue;
-            }
-            changes.push(recovery::Change {
+        let stage = self.prepare_recovery(snapshot, None)?;
+        let mut changes: Vec<_> = stage
+            .files
+            .iter()
+            .map(|file| recovery::Change {
                 target: self.worktree.join(file),
-                source: Some(source),
-            });
+                source: Some(stage.source(file)),
+            })
+            .collect();
+        if changes.is_empty() {
+            return Ok(());
+        }
+        // A restore overlays the snapshot. Remove only conflicting file
+        // paths already known to the snapshot index, and only as part of
+        // swapping a file for a directory or a directory for a file.
+        let current = self.git(
+            &self.args(&CORE, &["ls-files", "--stage", "-z"]),
+            Some(&self.worktree),
+            None,
+        );
+        if current.exit_code != 0 {
+            return Err(snapshot_error(
+                "list current snapshot files",
+                snapshot,
+                &current,
+            ));
+        }
+        let restore_files: HashSet<_> = stage.files.iter().map(Path::new).collect();
+        let restore_parents: HashSet<_> = restore_files
+            .iter()
+            .flat_map(|file| file.ancestors().skip(1))
+            .collect();
+        for (mode, file) in index_entries(&current.text) {
+            let path = Path::new(file);
+            if mode != "160000"
+                && (restore_parents.contains(path)
+                    || path.ancestors().skip(1).any(|p| restore_files.contains(p)))
+            {
+                changes.push(recovery::Change {
+                    target: self.worktree.join(path),
+                    source: None,
+                });
+            }
         }
         recovery::apply(&self.worktree, changes)
     }
@@ -1118,17 +1238,22 @@ impl GitSnapshot {
         // or replacement; an error in a later group leaves all files intact.
         let mut stages = Vec::new();
         for (hash, files) in &groups {
-            let (stage, present) = self.prepare_recovery(hash, Some(files))?;
-            stages.push((stage, present.into_iter().collect::<HashSet<_>>()));
+            stages.push(self.prepare_recovery(hash, Some(files))?);
         }
         let changes = order
             .into_iter()
-            .map(|(group, rel, target)| {
-                let (stage, present) = &stages[group];
-                let source = present
-                    .contains(&rel)
-                    .then(|| stage.path().join("tree").join(&rel));
-                recovery::Change { target, source }
+            .filter_map(|(group, rel, target)| {
+                let stage = &stages[group];
+                // Gitlinks belong to another repository. Absence of a
+                // staged file at that path is not a request to delete it.
+                if Path::new(&rel)
+                    .ancestors()
+                    .any(|path| stage.gitlinks.contains(path))
+                {
+                    return None;
+                }
+                let source = stage.files.contains(&rel).then(|| stage.source(&rel));
+                Some(recovery::Change { target, source })
             })
             .collect();
         recovery::apply(&self.worktree, changes)
@@ -1137,7 +1262,10 @@ impl GitSnapshot {
     /// `diff` (`snapshot/index.ts:526-544`).
     fn diff_impl(&self, hash: &str) -> String {
         let _guard = self.lock();
-        self.add();
+        if let Err(error) = self.add() {
+            tracing::warn!(%error, "failed to stage snapshot diff");
+            return String::new();
+        }
         let result = self.git(
             &self.args(
                 &QUOTE,
@@ -1418,6 +1546,20 @@ impl Snapshot for GitSnapshot {
         })
     }
 
+    fn checkpoint(&self) -> BoxFuture<'static, Result<Option<String>, CoreError>> {
+        let capture = self.track();
+        let enabled = self.enabled();
+        Box::pin(async move {
+            let snapshot = capture.await;
+            if enabled && snapshot.is_none() {
+                return Err(CoreError::Storage(
+                    "could not capture an undo snapshot before reverting".into(),
+                ));
+            }
+            Ok(snapshot)
+        })
+    }
+
     fn patch(&self, id: &str) -> BoxFuture<'static, Result<SnapshotPatch, CoreError>> {
         let snapshot = self.clone();
         let id = id.to_string();
@@ -1560,6 +1702,14 @@ fn encode_pathspecs(files: &[String]) -> String {
         .map(|file| format!(":(top,literal){file}"))
         .collect::<Vec<_>>();
     encode_nul_paths(&pathspecs)
+}
+
+fn index_entries(text: &str) -> impl Iterator<Item = (&str, &str)> {
+    text.split('\0').filter_map(|entry| {
+        let (metadata, path) = entry.split_once('\t')?;
+        let mode = metadata.split_whitespace().next()?;
+        Some((mode, path))
+    })
 }
 
 fn split_nul(text: &str) -> Vec<String> {
@@ -1962,6 +2112,148 @@ mod git_tests {
     }
 
     #[tokio::test]
+    async fn recovery_handles_file_directory_transitions_in_both_directions() {
+        for before_is_directory in [true, false] {
+            let dir = TempDir::new("snap-file-directory");
+            init_repo(dir.path());
+            let path = dir.path().join("foo");
+            let write_version = |is_directory| {
+                if is_directory {
+                    std::fs::create_dir(&path).unwrap();
+                    std::fs::write(path.join("bar"), "directory contents").unwrap();
+                } else {
+                    std::fs::write(&path, "file contents").unwrap();
+                }
+            };
+            let read_version = |is_directory| {
+                let filename = if is_directory {
+                    path.join("bar")
+                } else {
+                    path.clone()
+                };
+                std::fs::read_to_string(filename).unwrap()
+            };
+            write_version(before_is_directory);
+            let (snap, _data) = snapshot(dir.path());
+            let before = snap.track().await.unwrap();
+            let contents_before = read_version(before_is_directory);
+            if before_is_directory {
+                std::fs::remove_file(path.join("bar")).unwrap();
+                std::fs::remove_dir(&path).unwrap();
+            } else {
+                std::fs::remove_file(&path).unwrap();
+            }
+            write_version(!before_is_directory);
+            let after = snap.track().await.unwrap();
+            let contents_after = read_version(!before_is_directory);
+            let patch = snap.patch(&before).await.unwrap();
+            assert_eq!(patch.files.len(), 2);
+            snap.revert(vec![PatchPart {
+                hash: patch.hash,
+                files: patch.files,
+            }])
+            .await
+            .unwrap();
+            assert_eq!(read_version(before_is_directory), contents_before);
+            snap.track().await.unwrap();
+            snap.restore(&after).await.unwrap();
+            assert_eq!(read_version(!before_is_directory), contents_after);
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_leaves_existing_and_new_nested_repositories_alone() {
+        let dir = TempDir::new("snap-nested-repos");
+        init_repo(dir.path());
+        let file = dir.path().join("normal.txt");
+        let existing = dir.path().join("existing");
+        let added = dir.path().join("added");
+        std::fs::write(&file, "original").unwrap();
+        std::fs::create_dir(&existing).unwrap();
+        init_repo(&existing);
+        commit_all(&existing);
+        commit_all(dir.path());
+        let (snap, _data) = snapshot(dir.path());
+        let before = snap.track().await.unwrap();
+
+        std::fs::write(&file, "changed").unwrap();
+        std::fs::write(existing.join("keep.txt"), "existing repo").unwrap();
+        commit_all(&existing);
+        std::fs::create_dir(&added).unwrap();
+        init_repo(&added);
+        std::fs::write(added.join("keep.txt"), "new repo").unwrap();
+        commit_all(&added);
+        let patch = snap.patch(&before).await.unwrap();
+        assert_eq!(patch.files.len(), 3, "{:?}", patch.files);
+        snap.revert(vec![PatchPart {
+            hash: patch.hash,
+            files: patch.files,
+        }])
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "original");
+        for (path, contents) in [(existing, "existing repo"), (added, "new repo")] {
+            assert_eq!(
+                std::fs::read_to_string(path.join("keep.txt")).unwrap(),
+                contents
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_does_not_replace_unchanged_files() {
+        let dir = TempDir::new("snap-only-changes");
+        init_repo(dir.path());
+        let keep = dir.path().join("same.txt");
+        let change = dir.path().join("changed.txt");
+        std::fs::write(&keep, "same").unwrap();
+        std::fs::write(&change, "before").unwrap();
+        let (snap, _data) = snapshot(dir.path());
+        let before = snap.track().await.unwrap();
+        let timestamp = std::time::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&keep)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(timestamp))
+            .unwrap();
+        std::fs::write(&change, "after").unwrap();
+        snap.restore(&before).await.unwrap();
+        assert_eq!(std::fs::read_to_string(change).unwrap(), "before");
+        assert_eq!(
+            std::fs::metadata(keep).unwrap().modified().unwrap(),
+            timestamp
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_migration_with_a_missing_blob_allows_new_snapshots() {
+        let dir = TempDir::new("snap-legacy-pruned");
+        init_repo(dir.path());
+        let (snap, _data) = snapshot(dir.path());
+        let before = borrowed_snapshot(dir.path(), &snap);
+        let file = dir.path().join("b.txt");
+        let git = SubprocessGit;
+        std::fs::write(&file, "current work").unwrap();
+        assert_eq!(git.run(Some(dir.path()), &["add", "b.txt"]).exit_code, 0);
+        assert_eq!(
+            git.run(Some(dir.path()), &["prune", "--expire=now"])
+                .exit_code,
+            0
+        );
+        let current = snap
+            .track()
+            .await
+            .expect("new captures survive a broken old tree");
+        assert!(!snap.gitdir.join("objects/info/alternates").exists());
+        assert!(snap.restore(&before).await.is_err());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "current work");
+        std::fs::write(&file, "changed again").unwrap();
+        snap.restore(&current).await.unwrap();
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "current work");
+    }
+
+    #[tokio::test]
     async fn legacy_snapshots_are_dissociated_before_new_capture() {
         let dir = TempDir::new("snap-legacy-migrate");
         init_repo(dir.path());
@@ -2095,7 +2387,7 @@ mod git_tests {
         .unwrap();
         std::fs::copy(dir.join(".git/index"), snap.gitdir.join("index")).unwrap();
         std::fs::write(dir.join("a.txt"), "local original\n").unwrap();
-        snap.stage(&["a.txt".into()]);
+        snap.stage(&["a.txt".into()]).unwrap();
         let tree = snap.git(&snap.args(&CORE, &["write-tree"]), Some(dir), None);
         assert_eq!(tree.exit_code, 0, "{}", tree.stderr);
         tree.text.trim().to_string()
@@ -2397,6 +2689,23 @@ mod git_tests {
             .recv_timeout(Duration::from_secs(60))
             .expect("check-ignore deadlocked on a long path list");
         assert_eq!(ignored.len(), 20_000);
+    }
+
+    #[tokio::test]
+    async fn recovery_checkpoints_stay_out_of_new_snapshots() {
+        let dir = TempDir::new("snap-checkpoint-excluded");
+        init_repo(dir.path());
+        let checkpoint = dir.path().join("nested/.alforria-recovery-backup");
+        std::fs::create_dir_all(&checkpoint).unwrap();
+        std::fs::write(checkpoint.join("backup"), "original").unwrap();
+        std::fs::write(dir.path().join("included.txt"), "current").unwrap();
+        let (snap, _data) = snapshot(dir.path());
+        let hash = snap.track().await.unwrap();
+        assert_eq!(tree_files(&snap.gitdir, &hash), ["included.txt"]);
+        assert_eq!(
+            std::fs::read_to_string(checkpoint.join("backup")).unwrap(),
+            "original"
+        );
     }
 
     #[tokio::test]
@@ -2704,8 +3013,25 @@ mod git_tests {
         // A file the source repo does not have forces a fresh blob into the
         // snapshot store — `git gc` has something to pack.
         std::fs::write(dir.path().join("b.txt"), "two\n").unwrap();
-        snap.track().await.unwrap();
+        let captured = snap.track().await.unwrap();
+        let blob = snap.git(
+            &snap.args(&CORE, &["rev-parse", &format!("{captured}:b.txt")]),
+            Some(dir.path()),
+            None,
+        );
+        assert_eq!(blob.exit_code, 0, "{}", blob.stderr);
+        let oid = blob.text.trim();
+        let loose = snap.gitdir.join("objects").join(&oid[..2]).join(&oid[2..]);
+        assert!(loose.is_file(), "the staged file starts as a loose blob");
         snap.cleanup();
+        assert!(!loose.exists(), "cleanup packs the loose snapshot blob");
+        let read = snap.git(
+            &snap.args(&CORE, &["cat-file", "blob", oid]),
+            Some(dir.path()),
+            None,
+        );
+        assert_eq!(read.exit_code, 0, "{}", read.stderr);
+        assert_eq!(read.text, "two\n");
 
         let gitdir = gitdir(data.path(), dir.path());
         let packs: Vec<_> = std::fs::read_dir(gitdir.join("objects/pack"))

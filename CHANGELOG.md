@@ -14,6 +14,10 @@ pre-1.0, so minor releases may include breaking changes.
   workspace already exists`. The second now waits and uses the database the
   first one created.
 
+- Snapshot recovery checks the replacement contents before changing files.
+  Git packs snapshots but keeps undo points without a time or size limit.
+  Recovery backups left after a failed rollback stay outside future captures.
+
 ## [0.4.4] - 2026-11-13
 
 ### Fixed
