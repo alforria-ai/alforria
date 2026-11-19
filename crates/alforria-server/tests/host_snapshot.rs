@@ -1,0 +1,170 @@
+//! The host config a server process applies is the one it started with:
+//! an instance booted later does not read the host files again, so a file
+//! that broke, vanished or was rewritten in the meantime neither drops the
+//! host's permission ceiling nor lifts the project restriction. A
+//! developer's own server (nothing unattended) keeps re-reading, and keeps
+//! the last config that loaded when the file stops parsing.
+
+mod support;
+
+use std::path::Path;
+
+use alforria_schema::permission_v1::PermissionV1Action;
+use axum::http::StatusCode;
+use serde_json::{json, Value};
+
+use support::{basic, call, fixture_with, Fixture, Signer};
+
+const PASSWORD: &str = "hunter2";
+
+fn bearer_host(signer: &Signer, extra: Value) -> Value {
+    let mut host = json!({
+        "server": { "auth": { "bearer": { "keys": [signer.public_key()], "audience": "a" } } },
+        "permission": { "bash": "deny" },
+    });
+    alforria_core::merge_deep(&mut host, &extra);
+    host
+}
+
+fn host_file(f: &Fixture) -> std::path::PathBuf {
+    f.paths.config.join("opencode.json")
+}
+
+/// What `permission` on `pattern` resolves to for the `build` agent of the
+/// instance booted now for `directory`.
+fn build_action(f: &Fixture, directory: &Path, permission: &str) -> PermissionV1Action {
+    std::fs::create_dir_all(directory).unwrap();
+    let services = f.ctx.instances.load(directory).expect("the instance boots");
+    let build = services.agents.get("build").expect("the build agent");
+    build.permission.evaluate(permission, "id").action
+}
+
+/// The reviewer's scenario: the server runs with `bash: deny`, the global
+/// config file stops parsing (or is removed), and a directory is opened
+/// for the first time. The ceiling was gone: the built-in `*: allow`.
+#[tokio::test]
+async fn an_instance_booted_after_the_global_config_broke_keeps_the_startup_ceiling() {
+    let signer = Signer::new();
+    let f = fixture_with(|_| bearer_host(&signer, json!({})), Some(PASSWORD), vec![]);
+    assert_eq!(
+        build_action(&f, &f.dirs.repo, "bash"),
+        PermissionV1Action::Deny
+    );
+
+    std::fs::write(host_file(&f), "{ not json").unwrap();
+    assert_eq!(
+        build_action(&f, &f.dirs.other, "bash"),
+        PermissionV1Action::Deny,
+        "an unparseable global config dropped the host's ceiling"
+    );
+
+    std::fs::remove_file(host_file(&f)).unwrap();
+    assert_eq!(
+        build_action(&f, &f.dirs.other.join("third"), "bash"),
+        PermissionV1Action::Deny,
+        "a removed global config dropped the host's ceiling"
+    );
+}
+
+/// What decides how far a project's config is believed is read once, with
+/// the access policy: rewriting the host file to drop bearer auth, trust
+/// projects fully and allow `bash` changes nothing for a later boot.
+#[tokio::test]
+async fn a_host_file_rewritten_after_startup_does_not_lift_the_restriction() {
+    let signer = Signer::new();
+    let f = fixture_with(|_| bearer_host(&signer, json!({})), Some(PASSWORD), vec![]);
+    std::fs::write(
+        host_file(&f),
+        json!({
+            "server": { "trust": { "project": "full" } },
+            "permission": { "bash": "allow" },
+        })
+        .to_string(),
+    )
+    .unwrap();
+    // A project that brings its own agent and grants: kept on a server
+    // that trusts project config, dropped on this one.
+    std::fs::write(
+        f.dirs.other.join("opencode.json"),
+        json!({
+            "agent": {
+                "mine": { "permission": { "bash": "allow" } },
+                "build": { "permission": { "bash": "allow" } },
+            },
+        })
+        .to_string(),
+    )
+    .unwrap();
+    assert_eq!(
+        build_action(&f, &f.dirs.other, "bash"),
+        PermissionV1Action::Deny
+    );
+    let services = f.ctx.instances.load(&f.dirs.other).unwrap();
+    assert!(
+        services.agents.get("mine").is_none(),
+        "project config was read as trusted after the host file changed"
+    );
+}
+
+/// The operator's own way to change the host config of a running server —
+/// `PATCH /global/config`, an operator route — still takes effect.
+#[tokio::test]
+async fn a_global_config_written_through_the_api_reaches_the_next_boot() {
+    let signer = Signer::new();
+    let f = fixture_with(|_| bearer_host(&signer, json!({})), Some(PASSWORD), vec![]);
+    assert_eq!(
+        build_action(&f, &f.dirs.repo, "webfetch"),
+        PermissionV1Action::Allow
+    );
+    let response = call(
+        &f.router,
+        "PATCH",
+        "/global/config",
+        Some(&basic("alforria", PASSWORD)),
+        Some(json!({ "permission": { "webfetch": "deny" } })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        build_action(&f, &f.dirs.repo, "webfetch"),
+        PermissionV1Action::Deny
+    );
+    assert_eq!(
+        build_action(&f, &f.dirs.repo, "bash"),
+        PermissionV1Action::Deny
+    );
+}
+
+/// A developer's own server reads its config again at each boot, as
+/// before — and when the file stops parsing, the last config that loaded
+/// stands instead of none.
+#[tokio::test]
+async fn a_standalone_server_rereads_and_keeps_the_last_good_config_on_a_parse_error() {
+    let f = fixture_with(
+        |_| json!({ "permission": { "bash": "deny" } }),
+        None,
+        vec![],
+    );
+    assert_eq!(
+        build_action(&f, &f.dirs.repo, "bash"),
+        PermissionV1Action::Deny
+    );
+
+    std::fs::write(host_file(&f), "{ not json").unwrap();
+    assert_eq!(
+        build_action(&f, &f.dirs.other, "bash"),
+        PermissionV1Action::Deny,
+        "a parse error dropped the ceiling"
+    );
+
+    // A valid edit is picked up without a restart.
+    std::fs::write(
+        host_file(&f),
+        json!({ "permission": { "bash": "ask" } }).to_string(),
+    )
+    .unwrap();
+    assert_eq!(
+        build_action(&f, &f.dirs.other.join("third"), "bash"),
+        PermissionV1Action::Ask
+    );
+}

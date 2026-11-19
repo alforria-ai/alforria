@@ -12,6 +12,7 @@ pub mod extension;
 pub mod host;
 pub mod precedence;
 pub mod schema;
+pub mod snapshot;
 pub mod v2_compat;
 pub mod variable;
 
@@ -21,6 +22,7 @@ pub use precedence::{
     NoopDiscovery,
 };
 pub use schema::Config;
+pub use snapshot::HostSnapshot;
 pub use variable::{
     env_references, interpolate_dollar, interpolate_dollar_final, substitute, HostStrings, Missing,
     Source,

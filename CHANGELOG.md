@@ -244,6 +244,20 @@ pre-1.0, so minor releases may include breaking changes.
 
 ### Fixed
 
+- A running server applied its host config as it was on disk each time a
+  directory was first opened, while the access policy was read once at
+  startup. A global config that stopped parsing (or lost a `{file:}` it
+  refers to) counted as empty for the next directory — the host's
+  `permission` ceiling gone, the built-in `*: allow` in its place — and an
+  agent with a shell could rewrite the host files to drop bearer auth or
+  set `server.trust.project: "full"` and have the next directory opened
+  believe it. A server that is unattended, reachable or project-restricted
+  now keeps what the host sources loaded as at startup, and how far project
+  config is believed, for every directory it opens; editing a host file on
+  such a server takes a restart (`PATCH /global/config` still applies). A
+  developer's own server reads its host files at each open as before, and
+  keeps the last reading that loaded when one stops parsing instead of
+  running with none.
 - On a server where project config is restricted (bearer auth, or
   `server.trust.project: "restricted"`), a project file could still step
   around the rules the host wrote per agent: define an agent of its own

@@ -164,6 +164,13 @@ pub async fn global_config_update(
     std::fs::create_dir_all(file.parent().unwrap_or(Path::new(".")))
         .map_err(|err| defect(format!("failed to create config dir: {err}")))?;
     std::fs::write(&file, &serialized).map_err(defect)?;
+    // The operator changed the host config through the server: the
+    // instances booted from here on read it (`config::snapshot`). The
+    // access policy and how far project config is believed stay as they
+    // were at startup.
+    if let Some(snapshot) = alforria_core::config::HostSnapshot::of(&ctx.global_paths().config) {
+        snapshot.refresh();
+    }
     if changed {
         ctx.instances.dispose_all();
         ctx.global_bus.emit(crate::sse::GlobalEvent::injected(

@@ -439,6 +439,10 @@ pub fn production_context(
     let storage = Storage::open_default(&paths.data)
         .map_err(|err| io::Error::other(format!("storage open failed: {err}")))?;
     let storage = Arc::new(storage);
+    // A server start: what the host's files say is remembered from here
+    // (`alforria_core::config::snapshot`), and frozen below if this turns
+    // out to be an unattended, reachable or project-restricted server.
+    let host_snapshot = alforria_core::config::HostSnapshot::install(&paths.config);
     let global = global_config(&paths);
     apply_synchronous(&storage, &global);
     start_maintenance(&storage, &global, &paths.data);
@@ -477,6 +481,7 @@ pub fn production_context(
         });
     policy.observe(&opts.hostname, outside_trigger);
     tracing::info!("{}", policy.posture_summary());
+    freeze_host_config(&host_snapshot, &policy, &paths);
     // `hook.webhook`: the outbox captures from every instance's bus. A
     // hook that does not resolve is a host config error like any other.
     let outbox = match outbox::Outbox::new(storage.clone(), policy.hook.as_ref()) {
@@ -585,6 +590,41 @@ fn apply_synchronous(storage: &Storage, config: &alforria_core::config::schema::
             tracing::warn!("could not set storage.synchronous: {error}");
         }
     }
+}
+
+/// Freeze the host config of an unattended, reachable or project-restricted
+/// server at what it is now: every later instance boot applies the host
+/// files as they were read at startup, with the access policy, and not as
+/// they are on disk by then. A developer's own server keeps reading them
+/// (and keeps the last reading that loaded). A host config that did not
+/// load at all is not frozen: `listen` refuses to serve it.
+fn freeze_host_config(
+    snapshot: &alforria_core::config::HostSnapshot,
+    policy: &ServerPolicy,
+    paths: &alforria_core::GlobalPaths,
+) {
+    if policy.config_error.is_some() {
+        return;
+    }
+    let loader = alforria_core::ConfigLoader::new();
+    let params = || {
+        alforria_core::LoadParams::new(paths.home.clone(), paths.clone()).flags(
+            alforria_core::ConfigFlags {
+                disable_project_config: true,
+                ..Default::default()
+            },
+        )
+    };
+    let mode = loader.host_mode(&params());
+    if !(policy.unattended_or_remote() || mode.restricted) {
+        return;
+    }
+    // The reading the permission ceiling is built from, before anything
+    // the agent does can change the files.
+    if let Err(error) = loader.load_trusted(&params()) {
+        tracing::warn!("host config: {error}");
+    }
+    snapshot.freeze(mode);
 }
 
 /// The merged global config, for what the server decides once rather than

@@ -36,6 +36,7 @@ use crate::paths::GlobalPaths;
 use crate::{parse_jsonc, CoreError};
 
 use super::schema::{decode_config, Config, SCHEMA_REF};
+use super::snapshot::HostSnapshot;
 use super::variable::{substitute_confined, Confinement, Missing, Source};
 
 /// Content written to `.opencode/.gitignore` (`ensureGitignore`).
@@ -846,6 +847,13 @@ impl ConfigLoader {
     /// load leaves the mode restricted: what the operator wanted is
     /// unknown, so nothing from a project is taken on trust.
     pub fn host_mode(&self, params: &LoadParams) -> HostMode {
+        let snapshot = HostSnapshot::of(&params.paths.config);
+        if let Some(mode) = snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.frozen_mode())
+        {
+            return mode;
+        }
         let env: HashMap<String, String> = params
             .auth
             .all()
@@ -861,17 +869,20 @@ impl ConfigLoader {
             own_env: None,
         };
         let mut failed = false;
-        let mut load = |path: PathBuf, origin| match self.load_file(&path, &env, &rules(origin)) {
-            Ok(value) => value,
-            Err(error) => {
-                tracing::warn!(
-                    "{}: {error}; project config is treated as untrusted until it loads",
-                    path.display()
-                );
-                failed = true;
-                Value::Object(Map::new())
-            }
-        };
+        let mut load =
+            |path: PathBuf, origin| match remembered(&snapshot, (path.clone(), "mode"), || {
+                self.load_file(&path, &env, &rules(origin))
+            }) {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::warn!(
+                        "{}: {error}; project config is treated as untrusted until it loads",
+                        path.display()
+                    );
+                    failed = true;
+                    Value::Object(Map::new())
+                }
+            };
         let mut managed = Value::Object(Map::new());
         let managed_dir = managed_config_dir(params);
         if managed_dir.exists() {
@@ -1027,6 +1038,11 @@ impl ConfigLoader {
 
         // What the host config says about every other source: read first.
         let mode = self.host_mode(params);
+        // What a server process remembers of the host's sources
+        // (`config::snapshot`); the trusted load substitutes with another
+        // environment and is a reading of its own.
+        let snapshot = HostSnapshot::of(&params.paths.config);
+        let reading = if outside { "load" } else { "trusted" };
         let credentials: Vec<&str> = auth_env.keys().map(String::as_str).collect();
         // `{file:}` in a project config reads inside the project.
         let project_root = params
@@ -1082,8 +1098,19 @@ impl ConfigLoader {
 
         // 2. Global config dir (seeding + the three files). Global-load
         // failures degrade to `{}` with a warn — never fatal.
-        let global = match self.load_global(params, &auth_env) {
+        let global = match remembered(&snapshot, (params.paths.config.clone(), reading), || {
+            self.load_global(params, &auth_env)
+        }) {
             Ok(global) => global,
+            // A server that froze its host config and has none: an error,
+            // not a server without the host's rules.
+            Err(err)
+                if snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.is_frozen()) =>
+            {
+                return Err(err);
+            }
             Err(err) => {
                 tracing::warn!("failed to load global config, using defaults: {err}");
                 Value::Object(Map::new())
@@ -1153,7 +1180,13 @@ impl ConfigLoader {
             if is_opencode_dir {
                 for name in ["opencode.json", "opencode.jsonc"] {
                     let file = dir.join(name);
-                    let next = self.load_file(&file, &auth_env, &rules(origin_of(dir)))?;
+                    let next = if origin_of(dir) == ConfigOrigin::Outside {
+                        self.load_file(&file, &auth_env, &rules(origin_of(dir)))?
+                    } else {
+                        remembered(&snapshot, (file.clone(), reading), || {
+                            self.load_file(&file, &auth_env, &rules(origin_of(dir)))
+                        })?
+                    };
                     let next = apply_trust(next, &file.to_string_lossy(), origin_of(dir), &mode);
                     if origin_of(dir) != ConfigOrigin::Outside {
                         note_agent_names(&next, &mut host_agents);
@@ -1178,11 +1211,24 @@ impl ConfigLoader {
                 let mut held = apply_trust(json!({ key: found }), &source, origin_of(dir), &mode);
                 held[key].take()
             };
-            let commands = discovered("command", params.discovery.commands(dir)?);
+            // A host directory's markdown is host config like its JSON.
+            let find = |kind: &'static str,
+                        scan: &dyn Fn() -> Result<Value, CoreError>|
+             -> Result<Value, CoreError> {
+                if origin_of(dir) == ConfigOrigin::Outside {
+                    scan()
+                } else {
+                    remembered(&snapshot, (dir.clone(), kind), scan)
+                }
+            };
+            let commands = discovered(
+                "command",
+                find("commands", &|| params.discovery.commands(dir))?,
+            );
             merge_deep(entry_or_empty(&mut result, "command"), &commands);
-            let agents = discovered("agent", params.discovery.agents(dir)?);
+            let agents = discovered("agent", find("agents", &|| params.discovery.agents(dir))?);
             merge_deep(entry_or_empty(&mut result, "agent"), &agents);
-            let modes = discovered("agent", params.discovery.modes(dir)?);
+            let modes = discovered("agent", find("modes", &|| params.discovery.modes(dir))?);
             merge_deep(entry_or_empty(&mut result, "agent"), &modes);
             if origin_of(dir) != ConfigOrigin::Outside {
                 for found in [&agents, &modes] {
@@ -1240,13 +1286,13 @@ impl ConfigLoader {
         // (mobileconfig) are macOS-specific; the Linux port reads the
         // managed-config dir only.
         let managed_dir = managed_config_dir(params);
-        if managed_dir.exists() {
+        // (A server remembers that there was none, too.)
+        if managed_dir.exists() || snapshot.is_some() {
             for name in ["opencode.json", "opencode.jsonc"] {
-                let next = self.load_file(
-                    &managed_dir.join(name),
-                    &HashMap::new(),
-                    &rules(ConfigOrigin::Managed),
-                )?;
+                let file = managed_dir.join(name);
+                let next = remembered(&snapshot, (file.clone(), "managed"), || {
+                    self.load_file(&file, &HashMap::new(), &rules(ConfigOrigin::Managed))
+                })?;
                 note_agent_names(&next, &mut host_agents);
                 merge_config_concat_arrays(&mut result, &next);
             }
@@ -1380,7 +1426,12 @@ impl ConfigLoader {
             .iter()
             .map(|p| (p.key.clone(), p.token.clone()))
             .collect();
-        self.load_global(params, &auth_env).map(|_| ())
+        remembered(
+            &HostSnapshot::of(&params.paths.config),
+            (params.paths.config.clone(), "load"),
+            || self.load_global(params, &auth_env),
+        )
+        .map(|_| ())
     }
 
     /// The global config dir: seed + merge `config.json`, `opencode.json`,
@@ -1592,6 +1643,19 @@ impl ConfigLoader {
             return Ok(Value::Object(Map::new()));
         }
         self.load_config(&text, Source::Path(path.to_path_buf()), env, rules)
+    }
+}
+
+/// `load` through the process's [`HostSnapshot`] for these directories,
+/// when a server registered one.
+fn remembered(
+    snapshot: &Option<std::sync::Arc<HostSnapshot>>,
+    key: super::snapshot::SourceKey,
+    load: impl FnOnce() -> Result<Value, CoreError>,
+) -> Result<Value, CoreError> {
+    match snapshot {
+        Some(snapshot) => snapshot.read(key, load),
+        None => load(),
     }
 }
 

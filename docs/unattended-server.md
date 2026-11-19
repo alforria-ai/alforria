@@ -28,6 +28,35 @@ down. (A project file the server cannot read is skipped, as upstream.) Project c
 restricted (see `server.trust`) for as long as the host config does not
 load.
 
+**The rest of the host config is fixed at startup too, on a server that is
+unattended, reachable or project-restricted.** Every directory a client
+opens loads its config when it is first opened, long after the server
+started. If the host files changed in between — the global config stopped
+parsing, a `{file:}` it refers to vanished, or an agent with a shell
+rewrote `~/.config/alforria/opencode.json` — the next directory would have
+been opened under a different policy than the one the server started with:
+without your `permission` ceiling (the built-in default is `*: allow`), or
+with project config trusted again. So when the shell posture is restricted
+(the table under [`unattended_or_remote`](#what-selects-the-posture-unattended_or_remote))
+or project config is restricted (`server.trust`), the server keeps what each
+host source — the global config files, `~/.opencode`, the managed directory,
+and the markdown agents, commands and modes beside them — loaded as at
+startup, and how far project config is believed, and uses that for every
+directory opened later. Editing a host file on such a server takes a restart.
+The one exception is the server's own `PATCH /global/config` (an operator
+route): after it the host files are read once more, and a file that then
+fails to load keeps its previous reading. `server.*`, `shell_env`, the
+unattended settings and whether project config is restricted stay as they
+were at startup even then.
+
+A developer's own server — loopback, none of the unattended features,
+project config trusted — reads its host files again for each directory it
+opens, as before, so an edit applies without a restart. When a host file
+stops loading there, the last reading that loaded is kept (with a warning)
+instead of an empty config. `alforria run` and the other one-shot commands
+are one load and are unchanged. The code is
+`crates/alforria-core/src/config/snapshot.rs`.
+
 Which key is read from where is one table for every alforria key,
 `EXTENSION_KEYS` in `crates/alforria-core/src/config/precedence.rs`; the
 whole of it is in [assistant.md](assistant.md#which-config-may-set-what).
