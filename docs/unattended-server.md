@@ -827,7 +827,7 @@ Every request by which a credential below `admin` names a session:
 | Every other method on every route with a `{sessionID}` in it: `PATCH` and `DELETE /session/{id}`, `POST …/message`, `…/prompt_async`, `…/command`, `…/abort`, `…/init`, `…/summarize`, `…/revert`, `…/unrevert`, `…/permissions/{id}`, and any route of v1, v2 or alforria's own that the scope table opens later | allowed, under the session's restriction | `403`. (A session that does not exist is the handler's `404`; one that cannot be read is a `403`) |
 | `POST /permission/{id}/reply`, `POST /question/{id}/reply`, `…/reject` | allowed for an ask that belongs to it (`once` or `reject`; `always` needs `reply_always`) | `403`: the ask is looked up first and judged by its own session |
 | `GET /attention`, `GET /permission`, `GET /question` | its asks are listed | its asks are left out |
-| `POST /session` with `parentID` | the child is restricted, and is driven by its parent's turn, not by a prompt | the same: the child is restricted and cannot be prompted |
+| `POST /session` with `parentID` | the child is restricted, and is driven by its parent's turn, not by a prompt | `403`: a session is created only under a parent the token may act on (a parent that does not exist is refused too) |
 | `/memory` writes and `GET /memory/session` with `?session=<id>` | judged by that session's policy | refused |
 | `POST` or `PATCH /trigger` with `session: "<id>"` | allowed (see [A trigger that names a session](#a-trigger-that-names-a-session)) | `403`, and again at each run if the session's restriction was lifted since |
 
@@ -886,7 +886,7 @@ directory), and an id from elsewhere is a 404.
 | any `/session/{id}/…` | the session id | the project (the session's own directory) | location layer, same allowlist |
 | any `/session/{id}/…` except `GET` and `fork` | the session id | whose rights later engine turns run with | the route guard (`confine::guard_session_writes`, 403 before the handler) and core (`Caller::may_act_on`): the session must be restricted |
 | `POST /session` | `title`, `metadata` | stored text | not restricted |
-| | `parentID` | a child session | allowed; the child cannot then be prompted by this token |
+| | `parentID` | a child session, listed under its parent, resumable by the parent's model and reporting into it | route: the parent must be a session the token may act on (`confine::may_act_on`, 403); the child cannot then be prompted by this token |
 | | `agent`, `model` | stored on the session | route: a hidden or subagent-only agent is refused; core: whatever agent a later turn resolves to is judged when it runs |
 | | (the request itself) | the session's restriction | core: a session created below `admin` is restricted for life, with its children and forks |
 | | `permission` | the session's ruleset | refused (route) |

@@ -860,6 +860,20 @@ pub async fn create(
                 message: "selecting a workspace needs the admin scope".to_string(),
             }));
         }
+        // The session a request names in its body is a session it acts
+        // on, like one named in the path (`confine::guard_session_writes`):
+        // a child is listed under its parent, can be resumed by the
+        // parent's model as a task, and reports into it.
+        if let Some(parent) = &payload.parent_id {
+            crate::confine::may_act_on(&state, parent).map_err(|_| {
+                ServerError::Api(ApiError::Forbidden {
+                    message: format!(
+                        "session {parent}: it belongs to the operator, and this token can \
+                         read or fork it but not create a session under it"
+                    ),
+                })
+            })?;
+        }
     }
     let input = match payload.map(|p| decode_create_payload(&p)) {
         Some(Ok(input)) => Some(input),

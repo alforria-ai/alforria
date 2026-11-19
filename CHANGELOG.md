@@ -244,6 +244,10 @@ pre-1.0, so minor releases may include breaking changes.
 
 ### Fixed
 
+- `POST /session` accepted any `parentID` from a token below `admin`, so
+  a `chat` client could create a session as the child of an operator's
+  session. It is refused (`403`) unless the parent is a session the token
+  may act on, as on every route that names a session in its path.
 - Forking a session while one of its turns was running could produce a
   fork that held content without what the content had brought: the fork
   took its source's marks, ceilings and restriction first and copied the

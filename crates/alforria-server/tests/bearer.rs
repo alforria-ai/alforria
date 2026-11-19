@@ -2524,6 +2524,51 @@ fn filled(route: &str, session: &str) -> String {
         .join("/")
 }
 
+/// `POST /session` names a session too, in its body: `parentID`. The guard
+/// over the session routes reads the path, so a `chat` token could create
+/// a session as the child of an operator's — listed among that session's
+/// subagents, resumable by its model as a task, and inheriting what a
+/// child inherits. A token below `admin` gives a session only a parent it
+/// may act on.
+#[tokio::test]
+async fn a_narrow_token_cannot_create_a_child_of_an_operators_session() {
+    let signer = Signer::new();
+    let f = fixture_with(policy_config(&signer, false), Some(PASSWORD), Vec::new());
+    let chat = bearer(&signer.token(AUDIENCE, "chat"));
+    let operators = create_session(&f, &f.dirs.repo, &basic()).await;
+    let own = create_session(&f, &f.dirs.repo, &chat).await;
+    let create = |auth: String, parent: String| {
+        let router = f.router.clone();
+        let uri = format!("/session?{}", dir_query(&f.dirs.repo));
+        async move {
+            let body = json!({ "parentID": parent });
+            let response = call(&router, "POST", &uri, Some(&auth), Some(body)).await;
+            (response.status(), body_string(response).await)
+        }
+    };
+    let children = |parent: String| {
+        let router = f.router.clone();
+        async move {
+            let uri = format!("/session/{parent}/children");
+            let response = call(&router, "GET", &uri, Some(&basic()), None).await;
+            body_json(response).await.as_array().unwrap().len()
+        }
+    };
+
+    let (status, body) = create(chat.clone(), operators.clone()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(body.contains("belongs to the operator"), "{body}");
+    assert_eq!(children(operators.clone()).await, 0, "nothing was created");
+
+    // Its own session takes a child, and the operator's takes the operator's.
+    let (status, body) = create(chat.clone(), own.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(children(own).await, 1);
+    let (status, body) = create(basic(), operators.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(children(operators).await, 1);
+}
+
 /// A token below `admin` writes nothing to an operator's session, on any
 /// route that names one — title, metadata, archive, delete, share, revert,
 /// summarize, abort, init, command, shell, message and part edits, the v2
