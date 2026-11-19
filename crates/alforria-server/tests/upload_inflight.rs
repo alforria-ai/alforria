@@ -179,7 +179,7 @@ async fn one_principal_cannot_hold_every_place_in_an_upload_directory() {
         upload_area_in_flight(&area).0 == UPLOAD_MAX_IN_FLIGHT_PER_PRINCIPAL
     })
     .await;
-    assert!(UPLOAD_MAX_IN_FLIGHT_PER_PRINCIPAL < UPLOAD_MAX_IN_FLIGHT);
+    const { assert!(UPLOAD_MAX_IN_FLIGHT_PER_PRINCIPAL < UPLOAD_MAX_IN_FLIGHT) };
     let refused = put(&f, &greedy, "uploads/one-more", b"y").await;
     assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(body_json(refused).await["name"], "TooManyUploadsError");
