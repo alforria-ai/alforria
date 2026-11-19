@@ -422,8 +422,18 @@ impl GoalStore {
             return;
         };
         let saved = match goal {
-            Some(goal) => std::fs::create_dir_all(&self.dir)
-                .and_then(|()| std::fs::write(&path, serde_json::to_vec(goal).unwrap_or_default())),
+            // Written beside the file and renamed over it: a reader never
+            // finds the goal half-written, which it would take for no goal.
+            Some(goal) => std::fs::create_dir_all(&self.dir).and_then(|()| {
+                static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let partial = path.with_extension(format!("{}-{unique}.tmp", std::process::id()));
+                std::fs::write(&partial, serde_json::to_vec(goal).unwrap_or_default())
+                    .and_then(|()| std::fs::rename(&partial, &path))
+                    .inspect_err(|_| {
+                        let _ = std::fs::remove_file(&partial);
+                    })
+            }),
             None => match std::fs::remove_file(&path) {
                 Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
                 _ => Ok(()),
