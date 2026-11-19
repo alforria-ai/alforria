@@ -167,10 +167,13 @@ fn fixture(signer: &Signer, tool: &str, input: impl FnOnce(&Fixture) -> Value) -
     f
 }
 
+/// A tool, and the input it is called with.
+type Attempt = (&'static str, fn(&Fixture) -> Value);
+
 /// What each tool is pointed at: the credential store, by `read`; the data
 /// directory, by `grep` for the key; the global config directory, by
 /// `glob`; and the global config file, by `read`.
-fn attempts() -> Vec<(&'static str, fn(&Fixture) -> Value)> {
+fn attempts() -> Vec<Attempt> {
     vec![
         (
             "read",
