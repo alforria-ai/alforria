@@ -244,6 +244,15 @@ pre-1.0, so minor releases may include breaking changes.
 
 ### Fixed
 
+- A trigger scheduled by a run that outside input had started (a webhook
+  or watch trigger whose `permission` block grants `schedule`) recorded
+  its creator's restriction and outside-content provenance, but not that
+  outside input had started it. Its own runs were ordinary ones: their
+  sessions had no outside-start mark, so no write guard, no restricted
+  shell environment and no add-only memory. The trigger now records it
+  (`outsideStart`), and its runs in a session of their own are started by
+  outside input: marked, and read-only. A `current` reminder still runs in
+  the session that scheduled it, under that session's own ceiling.
 - A subagent resumed with `task_id` went on under the ceilings its session
   was created with, even when its parent's had been narrowed since (a
   trigger's bounds are replaced at each run): the resume compared the two

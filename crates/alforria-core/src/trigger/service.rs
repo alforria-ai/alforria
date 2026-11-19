@@ -136,6 +136,8 @@ struct Entry {
     restricted: bool,
     /// `StoredSpec::outside_content`.
     outside_content: bool,
+    /// `StoredSpec::outside_start`.
+    outside_start: bool,
     schedule: Result<Schedule, String>,
     state: TriggerState,
     time_created: u64,
@@ -351,7 +353,7 @@ impl TriggerService {
                     None,
                     None,
                     false,
-                    false,
+                    (false, false),
                     now,
                     now,
                     now,
@@ -377,7 +379,7 @@ impl TriggerService {
                 stored.stored.inherited,
                 stored.origin_session_id,
                 stored.stored.restricted,
-                stored.stored.outside_content,
+                (stored.stored.outside_content, stored.stored.outside_start),
                 stored.time_created,
                 stored.time_updated,
                 now,
@@ -422,7 +424,7 @@ impl TriggerService {
         inherited: Option<CreatorBounds>,
         origin_session_id: Option<String>,
         restricted: bool,
-        outside_content: bool,
+        (outside_content, outside_start): (bool, bool),
         time_created: u64,
         time_updated: u64,
         now: u64,
@@ -451,6 +453,7 @@ impl TriggerService {
             origin_session_id,
             restricted,
             outside_content,
+            outside_start,
             schedule,
             state,
             time_created: if source == TriggerSource::Config {
@@ -646,7 +649,7 @@ impl TriggerService {
                             trigger.stored.inherited,
                             trigger.origin_session_id,
                             trigger.stored.restricted,
-                            trigger.stored.outside_content,
+                            (trigger.stored.outside_content, trigger.stored.outside_start),
                             trigger.time_created,
                             trigger.time_updated,
                             now,
@@ -656,6 +659,7 @@ impl TriggerService {
                     }
                     Some(entry) if entry.source == TriggerSource::Runtime => {
                         entry.outside_content |= trigger.stored.outside_content;
+                        entry.outside_start |= trigger.stored.outside_start;
                         if entry.time_updated == trigger.time_updated {
                             continue;
                         }
@@ -763,6 +767,7 @@ impl TriggerService {
                 inherited: inherited.map(CreatorBounds::Flat),
                 restricted: false,
                 outside_content: false,
+                outside_start: false,
             },
         )
     }
@@ -848,6 +853,7 @@ impl TriggerService {
                     inherited: entry.inherited.clone(),
                     restricted: entry.restricted,
                     outside_content: true,
+                    outside_start: entry.outside_start,
                 },
                 origin_session_id: entry.origin_session_id.clone(),
                 time_created: entry.time_created,
@@ -855,6 +861,36 @@ impl TriggerService {
             })
             .map_err(|error| TriggerError::Failed(error.to_string()))?;
         entry.outside_content = true;
+        Ok(())
+    }
+
+    /// Record that a session outside input had started changed a stored
+    /// trigger (`StoredSpec::outside_start`): from now on its runs in a
+    /// session of their own are started by outside input. Never cleared.
+    pub fn mark_outside_start(&self, id: &str) -> Result<(), TriggerError> {
+        let mut entries = self.lock();
+        let Some(entry) = entries.get_mut(id) else {
+            return Err(TriggerError::NotFound(format!("trigger not found: {id}")));
+        };
+        if entry.outside_start || entry.source != TriggerSource::Runtime {
+            return Ok(());
+        }
+        self.store
+            .put(&StoredTrigger {
+                id: id.to_string(),
+                stored: StoredSpec {
+                    spec: entry.spec.clone(),
+                    inherited: entry.inherited.clone(),
+                    restricted: entry.restricted,
+                    outside_content: entry.outside_content,
+                    outside_start: true,
+                },
+                origin_session_id: entry.origin_session_id.clone(),
+                time_created: entry.time_created,
+                time_updated: entry.time_updated,
+            })
+            .map_err(|error| TriggerError::Failed(error.to_string()))?;
+        entry.outside_start = true;
         Ok(())
     }
 
@@ -871,6 +907,7 @@ impl TriggerService {
             inherited,
             restricted,
             outside_content,
+            outside_start,
         } = creator;
         self.require_enabled()?;
         let schedule = spec.schedule().map_err(TriggerError::Invalid)?;
@@ -937,6 +974,7 @@ impl TriggerService {
                         inherited: inherited.clone(),
                         restricted,
                         outside_content,
+                        outside_start,
                     },
                     origin_session_id: origin_session_id.clone(),
                     time_created: now,
@@ -952,6 +990,7 @@ impl TriggerService {
                 origin_session_id,
                 restricted,
                 outside_content,
+                outside_start,
                 schedule: Ok(schedule),
                 state,
                 time_created: now,
@@ -1084,6 +1123,7 @@ impl TriggerService {
                             inherited: entry.inherited.clone(),
                             restricted: entry.restricted,
                             outside_content: entry.outside_content,
+                            outside_start: entry.outside_start,
                         },
                         origin_session_id: entry.origin_session_id.clone(),
                         time_created: entry.time_created,
@@ -1615,11 +1655,22 @@ impl TriggerService {
                     // of trigger: any payload is outside text. The rules
                     // themselves are put together where the agent's are
                     // known (`trigger::rules`).
+                    //
+                    // A trigger a session outside input had started wrote
+                    // is that input's doing (`StoredSpec::outside_start`):
+                    // its run in a session of its own is started by
+                    // outside input as well. One that runs in the session
+                    // that wrote it (`current`; a tool's trigger names no
+                    // other) is a turn of that session, which carries the
+                    // mark and its ceiling itself.
+                    let own_session =
+                        !matches!(entry.spec.session_mode(), SessionMode::Existing(_));
                     let untrusted = payload.is_some()
                         || matches!(
                             entry.schedule,
                             Ok(Schedule::Webhook | Schedule::Watch { .. })
-                        );
+                        )
+                        || (entry.outside_start && own_session);
                     Ok(TriggerTurn {
                         trigger_id: id.to_string(),
                         run_id: run.id.clone(),

@@ -1205,6 +1205,7 @@ async fn a_trigger_names_only_a_session_whose_own_bounds_are_its_runs() {
         inherited: bounds(),
         restricted: false,
         outside_content,
+        outside_start: false,
     };
     let operator = Creator::default;
     let chat = || Creator {
@@ -1426,6 +1427,86 @@ async fn a_trigger_names_only_a_session_whose_own_bounds_are_its_runs() {
         )
         .unwrap();
     service.mark_outside_content("own").unwrap();
+}
+
+/// A trigger scheduled by a session outside input had started (a webhook
+/// run whose trigger grants it `schedule`) is that input's doing. It used
+/// to record its creator's restriction and outside-content provenance
+/// only, so its runs — an ordinary cron or interval — were not started by
+/// outside input: their sessions had no `SessionMark::OutsideStart`, and
+/// with it no write guard, no restricted shell and no add-only memory. The
+/// trigger remembers, across restarts, and a run in a session of its own
+/// is untrusted; one that runs in the very session that scheduled it
+/// (`current`) is a turn of that session, which carries the mark itself.
+#[tokio::test]
+async fn a_trigger_scheduled_by_a_session_outside_input_started_runs_as_outside_input() {
+    use crate::trigger::{Creator, SessionTarget};
+    let f = Fixture::new(
+        "trigger-outside-start-creator",
+        "2027-01-01T00:00:00Z",
+        FakeOps::answering("ok"),
+    );
+    f.ops.targets.lock().unwrap().insert(
+        "ses_hook".to_string(),
+        SessionTarget::Found {
+            restricted: false,
+            outside_content: true,
+        },
+    );
+    let by_the_run = |outside_start: bool| Creator {
+        origin_session_id: Some("ses_hook".to_string()),
+        inherited: None,
+        restricted: false,
+        outside_content: true,
+        outside_start,
+    };
+    let job = |session: &str| {
+        spec(json!({ "on": { "interval": "1h" }, "prompt": "Go", "session": session }))
+    };
+    {
+        let service = f.service(json!({}));
+        for (id, session, outside_start) in [
+            ("later", "new", true),
+            ("kept", "reuse", true),
+            ("here", "ses_hook", true),
+            ("clean", "new", false),
+        ] {
+            service
+                .create_as(
+                    Some(id.to_string()),
+                    job(session),
+                    by_the_run(outside_start),
+                )
+                .unwrap();
+        }
+    }
+    // A new process reads it back from the store.
+    let service = f.service(json!({}));
+    for id in ["later", "kept", "here", "clean"] {
+        let run = service.run_now(id).unwrap();
+        settle(&service, &[run]).await;
+    }
+    let turns = f.ops.turns();
+    assert_eq!(
+        turns
+            .iter()
+            .map(|turn| (turn.trigger_id.as_str(), turn.untrusted))
+            .collect::<Vec<_>>(),
+        [
+            ("later", true),
+            ("kept", true),
+            ("here", false),
+            ("clean", false)
+        ]
+    );
+    assert!(turns.iter().all(|turn| turn.payload.is_none()));
+
+    // A session that became one later marks the trigger it changes.
+    service.mark_outside_start("clean").unwrap();
+    let service = f.service(json!({}));
+    let run = service.run_now("clean").unwrap();
+    settle(&service, &[run]).await;
+    assert!(f.ops.turns().last().unwrap().untrusted);
 }
 
 /// A trigger remembers whether a restricted caller created it, across

@@ -43,6 +43,17 @@ pub struct StoredSpec {
         skip_serializing_if = "std::ops::Not::not"
     )]
     pub outside_content: bool,
+    /// The session that created or last changed it was one outside input
+    /// had started (`SessionMark::OutsideStart`): the trigger is that
+    /// input's doing, so its runs in a session of their own are started by
+    /// outside input too — the mark and the read-only ceiling, not
+    /// provenance alone. Set, never cleared.
+    #[serde(
+        rename = "outsideStart",
+        default,
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub outside_start: bool,
 }
 
 fn restricted_when_unsaid() -> bool {

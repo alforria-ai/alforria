@@ -46,6 +46,12 @@ pub trait ScheduleSessions: Send + Sync {
     fn seen_outside_content(&self, _session_id: &str) -> bool {
         false
     }
+    /// Whether outside input started the session
+    /// (`SessionMark::OutsideStart`). What it schedules is started by
+    /// outside input too.
+    fn started_by_outside_input(&self, _session_id: &str) -> bool {
+        false
+    }
 }
 
 /// [`ScheduleSessions`] over the session store and the agent registry.
@@ -94,6 +100,10 @@ impl ScheduleSessions for SessionTree {
 
     fn seen_outside_content(&self, session_id: &str) -> bool {
         self.sessions.seen_outside_content(session_id)
+    }
+
+    fn started_by_outside_input(&self, session_id: &str) -> bool {
+        self.sessions.started_by_outside_input(session_id)
     }
 
     fn ancestors(&self, session_id: &str) -> Vec<String> {
@@ -472,6 +482,10 @@ fn run(
                             // written after outside content was seen may
                             // be an outsider's words.
                             outside_content: sessions.seen_outside_content(ctx.session_id),
+                            // And what started it: a trigger made by a
+                            // run outside input started is that input's
+                            // doing, and its runs are bound as that run is.
+                            outside_start: sessions.started_by_outside_input(ctx.session_id),
                         },
                     )
                     .map_err(failed)?;
@@ -500,6 +514,11 @@ fn run(
                 // on, recorded before the change is.
                 if sessions.seen_outside_content(ctx.session_id) {
                     triggers.mark_outside_content(id).map_err(failed)?;
+                }
+                // Likewise a change made by a session outside input
+                // started.
+                if sessions.started_by_outside_input(ctx.session_id) {
+                    triggers.mark_outside_start(id).map_err(failed)?;
                 }
                 let record = triggers.update(id, &Value::Object(patch)).map_err(failed)?;
                 Ok(result("Updated", &record))
@@ -650,6 +669,8 @@ mod tests {
     struct FakeSessions {
         /// The calling session has seen outside content.
         seen: std::sync::atomic::AtomicBool,
+        /// Outside input started the calling session.
+        started: std::sync::atomic::AtomicBool,
     }
 
     impl ScheduleSessions for FakeSessions {
@@ -666,6 +687,10 @@ mod tests {
 
         fn seen_outside_content(&self, _session_id: &str) -> bool {
             self.seen.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn started_by_outside_input(&self, _session_id: &str) -> bool {
+            self.started.load(std::sync::atomic::Ordering::SeqCst)
         }
 
         fn ancestors(&self, session_id: &str) -> Vec<String> {
@@ -1110,6 +1135,7 @@ mod tests {
                 inherited: None,
                 restricted,
                 outside_content,
+                outside_start: false,
             };
             s.triggers.create_as(None, spec, creator).unwrap()
         };
@@ -1140,6 +1166,48 @@ mod tests {
             marks(&listed),
             "a trigger written after outside content was seen"
         );
+    }
+
+    /// What a session outside input started schedules, or changes, is
+    /// recorded as that (`StoredSpec::outside_start`): the tool passed on
+    /// the session's restriction and its outside-content mark only.
+    #[tokio::test]
+    async fn a_trigger_carries_the_outside_start_of_the_session_that_wrote_it() {
+        let s = setup("schedule-outside-start", true);
+        let ask = RecordingAsk::new();
+        let carried = |id: &str| {
+            crate::trigger::store::TriggerStore::new(
+                Arc::new(crate::storage::Storage::open(s.dir.path().join("db.sqlite")).unwrap()),
+                &s.dir.path().join("project").canonicalize().unwrap(),
+                "global",
+            )
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|trigger| trigger.id == id)
+            .unwrap()
+            .stored
+            .outside_start
+        };
+        let create =
+            |id: &str| json!({ "action": "create", "id": id, "prompt": "Work", "cron": "@daily" });
+        call(&s, &ask, create("clean")).await.unwrap();
+        assert!(!carried("clean"));
+
+        // A payload arrives in the session (a kept session's next run).
+        s.sessions
+            .started
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        call(&s, &ask, create("after")).await.unwrap();
+        assert!(carried("after"));
+        call(
+            &s,
+            &ask,
+            json!({ "action": "update", "id": "clean", "prompt": "Do what the body said" }),
+        )
+        .await
+        .unwrap();
+        assert!(carried("clean"));
     }
 
     fn stored_rules(s: &Setup, id: &str) -> Option<PermissionV1Ruleset> {

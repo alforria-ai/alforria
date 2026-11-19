@@ -415,6 +415,26 @@ mod tests {
         ("a_tool_added_next_year", "*"),
     ];
 
+    /// A run outside input started is read-only except for what its
+    /// trigger's own block grants — and the block can grant `schedule`. So
+    /// a session with `SessionMark::OutsideStart` can be one that creates
+    /// triggers, which is why a trigger records that mark of its creator
+    /// (`StoredSpec::outside_start`).
+    #[test]
+    fn a_trigger_block_can_grant_schedule_to_a_run_outside_input_started() {
+        let agent = agent();
+        let none = run(&Vec::new(), &Vec::new(), true);
+        assert_eq!(decide(&agent, &none, "schedule", "create"), Deny);
+        let own = vec![rule("schedule", "*", Allow)];
+        let granted = run(&Vec::new(), &own, true);
+        assert_eq!(decide(&agent, &granted, "schedule", "create"), Allow);
+        let policy = granted.over(&Policy::plain(agent));
+        assert!(
+            !policy.disabled(&["schedule"]).contains("schedule"),
+            "the tool is offered"
+        );
+    }
+
     #[test]
     fn an_untrusted_run_keeps_what_was_withheld_and_gains_nothing() {
         let agent = agent();

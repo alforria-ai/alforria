@@ -590,6 +590,9 @@ pub struct Creator {
     /// The creating session had seen outside content
     /// (`SessionMark::OutsideContent`).
     pub outside_content: bool,
+    /// Outside input had started the creating session
+    /// (`SessionMark::OutsideStart`).
+    pub outside_start: bool,
 }
 
 /// The session-engine seam behind the scheduler.
