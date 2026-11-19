@@ -36,6 +36,10 @@ pre-1.0, so minor releases may include breaking changes.
   workspace already exists`. The second now waits and uses the database the
   first one created.
 
+- Event streams close when a subscriber falls behind, so clients can reconnect
+  and refresh their state. Terminals and running turns keep sending events
+  through a configuration reload.
+
 ## [0.4.4] - 2026-11-13
 
 ### Fixed
