@@ -102,25 +102,38 @@ fn too_large(limit: u64) -> FileError {
     )
 }
 
-fn too_many_uploads() -> FileError {
+fn too_many_uploads(own: bool) -> FileError {
     FileError::Status(
         StatusCode::TOO_MANY_REQUESTS,
         "TooManyUploadsError",
-        format!(
-            "{UPLOAD_MAX_IN_FLIGHT} uploads into this upload directory are already being \
-             received; try again when one has finished"
-        ),
+        if own {
+            format!(
+                "{UPLOAD_MAX_IN_FLIGHT_PER_PRINCIPAL} uploads of this credential into this \
+                 upload directory are already being received; try again when one has finished"
+            )
+        } else {
+            format!(
+                "{UPLOAD_MAX_IN_FLIGHT} uploads into this upload directory are already being \
+                 received; try again when one has finished"
+            )
+        },
     )
 }
 
-fn stalled() -> FileError {
+fn stalled(total: Option<Duration>) -> FileError {
     FileError::Status(
         StatusCode::REQUEST_TIMEOUT,
         "UploadTimeoutError",
-        format!(
-            "the upload sent nothing for {} seconds and was ended",
-            idle_timeout().as_secs()
-        ),
+        match total {
+            None => format!(
+                "the upload sent nothing for {} seconds and was ended",
+                idle_timeout().as_secs()
+            ),
+            Some(total) => format!(
+                "the upload was not complete after {} seconds and was ended",
+                total.as_secs()
+            ),
+        },
     )
 }
 
@@ -141,8 +154,39 @@ pub const UPLOAD_MAX_DEPTH: usize = 8;
 /// How many uploads below `admin` one upload directory receives at a time.
 pub const UPLOAD_MAX_IN_FLIGHT: u32 = 8;
 
+/// How many of them one credential may hold: fewer than all, so that one
+/// token's slow uploads leave room for another's.
+pub const UPLOAD_MAX_IN_FLIGHT_PER_PRINCIPAL: u32 = 4;
+
 /// How long an upload may send nothing before it is ended.
 const UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The slowest an upload may be as a whole: with [`UPLOAD_GRACE`], what
+/// its total deadline is derived from ([`total_deadline`]). A byte sent
+/// just inside each idle window is not an upload in progress.
+const UPLOAD_MIN_RATE: u64 = 64 * 1024;
+const UPLOAD_GRACE: Duration = Duration::from_secs(60);
+
+static TOTAL_DEADLINE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How long a whole upload may take: the time `server.upload.max_bytes`
+/// takes at [`UPLOAD_MIN_RATE`], plus [`UPLOAD_GRACE`] (about nine and a
+/// half minutes at the default 32 MiB).
+fn total_deadline(limit: u64) -> Duration {
+    match TOTAL_DEADLINE_MS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => UPLOAD_GRACE + Duration::from_secs(limit / UPLOAD_MIN_RATE),
+        millis => Duration::from_millis(millis),
+    }
+}
+
+/// Test seam: how long a whole upload may take, for the whole process.
+#[doc(hidden)]
+pub fn upload_total_deadline(deadline: Duration) {
+    TOTAL_DEADLINE_MS.store(
+        deadline.as_millis() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
 
 /// A temporary file that no upload of this process is writing and that is
 /// older than this is a leftover (a server that was killed mid-upload):
@@ -220,8 +264,10 @@ struct AreaState {
     /// What the uploads being received hold of the quota — bytes, entries
     /// — from [`begin`] until each is committed or dropped ([`InFlight`]).
     reserved: (u64, u64),
-    /// How many are being received.
+    /// How many are being received, and how many of them each credential
+    /// holds.
     in_flight: u32,
+    by_principal: std::collections::HashMap<String, u32>,
     /// Their temporary files: not leftovers ([`refresh`]).
     temporaries: std::collections::HashSet<PathBuf>,
 }
@@ -243,6 +289,8 @@ struct InFlight {
     held: (u64, u64),
     /// What replacing the target takes off the count, as [`begin`] read it.
     credit: u64,
+    /// Whose it is ([`principal_key`]).
+    principal: String,
 }
 
 impl InFlight {
@@ -263,6 +311,7 @@ impl InFlight {
             created: false,
             held: (0, 0),
             credit: 0,
+            principal: String::new(),
         }
     }
 
@@ -283,6 +332,12 @@ impl Drop for InFlight {
             let mut state = area.lock();
             self.release(&mut state);
             state.in_flight = state.in_flight.saturating_sub(1);
+            if let Some(held) = state.by_principal.get_mut(&self.principal) {
+                *held = held.saturating_sub(1);
+                if *held == 0 {
+                    state.by_principal.remove(&self.principal);
+                }
+            }
             state.temporaries.remove(&self.path);
         }
     }
@@ -617,7 +672,8 @@ fn room(
 }
 
 /// The start of an upload below `admin`, in one hold of the area's lock:
-/// a place among the uploads being received ([`UPLOAD_MAX_IN_FLIGHT`]); a
+/// a place among the uploads being received ([`UPLOAD_MAX_IN_FLIGHT`], and
+/// [`UPLOAD_MAX_IN_FLIGHT_PER_PRINCIPAL`] of them for one credential); a
 /// first look at the quota — so that an upload that cannot fit is refused
 /// before anything is made or received; the target's directories, which
 /// count from the moment they exist whatever becomes of the upload; and
@@ -632,10 +688,16 @@ fn begin(
     area: &Arc<Area>,
     target: &Path,
     declared: u64,
+    principal: String,
 ) -> Result<std::io::Result<InFlight>, FileError> {
     let mut state = area.lock();
     if state.in_flight >= UPLOAD_MAX_IN_FLIGHT {
-        return Err(too_many_uploads());
+        return Err(too_many_uploads(false));
+    }
+    if state.by_principal.get(&principal).copied().unwrap_or(0)
+        >= UPLOAD_MAX_IN_FLIGHT_PER_PRINCIPAL
+    {
+        return Err(too_many_uploads(true));
     }
     let missing = target
         .ancestors()
@@ -675,6 +737,8 @@ fn begin(
     state.reserved.0 = state.reserved.0.saturating_add(declared);
     state.reserved.1 += new;
     state.in_flight += 1;
+    *state.by_principal.entry(principal.clone()).or_default() += 1;
+    upload.principal = principal;
     state.temporaries.insert(upload.path.clone());
     Ok(Ok(upload))
 }
@@ -1205,6 +1269,19 @@ fn restricted_upload_allowed(
     Ok(upload_area)
 }
 
+/// Whose upload it is, for the per-credential cap: how the request
+/// authenticated and as whom. Tokens that name no subject share one.
+fn principal_key(principal: &Option<Extension<Principal>>) -> String {
+    match principal {
+        Some(Extension(principal)) => format!(
+            "{:?}:{}",
+            principal.via,
+            principal.subject.as_deref().unwrap_or_default()
+        ),
+        None => String::new(),
+    }
+}
+
 /// Have the count of every upload directory `target` is in taken again.
 fn mark_stale_areas(ctx: &ServerContext, location: &LocationContext, target: &Path) {
     use alforria_core::protect::{resolve, resolve_path, within};
@@ -1288,7 +1365,8 @@ async fn upload(
             refresh(&ctx, root, area).await?;
             let (ctx, root, area) = (Arc::clone(&ctx), root.clone(), Arc::clone(area));
             let (target, declared) = (target.clone(), declared.unwrap_or(0));
-            tokio::task::spawn_blocking(move || begin(&ctx, &root, &area, &target, declared))
+            let who = principal_key(&principal);
+            tokio::task::spawn_blocking(move || begin(&ctx, &root, &area, &target, declared, who))
                 .await
                 .unwrap_or_else(|join| Ok(Err(std::io::Error::other(join.to_string()))))?
         }
@@ -1321,13 +1399,22 @@ async fn upload(
     );
     let mut written: u64 = 0;
     let mut stream = body.into_data_stream();
+    // A body that stops arriving does not hold its place for ever, and
+    // neither does one that keeps arriving a byte at a time.
+    let total = total_deadline(limit);
+    let deadline = tokio::time::Instant::now() + total;
     loop {
-        // A body that stops arriving does not hold its place for ever.
-        let chunk = match tokio::time::timeout(idle_timeout(), stream.next()).await {
-            Err(_) => return Err(stalled()),
+        let wait =
+            idle_timeout().min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+        let chunk = match tokio::time::timeout(wait, stream.next()).await {
+            Err(_) if tokio::time::Instant::now() >= deadline => return Err(stalled(Some(total))),
+            Err(_) => return Err(stalled(None)),
             Ok(None) => break,
             Ok(Some(chunk)) => chunk.map_err(|err| io(std::io::Error::other(err.to_string())))?,
         };
+        if tokio::time::Instant::now() >= deadline {
+            return Err(stalled(Some(total)));
+        }
         written += chunk.len() as u64;
         if written > limit {
             return Err(too_large(limit));

@@ -1679,8 +1679,10 @@ oversized upload leaves the old file as it was.
 
 - `413` when the body exceeds `server.upload.max_bytes` (host config,
   default 32 MiB = 33554432), declared or not.
-- `408` (`UploadTimeoutError`) when the body sends nothing for 30 seconds:
-  the upload is ended and its temporary file removed.
+- `408` (`UploadTimeoutError`) when the body sends nothing for 30 seconds,
+  or is not complete within the time `max_bytes` takes at 64 KiB/s plus a
+  minute (about nine and a half minutes at the default): the upload is
+  ended and its temporary file removed.
 - `409` with `overwrite=false` when the file exists.
 - `400` when the path is a directory; `403` when it leaves the project.
 
@@ -1761,7 +1763,10 @@ asked the model for:
   be are held against the quota from its first byte until it is committed
   or ends, so several slow uploads cannot each be admitted into the same
   free space. One upload directory receives at most 8 uploads below
-  `admin` at a time; one more is answered `429` with
+  `admin` at a time, and at most 4 of one credential (a JWT's `sub` or a
+  static token's `name`; tokens that name neither share one allowance), so
+  one token's slow uploads leave room for another's; one more is answered
+  `429` with
   `{"name": "TooManyUploadsError"}` and can be sent again. However an
   upload ends — refused, failed, timed out, or the client gone — its
   temporary file is unlinked and what it held is given back. A temporary

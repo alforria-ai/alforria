@@ -251,9 +251,10 @@ pre-1.0, so minor releases may include breaking changes.
   that stopped sending held its connection for ever. An upload below
   `admin` now holds the bytes it declares (or has sent) against the quota
   until it is committed or ends; an upload directory receives at most 8 at
-  a time (`429 TooManyUploadsError` for one more); a body that sends
-  nothing for 30 seconds is ended (`408 UploadTimeoutError`, for every
-  caller); the temporary file is unlinked however the upload ends; and
+  a time, 4 of one credential (`429 TooManyUploadsError` for one more); a
+  body that sends nothing for 30 seconds, or is slower overall than
+  64 KiB/s over `max_bytes` plus a minute, is ended
+  (`408 UploadTimeoutError`, for every caller); the temporary file is unlinked however the upload ends; and
   temporary files a killed server left are removed at the next count.
 - Upload quota: replacing a file took the file's size on disk off the
   running count, whatever had been counted for it. In a full upload

@@ -150,7 +150,53 @@ async fn stalled_uploads_hold_their_bytes_and_a_dropped_one_leaves_nothing() {
     assert_eq!(response.status(), StatusCode::CREATED);
 }
 
-use alforria_server::routes::file_ext::{upload_area_in_flight, UPLOAD_MAX_IN_FLIGHT};
+use alforria_server::routes::file_ext::{
+    upload_area_in_flight, UPLOAD_MAX_IN_FLIGHT, UPLOAD_MAX_IN_FLIGHT_PER_PRINCIPAL,
+};
+
+/// A `chat` token for `subject`.
+fn chat_as(signer: &Signer, subject: &str) -> String {
+    bearer(&signer.sign(json!({
+        "aud": AUDIENCE,
+        "scope": "chat",
+        "exp": support::now_secs() + 300,
+        "sub": subject,
+    })))
+}
+
+/// One principal holds only so many of an upload directory's places: at
+/// its own cap it is refused, and another principal still uploads.
+#[tokio::test]
+async fn one_principal_cannot_hold_every_place_in_an_upload_directory() {
+    let signer = Signer::new();
+    let f = fixture(&signer, 10_000);
+    let (greedy, other) = (chat_as(&signer, "greedy"), chat_as(&signer, "other"));
+    let area = f.dirs.repo.join("uploads");
+    let open: Vec<_> = (0..UPLOAD_MAX_IN_FLIGHT_PER_PRINCIPAL)
+        .map(|n| stalled(&f, &greedy, &format!("uploads/g{n}"), 10, 1))
+        .collect();
+    until("the uploads are being received", || {
+        upload_area_in_flight(&area).0 == UPLOAD_MAX_IN_FLIGHT_PER_PRINCIPAL
+    })
+    .await;
+    assert!(UPLOAD_MAX_IN_FLIGHT_PER_PRINCIPAL < UPLOAD_MAX_IN_FLIGHT);
+    let refused = put(&f, &greedy, "uploads/one-more", b"y").await;
+    assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(body_json(refused).await["name"], "TooManyUploadsError");
+    let response = put(&f, &other, "uploads/theirs", b"y").await;
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "one principal's stalled uploads kept another's out"
+    );
+    for upload in open {
+        upload.abort();
+        let _ = upload.await;
+    }
+    until("nothing is held", || upload_area_in_flight(&area) == (0, 0)).await;
+    let response = put(&f, &greedy, "uploads/one-more", b"y").await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+}
 
 /// An upload directory receives only so many uploads at a time.
 #[tokio::test]
@@ -159,8 +205,15 @@ async fn an_upload_directory_receives_a_bounded_number_of_uploads_at_once() {
     let f = fixture(&signer, 10_000);
     let chat = bearer(&signer.token(AUDIENCE, "chat"));
     let area = f.dirs.repo.join("uploads");
+    // From as many principals as it takes: each has a cap of its own.
     let open: Vec<_> = (0..UPLOAD_MAX_IN_FLIGHT)
-        .map(|n| stalled(&f, &chat, &format!("uploads/f{n}"), 10, 1))
+        .map(|n| {
+            let auth = chat_as(
+                &signer,
+                &format!("user-{}", n / UPLOAD_MAX_IN_FLIGHT_PER_PRINCIPAL),
+            );
+            stalled(&f, &auth, &format!("uploads/f{n}"), 10, 1)
+        })
         .collect();
     until("the uploads are being received", || {
         upload_area_in_flight(&area) == (UPLOAD_MAX_IN_FLIGHT, 10 * UPLOAD_MAX_IN_FLIGHT as u64)
