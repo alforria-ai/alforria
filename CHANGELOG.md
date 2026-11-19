@@ -244,6 +244,14 @@ pre-1.0, so minor releases may include breaking changes.
 
 ### Fixed
 
+- A guarded write truncated the existing file in place, so a name that is
+  a hard link to a loader file or to a host file (`notes.md` linked to
+  `AGENTS.md`) passed the write guard by name and rewrote the protected
+  file. Guarded writes — the edit tools' in a restricted or
+  outside-started session, and a guarded revert's restores — now write a
+  new file beside the target and rename it over the name, keeping the
+  replaced file's mode; the file's other names keep their content.
+  (Uploads already replaced by rename.)
 - The read guard judged a path and the tool then opened the spelling
   again, so a path component swapped for a link into a host location
   between the two — by the session's own shell — was followed. A guarded

@@ -59,7 +59,10 @@
 //!    open its parent from the root one component at a time with
 //!    `O_NOFOLLOW` (creating what is missing) and create, replace or
 //!    unlink the last component through that handle, not followed either
-//!    (`beneath::NoFollowDir`). There is no second resolution of the name
+//!    (`beneath::NoFollowDir`). A write replaces the directory entry — a
+//!    new file renamed over the name — and never truncates in place: the
+//!    name may be a hard link to a protected file, which a write through
+//!    the shared inode would rewrite under a name the guard let pass. There is no second resolution of the name
 //!    for a rename or a link swapped in between to redirect: such a write
 //!    fails. `write`, `edit`, `apply_patch` (through
 //!    `InstanceContext::write_file` / `remove_file`), the upload route and
@@ -1135,6 +1138,72 @@ mod tests {
             .protected
             .guards(&outer.join("rules/security.txt"))
             .is_some());
+    }
+
+    /// A name is not a file: `notes.md` can be a second name — a hard
+    /// link — of `AGENTS.md`, or of a host file. The guard judges names,
+    /// so the guarded write must not write through to the other one: it
+    /// replaces the directory entry, and the file's other names keep what
+    /// they held.
+    #[cfg(unix)]
+    #[test]
+    fn a_guarded_write_to_a_hard_link_replaces_the_name_and_leaves_the_other_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tree(default_config());
+        let p = paths(&t.home);
+        let project = &t.project;
+        std::fs::create_dir_all(project.join("docs")).unwrap();
+        std::fs::create_dir_all(&p.data).unwrap();
+        std::fs::write(project.join("AGENTS.md"), "the operator's").unwrap();
+        std::fs::write(p.data.join("auth.json"), "host secret").unwrap();
+        std::fs::hard_link(project.join("AGENTS.md"), project.join("docs/notes.md")).unwrap();
+        std::fs::hard_link(p.data.join("auth.json"), project.join("docs/cache.json")).unwrap();
+        std::fs::set_permissions(
+            project.join("docs/notes.md"),
+            std::fs::Permissions::from_mode(0o640),
+        )
+        .unwrap();
+
+        for (name, other, held) in [
+            ("docs/notes.md", project.join("AGENTS.md"), "the operator's"),
+            ("docs/cache.json", p.data.join("auth.json"), "host secret"),
+        ] {
+            // By name there is nothing to refuse.
+            let landing = t.protected.judge(&project.join(name)).expect(name);
+            write_at(&landing, b"mine now").unwrap();
+            assert_eq!(std::fs::read_to_string(&landing).unwrap(), "mine now");
+            assert_eq!(
+                std::fs::read_to_string(&other).unwrap(),
+                held,
+                "the write to {name} went through to {}",
+                other.display()
+            );
+        }
+        // The replaced file keeps the mode it had.
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode(&project.join("docs/notes.md")), 0o640);
+        // A restore sets the executable bit on what it wrote, and a link
+        // is replaced there too.
+        std::fs::hard_link(project.join("AGENTS.md"), project.join("docs/run.sh")).unwrap();
+        restore_at(&project.join("docs/run.sh"), b"#!/bin/sh\n", true).unwrap();
+        assert_eq!(mode(&project.join("docs/run.sh")) & 0o100, 0o100);
+        assert_eq!(
+            std::fs::read_to_string(project.join("AGENTS.md")).unwrap(),
+            "the operator's"
+        );
+        assert_eq!(
+            mode(&project.join("AGENTS.md")),
+            0o640,
+            "one inode, one mode"
+        );
+        // Nothing is left beside the files, written or failed.
+        assert!(write_at(&project.join("docs"), b"a directory").is_err());
+        let left: Vec<String> = std::fs::read_dir(project.join("docs"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".alforria-write-"))
+            .collect();
+        assert_eq!(left, [""; 0]);
     }
 
     /// Failure 1, the wrong path judged. Over generated spellings of paths

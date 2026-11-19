@@ -1111,7 +1111,14 @@ then made on the resolved path that was judged — its parent directory is
 opened from the root one component at a time with no link followed
 (`O_NOFOLLOW`, creating what is missing), and the file is created, replaced
 or removed through that handle — so a rename or a link swapped in between
-the check and the write makes the write fail instead of redirecting it.
+the check and the write makes the write fail instead of redirecting it. A
+write never truncates a file in place: the contents go to a new file in the
+same directory, which is renamed over the name (keeping the replaced file's
+mode). The name judged may be a *hard link* — `notes.md` as a second name
+of `AGENTS.md`, or of a file outside the project — and a write through the
+shared file would have rewritten the other name too; replacing the entry
+leaves it as it was. (A guarded session's write therefore breaks a hard
+link it writes to; other sessions write as upstream does.)
 
 **The grant.** The `edit_loader` permission in the host config hands back
 *project-level loader files*, per path

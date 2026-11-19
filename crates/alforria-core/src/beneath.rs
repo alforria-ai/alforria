@@ -384,17 +384,24 @@ pub struct NoFollowDir {
     path: PathBuf,
 }
 
-/// Create or truncate the file at `landing` (absolute, resolved) and write
-/// `contents`, creating its directories — every component opened without
-/// following a link ([`NoFollowDir`]).
+/// Make the file at `landing` (absolute, resolved) hold `contents`,
+/// creating its directories — every component opened without following a
+/// link ([`NoFollowDir`]).
+///
+/// The directory entry is **replaced**, not written through: the contents
+/// go to a new file beside it, which is renamed over the name. A name is
+/// not a file — `notes.md` can be a hard link to `AGENTS.md` or to a file
+/// outside the project — and truncating in place wrote every other name
+/// of that file too, past a guard that had judged only this one. The
+/// other names keep what they held.
 pub fn write_no_follow(landing: &Path, contents: &[u8]) -> io::Result<()> {
     write_no_follow_mode(landing, contents, None)
 }
 
 /// [`write_no_follow`], also setting whether the file is executable
 /// (`Some`) — on the handle that was written, not by name. Other
-/// permission bits are left as they are. No effect where there is no such
-/// bit.
+/// permission bits are the replaced file's (a new file gets the default).
+/// No effect where there is no such bit.
 pub fn write_no_follow_mode(
     landing: &Path,
     contents: &[u8],
@@ -402,25 +409,66 @@ pub fn write_no_follow_mode(
 ) -> io::Result<()> {
     use std::io::Write;
     let (parent, name) = split_landing(landing)?;
-    let mut file = NoFollowDir::open(parent, true)?.create(name, false)?;
-    file.write_all(contents)?;
-    #[cfg(unix)]
-    if let Some(executable) = executable {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = file.metadata()?.permissions().mode();
-        let wanted = if executable {
-            // Executable by whoever may read it.
-            mode | ((mode & 0o444) >> 2)
-        } else {
-            mode & !0o111
-        };
-        if wanted != mode {
-            file.set_permissions(std::fs::Permissions::from_mode(wanted))?;
+    let dir = NoFollowDir::open(parent, true)?;
+    // What has the name now. A link there was not there when the path was
+    // judged (the guard refuses a last component that is a link): it is
+    // not followed, and not quietly replaced either.
+    let existing = match dir.entry(name)? {
+        Entry::Link => return Err(refused("the path is a symbolic link")),
+        Entry::Directory => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the path is a directory",
+            ))
         }
+        Entry::Missing => None,
+        Entry::File { mode } => mode,
+    };
+    let temporary = std::ffi::OsString::from(format!(
+        ".alforria-write-{:016x}{:016x}",
+        rand::random::<u64>(),
+        rand::random::<u64>()
+    ));
+    let written = (|| {
+        let mut file = dir.create(&temporary, true)?;
+        file.write_all(contents)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let made = file.metadata()?.permissions().mode() & 0o7777;
+            let mode = existing.unwrap_or(made);
+            let wanted = match executable {
+                // Executable by whoever may read it.
+                Some(true) => mode | ((mode & 0o444) >> 2),
+                Some(false) => mode & !0o111,
+                None => mode,
+            };
+            if wanted != made {
+                file.set_permissions(std::fs::Permissions::from_mode(wanted))?;
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = (executable, existing);
+        drop(file);
+        dir.rename(&temporary, name)
+    })();
+    if written.is_err() {
+        let _ = dir.remove_file(&temporary);
     }
-    #[cfg(not(unix))]
-    let _ = executable;
-    Ok(())
+    written
+}
+
+/// What a name in a [`NoFollowDir`] is, the name itself and not what a
+/// link by that name leads to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Entry {
+    Missing,
+    Link,
+    Directory,
+    /// Anything else, with its permission bits where there are such.
+    File {
+        mode: Option<u32>,
+    },
 }
 
 /// Remove the file at `landing` (absolute, resolved) through its parent's
@@ -584,6 +632,42 @@ impl NoFollowDir {
         }
     }
 
+    /// What `name` is in this directory ([`Entry`]).
+    pub fn entry(&self, name: &std::ffi::OsStr) -> io::Result<Entry> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        let name = Self::name(name.as_bytes())?;
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: the directory is open, `name` a valid C string, `stat`
+        // room for one `struct stat`; the result is checked before it is
+        // read.
+        let status = unsafe {
+            libc::fstatat(
+                self.fd.as_raw_fd(),
+                name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if status != 0 {
+            let error = io::Error::last_os_error();
+            return match error.kind() {
+                io::ErrorKind::NotFound => Ok(Entry::Missing),
+                _ => Err(error),
+            };
+        }
+        // SAFETY: `fstatat` succeeded and filled it.
+        let mode = unsafe { stat.assume_init() }.st_mode;
+        // (`mode_t` is not `u32` everywhere.)
+        #[allow(clippy::unnecessary_cast)]
+        let bits = (mode & 0o7777) as u32;
+        Ok(match mode & libc::S_IFMT {
+            libc::S_IFLNK => Entry::Link,
+            libc::S_IFDIR => Entry::Directory,
+            _ => Entry::File { mode: Some(bits) },
+        })
+    }
+
     /// The size of `name` in this directory as the directory lists it — a
     /// link's own, never what it points to — or `None` when there is no
     /// such name.
@@ -650,6 +734,16 @@ impl NoFollowDir {
 
     pub fn remove_file(&self, name: &std::ffi::OsStr) -> io::Result<()> {
         by_name::remove_file(&self.path, name)
+    }
+
+    pub fn entry(&self, name: &std::ffi::OsStr) -> io::Result<Entry> {
+        match std::fs::symlink_metadata(self.path.join(name)) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Entry::Missing),
+            Err(error) => Err(error),
+            Ok(meta) if meta.file_type().is_symlink() => Ok(Entry::Link),
+            Ok(meta) if meta.is_dir() => Ok(Entry::Directory),
+            Ok(_) => Ok(Entry::File { mode: None }),
+        }
     }
 
     /// By name, once the path still resolves to itself.
