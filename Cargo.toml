@@ -64,7 +64,7 @@ thiserror = "2"
 libc = "0.2"
 
 # IDs & utilities
-ulid = { version = "1", features = ["serde"] }
+ulid = { version = "3", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 notify = "8"
 globset = "0.4"
