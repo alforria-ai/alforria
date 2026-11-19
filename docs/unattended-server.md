@@ -1110,6 +1110,31 @@ files themselves must be safe.
 | Files a guarded revert leaves alone | — | A guarded revert is narrower than an operator's: a file the snapshot listing leaves out (git-ignored files) and a path the snapshot holds as a symlink or a submodule stay as they are |
 | Names nobody listed | — | The agent's own edit tools are not refused the build and tool config names an upload is (`package.json`, `Makefile`, …): editing them is its work |
 
+#### Reads of host locations
+
+The same sessions — restricted, or started by outside input — do not *read*
+the host's own locations with `read`, `grep` or `glob`, and are attached no
+file from them: the data, state and cache directories (`auth.json`,
+`mcp-auth.json`, the database), the global config directory, `~/.opencode`,
+the managed directory, and a file `OPENCODE_CONFIG*` names (webhook
+secrets, MCP headers). The path is judged where it resolves, links followed
+(`protect::resolve_path`, `Protected::judge_read`), the tool fails with the
+reason, and **no ask is raised**: the `external_directory` ask that used to
+be the only thing in the way is answered by whoever holds the session's
+token (`once`), or by `permission.unattended.on_timeout: "allow"`. A search
+that starts above such a location returns nothing from inside it.
+
+What the server itself sends a session to stays readable: a place the
+agent's rules allow *by name* under `external_directory` in every reading of
+the policy — the saved tool outputs (`<data>/tool-output`), plans, skill and
+reference directories the defaults whitelist, or a path your host config
+allows. A catch-all `external_directory: "allow"` names nothing and lifts
+nothing here. The binary's directory is guarded against writes only.
+
+This is the tools, not the shell: a guarded session that may run `bash`
+reads any file the server's user can (see [Known limits](#known-limits)).
+The operator's own sessions are asked as before.
+
 #### `server.trust` (host)
 
 ```jsonc

@@ -81,6 +81,9 @@ fn run(
             None => instance.directory.clone(),
         };
 
+        // alforria extension: a guarded session does not list the host's
+        // own locations, and is not asked whether it may.
+        instance.about_to_read(&search)?;
         let info = tokio::fs::metadata(&search).await.ok();
         if info.map(|info| info.is_file()).unwrap_or(false) {
             return Err(ToolError::Failed(format!(
@@ -109,6 +112,8 @@ fn run(
         let listed: Vec<std::path::PathBuf> = files
             .iter()
             .map(|file| ts_resolve(&search, file.to_string_lossy().as_ref()))
+            // A walk from above a host location reaches into it.
+            .filter(|file| instance.may_return(file))
             .collect();
         reported.report(&search, files.iter(), !truncated);
 

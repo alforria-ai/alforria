@@ -277,6 +277,25 @@ impl Policy {
         granted(&self.written) && self.ceilings.iter().all(|ceiling| granted(&ceiling.rules))
     }
 
+    /// [`Policy::explicitly_allows`] by a rule that names a place: the
+    /// rule that decides, in every reading, is an allow whose pattern is
+    /// not the catch-all `*`.
+    pub fn allows_by_name(&self, permission: &str, pattern: &str) -> bool {
+        let granted = |rules: &Ruleset| {
+            rules
+                .iter()
+                .rev()
+                .find(|rule| {
+                    rule.permission == permission && wildcard_match(pattern, &rule.pattern)
+                })
+                .is_some_and(|rule| {
+                    rule.action == PermissionV1Action::Allow
+                        && !rule.pattern.chars().all(|c| c == '*')
+                })
+        };
+        granted(&self.written) && self.ceilings.iter().all(|ceiling| granted(&ceiling.rules))
+    }
+
     /// `disabled` (permission/index.ts:204-211) over every reading: a tool
     /// one of them denies outright is not offered.
     pub fn disabled(&self, tools: &[&str]) -> std::collections::HashSet<String> {

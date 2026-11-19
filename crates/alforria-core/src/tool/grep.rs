@@ -87,6 +87,9 @@ fn run(
             None => instance.directory.clone(),
         };
 
+        // alforria extension: a guarded session does not search the host's
+        // own locations, and is not asked whether it may.
+        instance.about_to_read(&requested)?;
         let requested_info = tokio::fs::metadata(&requested).await.ok();
         assert_external_directory(
             &ctx,
@@ -136,6 +139,8 @@ fn run(
         let rows: Vec<(PathBuf, u64, String)> = result
             .iter()
             .map(|item| (ts_resolve(&base, &item.path), item.line, item.text.clone()))
+            // A walk from above a host location reaches into it.
+            .filter(|(path, _, _)| instance.may_return(path))
             .collect();
         if rows.is_empty() {
             return empty_result(&params.pattern);

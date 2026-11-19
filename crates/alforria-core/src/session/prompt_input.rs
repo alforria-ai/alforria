@@ -1378,6 +1378,25 @@ async fn resolve_file_part(
                 .bounds(deps.sessions.is_restricted(session_id)?)
                 .check_read(&filepath, &deps.directory, &deps.worktree)
                 .map_err(|message| PromptError::Forbidden { message })?;
+            // A guarded session — restricted, or one outside input started
+            // a run in — is attached nothing from the host's own locations,
+            // as its `read` tool is refused them (`protect`).
+            if deps.sessions.runs_restricted(session_id) {
+                let absolute = if filepath.is_absolute() {
+                    filepath.clone()
+                } else {
+                    deps.directory.join(&filepath)
+                };
+                if let Err(refusal) = deps.agents.protected().judge_read(&absolute) {
+                    return Err(PromptError::Forbidden {
+                        message: format!(
+                            "{}. This session is restricted or was started by outside input, \
+                             so nothing there is attached to it.",
+                            refusal.reason
+                        ),
+                    });
+                }
+            }
             let part_mime = if filepath.is_dir() {
                 "application/x-directory".to_string()
             } else {

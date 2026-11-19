@@ -244,6 +244,17 @@ pre-1.0, so minor releases may include breaking changes.
 
 ### Fixed
 
+- A restricted session's `read`, `grep` and `glob` could open the host's
+  own files — `auth.json` and the rest of the data directory, the global
+  config with its webhook secrets and MCP headers: the only thing in the
+  way was the `external_directory` ask, which the `chat` token that owns
+  the session answers itself with `once` (or
+  `permission.unattended.on_timeout: "allow"` answers for it). A session
+  that is restricted or was started by outside input is now refused those
+  locations by the tools, with no ask, and is attached no file from them;
+  a search that starts above one returns nothing from inside it. The saved
+  tool outputs, plans, skill and reference directories stay readable. The
+  operator's own sessions are unchanged.
 - A running server applied its host config as it was on disk each time a
   directory was first opened, while the access policy was read once at
   startup. A global config that stopped parsing (or lost a `{file:}` it

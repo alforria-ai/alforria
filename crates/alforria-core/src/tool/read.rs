@@ -98,6 +98,9 @@ fn run(
         // the session's provenance mark (`tool::outside`) — reported
         // before anything can fail, so a failed read is judged by it too.
         ctx.extra.returned_paths.report_opened(&filepath);
+        // alforria extension: a guarded session does not open the host's
+        // own files, and is not asked whether it may.
+        instance.about_to_read(&filepath)?;
         let title = ts_relative(&instance.worktree, &filepath);
 
         let stat = tokio::fs::metadata(&filepath).await.ok();

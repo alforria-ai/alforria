@@ -318,6 +318,10 @@ pub fn landing(target: &Path) -> Result<PathBuf, String> {
     Ok(landing)
 }
 
+/// The one host location that holds nothing to keep from a reader: it is
+/// protected from writes only (it is often `/usr/bin`).
+const BINARY_DIRECTORY: &str = "the directory of the alforria binary";
+
 /// See the module docs.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Protected {
@@ -366,7 +370,7 @@ impl Protected {
             .ok()
             .and_then(|exe| exe.parent().map(Path::to_path_buf))
         {
-            Self::add(host, "the directory of the alforria binary", &dir);
+            Self::add(host, BINARY_DIRECTORY, &dir);
         }
         out
     }
@@ -590,6 +594,40 @@ impl Protected {
         Ok(landing)
     }
 
+    /// Why a guarded session may not read `target`, if it may not: it
+    /// resolves ([`resolve_path`], links followed as a read follows them)
+    /// into a host location — the data, state and cache directories, the
+    /// global and managed config directories, `~/.opencode`, a file
+    /// `OPENCODE_CONFIG*` names. That is where the credential store, the
+    /// database, and the host config with its webhook secrets and MCP
+    /// headers live. A path that cannot be resolved is refused. `Ok` is
+    /// the resolved path that was judged.
+    pub fn judge_read(&self, target: &Path) -> Result<PathBuf, Refusal> {
+        let resolved = match resolve_path(target) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                return Err(Refusal {
+                    class: Class::Host,
+                    reason: format!("{} cannot be resolved ({error})", target.display()),
+                    landing: None,
+                })
+            }
+        };
+        let location = self
+            .host
+            .iter()
+            .filter(|(what, _)| what != BINARY_DIRECTORY)
+            .find(|(_, location)| within(&resolved, location));
+        match location {
+            Some((what, location)) => Err(Refusal {
+                class: Class::Host,
+                reason: format!("{} is in {what} ({})", target.display(), location.display()),
+                landing: Some(resolved),
+            }),
+            None => Ok(resolved),
+        }
+    }
+
     /// The protected location `directory` overlaps — one contains the
     /// other, or they are the same — if any: `(what, location)`.
     pub fn overlap(&self, directory: &Path) -> Option<(String, PathBuf)> {
@@ -661,6 +699,37 @@ impl WriteGuard {
                 refusal.reason
             ),
         })
+    }
+}
+
+impl WriteGuard {
+    /// Whether the session may read `target` — a file to open or a
+    /// directory to search; `Err` is why not. A host location
+    /// ([`Protected::judge_read`]) is refused, with no ask: the ask is
+    /// answered by whoever holds the session's token, or by
+    /// `permission.unattended`, and neither is the operator.
+    ///
+    /// What the server itself points a session at inside those locations
+    /// stays readable: a place every reading of the policy allows by name
+    /// under `external_directory` — the saved tool outputs, plans, skill
+    /// and reference directories the agent defaults whitelist, or a path
+    /// the host config allows. A catch-all (`*`) names nothing.
+    pub fn admit_read(&self, target: &Path) -> Result<(), String> {
+        let Err(refusal) = self.protected.judge_read(target) else {
+            return Ok(());
+        };
+        let named = refusal.landing.as_ref().is_some_and(|resolved| {
+            self.policy
+                .allows_by_name("external_directory", &resolved.to_string_lossy())
+        });
+        if named {
+            return Ok(());
+        }
+        Err(format!(
+            "{}. This session is restricted or was started by outside input, so it may not \
+             read there.",
+            refusal.reason
+        ))
     }
 }
 

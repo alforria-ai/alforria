@@ -129,6 +129,24 @@ impl InstanceContext {
         }
     }
 
+    /// **Every tool that returns a file's content, or searches a
+    /// directory, calls this with the path it is about to open**, before
+    /// it raises any ask: a guarded session does not read the host's own
+    /// locations (`protect::WriteGuard::admit_read`), and is not asked.
+    pub fn about_to_read(&self, path: &Path) -> Result<(), ToolError> {
+        match &self.write_guard {
+            None => Ok(()),
+            Some(guard) => guard.admit_read(path).map_err(ToolError::Permission),
+        }
+    }
+
+    /// Whether a search result at `path` may be returned
+    /// ([`InstanceContext::about_to_read`]): a walk that started outside
+    /// a host location can still reach into one.
+    pub fn may_return(&self, path: &Path) -> bool {
+        self.about_to_read(path).is_ok()
+    }
+
     /// Create or overwrite `path` with `contents`, creating its
     /// directories: **the one way a tool writes a file.**
     ///
