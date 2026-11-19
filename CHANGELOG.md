@@ -244,6 +244,17 @@ pre-1.0, so minor releases may include breaking changes.
 
 ### Fixed
 
+- Upload quota: replacing a file took the file's size on disk off the
+  running count, whatever had been counted for it. In a full upload
+  directory the agent's shell could make a file sparse and huge
+  (`truncate -s 100G uploads/pad`), a one-byte upload over it then
+  credited the whole 100G, and the directory was "empty" again. A replace
+  now takes off what the count holds for that file and no more, and a
+  difference has the directory counted again before the next upload. An
+  operator's upload into an upload directory is counted before the next
+  upload below `admin` instead of up to five minutes later, and a
+  directory in the area that cannot be listed makes the area full instead
+  of counting as empty.
 - A restricted session's `read`, `grep` and `glob` could open the host's
   own files — `auth.json` and the rest of the data directory, the global
   config with its webhook secrets and MCP headers: the only thing in the

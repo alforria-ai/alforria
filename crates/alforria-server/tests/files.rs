@@ -819,6 +819,84 @@ fn quota_fixture(signer: &Signer, total: u64, files: u64) -> Fixture {
     f
 }
 
+/// Replacing a file credits the count with what the count holds for it,
+/// not with whatever the file has grown to since: the agent's shell could
+/// make a file in a full area sparse and huge (`truncate -s 100G`), and a
+/// one-byte upload over it took the whole count off.
+#[tokio::test]
+async fn replacing_a_file_grown_behind_the_count_credits_only_what_was_counted() {
+    let signer = Signer::new();
+    let f = quota_fixture(&signer, 100, 50);
+    let chat = bearer(&signer.token(AUDIENCE, "chat"));
+    let area = f.dirs.repo.join("uploads");
+    for name in ["a", "b"] {
+        let response = put(&f, Some(&chat), &format!("uploads/{name}"), "", &[b'x'; 50]).await;
+        assert_eq!(response.status(), StatusCode::CREATED, "{name}");
+    }
+    // Full.
+    let response = put(&f, Some(&chat), "uploads/c", "", b"y").await;
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    // The shell's part: sparse, and never counted.
+    std::fs::File::options()
+        .write(true)
+        .open(area.join("a"))
+        .unwrap()
+        .set_len(10 * 100)
+        .unwrap();
+    let response = put(&f, Some(&chat), "uploads/a", "", b"z").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    // 50 counted for `a` came off, 1 went on: 51 of 100, and 50 do not fit.
+    let (bytes, _) = alforria_server::routes::file_ext::upload_area_usage(&area).unwrap();
+    assert!(bytes >= 51, "the count went below what is there: {bytes}");
+    let response = put(&f, Some(&chat), "uploads/c", "", &[b'y'; 50]).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "the replace credited bytes that were never counted"
+    );
+    let (on_disk, _) = alforria_server::routes::file_ext::upload_area_on_disk(&area, 50);
+    assert_eq!(on_disk, 51);
+}
+
+/// An upload by the operator into an upload directory is counted with the
+/// rest: the next upload below `admin` sees it.
+#[tokio::test]
+async fn an_admin_upload_into_the_area_counts_against_the_quota() {
+    let signer = Signer::new();
+    let f = quota_fixture(&signer, 100, 50);
+    let chat = bearer(&signer.token(AUDIENCE, "chat"));
+    let response = put(&f, Some(&chat), "uploads/a", "", &[b'x'; 10]).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let response = put(&f, Some(&basic()), "uploads/big", "", &[b'x'; 80]).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let response = put(&f, Some(&chat), "uploads/b", "", &[b'x'; 20]).await;
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+/// A directory in the area that cannot be listed is not an empty one: what
+/// it holds is unknown, and the area is treated as full.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_unreadable_directory_in_the_area_is_not_counted_as_empty() {
+    use std::os::unix::fs::PermissionsExt;
+    let signer = Signer::new();
+    let f = quota_fixture(&signer, 100, 50);
+    let chat = bearer(&signer.token(AUDIENCE, "chat"));
+    let closed = f.dirs.repo.join("uploads").join("closed");
+    std::fs::create_dir_all(&closed).unwrap();
+    std::fs::write(closed.join("hidden"), [b'x'; 100]).unwrap();
+    std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read_dir(&closed).is_ok() {
+        // Root reads anything: nothing to test.
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+    let response = put(&f, Some(&chat), "uploads/a", "", b"x").await;
+    std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
 /// Nothing in the upload directory is left out of the count for its name:
 /// a file carrying the server's own prefix for an upload in progress
 /// counts like any other, and a narrow token cannot create one.

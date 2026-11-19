@@ -1727,9 +1727,14 @@ asked the model for:
   upload that would exceed either is answered `413` with
   `{"name": "UploadQuotaError"}` before anything is written (a body with
   no declared length is cut off at what is left and removed); replacing a
-  file counts the difference. The server counts a directory once — a
+  file counts the difference — taking off what the count holds for that
+  file and no more: a file the agent's shell has grown since it was
+  counted (`truncate -s 100G`, sparse) credits only what was counted for
+  it, and has the directory counted again before the next upload. The
+  server counts a directory once — a
   bounded walk that gives up, and reports the directory full, past
-  `max_files` entries or 8 levels — and then keeps the figure up to date
+  `max_files` entries or 8 levels, or when a directory in it cannot be
+  listed (what it holds is unknown, not nothing) — and then keeps the figure up to date
   with each upload it writes; it does not walk per upload. What an upload
   replaces is read at the moment of its rename, under that directory's
   lock, so uploads racing for one file are each counted for what they
@@ -1742,8 +1747,8 @@ asked the model for:
   high until the next recount and never low. One recount runs at a time
   per directory, with no lock held across the walk; uploads that arrive
   meanwhile go by the running count. `admin` and the operator are held to
-  `max_bytes` only, and their uploads are likewise noticed at the next
-  count.
+  `max_bytes` only; an upload of theirs into an upload directory has it
+  counted again before the next upload below `admin`.
 
 While bearer tokens are configured, no language server is started on a
 file inside an upload directory — reading or editing `uploads/x.ts` gives

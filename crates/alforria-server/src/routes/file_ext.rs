@@ -155,6 +155,30 @@ struct AreaState {
     /// The count is to be taken again whatever its age.
     stale: bool,
     walks: u64,
+    /// What the count holds for each file: its size when the last walk
+    /// saw it, or when the server wrote it. Replacing a file takes this
+    /// much off the count and no more ([`credit`]) — a file the agent's
+    /// shell grew since (`truncate -s 100G`, sparse) is bigger on disk
+    /// than anything that was ever counted for it.
+    sizes: std::collections::HashMap<PathBuf, u64>,
+    /// The files uploads made while a walk was under way: put back over
+    /// what the walk recorded, which may have missed them.
+    landed: Vec<(PathBuf, u64)>,
+}
+
+/// What replacing `target`, now `on_disk` bytes, takes off the count: what
+/// the count holds for it, at most what is there. A difference between
+/// the two means something else wrote the file: the area is counted again
+/// before the next upload.
+fn credit(state: &mut AreaState, target: &Path, on_disk: Option<u64>) -> u64 {
+    let Some(on_disk) = on_disk else {
+        return 0;
+    };
+    let counted = state.sizes.get(target).copied().unwrap_or(0);
+    if counted != on_disk {
+        state.stale = true;
+    }
+    counted.min(on_disk)
 }
 
 /// Clears `walking` however the recount ends — a request dropped half-way
@@ -244,46 +268,67 @@ pub fn upload_area_usage(area: &Path) -> Option<(u64, u64)> {
 /// What `area` holds on disk, counted the way the quota counts it.
 #[doc(hidden)]
 pub fn upload_area_on_disk(area: &Path, max_entries: u64) -> (u64, u64) {
-    let usage = count_area(area, max_entries);
+    let (usage, _) = count_area(area, max_entries);
     (usage.bytes, usage.entries)
 }
 
 /// Count what `root` holds: every entry, directories included, no link
-/// followed, nothing skipped by name. Bounded: it gives up — `over` — past
-/// `max_entries` entries or below [`UPLOAD_MAX_DEPTH`].
-fn count_area(root: &Path, max_entries: u64) -> Usage {
+/// followed, nothing skipped by name — and the size of each file. Bounded:
+/// it gives up — `over` — past `max_entries` entries or below
+/// [`UPLOAD_MAX_DEPTH`]. A directory or an entry that is there and cannot
+/// be read is not an empty one: what it holds is unknown, and the count is
+/// `over` too.
+fn count_area(root: &Path, max_entries: u64) -> (Usage, std::collections::HashMap<PathBuf, u64>) {
     let mut usage = Usage {
         bytes: 0,
         entries: 0,
         over: false,
         counted: std::time::Instant::now(),
     };
+    let mut sizes = std::collections::HashMap::new();
+    let gone = |err: &std::io::Error| err.kind() == std::io::ErrorKind::NotFound;
     let mut pending = vec![(root.to_path_buf(), 0usize)];
     while let Some((directory, depth)) = pending.pop() {
-        let Ok(entries) = std::fs::read_dir(&directory) else {
-            continue;
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            // Not made yet, or removed since it was listed.
+            Err(err) if gone(&err) => continue,
+            Err(_) => {
+                usage.over = true;
+                return (usage, sizes);
+            }
         };
-        for entry in entries.flatten() {
+        for entry in entries {
+            let Ok(entry) = entry else {
+                usage.over = true;
+                return (usage, sizes);
+            };
             usage.entries += 1;
             if usage.entries > max_entries {
                 usage.over = true;
-                return usage;
+                return (usage, sizes);
             }
-            let Ok(meta) = entry.metadata() else {
-                continue;
+            let meta = match entry.metadata() {
+                Ok(meta) => meta,
+                Err(err) if gone(&err) => continue,
+                Err(_) => {
+                    usage.over = true;
+                    return (usage, sizes);
+                }
             };
             if meta.is_dir() {
                 if depth + 1 >= UPLOAD_MAX_DEPTH {
                     usage.over = true;
-                    return usage;
+                    return (usage, sizes);
                 }
                 pending.push((entry.path(), depth + 1));
             } else {
                 usage.bytes = usage.bytes.saturating_add(meta.len());
+                sizes.insert(entry.path(), meta.len());
             }
         }
     }
-    usage
+    (usage, sizes)
 }
 
 /// Make sure `area` has a count no older than [`USAGE_MAX_AGE`]: the
@@ -311,6 +356,7 @@ async fn refresh(ctx: &ServerContext, root: &Path, area: &Arc<Area>) -> Result<(
             return Ok(());
         }
         state.walking = true;
+        state.landed.clear();
         state.added
     };
     let _walking = Walking(area);
@@ -330,9 +376,12 @@ async fn refresh(ctx: &ServerContext, root: &Path, area: &Arc<Area>) -> Result<(
     })
     .await
     .map_err(|join| storage_error(&std::io::Error::other(join.to_string())))?;
+    let (counted, mut sizes) = counted;
     let mut state = area.lock();
     state.walks += 1;
     state.stale = false;
+    sizes.extend(std::mem::take(&mut state.landed));
+    state.sizes = sizes;
     state.usage = Some(Usage {
         bytes: counted
             .bytes
@@ -410,9 +459,14 @@ fn begin(
         .filter(|path| std::fs::symlink_metadata(path).is_err())
         .count() as u64;
     let existing = std::fs::symlink_metadata(target).ok();
+    let replaced = credit(
+        &mut state,
+        target,
+        existing.as_ref().map(std::fs::Metadata::len),
+    );
     let addition = Addition {
         bytes: declared,
-        replaced: existing.as_ref().map_or(0, std::fs::Metadata::len),
+        replaced,
         entries: missing + u64::from(existing.is_none()),
     };
     let left = room(ctx, root, state.usage.as_ref(), addition)?;
@@ -431,8 +485,11 @@ fn begin(
 /// Make a received upload the file `name`, and count it — one hold of the
 /// area's lock around all of it. What it replaces is read here, through
 /// the handle the rename goes through, and the same reading decides
-/// whether there is room and is taken off the count: two uploads replacing
-/// one file cannot both be credited with it.
+/// whether there is room and what is taken off the count ([`credit`]: no
+/// more than the count holds for that file): two uploads replacing one
+/// file cannot both be credited with it, and a file grown behind the
+/// count's back credits nothing it did not count.
+#[allow(clippy::too_many_arguments)]
 fn commit(
     ctx: &ServerContext,
     root: &Path,
@@ -440,6 +497,7 @@ fn commit(
     directory: &alforria_core::beneath::NoFollowDir,
     temporary: &std::ffi::OsStr,
     name: &std::ffi::OsStr,
+    target: &Path,
     written: u64,
 ) -> Result<std::io::Result<()>, FileError> {
     let mut state = area.lock();
@@ -449,7 +507,7 @@ fn commit(
     };
     let addition = Addition {
         bytes: written,
-        replaced: replaced.unwrap_or(0),
+        replaced: credit(&mut state, target, replaced),
         entries: u64::from(replaced.is_none()),
     };
     room(ctx, root, state.usage.as_ref(), addition)?;
@@ -458,6 +516,10 @@ fn commit(
     }
     state.added.0 = state.added.0.saturating_add(written);
     state.added.1 += addition.entries;
+    state.sizes.insert(target.to_path_buf(), written);
+    if state.walking {
+        state.landed.push((target.to_path_buf(), written));
+    }
     if let Some(usage) = &mut state.usage {
         usage.bytes = usage
             .bytes
@@ -908,6 +970,19 @@ fn restricted_upload_allowed(
     Ok(upload_area)
 }
 
+/// Have the count of every upload directory `target` is in taken again.
+fn mark_stale_areas(ctx: &ServerContext, location: &LocationContext, target: &Path) {
+    use alforria_core::protect::{resolve, resolve_path, within};
+    let project = resolve(&location.directory);
+    for directory in &ctx.policy.upload_directories {
+        if let Ok(root) = resolve_path(&project.join(directory)) {
+            if within(target, &root) {
+                area_of(&root).lock().stale = true;
+            }
+        }
+    }
+}
+
 /// `PUT /file/content?path=[&overwrite=false]` — write the request body to
 /// a file in the project, creating its directories.
 ///
@@ -1036,7 +1111,9 @@ async fn upload(
     // Decided now, on what was received and what is there: see `commit`.
     let renamed = match &area {
         Some((root, area)) => {
-            match commit(&ctx, root, area, &directory, &temporary, &name, written) {
+            match commit(
+                &ctx, root, area, &directory, &temporary, &name, &target, written,
+            ) {
                 Ok(renamed) => renamed,
                 Err(refusal) => {
                     let _ = directory.remove_file(&temporary);
@@ -1044,7 +1121,16 @@ async fn upload(
                 }
             }
         }
-        None => directory.rename(&temporary, &name),
+        None => {
+            let renamed = directory.rename(&temporary, &name);
+            // The operator's upload into an upload directory is part of
+            // what that directory holds: counted again before the next
+            // upload below `admin`.
+            if renamed.is_ok() {
+                mark_stale_areas(&ctx, &location, &target);
+            }
+            renamed
+        }
     };
     if let Err(err) = renamed {
         let _ = directory.remove_file(&temporary);
