@@ -977,8 +977,9 @@ New in this round and left (found while fixing, not fixed):
   the config loader: upstream honours them, alforria ignores them. Whether
   to wire them is open; the loader already holds them under a frozen
   snapshot if they are.
-- A guarded `grep` / `glob` walks by name: a link swapped into the judged
-  root and back while the walk runs is not detected.
+- A guarded directory listing and `grep` / `glob` walk by name, checked
+  before and after: a link swapped in and back during the walk is not
+  detected (accepted; "Known limits").
 - A frozen server's `PATCH /global/config` applies the request to the
   remembered config without `{env:}` / `{file:}` substitution until the
   next start.

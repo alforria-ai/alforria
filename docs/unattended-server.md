@@ -1706,6 +1706,17 @@ managed config directory owned by another user
 changed, not from being read; or run the agent's shell as a different
 user, which alforria does not implement.
 
+**A listing or a search is checked, not held.** In a guarded session a
+single file — the `read` tool on a file, a file attached to a prompt — is
+opened through a handle on the path that was judged, and a swap cannot
+redirect it. A directory listing and a `grep` / `glob` search are judged
+before they start and again when they finish (and each file a search
+returns is judged by where it resolves), but the walk itself goes by name.
+A concurrent local writer — which takes shell access in that session or
+another — that swaps a path component for a link into a host location for
+the duration of the walk, and back, can expose names (a listing) or
+matching lines (a search) from there.
+
 **Marks and approvals.**
 
 - Files in the workspace carry no provenance. A file a marked session
