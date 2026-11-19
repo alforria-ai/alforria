@@ -109,12 +109,16 @@ pub fn merge_http_options(items: &[Option<&HttpOptions>]) -> Option<HttpOptions>
             .map(|options| options.body.as_ref())
             .collect::<Vec<_>>(),
     );
-    let headers = merge_string_records(
-        &defined
-            .iter()
-            .map(|options| options.headers.as_ref())
-            .collect::<Vec<_>>(),
-    );
+    let mut headers = BTreeMap::new();
+    for record in defined
+        .iter()
+        .filter_map(|options| options.headers.as_ref())
+    {
+        for (name, value) in record {
+            headers.insert(name.to_ascii_lowercase(), value.clone());
+        }
+    }
+    let headers = (!headers.is_empty()).then_some(headers);
     let query = merge_string_records(
         &defined
             .iter()
