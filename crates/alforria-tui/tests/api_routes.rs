@@ -262,6 +262,39 @@ const EMPTY_LOC: &Location = &Location {
     workspace: None,
 };
 
+#[tokio::test]
+async fn review_completion_reads_commits_from_the_selected_location() {
+    let hash = "a".repeat(40);
+    let (addr, recorder) = Recorder::spawn(
+        BTreeMap::from([(
+            "GET /experimental/vcs/commits".to_string(),
+            json!([{"hash": hash, "shortHash": "aaaaaaa", "subject": "Fix café wrapping"}]),
+        )]),
+        BTreeMap::new(),
+    )
+    .await;
+    let commits = api(addr)
+        .vcs_commits(&Location {
+            directory: Some("/remote/repo with spaces".to_string()),
+            workspace: Some("wrk_review".to_string()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(commits.len(), 1);
+    assert_eq!(commits[0].hash, hash);
+    assert_eq!(commits[0].short_hash, "aaaaaaa");
+    assert_eq!(commits[0].subject, "Fix café wrapping");
+    let requests = recorder.recorded();
+    assert_eq!(requests.len(), 1);
+    let request = &requests[0];
+    assert_eq!(request.method, "GET");
+    assert_eq!(request.path, "/experimental/vcs/commits");
+    let url = reqwest::Url::parse(&format!("http://localhost/?{}", request.query)).unwrap();
+    let query: BTreeMap<_, _> = url.query_pairs().into_owned().collect();
+    assert_eq!(query.get("directory").unwrap(), "/remote/repo with spaces");
+    assert_eq!(query.get("workspace").unwrap(), "wrk_review");
+}
+
 /// Exercise every ServerApi method; assert each request lands on a frozen
 /// route.
 #[tokio::test]

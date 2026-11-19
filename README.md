@@ -93,6 +93,19 @@ setup, model selection, and the first session.
   against frozen fixtures from the upstream project; user-facing surfaces use
   the alforria name.
 
+## Reviewing changes
+
+Use `/review` for uncommitted changes or `/review <hash>` for a commit
+(short and full hashes work). In the TUI, type `/review ` to browse recent
+commits by hash or subject. Tab fills a suggestion; arrow keys and Enter
+review a selected entry. Enter without a selection reviews what you typed.
+Branch names and pull request references also work.
+
+Completion uses alforria's `GET /experimental/vcs/commits` extension,
+outside the pinned API documents. It returns up to 50 recent commits from
+the selected directory or workspace. Typed targets remain usable when
+completion is unavailable.
+
 ## Documentation
 
 Full documentation lives at **[alforria.ai/docs](https://alforria.ai/docs/)**:

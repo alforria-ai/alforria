@@ -304,13 +304,19 @@ impl SessionPrompt {
             .command
             .as_ref()
             .and_then(|commands| commands.get(&input.command))
+            .cloned()
+            .or_else(|| super::commands::builtin(&input.command, &deps.instance.directory))
         else {
-            let available: Vec<String> = deps
+            let mut available: Vec<String> = deps
                 .config
                 .command
                 .as_ref()
                 .map(|commands| commands.keys().cloned().collect())
                 .unwrap_or_default();
+            available.extend(super::commands::NAMES.iter().map(|name| name.to_string()));
+            available.push("goal".to_string());
+            available.sort();
+            available.dedup();
             let hint = if available.is_empty() {
                 String::new()
             } else {

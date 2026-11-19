@@ -730,6 +730,9 @@ pub enum Effect {
         query: String,
         workspace: Option<String>,
     },
+    ReviewCommits {
+        location: crate::transport::api::Location,
+    },
     /// After an SSE reconnect: `GET /session/status` replaces the statuses.
     SessionStatusRefresh,
     /// After an SSE reconnect: hydrate the session again, even if it was
@@ -1250,6 +1253,9 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             workspace: app.state.project.workspace.current.clone(),
         });
     }
+    if let Some(location) = app.ui.prompt.autocomplete.review_request.take() {
+        effects.push(Effect::ReviewCommits { location });
+    }
     app.version += 1;
     effects.extend(crate::app::post_update(app));
     effects
@@ -1408,6 +1414,7 @@ pub fn animating(app: &App) -> bool {
     !app.ui.startup_ready
         || app.ui.startup_loading.visible()
         || app.ui.prompt.submitting
+        || app.ui.prompt.autocomplete.review_loading()
         || crate::ui::workflows::animating(app)
         || app.state.sync.session_status.values().any(|status| {
             matches!(

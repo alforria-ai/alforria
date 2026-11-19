@@ -84,6 +84,9 @@ pub struct LocationContext {
 }
 
 pub fn surface(method: &Method, path: &str) -> LocationSurface {
+    if method == Method::GET && path == "/experimental/vcs/commits" {
+        return LocationSurface::V1;
+    }
     let method = method.as_str();
     if let Some((_, pattern)) = v2::ROUTES
         .iter()
