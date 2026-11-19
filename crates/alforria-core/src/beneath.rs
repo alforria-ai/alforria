@@ -400,7 +400,9 @@ pub fn write_no_follow(landing: &Path, contents: &[u8]) -> io::Result<()> {
 
 /// [`write_no_follow`], also setting whether the file is executable
 /// (`Some`) — on the handle that was written, not by name. Other
-/// permission bits are the replaced file's (a new file gets the default).
+/// permission bits are the replaced file's (a new file gets the default),
+/// without setuid, setgid or sticky, and are on the new file before its
+/// contents are ([`prepare_temporary`]).
 /// No effect where there is no such bit.
 pub fn write_no_follow_mode(
     landing: &Path,
@@ -424,19 +426,48 @@ pub fn write_no_follow_mode(
         Entry::Missing => None,
         Entry::File { mode } => mode,
     };
+    let (temporary, mut file) = prepare_temporary(&dir, existing, executable)?;
+    let written = file.write_all(contents).and_then(|()| {
+        drop(file);
+        dir.rename(&temporary, name)
+    });
+    if written.is_err() {
+        let _ = dir.remove_file(&temporary);
+    }
+    written
+}
+
+/// The empty file a guarded write fills and renames over its target, in
+/// `dir`, **already carrying the mode the result will have** — set before
+/// a byte of content is written, so what replaces a private file is at no
+/// moment readable by more than the file it replaces was.
+///
+/// Replacing a file (`existing` is its mode): the new one is created
+/// `0600` and given the old one's permission bits — those only: setuid,
+/// setgid and sticky are not carried onto contents a session wrote. A new
+/// file is created as any new file is, under the umask. `executable` then
+/// sets or clears the executable bits.
+fn prepare_temporary(
+    dir: &NoFollowDir,
+    existing: Option<u32>,
+    executable: Option<bool>,
+) -> io::Result<(std::ffi::OsString, File)> {
     let temporary = std::ffi::OsString::from(format!(
         ".alforria-write-{:016x}{:016x}",
         rand::random::<u64>(),
         rand::random::<u64>()
     ));
-    let written = (|| {
-        let mut file = dir.create(&temporary, true)?;
-        file.write_all(contents)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
+    let file = dir.create_with(
+        &temporary,
+        true,
+        if existing.is_some() { 0o600 } else { 0o666 },
+    )?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let prepared = (|| {
             let made = file.metadata()?.permissions().mode() & 0o7777;
-            let mode = existing.unwrap_or(made);
+            let mode = existing.map_or(made, |mode| mode & 0o777);
             let wanted = match executable {
                 // Executable by whoever may read it.
                 Some(true) => mode | ((mode & 0o444) >> 2),
@@ -446,16 +477,16 @@ pub fn write_no_follow_mode(
             if wanted != made {
                 file.set_permissions(std::fs::Permissions::from_mode(wanted))?;
             }
+            Ok(())
+        })();
+        if let Err(error) = prepared {
+            let _ = dir.remove_file(&temporary);
+            return Err(error);
         }
-        #[cfg(not(unix))]
-        let _ = (executable, existing);
-        drop(file);
-        dir.rename(&temporary, name)
-    })();
-    if written.is_err() {
-        let _ = dir.remove_file(&temporary);
     }
-    written
+    #[cfg(not(unix))]
+    let _ = (existing, executable);
+    Ok((temporary, file))
 }
 
 /// What a name in a [`NoFollowDir`] is, the name itself and not what a
@@ -553,6 +584,18 @@ impl NoFollowDir {
     /// `exclusive`, truncates it otherwise. A link by that name is not
     /// followed.
     pub fn create(&self, name: &std::ffi::OsStr, exclusive: bool) -> io::Result<File> {
+        self.create_with(name, exclusive, 0o666)
+    }
+
+    /// [`NoFollowDir::create`] with the mode a file it makes is created
+    /// with (before the umask): `0o600` for one nobody else may read
+    /// while it is filled.
+    pub fn create_with(
+        &self,
+        name: &std::ffi::OsStr,
+        exclusive: bool,
+        mode: u32,
+    ) -> io::Result<File> {
         use std::os::fd::{AsRawFd, FromRawFd};
         use std::os::unix::ffi::OsStrExt;
         let name = Self::name(name.as_bytes())?;
@@ -563,7 +606,14 @@ impl NoFollowDir {
         };
         let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC | how;
         // SAFETY: the directory is open, `name` a valid C string; checked.
-        let fd = unsafe { libc::openat(self.fd.as_raw_fd(), name.as_ptr(), flags, 0o666) };
+        let fd = unsafe {
+            libc::openat(
+                self.fd.as_raw_fd(),
+                name.as_ptr(),
+                flags,
+                mode as libc::c_uint,
+            )
+        };
         if fd < 0 {
             let error = io::Error::last_os_error();
             return Err(match error.raw_os_error() {
@@ -728,6 +778,16 @@ impl NoFollowDir {
         by_name::create(&self.path, name, exclusive)
     }
 
+    /// There is no mode to create with here.
+    pub fn create_with(
+        &self,
+        name: &std::ffi::OsStr,
+        exclusive: bool,
+        _mode: u32,
+    ) -> io::Result<File> {
+        self.create(name, exclusive)
+    }
+
     pub fn rename(&self, from: &std::ffi::OsStr, to: &std::ffi::OsStr) -> io::Result<()> {
         by_name::rename(&self.path, from, to)
     }
@@ -860,6 +920,56 @@ mod by_name {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A guarded write replaces a file with a new one. The new one is
+    /// never more open than what it replaces — not while it is being
+    /// filled either — and takes the permission bits only: setuid, setgid
+    /// and sticky are not carried onto contents a session wrote.
+    #[cfg(unix)]
+    #[test]
+    fn a_replacing_write_is_never_more_permissive_and_drops_special_bits() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+        let chmod = |path: &Path, mode: u32| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+
+        // The file being filled, before a byte of content is in it.
+        let handle = NoFollowDir::open(&root, false).unwrap();
+        let (temporary, file) = prepare_temporary(&handle, Some(0o600), None).unwrap();
+        assert_eq!(file.metadata().unwrap().len(), 0);
+        assert_eq!(mode(&root.join(&temporary)), 0o600, "readable while filled");
+        drop(file);
+        handle.remove_file(&temporary).unwrap();
+        let (temporary, file) = prepare_temporary(&handle, Some(0o4755), Some(false)).unwrap();
+        assert_eq!(mode(&root.join(&temporary)), 0o644);
+        drop(file);
+        handle.remove_file(&temporary).unwrap();
+
+        let private = root.join("private.key");
+        std::fs::write(&private, "old").unwrap();
+        chmod(&private, 0o600);
+        write_no_follow(&private, b"new").unwrap();
+        assert_eq!(mode(&private), 0o600);
+
+        let tool = root.join("tool");
+        std::fs::write(&tool, "old").unwrap();
+        chmod(&tool, 0o4755);
+        write_no_follow(&tool, b"new").unwrap();
+        assert_eq!(mode(&tool), 0o755, "setuid carried onto new contents");
+        chmod(&tool, 0o2750);
+        write_no_follow_mode(&tool, b"newer", Some(true)).unwrap();
+        assert_eq!(mode(&tool), 0o750);
+
+        // A new file is made as any new file is (the umask applies).
+        let fresh = root.join("fresh.txt");
+        write_no_follow(&fresh, b"x").unwrap();
+        let plain = root.join("plain.txt");
+        std::fs::write(&plain, "x").unwrap();
+        assert_eq!(mode(&fresh), mode(&plain));
+    }
 
     /// A FIFO with no writer opens at once and is refused on the handle; a
     /// file over the limit is refused without being read; a directory is
