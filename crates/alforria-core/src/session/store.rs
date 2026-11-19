@@ -1974,7 +1974,53 @@ impl SessionStore {
                 self.update_part(&new_part)?;
             }
         }
-        Ok(session)
+        // alforria extension: the fork was created as its source then
+        // was, and the messages were read after that. A result that marks
+        // a session marks it before it is appended
+        // (`note_tool_result`), so whatever the copy holds, its source
+        // has the mark for by now: the source is read again and the fork
+        // brought up to it — marks, ceilings, restriction, and the rules
+        // an outside-start session's fork keeps. A fork that cannot be is
+        // not left behind holding the content without them.
+        match self.catch_up_with(&session.id, session_id, marks) {
+            Ok(false) => Ok(session),
+            Ok(true) => self.get(&session.id),
+            Err(error) => {
+                if let Err(removal) = self.remove(&session.id) {
+                    tracing::warn!("a fork that could not be marked was not removed: {removal}");
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// [`SessionStore::fork_as`]: give `fork` what `source` has now beyond
+    /// `inherited`, the marks it was created with. Whether the fork's own
+    /// rules changed.
+    fn catch_up_with(
+        &self,
+        fork: &str,
+        source: &str,
+        inherited: SessionMarks,
+    ) -> Result<bool, SessionError> {
+        let marks = self.inherited_marks(source);
+        for mark in marks.list() {
+            self.mark(fork, mark)?;
+        }
+        // A ceiling of the same name is replaced; none is removed.
+        for ceiling in self.ceilings(source)? {
+            self.set_ceiling(fork, &ceiling)?;
+        }
+        if self.is_restricted(source)? {
+            self.restrict(fork)?;
+        }
+        if marks.outside_start && !inherited.outside_start {
+            if let Some(permission) = self.get(source)?.permission {
+                self.set_permission(fork, permission)?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 }
 
@@ -2986,6 +3032,58 @@ mod integration_tests {
         assert_eq!(messages[0].parts.len(), 1);
         let title_should_bump = get_forked_title(&created.title);
         assert_eq!(fork.title, title_should_bump);
+    }
+
+    /// A fork read its source's marks, ceilings and restriction, created
+    /// itself with them, and only then copied the messages: a source
+    /// marked, bounded or restricted in between left a fork that holds the
+    /// content without what the content brought. Here the source changes
+    /// at the moment the fork's row is created — after the first read,
+    /// before the copy — and the fork still comes out as its source is.
+    #[test]
+    fn a_fork_of_a_session_marked_while_it_is_forked_carries_the_marks() {
+        use alforria_schema::permission_v1::{PermissionV1Action, PermissionV1Rule};
+        let dir = crate::storage::test_support::TempDir::new("store-fork-race");
+        let services = services(dir.path());
+        insert_project(&services, "proj_01");
+        let sessions = &services.sessions;
+        let context = ctx("proj_01");
+        let source = sessions.create(&context, &Default::default()).unwrap();
+        sessions
+            .update_message(&user_message(&source.id, "msg_01", 10.0))
+            .unwrap();
+        let ceiling = SessionCeiling {
+            name: crate::trigger::rules::OUTSIDE_CEILING.to_string(),
+            readings: vec![vec![PermissionV1Rule {
+                permission: "*".to_string(),
+                pattern: "*".to_string(),
+                action: PermissionV1Action::Deny,
+            }]],
+        };
+        let _listening = services.events.listen(Arc::new({
+            let (sessions, source, ceiling) =
+                (sessions.clone(), source.id.clone(), ceiling.clone());
+            move |event: &crate::event::Payload| {
+                let created = event.r#type == "session.created"
+                    && event.data["info"]["id"].as_str() != Some(source.as_str());
+                if created {
+                    sessions.mark(&source, SessionMark::OutsideStart).unwrap();
+                    sessions.set_ceiling(&source, &ceiling).unwrap();
+                    sessions.restrict(&source).unwrap();
+                }
+            }
+        }));
+
+        let fork = sessions.fork(&context, &source.id, None).unwrap();
+        assert_eq!(sessions.messages(&fork.id, None).unwrap().len(), 1);
+        assert_eq!(
+            sessions.marks(&source.id).unwrap(),
+            SessionMarks::ALL,
+            "the source was marked while it was being forked"
+        );
+        assert_eq!(sessions.marks(&fork.id).unwrap(), SessionMarks::ALL);
+        assert_eq!(sessions.ceilings(&fork.id).unwrap(), vec![ceiling]);
+        assert!(sessions.is_restricted(&fork.id).unwrap());
     }
 
     /// The two marks a session can carry are independent, and each is

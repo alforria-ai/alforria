@@ -244,6 +244,13 @@ pre-1.0, so minor releases may include breaking changes.
 
 ### Fixed
 
+- Forking a session while one of its turns was running could produce a
+  fork that held content without what the content had brought: the fork
+  took its source's marks, ceilings and restriction first and copied the
+  messages afterwards, so a tool result that marked the source in between
+  was copied into an unmarked fork. The source is now read again after the
+  copy and the fork brought up to it; a fork that cannot be is removed
+  and the request fails.
 - Answering one permission ask with `always` also answered the session's
   other pending asks that the new approval covered, judged by the
   approvals alone. An ask that was pending because a sealed ceiling (a
