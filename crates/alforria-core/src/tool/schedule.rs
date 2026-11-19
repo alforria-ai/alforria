@@ -1114,6 +1114,7 @@ mod tests {
                 &ToolResult {
                     call_id: None,
                     tool: TOOL_ID,
+                    external: false,
                     input: &args,
                     metadata: Some(&result.metadata),
                     output: &result.output,

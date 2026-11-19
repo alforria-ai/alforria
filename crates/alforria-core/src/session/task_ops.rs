@@ -805,6 +805,7 @@ mod tests {
                 &crate::tool::outside::ToolResult {
                     call_id: None,
                     tool: "webfetch",
+                    external: false,
                     input: &serde_json::json!({ "url": "https://example.com" }),
                     metadata: None,
                     output: "a page somebody else wrote",

@@ -114,6 +114,14 @@ impl ToolRegistry {
         let read = find_tool(&builtin, &custom, "read")
             .cloned()
             .ok_or_else(|| ToolError::Failed("registry requires a `read` tool".to_string()))?;
+        // A custom tool is someone else's, under whatever id it chose.
+        let custom = custom
+            .into_iter()
+            .map(|tool| ToolDef {
+                external: true,
+                ..tool
+            })
+            .collect();
         Ok(ToolRegistry {
             builtin,
             custom,
@@ -280,6 +288,7 @@ impl ToolRegistry {
                 parameters: tool.parameters.clone(),
                 format_validation_error: tool.format_validation_error.clone(),
                 execute: Arc::clone(&tool.execute),
+                external: tool.external,
             });
         }
         out
@@ -350,6 +359,7 @@ mod tests {
                 execute: Arc::new(|_args, _ctx| {
                     panic!("unused in tests");
                 }),
+                external: false,
             })
             .collect()
     }
@@ -492,6 +502,48 @@ mod tests {
             ..Default::default()
         };
         assert!(builtin_ids(&flags).contains(&"plan_exit"));
+    }
+
+    /// A custom tool is a plugin's, whatever id it chose: the registry
+    /// says so on the def, and what it hands out for a request keeps it
+    /// (`tool::outside::classify_result` reads it, not the name).
+    #[tokio::test]
+    async fn a_custom_tool_is_external_under_any_name() {
+        let registry = ToolRegistry::new(
+            tools_of(&["invalid", "read", "task"]),
+            tools_of(&["plan_exit", "my_plugin"]),
+            RuntimeFlags::default(),
+            Arc::new(FixedAgents {
+                agents: vec![agent_info("build")],
+                missing: false,
+            }),
+        )
+        .unwrap();
+        let expected = vec![
+            ("invalid", false),
+            ("read", false),
+            ("task", false),
+            ("plan_exit", true),
+            ("my_plugin", true),
+        ];
+        let registered: Vec<_> = registry
+            .all()
+            .iter()
+            .map(|tool| (tool.id, tool.external))
+            .collect();
+        assert_eq!(registered, expected);
+        let offered: Vec<_> = registry
+            .tools(ToolModel {
+                provider_id: "anthropic",
+                model_id: "claude",
+                agent: agent_info("build"),
+                permission: None,
+            })
+            .await
+            .iter()
+            .map(|tool| (tool.id, tool.external))
+            .collect();
+        assert_eq!(offered, expected);
     }
 
     #[test]

@@ -615,6 +615,7 @@ fn hanging_def(id: &'static str) -> crate::tool::def::ToolDef {
         description: "hanging".into(),
         parameters: serde_json::json!({ "type": "object" }),
         format_validation_error: None,
+        external: false,
         execute: Arc::new(|_args, _ctx| {
             Box::pin(async {
                 std::future::pending::<()>().await;
@@ -674,6 +675,28 @@ pub(crate) struct EngineOverrides {
     /// One provider for both the turns and the compaction summaries, in
     /// place of the scripted ones.
     pub(crate) llm: Option<Arc<dyn LlmStream>>,
+    /// The connected MCP servers' tools.
+    pub(crate) mcp_tools: Option<Arc<dyn crate::session::tools::McpToolSource>>,
+}
+
+/// A scripted engine with the tools of `mcp` beside its own.
+pub(crate) fn engine_with_mcp_tools(
+    name: &str,
+    script: MockScript,
+    mcp: Arc<dyn crate::session::tools::McpToolSource>,
+) -> Engine {
+    engine_build_with(
+        name,
+        script.clone(),
+        script,
+        serde_json::json!({}),
+        None,
+        EngineDefs::Real,
+        EngineOverrides {
+            mcp_tools: Some(mcp),
+            ..Default::default()
+        },
+    )
 }
 
 /// An engine talking to `llm` as `model`.
@@ -693,6 +716,7 @@ pub(crate) fn engine_with_provider(
         EngineOverrides {
             model: Some(model),
             llm: Some(llm),
+            mcp_tools: None,
         },
     )
 }
@@ -709,6 +733,7 @@ pub(crate) fn engine_with_model(name: &str, script: MockScript, model: ResolvedM
         EngineOverrides {
             model: Some(model),
             llm: None,
+            mcp_tools: None,
         },
     )
 }
@@ -963,7 +988,7 @@ fn engine_build_with(
         clock,
         instance: instance.clone(),
         mcp: Arc::new(EmptyMcp),
-        mcp_tools: None,
+        mcp_tools: overrides.mcp_tools.clone(),
         truncate: std::sync::Arc::new(crate::tool::truncate::TruncateService::default_limits(
             temp.path().to_path_buf(),
         )),

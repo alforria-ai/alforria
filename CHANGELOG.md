@@ -244,6 +244,11 @@ pre-1.0, so minor releases may include breaking changes.
 
 ### Fixed
 
+- An MCP tool whose key spelled a built-in tool's name (a server `apply`
+  with a tool `patch` is `apply_patch`) was classified as that built-in
+  when deciding whether its answer is outside content, and could leave the
+  session unmarked. MCP and plugin tools are now judged by where they come
+  from: whatever they answer marks the session, under any name.
 - `POST /session` accepted any `parentID` from a token below `admin`, so
   a `chat` client could create a session as the child of an operator's
   session. It is refused (`403`) unless the parent is a session the token

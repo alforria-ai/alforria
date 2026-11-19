@@ -737,8 +737,10 @@ impl SessionStore {
         session_id: &str,
         result: &crate::tool::outside::ToolResult<'_>,
     ) -> Result<(), SessionError> {
-        use crate::tool::outside::{carries_outside_content, classify, Outside, SessionFacts};
-        let class = classify(result.tool);
+        use crate::tool::outside::{
+            carries_outside_content, classify_result, Outside, SessionFacts,
+        };
+        let class = classify_result(result);
         if class == Outside::Never {
             return Ok(());
         }

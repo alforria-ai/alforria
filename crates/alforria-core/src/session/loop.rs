@@ -1945,6 +1945,7 @@ mod tests {
                 "properties": {},
             }),
             format_validation_error: None,
+            external: false,
             execute: Arc::new(|_args, _ctx| {
                 Box::pin(async {
                     Ok(crate::tool::def::ExecuteResult {
@@ -2088,6 +2089,7 @@ mod tests {
             description: "hanging".into(),
             parameters: serde_json::json!({ "type": "object" }),
             format_validation_error: None,
+            external: false,
             execute: Arc::new(|_args, _ctx| {
                 Box::pin(async {
                     std::future::pending::<()>().await;

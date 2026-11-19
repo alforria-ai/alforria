@@ -244,6 +244,9 @@ struct Inner {
     ctx: Mutex<Ctx>,
     model: ProcessorModel,
     session_id: String,
+    /// alforria extension: the calls of this turn that ran a tool which is
+    /// not the engine's own ([`Handle::report_external_tool`]).
+    external_calls: Mutex<std::collections::HashSet<String>>,
 }
 
 /// The processor handle (processor.ts:54-62): the message under
@@ -319,6 +322,7 @@ impl Processor {
                 ctx: Mutex::new(ctx),
                 model: input.model,
                 session_id: input.session_id,
+                external_calls: Mutex::default(),
             }),
         }
     }
@@ -696,6 +700,27 @@ impl Handle {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// alforria extension: the call `call_id` runs a tool that is not the
+    /// engine's own — an MCP server's or a plugin's. Said by the code that
+    /// runs it (`session::tools`), before it runs, so that its result and
+    /// the message of its failure are judged as that
+    /// (`tool::outside::ToolResult::external`) and not by its name.
+    pub fn report_external_tool(&self, call_id: &str) {
+        self.inner
+            .external_calls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(call_id.to_string());
+    }
+
+    fn is_external_call(&self, call_id: &str) -> bool {
+        self.inner
+            .external_calls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(call_id)
+    }
+
     /// alforria extension: a tool's own report of what it opened and
     /// returned for one call, handed to where the call's result will be
     /// judged
@@ -817,6 +842,7 @@ impl Handle {
             &crate::tool::outside::ToolResult {
                 call_id: Some(tool_call_id),
                 tool: tool_name(&part),
+                external: self.is_external_call(tool_call_id),
                 input: &Value::Object(input.clone()),
                 metadata: Some(&output.metadata),
                 output: &output.output,
@@ -1884,6 +1910,7 @@ impl Handle {
                     &crate::tool::outside::ToolResult {
                         call_id: Some(tool_call_id),
                         tool: tool_name(&part),
+                        external: self.is_external_call(tool_call_id),
                         input: &Value::Object(input.clone()),
                         metadata: None,
                         output: message,

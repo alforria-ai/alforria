@@ -625,6 +625,7 @@ pub fn resolve_model_prompt_parts(
             &crate::tool::outside::ToolResult {
                 call_id: Some(&call),
                 tool: "read",
+                external: false,
                 input: &input,
                 metadata: None,
                 output: "",

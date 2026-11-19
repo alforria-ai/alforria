@@ -43,6 +43,11 @@ pub struct ToolDef {
     pub parameters: Value,
     pub format_validation_error: Option<FormatValidationError>,
     pub execute: ExecuteFn,
+    /// alforria extension: the tool is not one of the engine's own — a
+    /// plugin's, registered in the registry's custom slot
+    /// (`ToolRegistry::new` sets it). What it answers was written
+    /// elsewhere, whatever its id (`tool::outside::classify_result`).
+    pub external: bool,
 }
 
 impl std::fmt::Debug for ToolDef {
@@ -357,6 +362,7 @@ where
         parameters,
         format_validation_error,
         execute: wrapped,
+        external: false,
     }
 }
 

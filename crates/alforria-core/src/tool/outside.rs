@@ -11,8 +11,10 @@
 //!
 //! Every built-in tool is classified here, and a test walks the registry
 //! the server builds: a tool added without a line in [`BUILTIN`] fails it.
-//! A name that is not in the table — every MCP tool, every plugin tool — is
-//! [`Outside::Always`].
+//! An MCP or plugin tool is [`Outside::Always`] whatever its name
+//! ([`classify_result`]): it is judged by where it comes from, which the
+//! code that runs it says ([`ToolResult::external`]), and so is a name that
+//! is not in the table.
 //!
 //! `read`, `grep` and `glob` are judged by what the tool itself reports
 //! ([`ReturnedPaths`]): the path it actually opened or walked — the very
@@ -182,10 +184,23 @@ pub fn builtin(tool: &str) -> Option<Outside> {
         .map(|(_, class)| *class)
 }
 
-/// How `tool` is classified. Anything that is not a built-in is an MCP or
-/// plugin tool: its answer was written elsewhere.
+/// How the name `tool` is classified: a built-in's line in the table, and
+/// [`Outside::Always`] for a name that is not there. A name alone does not
+/// say whose tool answered — a decision goes through [`classify_result`].
 pub fn classify(tool: &str) -> Outside {
     builtin(tool).unwrap_or(Outside::Always)
+}
+
+/// How `result` is classified: **by where its tool comes from, then by
+/// name.** An MCP server's or a plugin's tool answers with what was
+/// written elsewhere whatever it is called — an MCP tool is keyed
+/// `<server>_<tool>`, which can spell a built-in's name (`apply_patch`,
+/// `plan_exit`, `session_search`), and must not be read as that built-in.
+pub fn classify_result(result: &ToolResult<'_>) -> Outside {
+    if result.external {
+        return Outside::Always;
+    }
+    classify(result.tool)
 }
 
 /// One tool result, as the processor is about to append it.
@@ -194,6 +209,10 @@ pub struct ToolResult<'a> {
     /// returned files is kept under (`SessionStore::report_returned_paths`).
     pub call_id: Option<&'a str>,
     pub tool: &'a str,
+    /// The tool is not one of the engine's own: an MCP server's, or a
+    /// plugin's (`ToolDef::external`). Said by whoever ran it, never
+    /// worked out from the name.
+    pub external: bool,
     pub input: &'a Value,
     pub metadata: Option<&'a Value>,
     pub output: &'a str,
@@ -244,7 +263,7 @@ fn holds_something(root: &Path) -> bool {
 /// call's input; whatever cannot be decided counts as outside content.
 pub fn carries_outside_content(result: &ToolResult<'_>, facts: &SessionFacts<'_>) -> bool {
     use crate::protect::resolve_path;
-    match classify(result.tool) {
+    match classify_result(result) {
         Outside::Never => false,
         Outside::Always => true,
         Outside::Flagged => {
@@ -308,6 +327,7 @@ mod tests {
         ToolResult {
             call_id: None,
             tool,
+            external: false,
             input,
             metadata: Some(metadata),
             output: "",
@@ -518,6 +538,7 @@ mod tests {
                             &ToolResult {
                                 call_id: None,
                                 tool,
+                                external: false,
                                 input,
                                 metadata: None,
                                 output,

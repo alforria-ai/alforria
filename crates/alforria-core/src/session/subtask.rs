@@ -294,6 +294,7 @@ impl SessionSubtask {
             &crate::tool::outside::ToolResult {
                 call_id: Some(&call_id),
                 tool: "task",
+                external: false,
                 input: &task_args,
                 metadata: noted_metadata,
                 output: &noted_output,

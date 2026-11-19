@@ -202,6 +202,11 @@ pub async fn resolve(
                 let session_id = session_id.clone();
                 let message_id = message_id.clone();
                 Box::pin(async move {
+                    // alforria extension: whose tool this call runs, for
+                    // the marking of its result (`tool::outside`).
+                    if tool.external {
+                        processor.report_external_tool(&call_id);
+                    }
                     let ask = PermissionAdapter {
                         permission: permission.clone(),
                         session_id: session_id.clone(),
@@ -349,6 +354,11 @@ pub async fn resolve(
                     let processor = processor.clone();
                     let key = key.clone();
                     Box::pin(async move {
+                        // alforria extension: this call runs an MCP
+                        // server's tool, whatever its key spells: its
+                        // answer, and the text of its failure, are outside
+                        // content (`tool::outside::classify_result`).
+                        processor.report_external_tool(&call_id);
                         // TS: `ctx.ask({ permission: key, metadata: {},
                         // patterns: ["*"], always: ["*"] })`
                         // (tools.ts:422).
@@ -917,6 +927,7 @@ mod mcp_tests {
                 "properties": {},
             }),
             format_validation_error: None,
+            external: false,
             execute: Arc::new(|_args, _ctx| {
                 Box::pin(async {
                     Ok(crate::tool::def::ExecuteResult {
@@ -936,6 +947,7 @@ mod mcp_tests {
                 "properties": {},
             }),
             format_validation_error: None,
+            external: false,
             execute: Arc::new(|_args, _ctx| {
                 Box::pin(async {
                     Ok(crate::tool::def::ExecuteResult {
