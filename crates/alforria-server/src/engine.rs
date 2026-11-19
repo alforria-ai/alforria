@@ -1467,6 +1467,7 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
         state: services.run_state.clone(),
         data_dir: input.paths.data.clone(),
         protected: services.agents.protected(),
+        worktree: input.worktree.clone(),
     }));
     let memory_flush: Option<Arc<dyn alforria_core::memory::flush::BeforeCompaction>> =
         (memory.enabled() && memory.settings().flush_before_compaction).then(|| {

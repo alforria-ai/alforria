@@ -244,6 +244,13 @@ pre-1.0, so minor releases may include breaking changes.
 
 ### Fixed
 
+- Reverting or unreverting a guarded session (restricted, or started by
+  outside input) could write or delete a file outside the project: the
+  guard judged each file against the protected locations only, so a file
+  under a directory the agent had since replaced with a link out of the
+  project was restored or removed where the link led. Such a revert is now
+  refused (`403`, nothing restored), naming the files. Other sessions'
+  reverts already stayed inside the worktree.
 - Two alforria processes starting at the same moment on a fresh install could
   both try to create the database, and the second failed with `table
   workspace already exists`. The second now waits and uses the database the

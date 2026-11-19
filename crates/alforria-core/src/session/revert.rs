@@ -78,6 +78,10 @@ pub struct RevertDeps {
     /// (`AgentRegistry::protected`). A revert restores files from snapshots
     /// directly, not through a tool, so it is judged here.
     pub protected: Arc<crate::protect::Protected>,
+    /// The project's git worktree (`/` when it has none): with the
+    /// session's directory, what a guarded revert stays inside
+    /// ([`crate::session::caller::project_roots`]).
+    pub worktree: PathBuf,
 }
 
 /// `SessionRevert.Service` (revert.ts:28-136).
@@ -106,8 +110,9 @@ impl SessionRevert {
     /// its directory's handle ([`Snapshot::write_checked`]). What is not on
     /// the list is left untouched.
     ///
-    /// If the guard refuses any candidate the whole revert is refused
-    /// before anything is written: a revert that skipped files would leave
+    /// If the guard refuses any candidate, or one would land outside the
+    /// project (a directory on its way replaced by a link out of it), the
+    /// whole revert is refused before anything is written: a revert that skipped files would leave
     /// the tree in a state no message of the session describes. No
     /// `edit_loader` grant is looked up — a grant is an agent's, and a
     /// revert has no agent. An unguarded session never comes here: its
@@ -118,10 +123,25 @@ impl SessionRevert {
         candidates: Vec<Candidate>,
     ) -> Result<Vec<CheckedWrite>, SessionError> {
         let mut refused: Vec<String> = Vec::new();
+        let mut outside: Vec<String> = Vec::new();
         let mut checked: Vec<CheckedWrite> = Vec::new();
+        let directory = std::path::Path::new(&session.directory);
+        let roots = crate::session::caller::project_roots(directory, &self.deps.worktree);
         for candidate in candidates {
-            let path = std::path::Path::new(&session.directory).join(&candidate.file);
+            let path = directory.join(&candidate.file);
             match self.deps.protected.judge(&path) {
+                // The guard names what may not be written; where a revert
+                // may write at all is the project. A directory on the way
+                // that is now a link out of it lands the write outside.
+                Ok(landing)
+                    if !roots
+                        .iter()
+                        .any(|root| crate::protect::within(&landing, root)) =>
+                {
+                    if !outside.contains(&candidate.file) {
+                        outside.push(candidate.file);
+                    }
+                }
                 Ok(landing) => checked.push(CheckedWrite {
                     hash: candidate.hash,
                     file: candidate.file,
@@ -132,14 +152,28 @@ impl SessionRevert {
                 Err(_) => refused.push(candidate.file),
             }
         }
-        if refused.is_empty() {
+        if refused.is_empty() && outside.is_empty() {
             return Ok(checked);
         }
         refused.sort();
+        outside.sort();
+        let mut reasons = Vec::new();
+        if !refused.is_empty() {
+            reasons.push(format!(
+                "the revert would rewrite files the agent's configuration is loaded from: {}",
+                refused.join(", ")
+            ));
+        }
+        if !outside.is_empty() {
+            reasons.push(format!(
+                "the revert would write outside the project, through a link: {}",
+                outside.join(", ")
+            ));
+        }
         Err(SessionError::Refused(format!(
-            "this session is restricted or was started by outside input, and the revert would \
-             rewrite files the agent's configuration is loaded from: {}. Nothing was reverted.",
-            refused.join(", ")
+            "this session is restricted or was started by outside input, and {}. Nothing was \
+             reverted.",
+            reasons.join("; and ")
         )))
     }
 
@@ -415,6 +449,7 @@ mod tests {
             state: h.services.run_state.clone(),
             data_dir: h.temp.path().to_path_buf(),
             protected: h.services.agents.protected(),
+            worktree: h.worktree.clone(),
         })
     }
 
@@ -882,6 +917,7 @@ mod tests {
             state: h.services.run_state.clone(),
             data_dir: h.temp.path().to_path_buf(),
             protected: h.services.agents.protected(),
+            worktree: h.worktree.clone(),
         });
         GitScenario {
             h,
@@ -1036,6 +1072,130 @@ mod tests {
         assert_eq!(s.read("plain.md"), None);
         assert_eq!(s.read("CLAUDE.md").as_deref(), Some("plain\n"));
         assert_eq!(s.read("edit.txt").as_deref(), Some("e2\n"));
+    }
+
+    /// `d` replaced by a link to a directory outside the project, holding
+    /// one file `x`.
+    #[cfg(unix)]
+    fn swap_for_a_link_outside(
+        s: &GitScenario,
+        name: &str,
+    ) -> (crate::storage::test_support::TempDir, std::path::PathBuf) {
+        let outside = crate::storage::test_support::TempDir::new(name);
+        let file = outside.path().join("x");
+        std::fs::write(&file, "the operator's\n").unwrap();
+        std::fs::remove_dir_all(s.h.worktree.join("d")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), s.h.worktree.join("d")).unwrap();
+        (outside, file)
+    }
+
+    /// The guard judged where a write lands, but only against the loader
+    /// and host locations: a patch naming `d/x`, with `d` since replaced by
+    /// a link out of the project, landed outside it and the revert deleted
+    /// the file there. A guarded revert is refused when a file it would
+    /// write lands outside the project.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_guarded_revert_does_not_delete_through_a_link_out_of_the_project() {
+        let change = |worktree: &std::path::Path| {
+            std::fs::create_dir_all(worktree.join("d")).unwrap();
+            std::fs::write(worktree.join("d/x"), "the agent's\n").unwrap();
+            std::fs::write(worktree.join("a.txt"), "goodbye\n").unwrap();
+        };
+        let before = &[("a.txt", "hello\n")];
+        let s = git_scenario(
+            "revert-git-out-delete",
+            true,
+            before,
+            change,
+            &["d/x", "a.txt"],
+        )
+        .await;
+        let (_outside, file) = swap_for_a_link_outside(&s, "revert-out-delete");
+        let refused = s.service.revert(revert_all(&s.session.id)).await;
+        assert_eq!(
+            std::fs::read_to_string(&file).ok().as_deref(),
+            Some("the operator's\n"),
+            "the file outside the project is untouched"
+        );
+        assert!(
+            matches!(&refused, Err(SessionError::Refused(message)) if message.contains("d/x")),
+            "{refused:?}"
+        );
+        assert!(!s.reverted());
+        assert_eq!(
+            s.read("a.txt").as_deref(),
+            Some("goodbye\n"),
+            "nothing written"
+        );
+    }
+
+    /// The same link with a snapshot that holds `d/x`: the revert, and the
+    /// unrevert after a revert, would have written the snapshot's bytes
+    /// over the file outside.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_guarded_revert_or_unrevert_does_not_overwrite_through_a_link_out_of_the_project() {
+        let before = &[("d/x", "v1\n"), ("a.txt", "hello\n")];
+        let change = |worktree: &std::path::Path| {
+            std::fs::write(worktree.join("d/x"), "v2\n").unwrap();
+            std::fs::write(worktree.join("a.txt"), "goodbye\n").unwrap();
+        };
+        let s = git_scenario(
+            "revert-git-out-write",
+            true,
+            before,
+            change,
+            &["d/x", "a.txt"],
+        )
+        .await;
+        let (_outside, file) = swap_for_a_link_outside(&s, "revert-out-write");
+        let refused = s.service.revert(revert_all(&s.session.id)).await;
+        assert_eq!(
+            std::fs::read_to_string(&file).ok().as_deref(),
+            Some("the operator's\n"),
+            "revert: the file outside the project is untouched"
+        );
+        assert!(
+            matches!(&refused, Err(SessionError::Refused(message)) if message.contains("d/x")),
+            "{refused:?}"
+        );
+        assert!(!s.reverted());
+        assert_eq!(
+            s.read("a.txt").as_deref(),
+            Some("goodbye\n"),
+            "nothing written"
+        );
+
+        // Reverted while `d` was still a directory, linked out afterwards:
+        // the unrevert restores the snapshot taken at the revert.
+        let s = git_scenario(
+            "revert-git-out-unrevert",
+            true,
+            before,
+            change,
+            &["d/x", "a.txt"],
+        )
+        .await;
+        s.service.revert(revert_all(&s.session.id)).await.unwrap();
+        assert_eq!(s.read("d/x").as_deref(), Some("v1\n"));
+        let (_outside, file) = swap_for_a_link_outside(&s, "revert-out-unrevert");
+        let refused = s.service.unrevert(&s.session.id).await;
+        assert_eq!(
+            std::fs::read_to_string(&file).ok().as_deref(),
+            Some("the operator's\n"),
+            "unrevert: the file outside the project is untouched"
+        );
+        assert!(
+            matches!(&refused, Err(SessionError::Refused(message)) if message.contains("d/x")),
+            "{refused:?}"
+        );
+        assert!(s.reverted(), "still reverted");
+        assert_eq!(
+            s.read("a.txt").as_deref(),
+            Some("hello\n"),
+            "nothing written"
+        );
     }
 
     /// The executable bit of a restored file follows the snapshot, set on

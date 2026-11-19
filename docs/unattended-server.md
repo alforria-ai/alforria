@@ -1027,7 +1027,7 @@ and then writes through it:
 | --- | --- |
 | `write`, `edit`, `apply_patch` | Every file operation: a patch's adds, updates and deletes, both ends of a move, and the rewrite after formatting (`InstanceContext::write_file` / `remove_file`) |
 | Uploads (`PUT /file/content`) | The temporary file is created and renamed into place through the judged directory's handle, for every caller |
-| Session revert and unrevert | In a guarded session every file the restore means to write is judged first — a snapshot restore's listed files, the reverted patches' files, both ends of a rename, each deletion. One protected file refuses the whole revert (`403`, naming the files): nothing is restored and the session is not marked reverted. Otherwise exactly the judged files are written, each at its judged path through the directory handle; `git checkout` writes nothing |
+| Session revert and unrevert | In a guarded session every file the restore means to write is judged first — a snapshot restore's listed files, the reverted patches' files, both ends of a rename, each deletion. One protected file, or one file that would land outside the project (a directory on its path has since become a link out of it), refuses the whole revert (`403`, naming the files): nothing is restored and the session is not marked reverted. Otherwise exactly the judged files are written, each at its judged path through the directory handle; `git checkout` writes nothing |
 
 **What it protects.** A loader name anywhere on the resolved path —
 `opencode.json`, `.opencode/`, `AGENTS.md`, `CLAUDE.md`, `.claude/`,
