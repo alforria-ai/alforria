@@ -39,6 +39,9 @@ pre-1.0, so minor releases may include breaking changes.
 - Event streams close when a subscriber falls behind, so clients can reconnect
   and refresh their state. Terminals and running turns keep sending events
   through a configuration reload.
+- Snapshot recovery checks the replacement contents before changing files.
+  Git packs snapshots but keeps undo points without a time or size limit.
+  Recovery backups left after a failed rollback stay outside future captures.
 
 ## [0.4.4] - 2026-11-13
 
