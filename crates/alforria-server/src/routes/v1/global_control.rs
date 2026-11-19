@@ -164,12 +164,18 @@ pub async fn global_config_update(
     std::fs::create_dir_all(file.parent().unwrap_or(Path::new(".")))
         .map_err(|err| defect(format!("failed to create config dir: {err}")))?;
     std::fs::write(&file, &serialized).map_err(defect)?;
-    // The operator changed the host config through the server: the
-    // instances booted from here on read it (`config::snapshot`). The
-    // access policy and how far project config is believed stay as they
-    // were at startup.
+    // The operator changed the host config through the server. A server
+    // that froze its host config (`config::snapshot`) applies exactly what
+    // was sent to what it remembers, and reads nothing back from disk: the
+    // file just written was merged with whatever stood there, and neither
+    // that nor any other host file is taken on trust now. The access
+    // policy and how far project config is believed stay as at startup.
     if let Some(snapshot) = alforria_core::config::HostSnapshot::of(&ctx.global_paths().config) {
-        snapshot.refresh();
+        let mut patch = payload.clone();
+        if patch["shell"] == json!("") {
+            patch["shell"] = Value::Null;
+        }
+        snapshot.apply_patch(&ctx.global_paths().config, &patch);
     }
     if changed {
         ctx.instances.dispose_all();

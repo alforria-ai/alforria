@@ -17,11 +17,13 @@
 //!
 //! * **Frozen** ([`HostSnapshot::freeze`]): an unattended, reachable or
 //!   project-restricted server. Each host source is read once and never
-//!   again, and [`HostMode`] is the one computed at startup. Only
-//!   [`HostSnapshot::refresh`] — the server's own, operator-only config
-//!   write — has the files read again, and a file that then fails to load
-//!   keeps its previous reading. A source that never loaded is an error,
-//!   not an empty config.
+//!   again, and [`HostMode`] is the one computed at startup. The server's
+//!   own, operator-only config write changes the remembered reading by
+//!   exactly what the operator sent ([`HostSnapshot::apply_patch`]):
+//!   nothing is read from disk for it, so a host file rewritten in the
+//!   meantime — the one written or any other — is not adopted with it. A
+//!   host source that was not there at startup (a `~/.opencode` created
+//!   later) stays absent.
 //! * **Not frozen**: a developer's own server. Sources are read at every
 //!   load, as before, so an edit applies to the next directory opened; a
 //!   source that stops loading keeps its last good reading.
@@ -46,9 +48,8 @@ pub(crate) type SourceKey = (PathBuf, &'static str);
 struct State {
     /// `Some`: frozen, with the mode to answer.
     frozen: Option<HostMode>,
-    /// The last good reading of each source, and whether it is current
-    /// (not current: [`HostSnapshot::refresh`] asked for another read).
-    sources: HashMap<SourceKey, (Value, bool)>,
+    /// The last good reading of each source.
+    sources: HashMap<SourceKey, Value>,
 }
 
 /// See the module documentation.
@@ -104,17 +105,27 @@ impl HostSnapshot {
         self.frozen_mode().is_some()
     }
 
-    /// Have every source read once more (the server wrote the global
-    /// config itself). What then fails to load keeps its reading; the
-    /// frozen mode does not change.
-    pub fn refresh(&self) {
+    /// The operator changed the global config through the server
+    /// (`PATCH /global/config`): merge `patch` (`merge_patch`: a `null`
+    /// deletes its key) into what a frozen snapshot remembers the global
+    /// config directory `config_dir` loaded as. Nothing is read from disk,
+    /// and the frozen mode does not change. Not frozen: nothing to do, the
+    /// next load reads the file the server just wrote. `{env:}` and
+    /// `{file:}` in the patch are not substituted until a restart.
+    pub fn apply_patch(&self, config_dir: &Path, patch: &Value) {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        for (_, current) in state.sources.values_mut() {
-            *current = false;
+        if state.frozen.is_none() {
+            return;
+        }
+        for ((path, reading), value) in state.sources.iter_mut() {
+            if path == config_dir && matches!(*reading, "load" | "trusted") {
+                crate::merge_patch(value, patch);
+            }
         }
     }
 
-    /// The reading of `key`: the remembered one when frozen and current,
+    /// The reading of `key`: the remembered one when frozen (empty for a
+    /// source the freeze did not read),
     /// else `load`'s — remembered when it succeeds, and replaced by the
     /// last good one when it fails.
     pub(crate) fn read(
@@ -124,8 +135,14 @@ impl HostSnapshot {
     ) -> Result<Value, CoreError> {
         {
             let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-            if let (Some(_), Some((value, true))) = (&state.frozen, state.sources.get(&key)) {
-                return Ok(value.clone());
+            if state.frozen.is_some() {
+                // What was not read by the freeze was not there: a host
+                // file that appears afterwards is nobody's startup config.
+                return Ok(state
+                    .sources
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or_else(|| Value::Object(Default::default())));
             }
         }
         // Not under the lock: a load reads files and may take a while.
@@ -133,16 +150,15 @@ impl HostSnapshot {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         match loaded {
             Ok(value) => {
-                state.sources.insert(key, (value.clone(), true));
+                state.sources.insert(key, value.clone());
                 Ok(value)
             }
-            Err(error) => match state.sources.get_mut(&key) {
-                Some((value, current)) => {
+            Err(error) => match state.sources.get(&key) {
+                Some(value) => {
                     tracing::warn!(
                         "{}: {error}; keeping the host config as it last loaded",
                         key.0.display()
                     );
-                    *current = true;
                     Ok(value.clone())
                 }
                 None => Err(error),
@@ -178,27 +194,44 @@ mod tests {
     }
 
     #[test]
-    fn a_frozen_snapshot_reads_each_source_once_until_refreshed() {
+    fn a_frozen_snapshot_reads_each_source_once_and_changes_only_by_a_patch() {
         let snapshot = HostSnapshot::default();
-        assert_eq!(snapshot.read(key("a"), || Ok(json!(1))).unwrap(), json!(1));
+        let dir = PathBuf::from("config");
+        let global = |reading| (dir.clone(), reading);
+        for reading in ["load", "trusted", "mode"] {
+            snapshot
+                .read(global(reading), || Ok(json!({ "a": 1, "b": 2 })))
+                .unwrap();
+        }
+        assert_eq!(snapshot.read(key("x"), || Ok(json!(1))).unwrap(), json!(1));
+        // Not frozen: a patch is nothing, the next load reads the file.
+        snapshot.apply_patch(&dir, &json!({ "a": 9 }));
         snapshot.freeze(HostMode {
             restricted: true,
             ..HostMode::default()
         });
-        assert!(snapshot.frozen_mode().unwrap().restricted);
         let unreachable = || -> Result<Value, CoreError> { panic!("read again") };
-        assert_eq!(snapshot.read(key("a"), unreachable).unwrap(), json!(1));
-        // A source first seen after the freeze is read once, then kept.
-        assert_eq!(snapshot.read(key("b"), || Ok(json!(5))).unwrap(), json!(5));
-        assert_eq!(snapshot.read(key("b"), unreachable).unwrap(), json!(5));
-        assert!(snapshot.read(key("c"), broken).is_err());
+        assert_eq!(
+            snapshot.read(global("load"), unreachable).unwrap(),
+            json!({ "a": 1, "b": 2 })
+        );
+        // A source first seen after the freeze was not there at startup.
+        assert_eq!(snapshot.read(key("y"), unreachable).unwrap(), json!({}));
 
-        snapshot.refresh();
-        assert_eq!(snapshot.read(key("a"), || Ok(json!(3))).unwrap(), json!(3));
-        assert_eq!(snapshot.read(key("a"), unreachable).unwrap(), json!(3));
-        // A refresh that finds a broken file keeps the reading, once.
-        assert_eq!(snapshot.read(key("b"), broken).unwrap(), json!(5));
-        assert_eq!(snapshot.read(key("b"), unreachable).unwrap(), json!(5));
+        snapshot.apply_patch(&dir, &json!({ "a": null, "c": 3 }));
+        for reading in ["load", "trusted"] {
+            assert_eq!(
+                snapshot.read(global(reading), unreachable).unwrap(),
+                json!({ "b": 2, "c": 3 })
+            );
+        }
+        // Only the global config's readings: no other source, and not what
+        // the mode was computed from.
+        assert_eq!(snapshot.read(key("x"), unreachable).unwrap(), json!(1));
+        assert_eq!(
+            snapshot.read(global("mode"), unreachable).unwrap(),
+            json!({ "a": 1, "b": 2 })
+        );
         assert!(snapshot.frozen_mode().unwrap().restricted);
     }
 }

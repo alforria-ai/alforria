@@ -265,7 +265,8 @@ pre-1.0, so minor releases may include breaking changes.
   believe it. A server that is unattended, reachable or project-restricted
   now keeps what the host sources loaded as at startup, and how far project
   config is believed, for every directory it opens; editing a host file on
-  such a server takes a restart (`PATCH /global/config` still applies). A
+  such a server takes a restart (`PATCH /global/config` still applies:
+  what the request sends, and nothing read back from disk). A
   developer's own server reads its host files at each open as before, and
   keeps the last reading that loaded when one stops parsing instead of
   running with none.

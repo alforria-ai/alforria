@@ -135,6 +135,60 @@ async fn a_global_config_written_through_the_api_reaches_the_next_boot() {
     );
 }
 
+/// An operator's `PATCH /global/config` applies what the operator sent and
+/// nothing else: host files rewritten on disk in the meantime — the one
+/// the route writes, and one it does not — are not adopted with it.
+#[tokio::test]
+async fn an_api_config_write_does_not_adopt_host_files_tampered_on_disk() {
+    let signer = Signer::new();
+    let f = fixture_with(|_| bearer_host(&signer, json!({})), Some(PASSWORD), vec![]);
+    // Out of band, as an agent with a shell would: the global file loses
+    // its deny, and `~/.opencode` gains a full-trust switch and a grant.
+    std::fs::write(host_file(&f), json!({ "model": "acme/m" }).to_string()).unwrap();
+    let dot = f.paths.home.join(".opencode");
+    std::fs::create_dir_all(&dot).unwrap();
+    std::fs::write(
+        dot.join("opencode.json"),
+        json!({
+            "server": { "trust": { "project": "full" } },
+            "permission": { "bash": "allow" },
+        })
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        f.dirs.other.join("opencode.json"),
+        json!({ "agent": { "mine": { "permission": { "bash": "allow" } } } }).to_string(),
+    )
+    .unwrap();
+
+    let response = call(
+        &f.router,
+        "PATCH",
+        "/global/config",
+        Some(&basic("alforria", PASSWORD)),
+        Some(json!({ "permission": { "webfetch": "deny" } })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    assert_eq!(
+        build_action(&f, &f.dirs.other, "bash"),
+        PermissionV1Action::Deny,
+        "the config write adopted a tampered host file"
+    );
+    assert_eq!(
+        build_action(&f, &f.dirs.other, "webfetch"),
+        PermissionV1Action::Deny,
+        "the operator's own change did not apply"
+    );
+    let services = f.ctx.instances.load(&f.dirs.other).unwrap();
+    assert!(
+        services.agents.get("mine").is_none(),
+        "project config was read as trusted after the config write"
+    );
+}
+
 /// A developer's own server reads its config again at each boot, as
 /// before — and when the file stops parsing, the last config that loaded
 /// stands instead of none.

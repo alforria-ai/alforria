@@ -1102,15 +1102,9 @@ impl ConfigLoader {
             self.load_global(params, &auth_env)
         }) {
             Ok(global) => global,
-            // A server that froze its host config and has none: an error,
-            // not a server without the host's rules.
-            Err(err)
-                if snapshot
-                    .as_ref()
-                    .is_some_and(|snapshot| snapshot.is_frozen()) =>
-            {
-                return Err(err);
-            }
+            // (A server that froze its host config answers from what it
+            // read at startup; one that keeps reading gets here only when
+            // no reading ever loaded.)
             Err(err) => {
                 tracing::warn!("failed to load global config, using defaults: {err}");
                 Value::Object(Map::new())

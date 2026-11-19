@@ -42,12 +42,19 @@ or project config is restricted (`server.trust`), the server keeps what each
 host source — the global config files, `~/.opencode`, the managed directory,
 and the markdown agents, commands and modes beside them — loaded as at
 startup, and how far project config is believed, and uses that for every
-directory opened later. Editing a host file on such a server takes a restart.
+directory opened later. Editing a host file on such a server takes a restart,
+and a host file that was not there at startup (a `~/.opencode/opencode.json`
+created later) is not read at all.
 The one exception is the server's own `PATCH /global/config` (an operator
-route): after it the host files are read once more, and a file that then
-fails to load keeps its previous reading. `server.*`, `shell_env`, the
-unattended settings and whether project config is restricted stay as they
-were at startup even then.
+route): what the request sends is merged into what the server remembers of
+the global config, and applies to the directories opened after it. Nothing
+is read back from disk for that — a host file that was rewritten in the
+meantime, the one the route writes included, is not adopted with it (the
+file on disk is still the merge of what stood there and the request, and is
+what the next start reads). `{env:}` / `{file:}` in such a request are
+substituted at the next start. `server.*`, `shell_env`, the unattended
+settings and whether project config is restricted stay as they were at
+startup even then.
 
 A developer's own server — loopback, none of the unattended features,
 project config trusted — reads its host files again for each directory it

@@ -619,8 +619,13 @@ fn freeze_host_config(
     if !(policy.unattended_or_remote() || mode.restricted) {
         return;
     }
-    // The reading the permission ceiling is built from, before anything
-    // the agent does can change the files.
+    // Both readings of every host source, before anything the agent does
+    // can change the files: the merged one, and the one the permission
+    // ceiling is built from. What these do not read is not host config
+    // for as long as the process lives.
+    if let Err(error) = loader.load(&params()) {
+        tracing::warn!("host config: {error}");
+    }
     if let Err(error) = loader.load_trusted(&params()) {
         tracing::warn!("host config: {error}");
     }
