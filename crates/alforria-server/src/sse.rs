@@ -6,7 +6,8 @@
 
 use std::sync::Arc;
 
-use alforria_core::{new_event_id, versioned_type, EventBus, Payload, Subscription};
+use alforria_core::event::bus::Listener;
+use alforria_core::{new_event_id, versioned_type, EventBus, Payload};
 use alforria_schema::event_manifest::SERVER_HEARTBEAT_TYPE;
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, State};
@@ -120,9 +121,8 @@ impl GlobalEvent {
 /// fed by the `EventV2Bridge` listener (`event-v2-bridge.ts:26-62`).
 #[derive(Clone)]
 pub struct GlobalBus {
-    tx: broadcast::Sender<GlobalEvent>,
-    /// Keeps the core-bus bridge listener alive while any handle exists.
-    bridge: Option<Arc<Subscription>>,
+    tx: Arc<broadcast::Sender<GlobalEvent>>,
+    forward: Listener,
 }
 
 impl Default for GlobalBus {
@@ -133,35 +133,34 @@ impl Default for GlobalBus {
 
 impl GlobalBus {
     pub fn new() -> GlobalBus {
-        GlobalBus {
-            tx: broadcast::channel(alforria_core::event::bus::CHANNEL_CAPACITY).0,
-            bridge: None,
-        }
+        let tx = Arc::new(broadcast::channel(alforria_core::event::bus::CHANNEL_CAPACITY).0);
+        let destination = Arc::downgrade(&tx);
+        let forward = Arc::new(move |event: &Payload| {
+            if let Some(tx) = destination.upgrade() {
+                for frame in bridge_frames(event) {
+                    let _ = tx.send(frame);
+                }
+            }
+        });
+        GlobalBus { tx, forward }
     }
 
     /// A bus bridged to the core EventV2 bus: every published event is
     /// mirrored as a regular global frame, and every durable event
     /// additionally as a `sync` frame (`event-v2-bridge.ts:26-62`).
-    pub fn bridged(bus: Arc<EventBus>) -> GlobalBus {
-        let mut global = GlobalBus::new();
-        let subscription = global.chain(bus);
-        global.bridge = Some(Arc::new(subscription));
+    pub fn bridged(bus: &EventBus) -> GlobalBus {
+        let global = GlobalBus::new();
+        global.chain(bus);
         global
     }
 
     /// Bridge an additional (per-instance) EventV2 bus into the global bus
     /// — every instance publishes onto its own bus in the Rust port, and
     /// the bridge listener is the TS process-wide EventV2's listener.
-    /// The instance owns the guard and drops it when disposed. Capture only
-    /// the sender, avoiding a cycle through this bus's subscription owners.
-    #[must_use]
-    pub fn chain(&self, bus: Arc<EventBus>) -> Subscription {
-        let tx = self.tx.clone();
-        bus.listen(Arc::new(move |event| {
-            for frame in bridge_frames(event) {
-                let _ = tx.send(frame);
-            }
-        }))
+    /// The publishing bus owns the listener so PTYs and turns can outlive
+    /// a cache entry. The listener refers to the destination weakly.
+    pub fn chain(&self, bus: &EventBus) {
+        bus.listen_for_lifetime(self.forward.clone());
     }
 
     /// `GlobalBus.emit` (global.ts:9-17) — ids are assigned at construction

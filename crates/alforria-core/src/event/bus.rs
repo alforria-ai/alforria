@@ -246,6 +246,19 @@ impl EventBus {
         }
     }
 
+    /// Register a shared listener for as long as this bus has publishers.
+    /// Attaching the same callback again is a no-op.
+    pub fn listen_for_lifetime(&self, listener: Listener) {
+        let mut state = self.lock_state();
+        if !state
+            .listeners
+            .iter()
+            .any(|existing| Arc::ptr_eq(existing, &listener))
+        {
+            state.listeners.push(listener);
+        }
+    }
+
     /// Register a projector for a definition; it runs inside the commit
     /// transaction, before the INSERT (`event.ts:615-619`). A projector
     /// failure aborts the transaction. Projectors are never unregistered

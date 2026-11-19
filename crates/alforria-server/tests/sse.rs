@@ -627,10 +627,8 @@ async fn chained_bus_releases_its_sender_when_owners_drop() {
     let global = alforria_server::sse::GlobalBus::new();
     let core = Arc::new(EventBus::new(Storage::open_in_memory().unwrap(), None));
     let mut receiver = global.subscribe();
-    let bridge = global.chain(core.clone());
+    global.chain(&core);
     drop(global);
-    drop(core);
-    drop(bridge);
     assert!(matches!(
         receiver.try_recv(),
         Err(tokio::sync::broadcast::error::TryRecvError::Closed)
@@ -638,26 +636,40 @@ async fn chained_bus_releases_its_sender_when_owners_drop() {
 }
 
 #[tokio::test]
-async fn disposed_instances_stop_forwarding_even_with_external_service_owners() {
+async fn instance_publishers_keep_forwarding_until_their_bus_is_dropped() {
     let ctx = located_fixture();
     let mut receiver = ctx.global_bus.subscribe();
-    for _ in 0..20 {
-        let services = ctx.instances.load(Path::new("/repo")).unwrap();
+    let directory = Path::new("/repo");
+    for dispose_all in [false, true] {
+        let old_events = ctx.instances.load(directory).unwrap().events.clone();
         receiver.try_recv().unwrap(); // project.updated
-        ctx.instances.dispose_directory(Path::new("/repo"));
+        if dispose_all {
+            ctx.instances.dispose_all();
+        } else {
+            ctx.instances.dispose_directory(directory);
+        }
         receiver.try_recv().unwrap(); // server.instance.disposed
-        services
-            .events
-            .publish(
-                &alforria_core::MODELS_DEV_REFRESHED,
-                serde_json::json!({}),
-                PublishOptions::default(),
-            )
-            .unwrap();
-        assert!(matches!(
-            receiver.try_recv(),
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-        ));
+        let new_events = ctx.instances.load(directory).unwrap().events.clone();
+        receiver.try_recv().unwrap(); // project.updated
+        assert!(!Arc::ptr_eq(&old_events, &new_events));
+        for bus in [&old_events, &new_events] {
+            let published = bus
+                .publish(
+                    &alforria_core::MODELS_DEV_REFRESHED,
+                    serde_json::json!({}),
+                    PublishOptions::default(),
+                )
+                .unwrap();
+            assert_eq!(receiver.try_recv().unwrap().v2.unwrap().id, published.id);
+        }
+        let weak = Arc::downgrade(&old_events);
+        drop(old_events);
+        assert!(
+            weak.upgrade().is_none(),
+            "the bridge must not retain the old bus"
+        );
+        ctx.instances.dispose_directory(directory);
+        receiver.try_recv().unwrap();
     }
 }
 

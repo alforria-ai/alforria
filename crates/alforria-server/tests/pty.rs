@@ -22,6 +22,7 @@ use tempfile::TempDir;
 
 /// A live server backed by a tempdir instance store.
 struct Fixture {
+    ctx: Arc<ServerContext>,
     listener: alforria_server::Listener,
     client: Client,
     directory: String,
@@ -77,11 +78,14 @@ async fn fixture() -> Fixture {
         Ok(test_services(directory))
     }));
     let mut ctx = ServerContext::for_tests();
+    instances.set_global_bus(ctx.global_bus.clone());
     ctx.instances = instances;
-    let listener = alforria_server::listen_with(&ListenOptions::default(), Arc::new(ctx))
+    let ctx = Arc::new(ctx);
+    let listener = alforria_server::listen_with(&ListenOptions::default(), ctx.clone())
         .await
         .unwrap();
     Fixture {
+        ctx,
         listener,
         client: Client::new(),
         directory: directory.display().to_string(),
@@ -154,6 +158,27 @@ async fn connect_ticket(fx: &Fixture, path: &str, headers: &[(&str, &str)]) -> r
         request = request.header(*name, *value);
     }
     request.send().await.unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cached_pty_service_delivers_events_after_instance_reload() {
+    let fixture = fixture().await;
+    let directory = std::path::Path::new(&fixture.directory);
+    // Resolve the registry before disposal, so it holds the original bus.
+    assert_eq!(fixture.get("/pty").await.status(), StatusCode::OK);
+    fixture.ctx.instances.dispose_directory(directory);
+    fixture.ctx.instances.load(directory).unwrap();
+
+    let mut events = fixture.ctx.global_bus.subscribe();
+    let pty = create(&fixture, python(), &["-c", "pass"]).await;
+    let created = tokio::time::timeout(Duration::from_secs(3), events.recv())
+        .await
+        .expect("the cached PTY bus still forwards to SSE")
+        .unwrap()
+        .v2
+        .unwrap();
+    assert_eq!(created.r#type, "pty.created");
+    assert_eq!(created.data["info"]["id"], pty["id"]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
