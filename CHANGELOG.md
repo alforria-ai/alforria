@@ -244,6 +244,11 @@ pre-1.0, so minor releases may include breaking changes.
 
 ### Fixed
 
+- A command configured to run as a subagent (`subtask: true`) stored the
+  subagent's answer in the session without the outside-content check every
+  other tool result gets: a subagent that had fetched a page or read an
+  upload left the session that received its answer unmarked. It is marked
+  now, as by a `task` call the model makes.
 - An `@file` mention in a prompt the model wrote for a subagent or a
   workflow agent attached any file in the project with no permission
   asked: `Summarise @.env` handed the subagent a file its `read` rule asks

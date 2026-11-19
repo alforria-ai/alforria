@@ -246,7 +246,7 @@ impl SessionSubtask {
                 }
                 return Err(LoopError::Cancelled);
             }
-            result = (task_tool.execute)(task_args, ToolCtxRef {
+            result = (task_tool.execute)(task_args.clone(), ToolCtxRef {
                 session_id: &session_id,
                 message_id: &assistant_id,
                 agent: &agent_name,
@@ -279,6 +279,26 @@ impl SessionSubtask {
             time.completed = Some(self.deps.clock.now_ms());
         }
         self.deps.sessions.update_message(&finished)?;
+
+        // alforria extension: this result is stored here, not by the
+        // processor, so this is where it marks the session
+        // (`SessionStore::note_tool_result`) — before it is stored. A
+        // subagent that saw outside content hands it on in its answer, and
+        // in the text of its failure.
+        let (noted_metadata, noted_output) = match &result {
+            Ok(result) => (Some(&result.metadata), result.output.clone()),
+            Err(error) => (None, error.to_string()),
+        };
+        self.deps.sessions.note_tool_result(
+            &session_id,
+            &crate::tool::outside::ToolResult {
+                call_id: Some(&call_id),
+                tool: "task",
+                input: &task_args,
+                metadata: noted_metadata,
+                output: &noted_output,
+            },
+        )?;
 
         match result {
             Ok(result) => {
@@ -714,6 +734,81 @@ mod tests {
                 )
             });
         assert!(synthetic, "expected synthetic summary user message");
+    }
+
+    /// A command's configured subtask runs the `task` tool here, not
+    /// through the processor, and stored its result without the marking
+    /// every other tool result gets: a subagent that had read outside
+    /// content (here an uploaded file) handed its answer to an unmarked
+    /// parent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_command_subtask_whose_child_saw_outside_content_marks_the_parent() {
+        use crate::session::store::SessionMark;
+        use alforria_llm::schema::ids::FinishReason;
+        use alforria_llm::LlmEvent;
+        let read_upload = vec![
+            Ok(LlmEvent::ToolCall {
+                id: "call_read".to_string(),
+                name: "read".to_string(),
+                input: json!({ "filePath": "uploads/x.txt" }),
+                provider_executed: None,
+                provider_metadata: None,
+            }),
+            Ok(LlmEvent::StepFinish {
+                index: 0.0,
+                reason: FinishReason::ToolCalls,
+                usage: None,
+                provider_metadata: None,
+            }),
+            Ok(LlmEvent::Finish {
+                reason: FinishReason::ToolCalls,
+                usage: None,
+                provider_metadata: None,
+            }),
+        ];
+        let e = engine(
+            "subtask-marks-parent",
+            vec![read_upload, text_stream("what the upload said")],
+        );
+        let sessions = &e.services.sessions;
+        sessions.set_upload_directories(vec!["uploads".to_string()]);
+        std::fs::create_dir_all(e.worktree.join("uploads")).unwrap();
+        std::fs::write(e.worktree.join("uploads/x.txt"), "from a client").unwrap();
+        let session = create_engine_session(&e);
+        let user = crate::session::test_support::user_message(&session.id, "msg_p1", 1.0);
+        sessions.update_message(&user).unwrap();
+
+        let part = subtask_part(&session.id, "msg_p1", "build", Some("build".to_string()));
+        driver(&e)
+            .handle(crate::session::r#loop::SubtaskInput {
+                task: part,
+                model: test_model(),
+                last_user: user.clone(),
+                session_id: session.id.clone(),
+                session: session.clone(),
+                messages: vec![],
+                cancel: CancellationToken::new(),
+            })
+            .await
+            .unwrap();
+
+        let children = sessions.children(&session.id).unwrap();
+        assert_eq!(children.len(), 1);
+        let marked = |id: &str| sessions.has_mark(id, SessionMark::OutsideContent).unwrap();
+        assert!(marked(&children[0].id), "the subagent read an upload");
+        let messages = e.services.messages.stream(&session.id).unwrap();
+        assert!(
+            messages
+                .iter()
+                .flat_map(|msg| msg.parts.iter())
+                .any(|part| matches!(
+                    part,
+                    V1Part::Tool { tool, state: V1ToolState::Completed { output, .. }, .. }
+                        if tool == "task" && output.contains("what the upload said")
+                )),
+            "the parent holds the subagent's answer"
+        );
+        assert!(marked(&session.id), "so the parent is marked");
     }
 
     #[test]
