@@ -33,7 +33,7 @@ use crate::session::error::SessionError;
 use crate::session::event_definitions::SESSION_ERROR;
 use crate::session::instruction::Instruction;
 use crate::session::llm::{LlmModel, LlmStream, LlmTool, LlmToolOutput, StreamInput, ToolFailure};
-use crate::session::message::{filter_compacted, latest, MessageStore, WithParts};
+use crate::session::message::{latest, MessageStore, WithParts};
 use crate::session::overflow::{is_overflow, IsOverflowInput, ModelLimits};
 use crate::session::processor::{
     AskPermission, Handle as ProcessorHandle, ProcessResult, Processor, ProcessorDeps,
@@ -320,7 +320,7 @@ pub async fn run_loop(
             alforria_schema::session_status::SessionStatusInfo::Busy,
         )?;
 
-        let msgs = filter_compacted(deps.messages.stream_without_diffs(session_id)?);
+        let msgs = deps.messages.active_context(session_id)?;
         let latest = latest(&msgs);
         let last_user = latest.user.clone().ok_or_else(|| {
             LoopError::Unknown(

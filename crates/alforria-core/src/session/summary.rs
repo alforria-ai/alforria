@@ -203,20 +203,7 @@ impl SessionSummary {
         if self.deps.config.snapshot == Some(false) {
             return Ok(());
         }
-        let all = self.deps.sessions.messages_without_diffs(session_id)?;
-        if all.is_empty() {
-            return Ok(());
-        }
-
-        let messages: Vec<&WithParts> = all
-            .iter()
-            .filter(|msg| {
-                let info = &msg.info;
-                (message_id_of(info) == message_id)
-                    || (matches!(info, V1Message::Assistant { .. })
-                        && assistant_parent_id(info) == message_id)
-            })
-            .collect();
+        let messages = self.deps.sessions.turn_snapshots(session_id, message_id)?;
         let Some(target) = messages
             .iter()
             .find(|msg| message_id_of(&msg.info) == message_id)
@@ -226,20 +213,19 @@ impl SessionSummary {
         if !matches!(target.info, V1Message::User { .. }) {
             return Ok(());
         }
-        let owned: Vec<WithParts> = messages.iter().map(|msg| (*msg).clone()).collect();
-        let msg_diffs = self.compute_diff(&owned).await?;
+        let msg_diffs = self.compute_diff(&messages).await?;
+        let mut info = self.deps.sessions.message_info(session_id, message_id)?;
         // A step that changed no files leaves the turn's diffs as they were,
         // and rewriting them would only add to the event log.
         if let V1Message::User {
             summary: Some(existing),
             ..
-        } = &self.deps.sessions.get_message(session_id, message_id)?.info
+        } = &info
         {
             if existing.diffs == msg_diffs {
                 return Ok(());
             }
         }
-        let mut info = target.info.clone();
         if let V1Message::User { summary, .. } = &mut info {
             let (title, body) = match summary {
                 Some(existing) => (existing.title.clone(), existing.body.clone()),
@@ -265,17 +251,18 @@ impl SessionSummary {
         let Some(message_id) = message_id else {
             return Ok(Vec::new());
         };
-        let all = self.deps.sessions.messages(session_id, None)?;
-        let Some(message) = all
-            .iter()
-            .find(|msg| message_id_of(&msg.info) == message_id)
-        else {
-            return Ok(Vec::new());
+        let info = match self.deps.sessions.message_info(session_id, message_id) {
+            Ok(info) => info,
+            Err(SessionError::NotFound(_)) => {
+                self.deps.sessions.get(session_id)?;
+                return Ok(Vec::new());
+            }
+            Err(error) => return Err(error),
         };
-        if !matches!(message.info, V1Message::User { .. }) {
+        if !matches!(info, V1Message::User { .. }) {
             return Ok(Vec::new());
         }
-        let diffs = match &message.info {
+        let diffs = match &info {
             V1Message::User { summary, .. } => summary
                 .as_ref()
                 .map(|summary| summary.diffs.clone())
@@ -304,14 +291,6 @@ impl SessionSummary {
 fn message_id_of(info: &V1Message) -> &str {
     match info {
         V1Message::User { id, .. } | V1Message::Assistant { id, .. } => id,
-    }
-}
-
-/// `info.parentID` for assistants (the empty string for users).
-fn assistant_parent_id(info: &V1Message) -> &str {
-    match info {
-        V1Message::User { .. } => "",
-        V1Message::Assistant { parent_id, .. } => parent_id,
     }
 }
 
@@ -387,6 +366,9 @@ impl SummarySummarize for SessionSummary {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod benchmarks;
 
 #[cfg(test)]
 mod tests {
@@ -665,6 +647,144 @@ mod tests {
         let written = message_updated_count(&h);
         summary.summarize(&session.id, "msg_u").await.unwrap();
         assert_eq!(message_updated_count(&h), written);
+    }
+
+    #[tokio::test]
+    async fn summaries_read_only_the_requested_turn_including_older_turns() {
+        use crate::session::test_support::{assistant_message, compaction_part};
+
+        let h = harness("summary-isolated-turn", vec![]);
+        let session = create_session(&h.services.sessions, &h.worktree);
+        for index in 0..100 {
+            h.services
+                .sessions
+                .update_message(&user_message(
+                    &session.id,
+                    &format!("msg_archived_{index:03}"),
+                    index as f64,
+                ))
+                .unwrap();
+        }
+        std::fs::write(h.worktree.join("a.txt"), "one\n").unwrap();
+        let from = h.snapshot.track().await.unwrap();
+        std::fs::write(h.worktree.join("a.txt"), "one\ntwo\n").unwrap();
+        let older_to = h.snapshot.track().await.unwrap();
+        std::fs::write(h.worktree.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        let current_to = h.snapshot.track().await.unwrap();
+
+        for (user, reply, created) in [("msg_old", "msg_old_a", 100), ("msg_u", "msg_a", 104)] {
+            h.services
+                .sessions
+                .update_message(&user_message(&session.id, user, created as f64))
+                .unwrap();
+            h.services
+                .sessions
+                .update_message(&assistant_message(
+                    &session.id,
+                    reply,
+                    user,
+                    created + 1,
+                    None,
+                    None,
+                ))
+                .unwrap();
+        }
+        h.services
+            .sessions
+            .update_message(&user_message(&session.id, "msg_compact", 102.0))
+            .unwrap();
+        h.services
+            .sessions
+            .update_part(&compaction_part(
+                &session.id,
+                "msg_compact",
+                "prt_compact",
+                true,
+                None,
+                None,
+            ))
+            .unwrap();
+        h.services
+            .sessions
+            .update_message(&assistant_message(
+                &session.id,
+                "msg_compacted",
+                "msg_compact",
+                103,
+                Some(true),
+                Some("stop".into()),
+            ))
+            .unwrap();
+        for (reply, start, finish) in [
+            ("msg_old_a", from.as_str(), older_to.as_str()),
+            ("msg_a", older_to.as_str(), current_to.as_str()),
+        ] {
+            for part in [
+                step_start(&session.id, reply, &format!("prt_{reply}_1"), start),
+                step_finish(&session.id, reply, &format!("prt_{reply}_2"), finish),
+            ] {
+                h.services.sessions.update_part(&part).unwrap();
+            }
+        }
+
+        // The old full-history read trips over this unrelated row. Neither
+        // the active context nor any requested turn should hydrate it.
+        h.services.storage.with_connection(|conn| {
+            conn.execute(
+                "UPDATE message SET data = '{broken' WHERE id = 'msg_archived_000'",
+                [],
+            )
+            .unwrap();
+        });
+        assert!(h
+            .services
+            .sessions
+            .messages_without_diffs(&session.id)
+            .is_err());
+        assert_eq!(
+            h.services
+                .messages
+                .active_context(&session.id)
+                .unwrap()
+                .len(),
+            4
+        );
+        let summary = summary_service(&h);
+        for user in ["msg_u", "msg_old"] {
+            summary.attach_diffs(&session.id, user).await.unwrap();
+            let diffs = summary.diff(&session.id, Some(user)).unwrap();
+            assert_eq!(diffs.len(), 1);
+            assert_eq!(diffs[0].additions, 1.0);
+            assert_eq!(diffs[0].deletions, 0.0);
+            let expected = if user == "msg_old" { "+two" } else { "+three" };
+            assert!(diffs[0].patch.as_ref().unwrap().contains(expected));
+            let written = message_updated_count(&h);
+            summary.attach_diffs(&session.id, user).await.unwrap();
+            assert_eq!(message_updated_count(&h), written);
+        }
+    }
+
+    #[tokio::test]
+    async fn summary_queries_preserve_missing_session_and_message_behavior() {
+        let h = harness("summary-missing", vec![]);
+        let session = create_session(&h.services.sessions, &h.worktree);
+        let summary = summary_service(&h);
+        summary
+            .attach_diffs(&session.id, "msg_missing")
+            .await
+            .unwrap();
+        assert!(summary
+            .diff(&session.id, Some("msg_missing"))
+            .unwrap()
+            .is_empty());
+        assert!(matches!(
+            summary.attach_diffs("ses_missing", "msg_missing").await,
+            Err(SessionError::NotFound(_))
+        ));
+        assert!(matches!(
+            summary.diff("ses_missing", Some("msg_missing")),
+            Err(SessionError::NotFound(_))
+        ));
     }
 
     #[tokio::test]
