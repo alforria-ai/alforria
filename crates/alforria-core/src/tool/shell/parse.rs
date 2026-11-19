@@ -181,6 +181,12 @@ pub(super) fn literal_command(source: &str) -> Option<Vec<String>> {
         }
     }
 
+    // A backslash-newline joins two lines into one word for the shell
+    // (`-\<newline>e` is `-e`), but the grammar reads it as a gap between
+    // words. Leave such a command to the general path scan.
+    if source.contains("\\\n") {
+        return None;
+    }
     let mut parser = tree_sitter::Parser::new();
     parser
         .set_language(&tree_sitter_bash::LANGUAGE.into())
@@ -340,7 +346,12 @@ mod tests {
             literal_command(r#"demo -A 2 one\ word 'single 'quote "two "words"#).unwrap(),
             ["demo", "-A", "2", "one word", "single quote", "two words"]
         );
-        for source in [r#"demo "$value""#, "demo *.txt", "demo ~/file"] {
+        for source in [
+            r#"demo "$value""#,
+            "demo *.txt",
+            "demo ~/file",
+            "demo -\\\ne value",
+        ] {
             assert_eq!(literal_command(source), None, "{source}");
         }
     }

@@ -1686,6 +1686,8 @@ mod tests {
             format!(r#"'grep' /dev "{outside}/file""#),
             format!(r#"grep /dev . > "{outside}/output""#),
             format!(r#"grep /dev . < "{outside}/input""#),
+            // The shell joins the continued line into `-e`.
+            format!("grep \"{outside}/file\" -\\\ne root"),
         ] {
             let scan = redirect_scan(&command, &project);
             assert_eq!(scan.dirs, [outside.as_str()], "{command}");
