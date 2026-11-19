@@ -150,15 +150,27 @@ impl BashParser {
     }
 }
 
-/// A complete literal argv for command-specific option parsing. The flat
-/// parts intentionally omit expansions, so they cannot safely identify an
-/// implicit search pattern. Redirections are inspected separately.
+/// A literal POSIX argv for command-specific option parsing. Check the syntax
+/// tree before removing quotes and escapes, since the flat parts can omit
+/// expansions. Redirections are inspected separately.
 pub(super) fn literal_command(source: &str) -> Option<Vec<String>> {
     fn literal(node: tree_sitter::Node<'_>, source: &str) -> bool {
+        let text = &source[node.byte_range()];
         match node.kind() {
-            "word" => !source[node.byte_range()].contains(['*', '?', '[', '{', '}']),
-            "raw_string" | "string_content" => true,
-            "command_name" | "string" | "concatenation" => {
+            "word" => {
+                !text.contains(['*', '?', '[', '{', '}', '~', '$', '`', '!'])
+                    && !text.starts_with('=')
+            }
+            "number" => text.bytes().all(|byte| byte.is_ascii_digit()),
+            "raw_string" => true,
+            "string" => {
+                let mut cursor = node.walk();
+                let plain = node
+                    .named_children(&mut cursor)
+                    .all(|child| child.kind() == "string_content");
+                plain && !text.contains(['$', '`', '!'])
+            }
+            "command_name" | "concatenation" => {
                 let mut cursor = node.walk();
                 let all_literal = node
                     .named_children(&mut cursor)
@@ -187,7 +199,15 @@ pub(super) fn literal_command(source: &str) -> Option<Vec<String>> {
     nodes.extend(command.children_by_field_name("argument", &mut cursor));
     nodes
         .into_iter()
-        .map(|node| literal(node, source).then(|| source[node.byte_range()].to_string()))
+        .map(|node| {
+            let raw = &source[node.byte_range()];
+            if !literal(node, source) || raw.contains('\0') {
+                return None;
+            }
+            let mut lexer = shlex::Shlex::new(raw);
+            let argument = lexer.next()?;
+            (lexer.next().is_none() && !lexer.had_error).then_some(argument)
+        })
         .collect()
 }
 
@@ -312,6 +332,17 @@ mod tests {
             .iter()
             .map(|p| (p.kind.clone(), p.text.clone()))
             .collect()
+    }
+
+    #[test]
+    fn literal_command_decodes_quoted_words_and_numbers() {
+        assert_eq!(
+            literal_command(r#"demo -A 2 one\ word 'single 'quote "two "words"#).unwrap(),
+            ["demo", "-A", "2", "one word", "single quote", "two words"]
+        );
+        for source in [r#"demo "$value""#, "demo *.txt", "demo ~/file"] {
+            assert_eq!(literal_command(source), None, "{source}");
+        }
     }
 
     #[test]

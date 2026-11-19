@@ -26,6 +26,7 @@ indexmap = { workspace = true }
 rand = { workspace = true }
 tree-sitter = { workspace = true }
 tree-sitter-bash = { workspace = true }
+shlex = { workspace = true }
 similar = { workspace = true }
 grep-regex = { workspace = true }
 grep-searcher = { workspace = true }

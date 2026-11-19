@@ -698,7 +698,8 @@ pub async fn collect(
     instance: &InstanceContext,
 ) -> Scan {
     let mut scan = Scan::default();
-    let shell_kind = id::to_kind(&shell_name(shell));
+    let shell_basename = shell_name(shell);
+    let shell_kind = id::to_kind(&shell_basename);
     let mut cwd = cwd.to_path_buf();
 
     for node in nodes {
@@ -715,7 +716,9 @@ pub async fn collect(
             let posix = !ps && shell_kind != "cmd";
             let listed = FILES.contains(&cmd.as_str())
                 || (shell_kind == "cmd" && CMD_FILES.contains(&cmd.as_str()));
-            let grep_paths = posix.then(|| grep::path_args(node)).flatten();
+            let grep_paths = (posix && SHELLS.contains(&shell_basename.as_str()))
+                .then(|| grep::path_args(node))
+                .flatten();
             let parsed_grep = grep_paths.is_some();
             // Outside the listed file commands, any POSIX command's arguments
             // are still looked at when they read as a path out of the
@@ -752,7 +755,13 @@ pub async fn collect(
                 if !known && !path_like(&posix_expand(unquote(&arg))) {
                     continue;
                 }
-                let Some(resolved) = arg_path(&arg, &cwd, ps, shell) else {
+                let resolved = if parsed_grep {
+                    // The lexer already resolved the literal spelling.
+                    (!arg.is_empty() && arg != "-").then(|| resolve_path(&cwd, &arg))
+                } else {
+                    arg_path(&arg, &cwd, ps, shell)
+                };
+                let Some(resolved) = resolved else {
                     continue;
                 };
                 first.get_or_insert_with(|| resolved.clone());
@@ -1633,6 +1642,8 @@ mod tests {
         for command in [
             r#"grep -R "/dev" -n poc docs/security tsconfig.json package.json || true"#,
             "grep -nRA2 /dev .",
+            "grep -A 2 /dev .",
+            "grep -m 1 /dev .",
             "grep -- /dev .",
             "grep -e /dev -e /etc .",
             r#"grep --regexp="/dev" --exclude-dir=/etc --include=/bin ."#,

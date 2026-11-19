@@ -1,6 +1,8 @@
 //! Separate grep's patterns and option values from the files it opens.
 
-use super::{command_word, parse, unquote};
+use std::path::Path;
+
+use super::{command_word, parse};
 
 enum Value {
     Pattern,
@@ -26,7 +28,7 @@ pub(super) fn path_args(node: &parse::CommandNode) -> Option<Vec<String>> {
         return None;
     }
     let mut arguments = parse::literal_command(&node.source)?.into_iter();
-    if command_word(&arguments.next()?) != name {
+    if Path::new(&arguments.next()?).file_name()?.to_str()? != name {
         return None;
     }
     let mut files = Vec::new();
@@ -35,7 +37,7 @@ pub(super) fn path_args(node: &parse::CommandNode) -> Option<Vec<String>> {
     let mut explicit = false;
     let mut options = true;
     while let Some(argument) = arguments.next() {
-        let text = unquote(&argument);
+        let text = argument.as_str();
         if options && text == "--" {
             options = false;
         } else if options && text.starts_with("--") {
@@ -45,9 +47,12 @@ pub(super) fn path_args(node: &parse::CommandNode) -> Option<Vec<String>> {
             let kind = match name {
                 "--regexp" => Value::Pattern,
                 "--file" => Value::PatternFile,
-                "--after-context" | "--before-context" | "--context" | "--max-count"
-                | "--directories" | "--devices" | "--binary-files" | "--label" | "--include"
-                | "--exclude" | "--exclude-dir" | "--include-dir" => Value::Other,
+                // BSD grep can accept bare --context without consuming the
+                // next word. Only classify the attached form on all platforms.
+                "--context" if inline.is_some() => Value::Other,
+                "--after-context" | "--before-context" | "--max-count" | "--directories"
+                | "--devices" | "--binary-files" | "--label" | "--include" | "--exclude"
+                | "--exclude-dir" | "--include-dir" => Value::Other,
                 "--color" | "--colour" => continue,
                 "--extended-regexp"
                 | "--fixed-strings"
@@ -127,4 +132,29 @@ pub(super) fn path_args(node: &parse::CommandNode) -> Option<Vec<String>> {
     files.extend(operands.into_iter().skip(usize::from(!explicit)));
     files.extend(posix_files.unwrap_or_default());
     Some(files)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tool::shell::parse::{BashParser, ShellParser};
+
+    #[test]
+    fn context_option_requires_an_unambiguous_value() {
+        let parser = BashParser::new();
+        for command in ["grep --context needle .", "grep --context 2 needle ."] {
+            assert_eq!(path_args(&parser.parse(command).unwrap()[0]), None);
+        }
+        for command in [
+            "grep --context=2 needle .",
+            "grep -A 2 needle .",
+            "grep -m 1 needle .",
+        ] {
+            let paths = path_args(&parser.parse(command).unwrap()[0]).unwrap();
+            assert!(
+                !paths.is_empty() && paths.iter().all(|path| path == "."),
+                "{command}: {paths:?}"
+            );
+        }
+    }
 }
