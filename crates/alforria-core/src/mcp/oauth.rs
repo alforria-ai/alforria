@@ -111,47 +111,44 @@ pub trait McpBrowser: Send + Sync {
     fn open<'a>(&'a self, url: &'a str) -> crate::tool::def::BoxFuture<'a, Result<(), String>>;
 }
 
-/// The `open` package's platform behavior (browser.ts:13): spawn the
-/// desktop opener and treat a fast non-zero exit as failure.
+/// Why the desktop opener is not started for `url`, if it is not. The
+/// URL is the MCP server's — it comes from that server's OAuth metadata —
+/// so it is handed to the desktop's URL handler only as a plain web URL
+/// (`browser::launchable_url`: no `file:`, no custom protocol, no
+/// argument). And on a server in the restricted posture
+/// (`crate::shell_env`) no opener is started at all: nobody sits at it,
+/// and the opener would be a process started with the server's whole
+/// environment at an MCP server's word. The caller is told the open
+/// failed and shows the URL (`mcp.browser.open.failed`).
+pub(crate) fn launch_refusal(url: &str, restricted: bool) -> Option<String> {
+    if restricted {
+        return Some(
+            "no browser is opened on an unattended or remotely reachable server; open the \
+             authorization URL yourself"
+                .to_string(),
+        );
+    }
+    if !crate::browser::launchable_url(url) {
+        return Some("the authorization URL is not a plain web URL".to_string());
+    }
+    None
+}
+
+/// The desktop's URL handler, through the one place that starts it
+/// (`crate::browser::open_url`), after [`launch_refusal`].
 pub struct SystemBrowser;
 
 impl McpBrowser for SystemBrowser {
     fn open<'a>(&'a self, url: &'a str) -> crate::tool::def::BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
-            let command = if cfg!(target_os = "macos") {
-                "open"
-            } else if cfg!(target_os = "windows") {
-                "cmd"
+            let restricted = crate::shell_env::current().is_restricted();
+            if let Some(refusal) = launch_refusal(url, restricted) {
+                return Err(refusal);
+            }
+            if crate::browser::open_url(url) {
+                Ok(())
             } else {
-                "xdg-open"
-            };
-            let args: Vec<String> = if command == "cmd" {
-                vec!["/c".to_string(), "start".to_string(), url.to_string()]
-            } else {
-                vec![url.to_string()]
-            };
-            match tokio::time::timeout(
-                Duration::from_millis(500),
-                // shell_env: not routed. A fixed desktop opener handed the
-                // authorization URL as an argument, for the person at this
-                // machine; it needs the desktop session's variables and runs
-                // nothing the agent or a config names. A failure to open is
-                // reported with the URL.
-                tokio::process::Command::new(command)
-                    .args(&args)
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status(),
-            )
-            .await
-            {
-                Err(_) => Ok(()),
-                Ok(Err(err)) => Err(err.to_string()),
-                Ok(Ok(status)) if status.success() || status.code().is_none() => Ok(()),
-                Ok(Ok(status)) => Err(format!(
-                    "Browser open failed with exit code {}",
-                    status.code().unwrap_or(-1)
-                )),
+                Err("the browser could not be started".to_string())
             }
         })
     }
@@ -819,6 +816,28 @@ fn now_seconds() -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The authorization URL comes from the MCP server's OAuth metadata.
+    /// It is handed to the desktop's URL handler only when it is a plain
+    /// web URL, and never on a server nobody sits at.
+    #[test]
+    fn the_desktop_opener_takes_only_a_web_url_and_never_on_a_restricted_server() {
+        let web = "https://auth.example.com/authorize?client_id=a&state=b";
+        assert_eq!(launch_refusal(web, false), None);
+        for url in [
+            "file:///etc/passwd",
+            "vscode://file/x",
+            "-a Calculator",
+            "ms-msdt:/id PCWDiagnostic",
+            "https://example.com/a b",
+        ] {
+            assert!(launch_refusal(url, false).is_some(), "{url:?} would launch");
+        }
+        assert!(
+            launch_refusal(web, true).is_some(),
+            "an opener would be started on a restricted server"
+        );
+    }
 
     #[test]
     fn redirect_url_defaults() {

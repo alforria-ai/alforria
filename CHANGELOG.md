@@ -244,6 +244,13 @@ pre-1.0, so minor releases may include breaking changes.
 
 ### Fixed
 
+- An MCP OAuth sign-in started the desktop's URL handler (`xdg-open`,
+  `open`, `cmd /c start`) on whatever authorization URL the MCP server's
+  metadata named, with the server's whole environment, on any server. It
+  now goes through the same check as every other sign-in — a plain
+  `http(s)` URL or nothing — and a server in the restricted shell posture
+  starts no opener at all: the flow reports `mcp.browser.open.failed` with
+  the URL, as it does when a browser cannot be opened.
 - File tickets shared one cache of 10 000 with oldest-first eviction, so
   one token minting tickets in a loop invalidated everybody else's. A
   credential now holds at most 1 000 live tickets and evicts its own

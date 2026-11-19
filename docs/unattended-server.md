@@ -600,7 +600,11 @@ only if `allow` names `SSH_AUTH_SOCK`.
   the user's environment.
 - **The desktop opener** the server uses for a sign-in URL (an MCP OAuth
   flow): a fixed system program handed one URL, started with the server's
-  environment.
+  environment — on a standalone server only, and only for a plain
+  `http(s)` URL (the URL comes from the MCP server's OAuth metadata). On a
+  server in the restricted posture no opener is started: the flow reports
+  `mcp.browser.open.failed` with the URL, for whoever is driving it to
+  open.
 - **The floor, for terminals and worktree start scripts.** `/pty` and
   worktree creation are `admin` routes that belong to no session; they get
   the server's posture, not a session's.
