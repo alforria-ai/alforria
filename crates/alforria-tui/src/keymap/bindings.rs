@@ -211,7 +211,7 @@ pub static DEFINITIONS: &[Definition] = &[
     (Definition {
         name: "session_copy",
         default: "none",
-        description: "Copy session transcript",
+        description: "Copy message or session transcript",
     }),
     (Definition {
         name: "session_move",

@@ -15,6 +15,13 @@ pub enum PromptMaxWidth {
     Fixed(u16),
 }
 
+/// Alforria's `copy_mode`: what `/copy` puts on the clipboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyMode {
+    LastMessage,
+    Thread,
+}
+
 /// `attention` (`config/index.tsx:113-122`): defaults
 /// `{enabled: false, notifications: true, sound: true, volume: 0.4}`.
 /// `volume` only scales sound-pack playback — a non-goal (spec §6 N5) —
@@ -45,6 +52,8 @@ pub struct TuiConfig {
     pub mouse: bool,
     /// `theme` (`config/index.tsx:63`).
     pub theme: Option<String>,
+    /// `copy_mode`: `"last_message"` (default) or `"thread"`.
+    pub copy_mode: CopyMode,
     /// `prompt.max_width` — default 75 (`routes/home.tsx:33-37`).
     pub prompt_max_width: PromptMaxWidth,
     /// `keybinds` (`config/index.tsx:67`) — user overrides,
@@ -92,6 +101,7 @@ impl Default for TuiConfig {
         TuiConfig {
             mouse: true,
             theme: None,
+            copy_mode: CopyMode::LastMessage,
             prompt_max_width: PromptMaxWidth::Fixed(75),
             prompt_max_height: None,
             keybinds: std::collections::BTreeMap::new(),
@@ -156,6 +166,9 @@ pub fn validate_info(info: &Value) -> Result<(), String> {
     kind("$schema", Value::is_string)?;
     kind("theme", Value::is_string)?;
     kind("mouse", Value::is_boolean)?;
+    kind("copy_mode", |v| {
+        matches!(v.as_str(), Some("last_message" | "thread"))
+    })?;
     kind("leader_timeout", |v| v.as_u64().is_some_and(|n| n > 0))?;
     kind("scroll_speed", |v| v.as_f64().is_some_and(|n| n >= 0.001))?;
     kind("diff_style", |v| {
@@ -217,6 +230,9 @@ impl TuiConfig {
         config.theme = get("theme").and_then(Value::as_str).map(str::to_string);
         if let Some(mouse) = get("mouse").and_then(Value::as_bool) {
             config.mouse = mouse;
+        }
+        if get("copy_mode").and_then(Value::as_str) == Some("thread") {
+            config.copy_mode = CopyMode::Thread;
         }
         config.leader_timeout_ms = get("leader_timeout").and_then(Value::as_u64);
         if let Some(speed) = get("scroll_speed").and_then(Value::as_f64) {
@@ -364,12 +380,31 @@ mod tests {
     fn invalid_info_is_rejected() {
         for bad in [
             serde_json::json!({"mouse": "no"}),
+            serde_json::json!({"copy_mode": "all"}),
+            serde_json::json!({"copy_mode": true}),
             serde_json::json!({"scroll_speed": 0}),
             serde_json::json!({"diff_style": "split"}),
             serde_json::json!({"prompt": {"max_width": 0}}),
             serde_json::json!({"keybinds": {"leader": 3}}),
         ] {
             assert!(validate_info(&bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn copy_mode_defaults_to_last_message_and_accepts_thread() {
+        assert_eq!(TuiConfig::default().copy_mode, CopyMode::LastMessage);
+        assert_eq!(
+            TuiConfig::from_info(&serde_json::json!({}), true).copy_mode,
+            CopyMode::LastMessage
+        );
+        for (value, expected) in [
+            ("last_message", CopyMode::LastMessage),
+            ("thread", CopyMode::Thread),
+        ] {
+            let info = serde_json::json!({"copy_mode": value});
+            validate_info(&info).expect("valid copy mode");
+            assert_eq!(TuiConfig::from_info(&info, true).copy_mode, expected);
         }
     }
 
