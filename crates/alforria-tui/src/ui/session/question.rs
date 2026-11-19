@@ -404,11 +404,26 @@ fn app_theme(app: &App) -> Theme {
 
 /// The question box's rendered rows.
 pub fn lines(app: &App) -> Vec<Line<'static>> {
-    layout(app).0
+    layout(
+        app,
+        Rect::new(0, 0, app.ui.terminal_width, app.ui.terminal_height),
+    )
+    .0
+}
+
+fn question_block() -> Block<'static> {
+    Block::new()
+        .borders(ratatui::widgets::Borders::LEFT)
+        .padding(Padding {
+            left: 1,
+            right: 3,
+            top: 1,
+            bottom: 1,
+        })
 }
 
 /// The rows plus the clickable line indices (mouse hit-testing).
-fn layout(app: &App) -> (Vec<Line<'static>>, Vec<(usize, ClickLine)>) {
+fn layout(app: &App, area: Rect) -> (Vec<Line<'static>>, Vec<(usize, ClickLine)>) {
     let theme = app_theme(app);
     let Some(request) = visible(app) else {
         return (Vec::new(), Vec::new());
@@ -491,7 +506,12 @@ fn layout(app: &App) -> (Vec<Line<'static>>, Vec<(usize, ClickLine)>) {
         }
         if custom {
             clicks.push((rows.len(), ClickLine::Other));
-            rows.extend(other_row(app, &request, &theme));
+            rows.extend(other_row(
+                app,
+                &request,
+                &theme,
+                question_block().inner(area).width,
+            ));
         }
     } else {
         // The confirm review (`question.tsx:459-479`) — each row is a
@@ -638,7 +658,12 @@ fn option_row(
 }
 
 /// The "Type your own answer" row (`question.tsx:400-454`).
-fn other_row(app: &App, request: &QuestionV1Request, theme: &Theme) -> Vec<Line<'static>> {
+fn other_row(
+    app: &App,
+    request: &QuestionV1Request,
+    theme: &Theme,
+    width: u16,
+) -> Vec<Line<'static>> {
     let state = &app.ui.question;
     let options = options_of(request, state.tab);
     let multi = multiple(request, state.tab);
@@ -683,52 +708,87 @@ fn other_row(app: &App, request: &QuestionV1Request, theme: &Theme) -> Vec<Line<
         ));
     }
     lines.push(Line::from(row));
-    if state.editing {
-        // The editing textarea below the row (`question.tsx:427-448`):
-        // the typed draft, or the placeholder while empty.
-        lines.push(Line::from(Span::styled(
-            format!(
-                "     {}",
-                if state.input.is_empty() {
-                    "Type your own answer".to_string()
-                } else {
-                    state.input.clone()
-                }
-            ),
-            Style::new().fg(if state.input.is_empty() {
-                theme.text_muted.to_color()
-            } else {
-                theme.text.to_color()
-            }),
-        )));
+    let content = if state.editing {
+        if state.input.is_empty() {
+            "Type your own answer"
+        } else {
+            state.input.as_str()
+        }
     } else if !state.custom[state.tab].is_empty() {
-        // The saved custom answer under the row (`question.tsx:448-452`).
-        lines.push(Line::from(Span::styled(
-            format!("     {}", state.custom[state.tab]),
-            Style::new().fg(theme.text_muted.to_color()),
-        )));
-    }
+        state.custom[state.tab].as_str()
+    } else {
+        return lines;
+    };
+    let color = if state.editing && !state.input.is_empty() {
+        theme.text
+    } else {
+        theme.text_muted
+    };
+    // Leave room for a wide character even in a narrow panel.
+    let indent = 5.min(width.saturating_sub(2));
+    let display = crate::ui::textarea::wrap_text(content, width.saturating_sub(indent).max(1));
+    let max_rows = crate::ui::textarea::Textarea::max_height(
+        app.config.prompt_max_height,
+        app.ui.terminal_height,
+    );
+    lines.extend(
+        display
+            .lines(
+                display.window(max_rows),
+                Style::new().fg(color.to_color()),
+                None,
+            )
+            .into_iter()
+            .map(|mut line| {
+                line.spans.insert(0, Span::raw(" ".repeat(indent as usize)));
+                line
+            }),
+    );
     lines
 }
 
-pub fn height(app: &App) -> u16 {
-    (lines(app).len() + 2) as u16
+pub fn height(app: &App, area: Rect) -> u16 {
+    layout(app, area)
+        .0
+        .len()
+        .saturating_add(2)
+        .min(u16::MAX as usize) as u16
 }
 
 /// Render into the prompt slot.
 pub fn render(app: &mut App, frame: &mut ratatui::Frame, theme: &Theme, area: Rect) {
-    let (line_rows, clicks) = layout(app);
-    let rows = line_rows;
+    let block = question_block()
+        .border_set(ratatui::symbols::border::Set {
+            vertical_left: "┃",
+            ..Default::default()
+        })
+        .border_style(theme.accent.to_color())
+        .style(Style::new().bg(theme.background_panel.to_color()));
+    let inner = block.inner(area);
+    let (rows, clicks) = layout(app, area);
+    let scroll = if app.ui.question.editing {
+        rows.len()
+            .saturating_sub(inner.height as usize)
+            .min(u16::MAX as usize)
+    } else {
+        0
+    };
     // The tabs/options are mouse-interactive (`question.tsx:296-408`)
     // — record their screen geometry for hit-testing. Content starts
     // at `area.x + 2` (left border + padding) / `area.y + 1` (top
     // padding).
     let mut rendered = Vec::new();
     for (line, target) in clicks {
-        let row = area.y + 1 + line as u16;
+        let Some(visible_line) = line
+            .checked_sub(scroll)
+            .filter(|line| *line < inner.height as usize)
+        else {
+            continue;
+        };
+        let row = inner.y + visible_line as u16;
         match target {
             ClickLine::Tabs => {
-                let Some(spans) = rows.get(line).map(|line| tab_spans(line, area.x + 2)) else {
+                let Some(spans) = rows.get(line).map(|line| tab_spans(line, inner.x)) else {
                     continue;
                 };
                 rendered.push((row, Click::Tabs(spans)));
@@ -739,22 +799,8 @@ pub fn render(app: &mut App, frame: &mut ratatui::Frame, theme: &Theme, area: Re
     }
     app.ui.question.clicks = rendered;
     Paragraph::new(rows)
-        .block(
-            Block::new()
-                .borders(ratatui::widgets::Borders::LEFT)
-                .border_set(ratatui::symbols::border::Set {
-                    vertical_left: "┃",
-                    ..Default::default()
-                })
-                .border_style(theme.accent.to_color())
-                .style(Style::new().bg(theme.background_panel.to_color()))
-                .padding(Padding {
-                    left: 1,
-                    right: 3,
-                    top: 1,
-                    bottom: 1,
-                }),
-        )
+        .block(block)
+        .scroll((scroll as u16, 0))
         .render(area, frame.buffer_mut());
 }
 

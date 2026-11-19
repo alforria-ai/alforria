@@ -9,6 +9,7 @@ pub mod diff;
 pub mod edit;
 pub mod error;
 pub mod external_directory;
+pub(crate) mod file_path;
 pub mod glob;
 pub mod grep;
 pub mod invalid;

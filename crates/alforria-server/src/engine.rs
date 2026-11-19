@@ -888,7 +888,7 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
         .unwrap_or_else(|| Arc::new(runtime_models.clone()));
     let llm: Arc<dyn LlmStream> = input.seams.llm.clone().unwrap_or_else(|| {
         Arc::new(alforria_core::session::llm::LlmStreamImpl::new(Arc::new(
-            crate::provider_runtime::RouteLlmSender,
+            crate::provider_runtime::RouteLlmSender::default(),
         )))
     });
     // M7.3: the production git snapshot behind the M5 `Snapshot` seam

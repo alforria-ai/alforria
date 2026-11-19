@@ -18,6 +18,7 @@ thiserror = { workspace = true }
 jsonc-parser = { workspace = true }
 fs4 = { workspace = true }
 walkdir = { workspace = true }
+same-file = { workspace = true }
 sha2 = { workspace = true }
 sha1 = { workspace = true }
 hex = { workspace = true }
@@ -41,9 +42,9 @@ ulid = { workspace = true }
 regex = { workspace = true }
 rust_decimal = { workspace = true }
 tracing = { workspace = true }
+tempfile = "3"
 rquickjs = { workspace = true }
 
 [dev-dependencies]
 # `start_paused` for the M5.8 retry tests (deterministic clocks, no sleeps)
 tokio = { workspace = true, features = ["test-util"] }
-tempfile = "3"

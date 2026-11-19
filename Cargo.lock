@@ -85,6 +85,7 @@ dependencies = [
  "rquickjs",
  "rusqlite",
  "rust_decimal",
+ "same-file",
  "serde",
  "serde_json",
  "sha1",

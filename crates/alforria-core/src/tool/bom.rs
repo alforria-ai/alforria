@@ -50,14 +50,42 @@ pub async fn read_file(file_path: &Path) -> Result<Split, ToolError> {
 /// `writeWithDirs` (fs-util.ts:127): `create_dir_all(parent)` then write
 /// (spec §2.5).
 pub async fn write_with_dirs(file_path: &Path, contents: &str) -> Result<(), ToolError> {
-    if let Some(parent) = file_path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|e| ToolError::Failed(e.to_string()))?;
-    }
-    tokio::fs::write(file_path, contents)
-        .await
-        .map_err(|e| ToolError::Failed(e.to_string()))
+    let file_path = file_path.to_path_buf();
+    let contents = contents.to_string();
+    // Replace the directory entry, rather than truncating an inode that may
+    // have another protected hard-link name. Callers pin symlink resolution.
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        use std::io::Write;
+        let parent = file_path.parent().unwrap_or(Path::new("."));
+        std::fs::create_dir_all(parent)?;
+        // Match normal file creation permissions, including the umask.
+        let mut staged = tempfile::Builder::new().make_in(parent, |path| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(path)
+        })?;
+        match std::fs::metadata(&file_path) {
+            Ok(meta) => {
+                if meta.permissions().readonly() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "file is read-only",
+                    ));
+                }
+                staged.as_file().set_permissions(meta.permissions())?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        staged.write_all(contents.as_bytes())?;
+        staged.persist(&file_path).map_err(|error| error.error)?;
+        Ok(())
+    })
+    .await
+    .map_err(|error| ToolError::Failed(error.to_string()))?
+    .map_err(|error| ToolError::Failed(error.to_string()))
 }
 
 /// `Bom.syncFile` (bom.ts:22-27): re-writes the file when its BOM-ness
@@ -95,6 +123,27 @@ mod tests {
         assert_eq!(join("\u{feff}hi", false), "hi");
         assert_eq!(join("hi", true), "\u{feff}hi");
         assert_eq!(join("hi", false), "hi");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn atomic_writes_preserve_normal_creation_and_existing_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new("bom-permissions");
+        let normal = temp.path().join("normal");
+        let written = temp.path().join("written");
+        std::fs::write(&normal, "normal").unwrap();
+        write_with_dirs(&written, "new").await.unwrap();
+        assert_eq!(
+            std::fs::metadata(&written).unwrap().permissions().mode(),
+            std::fs::metadata(&normal).unwrap().permissions().mode(),
+        );
+        std::fs::set_permissions(&written, std::fs::Permissions::from_mode(0o750)).unwrap();
+        write_with_dirs(&written, "replacement").await.unwrap();
+        assert_eq!(
+            std::fs::metadata(&written).unwrap().permissions().mode() & 0o777,
+            0o750
+        );
     }
 
     #[tokio::test]

@@ -47,9 +47,20 @@ pub(crate) fn border_highlight(app: &App, theme: &Theme) -> Rgba {
     }
 }
 
-/// The inner textarea width: the frame pads left+right by 2.
+pub(crate) fn prompt_block(top_padding: u16) -> Block<'static> {
+    Block::new()
+        .borders(ratatui::widgets::Borders::LEFT)
+        .padding(Padding {
+            left: 2,
+            right: 2,
+            top: top_padding,
+            bottom: 0,
+        })
+}
+
+/// The textarea width after the frame's border and padding.
 fn inner_width(area: Rect) -> u16 {
-    area.width.saturating_sub(4).max(1)
+    prompt_block(0).inner(area).width.max(1)
 }
 
 /// The wrapped textarea rows (`Textarea::display`).
@@ -520,17 +531,10 @@ pub fn render(app: &App, frame: &mut ratatui::Frame, theme: &Theme, area: Rect) 
     }
     Paragraph::new(text)
         .block(
-            Block::new()
-                .borders(ratatui::widgets::Borders::LEFT)
+            prompt_block(0)
                 .border_set(split_border_set())
                 .border_style(border_highlight(app, theme).to_color())
-                .style(Style::new().bg(theme.background_element.to_color()))
-                .padding(Padding {
-                    left: 2,
-                    right: 2,
-                    top: 0,
-                    bottom: 0,
-                }),
+                .style(Style::new().bg(theme.background_element.to_color())),
         )
         .render(
             Rect {
@@ -752,6 +756,41 @@ mod caret_tests {
             }),
             "block cursor cell not rendered"
         );
+    }
+
+    #[test]
+    fn resizing_a_narrow_prompt_keeps_every_input_character_visible() {
+        let theme = theme();
+        for input in [
+            "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ",
+            "abcdefghijklmno\n0123456789XYZ\nlastline",
+            "abc界def🦀ghi界jkl🦀mno",
+        ] {
+            let mut app = app();
+            app.config.prompt_max_height = Some(100);
+            app.ui.prompt.textarea.set_text(input);
+            let expected = input.replace('\n', "");
+            for width in [32, 12, 20, 7, 80] {
+                let mut area = Rect::new(2, 1, width, 120);
+                area.height = height(&app, area, 128);
+                let backend = ratatui::backend::TestBackend::new(width + 4, 128);
+                let mut terminal = ratatui::Terminal::new(backend).unwrap();
+                terminal
+                    .draw(|frame| render(&app, frame, &theme, area))
+                    .unwrap();
+                let buffer = terminal.backend().buffer();
+                let mut visible = String::new();
+                // The textarea sits between the top padding and the four
+                // metadata/footer rows. Ignore blank wide-glyph cells.
+                for y in area.y + 1..area.bottom() - 4 {
+                    for x in area.x + 3..area.right() - 2 {
+                        visible.extend(buffer[(x, y)].symbol().chars().filter(|c| *c != ' '));
+                    }
+                }
+                assert_eq!(visible, expected, "input={input:?}, width={width}");
+                assert_eq!(app.ui.prompt.input(), input);
+            }
+        }
     }
 }
 
