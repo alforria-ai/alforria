@@ -1155,6 +1155,17 @@ be the only thing in the way is answered by whoever holds the session's
 token (`once`), or by `permission.unattended.on_timeout: "allow"`. A search
 that starts above such a location returns nothing from inside it.
 
+The judgement and the read are of one path. The tool gets back the
+resolved path that was judged and uses it for everything after: a file is
+opened through its parent directory's handle, reached from the root one
+component at a time with no link followed (`protect::open_read_at`, the
+read-side twin of the guarded write), so a component swapped for a link
+into a host location after the judgement — by the session's own shell —
+makes the open fail instead of landing there; a directory listing or a
+search is made on the resolved path and is discarded if that path no longer
+resolves to itself when it finishes. (A link swapped in *and back* while a
+search runs is not seen: the walk is by name.)
+
 What the server itself sends a session to stays readable: a place the
 agent's rules allow *by name* under `external_directory` in every reading of
 the policy — the saved tool outputs (`<data>/tool-output`), plans, skill and

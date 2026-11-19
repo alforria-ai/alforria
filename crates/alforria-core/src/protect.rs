@@ -714,16 +714,21 @@ impl WriteGuard {
     /// under `external_directory` — the saved tool outputs, plans, skill
     /// and reference directories the agent defaults whitelist, or a path
     /// the host config allows. A catch-all (`*`) names nothing.
-    pub fn admit_read(&self, target: &Path) -> Result<(), String> {
-        let Err(refusal) = self.protected.judge_read(target) else {
-            return Ok(());
+    ///
+    /// `Ok` is the resolved path that was judged: what the caller then
+    /// opens, lists or walks is that path ([`open_read_at`] for a file),
+    /// never the spelling looked up again.
+    pub fn admit_read(&self, target: &Path) -> Result<PathBuf, String> {
+        let refusal = match self.protected.judge_read(target) {
+            Ok(resolved) => return Ok(resolved),
+            Err(refusal) => refusal,
         };
-        let named = refusal.landing.as_ref().is_some_and(|resolved| {
+        let named = refusal.landing.as_ref().filter(|resolved| {
             self.policy
                 .allows_by_name("external_directory", &resolved.to_string_lossy())
         });
-        if named {
-            return Ok(());
+        if let Some(resolved) = named {
+            return Ok(resolved.clone());
         }
         Err(format!(
             "{}. This session is restricted or was started by outside input, so it may not \
@@ -731,6 +736,23 @@ impl WriteGuard {
             refusal.reason
         ))
     }
+}
+
+/// Open the file at `resolved` for reading — a path a guard judged
+/// ([`WriteGuard::admit_read`], [`Protected::judge_read`]): absolute,
+/// resolved, no link in it. Like a guarded write ([`write_at`]), it is
+/// opened on the path that was judged and not on a name looked up again:
+/// its parent is opened from the root one component at a time with no link
+/// followed, and the file through that handle, not followed either. A
+/// component swapped for a link after the judgement makes this fail
+/// instead of opening what the link leads to. The open does not wait on a
+/// FIFO; what was opened is for the caller to check on the handle.
+pub fn open_read_at(resolved: &Path) -> std::io::Result<std::fs::File> {
+    let (Some(parent), Some(name)) = (resolved.parent(), resolved.file_name()) else {
+        // The root itself: nothing to swap.
+        return crate::beneath::open_nonblocking(resolved);
+    };
+    crate::beneath::NoFollowDir::open(parent, false)?.open_file(name)
 }
 
 /// Write `contents` to `landing` — a path a guard judged

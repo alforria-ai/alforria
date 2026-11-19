@@ -133,10 +133,46 @@ impl InstanceContext {
     /// directory, calls this with the path it is about to open**, before
     /// it raises any ask: a guarded session does not read the host's own
     /// locations (`protect::WriteGuard::admit_read`), and is not asked.
-    pub fn about_to_read(&self, path: &Path) -> Result<(), ToolError> {
+    ///
+    /// The answer is the path to use for everything that follows — the
+    /// stat, the open ([`InstanceContext::open_for_read`]), the listing,
+    /// the walk: for a guarded session the resolved path that was judged,
+    /// so that a link swapped into the spelling afterwards changes nothing;
+    /// for any other session the path as given.
+    pub fn about_to_read(&self, path: &Path) -> Result<PathBuf, ToolError> {
         match &self.write_guard {
-            None => Ok(()),
+            None => Ok(path.to_path_buf()),
             Some(guard) => guard.admit_read(path).map_err(ToolError::Permission),
+        }
+    }
+
+    /// Open the file at `judged` ([`InstanceContext::about_to_read`]'s
+    /// answer) for reading, without waiting on it (a FIFO opens at once
+    /// and is for the caller to refuse on the handle).
+    pub async fn open_for_read(&self, judged: &Path) -> std::io::Result<std::fs::File> {
+        let (guarded, judged) = (self.write_guard.is_some(), judged.to_path_buf());
+        tokio::task::spawn_blocking(move || match guarded {
+            true => crate::protect::open_read_at(&judged),
+            false => crate::beneath::open_nonblocking(&judged),
+        })
+        .await
+        .unwrap_or_else(|join| Err(std::io::Error::other(join.to_string())))
+    }
+
+    /// After a listing or a walk of `judged`: in a guarded session it must
+    /// still be the place that was judged — nothing on the way swapped for
+    /// a link since — and still one the session may read.
+    pub fn still_judged(&self, judged: &Path) -> Result<(), ToolError> {
+        let Some(guard) = &self.write_guard else {
+            return Ok(());
+        };
+        match guard.admit_read(judged) {
+            Ok(resolved) if resolved == judged => Ok(()),
+            Ok(_) => Err(ToolError::Permission(format!(
+                "{} changed while it was being read",
+                judged.display()
+            ))),
+            Err(reason) => Err(ToolError::Permission(reason)),
         }
     }
 

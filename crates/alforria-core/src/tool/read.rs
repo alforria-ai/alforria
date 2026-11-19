@@ -99,11 +99,13 @@ fn run(
         // before anything can fail, so a failed read is judged by it too.
         ctx.extra.returned_paths.report_opened(&filepath);
         // alforria extension: a guarded session does not open the host's
-        // own files, and is not asked whether it may.
-        instance.about_to_read(&filepath)?;
+        // own files, and is not asked whether it may. `target` is what is
+        // looked at from here on: the path as given, or — guarded — the
+        // resolved path that was judged. `filepath` is what is shown.
+        let target = instance.about_to_read(&filepath)?;
         let title = ts_relative(&instance.worktree, &filepath);
 
-        let stat = tokio::fs::metadata(&filepath).await.ok();
+        let stat = tokio::fs::metadata(&target).await.ok();
         let kind = match &stat {
             Some(stat) if stat.is_dir() => Kind::Directory,
             _ => Kind::File,
@@ -133,21 +135,27 @@ fn run(
         };
 
         if stat.is_dir() {
-            return directory_result(&params, &filepath, &title).await;
+            let listed = directory_result(&params, &target, &filepath, &title).await;
+            instance.still_judged(&target)?;
+            return listed;
         }
 
         // `Instruction.resolve` seam — returns nothing in M4 (spec §9 S2).
         let loaded: Vec<String> = Vec::new();
 
-        let sample = read_sample(&filepath, stat.len()).await;
-        let mime = sniff_attachment_mime(&sample, &mime_type(&filepath));
+        // alforria extension: the file is opened once, without waiting on
+        // it, and everything else is asked of that handle — in a guarded
+        // session the handle of the path that was judged
+        // (`InstanceContext::open_for_read`). Upstream stats, samples and
+        // reads by name, three times: a FIFO parked a thread on the first
+        // open, and a link swapped in between two of them changed the file.
+        let bytes = read_regular_file(instance, &target, &filepath).await?;
+        let sample = &bytes[..SAMPLE_BYTES.min(bytes.len())];
+        let mime = sniff_attachment_mime(sample, &mime_type(&filepath));
         let is_image = SUPPORTED_IMAGE_MIMES.contains(&mime.as_str());
         let is_pdf = mime == "application/pdf";
 
         if is_image || is_pdf {
-            let bytes = tokio::fs::read(&filepath)
-                .await
-                .map_err(|e| ToolError::Failed(e.to_string()))?;
             let msg = if is_pdf {
                 "PDF read successfully"
             } else {
@@ -173,7 +181,7 @@ fn run(
             });
         }
 
-        if is_binary_file(&filepath, &sample) {
+        if is_binary_file(&filepath, sample) {
             return Err(ToolError::Failed(format!(
                 "Cannot read binary file: {}",
                 filepath.display()
@@ -181,11 +189,10 @@ fn run(
         }
 
         let file = read_lines(
-            &filepath,
+            &bytes,
             params.limit.unwrap_or(DEFAULT_READ_LIMIT as u64),
             params.offset.unwrap_or(0),
-        )
-        .await?;
+        );
 
         if file.count < file.offset && !(file.count == 0 && file.offset == 1) {
             return Err(ToolError::Failed(format!(
@@ -259,11 +266,37 @@ struct Lines {
     offset: u64,
 }
 
-async fn read_lines(filepath: &Path, limit: u64, offset: u64) -> Result<Lines, ToolError> {
-    let bytes = tokio::fs::read(filepath)
-        .await
-        .map_err(|e| ToolError::Failed(e.to_string()))?;
-    let text = String::from_utf8_lossy(bytes.as_slice());
+/// The whole of the regular file at `target` (`about_to_read`'s answer),
+/// through one handle. `shown` names it in an error.
+async fn read_regular_file(
+    instance: &crate::tool::def::InstanceContext,
+    target: &Path,
+    shown: &Path,
+) -> Result<Vec<u8>, ToolError> {
+    let failed = |error: std::io::Error| ToolError::Failed(error.to_string());
+    let mut file = instance.open_for_read(target).await.map_err(failed)?;
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        if !file.metadata()?.is_file() {
+            return Ok(None);
+        }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(Some(bytes))
+    })
+    .await
+    .unwrap_or_else(|join| Err(std::io::Error::other(join.to_string())))
+    .map_err(failed)?
+    .ok_or_else(|| {
+        ToolError::Failed(format!(
+            "Cannot read {}: not a regular file",
+            shown.display()
+        ))
+    })
+}
+
+fn read_lines(bytes: &[u8], limit: u64, offset: u64) -> Lines {
+    let text = String::from_utf8_lossy(bytes);
 
     let offset = if offset == 0 { 1 } else { offset };
     let start = offset - 1;
@@ -301,13 +334,13 @@ async fn read_lines(filepath: &Path, limit: u64, offset: u64) -> Result<Lines, T
         }
     }
 
-    Ok(Lines {
+    Lines {
         raw,
         count,
         cut,
         more,
         offset,
-    })
+    }
 }
 
 /// Effect `Stream.splitLines`: `\n`, `\r\n` and standalone `\r` terminate
@@ -353,12 +386,14 @@ fn split_lines(text: &str) -> impl Iterator<Item = &str> {
     })
 }
 
+/// The listing of the directory at `target`, shown as `filepath`.
 async fn directory_result(
     params: &ReadParameters,
+    target: &Path,
     filepath: &Path,
     title: &str,
 ) -> Result<ExecuteResult, ToolError> {
-    let items = list_directory(filepath).await?;
+    let items = list_directory(target).await?;
     let limit = params.limit.unwrap_or(DEFAULT_READ_LIMIT as u64);
     // `params.offset || 1` — a zero or missing offset reads from line 1.
     let offset = match params.offset {
@@ -488,25 +523,6 @@ fn warm_lsp(filepath: &Path, lsp: &Option<Arc<dyn ReadLsp>>) {
             lsp.touch_file(&filepath).await;
         });
     }
-}
-
-/// `readSample` (read.ts:122-135): the first `min(sample, size)` bytes.
-async fn read_sample(filepath: &Path, file_size: u64) -> Vec<u8> {
-    if file_size == 0 {
-        return Vec::new();
-    }
-    let take = SAMPLE_BYTES.min(file_size as usize);
-    use tokio::io::AsyncReadExt;
-    let mut file = match tokio::fs::File::open(filepath).await {
-        Ok(file) => file,
-        Err(_) => return Vec::new(),
-    };
-    let mut sample = vec![0u8; take];
-    match file.read(&mut sample).await {
-        Ok(n) => sample.truncate(n),
-        Err(_) => return Vec::new(),
-    }
-    sample
 }
 
 /// `isBinaryFile` (read.ts:182-227).
@@ -660,6 +676,105 @@ mod tests {
         .unwrap();
         let golden: Value = serde_json::from_str(&golden).unwrap();
         assert_eq!(parameters(), golden);
+    }
+
+    /// A guarded session's tree: a project, and a host location beside it
+    /// that holds a secret.
+    #[cfg(unix)]
+    fn guarded(root: &Path) -> (crate::tool::def::InstanceContext, std::path::PathBuf) {
+        let project = root.join("project");
+        for dir in ["project/sub", "data", "home", "config", "cache", "state"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        std::fs::write(root.join("data/auth.json"), "HOST-SECRET").unwrap();
+        std::fs::write(project.join("sub/auth.json"), "innocent").unwrap();
+        let paths = crate::GlobalPaths {
+            home: root.join("home"),
+            config: root.join("config"),
+            data: root.join("data"),
+            cache: root.join("cache"),
+            state: root.join("state"),
+        };
+        let protected = crate::protect::Protected::host(&paths, &root.join("managed"), true);
+        let mut inst = instance(&project);
+        inst.write_guard = Some(Arc::new(crate::protect::WriteGuard {
+            protected: Arc::new(protected),
+            policy: Default::default(),
+            worktree: project.clone(),
+        }));
+        (inst, project)
+    }
+
+    /// The judgement and the open are of one path: a component swapped for
+    /// a link into a host location after the path was judged — by the
+    /// session's own shell, say — does not make the open land there.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_guarded_read_opens_what_was_judged_not_where_a_swapped_link_leads() {
+        let temp = crate::storage::test_support::TempDir::new("read-swap");
+        let root = temp.path().canonicalize().unwrap();
+        let (inst, project) = guarded(&root);
+        let spelled = project.join("sub/auth.json");
+
+        let judged = inst.about_to_read(&spelled).expect("a project file");
+        // Between the judgement and the open.
+        std::fs::rename(project.join("sub"), project.join("sub.real")).unwrap();
+        symlink(root.join("data"), project.join("sub")).unwrap();
+
+        let opened = inst.open_for_read(&judged).await;
+        let read = opened.and_then(|mut file| {
+            let mut text = String::new();
+            std::io::Read::read_to_string(&mut file, &mut text).map(|_| text)
+        });
+        assert!(
+            read.is_err(),
+            "the open followed the swapped link: {read:?}"
+        );
+        // Judged now, the same spelling is refused outright.
+        assert!(inst.about_to_read(&spelled).is_err());
+        // And the whole tool, on a path that was a link all along, reads
+        // what the link led to when it was judged — or nothing.
+        std::fs::remove_file(project.join("sub")).unwrap();
+        symlink(project.join("sub.real"), project.join("sub")).unwrap();
+        let def = tool(&root);
+        let ask = RecordingAsk::new();
+        let extra = Extra::default();
+        let result = (def.execute)(
+            json!({ "filePath": spelled.to_string_lossy() }),
+            ctx(&ask, &inst, &extra),
+        )
+        .await
+        .unwrap();
+        assert!(result.output.contains("innocent"), "{}", result.output);
+    }
+
+    /// A FIFO nobody writes to blocks an open for ever. The tool opens
+    /// without waiting and refuses what is not a regular file — for every
+    /// session.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_read_tool_refuses_a_fifo_instead_of_waiting_on_it() {
+        let temp = crate::storage::test_support::TempDir::new("read-fifo");
+        let fifo = temp.path().join("pipe");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
+        let args = json!({ "filePath": fifo.to_string_lossy() });
+        let answered =
+            tokio::time::timeout(std::time::Duration::from_secs(2), call(temp.path(), args)).await;
+        let Ok((result, _)) = answered else {
+            // Let the reader go, so the runtime can shut down.
+            use std::os::unix::fs::OpenOptionsExt;
+            let _writer = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&fifo);
+            panic!("the read tool waited on a FIFO");
+        };
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("not a regular file"), "{error}");
     }
 
     #[tokio::test]

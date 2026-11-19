@@ -244,6 +244,17 @@ pre-1.0, so minor releases may include breaking changes.
 
 ### Fixed
 
+- The read guard judged a path and the tool then opened the spelling
+  again, so a path component swapped for a link into a host location
+  between the two — by the session's own shell — was followed. A guarded
+  session's `read`, `grep`, `glob` and file attachments now use the
+  resolved path that was judged; a file is opened through its parent
+  directory's handle with no link followed, and a listing or search is
+  discarded when its root no longer resolves to itself afterwards.
+- The `read` tool stat'ed, sampled and read a file by name, three opens,
+  and waited for ever on a FIFO. It now opens the file once without
+  waiting, for every session, and answers "not a regular file" for a
+  FIFO, socket or device.
 - Documented, and held by a test, that no alforria entry point reads
   `OPENCODE_CONFIG`, `OPENCODE_CONFIG_DIR`, `OPENCODE_CONFIG_CONTENT` or
   `OPENCODE_PERMISSION`: the loader supports them, nothing passes the

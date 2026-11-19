@@ -83,7 +83,8 @@ fn run(
 
         // alforria extension: a guarded session does not list the host's
         // own locations, and is not asked whether it may.
-        instance.about_to_read(&search)?;
+        // What is stat'ed and walked from here on is the judged path.
+        let search = instance.about_to_read(&search)?;
         let info = tokio::fs::metadata(&search).await.ok();
         if info.map(|info| info.is_file()).unwrap_or(false) {
             return Err(ToolError::Failed(format!(
@@ -115,6 +116,8 @@ fn run(
             // A walk from above a host location reaches into it.
             .filter(|file| instance.may_return(file))
             .collect();
+        // And the walk was of the place that was judged.
+        instance.still_judged(&search)?;
         reported.report(&search, files.iter(), !truncated);
 
         let mut output: Vec<String> = Vec::new();

@@ -968,15 +968,17 @@ Open product decisions:
 
 New in this round and left (found while fixing, not fixed):
 
-- The `read` tool itself opens by name and will wait on a FIFO in a
-  blocking thread (not an async worker); only the HTTP read routes and the
-  inlined prompt file part were moved to the bounded, non-blocking read.
 - `alforria run` and the other one-shot commands still degrade an
   unparseable global config to an empty one (upstream's behaviour); only
   server processes keep or require a good host config.
-- The host-config snapshot is a registry keyed by the global config
-  directory inside the process; `OPENCODE_CONFIG*` environment sources are
-  not part of it (the server does not pass those flags to the loader).
+- No entry point passes `OPENCODE_CONFIG`, `OPENCODE_CONFIG_DIR`,
+  `OPENCODE_CONFIG_CONTENT`, `OPENCODE_PERMISSION` (or, for the config
+  load, `OPENCODE_DISABLE_PROJECT_CONFIG` / `_AUTOCOMPACT` / `_PRUNE`) to
+  the config loader: upstream honours them, alforria ignores them. Whether
+  to wire them is open; the loader already holds them under a frozen
+  snapshot if they are.
+- A guarded `grep` / `glob` walks by name: a link swapped into the judged
+  root and back while the walk runs is not detected.
 - A frozen server's `PATCH /global/config` applies the request to the
   remembered config without `{env:}` / `{file:}` substitution until the
   next start.

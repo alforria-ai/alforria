@@ -1095,6 +1095,7 @@ async fn exec_read(
     agent: &str,
     args: Value,
     extra_model: Option<Value>,
+    read_guard: Option<std::sync::Arc<crate::protect::WriteGuard>>,
 ) -> Result<ExecuteResult, String> {
     let ask = NoopAsk;
     let extra = Extra {
@@ -1115,7 +1116,9 @@ async fn exec_read(
         instance: &crate::tool::def::InstanceContext {
             directory: deps.worktree.clone(),
             worktree: deps.worktree.clone(),
-            write_guard: None,
+            // A guarded session's attachment is read as its `read` tool
+            // reads: judged, and opened where it was judged.
+            write_guard: read_guard,
         },
         ask: &ask,
         metadata: &ask,
@@ -1388,22 +1391,39 @@ async fn resolve_file_part(
             // A guarded session — restricted, or one outside input started
             // a run in — is attached nothing from the host's own locations,
             // as its `read` tool is refused them (`protect`).
-            if deps.sessions.runs_restricted(session_id) {
+            // What is read from here on is the resolved path that was
+            // judged, opened as judged (`read_guard`, `open_read_at`): a
+            // link swapped into the spelling afterwards changes nothing.
+            let guarded = deps.sessions.runs_restricted(session_id);
+            let filepath = if guarded {
                 let absolute = if filepath.is_absolute() {
                     filepath.clone()
                 } else {
                     deps.directory.join(&filepath)
                 };
-                if let Err(refusal) = deps.agents.protected().judge_read(&absolute) {
-                    return Err(PromptError::Forbidden {
-                        message: format!(
-                            "{}. This session is restricted or was started by outside input, \
-                             so nothing there is attached to it.",
-                            refusal.reason
-                        ),
-                    });
+                match deps.agents.protected().judge_read(&absolute) {
+                    Ok(resolved) => resolved,
+                    Err(refusal) => {
+                        return Err(PromptError::Forbidden {
+                            message: format!(
+                                "{}. This session is restricted or was started by outside \
+                                 input, so nothing there is attached to it.",
+                                refusal.reason
+                            ),
+                        })
+                    }
                 }
-            }
+            } else {
+                filepath
+            };
+            // The guard the read tool runs under for this part.
+            let read_guard = guarded.then(|| {
+                std::sync::Arc::new(crate::protect::WriteGuard {
+                    protected: deps.agents.protected(),
+                    policy: ag.permission.clone(),
+                    worktree: deps.worktree.clone(),
+                })
+            });
             let part_mime = if filepath.is_dir() {
                 "application/x-directory".to_string()
             } else {
@@ -1476,6 +1496,7 @@ async fn resolve_file_part(
                     &agent,
                     args_value,
                     Some(full_value),
+                    read_guard.clone(),
                 )
                 .await
                 {
@@ -1529,7 +1550,17 @@ async fn resolve_file_part(
                 let (args_text, args_value) =
                     json_read_args(&filepath.to_string_lossy(), None, None);
                 let agent = input.agent.as_deref().unwrap_or(&ag.name).to_string();
-                match exec_read(deps, session_id, message_id, &agent, args_value, None).await {
+                match exec_read(
+                    deps,
+                    session_id,
+                    message_id,
+                    &agent,
+                    args_value,
+                    None,
+                    read_guard.clone(),
+                )
+                .await
+                {
                     Err(message) => {
                         publish_session_error(deps, session_id, &message)?;
                         return Ok(vec![synthetic_text(
@@ -1572,8 +1603,11 @@ async fn resolve_file_part(
             let bytes = {
                 let opened = filepath.clone();
                 tokio::task::spawn_blocking(move || {
-                    let file = crate::beneath::open_nonblocking(&opened)
-                        .map_err(crate::beneath::ReadRegularError::Io)?;
+                    let file = match guarded {
+                        true => crate::protect::open_read_at(&opened),
+                        false => crate::beneath::open_nonblocking(&opened),
+                    }
+                    .map_err(crate::beneath::ReadRegularError::Io)?;
                     crate::beneath::read_regular(file, MAX_FILE_PART_BYTES)
                 })
                 .await

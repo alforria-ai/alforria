@@ -527,6 +527,27 @@ impl NoFollowDir {
         Ok(unsafe { File::from_raw_fd(fd) })
     }
 
+    /// Open `name` in the directory for reading: a link by that name is
+    /// not followed (a refusal), and the open does not wait (`O_NONBLOCK`:
+    /// a FIFO opens at once, for the caller to refuse on the handle).
+    pub fn open_file(&self, name: &std::ffi::OsStr) -> io::Result<File> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::ffi::OsStrExt;
+        let name = Self::name(name.as_bytes())?;
+        let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+        // SAFETY: the directory is open, `name` a valid C string; checked.
+        let fd = unsafe { libc::openat(self.fd.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            let error = io::Error::last_os_error();
+            return Err(match error.raw_os_error() {
+                Some(libc::ELOOP) | Some(libc::EMLINK) => Self::link_error(error),
+                _ => error,
+            });
+        }
+        // SAFETY: a descriptor this call just opened.
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
     /// Rename `from` to `to`, both in this directory; `to` is replaced, a
     /// link by that name included (it is not followed).
     pub fn rename(&self, from: &std::ffi::OsStr, to: &std::ffi::OsStr) -> io::Result<()> {
@@ -629,6 +650,13 @@ impl NoFollowDir {
 
     pub fn remove_file(&self, name: &std::ffi::OsStr) -> io::Result<()> {
         by_name::remove_file(&self.path, name)
+    }
+
+    /// By name, once the path still resolves to itself.
+    pub fn open_file(&self, name: &std::ffi::OsStr) -> io::Result<File> {
+        let path = self.path.join(name);
+        by_name::unchanged(&path)?;
+        File::open(path)
     }
 
     /// Without a no-replace rename by handle: a look, then the rename.

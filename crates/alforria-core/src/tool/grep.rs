@@ -89,7 +89,8 @@ fn run(
 
         // alforria extension: a guarded session does not search the host's
         // own locations, and is not asked whether it may.
-        instance.about_to_read(&requested)?;
+        // What is stat'ed and walked from here on is the judged path.
+        let requested = instance.about_to_read(&requested)?;
         let requested_info = tokio::fs::metadata(&requested).await.ok();
         assert_external_directory(
             &ctx,
@@ -142,6 +143,8 @@ fn run(
             // A walk from above a host location reaches into it.
             .filter(|(path, _, _)| instance.may_return(path))
             .collect();
+        // And the walk was of the place that was judged.
+        instance.still_judged(&requested)?;
         if rows.is_empty() {
             return empty_result(&params.pattern);
         }
