@@ -18,6 +18,7 @@ thiserror = { workspace = true }
 jsonc-parser = { workspace = true }
 fs4 = { workspace = true }
 walkdir = { workspace = true }
+same-file = { workspace = true }
 sha2 = { workspace = true }
 sha1 = { workspace = true }
 hex = { workspace = true }
@@ -26,8 +27,10 @@ indexmap = { workspace = true }
 rand = { workspace = true }
 tree-sitter = { workspace = true }
 tree-sitter-bash = { workspace = true }
+shlex = { workspace = true }
 similar = { workspace = true }
 grep-regex = { workspace = true }
+grep-matcher = { workspace = true }
 grep-searcher = { workspace = true }
 base64 = { workspace = true }
 tokio-util = { workspace = true }

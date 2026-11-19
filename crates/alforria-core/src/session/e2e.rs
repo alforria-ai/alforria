@@ -1082,6 +1082,65 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn builtin_review_accepts_short_and_full_commit_hashes() {
+        for arguments in ["", "011a4a4", "011a4a4e9f0a1b2c3d4e5f678901234567890abc"] {
+            let e = engine(
+                "e2e-builtin-review",
+                vec![text_stream("Review complete."), text_stream("No findings.")],
+            );
+            let session = create_engine_session(&e);
+            let mut command = goal_command(&session.id, arguments);
+            command.command = "review".to_string();
+            tokio::time::timeout(TIMEOUT, e.prompt.command(command))
+                .await
+                .expect("review finishes")
+                .expect("the advertised built-in review command resolves");
+            let child = child_of(&e, &session.id);
+            let prompts = user_texts(&e, &child).join("\n");
+            assert!(
+                prompts.contains(&format!("Input: {arguments}")),
+                "{prompts}"
+            );
+            assert!(!prompts.contains("$ARGUMENTS"));
+            assert_eq!(e.llm.calls(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_review_overrides_the_builtin() {
+        let e = engine_with_config(
+            "e2e-custom-review",
+            vec![text_stream("Custom review complete.")],
+            json!({"command": {"review": {"template": "Custom review for $ARGUMENTS", "subtask": false}}}),
+        );
+        let session = create_engine_session(&e);
+        let mut command = goal_command(&session.id, "abc1234");
+        command.command = "review".to_string();
+        e.prompt
+            .command(command)
+            .await
+            .expect("custom review resolves");
+        assert_eq!(user_texts(&e, &session.id), ["Custom review for abc1234"]);
+        assert_eq!(e.llm.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn builtin_init_uses_the_shared_template() {
+        let e = engine("e2e-builtin-init", vec![text_stream("Setup complete.")]);
+        let session = create_engine_session(&e);
+        let mut command = goal_command(&session.id, "");
+        command.command = "init".to_string();
+        e.prompt
+            .command(command)
+            .await
+            .expect("built-in init resolves");
+        let prompts = user_texts(&e, &session.id).join("\n");
+        assert!(prompts.contains("AGENTS.md"));
+        assert!(prompts.contains(e.worktree.to_string_lossy().as_ref()));
+        assert_eq!(e.llm.calls(), 1);
+    }
+
     fn verdict(json: &str) -> Vec<Result<LlmEvent, LlmError>> {
         text_stream(json)
     }

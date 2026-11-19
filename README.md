@@ -71,6 +71,16 @@ alforria attach http://localhost:4096
 See the [quickstart](https://alforria.ai/docs/quickstart.html) for provider
 setup, model selection, and the first session.
 
+In the TUI, `/copy` copies the last assistant message as Markdown.
+`/copythread` copies the full conversation. To restore whole-conversation
+copying for `/copy`, add this to your global or project `tui.json`:
+
+```json
+{ "copy_mode": "thread" }
+```
+
+The default `copy_mode` is `"last_message"`.
+
 ## What's inside
 
 - **Terminal UI.** A ratatui chat view with sessions, subagents, diffs,
@@ -92,6 +102,19 @@ setup, model selection, and the first session.
   XDG config paths, and SQLite session storage. Compatibility is tested
   against frozen fixtures from the upstream project; user-facing surfaces use
   the alforria name.
+
+## Reviewing changes
+
+Use `/review` for uncommitted changes or `/review <hash>` for a commit
+(short and full hashes work). In the TUI, type `/review ` to browse recent
+commits by hash or subject. Tab fills a suggestion; arrow keys and Enter
+review a selected entry. Enter without a selection reviews what you typed.
+Branch names and pull request references also work.
+
+Completion uses alforria's `GET /experimental/vcs/commits` extension,
+outside the pinned API documents. It returns up to 50 recent commits from
+the selected directory or workspace. Typed targets remain usable when
+completion is unavailable.
 
 ## Documentation
 

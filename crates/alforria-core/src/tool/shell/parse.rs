@@ -150,6 +150,73 @@ impl BashParser {
     }
 }
 
+/// A literal POSIX argv for command-specific option parsing. Check the syntax
+/// tree before removing quotes and escapes, since the flat parts can omit
+/// expansions. Redirections are inspected separately.
+pub(super) fn literal_command(source: &str) -> Option<Vec<String>> {
+    fn literal(node: tree_sitter::Node<'_>, source: &str) -> bool {
+        let text = &source[node.byte_range()];
+        match node.kind() {
+            "word" => {
+                !text.contains(['*', '?', '[', '{', '}', '~', '$', '`', '!'])
+                    && !text.starts_with('=')
+            }
+            "number" => text.bytes().all(|byte| byte.is_ascii_digit()),
+            "raw_string" => true,
+            "string" => {
+                let mut cursor = node.walk();
+                let plain = node
+                    .named_children(&mut cursor)
+                    .all(|child| child.kind() == "string_content");
+                plain && !text.contains(['$', '`', '!'])
+            }
+            "command_name" | "concatenation" => {
+                let mut cursor = node.walk();
+                let all_literal = node
+                    .named_children(&mut cursor)
+                    .all(|child| literal(child, source));
+                all_literal
+            }
+            _ => false,
+        }
+    }
+
+    // A backslash-newline joins two lines into one word for the shell
+    // (`-\<newline>e` is `-e`), but the grammar reads it as a gap between
+    // words. Leave such a command to the general path scan.
+    if source.contains("\\\n") {
+        return None;
+    }
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_bash::LANGUAGE.into())
+        .ok()?;
+    let tree = parser.parse(source, None)?;
+    if tree.root_node().has_error() {
+        return None;
+    }
+    let nodes = commands(tree.root_node());
+    let [command] = nodes.as_slice() else {
+        return None;
+    };
+    let name = command.child_by_field_name("name")?;
+    let mut nodes = vec![name];
+    let mut cursor = command.walk();
+    nodes.extend(command.children_by_field_name("argument", &mut cursor));
+    nodes
+        .into_iter()
+        .map(|node| {
+            let raw = &source[node.byte_range()];
+            if !literal(node, source) || raw.contains('\0') {
+                return None;
+            }
+            let mut lexer = shlex::Shlex::new(raw);
+            let argument = lexer.next()?;
+            (lexer.next().is_none() && !lexer.had_error).then_some(argument)
+        })
+        .collect()
+}
+
 impl ShellParser for BashParser {
     fn parse(&self, command: &str) -> Result<Vec<CommandNode>> {
         let mut parser = tree_sitter::Parser::new();
@@ -271,6 +338,22 @@ mod tests {
             .iter()
             .map(|p| (p.kind.clone(), p.text.clone()))
             .collect()
+    }
+
+    #[test]
+    fn literal_command_decodes_quoted_words_and_numbers() {
+        assert_eq!(
+            literal_command(r#"demo -A 2 one\ word 'single 'quote "two "words"#).unwrap(),
+            ["demo", "-A", "2", "one word", "single quote", "two words"]
+        );
+        for source in [
+            r#"demo "$value""#,
+            "demo *.txt",
+            "demo ~/file",
+            "demo -\\\ne value",
+        ] {
+            assert_eq!(literal_command(source), None, "{source}");
+        }
     }
 
     #[test]

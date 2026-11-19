@@ -313,6 +313,75 @@ async fn instance_vcs_status_and_command() {
 }
 
 #[tokio::test]
+async fn review_commit_completion_uses_the_requested_repository() {
+    let f = fixture();
+    let other = f._dir.path().join("other repo");
+    std::fs::create_dir_all(&other).unwrap();
+    for (directory, subject) in [
+        (&f.worktree, "first repository"),
+        (&other, "selected repository"),
+    ] {
+        for args in [
+            vec!["init", "--quiet"],
+            vec![
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                subject,
+            ],
+        ] {
+            let result = std::process::Command::new("git")
+                .args(args)
+                .current_dir(directory)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+    }
+    let router = routes::build_router(f.ctx.clone());
+    let response = send(
+        &router,
+        "GET",
+        &instance_uri(&other, "experimental/vcs/commits"),
+        "",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let commits: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+    assert_eq!(commits.as_array().unwrap().len(), 1);
+    assert_eq!(commits[0]["subject"], "selected repository");
+    assert!(matches!(
+        commits[0]["hash"].as_str().unwrap().len(),
+        40 | 64
+    ));
+    assert!(commits[0]["hash"]
+        .as_str()
+        .unwrap()
+        .starts_with(commits[0]["shortHash"].as_str().unwrap()));
+
+    let empty = f._dir.path().join("not a repository");
+    std::fs::create_dir_all(&empty).unwrap();
+    let response = send(
+        &router,
+        "GET",
+        &instance_uri(&empty, "experimental/vcs/commits"),
+        "",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_string(response).await, "[]");
+}
+
+#[tokio::test]
 async fn instance_agent_skill_lsp_formatter() {
     let f = fixture();
     let router = routes::build_router(f.ctx.clone());

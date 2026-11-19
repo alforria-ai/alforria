@@ -524,6 +524,25 @@ mod tests {
     }
 
     #[test]
+    fn copy_mode_loads_from_tui_json_with_project_override() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = paths(home.path());
+        std::fs::create_dir_all(&paths.config).unwrap();
+        std::fs::write(paths.config.join("tui.json"), r#"{"copy_mode": "thread"}"#).unwrap();
+        let project = home.path().join("work/repo");
+        std::fs::create_dir_all(&project).unwrap();
+        assert_eq!(
+            load(&project, &paths, &Flags::default()).copy_mode,
+            alforria_tui::config::CopyMode::Thread
+        );
+        std::fs::write(project.join("tui.json"), r#"{"copy_mode": "last_message"}"#).unwrap();
+        assert_eq!(
+            load(&project, &paths, &Flags::default()).copy_mode,
+            alforria_tui::config::CopyMode::LastMessage
+        );
+    }
+
+    #[test]
     fn precedence_env_project_and_dot_opencode() {
         let home = tempfile::tempdir().unwrap();
         let paths = paths(home.path());

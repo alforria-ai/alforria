@@ -667,8 +667,7 @@ pub enum Effect {
     SessionBackground {
         session_id: String,
     },
-    /// `session.copy` — clipboard write of `formatTranscript(...)`
-    /// (TODO(M8.8): the transcript formatter).
+    /// Full transcript for `/copythread` or `/copy` in thread mode.
     SessionCopyTranscript {
         thinking: bool,
         tool_details: bool,
@@ -729,6 +728,9 @@ pub enum Effect {
     FindFiles {
         query: String,
         workspace: Option<String>,
+    },
+    ReviewCommits {
+        location: crate::transport::api::Location,
     },
     /// After an SSE reconnect: `GET /session/status` replaces the statuses.
     SessionStatusRefresh,
@@ -1250,6 +1252,9 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             workspace: app.state.project.workspace.current.clone(),
         });
     }
+    if let Some(location) = app.ui.prompt.autocomplete.review_request.take() {
+        effects.push(Effect::ReviewCommits { location });
+    }
     app.version += 1;
     effects.extend(crate::app::post_update(app));
     effects
@@ -1408,6 +1413,7 @@ pub fn animating(app: &App) -> bool {
     !app.ui.startup_ready
         || app.ui.startup_loading.visible()
         || app.ui.prompt.submitting
+        || app.ui.prompt.autocomplete.review_loading()
         || crate::ui::workflows::animating(app)
         || app.state.sync.session_status.values().any(|status| {
             matches!(

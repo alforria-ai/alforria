@@ -21,6 +21,7 @@ pub mod prompt;
 pub mod prompt_input;
 pub mod revert;
 pub mod schema;
+pub mod vcs;
 
 // M1.2 — Provider & model
 pub mod model;

@@ -96,21 +96,17 @@ pub fn get_forked_title(title: &str) -> String {
 }
 
 /// `sessionPath` (session.ts:171-173): relpath with `/` separators.
+///
+/// `path.relative` yields the empty string when both paths are equal — a
+/// session in the worktree root stores `""`, not `"."` (`path.relative`
+/// parity; opencode stores the same).
 pub fn session_path(worktree: &Path, cwd: &Path) -> String {
     let worktree = worktree
         .canonicalize()
         .unwrap_or_else(|_| worktree.to_path_buf());
     let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
     match cwd.strip_prefix(&worktree) {
-        Ok(relative) => {
-            let relative = relative.to_string_lossy().replace('\\', "/");
-            // `path.relative` yields "." for equal paths.
-            if relative.is_empty() {
-                ".".to_string()
-            } else {
-                relative
-            }
-        }
+        Ok(relative) => relative.to_string_lossy().replace('\\', "/"),
         Err(_) => cwd.to_string_lossy().replace('\\', "/"),
     }
 }
@@ -1053,6 +1049,23 @@ impl SessionStore {
         Ok(result)
     }
 
+    /// A turn's metadata and snapshot step parts, for computing its diff.
+    pub(crate) fn turn_snapshots(
+        &self,
+        session_id: &str,
+        message_id: &str,
+    ) -> Result<Vec<WithParts>, SessionError> {
+        self.messages.turn_snapshots(session_id, message_id)
+    }
+
+    pub(crate) fn message_info(
+        &self,
+        session_id: &str,
+        message_id: &str,
+    ) -> Result<V1Message, SessionError> {
+        self.messages.get_info(session_id, message_id)
+    }
+
     /// One message with its parts (`MessageV2.get`, message-v2.ts:506-519).
     pub fn get_message(
         &self,
@@ -1835,7 +1848,7 @@ mod tests {
                 session_path(Path::new("/repo"), Path::new("/repo/a/b")),
                 "a/b"
             );
-            assert_eq!(session_path(Path::new("/repo"), Path::new("/repo")), ".");
+            assert_eq!(session_path(Path::new("/repo"), Path::new("/repo")), "");
         }
     }
 }

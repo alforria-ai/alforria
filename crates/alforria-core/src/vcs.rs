@@ -152,6 +152,54 @@ fn out(text: &str) -> String {
 }
 
 impl GitCli {
+    /// Recent commits for review completion; unborn and non-git projects return none.
+    pub fn commits(&self, cwd: &Path, limit: usize) -> Vec<alforria_schema::vcs::CommitInfo> {
+        let count = format!("-{}", limit.clamp(1, 100));
+        let result = self.run(
+            cwd,
+            &[
+                "--no-pager",
+                "log",
+                "--no-color",
+                "--no-show-signature",
+                &count,
+                "--format=%H%x00%h%x00%<(200,trunc)%s",
+                "-z",
+                "--",
+            ],
+            Some(256 * 1024),
+        );
+        if result.exit_code != 0 {
+            return Vec::new();
+        }
+        let fields: Vec<&str> = result.text.split_terminator('\0').collect();
+        fields
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .filter_map(|row| {
+                let hash = row[0];
+                let short_hash = row[1];
+                if !matches!(hash.len(), 40 | 64)
+                    || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    || short_hash.is_empty()
+                    || !hash.starts_with(short_hash)
+                {
+                    return None;
+                }
+                let subject: String = row[2]
+                    .chars()
+                    .map(|char| if char.is_control() { ' ' } else { char })
+                    .collect();
+                Some(alforria_schema::vcs::CommitInfo {
+                    hash: hash.to_string(),
+                    short_hash: short_hash.to_string(),
+                    subject: subject.trim().to_string(),
+                })
+            })
+            .collect()
+    }
+
     /// `Git.run` (`git/index.ts:110-132`).
     pub fn run(&self, cwd: &Path, args: &[&str], max_output_bytes: Option<usize>) -> RunResult {
         let mut command = Command::new("git");
@@ -1062,6 +1110,45 @@ mod tests {
 
     fn vcs() -> Vcs {
         Vcs::default()
+    }
+
+    #[test]
+    fn review_commits_are_bounded_and_keep_unicode_and_empty_subjects() {
+        let (_temp, dir) = repo("vcs-review-commits");
+        git(
+            &dir,
+            &["commit", "--quiet", "--allow-empty", "-m", "Fix café 界"],
+        );
+        let older = git(&dir, &["rev-parse", "HEAD"]).trim().to_string();
+        git(
+            &dir,
+            &[
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "--allow-empty-message",
+                "-m",
+                "",
+            ],
+        );
+        let newest = git(&dir, &["rev-parse", "HEAD"]).trim().to_string();
+        let commits = GitCli.commits(&dir, 2);
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0].hash, newest);
+        assert_eq!(commits[0].subject, "");
+        assert_eq!(commits[1].hash, older);
+        assert_eq!(commits[1].subject, "Fix café 界");
+        assert!(commits
+            .iter()
+            .all(|commit| commit.hash.starts_with(&commit.short_hash)));
+    }
+
+    #[test]
+    fn review_commits_are_empty_without_git_history() {
+        let temp = TempDir::new("vcs-review-no-history");
+        assert!(GitCli.commits(temp.path(), 20).is_empty());
+        git(temp.path(), &["init", "--quiet"]);
+        assert!(GitCli.commits(temp.path(), 20).is_empty());
     }
 
     #[test]

@@ -204,20 +204,25 @@ impl EventBus {
             self.notify(&event);
             return Ok(event);
         }
-        let _ordering = self.publish_lock.lock().unwrap_or_else(|p| p.into_inner());
-        let committed = self.commit_durable_event(definition, &event, None, opts.commit)?;
-        if let Some((aggregate_id, seq)) = committed {
-            event.durable = Some(DurableRef {
-                aggregate_id,
-                seq,
-                version: definition
-                    .durable
-                    .map(|d| i64::from(d.version))
-                    .unwrap_or_default(),
-            });
-            self.notify(&event);
-        }
-        Ok(event)
+        // The ordering lock can wait behind a publisher blocked on SQLite.
+        // Yield the runtime worker before acquiring it, and preserve commit
+        // and notification order within the same blocking boundary.
+        crate::storage::connection::database_blocking(|| {
+            let _ordering = self.publish_lock.lock().unwrap_or_else(|p| p.into_inner());
+            let committed = self.commit_durable_event(definition, &event, None, opts.commit)?;
+            if let Some((aggregate_id, seq)) = committed {
+                event.durable = Some(DurableRef {
+                    aggregate_id,
+                    seq,
+                    version: definition
+                        .durable
+                        .map(|d| i64::from(d.version))
+                        .unwrap_or_default(),
+                });
+                self.notify(&event);
+            }
+            Ok(event)
+        })
     }
 
     /// Stream of one type's events (unversioned type).
@@ -243,6 +248,19 @@ impl EventBus {
         Subscription {
             state: Arc::clone(&self.state),
             listener,
+        }
+    }
+
+    /// Register a shared listener for as long as this bus has publishers.
+    /// Attaching the same callback again is a no-op.
+    pub fn listen_for_lifetime(&self, listener: Listener) {
+        let mut state = self.lock_state();
+        if !state
+            .listeners
+            .iter()
+            .any(|existing| Arc::ptr_eq(existing, &listener))
+        {
+            state.listeners.push(listener);
         }
     }
 
@@ -306,33 +324,35 @@ impl EventBus {
             location: None,
             data: event.data.clone(),
         };
-        let _ordering = self.publish_lock.lock().unwrap_or_else(|p| p.into_inner());
-        let committed = self.commit_durable_event(
-            definition,
-            &payload,
-            Some(ReplayInput {
-                seq: event.seq,
-                aggregate_id: &event.aggregate_id,
-                owner_id: opts.owner_id.as_deref(),
-                strict_owner: opts.strict_owner,
-            }),
-            None,
-        )?;
-        if opts.publish {
-            if let Some((aggregate_id, seq)) = committed {
-                let mut published = payload;
-                published.durable = Some(DurableRef {
-                    aggregate_id,
-                    seq,
-                    version: definition
-                        .durable
-                        .map(|d| i64::from(d.version))
-                        .unwrap_or_default(),
-                });
-                self.notify(&published);
+        crate::storage::connection::database_blocking(|| {
+            let _ordering = self.publish_lock.lock().unwrap_or_else(|p| p.into_inner());
+            let committed = self.commit_durable_event(
+                definition,
+                &payload,
+                Some(ReplayInput {
+                    seq: event.seq,
+                    aggregate_id: &event.aggregate_id,
+                    owner_id: opts.owner_id.as_deref(),
+                    strict_owner: opts.strict_owner,
+                }),
+                None,
+            )?;
+            if opts.publish {
+                if let Some((aggregate_id, seq)) = committed {
+                    let mut published = payload;
+                    published.durable = Some(DurableRef {
+                        aggregate_id,
+                        seq,
+                        version: definition
+                            .durable
+                            .map(|d| i64::from(d.version))
+                            .unwrap_or_default(),
+                    });
+                    self.notify(&published);
+                }
             }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Replay a batch belonging to one aggregate, validating contiguous
@@ -833,6 +853,93 @@ mod tests {
             seq,
             aggregate_id: aggregate.to_string(),
             data: durable_data(aggregate),
+        }
+    }
+
+    #[test]
+    fn contended_publish_and_replay_locks_do_not_starve_runtime_workers() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::{Duration, Instant};
+        static FIRST_BUSY: AtomicBool = AtomicBool::new(false);
+        for replay in [false, true] {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
+            let (bus, directory) = bus_with_manifest();
+            let bus = Arc::new(bus);
+            let mut events = bus.subscribe("test.event");
+            bus.storage
+                .with_connection(|connection| {
+                    connection.busy_handler(Some(|attempt| {
+                        FIRST_BUSY.store(true, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(1));
+                        attempt < 5000
+                    }))
+                })
+                .unwrap();
+            // Declare the writer after the runtime so panic cleanup releases
+            // SQLite before waiting for any runtime blocking tasks.
+            let holder = Connection::open(directory.path().join("db.sqlite")).unwrap();
+            holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+            FIRST_BUSY.store(false, Ordering::SeqCst);
+            let first_bus = bus.clone();
+            let first = runtime.spawn(async move {
+                first_bus.publish(
+                    &durable_def(),
+                    durable_data("ses_1"),
+                    PublishOptions::default(),
+                )
+            });
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !FIRST_BUSY.load(Ordering::SeqCst) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(
+                FIRST_BUSY.load(Ordering::SeqCst),
+                "first publisher must reach SQLite contention"
+            );
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let second_bus = bus.clone();
+            let second = runtime.spawn(async move {
+                started_tx.send(()).unwrap();
+                if replay {
+                    second_bus.replay(
+                        serialized(1, "ses_1", "evt_second"),
+                        ReplayOpts {
+                            publish: true,
+                            ..Default::default()
+                        },
+                    )
+                } else {
+                    second_bus
+                        .publish(
+                            &durable_def(),
+                            durable_data("ses_1"),
+                            PublishOptions::default(),
+                        )
+                        .map(|_| ())
+                }
+            });
+            started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+            let (tick_tx, tick_rx) = std::sync::mpsc::channel();
+            runtime.spawn(async move {
+                let _ = tick_tx.send(());
+            });
+            let responsive = tick_rx.recv_timeout(Duration::from_millis(250)).is_ok();
+            holder.execute_batch("COMMIT").unwrap();
+            runtime.block_on(async {
+                first.await.unwrap().unwrap();
+                second.await.unwrap().unwrap();
+            });
+            assert!(
+                responsive,
+                "ordering-lock contention must yield the worker (replay={replay})"
+            );
+            assert_eq!(events.try_recv().unwrap().durable().unwrap().seq, 0);
+            assert_eq!(events.try_recv().unwrap().durable().unwrap().seq, 1);
         }
     }
 

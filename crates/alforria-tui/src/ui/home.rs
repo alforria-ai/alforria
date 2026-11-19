@@ -5,7 +5,7 @@
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph, Widget};
+use ratatui::widgets::{Paragraph, Widget};
 use serde_json::Value;
 
 use super::theme::{tint, Rgba, Theme};
@@ -78,9 +78,12 @@ const TIPS_PADDING_TOP: u16 = 3;
 const TIP_PREFIX: &str = "● Tip ";
 const TIP_PREFIX_WIDTH: usize = 6;
 
-/// The inner textarea width: the frame pads left+right by 2.
+/// The textarea width after the prompt frame's border and padding.
 fn inner_width(area: Rect) -> u16 {
-    area.width.saturating_sub(4).max(1)
+    crate::ui::session::prompt::prompt_block(1)
+        .inner(area)
+        .width
+        .max(1)
 }
 
 /// The wrapped textarea rows: the live editor, or the seeded --prompt
@@ -623,20 +626,13 @@ fn render_prompt(app: &App, frame: &mut ratatui::Frame, theme: &Theme, area: Rec
     };
     Paragraph::new(lines)
         .block(
-            Block::new()
-                .borders(ratatui::widgets::Borders::LEFT)
+            crate::ui::session::prompt::prompt_block(1)
                 .border_set(ratatui::symbols::border::Set {
                     vertical_left: "┃",
                     ..Default::default()
                 })
                 .border_style(crate::ui::session::prompt::border_highlight(app, theme).to_color())
-                .style(Style::new().bg(theme.background_element.to_color()))
-                .padding(ratatui::widgets::Padding {
-                    left: 2,
-                    right: 2,
-                    top: 1,
-                    bottom: 0,
-                }),
+                .style(Style::new().bg(theme.background_element.to_color())),
         )
         .render(main, frame.buffer_mut());
     render_prompt_cap(
@@ -870,6 +866,52 @@ mod tests {
         app.ui.prompt.textarea.insert_text("hello");
         let lines = buffer_text(&app, 80, 24);
         assert!(lines.iter().any(|l| l.contains("hello")), "{lines:?}");
+    }
+
+    #[test]
+    fn initial_prompt_keeps_typed_and_seeded_input_visible_when_resized() {
+        for input in [
+            "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ",
+            "abcdefghijklmno\n0123456789XYZ\nlastline",
+            "abc界def🦀ghi界jkl🦀mno",
+        ] {
+            for seeded in [false, true] {
+                for max_width in [
+                    PromptMaxWidth::Fixed(75),
+                    PromptMaxWidth::Fixed(24),
+                    PromptMaxWidth::Auto,
+                ] {
+                    let mut app = make_app();
+                    app.config.prompt_max_height = Some(100);
+                    app.config.prompt_max_width = max_width;
+                    if seeded {
+                        app.state.route.navigate(Route::Home {
+                            prompt: Some(crate::state::route::PromptInfo {
+                                input: input.to_string(),
+                                mode: None,
+                                parts: Vec::new(),
+                            }),
+                        });
+                    } else {
+                        app.ui.prompt.textarea.set_text(input);
+                    }
+                    for width in [80, 32, 12, 20, 11, 140] {
+                        let lines = buffer_text(&app, width, 128);
+                        let visible: String = lines
+                            .iter()
+                            .filter_map(|line| line.split_once('┃').map(|(_, text)| text))
+                            .flat_map(|text| text.chars().filter(|char| *char != ' '))
+                            .collect();
+                        assert_eq!(
+                            visible,
+                            input.replace('\n', ""),
+                            "width={width}, max_width={max_width:?}, seeded={seeded}"
+                        );
+                        assert_eq!(app.ui.prompt.input(), if seeded { "" } else { input });
+                    }
+                }
+            }
+        }
     }
 
     #[test]

@@ -225,7 +225,7 @@ pub fn render(app: &mut App, frame: &mut ratatui::Frame, theme: &Theme, area: Re
     if permission_visible {
         bottom_height += permission::height(app);
     } else if question_visible {
-        bottom_height += question::height(app);
+        bottom_height += question::height(app, column);
     } else if prompt_visible {
         bottom_height += prompt::height(app, column, area.height);
     }

@@ -9,6 +9,7 @@
 //! truncation limits.
 
 pub mod arity;
+mod grep;
 pub mod id;
 pub mod parse;
 pub mod prompt;
@@ -697,7 +698,8 @@ pub async fn collect(
     instance: &InstanceContext,
 ) -> Scan {
     let mut scan = Scan::default();
-    let shell_kind = id::to_kind(&shell_name(shell));
+    let shell_basename = shell_name(shell);
+    let shell_kind = id::to_kind(&shell_basename);
     let mut cwd = cwd.to_path_buf();
 
     for node in nodes {
@@ -714,10 +716,16 @@ pub async fn collect(
             let posix = !ps && shell_kind != "cmd";
             let listed = FILES.contains(&cmd.as_str())
                 || (shell_kind == "cmd" && CMD_FILES.contains(&cmd.as_str()));
+            let grep_paths = (posix && SHELLS.contains(&shell_basename.as_str()))
+                .then(|| grep::path_args(node))
+                .flatten();
+            let parsed_grep = grep_paths.is_some();
             // Outside the listed file commands, any POSIX command's arguments
             // are still looked at when they read as a path out of the
             // project (`head /etc/shadow`, `tar -C ~/x`, `cp --target-directory=/etc`).
-            let mut args: Vec<(String, bool)> = if listed {
+            let mut args: Vec<(String, bool)> = if let Some(files) = grep_paths {
+                files.into_iter().map(|file| (file, true)).collect()
+            } else if listed {
                 path_args(&node.parts, ps, shell_kind == "cmd")
                     .into_iter()
                     .map(|arg| (arg, true))
@@ -725,7 +733,7 @@ pub async fn collect(
             } else {
                 Vec::new()
             };
-            if posix {
+            if posix && !parsed_grep {
                 for part in node.parts.iter().skip(1) {
                     let text = part.text.as_str();
                     if let Some((flag, value)) = text.split_once('=') {
@@ -747,7 +755,13 @@ pub async fn collect(
                 if !known && !path_like(&posix_expand(unquote(&arg))) {
                     continue;
                 }
-                let Some(resolved) = arg_path(&arg, &cwd, ps, shell) else {
+                let resolved = if parsed_grep {
+                    // The lexer already resolved the literal spelling.
+                    (!arg.is_empty() && arg != "-").then(|| resolve_path(&cwd, &arg))
+                } else {
+                    arg_path(&arg, &cwd, ps, shell)
+                };
+                let Some(resolved) = resolved else {
                     continue;
                 };
                 first.get_or_insert_with(|| resolved.clone());
@@ -1616,6 +1630,119 @@ mod tests {
     // ------------------------------------------------------------------
     // collect
     // ------------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn grep_patterns_do_not_request_external_directory_access() {
+        let dir = temp("grep-patterns");
+        let instance = InstanceContext {
+            directory: dir.clone(),
+            worktree: dir.clone(),
+        };
+        for command in [
+            r#"grep -R "/dev" -n poc docs/security tsconfig.json package.json || true"#,
+            "grep -nRA2 /dev .",
+            "grep -A 2 /dev .",
+            "grep -m 1 /dev .",
+            "grep -- /dev .",
+            "grep -e /dev -e /etc .",
+            r#"grep --regexp="/dev" --exclude-dir=/etc --include=/bin ."#,
+            "grep --color=always --binary-files=text /dev .",
+            "grep -R /dev . 2>/dev/null",
+        ] {
+            let scan = redirect_scan(command, &dir);
+            assert!(scan.dirs.is_empty(), "{command}: {:?}", scan.dirs);
+            let recorder = RecordingAsk::new();
+            let extra = Extra::default();
+            ask(&ctx(&recorder, &instance, &extra), &scan, command)
+                .await
+                .unwrap();
+            let requests = recorder.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1, "{command}");
+            assert_eq!(requests[0].permission, "bash", "{command}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn grep_files_pattern_files_and_redirections_still_need_permission() {
+        let root = temp("grep-operands");
+        let project = root.join("project");
+        let outside = root.join("outside files");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let outside = outside.display().to_string();
+        for command in [
+            format!(r#"grep -R pattern "{outside}""#),
+            format!(r#"grep -e /dev "{outside}/file""#),
+            format!(r#"grep "{outside}/file" --regexp=/dev"#),
+            format!(r#"grep -f "{outside}/patterns" ."#),
+            format!(r#"grep --file="{outside}/patterns" ."#),
+            format!(r#"grep -Rnf"{outside}/patterns" ."#),
+            format!(r#"grep -- /dev "{outside}/file""#),
+            format!(r#"grep -e /dev -- -f "{outside}/file""#),
+            format!(r#"/usr/bin/grep /dev "{outside}/file""#),
+            format!(r#"'grep' /dev "{outside}/file""#),
+            format!(r#"grep /dev . > "{outside}/output""#),
+            format!(r#"grep /dev . < "{outside}/input""#),
+            // The shell joins the continued line into `-e`.
+            format!("grep \"{outside}/file\" -\\\ne root"),
+        ] {
+            let scan = redirect_scan(&command, &project);
+            assert_eq!(scan.dirs, [outside.as_str()], "{command}");
+        }
+        // These expressions are omitted from the parser's flat parts, or
+        // can expand to several operands. Do not guess which one is a pattern.
+        for command in [
+            format!(r#"grep $pattern "{outside}/file""#),
+            format!(r#"grep "$(printf pattern)" "{outside}/file""#),
+            format!(r#"grep <(printf pattern) "{outside}/file""#),
+            format!(r#"grep {{one,two}} "{outside}/file""#),
+            format!(r#"grep * "{outside}/file""#),
+            format!(r#"grep --unknown-option "{outside}/file""#),
+        ] {
+            let scan = redirect_scan(&command, &project);
+            assert!(scan.dirs.contains(&outside), "{command}: {:?}", scan.dirs);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn grep_posix_operands_after_the_pattern_still_need_permission() {
+        let root = temp("grep-posix-operands");
+        let project = root.join("project");
+        let outside = root.join("outside files");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let outside = outside.display().to_string();
+        for command in [
+            format!(r#"POSIXLY_CORRECT=1 grep pattern -e "{outside}/file""#),
+            format!(r#"POSIXLY_CORRECT=1 grep pattern --regexp "{outside}/file""#),
+            format!(r#"POSIXLY_CORRECT=1 grep pattern -A "{outside}/file""#),
+            format!(r#"export POSIXLY_CORRECT=1; grep pattern -e "{outside}/file""#),
+        ] {
+            let scan = redirect_scan(&command, &project);
+            assert!(scan.dirs.contains(&outside), "{command}: {:?}", scan.dirs);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn grep_dev_directory_operands_still_need_permission() {
+        let dir = temp("grep-dev-operands");
+        for command in [
+            "grep -R pattern /dev",
+            "grep -e /dev /dev",
+            "grep -- -e /dev",
+        ] {
+            let scan = redirect_scan(command, &dir);
+            assert_eq!(scan.dirs, ["/dev"], "{command}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     fn scan_sync(command: &str, directory: &Path, worktree: &Path) -> Scan {
         let parser = parse::parser_for("bash");

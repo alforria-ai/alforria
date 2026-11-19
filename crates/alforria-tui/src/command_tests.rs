@@ -168,6 +168,7 @@ fn session_commands_only_register_on_the_session_route() {
         "session.message.previous",
         "messages.copy",
         "session.copy",
+        "session.copy.thread",
         "session.export",
         "session.background",
         "session.child.first",
@@ -212,6 +213,7 @@ fn slash_command_names_and_aliases() {
     assert_eq!(get("session.undo").slash_name, Some("undo"));
     assert_eq!(get("session.redo").slash_name, Some("redo"));
     assert_eq!(get("session.copy").slash_name, Some("copy"));
+    assert_eq!(get("session.copy.thread").slash_name, Some("copythread"));
     assert_eq!(get("session.export").slash_name, Some("export"));
     assert_eq!(get("prompt.editor").slash_name, Some("editor"));
     assert_eq!(get("prompt.skills").slash_name, Some("skills"));
@@ -506,6 +508,129 @@ fn redo_unreverts_when_no_later_user_message() {
 }
 
 #[test]
+fn copy_defaults_to_last_assistant_markdown() {
+    let mut app = new_app();
+    navigate_to_session(&mut app);
+    app.state.sync.message.insert(
+        "ses_1".into(),
+        vec![
+            user_message("msg_1"),
+            assistant_message("msg_2"),
+            user_message("msg_3"),
+            assistant_message("msg_4"),
+            user_message("msg_5"),
+        ],
+    );
+    app.state.sync.part.insert(
+        "msg_2".into(),
+        vec![text_part("txt_2", "An older reply", false)],
+    );
+    let markdown =
+        "    indented code\n\n# Latest reply\n\n**bold**\n\n```rust\nfn main() {}\n```\n";
+    app.state
+        .sync
+        .part
+        .insert("msg_4".into(), vec![text_part("txt_4", markdown, false)]);
+    let command = slash_commands(&app)
+        .into_iter()
+        .find(|command| command.slash_name == Some("copy"))
+        .unwrap();
+    let effects = run(&mut app, command.name);
+    let [Effect::ClipboardWrite { text, .. }] = effects.as_slice() else {
+        panic!("expected a message clipboard write, got {effects:?}");
+    };
+    assert_eq!(
+        text, markdown,
+        "preserve the original Markdown and whitespace"
+    );
+}
+
+#[test]
+fn copy_skips_reverted_replies() {
+    let mut app = new_app();
+    navigate_to_session(&mut app);
+    app.state.sync.session[0].revert = Some(revert("msg_3"));
+    app.state.sync.message.insert(
+        "ses_1".into(),
+        vec![
+            user_message("msg_1"),
+            assistant_message("msg_2"),
+            user_message("msg_3"),
+            assistant_message("msg_4"),
+        ],
+    );
+    app.state.sync.part.insert(
+        "msg_2".into(),
+        vec![text_part("txt_2", "Visible reply", false)],
+    );
+    app.state.sync.part.insert(
+        "msg_4".into(),
+        vec![text_part("txt_4", "Reverted reply", false)],
+    );
+    let effects = run(&mut app, "session.copy");
+    let [Effect::ClipboardWrite { text, .. }] = effects.as_slice() else {
+        panic!("expected a message clipboard write, got {effects:?}");
+    };
+    assert_eq!(text, "Visible reply");
+}
+
+#[test]
+fn copy_thread_and_legacy_mode_keep_transcript_options() {
+    for (mode, slash) in [
+        ("last_message", "copythread"),
+        ("thread", "copy"),
+        ("thread", "copythread"),
+    ] {
+        let mut app = App::new(
+            crate::config::TuiConfig::from_info(&json!({"copy_mode": mode}), true),
+            crate::state::Args::default(),
+            None,
+        );
+        navigate_to_session(&mut app);
+        app.state.kv.set(keys::THINKING_MODE, json!("show"));
+        app.state
+            .kv
+            .set(keys::TOOL_DETAILS_VISIBILITY, json!(false));
+        app.state
+            .kv
+            .set(keys::ASSISTANT_METADATA_VISIBILITY, json!(false));
+        let command = slash_commands(&app)
+            .into_iter()
+            .find(|command| command.slash_name == Some(slash))
+            .unwrap();
+        assert_eq!(
+            run(&mut app, command.name),
+            vec![Effect::SessionCopyTranscript {
+                thinking: true,
+                tool_details: false,
+                assistant_metadata: false,
+            }],
+            "copy_mode={mode}, /{slash}"
+        );
+    }
+}
+
+#[test]
+fn copy_with_no_text_preserves_the_clipboard() {
+    for content in [None, Some(" \n ")] {
+        let mut app = new_app();
+        navigate_to_session(&mut app);
+        app.state.sync.message.insert(
+            "ses_1".into(),
+            vec![user_message("msg_1"), assistant_message("msg_2")],
+        );
+        if let Some(content) = content {
+            app.state
+                .sync
+                .part
+                .insert("msg_2".into(), vec![text_part("txt_2", content, false)]);
+        }
+        assert!(run(&mut app, "session.copy").is_empty());
+        assert_eq!(app.ui.toasts[0].variant, ToastVariant::Error);
+    }
+}
+
+#[test]
 fn messages_copy_finds_last_assistant_message() {
     let mut app = new_app();
     navigate_to_session(&mut app);
@@ -539,15 +664,17 @@ fn messages_copy_finds_last_assistant_message() {
 
 #[test]
 fn messages_copy_without_assistant_message_toasts() {
-    let mut app = new_app();
-    navigate_to_session(&mut app);
-    app.state
-        .sync
-        .message
-        .insert("ses_1".to_string(), vec![user_message("msg_1")]);
-    let effects = run(&mut app, "messages.copy");
-    assert!(effects.is_empty());
-    assert_eq!(app.ui.toasts[0].message, "No assistant messages found");
+    for command in ["messages.copy", "session.copy"] {
+        let mut app = new_app();
+        navigate_to_session(&mut app);
+        app.state
+            .sync
+            .message
+            .insert("ses_1".to_string(), vec![user_message("msg_1")]);
+        let effects = run(&mut app, command);
+        assert!(effects.is_empty());
+        assert_eq!(app.ui.toasts[0].message, "No assistant messages found");
+    }
 }
 
 #[test]
