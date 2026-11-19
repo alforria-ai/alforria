@@ -244,6 +244,17 @@ pre-1.0, so minor releases may include breaking changes.
 
 ### Fixed
 
+- An `@file` mention in a prompt the model wrote for a subagent or a
+  workflow agent attached any file in the project with no permission
+  asked: `Summarise @.env` handed the subagent a file its `read` rule asks
+  about or denies. A mentioned file is now attached only when the child
+  session's policy allows that agent to `read` it; otherwise the mention
+  stays text and the agent's own `read` tool asks as usual. A file from
+  the upload area attached this way marks the child session as having seen
+  outside content, as reading it would (and through it the parent, when
+  the result comes back). An `@agent` mention in such a prompt stays text:
+  it used to become an agent part, which let the subagent start that agent
+  without the `task` ask. Prompts you type resolve as before.
 - Reverting or unreverting a guarded session (restricted, or started by
   outside input) could write or delete a file outside the project: the
   guard judged each file against the protected locations only, so a file

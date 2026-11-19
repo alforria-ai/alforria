@@ -931,7 +931,7 @@ the session is.
 | Turn source | Where its restriction comes from |
 | --- | --- |
 | `/goal` rounds after the first, and the goal reviewer's verdicts | the session. A caller below `admin` can only set, pause, resume or clear a goal in a restricted session, so the session's restriction is never weaker than the goal starter's. `GoalState.startedBy` records who set it. The round cap and stall limit are unchanged |
-| A subagent run by the task tool | the child session, which inherits from its parent when it is created. Its agent is the one the model chose under the parent's `task` permission, so the "an agent a client could pick" rule does not apply to it; everything else does |
+| A subagent run by the task tool | the child session, which inherits from its parent when it is created. Its agent is the one the model chose under the parent's `task` permission, so the "an agent a client could pick" rule does not apply to it; everything else does. The prompt is the model's: an `@file` mention in it attaches the file only if it is inside the project and the child session's policy allows that agent to `read` it (an `ask` is not an allow — the mention stays text and the agent's own `read` asks), an attached file from the upload area marks the child as a `read` would, and an `@agent` mention stays text. The same holds for a workflow agent's prompt |
 | A subagent's result delivered into its parent | the parent session |
 | A command's configured subtask | the session; below `admin` a command configured to run as a subagent is refused |
 | Workflow agents started by the `workflow` tool | child sessions of the session that called the tool: inherited. (Starting a workflow over HTTP is `admin`.) |

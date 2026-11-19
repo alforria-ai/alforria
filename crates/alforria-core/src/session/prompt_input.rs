@@ -553,12 +553,115 @@ pub fn resolve_prompt_parts(
 /// permission check, which is right for what the user typed and wrong for
 /// the model: `@~/.ssh/id_rsa` would hand it any file. With `confine`, only
 /// files inside the project are attached; the mention stays in the text and
-/// the agent can read the file with its own tools and permissions.
+/// the agent can read the file with its own tools and permissions. An
+/// `@agent` mention stays text too: an agent part lets the turn start that
+/// agent with no `task` ask, as the user's own choice, and the model is not
+/// the user.
+///
+/// This is the project boundary only. The engine's seam is
+/// [`resolve_model_prompt_parts`], which also asks the session's policy.
 pub fn resolve_prompt_parts_within(
     agents: &AgentRegistry,
     worktree: &Path,
     template: &str,
     confine: Option<&crate::tool::def::InstanceContext>,
+) -> Vec<PromptPartInput> {
+    resolve_mentions(agents, worktree, template, confine, &mut |_| true)
+}
+
+/// The parts of a prompt the model wrote for `agent`'s turn in
+/// `session_id` (a subagent's, a workflow agent's): the text, and a file
+/// part for each mention the agent could have read itself.
+///
+/// - Inside the project ([`resolve_prompt_parts_within`]).
+/// - Allowed by the session's policy
+///   ([`crate::session::store::SessionStore::policy`]) for `read` on the
+///   path, as the `read` tool would ask it. An `ask` is not an allow: the
+///   mention stays text, and the agent's own `read` asks. An agent that is
+///   not registered has no policy, and nothing is attached.
+/// - Marked like a `read` result: an attached file from the upload area
+///   sets `SessionMark::OutsideContent` on `session_id` before the prompt
+///   that carries it is made
+///   ([`crate::session::store::SessionStore::note_tool_result`]).
+///
+/// No `@agent` mention becomes an agent part.
+pub fn resolve_model_prompt_parts(
+    agents: &AgentRegistry,
+    sessions: &crate::session::store::SessionStore,
+    instance: &crate::tool::def::InstanceContext,
+    session_id: &str,
+    agent: &str,
+    template: &str,
+) -> Result<Vec<PromptPartInput>, crate::session::error::SessionError> {
+    use alforria_schema::permission_v1::PermissionV1Action;
+    let policy = agents
+        .get(agent)
+        .map(|found| sessions.policy(session_id, &found.permission));
+    let mut failed = None;
+    let mut admit = |filepath: &Path| {
+        let Some(policy) = &policy else {
+            return false;
+        };
+        let pattern = crate::tool::ripgrep::ts_relative(&instance.worktree, filepath);
+        if policy.evaluate("read", &pattern).action != PermissionV1Action::Allow {
+            return false;
+        }
+        // What the `read` tool reports for the call, and the marking
+        // decision its result gets.
+        let call = format!("mention:{}", filepath.display());
+        let input = serde_json::json!({ "filePath": filepath.to_string_lossy() });
+        sessions.report_returned_paths(
+            session_id,
+            &call,
+            "read",
+            &input,
+            crate::tool::outside::ReturnedPaths {
+                searched: filepath.to_path_buf(),
+                files: Some(vec![filepath.to_path_buf()]),
+            },
+        );
+        let noted = sessions.note_tool_result(
+            session_id,
+            &crate::tool::outside::ToolResult {
+                call_id: Some(&call),
+                tool: "read",
+                input: &input,
+                metadata: None,
+                output: "",
+            },
+        );
+        match noted {
+            Ok(()) => true,
+            // Content is not attached in a session that could not be
+            // marked for it.
+            Err(error) => {
+                failed.get_or_insert(error);
+                false
+            }
+        }
+    };
+    let parts = resolve_mentions(
+        agents,
+        &instance.worktree,
+        template,
+        Some(instance),
+        &mut admit,
+    );
+    match failed {
+        Some(error) => Err(error),
+        None => Ok(parts),
+    }
+}
+
+/// The text, and a part per mention. `confine`: the prompt is the model's
+/// — a file outside that project is not attached, nor one `admit` refuses,
+/// and no agent part is made.
+fn resolve_mentions(
+    agents: &AgentRegistry,
+    worktree: &Path,
+    template: &str,
+    confine: Option<&crate::tool::def::InstanceContext>,
+    admit: &mut dyn FnMut(&Path) -> bool,
 ) -> Vec<PromptPartInput> {
     let mut parts = vec![PromptPartInput::Text {
         id: None,
@@ -585,6 +688,9 @@ pub fn resolve_prompt_parts_within(
             continue;
         }
         let Ok(stat) = std::fs::metadata(&filepath) else {
+            if confine.is_some() {
+                continue;
+            }
             if let Some(found) = agents.get(&name) {
                 parts.push(PromptPartInput::Agent {
                     id: None,
@@ -594,6 +700,9 @@ pub fn resolve_prompt_parts_within(
             }
             continue;
         };
+        if confine.is_some() && !admit(&filepath) {
+            continue;
+        }
         parts.push(PromptPartInput::File {
             id: None,
             mime: if stat.is_dir() {
@@ -2061,6 +2170,147 @@ mod tests {
         assert_eq!(files(Some(&instance)), vec!["inside.txt".to_string()]);
         // What the user typed is attached as before.
         assert!(files(None).len() > 1);
+    }
+
+    /// The parts a model-written prompt resolves to for the default
+    /// subagent in a fresh session, and that session's id.
+    fn model_prompt(h: &Harness, template: &str) -> (String, Vec<PromptPartInput>) {
+        let session = session_id(h);
+        let instance = crate::tool::def::InstanceContext {
+            directory: h.worktree.clone(),
+            worktree: h.worktree.clone(),
+            write_guard: None,
+        };
+        let parts = resolve_model_prompt_parts(
+            &h.services.agents,
+            &h.services.sessions,
+            &instance,
+            &session,
+            "general",
+            template,
+        )
+        .unwrap();
+        (session, parts)
+    }
+
+    fn attached(parts: &[PromptPartInput]) -> Vec<String> {
+        parts
+            .iter()
+            .filter_map(|part| match part {
+                PromptPartInput::File { filename, .. } => filename.clone(),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A mention in a prompt the model wrote attached the file by reading
+    /// it with no permission asked: `@.env` handed a subagent what its
+    /// `read` rule (`*.env`: ask, by default; or a deny) keeps from its
+    /// own `read` tool. Only a file the session's policy allows the agent
+    /// to read is attached; the mention stays in the text.
+    #[test]
+    fn a_model_written_mention_is_attached_only_if_the_policy_allows_the_read() {
+        use alforria_schema::permission_v1::{PermissionV1Action, PermissionV1Rule};
+        let h = harness("prompt-model-mention-policy");
+        std::fs::write(h.worktree.join(".env"), "KEY=1").unwrap();
+        std::fs::write(h.worktree.join("notes.txt"), "n").unwrap();
+        std::fs::write(h.worktree.join("private.txt"), "p").unwrap();
+        let template = "Summarise @.env and @notes.txt and @private.txt";
+        let (_, parts) = model_prompt(&h, template);
+        assert_eq!(
+            attached(&parts),
+            ["notes.txt", "private.txt"],
+            "ask: not attached"
+        );
+        assert!(
+            matches!(&parts[0], PromptPartInput::Text { text, .. } if text == template),
+            "the mention stays in the text"
+        );
+
+        // A deny among the session's own rules (a subagent inherits its
+        // parent's) is read too: the policy is the session's.
+        let session = session_id(&h);
+        h.services
+            .sessions
+            .set_permission(
+                &session,
+                vec![PermissionV1Rule {
+                    permission: "read".to_string(),
+                    pattern: "private.txt".to_string(),
+                    action: PermissionV1Action::Deny,
+                }],
+            )
+            .unwrap();
+        let instance = crate::tool::def::InstanceContext {
+            directory: h.worktree.clone(),
+            worktree: h.worktree.clone(),
+            write_guard: None,
+        };
+        let parts = resolve_model_prompt_parts(
+            &h.services.agents,
+            &h.services.sessions,
+            &instance,
+            &session,
+            "general",
+            template,
+        )
+        .unwrap();
+        assert_eq!(attached(&parts), ["notes.txt"]);
+        // An agent that does not exist has no policy to allow anything.
+        let parts = resolve_model_prompt_parts(
+            &h.services.agents,
+            &h.services.sessions,
+            &instance,
+            &session,
+            "no-such-agent",
+            template,
+        )
+        .unwrap();
+        assert_eq!(attached(&parts), Vec::<String>::new());
+    }
+
+    /// A file from the upload area attached through a model-written
+    /// mention marks the session it is attached in, as the `read` tool's
+    /// result would: it used to arrive in the subagent unmarked, so neither
+    /// the subagent nor (through it) its parent was marked.
+    #[test]
+    fn a_model_written_mention_of_an_uploaded_file_marks_the_session() {
+        use crate::session::store::SessionMark;
+        let h = harness("prompt-model-mention-upload");
+        h.services
+            .sessions
+            .set_upload_directories(vec!["uploads".to_string()]);
+        std::fs::create_dir_all(h.worktree.join("uploads")).unwrap();
+        std::fs::write(h.worktree.join("uploads/x.txt"), "from a client").unwrap();
+        std::fs::write(h.worktree.join("notes.txt"), "n").unwrap();
+        let marked = |session: &str| {
+            h.services
+                .sessions
+                .has_mark(session, SessionMark::OutsideContent)
+                .unwrap()
+        };
+        let (session, parts) = model_prompt(&h, "Read @notes.txt");
+        assert_eq!(attached(&parts), ["notes.txt"]);
+        assert!(!marked(&session), "a project file does not mark");
+        let (session, parts) = model_prompt(&h, "Read @uploads/x.txt");
+        assert_eq!(attached(&parts), ["uploads/x.txt"]);
+        assert!(marked(&session), "an uploaded file does");
+    }
+
+    /// `@agent` in what the user typed becomes an agent part, which lets
+    /// the turn start that agent without the `task` ask and as the user's
+    /// choice. In a prompt the model wrote it is text.
+    #[test]
+    fn a_model_written_mention_of_an_agent_stays_text() {
+        let h = harness("prompt-model-mention-agent");
+        let (_, parts) = model_prompt(&h, "ask @plan and @build");
+        assert_eq!(parts.len(), 1, "{parts:?}");
+        assert!(
+            matches!(&parts[0], PromptPartInput::Text { text, .. } if text == "ask @plan and @build")
+        );
+        // What the user typed resolves as before.
+        let typed = resolve_prompt_parts(&h.services.agents, &h.worktree, "ask @plan");
+        assert!(matches!(&typed[1], PromptPartInput::Agent { name, .. } if name == "plan"));
     }
 
     // ------------------------------------------------------------------

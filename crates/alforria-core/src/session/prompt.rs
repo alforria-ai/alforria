@@ -582,16 +582,20 @@ impl crate::session::task_ops::PromptFacade for SessionPrompt {
 
     fn resolve_prompt_parts<'a>(
         &'a self,
+        session_id: &'a str,
+        agent: &'a str,
         template: &'a str,
     ) -> futures::future::BoxFuture<'a, Result<Vec<PromptPartInput>, SessionError>> {
         // This seam serves prompts the model wrote (subagents, workflows).
         Box::pin(async move {
-            Ok(crate::session::prompt_input::resolve_prompt_parts_within(
+            crate::session::prompt_input::resolve_model_prompt_parts(
                 &self.deps.services.agents,
-                &self.deps.instance.worktree,
+                &self.deps.services.sessions,
+                &self.deps.instance,
+                session_id,
+                agent,
                 template,
-                Some(&self.deps.instance),
-            ))
+            )
         })
     }
 

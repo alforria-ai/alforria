@@ -324,7 +324,7 @@ impl WorkflowOps for ProductionWorkflowOps {
         Box::pin(async move {
             let parts = self
                 .facade()?
-                .resolve_prompt_parts(prompt)
+                .resolve_prompt_parts(session_id, agent, prompt)
                 .await
                 .map_err(|error| error.to_string())?;
             self.run_prompt(session_id, agent, parts, schema).await

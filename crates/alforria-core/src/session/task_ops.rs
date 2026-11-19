@@ -37,22 +37,38 @@ pub trait PromptFacade: Send + Sync {
     fn cancel_count(&self, _session_id: &str) -> u64 {
         0
     }
-    /// `resolvePromptParts` (prompt.ts:157-191).
+    /// `resolvePromptParts` (prompt.ts:157-191), for a prompt the model
+    /// wrote for `agent`'s turn in `session_id`: a mentioned file is
+    /// attached only if it is inside the project and the session's policy
+    /// allows the agent to read it, and an attached file marks the session
+    /// as a `read` of it would; an `@agent` mention stays text
+    /// (`prompt_input::resolve_model_prompt_parts`).
     fn resolve_prompt_parts<'a>(
         &'a self,
+        session_id: &'a str,
+        agent: &'a str,
         template: &'a str,
     ) -> BoxFuture<'a, Result<Vec<crate::session::prompt_input::PromptPartInput>, SessionError>>;
-    /// [`PromptFacade::resolve_prompt_parts`] for a prompt the operator
-    /// wrote (a trigger from the host config or an `admin` request): like a
-    /// prompt typed by the user, its mentions attach files wherever they
-    /// are. The default is the confined resolution, so an implementation
-    /// that does not say otherwise attaches nothing outside the project.
+    /// The parts of a prompt the operator wrote (a trigger from the host
+    /// config or an `admin` request): like a prompt typed by the user, its
+    /// mentions attach files wherever they are. The default attaches
+    /// nothing — the text alone — so an implementation that does not say
+    /// otherwise reads no file.
     fn resolve_operator_prompt_parts<'a>(
         &'a self,
         template: &'a str,
     ) -> BoxFuture<'a, Result<Vec<crate::session::prompt_input::PromptPartInput>, SessionError>>
     {
-        self.resolve_prompt_parts(template)
+        Box::pin(async move {
+            Ok(vec![crate::session::prompt_input::PromptPartInput::Text {
+                id: None,
+                text: template.to_string(),
+                synthetic: None,
+                ignored: None,
+                time: None,
+                metadata: None,
+            }])
+        })
     }
     /// `prompt(input).pipe(Effect.catch(Effect.die))` (prompt.ts:1052-1071).
     fn prompt<'a>(
@@ -308,7 +324,7 @@ impl TaskOps for ProductionTaskOps {
         Box::pin(async move {
             let parts = self
                 .facade()?
-                .resolve_prompt_parts(prompt)
+                .resolve_prompt_parts(session_id, agent, prompt)
                 .await
                 .map_err(tool_error)?;
             self.run_prompt(session_id, agent, model, variant, parts)
