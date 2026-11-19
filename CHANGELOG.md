@@ -244,6 +244,13 @@ pre-1.0, so minor releases may include breaking changes.
 
 ### Fixed
 
+- Answering one permission ask with `always` also answered the session's
+  other pending asks that the new approval covered, judged by the
+  approvals alone. An ask that was pending because a sealed ceiling (a
+  trigger creator's bounds) still asked about it was released by it,
+  unanswered. Each pending ask is now judged again under the policy it was
+  asked under, as a new ask of the same thing would be. Sessions without
+  ceilings behave as before.
 - A trigger scheduled by a run that outside input had started (a webhook
   or watch trigger whose `permission` block grants `schedule`) recorded
   its creator's restriction and outside-content provenance, but not that

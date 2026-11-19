@@ -322,7 +322,8 @@ The bounds and the outside-input ceiling are stored for the run's session by
 the server (`session_ceiling`; `GET /session/{id}/restriction` lists their
 names as `ceilings`), are inherited by its subagents and forks, and are
 sealed: neither a rule added to the session nor a standing `always`
-approval reaches them. They are a **persistent** ceiling on that session,
+approval reaches them — an `always` given to one ask does not answer the
+session's other pending asks that a ceiling still holds either. They are a **persistent** ceiling on that session,
 not something held for the length of the run: a background subagent or
 workflow the run started, and any later turn in the session — a person's
 included — stays under them. The run session's own `permission` holds only the

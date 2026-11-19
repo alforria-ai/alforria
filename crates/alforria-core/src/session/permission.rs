@@ -103,6 +103,9 @@ struct PendingEntry {
     done: oneshot::Sender<Result<(), PermissionError>>,
     /// When the ask was registered (ms since the epoch).
     asked_at: u64,
+    /// The policy the ask was judged by, and is judged by again when an
+    /// `always` given to another ask might cover it.
+    policy: crate::tool::permission::Policy,
 }
 
 /// What an ask resolves to when nobody answers it in time (alforria
@@ -464,6 +467,7 @@ impl PermissionService {
                 info: request.clone(),
                 done,
                 asked_at: now_ms(),
+                policy: policy.clone(),
             });
         }
         let guard = PendingCleanup {
@@ -552,7 +556,8 @@ impl PermissionService {
                 // `always`: append `allow` rules for the request's `always`
                 // patterns (145-151), then auto-approve every other pending
                 // request of the same session whose patterns are all allowed
-                // now (153-166) — evaluated against `approved` only.
+                // now (153-166) — evaluated against `approved`, and
+                // against the policy each was asked under.
                 for pattern in &existing.info.always {
                     state.approved.push(PermissionV1Rule {
                         permission: existing.info.permission.clone(),
@@ -567,9 +572,19 @@ impl PermissionService {
                     .iter()
                     .filter(|entry| entry.info.session_id == session_id)
                     .filter(|entry| {
+                        // alforria extension: and under the policy the ask
+                        // was made under, as a fresh ask would be judged
+                        // (`ask_policy`) — an approval lifts no sealed
+                        // ceiling, so an ask one still holds stays asked.
+                        // Without ceilings this adds nothing: an approval
+                        // that allows the pattern is the last word of the
+                        // written list too.
+                        let policy = entry.policy.with_approvals(&approved);
                         entry.info.patterns.iter().all(|pattern| {
                             evaluate(&entry.info.permission, pattern, &[&approved]).action
                                 == PermissionV1Action::Allow
+                                && policy.evaluate(&entry.info.permission, pattern).action
+                                    == PermissionV1Action::Allow
                         })
                     })
                     .map(|entry| entry.info.id.clone())
@@ -1136,6 +1151,65 @@ mod tests {
         assert_eq!(event.data["reply"], "always");
         b.await.unwrap().unwrap();
         assert!(service.list().is_empty());
+    }
+
+    /// The cascade after an `always` judged the session's other pending
+    /// asks by the standing approvals alone. An ask is pending because the
+    /// session's policy said so — here a sealed ceiling (a trigger
+    /// creator's bounds) that a standing approval does not lift — and an
+    /// `always` given to another ask released it without anyone answering
+    /// it. The cascade approves only what a fresh ask under the same
+    /// policy would now allow.
+    #[tokio::test]
+    async fn reply_always_does_not_release_an_ask_a_sealed_ceiling_still_holds() {
+        use crate::tool::permission::Policy;
+        let events = bus();
+        let service = Arc::new(PermissionService::new(Arc::clone(&events)));
+        let mut asked = events.subscribe("permission.asked");
+        let policy = Policy::plain(vec![]).with_sealed_ceiling(
+            "trigger-creator",
+            vec![
+                rule("*", "*", PermissionV1Action::Allow),
+                rule("bash", "rm *", PermissionV1Action::Ask),
+            ],
+        );
+        let ask = |id: &str, pattern: &str| {
+            let service = Arc::clone(&service);
+            let policy = policy.clone();
+            let input = PermissionV1AskInput {
+                patterns: vec![pattern.to_string()],
+                always: vec!["*".to_string()],
+                ..ask_input(Some(id))
+            };
+            tokio::spawn(async move { service.ask_policy(input, &policy).await })
+        };
+        let listing = ask("per_ls", "ls");
+        recv(&mut asked, "permission.asked").await;
+        let removing = ask("per_rm", "rm -rf build");
+        recv(&mut asked, "permission.asked").await;
+        let other = ask("per_cat", "cat notes");
+        recv(&mut asked, "permission.asked").await;
+
+        service
+            .reply(PermissionV1ReplyInput {
+                request_id: "per_ls".to_string(),
+                reply: PermissionV1Reply::Always,
+                message: None,
+            })
+            .unwrap();
+        listing.await.unwrap().unwrap();
+        // What the approval covers in every reading is released…
+        other.await.unwrap().unwrap();
+        // …and what the ceiling still asks about is still asked.
+        let pending: Vec<String> = service.list().iter().map(|item| item.id.clone()).collect();
+        assert_eq!(pending, vec!["per_rm".to_string()]);
+        // As a fresh ask of the same thing would be.
+        let again = ask("per_rm2", "rm -rf build");
+        recv(&mut asked, "permission.asked").await;
+        service.reply(reply_once("per_rm")).unwrap();
+        service.reply(reply_once("per_rm2")).unwrap();
+        removing.await.unwrap().unwrap();
+        again.await.unwrap().unwrap();
     }
 
     #[tokio::test]
