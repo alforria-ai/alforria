@@ -298,6 +298,23 @@ impl Policy {
             .collect()
     }
 
+    /// Every `deny` rule of every reading, the written one first: what a
+    /// subagent's session inherits from the agent that starts it
+    /// (`tool::task`). Each is a rule some reading holds as it is written;
+    /// nothing is derived.
+    pub fn denies(&self) -> Ruleset {
+        self.written
+            .iter()
+            .chain(
+                self.ceilings
+                    .iter()
+                    .flat_map(|ceiling| ceiling.rules.iter()),
+            )
+            .filter(|rule| rule.action == PermissionV1Action::Deny)
+            .cloned()
+            .collect()
+    }
+
     /// A flat ruleset for a wire format. Without ceilings it is the written
     /// list, byte for byte. With them it is the written list followed by
     /// every ceiling's `ask` rules, then every reading's `deny` rules: read

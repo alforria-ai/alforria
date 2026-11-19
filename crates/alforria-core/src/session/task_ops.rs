@@ -152,10 +152,13 @@ impl TaskOps for ProductionTaskOps {
                     model_id: model.model_id.clone(),
                     provider_id: model.provider_id.clone(),
                 }),
-                // A flat rendering, never more permissive than the policy.
+                // The agent's own rules as they are written: the task
+                // tool asks them only whether the agent says anything
+                // about `task` and `todowrite`
+                // (`derive_subagent_session_permission`).
                 permission: found
                     .permission
-                    .render()
+                    .written()
                     .iter()
                     .map(|rule| Rule {
                         permission: rule.permission.clone(),
@@ -199,13 +202,11 @@ impl TaskOps for ProductionTaskOps {
             self.agents
                 .get(agent)
                 .map(|found| {
-                    // Every deny the policy holds, the ceilings' included:
-                    // without ceilings `render` is the written list.
+                    // Every deny the policy holds, the ceilings' included.
                     found
                         .permission
-                        .render()
+                        .denies()
                         .iter()
-                        .filter(|rule| rule.action == PermissionV1Action::Deny)
                         .map(|rule| Rule {
                             permission: rule.permission.clone(),
                             pattern: rule.pattern.clone(),
@@ -214,6 +215,24 @@ impl TaskOps for ProductionTaskOps {
                         .collect()
                 })
                 .unwrap_or_default()
+        })
+    }
+
+    /// Every ceiling the parent has now is set on the child: one of the
+    /// same name is replaced, and one the child has that the parent does
+    /// not is kept (a ceiling is never removed).
+    fn inherit_ceilings<'a>(
+        &'a self,
+        parent: &'a str,
+        child: &'a str,
+    ) -> BoxFuture<'a, Result<(), ToolError>> {
+        Box::pin(async move {
+            for ceiling in self.sessions.ceilings(parent).map_err(tool_error)? {
+                self.sessions
+                    .set_ceiling(child, &ceiling)
+                    .map_err(tool_error)?;
+            }
+            Ok(())
         })
     }
 
@@ -943,6 +962,94 @@ mod tests {
         assert_eq!(session.parent_id, Some(parent.id));
         assert_eq!(session.title, "research stuff (@research subagent)");
         assert_eq!(session.agent, Some("research".to_string()));
+    }
+
+    /// A subagent's session takes its parent's ceilings when it is
+    /// created, and a resume compared only the two sessions' deny rules:
+    /// a parent whose ceiling had been narrowed since (a trigger's bounds
+    /// are replaced at each run) resumed a child still under the old,
+    /// wider one. A resume gives the child the parent's ceilings as they
+    /// stand now, before it is prompted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_resumed_subagent_is_under_its_parents_ceilings_as_they_stand_now() {
+        use crate::session::store::SessionCeiling;
+        use alforria_schema::permission_v1::PermissionV1Rule;
+        let e = engine(
+            "task-ops-resume-ceiling",
+            vec![text_stream("started"), text_stream("carried on")],
+        );
+        let sessions = &e.services.sessions;
+        let ceiling = |rules: &[(&str, PermissionV1Action)]| SessionCeiling {
+            name: crate::trigger::rules::CREATOR_CEILING.to_string(),
+            readings: vec![rules
+                .iter()
+                .map(|(permission, action)| PermissionV1Rule {
+                    permission: permission.to_string(),
+                    pattern: "*".to_string(),
+                    action: *action,
+                })
+                .collect()],
+        };
+        let parent = create_engine_session(&e);
+        let wide = ceiling(&[("*", PermissionV1Action::Allow)]);
+        sessions.set_ceiling(&parent.id, &wide).unwrap();
+        let user = crate::session::test_support::user_message(&parent.id, "msg_p1", 1.0);
+        sessions.update_message(&user).unwrap();
+        let assistant = crate::session::test_support::assistant_message(
+            &parent.id, "msg_a1", "msg_p1", 1, None, None,
+        );
+        sessions.update_message(&assistant).unwrap();
+        let (task, _) = e.registry.named();
+        let ask = crate::tool::ripgrep::test_support::RecordingAsk::new();
+        let extra = crate::tool::def::Extra::default();
+        let call = |task_id: Option<String>| {
+            (task.execute)(
+                serde_json::json!({
+                    "description": "research",
+                    "prompt": "carry on",
+                    "subagent_type": "general",
+                    "task_id": task_id,
+                }),
+                crate::tool::def::ToolCtxRef {
+                    session_id: &parent.id,
+                    message_id: "msg_a1",
+                    agent: "build",
+                    call_id: Some("cal_1"),
+                    abort: tokio_util::sync::CancellationToken::new(),
+                    messages: &[],
+                    extra: &extra,
+                    instance: &e.instance,
+                    ask: &ask,
+                    metadata: &ask,
+                },
+            )
+        };
+        call(None).await.unwrap();
+        let child = sessions.children(&parent.id).unwrap()[0].id.clone();
+        assert_eq!(sessions.ceilings(&child).unwrap(), vec![wide]);
+
+        // The parent's bounds are narrowed after the child was made.
+        let narrow = ceiling(&[
+            ("*", PermissionV1Action::Allow),
+            ("bash", PermissionV1Action::Deny),
+        ]);
+        sessions.set_ceiling(&parent.id, &narrow).unwrap();
+        let result = call(Some(child.clone())).await.unwrap();
+        assert!(result.output.contains("carried on"), "{}", result.output);
+        assert_eq!(
+            sessions.children(&parent.id).unwrap().len(),
+            1,
+            "the same session was resumed"
+        );
+        assert_eq!(sessions.ceilings(&child).unwrap(), vec![narrow]);
+        let general = e.services.agents.get("general").unwrap().permission.clone();
+        assert_eq!(
+            sessions
+                .policy(&child, &general)
+                .evaluate("bash", "ls")
+                .action,
+            PermissionV1Action::Deny
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -244,6 +244,11 @@ pre-1.0, so minor releases may include breaking changes.
 
 ### Fixed
 
+- A subagent resumed with `task_id` went on under the ceilings its session
+  was created with, even when its parent's had been narrowed since (a
+  trigger's bounds are replaced at each run): the resume compared the two
+  sessions' deny rules only. A resumed subagent is now given its parent's
+  current ceilings before it is prompted.
 - Three tools handed an operator's session what a client below `admin`
   had written without marking the session as having seen outside content:
   `memory` (`search`, `list`) returning a record a restricted writer
