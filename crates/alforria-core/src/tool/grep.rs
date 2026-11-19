@@ -270,7 +270,7 @@ mod tests {
     async fn search_runs_off_the_runtime_and_cancellation_releases_it() {
         use crate::tool::ripgrep::GrepMatch;
         use tokio_util::sync::CancellationToken;
-        struct SlowSearch;
+        struct SlowSearch(std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>);
         impl Ripgrep for SlowSearch {
             fn grep(
                 &self,
@@ -289,6 +289,7 @@ mod tests {
                 _: usize,
                 cancel: &CancellationToken,
             ) -> Result<Vec<GrepMatch>, String> {
+                self.0.lock().unwrap().take().unwrap().send(()).unwrap();
                 while !cancel.is_cancelled() {
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
@@ -307,17 +308,29 @@ mod tests {
         let extra = Extra::default();
         let context = ctx(&ask, &inst, &extra);
         let cancel = context.abort.clone();
+        let (started, running) = tokio::sync::oneshot::channel();
         let def = grep_tool(
             Arc::new(TruncateService::default_limits(temp.path().join("output"))),
             fixed_agents(),
-            Arc::new(SlowSearch),
+            Arc::new(SlowSearch(std::sync::Mutex::new(Some(started)))),
         );
         let canceller = async {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            running.await.unwrap();
             cancel.cancel();
         };
-        let (result, ()) = tokio::join!((def.execute)(json!({"pattern":"x"}), context), canceller);
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!((def.execute)(json!({"pattern":"x"}), context), canceller)
+        })
+        .await
+        .expect("the runtime stays responsive while the search is running");
         assert!(matches!(result, Err(ToolError::Aborted)));
+        let _slots = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            SEARCH_SLOTS.acquire_many(4),
+        )
+        .await
+        .expect("the cancelled search returned its permit")
+        .unwrap();
     }
 
     #[tokio::test]

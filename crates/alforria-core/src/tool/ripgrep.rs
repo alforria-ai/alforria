@@ -10,7 +10,7 @@
 //! `dirname`, `basename`) and the UTF-16 truncation helpers shared by the
 //! M4.2 tools.
 
-use std::io::Read;
+use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Component, Path, PathBuf};
 use tokio_util::sync::CancellationToken;
 
@@ -99,14 +99,7 @@ impl Ripgrep for RipgrepService {
         limit: usize,
         cancel: &CancellationToken,
     ) -> Result<Vec<GrepMatch>, String> {
-        let regex = grep_regex::RegexMatcherBuilder::new()
-            .crlf(true)
-            .build(pattern)
-            .map_err(|e| e.to_string())?;
-        let mut searcher = grep_searcher::SearcherBuilder::new()
-            .line_terminator(grep_matcher::LineTerminator::crlf())
-            .line_number(true)
-            .build();
+        let regex = regex::Regex::new(pattern).map_err(|e| e.to_string())?;
         let mut globs: Vec<&str> = Vec::new();
         if let Some(include) = include {
             globs.push(include);
@@ -114,12 +107,9 @@ impl Ripgrep for RipgrepService {
         globs.push(GIT_GLOB);
         // rg --json --hidden: hidden files are searched.
         let mut out: Vec<GrepMatch> = Vec::new();
-        for entry in walk(cwd, &globs, false, false) {
-            if cancel.is_cancelled() {
-                return Err("Search cancelled".into());
-            }
-            if out.len() >= limit {
-                break;
+        for entry in walk(cwd, &globs, false, false, Some(cancel)) {
+            if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+                continue;
             }
             let relative = match relative_to(cwd, entry.path()) {
                 Some(relative) => relative,
@@ -129,29 +119,13 @@ impl Ripgrep for RipgrepService {
                 Ok(file) => file,
                 Err(_) => continue,
             };
-            let reader = CancellableReader {
-                reader: file,
-                cancel,
-            };
-            searcher
-                .search_reader(
-                    &regex,
-                    reader,
-                    grep_searcher::sinks::Bytes(|number, bytes: &[u8]| {
-                        let text = String::from_utf8_lossy(bytes);
-                        let text = match truncate_utf16(&text, MATCH_TEXT_MAX) {
-                            Some(truncated) => format!("{truncated}..."),
-                            None => text.into_owned(),
-                        };
-                        out.push(GrepMatch {
-                            path: relative.clone(),
-                            line: number,
-                            text,
-                        });
-                        Ok(out.len() < limit && !cancel.is_cancelled())
-                    }),
-                )
-                .map_err(|error| error.to_string())?;
+            // A failed read discards this file's matches and leaves the others intact.
+            if let Ok(matches) = grep_reader(file, &regex, &relative, limit - out.len(), cancel) {
+                out.extend(matches);
+            }
+            if out.len() >= limit {
+                break;
+            }
         }
         if cancel.is_cancelled() {
             return Err("Search cancelled".into());
@@ -161,7 +135,7 @@ impl Ripgrep for RipgrepService {
 
     fn glob(&self, cwd: &Path, pattern: &str, limit: usize) -> Vec<PathBuf> {
         let mut out = Vec::new();
-        for entry in walk(cwd, &[pattern, GIT_GLOB], true, false) {
+        for entry in walk(cwd, &[pattern, GIT_GLOB], true, false, None) {
             out.push(match relative_to(cwd, entry.path()) {
                 Some(relative) => PathBuf::from(relative),
                 None => continue,
@@ -189,7 +163,7 @@ impl Ripgrep for RipgrepService {
             vec![pattern, GIT_GLOB]
         };
         // TS `hidden` = rg's `--hidden` flag (include hidden files).
-        for entry in walk(cwd, &globs, !hidden, follow) {
+        for entry in walk(cwd, &globs, !hidden, follow, None) {
             out.push(match relative_to(cwd, entry.path()) {
                 Some(relative) => PathBuf::from(relative),
                 None => continue,
@@ -207,12 +181,13 @@ impl Ripgrep for RipgrepService {
 /// `--glob` overrides, `skip_hidden = true` skips hidden files (the rg
 /// default) and symlinks are never returned unless `follow` resolves them
 /// (rg skips symlinks during traversal).
-fn walk(
+fn walk<'a>(
     cwd: &Path,
     globs: &[&str],
     skip_hidden: bool,
     follow: bool,
-) -> Box<dyn Iterator<Item = DirEntry>> {
+    cancel: Option<&'a CancellationToken>,
+) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
     let mut builder = WalkBuilder::new(cwd);
     builder.hidden(skip_hidden);
     builder.follow_links(follow);
@@ -231,6 +206,8 @@ fn walk(
     Box::new(
         builder
             .build()
+            // Check directory entries too, before filtering them out of the results.
+            .take_while(move |_| cancel.is_none_or(|token| !token.is_cancelled()))
             .filter_map(|entry| entry.ok())
             .filter(|entry| {
                 entry
@@ -238,6 +215,43 @@ fn walk(
                     .is_some_and(|ty| !ty.is_dir() && !ty.is_symlink())
             }),
     )
+}
+
+fn grep_reader(
+    reader: impl Read,
+    regex: &regex::Regex,
+    path: &str,
+    limit: usize,
+    cancel: &CancellationToken,
+) -> io::Result<Vec<GrepMatch>> {
+    let mut reader = BufReader::new(CancellableReader { reader, cancel });
+    let mut matches = Vec::new();
+    let mut bytes = Vec::new();
+    let mut line = 0;
+    while matches.len() < limit && !cancel.is_cancelled() {
+        bytes.clear();
+        if reader.read_until(b'\n', &mut bytes)? == 0 {
+            break;
+        }
+        line += 1;
+        // Match one lossy UTF-8 line at a time, without its terminator.
+        // Keep the original terminator in the displayed text for matches.
+        let text = String::from_utf8_lossy(&bytes);
+        let content = text.strip_suffix('\n').unwrap_or(&text);
+        let content = content.strip_suffix('\r').unwrap_or(content);
+        if regex.is_match(content) {
+            let text = match truncate_utf16(&text, MATCH_TEXT_MAX) {
+                Some(truncated) => format!("{truncated}..."),
+                None => text.into_owned(),
+            };
+            matches.push(GrepMatch {
+                path: path.to_string(),
+                line,
+                text,
+            });
+        }
+    }
+    Ok(matches)
 }
 
 /// Cwd-relative path with `/` separators (TS strips the leading `./` rg
@@ -646,21 +660,69 @@ mod tests {
             }
         }
         let cancel = CancellationToken::new();
-        let mut reader = CancellableReader {
-            reader: CancelOnRead {
-                token: cancel.clone(),
-                reads: 0,
-            },
-            cancel: &cancel,
+        let mut reader = CancelOnRead {
+            token: cancel.clone(),
+            reads: 0,
         };
-        let regex = grep_regex::RegexMatcher::new("not present").unwrap();
-        let result = grep_searcher::Searcher::new().search_reader(
-            &regex,
+        let result = grep_reader(
             &mut reader,
-            grep_searcher::sinks::Bytes(|_, _: &[u8]| panic!("no matches")),
+            &regex::Regex::new("not present").unwrap(),
+            "file.txt",
+            10,
+            &cancel,
         );
         assert!(result.is_err());
-        assert_eq!(reader.reader.reads, 1);
+        assert_eq!(reader.reads, 1);
+    }
+
+    #[test]
+    fn a_read_error_discards_partial_file_matches() {
+        struct FailsToRead;
+        impl Read for FailsToRead {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("injected read error"))
+            }
+        }
+        let reader = (&b"match\n"[..]).chain(FailsToRead);
+        let result = grep_reader(
+            reader,
+            &regex::Regex::new("match").unwrap(),
+            "file.txt",
+            10,
+            &CancellationToken::new(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn grep_keeps_per_line_regex_semantics() {
+        let temp = crate::storage::test_support::TempDir::new("ripgrep-anchors");
+        std::fs::write(
+            temp.path().join("lines.txt"),
+            b"first\nfoo\r\nlast\ncaf\xe9\nfoo\r",
+        )
+        .unwrap();
+        for pattern in ["^foo", "foo$", r"\Afoo\z", "(?-m:^foo$)"] {
+            let matches = RipgrepService
+                .grep(temp.path(), pattern, None, 100)
+                .unwrap();
+            assert_eq!(
+                matches.iter().map(|hit| hit.line).collect::<Vec<_>>(),
+                [2, 5],
+                "{pattern}"
+            );
+            assert_eq!(matches[0].text, "foo\r\n");
+        }
+        let matches = RipgrepService
+            .grep(temp.path(), r"^caf.$", None, 100)
+            .unwrap();
+        assert_eq!(matches[0].text, "caf\u{fffd}\n");
+        for pattern in [r"foo\n", r"foo\r"] {
+            assert!(RipgrepService
+                .grep(temp.path(), pattern, None, 100)
+                .unwrap()
+                .is_empty());
+        }
     }
 
     #[test]
