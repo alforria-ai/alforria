@@ -1495,7 +1495,18 @@ mod tests {
 
         // It died without finishing.
         drop(lock);
-        assert_eq!(service.get("theirs").unwrap().state, WorkflowState::Failed);
+        // A child another test forked at that instant holds a copy of the
+        // lock's descriptor until its `exec` closes it, so the lock can
+        // outlive the drop by a moment when tests share a process.
+        let mut state = service.get("theirs").unwrap().state;
+        for _ in 0..200 {
+            if state != WorkflowState::Running {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            state = service.get("theirs").unwrap().state;
+        }
+        assert_eq!(state, WorkflowState::Failed);
         std::fs::remove_dir_all(temp.path()).ok();
     }
 
