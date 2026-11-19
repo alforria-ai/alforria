@@ -6,7 +6,8 @@
 
 use std::sync::Arc;
 
-use alforria_core::{new_event_id, versioned_type, EventBus, Payload, Subscription};
+use alforria_core::event::bus::Listener;
+use alforria_core::{new_event_id, versioned_type, EventBus, Payload};
 use alforria_schema::event_manifest::SERVER_HEARTBEAT_TYPE;
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, State};
@@ -120,11 +121,8 @@ impl GlobalEvent {
 /// fed by the `EventV2Bridge` listener (`event-v2-bridge.ts:26-62`).
 #[derive(Clone)]
 pub struct GlobalBus {
-    tx: broadcast::Sender<GlobalEvent>,
-    /// Keeps the core-bus bridge listener alive while any handle exists.
-    bridge: Option<Arc<Subscription>>,
-    /// Retained subscriptions of chained per-instance buses (M7.1).
-    chains: Arc<std::sync::Mutex<Vec<Arc<Subscription>>>>,
+    tx: Arc<broadcast::Sender<GlobalEvent>>,
+    forward: Listener,
 }
 
 impl Default for GlobalBus {
@@ -135,42 +133,34 @@ impl Default for GlobalBus {
 
 impl GlobalBus {
     pub fn new() -> GlobalBus {
-        GlobalBus {
-            tx: broadcast::channel(alforria_core::event::bus::CHANNEL_CAPACITY).0,
-            bridge: None,
-            chains: Arc::new(std::sync::Mutex::new(Vec::new())),
-        }
+        let tx = Arc::new(broadcast::channel(alforria_core::event::bus::CHANNEL_CAPACITY).0);
+        let destination = Arc::downgrade(&tx);
+        let forward = Arc::new(move |event: &Payload| {
+            if let Some(tx) = destination.upgrade() {
+                for frame in bridge_frames(event) {
+                    let _ = tx.send(frame);
+                }
+            }
+        });
+        GlobalBus { tx, forward }
     }
 
     /// A bus bridged to the core EventV2 bus: every published event is
     /// mirrored as a regular global frame, and every durable event
     /// additionally as a `sync` frame (`event-v2-bridge.ts:26-62`).
-    pub fn bridged(bus: Arc<EventBus>) -> GlobalBus {
-        let mut global = GlobalBus::new();
-        let bridged = global.clone();
-        let subscription = bus.listen(Arc::new(move |event| {
-            for frame in bridge_frames(event) {
-                bridged.emit(frame);
-            }
-        }));
-        global.bridge = Some(Arc::new(subscription));
+    pub fn bridged(bus: &EventBus) -> GlobalBus {
+        let global = GlobalBus::new();
+        global.chain(bus);
         global
     }
 
     /// Bridge an additional (per-instance) EventV2 bus into the global bus
     /// — every instance publishes onto its own bus in the Rust port, and
     /// the bridge listener is the TS process-wide EventV2's listener.
-    pub fn chain(&self, bus: Arc<EventBus>) {
-        let chained = self.clone();
-        let subscription = bus.listen(Arc::new(move |event| {
-            for frame in bridge_frames(event) {
-                chained.emit(frame);
-            }
-        }));
-        self.chains
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(Arc::new(subscription));
+    /// The publishing bus owns the listener so PTYs and turns can outlive
+    /// a cache entry. The listener refers to the destination weakly.
+    pub fn chain(&self, bus: &EventBus) {
+        bus.listen_for_lifetime(self.forward.clone());
     }
 
     /// `GlobalBus.emit` (global.ts:9-17) — ids are assigned at construction
@@ -381,7 +371,10 @@ pub async fn v1_event(
                             return;
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(skipped, "closing lagged event stream for client resync");
+                        return;
+                    }
                     Err(broadcast::error::RecvError::Closed) => return,
                 },
                 _ = &mut heartbeat => {
@@ -439,7 +432,10 @@ pub async fn global_event(State(ctx): State<Arc<ServerContext>>) -> Response {
                             return;
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(skipped, "closing lagged global event stream for client resync");
+                        return;
+                    }
                     Err(broadcast::error::RecvError::Closed) => return,
                 },
                 _ = &mut heartbeat => {
@@ -480,26 +476,23 @@ pub async fn api_event(State(ctx): State<Arc<ServerContext>>) -> Response {
     // raw `EventV2` payload on the bridge frames (`event-v2-bridge.ts`:
     // the process-wide `EventV2` service TS subscribes to here).
     let (event_tx, mut events) = mpsc::channel::<Payload>(SUBSCRIBER_CAPACITY);
-    let event_tx = Arc::new(std::sync::Mutex::new(Some(event_tx)));
-    let listener_tx = Arc::clone(&event_tx);
     let mut global = ctx.global_bus.subscribe();
     tokio::spawn(async move {
         loop {
-            let received = global.recv().await;
+            let received = tokio::select! {
+                _ = event_tx.closed() => return,
+                received = global.recv() => received,
+            };
             let payload = match received {
                 Ok(event) => event.v2,
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => break,
+                // A gap invalidates this subscription. Dropping the only
+                // queue sender closes the response after queued events drain.
+                Err(_) => return,
             };
             let Some(payload) = payload else {
                 continue;
             };
-            let mut sender = listener_tx.lock().unwrap_or_else(|p| p.into_inner());
-            let sender = match sender.as_mut() {
-                Some(sender) => sender,
-                None => return,
-            };
-            if sender.try_send(payload).is_err() {
+            if event_tx.try_send(payload).is_err() {
                 return;
             }
         }
@@ -508,10 +501,6 @@ pub async fn api_event(State(ctx): State<Arc<ServerContext>>) -> Response {
     let interval = ctx.heartbeat.v2;
     let (tx, rx) = mpsc::channel(64);
     tokio::spawn(async move {
-        // Hold the listener's sender for the lifetime of the stream —
-        // dropping it on disconnect unsubscribes.
-        let _listener_sender = event_tx;
-
         let connected = Payload {
             id: new_event_id(),
             metadata: None,
@@ -536,6 +525,7 @@ pub async fn api_event(State(ctx): State<Arc<ServerContext>>) -> Response {
         let mut heartbeat = Box::pin(tokio::time::sleep(interval));
         loop {
             tokio::select! {
+                _ = tx.closed() => return,
                 event = events.recv() => match event {
                     Some(event) => {
                         let frame = sse_frame(&serde_json::to_string(&event).unwrap());

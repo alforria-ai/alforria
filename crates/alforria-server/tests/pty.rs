@@ -1,6 +1,8 @@
 //! M6.8 acceptance: the PTY service, connect tickets and the v1+v2 connect
-//! websockets, exercised against a live listener with real `/bin/sh`
-//! sessions.
+//! websockets, exercised against a live listener with real portable Python
+//! processes.
+
+mod support;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,6 +22,7 @@ use tempfile::TempDir;
 
 /// A live server backed by a tempdir instance store.
 struct Fixture {
+    ctx: Arc<ServerContext>,
     listener: alforria_server::Listener,
     client: Client,
     directory: String,
@@ -77,11 +80,14 @@ async fn fixture() -> Fixture {
         Ok(test_services(directory))
     }));
     let mut ctx = ServerContext::for_tests();
+    instances.set_global_bus(ctx.global_bus.clone());
     ctx.instances = instances;
-    let listener = alforria_server::listen_with(&ListenOptions::default(), Arc::new(ctx))
+    let ctx = Arc::new(ctx);
+    let listener = alforria_server::listen_with(&ListenOptions::default(), ctx.clone())
         .await
         .unwrap();
     Fixture {
+        ctx,
         listener,
         client: Client::new(),
         directory: directory.display().to_string(),
@@ -120,6 +126,14 @@ impl Fixture {
     }
 }
 
+fn python() -> &'static str {
+    if cfg!(windows) {
+        "python"
+    } else {
+        "python3"
+    }
+}
+
 /// Create a session through the v1 surface and return its info.
 async fn create(fx: &Fixture, command: &str, args: &[&str]) -> Value {
     let response = fx
@@ -149,6 +163,27 @@ async fn connect_ticket(fx: &Fixture, path: &str, headers: &[(&str, &str)]) -> r
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cached_pty_service_delivers_events_after_instance_reload() {
+    let fixture = fixture().await;
+    let directory = std::path::Path::new(&fixture.directory);
+    // Resolve the registry before disposal, so it holds the original bus.
+    assert_eq!(fixture.get("/pty").await.status(), StatusCode::OK);
+    fixture.ctx.instances.dispose_directory(directory);
+    fixture.ctx.instances.load(directory).unwrap();
+
+    let mut events = fixture.ctx.global_bus.subscribe();
+    let pty = create(&fixture, python(), &["-c", "pass"]).await;
+    let created = tokio::time::timeout(Duration::from_secs(3), events.recv())
+        .await
+        .expect("the cached PTY bus still forwards to SSE")
+        .unwrap()
+        .v2
+        .unwrap();
+    assert_eq!(created.r#type, "pty.created");
+    assert_eq!(created.data["info"]["id"], pty["id"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn v1_pty_http_family() {
     let fx = fixture().await;
     let shells = fx.get("/pty/shells").await;
@@ -158,7 +193,7 @@ async fn v1_pty_http_family() {
         s.get("path").is_some() && s.get("name").is_some() && s.get("acceptable").is_some()
     }));
 
-    let created = create(&fx, "/bin/sh", &["-c", "sleep 30"]).await;
+    let created = create(&fx, python(), &["-c", "import time; time.sleep(30)"]).await;
     let pty_id = created["id"].as_str().unwrap().to_string();
     assert!(pty_id.starts_with("pty_"));
     assert_eq!(created["status"], "running");
@@ -167,7 +202,7 @@ async fn v1_pty_http_family() {
         format!("Terminal {}", &pty_id[pty_id.len() - 4..])
     );
     assert!(created["pid"].as_u64().unwrap() > 0);
-    assert_eq!(created["command"], "/bin/sh");
+    assert_eq!(created["command"], python());
     assert_eq!(created["cwd"], fx.directory);
 
     let list = fx.get("/pty").await;
@@ -225,7 +260,7 @@ async fn v1_pty_http_family() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn v2_family_keeps_exited_sessions() {
     let fx = fixture().await;
-    let created = create(&fx, "/bin/sh", &["-c", "exit 4"]).await;
+    let created = create(&fx, python(), &["-c", "import sys; sys.exit(4)"]).await;
     let pty_id = created["id"].as_str().unwrap().to_string();
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
@@ -298,7 +333,7 @@ async fn v2_family_keeps_exited_sessions() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn connect_token_enforcement() {
     let fx = fixture().await;
-    let created = create(&fx, "/bin/sh", &["-c", "sleep 30"]).await;
+    let created = create(&fx, python(), &["-c", "import time; time.sleep(30)"]).await;
     let pty_id = created["id"].as_str().unwrap().to_string();
     let path = format!("/pty/{pty_id}/connect-token");
 
@@ -374,7 +409,7 @@ async fn connect_token_enforcement() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn connect_handshake_order() {
     let fx = fixture().await;
-    let created = create(&fx, "/bin/sh", &["-c", "sleep 30"]).await;
+    let created = create(&fx, python(), &["-c", "import time; time.sleep(30)"]).await;
     let pty_id = created["id"].as_str().unwrap().to_string();
 
     // Missing session → 404 before decoding the query.
@@ -455,12 +490,15 @@ async fn ws_handshake(fx: &Fixture, path: &str, origin: Option<&str>, host: Opti
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ws_connect_refuses_foreign_origins() {
     let fx = fixture().await;
-    let created = create(&fx, "/bin/sh", &["-c", "sleep 30"]).await;
+    let created = create(&fx, python(), &["-c", "import time; time.sleep(30)"]).await;
     let pty_id = created["id"].as_str().unwrap().to_string();
-    let v1 = format!("/pty/{pty_id}/connect?directory={}", fx.directory);
+    let v1 = format!(
+        "/pty/{pty_id}/connect?directory={}",
+        support::encode_query_value(&fx.directory)
+    );
     let v2 = format!(
         "/api/pty/{pty_id}/connect?location[directory]={}",
-        fx.directory
+        support::encode_query_value(&fx.directory)
     );
 
     // Ticketless.
@@ -515,14 +553,17 @@ async fn ws_connect_refuses_foreign_origins() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ws_replay_meta_frame_and_live_output() {
     let fx = fixture().await;
-    let created = create(&fx, "/bin/sh", &["-c", "sleep 30"]).await;
+    let created = create(&fx, python(), &["-c", "import time; time.sleep(30)"]).await;
     let pty_id = created["id"].as_str().unwrap().to_string();
 
     // Seed the buffer with output before connecting.
     tokio::time::sleep(Duration::from_millis(100)).await;
     let mut stream = ws_connect(
         &fx,
-        &format!("/pty/{pty_id}/connect?directory={}", fx.directory),
+        &format!(
+            "/pty/{pty_id}/connect?directory={}",
+            support::encode_query_value(&fx.directory)
+        ),
     )
     .await;
 
@@ -559,11 +600,14 @@ async fn ws_replay_meta_frame_and_live_output() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ws_close_1000_when_the_session_is_removed() {
     let fx = fixture().await;
-    let created = create(&fx, "/bin/sh", &["-c", "sleep 30"]).await;
+    let created = create(&fx, python(), &["-c", "import time; time.sleep(30)"]).await;
     let pty_id = created["id"].as_str().unwrap().to_string();
     let mut stream = ws_connect(
         &fx,
-        &format!("/pty/{pty_id}/connect?directory={}", fx.directory),
+        &format!(
+            "/pty/{pty_id}/connect?directory={}",
+            support::encode_query_value(&fx.directory)
+        ),
     )
     .await;
     // The handshake completes before the server attaches the socket to
@@ -605,11 +649,14 @@ async fn ws_close_1000_when_the_session_is_removed() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ws_1001_on_server_close() {
     let fx = fixture().await;
-    let created = create(&fx, "/bin/sh", &["-c", "sleep 30"]).await;
+    let created = create(&fx, python(), &["-c", "import time; time.sleep(30)"]).await;
     let pty_id = created["id"].as_str().unwrap().to_string();
     let mut stream = ws_connect(
         &fx,
-        &format!("/pty/{pty_id}/connect?directory={}", fx.directory),
+        &format!(
+            "/pty/{pty_id}/connect?directory={}",
+            support::encode_query_value(&fx.directory)
+        ),
     )
     .await;
     let _ = stream.next().await; // meta frame etc — ignore frames until close
@@ -633,7 +680,7 @@ async fn ws_1001_on_server_close() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn v2_exited_session_closes_with_4404() {
     let fx = fixture().await;
-    let created = create(&fx, "/bin/sh", &["-c", "exit 4"]).await;
+    let created = create(&fx, python(), &["-c", "import sys; sys.exit(4)"]).await;
     let pty_id = created["id"].as_str().unwrap().to_string();
     // Wait for the exit.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
@@ -651,7 +698,7 @@ async fn v2_exited_session_closes_with_4404() {
         &fx,
         &format!(
             "/api/pty/{pty_id}/connect?location[directory]={}",
-            fx.directory
+            support::encode_query_value(&fx.directory)
         ),
     )
     .await;
@@ -669,7 +716,7 @@ async fn v2_exited_session_closes_with_4404() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn v1_exited_session_connects_are_404_before_upgrade() {
     let fx = fixture().await;
-    let created = create(&fx, "/bin/sh", &["-c", "exit 4"]).await;
+    let created = create(&fx, python(), &["-c", "import sys; sys.exit(4)"]).await;
     let pty_id = created["id"].as_str().unwrap().to_string();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     loop {
@@ -690,8 +737,8 @@ async fn v1_exited_session_connects_are_404_before_upgrade() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tickets_are_single_use_and_scope_bound_over_the_ws() {
     let fx = fixture().await;
-    let created = create(&fx, "/bin/sh", &["-c", "sleep 30"]).await;
-    let other = create(&fx, "/bin/sh", &["-c", "sleep 30"]).await;
+    let created = create(&fx, python(), &["-c", "import time; time.sleep(30)"]).await;
+    let other = create(&fx, python(), &["-c", "import time; time.sleep(30)"]).await;
     let pty_id = created["id"].as_str().unwrap().to_string();
     let other_id = other["id"].as_str().unwrap().to_string();
 
@@ -707,7 +754,8 @@ async fn tickets_are_single_use_and_scope_bound_over_the_ws() {
     // A ticket minted for one pty is invalid for another.
     let url = format!(
         "ws://127.0.0.1:{}/pty/{other_id}/connect?directory={}&ticket={ticket}",
-        fx.listener.port, fx.directory
+        fx.listener.port,
+        support::encode_query_value(&fx.directory)
     );
     let response = reqwest::get(url.replace("ws://", "http://")).await.unwrap();
     assert_eq!(response.status(), 403);
@@ -716,7 +764,8 @@ async fn tickets_are_single_use_and_scope_bound_over_the_ws() {
     // Valid connect consumes the ticket...
     let url = format!(
         "ws://127.0.0.1:{}/pty/{pty_id}/connect?directory={}&ticket={ticket}",
-        fx.listener.port, fx.directory
+        fx.listener.port,
+        support::encode_query_value(&fx.directory)
     );
     let (stream, _) = connect_async(url.into_client_request().unwrap())
         .await
@@ -726,7 +775,8 @@ async fn tickets_are_single_use_and_scope_bound_over_the_ws() {
     // ...and the same ticket cannot connect again.
     let url = format!(
         "ws://127.0.0.1:{}/pty/{pty_id}/connect?directory={}&ticket={ticket}",
-        fx.listener.port, fx.directory
+        fx.listener.port,
+        support::encode_query_value(&fx.directory)
     );
     let response = reqwest::get(url.replace("ws://", "http://")).await.unwrap();
     assert_eq!(response.status(), 403);

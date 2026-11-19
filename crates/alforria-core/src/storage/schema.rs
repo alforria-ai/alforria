@@ -980,8 +980,9 @@ mod tests {
     #[test]
     fn schema_sql_statement_shape() {
         // Byte-compare sqlite_master against SCHEMA_SQL (spec §7). The
-        // journal table (created afterwards by `migration::apply`) is
-        // excluded, and so is everything alforria's own migrations created
+        // journal table (created afterwards by `migration::apply`) and the
+        // additive local query index are excluded, and so is everything
+        // alforria's own migrations created
         // (`alforria_migration::OWN_TABLES`): those are not upstream's.
         let temp = TempDir::new("schema");
         let storage = crate::storage::Storage::open(temp.path().join("db.sqlite")).unwrap();
@@ -989,10 +990,12 @@ mod tests {
         let actual: Vec<String> = storage
             .with_connection(|conn| -> rusqlite::Result<Vec<(String, String)>> {
                 let mut stmt = conn.prepare(
-                    "SELECT tbl_name, sql FROM sqlite_master WHERE sql IS NOT NULL AND name != 'migration'
-                     ORDER BY rowid",
+                    "SELECT tbl_name, sql FROM sqlite_master WHERE sql IS NOT NULL
+                     AND name NOT IN ('migration', ?1) ORDER BY rowid",
                 )?;
-                let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+                let rows = stmt.query_map([crate::storage::connection::TURN_INDEX], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()
             })
             .unwrap()

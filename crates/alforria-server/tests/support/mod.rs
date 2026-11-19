@@ -477,3 +477,13 @@ pub fn basic(username: &str, password: &str) -> String {
         base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"))
     )
 }
+
+/// Encode a query value, including spaces, Unicode and reserved characters.
+pub fn encode_query_value(value: &str) -> String {
+    let url = reqwest::Url::parse_with_params("http://localhost/", [("value", value)]).unwrap();
+    url.query()
+        .unwrap()
+        .strip_prefix("value=")
+        .unwrap()
+        .to_owned()
+}

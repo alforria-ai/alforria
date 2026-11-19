@@ -154,6 +154,12 @@ impl From<rusqlite::Error> for CoreError {
     }
 }
 
+impl From<std::io::Error> for CoreError {
+    fn from(error: std::io::Error) -> Self {
+        CoreError::Storage(error.to_string())
+    }
+}
+
 impl CoreError {
     /// `ConfigInvalidError` with a single message, no issue list.
     pub fn invalid(path: impl Into<PathBuf>, message: impl Into<String>) -> CoreError {

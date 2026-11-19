@@ -334,7 +334,7 @@ impl InstanceStore {
         // (`event-v2-bridge.ts:26-62`).
         let global_bus = self.global_bus.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(global_bus) = global_bus.as_ref() {
-            global_bus.chain(services.events.clone());
+            global_bus.chain(&services.events);
         }
         entries.insert(directory.clone(), services.clone());
         // M7.1: every instance boot emits `project.updated` with directory
@@ -1717,7 +1717,7 @@ impl ServerContext {
         // :540-546) — its bridge carries the session projectors, so the
         // store both writes and reads the session table.
         alforria_core::register_projectors(&bus);
-        let global_bus = GlobalBus::bridged(Arc::clone(&bus));
+        let global_bus = GlobalBus::bridged(&bus);
         instances.set_global_bus(global_bus.clone());
         let (global_bus_clone, instances_clone) = (global_bus.clone(), instances.clone());
         // `emitUpdated` — the registry's `project.updated` frames

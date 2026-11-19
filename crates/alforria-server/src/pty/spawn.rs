@@ -25,13 +25,15 @@ pub struct Exit {
 
 /// `Proc` (`pty.ts:18-25`). Listeners fire from dedicated reader/waiter
 /// threads and must stay non-blocking.
-pub trait Proc: Send {
+pub trait Proc: Send + Sync {
     fn pid(&self) -> u32;
     fn write(&self, data: &str);
     fn resize(&self, cols: u16, rows: u16);
     fn kill(&self);
     fn on_data(&self, listener: Box<dyn Fn(&str) + Send>);
     fn on_exit(&self, listener: Box<dyn Fn(Exit) + Send>);
+    /// Start event delivery after the service has registered the session.
+    fn activate(&self) {}
 }
 
 /// `spawn` (`pty.node.ts:6-29`) behind a trait object.
@@ -84,16 +86,14 @@ impl SpawnBackend for PortableBackend {
         let killer = child.clone_killer();
 
         let listeners = Arc::new(Listeners::default());
-        spawn_reader(reader, Arc::clone(&listeners));
-        // The child leads its own session, hence its own process group.
-        let group = alforria_core::process_group::register(pid);
-        spawn_waiter(child, Arc::clone(&listeners), group);
         Ok(Box::new(PortableProc {
             pid,
             master: Mutex::new(pair.master),
             writer: Mutex::new(writer),
             killer: Mutex::new(killer),
             listeners,
+            reader: Mutex::new(Some(reader)),
+            child: Mutex::new(Some(child)),
         }))
     }
 }
@@ -127,6 +127,18 @@ struct PortableProc {
     writer: Mutex<Box<dyn Write + Send>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     listeners: Arc<Listeners>,
+    reader: Mutex<Option<Box<dyn Read + Send>>>,
+    child: Mutex<Option<Box<dyn portable_pty::Child + Send + Sync>>>,
+}
+
+impl Drop for PortableProc {
+    fn drop(&mut self) {
+        // An unactivated process has no waiter to reap it yet.
+        if let Some(mut child) = self.child.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 impl Proc for PortableProc {
@@ -169,6 +181,17 @@ impl Proc for PortableProc {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .push(listener);
+    }
+
+    fn activate(&self) {
+        if let Some(reader) = self.reader.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            spawn_reader(reader, self.listeners.clone());
+        }
+        if let Some(child) = self.child.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            // The child leads its own session, hence its own process group.
+            let group = alforria_core::process_group::register(self.pid);
+            spawn_waiter(child, self.listeners.clone(), group);
+        }
     }
 }
 
@@ -242,5 +265,53 @@ impl Utf8Decoder {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fast_process_delivery_waits_for_session_activation() {
+        let directory = tempfile::tempdir().unwrap();
+        let proc = portable_backend()
+            .spawn(
+                if cfg!(windows) { "python" } else { "python3" },
+                &[
+                    "-c".into(),
+                    "import sys; print('early output', flush=True); sys.exit(4)".into(),
+                ],
+                &SpawnOpts {
+                    cwd: directory.path().to_path_buf(),
+                    env: BTreeMap::new(),
+                },
+            )
+            .unwrap();
+        let (exit_tx, exit_rx) = std::sync::mpsc::channel();
+        let (data_tx, data_rx) = std::sync::mpsc::channel();
+        proc.on_data(Box::new(move |data| {
+            let _ = data_tx.send(data.to_string());
+        }));
+        proc.on_exit(Box::new(move |exit| {
+            let _ = exit_tx.send(exit.exit_code);
+        }));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            exit_rx.try_recv().is_err(),
+            "delivery starts only after registration"
+        );
+        assert!(data_rx.try_recv().is_err());
+        proc.activate();
+        assert_eq!(
+            exit_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap(),
+            Some(4)
+        );
+        assert!(data_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .contains("early output"));
     }
 }

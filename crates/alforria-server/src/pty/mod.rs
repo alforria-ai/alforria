@@ -48,7 +48,7 @@ struct SubscriberState {
 
 struct Session {
     info: PtyInfo,
-    proc: Box<dyn Proc>,
+    proc: Arc<dyn Proc>,
     buffer: Vec<u16>,
     buffer_cursor: u64,
     cursor: u64,
@@ -148,17 +148,18 @@ impl PtyService {
         let mut env = input.env.clone().unwrap_or_default();
         env.insert("TERM".to_string(), "xterm-256color".to_string());
         env.insert("OPENCODE_TERMINAL".to_string(), "1".to_string());
-        let proc = self
-            .backend
-            .spawn(
-                &command,
-                &args,
-                &spawn::SpawnOpts {
-                    cwd: cwd.clone(),
-                    env,
-                },
-            )
-            .map_err(|err| defect(&err))?;
+        let proc: Arc<dyn Proc> = Arc::from(
+            self.backend
+                .spawn(
+                    &command,
+                    &args,
+                    &spawn::SpawnOpts {
+                        cwd: cwd.clone(),
+                        env,
+                    },
+                )
+                .map_err(|err| defect(&err))?,
+        );
         let info = PtyInfo {
             id: id.clone(),
             title: input
@@ -174,19 +175,23 @@ impl PtyService {
             exit_code: None,
         };
         {
-            let inner = Arc::clone(&self.inner);
+            let inner = Arc::downgrade(&self.inner);
             let data_id = id.clone();
             proc.on_data(Box::new(move |chunk| {
-                handle_data(&inner, &data_id, chunk);
+                if let Some(inner) = inner.upgrade() {
+                    handle_data(&inner, &data_id, chunk);
+                }
             }));
         }
         {
-            let inner = Arc::clone(&self.inner);
+            let inner = Arc::downgrade(&self.inner);
             let events = Arc::clone(&self.events);
             let location = self.location.clone();
             let exit_id = id.clone();
             proc.on_exit(Box::new(move |exit| {
-                handle_exit(&inner, &events, &location, &exit_id, exit);
+                if let Some(inner) = inner.upgrade() {
+                    handle_exit(&inner, &events, &location, &exit_id, exit);
+                }
             }));
         }
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -194,7 +199,7 @@ impl PtyService {
             id.clone(),
             Session {
                 info: info.clone(),
-                proc,
+                proc: proc.clone(),
                 buffer: Vec::new(),
                 buffer_cursor: 0,
                 cursor: 0,
@@ -209,6 +214,7 @@ impl PtyService {
             "pty.created",
             serde_json::json!({ "info": info }),
         );
+        proc.activate();
         Ok(info)
     }
 
@@ -701,11 +707,15 @@ mod tests {
 
     #[test]
     fn create_lists_updates_and_removes_a_real_pty() {
-        let service = PtyService::new(spawn_backend(), "/tmp");
+        let directory = tempfile::tempdir().unwrap();
+        let service = PtyService::new(spawn_backend(), directory.path().to_str().unwrap());
         let created = service
             .create(&PtyCreateInput {
-                command: Some("/bin/sh".to_string()),
-                args: Some(vec!["-c".to_string(), "sleep 5".to_string()]),
+                command: Some(if cfg!(windows) { "python" } else { "python3" }.to_string()),
+                args: Some(vec![
+                    "-c".to_string(),
+                    "import time; time.sleep(5)".to_string(),
+                ]),
                 cwd: None,
                 title: Some("test".to_string()),
                 env: None,
@@ -736,11 +746,15 @@ mod tests {
 
     #[test]
     fn exited_sessions_retain_output_until_removed() {
-        let service = PtyService::new(spawn_backend(), "/tmp");
+        let directory = tempfile::tempdir().unwrap();
+        let service = PtyService::new(spawn_backend(), directory.path().to_str().unwrap());
         let created = service
             .create(&PtyCreateInput {
-                command: Some("/bin/sh".to_string()),
-                args: Some(vec!["-c".to_string(), "echo hi; exit 4".to_string()]),
+                command: Some(if cfg!(windows) { "python" } else { "python3" }.to_string()),
+                args: Some(vec![
+                    "-c".to_string(),
+                    "import sys; print('hi', flush=True); sys.exit(4)".to_string(),
+                ]),
                 cwd: None,
                 title: None,
                 env: None,
@@ -761,13 +775,18 @@ mod tests {
     /// bun-pty (the TS default backend) reports a signal-killed child as
     /// `exitCode: 1`, both on the session and in `pty.exited`.
     #[test]
+    #[cfg(unix)]
     fn signal_killed_sessions_exit_with_code_one() {
-        let service = PtyService::new(spawn_backend(), "/tmp");
+        let directory = tempfile::tempdir().unwrap();
+        let service = PtyService::new(spawn_backend(), directory.path().to_str().unwrap());
         let mut exited = service.events.subscribe("pty.exited");
         let created = service
             .create(&PtyCreateInput {
-                command: Some("/bin/sh".to_string()),
-                args: Some(vec!["-c".to_string(), "kill -9 $$".to_string()]),
+                command: Some(if cfg!(windows) { "python" } else { "python3" }.to_string()),
+                args: Some(vec![
+                    "-c".to_string(),
+                    "import os, signal; os.kill(os.getpid(), signal.SIGKILL)".to_string(),
+                ]),
                 cwd: None,
                 title: None,
                 env: None,
@@ -793,13 +812,15 @@ mod tests {
 
     #[test]
     fn attach_replays_buffer_from_cursor() {
-        let service = PtyService::new(spawn_backend(), "/tmp");
+        let directory = tempfile::tempdir().unwrap();
+        let service = PtyService::new(spawn_backend(), directory.path().to_str().unwrap());
         let created = service
             .create(&PtyCreateInput {
-                command: Some("/bin/sh".to_string()),
+                command: Some(if cfg!(windows) { "python" } else { "python3" }.to_string()),
                 args: Some(vec![
                     "-c".to_string(),
-                    "sleep 0.2; echo hello; sleep 30".to_string(),
+                    "import time; time.sleep(0.2); print('hello', flush=True); time.sleep(30)"
+                        .to_string(),
                 ]),
                 cwd: None,
                 title: None,
@@ -852,15 +873,16 @@ mod tests {
 
     #[test]
     fn attach_reports_not_found_and_exited() {
-        let service = PtyService::new(spawn_backend(), "/tmp");
+        let directory = tempfile::tempdir().unwrap();
+        let service = PtyService::new(spawn_backend(), directory.path().to_str().unwrap());
         assert!(matches!(
             service.attach("pty_missing", None, Box::new(|_| {}), Box::new(|_| {})),
             Err(PtyError::NotFound)
         ));
         let created = service
             .create(&PtyCreateInput {
-                command: Some("/bin/sh".to_string()),
-                args: Some(vec!["-c".to_string(), "true".to_string()]),
+                command: Some(if cfg!(windows) { "python" } else { "python3" }.to_string()),
+                args: Some(vec!["-c".to_string(), "pass".to_string()]),
                 cwd: None,
                 title: None,
                 env: None,

@@ -212,10 +212,10 @@ mod tests {
     fn upstream_objects(conn: &Connection) -> Vec<String> {
         conn.prepare(
             "SELECT tbl_name, sql FROM sqlite_master
-             WHERE sql IS NOT NULL AND name != 'migration' ORDER BY rowid",
+             WHERE sql IS NOT NULL AND name NOT IN ('migration', ?1) ORDER BY rowid",
         )
         .unwrap()
-        .query_map([], |row| {
+        .query_map([crate::storage::connection::TURN_INDEX], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })
         .unwrap()
