@@ -1106,8 +1106,9 @@ files themselves must be safe.
 
 | | Full (standalone default) | Restricted (bearer default) |
 | --- | --- | --- |
-| Open keys — `model`, `small_model`, `default_agent`, `username`, `logLevel`, `layout`, `snapshot`, `watcher`, `attachment`, `tool_output`, `disabled_providers`, `enabled_providers`, `command.*` (template without inline shell, description, agent, model, variant, subtask), `agent.*` (name, model, variant, temperature, top_p, prompt, description, mode, hidden, color, steps, maxSteps, disable), `provider.*` (name, id, whitelist, blacklist) and `provider.*.models.*` (id, name, family, release_date, attachment, reasoning, temperature, tool_call, interleaved, cost, limit, modalities, experimental, status), `compaction` (tail_turns, preserve_recent_tokens, reserved, default_context), `prompt`, `tool` | kept | kept |
-| Capability keys — `permission`, `tools`, `agent.*.permission` / `.tools` / `.options`, `mode` rules, `mcp`, `lsp`, `formatter`, `plugin`, `shell`, `instructions`, `skills`, `workflows`, `references`, `provider.*.api` / `.npm` / `.env` / `.options`, `provider.*.models.*.provider` / `.options` / `.headers` / `.variants`, `enterprise`, `share`, `autoshare`, `autoupdate`, `subagent_depth`, `compaction.auto` / `.prune`, `experimental`, upstream `server.*`, a `command` with inline shell | kept (permission rules under the host's ceiling) | dropped unless listed in `project_keys` |
+| Open keys — `model`, `small_model`, `username`, `logLevel`, `layout`, `snapshot`, `watcher`, `attachment`, `tool_output`, `disabled_providers`, `enabled_providers`, `command.*` (template without inline shell, description, agent, model, variant, subtask), `agent.*` (name, model, variant, temperature, top_p, prompt, description, color, steps, maxSteps), `provider.*` (name, id, whitelist, blacklist) and `provider.*.models.*` (id, name, family, release_date, attachment, reasoning, temperature, tool_call, interleaved, cost, limit, modalities, experimental, status), `compaction` (tail_turns, preserve_recent_tokens, reserved, default_context), `prompt`, `tool` | kept | kept |
+| Capability keys — `permission`, `tools`, `agent.*.permission` / `.tools` / `.options` / `.mode` / `.hidden` / `.disable`, `default_agent`, `mode` rules, `mcp`, `lsp`, `formatter`, `plugin`, `shell`, `instructions`, `skills`, `workflows`, `references`, `provider.*.api` / `.npm` / `.env` / `.options`, `provider.*.models.*.provider` / `.options` / `.headers` / `.variants`, `enterprise`, `share`, `autoshare`, `autoupdate`, `subagent_depth`, `compaction.auto` / `.prune`, `experimental`, upstream `server.*`, a `command` with inline shell | kept (permission rules under the host's ceiling) | dropped unless listed in `project_keys` |
+| An agent only a project or a remote config defines (JSON `agent` / `mode`, or markdown under `.opencode/`) | loaded, under the host's top-level rules | not loaded, unless `project_keys` lists `agent.<name>` (or `agent.*`) |
 | A key no table names | kept | dropped |
 | `{env:NAME}` in a project or remote config | substituted, as upstream; a name the shell environment policy withholds (or an `auth.json` credential) is warned about once per file; a name a project's own file refers to is withheld from the agent's processes from then on | only names in `project_env`; anything else is the empty string |
 | `{file:path}` in a project or remote config | read, as upstream; an absolute, `~` or `..` path is warned about once per file | a relative path that stays inside the project, opened beneath it in one resolution; anything else is a config error. Never in a remote config |
@@ -1118,6 +1119,20 @@ The classification is `UPSTREAM_KEYS` (beside `EXTENSION_KEYS`) in
 `crates/alforria-core/src/config/precedence.rs`; a schema key in neither
 table fails `every_schema_key_is_classified`. Markdown agents, commands and
 modes under a project's `.opencode/` go through the same tables as its JSON.
+
+**Agents are the host's in restricted mode.** The rules you write agent by
+agent (`agent.build.permission`) only mean something if a project cannot
+choose a different agent. So a restricted project config may reword an agent
+the host config names (or a built-in one) and pick its model, and nothing
+else: it cannot set `default_agent`, cannot change an agent's `mode` or
+`hidden` or `disable` it, and an agent only the project defines is not
+loaded — it would be built from the built-in defaults under your top-level
+`permission` alone. A `mode.<name>` entry is read as `agent.<name>` without
+the `primary` it implies. To let projects bring an agent, list it:
+`"project_keys": ["agent.reviewer"]` hands back that agent with every key
+it has, its `permission` included (still under the ceiling of your
+top-level `permission`); `"default_agent"` and `"agent.*.mode"` can be
+listed the same way.
 
 **Where the host config itself lives matters.** `~/.config/alforria`,
 `~/.opencode` and the data directory are host locations; if a directory the

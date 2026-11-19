@@ -230,6 +230,17 @@ pub fn slug_create() -> String {
     format!("{adjective}-{noun}")
 }
 
+/// The agents the registry builds with no config at all.
+pub const NATIVE_AGENTS: &[&str] = &[
+    "build",
+    "plan",
+    "general",
+    "explore",
+    "compaction",
+    "title",
+    "summary",
+];
+
 impl AgentRegistry {
     /// Construct the registry (agent.ts:88-311), with every agent's rules
     /// under the ceiling of [`AgentRegistryInput::host_config`].
@@ -927,6 +938,16 @@ mod tests {
             assert_eq!(agent.mode, AgentMode::Primary);
         }
         assert_eq!(registry.get("title").unwrap().temperature, Some(0.5));
+    }
+
+    #[test]
+    fn the_native_agent_list_is_what_an_empty_config_builds() {
+        let registry = AgentRegistry::new(&test_input(&empty_config()));
+        let mut built: Vec<String> = registry.list().into_iter().map(|a| a.name).collect();
+        let mut named: Vec<String> = NATIVE_AGENTS.iter().map(|n| n.to_string()).collect();
+        built.sort();
+        named.sort();
+        assert_eq!(built, named);
     }
 
     #[test]

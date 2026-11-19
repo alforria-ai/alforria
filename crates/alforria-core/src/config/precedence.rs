@@ -24,7 +24,7 @@
 //! loaded so that global failures can degrade to `{}` while project
 //! failures stay fatal.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -387,7 +387,6 @@ pub const UPSTREAM_KEYS: &[(&str, ProjectKey)] = &[
     // what the host set up, not a new capability.
     ("model", ProjectKey::Open),
     ("small_model", ProjectKey::Open),
-    ("default_agent", ProjectKey::Open),
     ("disabled_providers", ProjectKey::Open),
     ("enabled_providers", ProjectKey::Open),
     // A command is a prompt template; one with inline shell (`` !`cmd` ``)
@@ -406,12 +405,9 @@ pub const UPSTREAM_KEYS: &[(&str, ProjectKey)] = &[
     ("agent.*.top_p", ProjectKey::Open),
     ("agent.*.prompt", ProjectKey::Open),
     ("agent.*.description", ProjectKey::Open),
-    ("agent.*.mode", ProjectKey::Open),
-    ("agent.*.hidden", ProjectKey::Open),
     ("agent.*.color", ProjectKey::Open),
     ("agent.*.steps", ProjectKey::Open),
     ("agent.*.maxSteps", ProjectKey::Open),
-    ("agent.*.disable", ProjectKey::Open),
     // What a model is: names, limits, prices. Not where it is reached.
     ("provider.*.name", ProjectKey::Open),
     ("provider.*.id", ProjectKey::Open),
@@ -451,6 +447,14 @@ pub const UPSTREAM_KEYS: &[(&str, ProjectKey)] = &[
     ("agent.*.tools", ProjectKey::Capability),
     // Passed to the provider request as is.
     ("agent.*.options", ProjectKey::Capability),
+    // Which agent a session starts in, and which agents can be reached at
+    // all: the host writes each agent's rules knowing where it can be
+    // used. An agent only a project defines is dropped as a whole
+    // (`drop_project_only_agents`).
+    ("default_agent", ProjectKey::Capability),
+    ("agent.*.mode", ProjectKey::Capability),
+    ("agent.*.hidden", ProjectKey::Capability),
+    ("agent.*.disable", ProjectKey::Capability),
     // `mode` is folded into `agent`: the same split.
     ("mode", ProjectKey::Capability),
     // Processes started at load, with no ask.
@@ -573,6 +577,7 @@ pub fn restrict_project_config(mut config: Value, source: &str, mode: &HostMode)
     let mut dropped = Vec::new();
     // `mode.<name>` is `agent.<name>` with `mode: primary`: filter it under
     // the agent rules, keeping it where it was written.
+    let mut demoted = Map::new();
     if let Some(Value::Object(modes)) = config.get_mut("mode") {
         let mut as_agents = json!({ "agent": Value::Object(std::mem::take(modes)) });
         let mut found = Vec::new();
@@ -583,6 +588,28 @@ pub fn restrict_project_config(mut config: Value, source: &str, mode: &HostMode)
                 .map(|key| key.replacen("agent", "mode", 1)),
         );
         *modes = as_agents["agent"].as_object().cloned().unwrap_or_default();
+        // An entry here is that agent with `mode: primary`. Where the
+        // project may not set the agent's mode, the rest of the entry is
+        // read as the agent's (`agent.<name>`), under the same filter.
+        let names: Vec<String> = modes.keys().cloned().collect();
+        for name in names {
+            let path = ["agent".to_string(), name.clone(), "mode".to_string()];
+            if !open.iter().any(|pattern| key_covers(pattern, &path)) {
+                if let Some(entry) = modes.remove(&name) {
+                    demoted.insert(name.clone(), entry);
+                }
+                dropped.push(format!("mode.{name} (as a mode: read as agent.{name})"));
+            }
+        }
+    }
+    if !demoted.is_empty() {
+        let mut agents = Value::Object(demoted);
+        if let Some(written @ Value::Object(_)) = config.get("agent") {
+            merge_deep(&mut agents, written);
+        }
+        if let Some(fields) = config.as_object_mut() {
+            fields.insert("agent".to_string(), agents);
+        }
     }
     let modes = config
         .as_object_mut()
@@ -620,6 +647,55 @@ pub fn restrict_project_config(mut config: Value, source: &str, mode: &HostMode)
         );
     }
     config
+}
+
+/// The agents `config` names, under `agent` or `mode`.
+fn note_agent_names(config: &Value, names: &mut BTreeSet<String>) {
+    for key in ["agent", "mode"] {
+        if let Some(Value::Object(agents)) = config.get(key) {
+            names.extend(agents.keys().cloned());
+        }
+    }
+}
+
+/// In restricted mode, remove from the merged config every agent that only
+/// a project's or a remote config defines: `host_agents` are the ones a
+/// host source names, and the built-in ones are the host's too. Such an
+/// agent would be built from the defaults (`*: allow`) under the host's
+/// top-level rules only — none of the rules the host wrote agent by agent
+/// reach it — so it is not loaded unless the host hands the name back
+/// (`server.trust.project_keys: ["agent.<name>"]`, or `agent.*` for any).
+fn drop_project_only_agents(result: &mut Value, host_agents: &BTreeSet<String>, mode: &HostMode) {
+    let mut dropped = BTreeSet::new();
+    for key in ["agent", "mode"] {
+        let Some(Value::Object(agents)) = result.get_mut(key) else {
+            continue;
+        };
+        let names: Vec<String> = agents.keys().cloned().collect();
+        for name in names {
+            let path = ["agent".to_string(), name.clone()];
+            let known = host_agents.contains(&name)
+                || crate::session::agents::NATIVE_AGENTS.contains(&name.as_str())
+                || mode
+                    .project_keys
+                    .iter()
+                    .any(|pattern| key_covers(pattern, &path));
+            if !known {
+                agents.remove(&name);
+                dropped.insert(name);
+            }
+        }
+    }
+    if !dropped.is_empty() {
+        let names: Vec<String> = dropped.into_iter().collect();
+        tracing::warn!(
+            "ignoring the agent(s) {} defined only by a project's or a remote config: project \
+             config is restricted on this server, and an agent the host config does not name \
+             would run without the rules it sets per agent. Define them in the host config, \
+             or list `agent.<name>` in `server.trust.project_keys` there.",
+            names.join(", ")
+        );
+    }
 }
 
 /// Call `visit` with the object holding the last segment of `path`, for
@@ -974,6 +1050,8 @@ impl ConfigLoader {
         };
 
         let mut result = Value::Object(Map::new());
+        // The agents a host source names (`drop_project_only_agents`).
+        let mut host_agents = BTreeSet::new();
 
         // 1. Remote well-known configs (auth seam).
         for provider in &auth_providers {
@@ -1012,12 +1090,14 @@ impl ConfigLoader {
             }
         };
         let global = apply_trust(global, "the global config", ConfigOrigin::Host, &mode);
+        note_agent_names(&global, &mut host_agents);
         merge_config_concat_arrays(&mut result, &global);
 
         // 4. OPENCODE_CONFIG env file (failures are fatal).
         if let Some(flag) = flags_value(&params.flags.config) {
             let next = self.load_file(Path::new(flag), &auth_env, &rules(ConfigOrigin::Own))?;
             let next = apply_trust(next, flag, ConfigOrigin::Own, &mode);
+            note_agent_names(&next, &mut host_agents);
             merge_config_concat_arrays(&mut result, &next);
         }
 
@@ -1075,6 +1155,9 @@ impl ConfigLoader {
                     let file = dir.join(name);
                     let next = self.load_file(&file, &auth_env, &rules(origin_of(dir)))?;
                     let next = apply_trust(next, &file.to_string_lossy(), origin_of(dir), &mode);
+                    if origin_of(dir) != ConfigOrigin::Outside {
+                        note_agent_names(&next, &mut host_agents);
+                    }
                     merge_config_concat_arrays(&mut result, &next);
                     // result.agent ??= {}; result.mode ??= {}; result.plugin ??= []
                     assign_if_nullish(&mut result, "agent", Value::Object(Map::new()));
@@ -1101,6 +1184,11 @@ impl ConfigLoader {
             merge_deep(entry_or_empty(&mut result, "agent"), &agents);
             let modes = discovered("agent", params.discovery.modes(dir)?);
             merge_deep(entry_or_empty(&mut result, "agent"), &modes);
+            if origin_of(dir) != ConfigOrigin::Outside {
+                for found in [&agents, &modes] {
+                    note_agent_names(&json!({ "agent": found }), &mut host_agents);
+                }
+            }
         }
 
         // 7. OPENCODE_CONFIG_CONTENT env.
@@ -1115,6 +1203,7 @@ impl ConfigLoader {
                 &rules(ConfigOrigin::Own),
             )?;
             let next = apply_trust(next, "OPENCODE_CONFIG_CONTENT", ConfigOrigin::Own, &mode);
+            note_agent_names(&next, &mut host_agents);
             merge_config_concat_arrays(&mut result, &next);
         }
 
@@ -1158,8 +1247,12 @@ impl ConfigLoader {
                     &HashMap::new(),
                     &rules(ConfigOrigin::Managed),
                 )?;
+                note_agent_names(&next, &mut host_agents);
                 merge_config_concat_arrays(&mut result, &next);
             }
+        }
+        if outside && mode.restricted {
+            drop_project_only_agents(&mut result, &host_agents, &mode);
         }
 
         // 10. Post-merge normalization (config.ts:550-598).
@@ -3005,7 +3098,11 @@ mod tests {
             }
             write(
                 &f.root.join("config").join("opencode.json"),
-                &json!({ "server": server, "permission": { "bash": "deny" } }).to_string(),
+                // The host names the agents the project words: one only a
+                // project defines is not loaded at all (see the next test).
+                &json!({ "server": server, "permission": { "bash": "deny" },
+                         "agent": { "loud": {}, "sneaky": {} } })
+                .to_string(),
             );
         };
         host(Value::Null);
@@ -3151,6 +3248,107 @@ mod tests {
         let (config, _) = f.load().unwrap();
         assert!(config.mcp.is_some());
         assert_eq!(config.shell.as_deref(), Some("/tmp/evil-shell"));
+    }
+
+    /// In restricted mode the host's per-agent rules are the policy: a
+    /// project that could add an agent of its own (built from the defaults,
+    /// `*: allow`, with none of the rules the host wrote for `build`), make
+    /// it the default, or flip a host agent's `mode` / `hidden` would walk
+    /// around them.
+    #[test]
+    fn a_restricted_project_cannot_add_an_agent_choose_the_default_or_expose_a_host_agent() {
+        use crate::session::agents::{AgentRegistry, AgentRegistryInput};
+        use crate::tool::def::AgentMode;
+        use alforria_schema::permission_v1::PermissionV1Action;
+
+        let f = Fixture::new();
+        let work = f.root.join("work");
+        let host = |trust: Value| {
+            write(
+                &f.root.join("config").join("opencode.json"),
+                &json!({
+                    "server": { "trust": trust },
+                    "agent": {
+                        "build": { "permission": { "bash": "deny" } },
+                        "ops": {
+                            "mode": "subagent", "hidden": true,
+                            "permission": { "bash": "allow" },
+                        },
+                    },
+                })
+                .to_string(),
+            );
+        };
+        write(
+            &work.join("opencode.json"),
+            &json!({
+                "default_agent": "x",
+                "agent": {
+                    "x": { "mode": "primary" },
+                    "ops": { "mode": "primary", "hidden": false, "prompt": "Project words." },
+                    "build": { "disable": true },
+                },
+                "mode": { "y": { "prompt": "Y" }, "ops": { "description": "as a mode" } },
+            })
+            .to_string(),
+        );
+        write(
+            &work.join(".opencode").join("agent").join("z.md"),
+            "---\ndescription: z\nmode: primary\n---\nDo things.\n",
+        );
+        write(
+            &work.join(".opencode").join("mode").join("w.md"),
+            "---\ndescription: w\n---\nDo things.\n",
+        );
+        let registry = || {
+            let (config, _) = f.load().unwrap();
+            let host_config = ConfigLoader.load_trusted(&f.params).unwrap();
+            AgentRegistry::new(&AgentRegistryInput {
+                config,
+                host_config: Some(host_config),
+                ..Default::default()
+            })
+        };
+
+        host(json!({ "project": "restricted" }));
+        let restricted = registry();
+        for name in ["x", "y", "z", "w"] {
+            assert!(
+                restricted.get(name).is_none(),
+                "the project's own agent `{name}` was loaded"
+            );
+        }
+        // The default stays the host's, with the host's rule.
+        assert_eq!(restricted.default_agent().unwrap(), "build");
+        let build = restricted.get("build").expect("a project disabled `build`");
+        assert_eq!(
+            build.permission.evaluate("bash", "id").action,
+            PermissionV1Action::Deny
+        );
+        // The agent the operator wrote as unreachable stays so; its wording
+        // is still the project's to set.
+        let ops = restricted.get("ops").unwrap();
+        assert_eq!(ops.mode, AgentMode::Subagent);
+        assert_eq!(ops.hidden, Some(true));
+        assert_eq!(ops.prompt.as_deref(), Some("Project words."));
+
+        // Handed back by the host, name by name: the agent, not the default.
+        host(json!({ "project": "restricted", "project_keys": ["agent.x"] }));
+        let opted = registry();
+        assert_eq!(opted.get("x").unwrap().mode, AgentMode::Primary);
+        assert!(opted.get("z").is_none());
+        assert_eq!(opted.default_agent().unwrap(), "build");
+        assert_eq!(opted.get("ops").unwrap().hidden, Some(true));
+
+        // A standalone install is as it was.
+        host(json!({ "project": "full" }));
+        let standalone = registry();
+        assert_eq!(standalone.default_agent().unwrap(), "x");
+        for name in ["y", "z", "w"] {
+            assert!(standalone.get(name).is_some(), "{name}");
+        }
+        assert!(standalone.get("build").is_none());
+        assert_eq!(standalone.get("ops").unwrap().mode, AgentMode::Primary);
     }
 
     /// `load_trusted` is the host's reading: the managed directory and the

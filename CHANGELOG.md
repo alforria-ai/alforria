@@ -244,6 +244,18 @@ pre-1.0, so minor releases may include breaking changes.
 
 ### Fixed
 
+- On a server where project config is restricted (bearer auth, or
+  `server.trust.project: "restricted"`), a project file could still step
+  around the rules the host wrote per agent: define an agent of its own
+  (built from the built-in defaults, `*: allow`, with none of
+  `agent.build.permission`), name it `default_agent`, or flip a host
+  agent's `mode` / `hidden`. A restricted project config can no longer set
+  `default_agent`, `agent.*.mode`, `agent.*.hidden` or `agent.*.disable`,
+  a `mode.<name>` entry is read as `agent.<name>` without the `primary` it
+  implies, and an agent only a project or remote config defines — JSON or
+  markdown under `.opencode/` — is not loaded unless the host lists
+  `agent.<name>` in `server.trust.project_keys`. Standalone installs are
+  unchanged.
 - A process whose shell posture was restricted from startup (bearer auth,
   `permission.unattended`, a webhook) could be put back in the standalone
   posture by a later policy install in the same process: only a posture
