@@ -137,6 +137,14 @@ fn stalled(total: Option<Duration>) -> FileError {
     )
 }
 
+fn exists(path: &str) -> FileError {
+    FileError::Status(
+        StatusCode::CONFLICT,
+        "FileExistsError",
+        format!("{path} already exists"),
+    )
+}
+
 fn over_quota(message: String) -> FileError {
     FileError::Status(StatusCode::PAYLOAD_TOO_LARGE, "UploadQuotaError", message)
 }
@@ -313,6 +321,20 @@ impl InFlight {
             credit: 0,
             principal: String::new(),
         }
+    }
+
+    /// Make the received file `name`. With `replace`, over whatever has
+    /// that name; without, only if nothing has (`AlreadyExists`
+    /// otherwise) — decided by the one step that gives it the name, not
+    /// by a look beforehand.
+    fn land(&mut self, name: &std::ffi::OsStr, replace: bool) -> std::io::Result<()> {
+        if replace {
+            self.directory.rename(&self.temporary, name)?;
+        } else {
+            self.directory.rename_new(&self.temporary, name)?;
+        }
+        self.created = false;
+        Ok(())
     }
 
     /// Give back what is held, under the area's lock the caller holds.
@@ -791,9 +813,10 @@ fn commit(
     name: &std::ffi::OsStr,
     target: &Path,
     written: u64,
+    replace: bool,
 ) -> Result<std::io::Result<()>, FileError> {
     let Some(area) = upload.area.clone() else {
-        return Ok(upload.directory.rename(&upload.temporary, name));
+        return Ok(upload.land(name, replace));
     };
     let mut state = area.lock();
     // What this upload held becomes what it is: judged against the count
@@ -809,10 +832,9 @@ fn commit(
         entries: u64::from(replaced.is_none()),
     };
     room(ctx, root, state.usage.as_ref(), state.reserved, addition)?;
-    if let Err(err) = upload.directory.rename(&upload.temporary, name) {
+    if let Err(err) = upload.land(name, replace) {
         return Ok(Err(err));
     }
-    upload.created = false;
     state.added.0 = state.added.0.saturating_add(written);
     state.added.1 += addition.entries;
     state.sizes.insert(target.to_path_buf(), written);
@@ -909,6 +931,66 @@ fn upload_target(location: &LocationContext, path: &str) -> Result<PathBuf, File
             inside_project(location, path, parent.join(name))
         }
         _ => project_file(location, path),
+    }
+}
+
+/// Open a file for reading **as it was judged**: `resolved` is a path
+/// [`project_file`] (or the frozen routes' `confined_read`) resolved and
+/// found inside the project, and it is opened beneath the project root it
+/// is in through that root's handle (`beneath::open_beneath`) — a link put
+/// in the way after the judgement that leads out is a refusal, not
+/// another file. Without waiting on a FIFO.
+pub(crate) fn open_judged(
+    location: &LocationContext,
+    resolved: &Path,
+) -> std::io::Result<std::fs::File> {
+    let roots = crate::confine::project_roots(location);
+    let Some((root, relative)) = roots.iter().find_map(|root| {
+        resolved
+            .strip_prefix(root)
+            .ok()
+            .map(|relative| (root, relative))
+    }) else {
+        return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+    };
+    if relative.as_os_str().is_empty() {
+        // The project directory itself.
+        return alforria_core::beneath::open_nonblocking(root);
+    }
+    alforria_core::beneath::open_beneath(root, relative)
+}
+
+/// The whole of `file` for a response that carries it in one piece: a
+/// regular file of at most `max` bytes, read off the async workers.
+/// `Ok(None)` when `opened` says there is no such file.
+pub(crate) async fn read_whole(
+    opened: std::io::Result<std::fs::File>,
+    max: u64,
+) -> Result<Option<Vec<u8>>, FileError> {
+    use alforria_core::beneath::ReadRegularError;
+    let file = match opened {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Err(forbidden(format!("the file cannot be read: {err}")))
+        }
+        Err(err) => return Err(storage_error(&err)),
+    };
+    let read = tokio::task::spawn_blocking(move || alforria_core::beneath::read_regular(file, max))
+        .await
+        .map_err(|join| storage_error(&std::io::Error::other(join.to_string())))?;
+    match read {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(ReadRegularError::NotRegular) => Err(bad_request("not a file")),
+        Err(ReadRegularError::TooLarge { size }) => Err(FileError::Status(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "PayloadTooLargeError",
+            format!(
+                "the file is {size} bytes, more than the {max} this route returns in one \
+                 response (server.upload.max_bytes); GET /file/raw streams it"
+            ),
+        )),
+        Err(ReadRegularError::Io(err)) => Err(storage_error(&err)),
     }
 }
 
@@ -1103,16 +1185,29 @@ async fn raw(
     let location = location(&ctx, &directory)?;
     let file = project_file(&location, &required_path(&uri)?)?;
     check_ticket(&ctx, &principal, &uri, &location, &file)?;
-    let metadata = tokio::fs::metadata(&file)
+    // Opened once, as judged, and everything else is asked of the handle:
+    // the type, the length and the bytes are one file's.
+    let opened = {
+        let (location, file) = (location.clone(), file.clone());
+        tokio::task::spawn_blocking(move || {
+            let handle = open_judged(&location, &file)?;
+            let metadata = handle.metadata()?;
+            Ok::<_, std::io::Error>((handle, metadata))
+        })
         .await
-        .map_err(|_| not_found("no such file"))?;
+        .unwrap_or_else(|join| Err(std::io::Error::other(join.to_string())))
+    };
+    let (handle, metadata) = opened.map_err(|err| match err.kind() {
+        std::io::ErrorKind::PermissionDenied => {
+            forbidden(format!("the file cannot be read: {err}"))
+        }
+        _ => not_found("no such file"),
+    })?;
     if !metadata.is_file() {
         return Err(bad_request("not a file"));
     }
     let len = metadata.len();
-    let mut handle = tokio::fs::File::open(&file)
-        .await
-        .map_err(|_| not_found("no such file"))?;
+    let mut handle = tokio::fs::File::from_std(handle);
     let mut head = vec![0u8; 8192.min(len as usize)];
     let read = handle.read(&mut head).await.unwrap_or(0);
     head.truncate(read);
@@ -1239,12 +1334,29 @@ fn restricted_upload_allowed(
     // this route's own business: it has been resolved and confined to the
     // upload area above, and the upload replaces a link by renaming over
     // it instead of writing through it.)
-    let refusal = location
-        .services
-        .agents
-        .protected()
-        .guards(target)
-        .filter(|refusal| refusal.landing.is_some());
+    let refusal = location.services.agents.protected().guards(target);
+    // What the guard could not judge is a last component that is a link.
+    // The upload does not go through it: it renames over it, so the file
+    // ends up under the link's own name — and that name is judged here. A
+    // dangling `AGENTS.md -> /nowhere` is otherwise a way to upload an
+    // `AGENTS.md`.
+    if refusal
+        .as_ref()
+        .is_some_and(|refusal| refusal.landing.is_none())
+    {
+        let names: PathBuf = target
+            .components()
+            .filter(|part| matches!(part, std::path::Component::Normal(_)))
+            .collect();
+        if alforria_core::project_files::is_loader_path(&names) {
+            return Err(format!(
+                "{} is a file the agent's configuration is loaded from: this token may not \
+                 write config, instruction, agent, command, skill, workflow or git files",
+                target.display()
+            ));
+        }
+    }
+    let refusal = refusal.filter(|refusal| refusal.landing.is_some());
     if let Some(refusal) = refusal {
         let reason = refusal.reason;
         return Err(format!(
@@ -1337,12 +1449,10 @@ async fn upload(
     };
     let existed = target.exists();
     let overwrite = query_param(uri.query(), "overwrite").is_none_or(|value| value != "false");
+    // A first answer, before the body is received; the decision is the
+    // rename's (`InFlight::land`).
     if existed && !overwrite {
-        return Err(FileError::Status(
-            StatusCode::CONFLICT,
-            "FileExistsError",
-            format!("{path} already exists"),
-        ));
+        return Err(exists(&path));
     }
     let io = |err: std::io::Error| storage_error(&err);
     let name = target
@@ -1428,20 +1538,24 @@ async fn upload(
     file.sync_all().await.map_err(io)?;
     drop(file);
     // Decided now, on what was received and what is there: see `commit`.
-    match &area {
-        Some((root, _)) => commit(&ctx, root, &mut upload, &name, &target, written)?.map_err(io)?,
+    let landed = match &area {
+        Some((root, _)) => commit(&ctx, root, &mut upload, &name, &target, written, overwrite)?,
         None => {
-            upload
-                .directory
-                .rename(&upload.temporary, &name)
-                .map_err(io)?;
-            upload.created = false;
+            let landed = upload.land(&name, overwrite);
             // The operator's upload into an upload directory is part of
             // what that directory holds: counted again before the next
             // upload below `admin`.
-            mark_stale_areas(&ctx, &location, &target);
+            if landed.is_ok() {
+                mark_stale_areas(&ctx, &location, &target);
+            }
+            landed
         }
-    }
+    };
+    landed.map_err(|err| match err.kind() {
+        // `overwrite=false`, and another upload made the file first.
+        std::io::ErrorKind::AlreadyExists if !overwrite => exists(&path),
+        _ => io(err),
+    })?;
     drop(upload);
     // Clients watching the project learn of the file like any other edit.
     let _ = location.services.events.publish(

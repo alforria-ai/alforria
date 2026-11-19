@@ -244,6 +244,23 @@ pre-1.0, so minor releases may include breaking changes.
 
 ### Fixed
 
+- `GET /file/content` checked that the path existed and then read it by
+  name on an async worker, into memory, whatever it was: a FIFO in the
+  project (the agent's shell can make one) parked a server thread for
+  ever, and a sparse 50 GiB file was read whole. The file routes and the
+  inlined file part of a prompt now open the file once without waiting,
+  serve only a regular file (`400` otherwise), read off the async workers,
+  and cap what is returned in one piece — `server.upload.max_bytes` for
+  `GET /file/content` (`413`), 32 MiB for a prompt's file part. For a
+  credential below `admin` or a ticket the file is opened beneath the
+  project root it was judged inside instead of by name again
+  (`/file/raw`, `/file/content`, `/file` list, prompt file parts). Also:
+  the frozen `/file` list confines a request with no principal instead of
+  trusting it; an upload onto a dangling symlink named like a loader file
+  (`uploads/AGENTS.md -> /nonexistent`) is refused instead of creating a
+  real `AGENTS.md`; and `overwrite=false` is decided by a no-replace
+  rename, so concurrent uploads of one new file create it once (`409` for
+  the rest).
 - Uploads still being received were outside the upload quota: the body
   was written to its temporary file before anything was counted, so any
   number of slow uploads could each be admitted into the same free space,

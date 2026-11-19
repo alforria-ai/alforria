@@ -740,20 +740,30 @@ pub async fn file_list(
     let target = directory.join(&path);
     // A credential narrower than `admin` is confined to the project, like
     // `content` below: where the path really lands, links followed.
-    let restricted = principal.is_some_and(|principal| principal.0.restricted());
-    if restricted
-        && !(path_contains(directory, &target) && confined_read(&location, &target).is_some())
-    {
-        return Err(ServerError::Api(crate::error::ApiError::Forbidden {
-            message: "this token may only list files inside the project".to_string(),
-        }));
-    }
+    // (A request the auth layer did not judge has no principal and is
+    // confined, not trusted: `confine::restricted`.)
+    let restricted = crate::confine::restricted(&principal);
+    let judged = match restricted {
+        true => {
+            let resolved =
+                confined_read(&location, &target).filter(|_| path_contains(directory, &target));
+            let Some(resolved) = resolved else {
+                return Err(ServerError::Api(crate::error::ApiError::Forbidden {
+                    message: "this token may only list files inside the project".to_string(),
+                }));
+            };
+            Some(resolved)
+        }
+        false => None,
+    };
     // Like `/file/content`: an absolute path or `..` must not list a
     // directory outside the location, for any caller.
     if !path_contains(directory, &target) {
         return Err(defect("Path escapes the location"));
     }
-    let entries = std::fs::read_dir(&target).map_err(defect)?;
+    // What is listed is the directory that was judged: the resolved one,
+    // not the spelling looked up again.
+    let entries = std::fs::read_dir(judged.as_deref().unwrap_or(&target)).map_err(defect)?;
     let ignore = CombinedIgnore::load(directory);
     let mut out: Vec<Value> = Vec::new();
     for entry in entries.flatten() {
@@ -833,7 +843,12 @@ pub async fn file_content(
         || principal
             .as_ref()
             .is_some_and(|principal| principal.0.via == crate::bearer::Via::Ticket);
-    let file = if confined {
+    // Opened once and without waiting (a FIFO in the project would park
+    // the worker for ever), then everything is asked of the handle: a
+    // regular file, of at most `server.upload.max_bytes` — the response
+    // carries it whole — read off the async workers. A confined read is
+    // opened as it was judged, beneath the project root.
+    let opened = if confined {
         let Some(resolved) = confined_read(&location, &file) else {
             return Err(ServerError::Api(crate::error::ApiError::Forbidden {
                 message: "this token may only read files inside the project".to_string(),
@@ -844,14 +859,22 @@ pub async fn file_content(
         {
             return Ok(axum::response::IntoResponse::into_response(refusal));
         }
-        resolved
+        let location = location.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::routes::file_ext::open_judged(&location, &resolved)
+        })
+        .await
     } else {
-        file
-    };
-    if !file.exists() {
-        return Ok(json_ok(json!({"type": "text", "content": ""})));
+        let file = file.clone();
+        tokio::task::spawn_blocking(move || alforria_core::beneath::open_nonblocking(&file)).await
     }
-    let bytes = std::fs::read(&file).map_err(defect)?;
+    .unwrap_or_else(|join| Err(std::io::Error::other(join.to_string())));
+    let bytes = match crate::routes::file_ext::read_whole(opened, ctx.policy.upload_max_bytes).await
+    {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return Ok(json_ok(json!({"type": "text", "content": ""}))),
+        Err(refusal) => return Ok(axum::response::IntoResponse::into_response(refusal)),
+    };
     if bytes.contains(&0) {
         use base64::Engine;
         return Ok(json_ok(json!({

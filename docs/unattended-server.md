@@ -1665,6 +1665,17 @@ shown as an inert document, not run as a page of the server's origin.
 The frozen `GET /file/content?path=…` (JSON) accepts `&ticket=…` the same
 way.
 
+Both read routes open the file once, without waiting on it, and ask the
+open file what it is: only a regular file is served (`400` for a directory,
+a FIFO, a socket or a device — a FIFO the agent's shell made in the project
+does not park a server thread), and for a credential below `admin` or a
+ticket the open is made beneath the project root that the path was judged
+inside, so the file read is the file judged. `GET /file/content` carries
+the whole file in one JSON document and so returns at most
+`server.upload.max_bytes` (`413` for more, without reading it); `/file/raw`
+streams and has no such limit. A file part of a prompt that is inlined as
+data is likewise a regular file of at most 32 MiB.
+
 ### `PUT /file/content?path=…[&overwrite=false]`
 
 The request body is the file, byte for byte (no multipart, no JSON
@@ -1683,7 +1694,9 @@ oversized upload leaves the old file as it was.
   or is not complete within the time `max_bytes` takes at 64 KiB/s plus a
   minute (about nine and a half minutes at the default): the upload is
   ended and its temporary file removed.
-- `409` with `overwrite=false` when the file exists.
+- `409` with `overwrite=false` when the file exists — decided by the step
+  that gives the file its name, so of several such uploads of one new file
+  exactly one creates it.
 - `400` when the path is a directory; `403` when it leaves the project.
 
 Below `admin`, an upload is further limited, because it is a write nobody
@@ -1726,7 +1739,10 @@ asked the model for:
   for an upload in progress, and the path may be at most 8 levels below
   the upload directory;
 - these rules apply to the resolved path, so a symlink inside the upload
-  area does not lead out of it or into a loader directory (an upload
+  area does not lead out of it or into a loader directory; a last
+  component that is a link to nothing is replaced where it stands, and its
+  own name is judged (a dangling `AGENTS.md` link does not make an
+  `AGENTS.md`) (an upload
   directory that is a link to the project itself holds nothing);
 - each upload directory has a quota: `server.upload.max_total_bytes`
   (default 1 GiB = 1073741824) and `server.upload.max_files` (default

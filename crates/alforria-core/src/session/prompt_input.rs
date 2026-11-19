@@ -40,6 +40,11 @@ use crate::CoreError;
 use crate::session::event_definitions::SESSION_ERROR;
 
 const MAX_MCP_RESOURCE_BLOB_BYTES: usize = 10 * 1024 * 1024;
+
+/// The largest file a prompt's file part inlines (alforria extension): the
+/// default of `server.upload.max_bytes`, the largest file the server
+/// takes. A sparse 50 GiB file named in a prompt is not read into memory.
+const MAX_FILE_PART_BYTES: u64 = 32 * 1024 * 1024;
 const SUPPORTED_MCP_RESOURCE_ATTACHMENT_MIMES: [&str; 5] = [
     "application/pdf",
     "image/gif",
@@ -1372,11 +1377,13 @@ async fn resolve_file_part(
         ("file", _) => {
             let filepath = file_url_to_path(url);
             // The read itself: a restricted caller's path is judged here,
-            // on the path about to be opened, whatever produced the part.
-            input
+            // on the path about to be opened, whatever produced the part —
+            // and what is opened below is the resolved path that was
+            // judged, not the spelling again.
+            let filepath = input
                 .caller
                 .bounds(deps.sessions.is_restricted(session_id)?)
-                .check_read(&filepath, &deps.directory, &deps.worktree)
+                .judged_read(&filepath, &deps.directory, &deps.worktree)
                 .map_err(|message| PromptError::Forbidden { message })?;
             // A guarded session — restricted, or one outside input started
             // a run in — is attached nothing from the host's own locations,
@@ -1559,9 +1566,24 @@ async fn resolve_file_part(
             }
 
             // 939-970 — other mimes: inline base64 data URL.
-            let bytes = std::fs::read(&filepath).map_err(|err| PromptError::Unknown {
-                message: err.to_string(),
-            })?;
+            // Opened without waiting (a FIFO would park the worker for
+            // ever) and read off the async workers: a regular file, of a
+            // size a message can carry.
+            let bytes = {
+                let opened = filepath.clone();
+                tokio::task::spawn_blocking(move || {
+                    let file = crate::beneath::open_nonblocking(&opened)
+                        .map_err(crate::beneath::ReadRegularError::Io)?;
+                    crate::beneath::read_regular(file, MAX_FILE_PART_BYTES)
+                })
+                .await
+                .map_err(|join| PromptError::Unknown {
+                    message: join.to_string(),
+                })?
+                .map_err(|err| PromptError::Unknown {
+                    message: format!("{}: {err}", filepath.display()),
+                })?
+            };
             return Ok(vec![
                 synthetic_text(
                     session_id,

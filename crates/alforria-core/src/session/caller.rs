@@ -158,24 +158,35 @@ impl Bounds {
     /// the path as spelled — `..` and every symlink on the way followed in
     /// the order they stand; a path that cannot be resolved is outside.
     pub fn check_read(self, path: &Path, directory: &Path, worktree: &Path) -> Result<(), String> {
+        self.judged_read(path, directory, worktree).map(|_| ())
+    }
+
+    /// [`Bounds::check_read`], answering with the path to open: for a
+    /// restricted caller the resolved path that was judged — what is then
+    /// read is that, not the spelling looked up again — and the path as
+    /// given for anyone else.
+    pub fn judged_read(
+        self,
+        path: &Path,
+        directory: &Path,
+        worktree: &Path,
+    ) -> Result<PathBuf, String> {
         if !self.is_restricted() {
-            return Ok(());
+            return Ok(path.to_path_buf());
         }
         let path = if path.is_absolute() {
             path.to_path_buf()
         } else {
             directory.join(path)
         };
-        let inside = resolve_for_access(&path).is_ok_and(|resolved| {
-            project_roots(directory, worktree)
-                .iter()
-                .any(|root| crate::protect::within(&resolved, root))
-        });
-        if inside {
-            Ok(())
-        } else {
-            Err("this token may only attach files inside the project".to_string())
-        }
+        resolve_for_access(&path)
+            .ok()
+            .filter(|resolved| {
+                project_roots(directory, worktree)
+                    .iter()
+                    .any(|root| crate::protect::within(resolved, root))
+            })
+            .ok_or_else(|| "this token may only attach files inside the project".to_string())
     }
 }
 

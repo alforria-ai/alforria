@@ -67,6 +67,72 @@ pub fn read_to_string_beneath(root: &Path, relative: &Path) -> io::Result<String
     Ok(text)
 }
 
+/// Why [`read_regular`] did not return a file's bytes.
+#[derive(Debug)]
+pub enum ReadRegularError {
+    /// A directory, a FIFO, a socket, a device.
+    NotRegular,
+    /// More than the caller's limit; `size` is what the file says it is.
+    TooLarge {
+        size: u64,
+    },
+    Io(io::Error),
+}
+
+impl std::fmt::Display for ReadRegularError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReadRegularError::NotRegular => write!(f, "not a regular file"),
+            ReadRegularError::TooLarge { size } => {
+                write!(f, "the file is too large ({size} bytes)")
+            }
+            ReadRegularError::Io(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+/// Open `path` for reading without waiting for it: a FIFO nobody writes
+/// to, which a plain open blocks on for ever, opens at once
+/// (`O_NONBLOCK`) — to be refused by [`read_regular`], on the handle.
+pub fn open_nonblocking(path: &Path) -> io::Result<File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    options.open(path)
+}
+
+/// The whole of an opened file, if it is a regular file of at most `max`
+/// bytes — asked of the handle, so what is judged is what is read. Blocks
+/// for the read: call it from a blocking thread. Open the file with
+/// [`open_beneath`] or [`open_nonblocking`]: neither waits on a FIFO.
+pub fn read_regular(mut file: File, max: u64) -> Result<Vec<u8>, ReadRegularError> {
+    use std::io::Read;
+    let meta = file.metadata().map_err(ReadRegularError::Io)?;
+    if !meta.is_file() {
+        return Err(ReadRegularError::NotRegular);
+    }
+    if meta.len() > max {
+        return Err(ReadRegularError::TooLarge { size: meta.len() });
+    }
+    // The file may grow between the look and the read: one byte past the
+    // limit is enough to know.
+    let mut bytes = Vec::with_capacity(meta.len() as usize);
+    (&mut file)
+        .take(max.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(ReadRegularError::Io)?;
+    if bytes.len() as u64 > max {
+        return Err(ReadRegularError::TooLarge {
+            size: bytes.len() as u64,
+        });
+    }
+    Ok(bytes)
+}
+
 #[cfg(unix)]
 mod imp {
     use super::refused;
@@ -475,6 +541,28 @@ impl NoFollowDir {
         }
     }
 
+    /// Give `from` the name `to`, both in this directory, only if nothing
+    /// has that name: `AlreadyExists` otherwise, a link by that name
+    /// included. One step for the name — a hard link, which never
+    /// replaces — and then `from` is removed; there is no moment at which
+    /// a look-then-rename could have replaced what another writer made.
+    pub fn rename_new(&self, from: &std::ffi::OsStr, to: &std::ffi::OsStr) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        let (from, to) = (Self::name(from.as_bytes())?, Self::name(to.as_bytes())?);
+        let fd = self.fd.as_raw_fd();
+        // SAFETY: the directory is open, the names valid C strings.
+        if unsafe { libc::linkat(fd, from.as_ptr(), fd, to.as_ptr(), 0) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: as above. The file has its name; a temporary name that
+        // stays behind is the caller's to remove again.
+        match unsafe { libc::unlinkat(fd, from.as_ptr(), 0) } {
+            0 => Ok(()),
+            _ => Err(io::Error::last_os_error()),
+        }
+    }
+
     /// The size of `name` in this directory as the directory lists it — a
     /// link's own, never what it points to — or `None` when there is no
     /// such name.
@@ -541,6 +629,14 @@ impl NoFollowDir {
 
     pub fn remove_file(&self, name: &std::ffi::OsStr) -> io::Result<()> {
         by_name::remove_file(&self.path, name)
+    }
+
+    /// Without a no-replace rename by handle: a look, then the rename.
+    pub fn rename_new(&self, from: &std::ffi::OsStr, to: &std::ffi::OsStr) -> io::Result<()> {
+        if by_name::len_of(&self.path, to)?.is_some() {
+            return Err(io::Error::from(io::ErrorKind::AlreadyExists));
+        }
+        by_name::rename(&self.path, from, to)
     }
 
     pub fn len_of(&self, name: &std::ffi::OsStr) -> io::Result<Option<u64>> {
@@ -642,6 +738,61 @@ mod by_name {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A FIFO with no writer opens at once and is refused on the handle; a
+    /// file over the limit is refused without being read; a directory is
+    /// not a file; `rename_new` never replaces.
+    #[cfg(unix)]
+    #[test]
+    fn whole_reads_take_a_bounded_regular_file_and_rename_new_never_replaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("pipe");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
+        let opened = open_nonblocking(&fifo).unwrap();
+        assert!(matches!(
+            read_regular(opened, 10),
+            Err(ReadRegularError::NotRegular)
+        ));
+        assert!(matches!(
+            read_regular(open_nonblocking(dir.path()).unwrap(), 10),
+            Err(ReadRegularError::NotRegular)
+        ));
+        let file = dir.path().join("f");
+        std::fs::write(&file, b"0123456789").unwrap();
+        assert_eq!(
+            read_regular(open_nonblocking(&file).unwrap(), 10).unwrap(),
+            b"0123456789"
+        );
+        assert!(matches!(
+            read_regular(open_nonblocking(&file).unwrap(), 9),
+            Err(ReadRegularError::TooLarge { size: 10 })
+        ));
+        std::fs::File::create(dir.path().join("sparse"))
+            .unwrap()
+            .set_len(1 << 40)
+            .unwrap();
+        assert!(matches!(
+            read_regular(
+                open_nonblocking(&dir.path().join("sparse")).unwrap(),
+                1 << 20
+            ),
+            Err(ReadRegularError::TooLarge { .. })
+        ));
+
+        let handle = NoFollowDir::open(dir.path(), false).unwrap();
+        std::fs::write(dir.path().join("new"), b"new").unwrap();
+        let name = |name: &str| std::ffi::OsString::from(name);
+        let refused = handle.rename_new(&name("new"), &name("f")).unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&file).unwrap(), b"0123456789");
+        handle.rename_new(&name("new"), &name("g")).unwrap();
+        assert_eq!(std::fs::read(dir.path().join("g")).unwrap(), b"new");
+        assert!(!dir.path().join("new").exists());
+    }
 
     fn tree() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
