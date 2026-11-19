@@ -568,9 +568,31 @@ fn parse_after(query: Option<&str>) -> Result<Option<i64>, String> {
 /// no `server.connected`, no heartbeat.
 pub async fn api_session_event(
     State(ctx): State<Arc<ServerContext>>,
+    principal: Option<axum::Extension<crate::bearer::Principal>>,
     Path(session_id): Path<String>,
     axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
 ) -> Response {
+    // alforria extension: the one `/api` route open below `admin`
+    // (`middleware::scope`). It is outside the v1 location middleware, so
+    // the check that middleware makes is made here: the session is looked
+    // up, and its own directory must be one the credential may open. A
+    // session that does not exist and one elsewhere answer alike.
+    if crate::confine::restricted(&principal) {
+        let allowed = ctx.sessions.get(&session_id).is_ok_and(|session| {
+            ctx.policy
+                .directories
+                .allows(std::path::Path::new(&session.directory))
+        });
+        if !allowed {
+            return ApiError::Forbidden {
+                message: format!(
+                    "session {session_id}: not a session this token may read \
+                     (unknown, or outside server.directories)"
+                ),
+            }
+            .into_response();
+        }
+    }
     let after = match parse_after(uri.query()) {
         Ok(after) => after,
         Err(message) => {
@@ -582,6 +604,10 @@ pub async fn api_session_event(
             .into_response()
         }
     };
+    // Retention may have dropped the events the client wants to resume
+    // from, or drop them while it is still reading: the stream yields an
+    // `event.reset` marker ahead of the first event after each such hole, so
+    // the client reloads instead of silently missing them.
     let mut events = ctx.bus.durable_stream(&session_id, after);
     let (tx, rx) = mpsc::channel(64);
     tokio::spawn(async move {

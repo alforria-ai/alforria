@@ -34,6 +34,18 @@ pub fn generated_password_for(env: Option<&str>) -> Option<String> {
     }
 }
 
+/// Whether the host config sets up bearer authentication
+/// (`server.auth.bearer`). Such a server is not unsecured without a
+/// password, and is not given a generated one: the tokens are its access
+/// control, and a password printed to a supervisor's log would be a second,
+/// weaker way in.
+pub fn bearer_configured() -> bool {
+    // `alforria serve` entry point, before the server context exists: the
+    // process's own host config.
+    let paths = alforria_core::GlobalPaths::from_env();
+    alforria_server::ServerPolicy::load(&paths).bearer.is_some()
+}
+
 /// The lines after the handshake telling the user how to sign in.
 pub fn credentials_lines(username: &str, password: &str) -> String {
     format!("  username: {username}\n  password: {password}\n")
@@ -73,8 +85,13 @@ pub fn init_logging_from_env() {
 pub fn run(matches: &ArgMatches, ui: &mut Ui, raw: &[OsString]) -> Result<(), TypedError> {
     init_logging_from_env();
     let env_password = std::env::var("OPENCODE_SERVER_PASSWORD").ok();
-    let generated = generated_password_for(env_password.as_deref());
-    if generated.is_none() && !password_set() {
+    let bearer = bearer_configured();
+    let generated = if bearer {
+        None
+    } else {
+        generated_password_for(env_password.as_deref())
+    };
+    if generated.is_none() && !password_set() && !bearer {
         ui.write_stdout(&format!("{UNSECURED_WARNING}\n"));
     }
     let args = NetworkOptions::from_matches(matches);
@@ -82,6 +99,7 @@ pub fn run(matches: &ArgMatches, ui: &mut Ui, raw: &[OsString]) -> Result<(), Ty
     let opts = network::resolve(&args, raw, &config);
     let mut listen = opts.listen_options();
     listen.password = generated.clone();
+    listen.schedule = true;
     let runtime = super::runtime()?;
     let listener = runtime
         .block_on(alforria_server::listen(&listen))
@@ -92,13 +110,65 @@ pub fn run(matches: &ArgMatches, ui: &mut Ui, raw: &[OsString]) -> Result<(), Ty
         "{}\n",
         handshake(&listener.hostname, listener.port)
     ));
+    for warning in &listener.warnings {
+        ui.error(&format!("Warning: {warning}"));
+    }
     if let Some(password) = &generated {
         let username = alforria_server::AuthConfig::from_env().username;
         ui.write_stdout(&credentials_lines(&username, password));
     }
-    // serve.ts:22 `Effect.never` — run until interrupted.
-    runtime.block_on(tokio::signal::ctrl_c()).ok();
+    // serve.ts:22 `Effect.never` — run until told to stop.
+    run_until_stopped(runtime, listener);
     Ok(())
+}
+
+/// Resolves on the first request to stop: SIGTERM (a supervisor) or SIGINT
+/// (ctrl-c) on unix, ctrl-c elsewhere.
+pub async fn stop_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let (Ok(mut terminate), Ok(mut interrupt)) = (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::interrupt()),
+        ) else {
+            let _ = tokio::signal::ctrl_c().await;
+            return "SIGINT";
+        };
+        tokio::select! {
+            _ = terminate.recv() => "SIGTERM",
+            _ = interrupt.recv() => "SIGINT",
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        "ctrl-c"
+    }
+}
+
+/// Serve until a stop signal, then shut down the way the host config asks
+/// (`server.shutdown`): running turns are settled, their processes killed
+/// and the database checkpointed before the process exits 0. A second
+/// signal skips the wait.
+pub fn run_until_stopped(runtime: tokio::runtime::Runtime, listener: alforria_server::Listener) {
+    runtime.block_on(async {
+        let signal = stop_signal().await;
+        let options = listener.shutdown_options();
+        tracing::info!(signal, timeout = ?options.timeout, "shutting down");
+        tokio::select! {
+            report = listener.shutdown(options) => {
+                tracing::info!(?report, "shutdown complete");
+            }
+            signal = stop_signal() => {
+                tracing::warn!(signal, "second signal: exiting without waiting");
+                alforria_core::process_group::kill_all();
+            }
+        }
+    });
+    // Whatever is still blocked on a thread (a tool's file read, a pipe
+    // reader) must not hold the exit.
+    runtime.shutdown_timeout(std::time::Duration::from_secs(1));
 }
 
 #[cfg(test)]

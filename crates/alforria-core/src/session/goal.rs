@@ -43,6 +43,7 @@ use crate::session::llm::StreamInput;
 use crate::session::message::{latest, WithParts};
 use crate::session::prompt::SessionPrompt;
 use crate::session::prompt_input::{PromptError, PromptInput, PromptPartInput};
+use crate::session::r#loop::HISTORY_WINDOW_BYTES;
 use crate::session::render::to_model_messages;
 use crate::session::run_state::RunnerError;
 
@@ -96,6 +97,12 @@ pub struct GoalState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
     pub updated_at: u64,
+    /// Who set the goal (alforria extension): `"restricted"` when a caller
+    /// below `admin` did, or the session is restricted. For the record:
+    /// what binds the goal's rounds is the session's restriction, read
+    /// when each round runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_by: Option<String>,
 }
 
 impl GoalState {
@@ -108,6 +115,9 @@ impl GoalState {
             return false;
         }
         match self.pid {
+            // After a reboot the new server often has the id the old one
+            // had: another boot's goal under this process's id is nobody's.
+            Some(pid) if pid == std::process::id() => true,
             Some(pid) => !process_alive(pid),
             // Written before owners were recorded.
             None => true,
@@ -412,8 +422,18 @@ impl GoalStore {
             return;
         };
         let saved = match goal {
-            Some(goal) => std::fs::create_dir_all(&self.dir)
-                .and_then(|()| std::fs::write(&path, serde_json::to_vec(goal).unwrap_or_default())),
+            // Written beside the file and renamed over it: a reader never
+            // finds the goal half-written, which it would take for no goal.
+            Some(goal) => std::fs::create_dir_all(&self.dir).and_then(|()| {
+                static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let partial = path.with_extension(format!("{}-{unique}.tmp", std::process::id()));
+                std::fs::write(&partial, serde_json::to_vec(goal).unwrap_or_default())
+                    .and_then(|()| std::fs::rename(&partial, &path))
+                    .inspect_err(|_| {
+                        let _ = std::fs::remove_file(&partial);
+                    })
+            }),
             None => match std::fs::remove_file(&path) {
                 Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
                 _ => Ok(()),
@@ -656,7 +676,8 @@ impl SessionPrompt {
             .deps
             .services
             .messages
-            .active_context(session_id)
+            .window(session_id, HISTORY_WINDOW_BYTES)
+            .map(|window| window.messages)
             .unwrap_or_default();
         let stalled =
             same_reason(latest.reason.as_deref(), &reason) || !used_tools(&history, &latest.id);
@@ -737,8 +758,12 @@ impl SessionPrompt {
         let Ok(session) = deps.services.sessions.get(session_id) else {
             return Review::Failed("the session no longer exists".to_string());
         };
-        let history = match deps.services.messages.active_context(session_id) {
-            Ok(history) => history,
+        let history = match deps
+            .services
+            .messages
+            .window(session_id, HISTORY_WINDOW_BYTES)
+        {
+            Ok(window) => window.messages,
             Err(error) => return Review::Failed(error.to_string()),
         };
         let Some(user) = latest(&history).user else {
@@ -747,9 +772,14 @@ impl SessionPrompt {
         let V1Message::User { agent, model, .. } = &user else {
             return Review::Failed("the session has no user message".to_string());
         };
-        let Some(agent) = deps.services.agents.get(agent).cloned() else {
+        let Some(mut agent) = deps.services.agents.get(agent).cloned() else {
             return Review::Failed(format!("agent {agent} is not available"));
         };
+        // The reviewer has no tools and decides nothing by these rules; it
+        // still goes out as the session is held (`SessionStore::policy`),
+        // so nothing downstream of the request reads the agent's policy
+        // without the session's ceilings.
+        agent.permission = deps.services.sessions.policy(session_id, &agent.permission);
         let model = match deps
             .models
             .get_model(&model.provider_id, &model.model_id, session_id)
@@ -764,6 +794,7 @@ impl SessionPrompt {
             }
         };
         let mut messages = to_model_messages(&history, &model.render(), None);
+        crate::session::media::omit_unreadable_media(&mut messages, &model.media);
         messages.push(alforria_llm::schema::messages::Message::user(judge_text(
             &goal.objective,
         )));
@@ -868,6 +899,12 @@ impl SessionPrompt {
                 system: None,
                 variant,
                 parts,
+                // The round a `/goal` command starts is that caller's;
+                // every later one is the engine's own, bound by the
+                // session it runs in.
+                caller: chosen
+                    .map(|input| input.caller)
+                    .unwrap_or(crate::session::caller::Caller::Session),
             })
             .await,
         )
@@ -997,6 +1034,19 @@ impl SessionPrompt {
             boot: boot().to_string(),
             pid: Some(std::process::id()),
             updated_at: self.now_ms(),
+            started_by: {
+                let restricted = input
+                    .caller
+                    .bounds(
+                        self.deps
+                            .services
+                            .sessions
+                            .is_restricted(session_id)
+                            .map_err(|error| error.to_string())?,
+                    )
+                    .restricted;
+                Some(if restricted { "restricted" } else { "operator" }.to_string())
+            },
         };
         goals.write(session_id, Some(&created));
         let turn = self

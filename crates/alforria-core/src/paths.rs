@@ -51,6 +51,12 @@ pub struct GlobalPaths {
 
 impl GlobalPaths {
     /// Resolve paths from the process environment.
+    ///
+    /// This is the *process entry point's* resolver: a command resolves the
+    /// paths once and hands them on. Nothing a request handler or a test
+    /// fixture reaches may call it — they use the paths their context was
+    /// built over. To make that hold, a test run refuses to resolve the
+    /// developer's own directories: see [`sandbox`].
     pub fn from_env() -> GlobalPaths {
         let home = env::var_os("OPENCODE_TEST_HOME")
             .map(PathBuf::from)
@@ -59,7 +65,45 @@ impl GlobalPaths {
             Some(home) if !home.as_os_str().is_empty() => home,
             _ => PathBuf::from("."),
         };
-        GlobalPaths::resolve(home)
+        let paths = GlobalPaths::resolve(home);
+        sandbox::guard(&paths, "GlobalPaths::from_env()");
+        paths
+    }
+
+    /// Paths under a directory of their own in the system temporary
+    /// directory, removed when the returned guard drops. The contexts that
+    /// are not given real paths (the unwired ones tests build) run over
+    /// these, so a handler that reads or writes a global location finds an
+    /// empty one instead of the user's.
+    pub fn detached() -> DetachedPaths {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let root = env::temp_dir().join(format!(
+            "alforria-detached-{}-{n}-{nanos:08x}",
+            std::process::id()
+        ));
+        let paths = GlobalPaths {
+            home: root.join("home"),
+            config: root.join("config").join(APP_DIR),
+            data: root.join("data").join(APP_DIR),
+            cache: root.join("cache").join(APP_DIR),
+            state: root.join("state").join(APP_DIR),
+        };
+        DetachedPaths { paths, root }
+    }
+
+    /// The four application directories, for checks that must cover each.
+    pub fn locations(&self) -> [(&'static str, &Path); 4] {
+        [
+            ("config", self.config.as_path()),
+            ("data", self.data.as_path()),
+            ("cache", self.cache.as_path()),
+            ("state", self.state.as_path()),
+        ]
     }
 
     /// Resolve paths against an explicit home directory (XDG env vars are
@@ -110,6 +154,167 @@ impl GlobalPaths {
         .into_iter()
         .filter(|(_, path)| path.file_name().is_some_and(|name| name == LEGACY_DIR))
         .collect()
+    }
+}
+
+/// See [`GlobalPaths::detached`]. Nothing is created until something writes;
+/// dropping removes whatever was.
+#[derive(Debug)]
+pub struct DetachedPaths {
+    pub paths: GlobalPaths,
+    root: PathBuf,
+}
+
+impl Drop for DetachedPaths {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+/// The guard that keeps test runs off the developer's own directories.
+///
+/// Tests of this repository once opened — and migrated — the real database:
+/// a fixture or a handler called [`GlobalPaths::from_env`] and nothing
+/// noticed. So a process that is a test run refuses to use global paths that
+/// are not under a sandbox root, by panicking with a message that names the
+/// call. Every harness goes through [`guard`] as well (the server's
+/// `production_context`, the binary-spawning e2e harness), so the check does
+/// not depend on which constructor a new test happens to use.
+///
+/// *Test run* means: this crate compiled for its own tests, or a debug build
+/// that is a cargo test binary (the executable lives in a `deps` directory),
+/// runs under nextest (`NEXTEST` is set — inherited by the binaries a test
+/// spawns), or was told so with `ALFORRIA_TEST_GUARD=1`. Release builds never
+/// check: an installed binary behaves the same wherever it is started.
+///
+/// *Sandbox root* means: the system temporary directory, or the directory
+/// `ALFORRIA_TEST_SANDBOX` names (CI's isolation job designates one).
+pub mod sandbox {
+    use super::GlobalPaths;
+    use std::path::{Path, PathBuf};
+
+    /// Marks a process as a test run (see the module docs).
+    pub const GUARD_ENV: &str = "ALFORRIA_TEST_GUARD";
+    /// An extra sandbox root besides the temporary directory.
+    pub const SANDBOX_ENV: &str = "ALFORRIA_TEST_SANDBOX";
+
+    /// Whether this process is a test run.
+    pub fn under_test() -> bool {
+        if cfg!(test) {
+            return true;
+        }
+        if !cfg!(debug_assertions) {
+            return false;
+        }
+        static UNDER_TEST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *UNDER_TEST.get_or_init(|| {
+            let truthy = |name: &str| {
+                std::env::var_os(name).is_some_and(|value| !value.is_empty() && value != "0")
+            };
+            truthy(GUARD_ENV)
+                || truthy("NEXTEST")
+                || std::env::current_exe().ok().is_some_and(|exe| {
+                    exe.parent()
+                        .and_then(Path::file_name)
+                        .is_some_and(|dir| dir == "deps")
+                })
+        })
+    }
+
+    /// The directories a test run may use.
+    pub fn roots() -> Vec<PathBuf> {
+        let mut roots = vec![std::env::temp_dir()];
+        if let Some(extra) = std::env::var_os(SANDBOX_ENV).filter(|value| !value.is_empty()) {
+            roots.push(PathBuf::from(extra));
+        }
+        roots
+    }
+
+    /// `path` with its existing prefix canonicalised: the path itself often
+    /// does not exist yet, and `/tmp` may be a symlink.
+    fn normalise(path: &Path) -> PathBuf {
+        let mut existing = path;
+        let mut rest = Vec::new();
+        loop {
+            if let Ok(real) = existing.canonicalize() {
+                let mut out = real;
+                for part in rest.iter().rev() {
+                    out.push(part);
+                }
+                return out;
+            }
+            match (existing.parent(), existing.file_name()) {
+                (Some(parent), Some(name)) => {
+                    rest.push(name.to_os_string());
+                    existing = parent;
+                }
+                _ => return path.to_path_buf(),
+            }
+        }
+    }
+
+    /// Whether `path` lies under one of `roots`.
+    pub fn is_under(path: &Path, roots: &[PathBuf]) -> bool {
+        let path = normalise(path);
+        roots.iter().any(|root| {
+            let root = normalise(root);
+            path.starts_with(&root) && path != root
+        })
+    }
+
+    /// The first application directory of `paths` outside every sandbox
+    /// root, if any.
+    pub fn escape(paths: &GlobalPaths, roots: &[PathBuf]) -> Option<(&'static str, PathBuf)> {
+        paths
+            .locations()
+            .into_iter()
+            .find(|(_, path)| !is_under(path, roots))
+            .map(|(name, path)| (name, path.to_path_buf()))
+    }
+
+    /// Panic when this is a test run and `paths` is not sandboxed. `what`
+    /// names the caller for the message.
+    #[track_caller]
+    pub fn guard(paths: &GlobalPaths, what: &str) {
+        if under_test() {
+            require(paths, what);
+        }
+    }
+
+    /// [`guard`] for one path — the database file a storage is opened on.
+    #[track_caller]
+    pub fn guard_path(path: &Path, what: &str) {
+        if !under_test() {
+            return;
+        }
+        let roots = roots();
+        if !is_under(path, &roots) {
+            panic!(
+                "{what}: refusing to use {} in a test run — it is not under a sandbox root \
+                 ({roots:?}). See CONTRIBUTING.md, \"Tests never touch your own files\".",
+                path.display()
+            );
+        }
+    }
+
+    /// Panic unless `paths` is sandboxed, test run or not: for test
+    /// harnesses, which know they are one.
+    #[track_caller]
+    pub fn require(paths: &GlobalPaths, what: &str) {
+        require_in(paths, what, &roots());
+    }
+
+    /// [`require`] against explicit roots.
+    #[track_caller]
+    pub fn require_in(paths: &GlobalPaths, what: &str, roots: &[PathBuf]) {
+        if let Some((name, path)) = escape(paths, roots) {
+            panic!(
+                "{what}: refusing to use the {name} directory {} in a test run — it is not under \
+                 a sandbox root ({roots:?}). A test must build its context over a temporary home; \
+                 see CONTRIBUTING.md, \"Tests never touch your own files\".",
+                path.display()
+            );
+        }
     }
 }
 
@@ -200,6 +405,51 @@ mod tests {
 
         std::fs::create_dir_all(share.join("alforria")).unwrap();
         assert_eq!(resolve().data, share.join("alforria"));
+    }
+
+    #[test]
+    fn a_test_run_refuses_paths_outside_the_sandbox() {
+        let roots = vec![PathBuf::from("/nonexistent/sandbox")];
+        let inside = GlobalPaths::resolve_with(PathBuf::from("/nonexistent/sandbox/h"), |_| None);
+        assert_eq!(sandbox::escape(&inside, &roots), None);
+        // One location outside is enough, whichever it is.
+        let outside = GlobalPaths {
+            data: PathBuf::from("/home/someone/.local/share/opencode"),
+            ..inside.clone()
+        };
+        assert_eq!(
+            sandbox::escape(&outside, &roots),
+            Some(("data", PathBuf::from("/home/someone/.local/share/opencode")))
+        );
+        // The root itself is not "under" it, and a sibling with the same
+        // prefix is not either.
+        assert!(!sandbox::is_under(
+            Path::new("/nonexistent/sandbox"),
+            &roots
+        ));
+        assert!(!sandbox::is_under(
+            Path::new("/nonexistent/sandboxed/x"),
+            &roots
+        ));
+        assert!(sandbox::under_test());
+        let panic = std::panic::catch_unwind(|| sandbox::require_in(&outside, "a fixture", &roots))
+            .expect_err("must refuse");
+        let message = panic.downcast_ref::<String>().expect("message");
+        assert!(message.contains("a fixture"), "{message}");
+        assert!(
+            message.contains("/home/someone/.local/share/opencode"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn detached_paths_live_under_the_temp_dir_and_clean_up() {
+        let detached = GlobalPaths::detached();
+        assert_eq!(sandbox::escape(&detached.paths, &sandbox::roots()), None);
+        std::fs::create_dir_all(&detached.paths.data).unwrap();
+        let data = detached.paths.data.clone();
+        drop(detached);
+        assert!(!data.exists());
     }
 
     #[test]

@@ -451,6 +451,96 @@ fn session_list_json_after_run() {
 }
 
 // -----------------------------------------------------------------------
+// db prune
+// -----------------------------------------------------------------------
+
+#[test]
+fn db_prune_drops_events_on_demand_and_from_config() {
+    let env = env_with_llm("db-prune", "Hello from the mock");
+    let output = env.run(&["run", "--model", "mock/mock-model", "Say hi"]);
+    assert_eq!(output.code, Some(0), "stderr={}", output.stderr);
+    let count = |env: &Env| -> u64 {
+        let rows = env.run(&["db", "SELECT COUNT(*) AS n FROM event", "--format", "json"]);
+        assert_eq!(rows.code, Some(0), "stderr={}", rows.stderr);
+        let rows: serde_json::Value = serde_json::from_str(&rows.stdout).unwrap();
+        rows[0]["n"].as_u64().unwrap()
+    };
+    let before = count(&env);
+    assert!(before > 5, "{before}");
+
+    // No policy anywhere: nothing goes.
+    let none = env.run(&["db", "prune"]);
+    assert_eq!(none.code, Some(0), "stderr={}", none.stderr);
+    assert!(
+        none.stdout.contains("No retention is configured"),
+        "{}",
+        none.stdout
+    );
+    assert_eq!(count(&env), before);
+
+    // Everything is younger than a day.
+    let young = env.run(&["db", "prune", "--max-age", "1d"]);
+    assert_eq!(young.code, Some(0), "stderr={}", young.stderr);
+    assert!(
+        young.stdout.contains("Dropped 0 events"),
+        "{}",
+        young.stdout
+    );
+
+    let bad = env.run(&["db", "prune", "--max-age", "soon"]);
+    assert_ne!(bad.code, Some(0));
+    assert!(
+        bad.stderr.contains("--max-age takes a duration"),
+        "{}",
+        bad.stderr
+    );
+
+    // The configured policy applies when no flag overrides it.
+    let config_dir = env.home.join(".config").join("alforria");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("opencode.json"),
+        r#"{"storage": {"retention": {"events": {"keep_last": 5}}}}"#,
+    )
+    .unwrap();
+    let configured = env.run(&["db", "prune"]);
+    assert_eq!(configured.code, Some(0), "stderr={}", configured.stderr);
+    assert!(
+        configured
+            .stdout
+            .contains(&format!("Dropped {} events from 1 sessions.", before - 5)),
+        "{}",
+        configured.stdout
+    );
+    assert_eq!(count(&env), 5);
+
+    let pruned = env.run(&["db", "prune", "--keep-last", "3", "--vacuum"]);
+    assert_eq!(pruned.code, Some(0), "stderr={}", pruned.stderr);
+    assert!(
+        pruned.stdout.contains("Dropped 2 events from 1 sessions."),
+        "{}",
+        pruned.stdout
+    );
+    assert!(
+        pruned.stdout.contains("The database file is now"),
+        "{}",
+        pruned.stdout
+    );
+    assert_eq!(count(&env), 3);
+
+    // The session itself is intact.
+    let list = env.run(&["session", "list", "--format", "json"]);
+    assert_eq!(list.code, Some(0), "stderr={}", list.stderr);
+    let sessions: serde_json::Value = serde_json::from_str(&list.stdout).unwrap();
+    assert_eq!(
+        sessions.as_array().map(Vec::len),
+        Some(1),
+        "{}",
+        list.stdout
+    );
+}
+
+// -----------------------------------------------------------------------
 // providers login/logout round-trip
 // -----------------------------------------------------------------------
 
@@ -692,4 +782,135 @@ fn generate_outputs_openapi_with_code_samples() {
         }
     }
     assert!(sampled > 10, "sampled {sampled} operations");
+}
+
+// -----------------------------------------------------------------------
+// import --format openai-chat (alforria extension)
+// -----------------------------------------------------------------------
+
+#[test]
+fn import_openai_chat_transcript_dry_run_import_and_idempotence() {
+    let env = env_with_llm("import-openai", "x");
+    let project = env.project_dir();
+    let messages: Vec<serde_json::Value> = (0..12)
+        .map(|index| {
+            serde_json::json!({
+                "role": if index % 2 == 0 { "user" } else { "assistant" },
+                "content": format!("line {index}"),
+                "created_at": 1_767_225_600 + index * 60,
+            })
+        })
+        .collect();
+    let file = project.join("history.json");
+    std::fs::write(
+        &file,
+        serde_json::json!({
+            "title": "Old harness chat",
+            "summary": "They counted lines.",
+            "import_id": "legacy-1",
+            "metadata": { "source": "old-harness", "triggerID": "nightly" },
+            "messages": messages,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let path = file.to_str().unwrap();
+    let base = [
+        "import",
+        "--format",
+        "openai-chat",
+        "--model",
+        "mock/mock-model",
+    ];
+
+    let dry = env.run(&[&base[..], &["--live-tail", "4", "--dry-run", path]].concat());
+    assert_eq!(dry.code, Some(0), "stderr={}", dry.stderr);
+    assert!(
+        dry.stdout.starts_with("Dry run, nothing written: "),
+        "{}",
+        dry.stdout
+    );
+    assert!(
+        dry.stdout.contains("\"archived\":8") && dry.stdout.contains("\"live\":4"),
+        "{}",
+        dry.stdout
+    );
+    let list = env.run(&["session", "list", "--format", "json"]);
+    assert!(!list.stdout.contains("Old harness chat"), "{}", list.stdout);
+
+    let imported = env.run(&[&base[..], &["--live-tail", "4", path]].concat());
+    assert_eq!(imported.code, Some(0), "stderr={}", imported.stderr);
+    let session_id = imported
+        .stdout
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("Imported session: "))
+        .expect("the session id is printed")
+        .to_string();
+    assert!(
+        imported.stdout.contains("\"boundary\":\"summary\""),
+        "{}",
+        imported.stdout
+    );
+    let list = env.run(&["session", "list", "--format", "json"]);
+    assert!(list.stdout.contains("Old harness chat"), "{}", list.stdout);
+
+    // The whole history is in the export, with the boundary after it.
+    let export = env.run(&["export", &session_id]);
+    assert_eq!(export.code, Some(0), "stderr={}", export.stderr);
+    let start = export
+        .stdout
+        .find('{')
+        .unwrap_or_else(|| panic!("stdout={}\nstderr={}", export.stdout, export.stderr));
+    let document: serde_json::Value = serde_json::from_str(&export.stdout[start..]).unwrap();
+    let exported = document["messages"].as_array().unwrap();
+    assert_eq!(exported.len(), 14);
+    assert_eq!(exported[0]["parts"][0]["text"], "line 0");
+    assert_eq!(exported[12]["parts"][0]["type"], "compaction");
+    // The file's summary is carried as data from outside, and its metadata
+    // does not reach the keys the server keeps for itself.
+    let summary = exported[13]["parts"][0]["text"].as_str().unwrap();
+    assert!(
+        summary.ends_with("<untrusted_data>\nThey counted lines.\n</untrusted_data>"),
+        "{summary}"
+    );
+    let metadata = &document["info"]["metadata"];
+    assert_eq!(metadata["import"]["id"], "legacy-1");
+    assert_eq!(metadata["source"], "old-harness");
+    assert!(metadata.get("triggerID").is_none(), "{metadata}");
+
+    // The same import id again changes nothing.
+    let again = env.run(&[&base[..], &[path]].concat());
+    assert_eq!(again.code, Some(0), "stderr={}", again.stderr);
+    assert_eq!(
+        again.stdout.trim(),
+        format!("Already imported: {session_id} (import id legacy-1)")
+    );
+
+    // What cannot be imported says why.
+    let bad = project.join("bad.json");
+    std::fs::write(&bad, r#"[{"role":"narrator","content":"x"}]"#).unwrap();
+    let refused = env.run(&[&base[..], &[bad.to_str().unwrap()]].concat());
+    assert_eq!(refused.code, Some(1));
+    assert!(
+        refused.stderr.contains("unknown role"),
+        "{}",
+        refused.stderr
+    );
+    for flags in [&["--live-tail", "4"][..], &["--untrusted"][..]] {
+        let wrong = env.run(&[&["import"][..], flags, &[path]].concat());
+        assert_eq!(wrong.code, Some(1));
+        assert!(
+            wrong
+                .stderr
+                .contains("only applies with --format openai-chat"),
+            "{}",
+            wrong.stderr
+        );
+    }
+    // `--untrusted` is accepted with the format (the marks it sets are
+    // tested where they are read, `session::import`).
+    std::fs::write(&bad, r#"[{"role":"user","content":"hello"}]"#).unwrap();
+    let marked = env.run(&[&base[..], &["--untrusted", bad.to_str().unwrap()]].concat());
+    assert_eq!(marked.code, Some(0), "stderr={}", marked.stderr);
 }

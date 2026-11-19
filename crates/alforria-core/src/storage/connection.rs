@@ -2,6 +2,7 @@
 //! `packages/core/src/database/database.ts`).
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use rusqlite::Connection;
@@ -45,6 +46,8 @@ fn install_turn_index(conn: &Connection) -> Result<(), CoreError> {
 #[derive(Debug)]
 pub struct Storage {
     conn: Mutex<Connection>,
+    /// Message rows read back with their parts since this handle opened.
+    message_rows_read: AtomicU64,
 }
 
 impl Storage {
@@ -56,13 +59,18 @@ impl Storage {
     }
 
     fn open_impl(path: &Path) -> Result<Storage, CoreError> {
+        // A test run never opens (and so never migrates) a database outside
+        // a sandbox root: `paths::sandbox`.
+        crate::paths::sandbox::guard_path(path, "Storage::open");
         let mut conn = Connection::open(path)?;
         Self::configure(&conn)?;
         refuse_foreign_schema(&conn, path)?;
         migration::apply(&mut conn)?;
+        crate::storage::alforria_migration::apply(&mut conn)?;
         install_turn_index(&conn)?;
         Ok(Storage {
             conn: Mutex::new(conn),
+            message_rows_read: AtomicU64::new(0),
         })
     }
 
@@ -76,10 +84,37 @@ impl Storage {
         let mut conn = Connection::open_in_memory()?;
         Self::configure(&conn)?;
         migration::apply(&mut conn)?;
+        crate::storage::alforria_migration::apply(&mut conn)?;
         install_turn_index(&conn)?;
         Ok(Storage {
             conn: Mutex::new(conn),
+            message_rows_read: AtomicU64::new(0),
         })
+    }
+
+    /// `PRAGMA synchronous`: `full` puts every commit on disk before it
+    /// returns, `normal` (the default at open) leaves the write-ahead log
+    /// to the operating system between checkpoints.
+    pub fn set_synchronous(&self, full: bool) -> Result<(), CoreError> {
+        self.with_connection(|conn| {
+            conn.execute_batch(if full {
+                "PRAGMA synchronous = FULL"
+            } else {
+                "PRAGMA synchronous = NORMAL"
+            })?;
+            Ok(())
+        })
+    }
+
+    /// How many message rows have been read back with their parts: what a
+    /// step costs in history, for tests and diagnostics.
+    pub fn message_rows_read(&self) -> u64 {
+        self.message_rows_read.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn count_message_rows(&self, rows: usize) {
+        self.message_rows_read
+            .fetch_add(rows as u64, Ordering::Relaxed);
     }
 
     /// Open `<data_dir>/opencode.db` (`database.ts:53`).
@@ -121,6 +156,18 @@ impl Storage {
         }
         conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()))?;
         Ok(())
+    }
+
+    /// Move the whole write-ahead log into the database file and empty it
+    /// (`PRAGMA wal_checkpoint(TRUNCATE)`). A server about to exit calls
+    /// this so the database is one self-contained file; `false` means a
+    /// reader held the log and some frames stay in it (still durable).
+    pub fn checkpoint_truncate(&self) -> Result<bool, CoreError> {
+        self.with_connection(|conn| {
+            let busy: i64 =
+                conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+            Ok(busy == 0)
+        })
     }
 
     /// Runs `PRAGMA wal_checkpoint(PASSIVE)` on close (spec §7.5).

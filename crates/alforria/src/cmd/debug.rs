@@ -633,10 +633,9 @@ pub fn debug_agent(ui: &mut Ui, instance: &Instance, name: &str) -> Result<(), T
             },
             permission: None,
         }));
-    let disabled = alforria_core::tool::permission::disabled(
-        &tools.iter().map(|tool| tool.id).collect::<Vec<&str>>(),
-        &agent.permission,
-    );
+    let disabled = agent
+        .permission
+        .disabled(&tools.iter().map(|tool| tool.id).collect::<Vec<&str>>());
     let mut resolved = serde_json::Map::new();
     for tool in &tools {
         resolved.insert(
@@ -716,6 +715,7 @@ pub fn run(matches: &ArgMatches, ui: &mut Ui) -> Result<(), TypedError> {
             Ok(())
         }
         "paths" => {
+            // `alforria debug paths` prints exactly what the process resolves.
             paths(ui, &alforria_core::GlobalPaths::from_env());
             Ok(())
         }
@@ -923,7 +923,8 @@ pub fn run(matches: &ArgMatches, ui: &mut Ui) -> Result<(), TypedError> {
 /// `debug v2` (v2.ts) — the v2 catalog: providers, the default model and
 /// the per-provider small-model table (smoke output over models.dev).
 fn v2(ui: &mut Ui, instance: &Instance) -> Result<(), TypedError> {
-    let catalog = crate::catalog::catalog_service();
+    // `alforria debug v2` entry point: the process's own cache.
+    let catalog = crate::catalog::catalog_service_in(&alforria_core::GlobalPaths::from_env());
     let providers = catalog.get().map_err(crate::error::core_error)?;
     let mut available: Vec<(&String, &alforria_core::catalog::Provider)> =
         providers.iter().collect();
@@ -979,7 +980,8 @@ mod tests {
     #[test]
     fn paths_pad_keys_to_ten_columns() {
         let (mut ui, captured) = Ui::capture(false);
-        let global = alforria_core::GlobalPaths::resolve(PathBuf::from("/home/user"));
+        let global =
+            alforria_core::GlobalPaths::resolve_with(PathBuf::from("/home/user"), |_| None);
         paths(&mut ui, &global);
         let stdout = captured.stdout();
         assert!(stdout.contains("home       /home/user\n"), "{stdout}");
@@ -1099,7 +1101,7 @@ mod tests {
             lsp: None,
             directory: dir.path().to_path_buf(),
             worktree: dir.path().to_path_buf(),
-            paths: alforria_core::GlobalPaths::resolve(dir.path().to_path_buf()),
+            paths: alforria_core::GlobalPaths::resolve_with(dir.path().to_path_buf(), |_| None),
             events: None,
             flags: alforria_core::lsp::server::Flags::from_env(),
         });

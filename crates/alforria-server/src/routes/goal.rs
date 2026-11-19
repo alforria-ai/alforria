@@ -11,19 +11,18 @@
 //! (`{ sessionID, goal }`). Like the workflow routes this sits outside the
 //! frozen v1/v2 tables, takes `?directory=`, and returns plain JSON.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
-use axum::http::Uri;
 use axum::routing::get;
 use axum::{Json, Router};
 
 use alforria_core::session::goal::GoalState;
 
 use crate::error::ServerError;
+use crate::middleware::directory::RequestDirectory;
 use crate::middleware::location::LocationContext;
-use crate::state::{resolve_directory, ServerContext};
+use crate::state::ServerContext;
 
 pub fn register(router: Router<Arc<ServerContext>>) -> Router<Arc<ServerContext>> {
     router.route("/session/{sessionID}/goal", get(goal))
@@ -31,13 +30,12 @@ pub fn register(router: Router<Arc<ServerContext>>) -> Router<Arc<ServerContext>
 
 async fn goal(
     State(ctx): State<Arc<ServerContext>>,
-    uri: Uri,
+    axum::Extension(directory): axum::Extension<RequestDirectory>,
     Path(session_id): Path<String>,
 ) -> Result<Json<Option<GoalState>>, ServerError> {
-    let directory = crate::middleware::auth::query_param(uri.query(), "directory")
-        .map(PathBuf::from)
-        .unwrap_or_else(crate::state::cwd);
-    let directory = resolve_directory(&directory);
+    // The directory the auth layer resolved and the allowlist admitted
+    // (`middleware::directory`): a handler never reads it off the request.
+    let directory = directory.0.clone();
     let services = ctx.instances.load(&directory)?;
     let location = LocationContext {
         directory,

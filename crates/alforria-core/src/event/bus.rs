@@ -33,6 +33,47 @@ pub const CHANNEL_CAPACITY: usize = 1024;
 /// Capacity for the per-aggregate durable wake channels (TS `PubSub.sliding(1)`).
 pub const WAKE_CAPACITY: usize = 32;
 
+/// Events a durable stream reads from the log at a time.
+const DURABLE_PAGE: usize = 256;
+
+/// The event type of the marker a durable stream yields where the events
+/// its reader was due next are gone: at the start when it resumes from
+/// before what retention kept, and mid-read when retention overtakes it (an
+/// alforria extension).
+/// A client that sees it must load the session afresh instead of applying
+/// what follows to what it has.
+pub const EVENT_RESET: &str = "event.reset";
+
+/// A hole between where a reader left off and what the log still holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DurableGap {
+    /// The sequence the reader resumed after (`-1` for the start).
+    pub after: i64,
+    /// The first sequence the log still holds; `latest + 1` when it holds
+    /// none.
+    pub earliest: i64,
+    pub latest: i64,
+}
+
+impl DurableGap {
+    /// The marker frame for this gap.
+    pub fn marker(&self, aggregate_id: &str) -> Payload {
+        Payload {
+            id: new_event_id(),
+            metadata: None,
+            r#type: EVENT_RESET.to_string(),
+            durable: None,
+            location: None,
+            data: serde_json::json!({
+                "sessionID": aggregate_id,
+                "after": self.after,
+                "earliest": self.earliest,
+                "latest": self.latest,
+            }),
+        }
+    }
+}
+
 /// In-memory listener callback (`Subscriber` in `event.ts:18`).
 pub type Listener = Arc<dyn Fn(&Payload) + Send + Sync>;
 
@@ -49,8 +90,9 @@ pub type Projector = Arc<dyn Fn(&Connection, &Payload) -> Result<(), CoreError> 
 /// A failure rolls the transaction back.
 ///
 /// Must not call back into the bus — `publish`/`replay` re-enter the
-/// durable-commit lock.
-pub type CommitHook = Box<dyn FnOnce(i64) -> Result<(), CoreError> + Send>;
+/// durable-commit lock — nor into `Storage`, whose mutex is held: like a
+/// projector, it gets the transaction's connection.
+pub type CommitHook = Box<dyn FnOnce(&Connection, i64) -> Result<(), CoreError> + Send>;
 
 /// [`EventBus::publish`] options (`event.ts:118-123`).
 #[derive(Default)]
@@ -297,6 +339,33 @@ impl EventBus {
             buffer: VecDeque::new(),
             wake,
         }
+    }
+
+    /// Whether the log no longer holds the events right after `after`
+    /// (`None` reads from the start, as [`Self::durable_stream`] does):
+    /// retention dropped them, and a reader resuming there would miss them
+    /// without knowing. Always `None` for a log nothing was pruned from.
+    pub fn durable_gap(
+        &self,
+        aggregate_id: &str,
+        after: Option<i64>,
+    ) -> Result<Option<DurableGap>, CoreError> {
+        let after = after.unwrap_or(-1);
+        self.storage.with_connection(|conn| {
+            let latest = sql::latest_sequence(conn, aggregate_id)?;
+            if latest < 0 {
+                return Ok(None);
+            }
+            let earliest = sql::earliest_sequence(conn, aggregate_id)?.unwrap_or(latest + 1);
+            if earliest <= after + 1 {
+                return Ok(None);
+            }
+            Ok(Some(DurableGap {
+                after,
+                earliest,
+                latest,
+            }))
+        })
     }
 
     /// Replay a serialized event into the durable log (`event.ts:441-478`).
@@ -574,7 +643,7 @@ impl EventBus {
                 projector(&tx, &committed)?;
             }
             if let Some(commit) = commit {
-                commit(seq)?;
+                commit(&tx, seq)?;
             }
             sql::upsert_event_sequence(
                 &tx,
@@ -678,35 +747,65 @@ impl DurableStream {
     /// Next event, or `None` once the wake channel has closed (no bus
     /// instance left). A lagged wake channel is retried; the re-read is a
     /// no-op, matching the sliding-wake semantics of `event.ts:565-604`.
+    ///
+    /// An alforria extension: wherever the log no longer holds the event
+    /// that follows the last one this reader was given, an [`EVENT_RESET`]
+    /// marker comes first. That covers a reader that resumes from before
+    /// what retention kept, and one that retention overtakes while it is
+    /// still reading. A log nothing was pruned from never yields one.
     pub async fn next(&mut self) -> Result<Option<Payload>, CoreError> {
         loop {
             if let Some(event) = self.buffer.pop_front() {
                 return Ok(Some(event));
             }
-            let events = self.read_after()?;
-            if events.is_empty() {
+            let page = self.read_after()?;
+            let mut expected = self.last_seq + 1;
+            for (seq, event) in page.events {
+                if seq != expected {
+                    self.buffer
+                        .push_back(self.gap(expected - 1, seq, page.latest));
+                }
+                expected = seq + 1;
+                self.buffer.push_back(event);
+            }
+            if self.buffer.is_empty() && page.latest >= expected {
+                // Everything after this reader's place is gone.
+                self.buffer
+                    .push_back(self.gap(expected - 1, page.latest + 1, page.latest));
+                expected = page.latest + 1;
+            }
+            self.last_seq = expected - 1;
+            if self.buffer.is_empty() {
                 match self.wake.recv().await {
                     Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(broadcast::error::RecvError::Closed) => return Ok(None),
                 }
-            } else {
-                if let Some(last) = events.last() {
-                    self.last_seq = last
-                        .durable
-                        .as_ref()
-                        .map(|d| d.seq)
-                        .unwrap_or(self.last_seq);
-                }
-                self.buffer.extend(events);
             }
         }
     }
 
-    fn read_after(&self) -> Result<Vec<Payload>, CoreError> {
-        let rows = self.storage.with_connection(|conn| {
-            sql::list_events_after(conn, &self.aggregate_id, self.last_seq)
+    /// The marker for a hole between `after` and `earliest`.
+    fn gap(&self, after: i64, earliest: i64, latest: i64) -> Payload {
+        DurableGap {
+            after,
+            earliest,
+            latest,
+        }
+        .marker(&self.aggregate_id)
+    }
+
+    /// One page after `last_seq` and the aggregate's latest sequence, read
+    /// from one snapshot so a write between the two cannot look like a hole.
+    fn read_after(&self) -> Result<DurablePage, CoreError> {
+        let (rows, latest) = self.storage.with_connection(|conn| {
+            let snapshot = conn.unchecked_transaction()?;
+            let rows =
+                sql::list_events_page(&snapshot, &self.aggregate_id, self.last_seq, DURABLE_PAGE)?;
+            let latest = sql::latest_sequence(&snapshot, &self.aggregate_id)?;
+            Ok::<_, CoreError>((rows, latest))
         })?;
-        rows.iter()
+        let events = rows
+            .iter()
             .map(|row| {
                 decode_serialized_event(
                     self.manifest.as_ref(),
@@ -718,9 +817,19 @@ impl DurableStream {
                         data: row.data.clone(),
                     },
                 )
+                .map(|event| (row.seq, event))
             })
-            .collect()
+            .collect::<Result<Vec<_>, CoreError>>()?;
+        Ok(DurablePage { events, latest })
     }
+}
+
+/// What one read of the log gave a [`DurableStream`].
+struct DurablePage {
+    /// Each event with its sequence, ascending.
+    events: Vec<(i64, Payload)>,
+    /// The aggregate's latest sequence, `-1` when it has none.
+    latest: i64,
 }
 
 /// `decodeSerializedEvent` (`event.ts:50-61`): turn a stored row back into
@@ -1015,7 +1124,7 @@ mod tests {
                 &MODELS_DEV_REFRESHED,
                 serde_json::json!({}),
                 PublishOptions {
-                    commit: Some(Box::new(|_seq| Ok(()))),
+                    commit: Some(Box::new(|_conn, _seq| Ok(()))),
                     ..Default::default()
                 },
             )
@@ -1036,7 +1145,7 @@ mod tests {
             &durable_def(),
             durable_data("ses_1"),
             PublishOptions {
-                commit: Some(Box::new(move |seq| {
+                commit: Some(Box::new(move |_conn, seq| {
                     seen_hook.lock().unwrap().push(seq);
                     Ok(())
                 })),
@@ -1054,7 +1163,7 @@ mod tests {
             &durable_def(),
             durable_data("ses_1"),
             PublishOptions {
-                commit: Some(Box::new(|_seq| {
+                commit: Some(Box::new(|_conn, _seq| {
                     Err(CoreError::Storage("hook failed".to_string()))
                 })),
                 ..Default::default()
@@ -1300,6 +1409,197 @@ mod tests {
         diverged.data = serde_json::json!({"sessionID": "ses_1", "changed": true});
         let err = bus.replay(diverged, ReplayOpts::default()).unwrap_err();
         assert!(err.to_string().contains("Replay diverged"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_durable_stream_reads_a_long_log_in_pages_and_reports_pruned_history() {
+        let (bus, _dir) = bus_with_manifest();
+        let total = DURABLE_PAGE as i64 * 2 + 7;
+        for _ in 0..total {
+            bus.publish(
+                &durable_def(),
+                durable_data("ses_1"),
+                PublishOptions::default(),
+            )
+            .unwrap();
+        }
+        let mut stream = bus.durable_stream("ses_1", None);
+        for expected in 0..total {
+            let event = stream.next().await.unwrap().unwrap();
+            assert_eq!(event.durable().unwrap().seq, expected);
+            assert!(stream.buffer.len() < DURABLE_PAGE);
+        }
+
+        // Nothing pruned: no gap wherever a reader resumes.
+        assert_eq!(bus.durable_gap("ses_1", None).unwrap(), None);
+        assert_eq!(bus.durable_gap("ses_1", Some(3)).unwrap(), None);
+        assert_eq!(bus.durable_gap("ses_none", None).unwrap(), None);
+
+        // Retention drops everything through seq 99.
+        bus.storage
+            .with_connection(|conn| sql::prune_events(conn, "ses_1", 99, 10_000))
+            .unwrap();
+        let gap = DurableGap {
+            after: 40,
+            earliest: 100,
+            latest: total - 1,
+        };
+        assert_eq!(bus.durable_gap("ses_1", Some(40)).unwrap(), Some(gap));
+        assert_eq!(
+            bus.durable_gap("ses_1", None).unwrap(),
+            Some(DurableGap { after: -1, ..gap })
+        );
+        // Resuming at or past the cut misses nothing.
+        assert_eq!(bus.durable_gap("ses_1", Some(99)).unwrap(), None);
+        assert_eq!(bus.durable_gap("ses_1", Some(total)).unwrap(), None);
+        let marker = gap.marker("ses_1");
+        assert_eq!(marker.r#type, "event.reset");
+        assert_eq!(
+            marker.data,
+            serde_json::json!({
+                "sessionID": "ses_1", "after": 40, "earliest": 100, "latest": total - 1,
+            })
+        );
+
+        // A log with nothing left still says where it stands.
+        bus.storage
+            .with_connection(|conn| sql::prune_events(conn, "ses_1", total, 10_000))
+            .unwrap();
+        assert_eq!(
+            bus.durable_gap("ses_1", Some(40)).unwrap(),
+            Some(DurableGap {
+                after: 40,
+                earliest: total,
+                latest: total - 1,
+            })
+        );
+        // The next event carries on the numbering.
+        let next = bus
+            .publish(
+                &durable_def(),
+                durable_data("ses_1"),
+                PublishOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(next.durable().unwrap().seq, total);
+    }
+
+    /// Retention can run while a reader is still paging through a replay.
+    /// The reader is told where the hole is, once, before the first event
+    /// after it; a replay nothing was pruned under carries no marker.
+    #[tokio::test]
+    async fn a_durable_stream_marks_history_pruned_while_it_is_being_read() {
+        let (bus, _dir) = bus_with_manifest();
+        let total = 1000i64;
+        for _ in 0..total {
+            bus.publish(
+                &durable_def(),
+                durable_data("ses_1"),
+                PublishOptions::default(),
+            )
+            .unwrap();
+        }
+        // A client resumes after 40: nothing is pruned yet, so no marker.
+        let mut stream = bus.durable_stream("ses_1", Some(40));
+        let first = stream.next().await.unwrap().unwrap();
+        assert_eq!(first.durable().unwrap().seq, 41);
+        // The retention pass runs now and keeps the newest hundred.
+        let report = crate::storage::maintenance::prune_events(
+            &bus.storage,
+            &sql::EventRetention {
+                max_age_ms: None,
+                keep_last: Some(100),
+            },
+            0,
+        )
+        .unwrap();
+        assert_eq!(report.events, 900);
+
+        // The rest of the page already read arrives, then the marker, then
+        // what the log still holds.
+        let page_end = 40 + DURABLE_PAGE as i64;
+        for expected in 42..=page_end {
+            let event = stream.next().await.unwrap().unwrap();
+            assert_eq!(event.durable().unwrap().seq, expected);
+        }
+        let marker = stream.next().await.unwrap().unwrap();
+        assert_eq!(marker.r#type, EVENT_RESET);
+        assert!(marker.durable.is_none());
+        assert_eq!(
+            marker.data,
+            serde_json::json!({
+                "sessionID": "ses_1", "after": page_end, "earliest": 900, "latest": 999,
+            })
+        );
+        for expected in 900..total {
+            let event = stream.next().await.unwrap().unwrap();
+            assert_eq!(event.durable().unwrap().seq, expected, "one marker only");
+        }
+        // Caught up: the live tail follows without another marker.
+        bus.publish(
+            &durable_def(),
+            durable_data("ses_1"),
+            PublishOptions::default(),
+        )
+        .unwrap();
+        let live = stream.next().await.unwrap().unwrap();
+        assert_eq!(live.durable().unwrap().seq, total);
+
+        // A reader that starts where the log still reaches sees no marker.
+        let mut resumed = bus.durable_stream("ses_1", Some(899));
+        for expected in 900..=total {
+            let event = resumed.next().await.unwrap().unwrap();
+            assert_eq!(event.durable().unwrap().seq, expected);
+        }
+
+        // A hole inside a page is marked where it is.
+        bus.storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "DELETE FROM event WHERE aggregate_id = 'ses_1' AND seq BETWEEN 950 AND 959",
+                    [],
+                )
+            })
+            .unwrap();
+        let mut holed = bus.durable_stream("ses_1", Some(947));
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            let event = holed.next().await.unwrap().unwrap();
+            seen.push((
+                event.r#type.clone(),
+                event.durable.as_ref().map(|durable| durable.seq),
+                event.data.get("earliest").cloned(),
+            ));
+        }
+        assert_eq!(seen[0].1, Some(948));
+        assert_eq!(seen[1].1, Some(949));
+        assert_eq!(
+            (seen[2].0.as_str(), seen[2].1, seen[2].2.clone()),
+            (EVENT_RESET, None, Some(serde_json::json!(960)))
+        );
+        assert_eq!(seen[3].1, Some(960));
+
+        // With nothing left after the reader's place, it is told at once,
+        // and the next event follows without a second marker.
+        bus.storage
+            .with_connection(|conn| sql::prune_events(conn, "ses_1", total, 10_000))
+            .unwrap();
+        let mut emptied = bus.durable_stream("ses_1", Some(10));
+        let marker = emptied.next().await.unwrap().unwrap();
+        assert_eq!(
+            marker.data,
+            serde_json::json!({
+                "sessionID": "ses_1", "after": 10, "earliest": total + 1, "latest": total,
+            })
+        );
+        bus.publish(
+            &durable_def(),
+            durable_data("ses_1"),
+            PublishOptions::default(),
+        )
+        .unwrap();
+        let next = emptied.next().await.unwrap().unwrap();
+        assert_eq!(next.durable().unwrap().seq, total + 1);
     }
 
     #[test]

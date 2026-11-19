@@ -50,6 +50,8 @@ fn fixture() -> Fixture {
         data_dir: dir.path().to_path_buf(),
         tmp_dir: dir.path().to_path_buf(),
         home: dir.path().to_path_buf(),
+        host_config: None,
+        protected: None,
     };
     let services_for_factory = agent_input.clone();
     let storage_for_factory = storage.clone();
@@ -282,6 +284,17 @@ async fn permission_reply_finds_the_request_in_another_instance() {
     // client that lost the request's directory), so the location instance
     // does not know the id and the route must find it in the other one.
     let other_services = f.ctx.instances.load(&other).unwrap();
+    // A real session: an ask under an id that is no session's is denied
+    // outright (a session that cannot be read counts as carrying outside
+    // text).
+    let session = other_services
+        .sessions
+        .create(
+            &other_services.instance_context(&other, None).unwrap(),
+            &Default::default(),
+        )
+        .unwrap()
+        .id;
     let mut asked = other_services.events.subscribe("permission.asked");
     let ask = {
         let services = other_services.clone();
@@ -290,7 +303,7 @@ async fn permission_reply_finds_the_request_in_another_instance() {
                 .permission
                 .ask(alforria_schema::permission_v1::PermissionV1AskInput {
                     id: Some("per_fb".to_string()),
-                    session_id: "ses_fb".to_string(),
+                    session_id: session,
                     permission: "bash".to_string(),
                     patterns: vec!["ls".to_string()],
                     metadata: Default::default(),
@@ -422,4 +435,73 @@ async fn provider_oauth_authorize_and_callback_map_errors() {
         body_string(response).await,
         r#"{"name":"ProviderAuthOauthMissing","data":{"providerID":"anthropic"}}"#
     );
+}
+
+// -----------------------------------------------------------------------
+// the context's global paths are the only ones a handler uses
+// -----------------------------------------------------------------------
+
+/// Every handler that loads config reads the global config under the
+/// context's paths. They used to resolve the process's own directories
+/// (`GlobalPaths::from_env()`), so a test — or a second server over another
+/// data directory — read the developer's real config.
+#[tokio::test]
+async fn handlers_read_the_global_config_under_the_contexts_paths() {
+    let f = fixture();
+    let home = tempfile::tempdir().unwrap();
+    let paths = alforria_core::GlobalPaths::resolve_with(home.path().to_path_buf(), |_| None);
+    std::fs::create_dir_all(&paths.config).unwrap();
+    std::fs::write(
+        paths.config.join("opencode.json"),
+        serde_json::json!({
+            "username": "from-the-injected-home",
+            "command": { "injected-command": { "template": "say hi" } },
+            "references": { "injected-ref": { "type": "local", "path": "/nonexistent/ref" } },
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let ctx = Arc::new(ServerContext::clone(&f.ctx).with_paths(paths.clone()));
+    assert_eq!(ctx.global_paths(), paths);
+    let router = routes::build_router(ctx);
+
+    // v1 `/config` (`util::load_config`).
+    let response = send(&router, "GET", &instance_uri(&f.worktree, "config"), "").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let config: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+    assert_eq!(config["username"], "from-the-injected-home", "{config}");
+
+    // v1 `/command` (`global_control::command_list`).
+    let response = send(&router, "GET", &instance_uri(&f.worktree, "command"), "").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_string(response).await;
+    assert!(body.contains("injected-command"), "{body}");
+
+    // v2 `/api/command` and `/api/reference` (`v2::misc`, `v2::reference`).
+    for (path, needle) in [
+        ("api/command", "injected-command"),
+        ("api/reference", "injected-ref"),
+    ] {
+        let response = send(&router, "GET", &instance_uri(&f.worktree, path), "").await;
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let body = body_string(response).await;
+        assert!(body.contains(needle), "{path}: {body}");
+    }
+}
+
+/// A context built without paths gets detached temporary ones — never the
+/// process's — and its sign-in service reaches neither LibertAI nor a
+/// session file outside them.
+#[tokio::test]
+async fn a_context_without_paths_is_detached_from_the_process_directories() {
+    let f = fixture();
+    let paths = f.ctx.global_paths();
+    assert_eq!(
+        alforria_core::paths::sandbox::escape(&paths, &[std::env::temp_dir()]),
+        None,
+        "{paths:?}"
+    );
+    assert!(paths.data.to_string_lossy().contains("alforria-detached-"));
+    // Nothing is created until something writes.
+    assert!(!paths.data.exists());
 }

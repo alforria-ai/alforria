@@ -30,6 +30,7 @@ use axum::response::{IntoResponse, Response};
 use tower::Service;
 
 use crate::middleware::auth::{query_param, route_matches, routes};
+use crate::middleware::directory;
 use crate::routes::{v1, v2};
 use crate::state::ServerContext;
 
@@ -131,7 +132,15 @@ pub fn is_local_workspace_route(method: &str, path: &str) -> bool {
 }
 
 /// `getWorkspaceRouteSessionID` (`shared/workspace-routing.ts:20-29`).
-pub fn workspace_route_session_id(path: &str) -> Option<&str> {
+///
+/// alforria extension: the id is returned **as the handler will read it**
+/// — the path segment percent-decoded, which is what the router's `Path`
+/// extractor hands a handler. This layer runs before routing, on the raw
+/// path; taken raw, `/session/ses%5F1` named no session here (so the
+/// request was placed by its `?directory=` instead of by the session's
+/// own directory, and judged without the session) and then named `ses_1`
+/// to the handler.
+pub fn workspace_route_session_id(path: &str) -> Option<String> {
     if path == "/session/status" {
         return None;
     }
@@ -144,7 +153,34 @@ pub fn workspace_route_session_id(path: &str) -> Option<&str> {
                 .and_then(|rest| rest.strip_suffix("/background"))
                 .filter(|id| !id.is_empty() && !id.contains('/'))
         })?;
-    Some(id)
+    Some(decode_segment(id))
+}
+
+/// One path segment, percent-decoded as the router decodes a path
+/// parameter: `%XX` is the byte, anything else stands for itself. A segment
+/// that does not decode to UTF-8 is returned as written — the router
+/// refuses it (400) before any handler reads it.
+fn decode_segment(segment: &str) -> String {
+    let bytes = segment.as_bytes();
+    let hex = |byte: u8| (byte as char).to_digit(16).map(|digit| digit as u8);
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        let pair = (bytes[at] == b'%')
+            .then(|| Some(hex(*bytes.get(at + 1)?)? << 4 | hex(*bytes.get(at + 2)?)?))
+            .flatten();
+        match pair {
+            Some(byte) => {
+                out.push(byte);
+                at += 3;
+            }
+            None => {
+                out.push(bytes[at]);
+                at += 1;
+            }
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| segment.to_string())
 }
 
 /// `WorkspaceV2.ID` — `Schema.String.check(Schema.isStartsWith("wrk"))`
@@ -157,44 +193,6 @@ fn is_workspace_id(value: &str) -> bool {
 /// (`packages/schema/src/session-id.ts:4`).
 fn is_session_id(value: &str) -> bool {
     value.starts_with("ses")
-}
-
-/// `decodeURIComponent` — `None` on malformed percent escapes or invalid
-/// UTF-8.
-fn decode_uri_component(input: &str) -> Result<String, ()> {
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' {
-            if i + 2 >= bytes.len() {
-                return Err(());
-            }
-            let (Some(hi), Some(lo)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) else {
-                return Err(());
-            };
-            out.push(hi * 16 + lo);
-            i += 3;
-        } else {
-            out.push(bytes[i]);
-            i += 1;
-        }
-    }
-    String::from_utf8(out).map_err(|_| ())
-}
-
-fn hex(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
-}
-
-/// Best-effort `decode()` (`instance-context.ts:15-21`, `location.ts:41-47`).
-fn decode_best_effort(input: &str) -> String {
-    decode_uri_component(input).unwrap_or_else(|_| input.to_string())
 }
 
 /// `missingWorkspaceResponse` (`workspace-routing.ts:102-107`).
@@ -221,6 +219,9 @@ enum Rejection {
     SessionNotFound { session_id: String },
     /// Instance-load failure (config errors carry their own 400 envelope).
     Load(crate::error::ServerError),
+    /// The resolved directory is outside `server.directories` for a
+    /// credential narrower than `admin` (alforria extension).
+    Forbidden(String),
 }
 
 impl From<crate::error::ServerError> for Rejection {
@@ -249,6 +250,10 @@ impl Rejection {
                 .into_response()
             }
             Rejection::Load(err) => err.into_response(),
+            Rejection::Forbidden(what) => crate::error::ApiError::Forbidden {
+                message: format!("this token may not open {what}"),
+            }
+            .into_response(),
         }
     }
 }
@@ -354,7 +359,22 @@ impl<S> LocationService<S> {
         }
     }
 
-    fn load(&self, directory: &str) -> Result<Arc<SessionServices>, Rejection> {
+    /// Load the instance for the request's resolved directory. This is
+    /// where a session-derived directory meets the directory allowlist:
+    /// a credential narrower than `admin` is refused before the instance
+    /// (its config, its project) is touched.
+    fn load(
+        &self,
+        req: &Request<Body>,
+        directory: &str,
+    ) -> Result<Arc<SessionServices>, Rejection> {
+        let restricted =
+            crate::bearer::Principal::confines(req.extensions().get::<crate::bearer::Principal>());
+        if restricted && !self.ctx.policy.directories.allows(Path::new(directory)) {
+            return Err(Rejection::Forbidden(format!(
+                "{directory}: it is outside server.directories"
+            )));
+        }
         self.ctx
             .instances
             .load(Path::new(directory))
@@ -401,15 +421,20 @@ impl<S> LocationService<S> {
             }
         }
 
+        // Whether the caller may write to this session is not decided
+        // here: this layer sees the raw path, before routing, and the
+        // handler reads the session id decoded. `confine::
+        // guard_session_writes` decides it on the route that matched.
+
         // Local plan (`:181-184`): the route session's directory wins.
-        let directory = session
-            .filter(|session| !session.directory.is_empty())
-            .map(|session| session.directory)
-            .unwrap_or_else(|| default_directory(query, req.headers()));
         // `provideInstanceContext` decodes the resolved directory
-        // (`instance-context.ts:15-21`).
-        let directory = decode_best_effort(&directory);
-        let services = self.load(&directory)?;
+        // (`instance-context.ts:15-21`). A request-named one comes from the
+        // single resolver the allowlist gate validated.
+        let directory = match session.filter(|session| !session.directory.is_empty()) {
+            Some(session) => directory::decode(&session.directory),
+            None => directory::resolve(directory::Family::V1, query, req.headers()).raw,
+        };
+        let services = self.load(req, &directory)?;
         Ok(LocationContext {
             directory: crate::state::resolve_directory(Path::new(&directory)),
             workspace_id: env_workspace_id.or(workspace_id),
@@ -423,11 +448,11 @@ impl<S> LocationService<S> {
         let Some(id) = workspace_route_session_id(path) else {
             return Ok(None);
         };
-        if !is_session_id(id) {
+        if !is_session_id(&id) {
             // `SessionID.make` throws on non-`ses` ids (defect 500).
             return Err(Rejection::Defect);
         }
-        match self.ctx.sessions.get(id) {
+        match self.ctx.sessions.get(&id) {
             Ok(session) => Ok(Some(session)),
             Err(SessionError::NotFound(_)) => Ok(None),
             Err(_) => Err(Rejection::Defect),
@@ -446,15 +471,10 @@ impl<S> LocationService<S> {
             Some(_) => return Err(Rejection::Defect),
             None => None,
         };
-        let directory = match non_empty(query_param(query, "location[directory]")) {
-            Some(directory) => directory,
-            None => match non_empty(header_value(req.headers(), "x-opencode-directory")) {
-                // An empty header is falsy — cwd applies (`:33`).
-                Some(directory) => decode_best_effort(&directory),
-                None => crate::state::cwd().display().to_string(),
-            },
-        };
-        let services = self.load(&directory)?;
+        // `location[directory]`, else the header, else cwd (`:33`): the
+        // single resolver the allowlist gate validated.
+        let directory = directory::resolve(directory::Family::V2, query, req.headers()).raw;
+        let services = self.load(req, &directory)?;
         Ok(LocationContext {
             directory: crate::state::resolve_directory(Path::new(&directory)),
             workspace_id,
@@ -484,7 +504,7 @@ impl<S> LocationService<S> {
         };
         let directory = info.directory.clone();
         let workspace_id = info.workspace_id.clone();
-        let services = self.load(&directory)?;
+        let services = self.load(req, &directory)?;
         Ok(LocationContext {
             directory: crate::state::resolve_directory(Path::new(&directory)),
             workspace_id,
@@ -493,62 +513,43 @@ impl<S> LocationService<S> {
     }
 }
 
-/// `defaultDirectory` (`workspace-routing.ts:86-88`).
-fn default_directory(query: Option<&str>, headers: &HeaderMap) -> String {
-    non_empty(query_param(query, "directory"))
-        .or_else(|| header_value(headers, "x-opencode-directory"))
-        .unwrap_or_else(|| crate::state::cwd().display().to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn decode_uri_component_matrix() {
-        assert_eq!(decode_uri_component("/a%20b").as_deref(), Ok("/a b"));
-        assert_eq!(
-            decode_uri_component("%2Frepo%2Fx").as_deref(),
-            Ok("/repo/x")
-        );
-        assert!(decode_uri_component("%").is_err());
-        assert!(decode_uri_component("%zz").is_err());
-        assert!(decode_uri_component("%2").is_err());
-        // Invalid UTF-8.
-        assert!(decode_uri_component("%ff%fe").is_err());
-        // `+` is *not* decoded to space (decodeURIComponent, not form).
-        assert_eq!(decode_uri_component("a+b").as_deref(), Ok("a+b"));
-    }
-
-    #[test]
-    fn decode_best_effort_keeps_malformed_input() {
-        assert_eq!(decode_best_effort("/a%20b"), "/a b");
-        assert_eq!(decode_best_effort("/a%"), "/a%");
-    }
-
-    #[test]
     fn workspace_route_session_id_matrix() {
-        assert_eq!(workspace_route_session_id("/session/status"), None);
-        assert_eq!(workspace_route_session_id("/session"), None);
-        assert_eq!(workspace_route_session_id("/session/"), None);
-        assert_eq!(workspace_route_session_id("/session/ses_1"), Some("ses_1"));
+        let id = |path: &str| workspace_route_session_id(path);
+        assert_eq!(id("/session/status"), None);
+        assert_eq!(id("/session"), None);
+        assert_eq!(id("/session/"), None);
+        assert_eq!(id("/session/ses_1").as_deref(), Some("ses_1"));
+        assert_eq!(id("/session/ses_1/message").as_deref(), Some("ses_1"));
         assert_eq!(
-            workspace_route_session_id("/session/ses_1/message"),
-            Some("ses_1")
-        );
-        assert_eq!(
-            workspace_route_session_id("/experimental/session/ses_1/background"),
+            id("/experimental/session/ses_1/background").as_deref(),
             Some("ses_1")
         );
         // Not an exact background match.
+        assert_eq!(id("/experimental/session/ses_1/other"), None);
+        assert_eq!(id("/experimental/session/a/b/background"), None);
+        // The id is the one the handler will read: decoded.
+        for spelled in [
+            "/session/ses%5F1",
+            "/session/%73es_1/message",
+            "/session/s%65s%5f1",
+        ] {
+            assert_eq!(id(spelled).as_deref(), Some("ses_1"), "{spelled}");
+        }
         assert_eq!(
-            workspace_route_session_id("/experimental/session/ses_1/other"),
-            None
+            id("/experimental/session/ses%5F1/background").as_deref(),
+            Some("ses_1")
         );
-        assert_eq!(
-            workspace_route_session_id("/experimental/session/a/b/background"),
-            None
-        );
+        // What is not an escape stands for itself, and bytes that are not
+        // UTF-8 leave the segment as written (the router refuses it).
+        assert_eq!(id("/session/ses%zz").as_deref(), Some("ses%zz"));
+        assert_eq!(id("/session/ses%4").as_deref(), Some("ses%4"));
+        assert_eq!(id("/session/ses%ff").as_deref(), Some("ses%ff"));
+        assert_eq!(id("/session/ses%2Fx").as_deref(), Some("ses/x"));
     }
 
     #[test]

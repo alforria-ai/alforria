@@ -1,6 +1,8 @@
 //! SQLite storage: connection handling, migrations, schema.
 
+pub mod alforria_migration;
 pub mod connection;
+pub mod maintenance;
 pub mod migration;
 pub mod schema;
 

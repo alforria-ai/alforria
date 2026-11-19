@@ -913,6 +913,10 @@ pub struct ShellSpawn {
     pub shell: String,
     pub command: String,
     pub cwd: PathBuf,
+    /// The session is restricted or was started by outside input: the
+    /// process gets the restricted environment whatever the server's
+    /// posture (`shell_env::apply_shell_for`).
+    pub outside_run: bool,
 }
 
 pub type KillFn = Arc<dyn Fn(Duration) -> BoxFuture<'static, ()> + Send + Sync>;
@@ -931,8 +935,9 @@ pub trait ShellSpawner: Send + Sync {
 }
 
 /// Production spawner: `shell -c command`, stdin ignored, detached process
-/// group on Unix (`detached: platform !== "win32"`), child environment =
-/// process environment (the plugin `shell.env` seam is a no-op in M4).
+/// group on Unix (`detached: platform !== "win32"`). The child environment
+/// is what the host's `shell_env` policy lets through (`crate::shell_env`);
+/// TS passes the process environment whole.
 #[derive(Debug, Default)]
 pub struct TokioSpawner;
 
@@ -942,6 +947,7 @@ impl ShellSpawner for TokioSpawner {
             let mut cmd = tokio::process::Command::new(&request.shell);
             cmd.arg("-c").arg(&request.command);
             cmd.current_dir(&request.cwd);
+            crate::shell_env::apply_shell_for(cmd.as_std_mut(), request.outside_run);
             cmd.stdin(std::process::Stdio::null());
             cmd.stdout(std::process::Stdio::piped());
             cmd.stderr(std::process::Stdio::piped());
@@ -954,6 +960,7 @@ impl ShellSpawner for TokioSpawner {
                 .spawn()
                 .map_err(|err| ToolError::Failed(format!("Failed to spawn command: {err}")))?;
             let pid = child.id().unwrap_or(0);
+            let group = crate::process_group::register(pid);
 
             let stdout = child.stdout.take();
             let stderr = child.stderr.take();
@@ -996,6 +1003,7 @@ impl ShellSpawner for TokioSpawner {
                     Err(_) => None,
                 };
                 exited_flag.store(true, AtomicOrdering::SeqCst);
+                drop(group);
                 let _ = exit_tx.send(code);
             });
 
@@ -1024,6 +1032,8 @@ impl ShellSpawner for TokioSpawner {
                             // No graceful signal on Windows: force-kill the
                             // whole process tree right away.
                             let _ = force_after;
+                            // shell_env: not routed. A fixed Windows system tool that kills a
+                            // process tree by pid; nothing the agent or a config names.
                             let _ = std::process::Command::new("taskkill")
                                 .args(["/PID", &pid.to_string(), "/T", "/F"])
                                 .stdin(std::process::Stdio::null())
@@ -1100,6 +1110,10 @@ async fn run(
             shell: input.shell.clone(),
             command: input.command.clone(),
             cwd: input.cwd.clone(),
+            // The write guard is there exactly for a session that is
+            // restricted or that outside input started
+            // (`SessionMark::OutsideStart`, `session::tools::resolve`).
+            outside_run: ctx.instance.write_guard.is_some(),
         })
         .await?;
     let SpawnedProcess {
@@ -1479,7 +1493,7 @@ mod tests {
                     name: "build".to_string(),
                     description: None,
                     mode: crate::tool::def::AgentMode::Primary,
-                    permission: Ruleset::new(),
+                    permission: Ruleset::new().into(),
                 })
             })
         }
@@ -1638,6 +1652,7 @@ mod tests {
         let instance = InstanceContext {
             directory: dir.clone(),
             worktree: dir.clone(),
+            write_guard: None,
         };
         for command in [
             r#"grep -R "/dev" -n poc docs/security tsconfig.json package.json || true"#,
@@ -1752,6 +1767,7 @@ mod tests {
         let instance = InstanceContext {
             directory: directory.to_path_buf(),
             worktree: worktree.to_path_buf(),
+            write_guard: None,
         };
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()
@@ -1927,6 +1943,7 @@ mod tests {
         let instance = InstanceContext {
             directory: dir.clone(),
             worktree: dir.clone(),
+            write_guard: None,
         };
         let cwd = dir.clone();
         let scan = futures_executor_collect(&nodes, &cwd, &instance);
@@ -1967,6 +1984,7 @@ mod tests {
         let instance = InstanceContext {
             directory: dir.to_path_buf(),
             worktree: dir.to_path_buf(),
+            write_guard: None,
         };
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
@@ -2150,6 +2168,7 @@ mod tests {
         let instance = InstanceContext {
             directory: std::env::temp_dir(),
             worktree: Path::new("/").to_path_buf(),
+            write_guard: None,
         };
         let extra = Extra::default();
         let def = tool.def(Arc::new(FixedAgents)).await;
@@ -2255,6 +2274,7 @@ mod tests {
         let instance = InstanceContext {
             directory: std::env::temp_dir(),
             worktree: Path::new("/").to_path_buf(),
+            write_guard: None,
         };
         let extra = Extra::default();
         let def = tool.def(Arc::new(FixedAgents)).await;
@@ -2336,6 +2356,7 @@ mod tests {
         let instance = InstanceContext {
             directory: std::env::temp_dir(),
             worktree: Path::new("/").to_path_buf(),
+            write_guard: None,
         };
         let extra = Extra::default();
         let abort = tokio_util::sync::CancellationToken::new();
@@ -2374,6 +2395,7 @@ mod tests {
         let instance = InstanceContext {
             directory: std::env::temp_dir(),
             worktree: Path::new("/").to_path_buf(),
+            write_guard: None,
         };
         let extra = Extra::default();
         let def = tool.def(Arc::new(FixedAgents)).await;
@@ -2433,6 +2455,7 @@ mod tests {
         let instance = InstanceContext {
             directory: std::env::temp_dir(),
             worktree: Path::new("/").to_path_buf(),
+            write_guard: None,
         };
         let extra = Extra::default();
         let def = tool.def(Arc::new(FixedAgents)).await;
@@ -2470,6 +2493,91 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A bash call sees the server's environment minus the denied names:
+    /// the built-in list (here `ALFORRIA_*_SECRET` and a provider key) is
+    /// withheld, everything else passes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_real_spawner_withholds_denied_variables() {
+        std::env::set_var("ALFORRIA_SHELLENVTEST_SECRET", "s3cret");
+        std::env::set_var("OPENROUTER_API_KEY", "sk-or-leak");
+        std::env::set_var("SHELLENVTEST_PLAIN", "visible");
+        let spawner: Arc<dyn ShellSpawner> = Arc::new(TokioSpawner);
+        let dir = temp("run-real-env");
+        let tool = shell_tool(spawner, TRUNC_MAX_BYTES, &dir);
+        let (result, _, _, _) = execute(
+            &tool,
+            json!({
+                "command": "printf '[%s][%s][%s]' \"$ALFORRIA_SHELLENVTEST_SECRET\" \"$OPENROUTER_API_KEY\" \"$SHELLENVTEST_PLAIN\"; env | grep -c -e s3cret -e sk-or-leak; true"
+            }),
+        )
+        .await;
+        assert_eq!(result.output.trim(), "[][][visible]0", "{}", result.output);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The per-run floor, through the tool itself: a bash call of a
+    /// session that outside input started (it carries the write guard,
+    /// set for `SessionMark::OutsideStart` and restricted sessions) gets
+    /// the restricted environment although the server's posture is
+    /// standalone — the user's `GITHUB_TOKEN`-shaped variable and an
+    /// unlisted one stay behind — while a session of the user's own, on
+    /// the same server, keeps both.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_outside_started_sessions_bash_call_gets_the_restricted_environment() {
+        std::env::set_var("FLOORTEST_GITHUB_TOKEN", "ghp-floor-leak");
+        std::env::set_var("FLOORTEST_PLAIN", "plain-floor-leak");
+        assert!(
+            !crate::shell_env::current().is_restricted(),
+            "the server's own posture is standalone in this test"
+        );
+        let command = json!({
+            "command": "printf '[%s][%s][%s]' \"$FLOORTEST_GITHUB_TOKEN\" \"$FLOORTEST_PLAIN\" \"${PATH:+path}\""
+        });
+        let spawner: Arc<dyn ShellSpawner> = Arc::new(TokioSpawner);
+        let dir = temp("run-real-floor");
+        let tool = shell_tool(spawner, TRUNC_MAX_BYTES, &dir);
+
+        let (own, _, _, _) = execute(&tool, command.clone()).await;
+        assert_eq!(
+            own.output.trim(),
+            "[ghp-floor-leak][plain-floor-leak][path]"
+        );
+
+        let ask = RecordingAsk::new();
+        let instance = InstanceContext {
+            directory: dir.clone(),
+            worktree: Path::new("/").to_path_buf(),
+            write_guard: Some(Arc::new(crate::protect::WriteGuard {
+                protected: Default::default(),
+                policy: Default::default(),
+                worktree: dir.clone(),
+            })),
+        };
+        let extra = Extra::default();
+        let def = tool.def(Arc::new(FixedAgents)).await;
+        let ctx = ToolCtxRef {
+            session_id: "ses_1",
+            message_id: "msg_1",
+            agent: "build",
+            call_id: None,
+            abort: tokio_util::sync::CancellationToken::new(),
+            messages: &[],
+            extra: &extra,
+            instance: &instance,
+            ask: &ask,
+            metadata: &ask,
+        };
+        let outside = (def.execute)(command, ctx).await.expect("execute succeeds");
+        assert_eq!(outside.output.trim(), "[][][path]", "{}", outside.output);
+        assert!(
+            !crate::shell_env::current().is_restricted(),
+            "the floor did not go through the server's posture"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[tokio::test]
     async fn run_real_spawner_timeout_kill() {
         let spawner: Arc<dyn ShellSpawner> = Arc::new(TokioSpawner);
@@ -2479,6 +2587,7 @@ mod tests {
         let instance = InstanceContext {
             directory: std::env::temp_dir(),
             worktree: Path::new("/").to_path_buf(),
+            write_guard: None,
         };
         let extra = Extra::default();
         let def = tool.def(Arc::new(FixedAgents)).await;

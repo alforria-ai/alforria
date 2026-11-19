@@ -60,6 +60,8 @@ fn make_services(dir: &std::path::Path) -> (Arc<SessionServices>, std::path::Pat
         data_dir: dir.to_path_buf(),
         tmp_dir: dir.to_path_buf(),
         home: dir.to_path_buf(),
+        host_config: None,
+        protected: None,
     };
     (
         Arc::new(SessionServices::new(
@@ -207,6 +209,8 @@ struct StubState {
     unreverts: Vec<String>,
     fail_share: bool,
     busy: bool,
+    /// The engine refuses a revert or unrevert with this message.
+    refuse_revert: Option<String>,
 }
 
 #[derive(Default)]
@@ -308,12 +312,16 @@ impl SessionEngine for StubEngine {
             .reverts
             .push(input.session_id.clone());
         let busy = self.state.lock().unwrap().busy;
+        let refused = self.state.lock().unwrap().refuse_revert.clone();
         let session_info = self.session_info(&input.session_id);
         Box::pin(async move {
             if busy {
                 return Err(SessionError::Busy(alforria_core::BusyError {
                     session_id: input.session_id,
                 }));
+            }
+            if let Some(message) = refused {
+                return Err(SessionError::Refused(message));
             }
             Ok(session_info)
         })
@@ -329,12 +337,16 @@ impl SessionEngine for StubEngine {
             .unreverts
             .push(session_id.clone());
         let busy = self.state.lock().unwrap().busy;
+        let refused = self.state.lock().unwrap().refuse_revert.clone();
         let session_info = self.session_info(&session_id);
         Box::pin(async move {
             if busy {
                 return Err(SessionError::Busy(alforria_core::BusyError {
                     session_id: session_id.clone(),
                 }));
+            }
+            if let Some(message) = refused {
+                return Err(SessionError::Refused(message));
             }
             Ok(session_info)
         })
@@ -494,9 +506,37 @@ async fn create_body_semantics() {
     assert_eq!(created["parentID"], "ses_01JDY");
 }
 
+/// Make `dir` a git repository with one commit: a project of its own,
+/// whatever the directory the tests run in is.
+fn git_init(dir: &std::path::Path) {
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .status()
+            .expect("git");
+        assert!(status.success(), "git {args:?}");
+    };
+    git(&["init", "--quiet", "-b", "main"]);
+    git(&["config", "user.email", "test@alforria.test"]);
+    git(&["config", "user.name", "Test"]);
+    std::fs::write(dir.join("seed.txt"), dir.display().to_string()).unwrap();
+    git(&["add", "."]);
+    git(&["commit", "--quiet", "-m", "root"]);
+}
+
 #[tokio::test]
 async fn list_scopes_to_the_directory_param() {
     let f = fixture();
+    // The last check below compares this project with the one of the
+    // directory the test process runs in. A plain temp directory is the
+    // `global` project — and so is the process's directory when the tests
+    // do not run from a git checkout (a source tarball), which made the two
+    // one project and the check fail. A repository of its own is a project
+    // of its own either way.
+    git_init(&f.worktree);
     let router = routes::build_router(f.ctx.clone());
     let worktree = f.worktree.to_string_lossy().into_owned();
     let session = create_session_in(&router, &worktree).await;
@@ -642,6 +682,71 @@ async fn messages_paging_link_headers() {
     let response = send(&router, "GET", &format!("{base}?limit=0"), "").await;
     let all: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
     assert_eq!(all.as_array().map(Vec::len), Some(5));
+}
+
+/// A long history is written out a page at a time, and reads the same as
+/// the buffered and the paginated responses.
+#[tokio::test]
+async fn a_long_unpaginated_history_is_streamed() {
+    use futures::StreamExt;
+
+    let f = fixture();
+    let router = routes::build_router(f.ctx.clone());
+    let session = create_session(&router).await;
+    let session_id = session["id"].as_str().unwrap().to_string();
+    let base = format!("/session/{session_id}/message");
+
+    let ids: Vec<String> = (0..250)
+        .map(|i| seed_message(&f.services, &session_id, &format!("m{i}")))
+        .collect();
+
+    let response = send(&router, "GET", &base, "").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "application/json"
+    );
+    // No length up front: the body is not built before it is sent.
+    assert!(response.headers().get("content-length").is_none());
+    let mut body = response.into_body().into_data_stream();
+    let mut frames = 0;
+    let mut bytes = Vec::new();
+    while let Some(data) = body.next().await {
+        frames += 1;
+        bytes.extend_from_slice(&data.unwrap());
+    }
+    assert!(frames >= 3, "250 messages in pages of 100: {frames} frames");
+    let streamed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let listed: Vec<&str> = streamed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|message| message["info"]["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(listed, ids.iter().map(String::as_str).collect::<Vec<_>>());
+
+    // The same bytes the buffered path writes for the same messages.
+    let expected = serde_json::to_string(
+        &f.services
+            .sessions
+            .messages(&session_id, None)
+            .unwrap()
+            .iter()
+            .map(|message| serde_json::json!({ "info": message.info, "parts": message.parts }))
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    assert_eq!(String::from_utf8(bytes).unwrap(), expected);
+
+    // An exact multiple of the page size ends cleanly.
+    let other = create_session(&router).await;
+    let other_id = other["id"].as_str().unwrap().to_string();
+    for i in 0..200 {
+        seed_message(&f.services, &other_id, &format!("m{i}"));
+    }
+    let response = send(&router, "GET", &format!("/session/{other_id}/message"), "").await;
+    let all: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+    assert_eq!(all.as_array().map(Vec::len), Some(200));
 }
 
 #[tokio::test]
@@ -990,6 +1095,38 @@ async fn revert_unrevert_and_diff() {
         diffs[0]["file"],
         serde_json::Value::from(format!("{session_id}/file.txt"))
     );
+}
+
+/// A revert the engine refuses — one that would write a protected file in
+/// a guarded session (`session::revert`) — is a 403 `ForbiddenError`
+/// carrying the engine's message, on both routes; not a defect 500.
+#[tokio::test]
+async fn a_refused_revert_is_a_403() {
+    let f = fixture();
+    let router = routes::build_router(f.ctx.clone());
+    let session = create_session(&router).await;
+    let session_id = session["id"].as_str().unwrap().to_string();
+    f.engine.state.lock().unwrap().refuse_revert =
+        Some("the revert would rewrite AGENTS.md. Nothing was reverted.".to_string());
+    for (route, body) in [
+        ("revert", "{\"messageID\":\"msg_01JDY\"}"),
+        ("unrevert", ""),
+    ] {
+        let response = send(
+            &router,
+            "POST",
+            &format!("/session/{session_id}/{route}"),
+            body,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{route}");
+        let body: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(body["_tag"], "ForbiddenError", "{route}: {body}");
+        assert_eq!(
+            body["message"], "the revert would rewrite AGENTS.md. Nothing was reverted.",
+            "{route}"
+        );
+    }
 }
 
 #[tokio::test]

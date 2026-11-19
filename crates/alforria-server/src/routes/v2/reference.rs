@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use axum::extract::State;
 use axum::response::Response;
 use axum::routing::get;
 
@@ -32,11 +33,11 @@ pub fn register(router: Router, method: &str, path: &'static str) -> (Router, bo
 /// `cache.ensure` clone is forked like the TS `forkIn(scope)` — failures
 /// are logged and swallowed.
 async fn list(
+    State(ctx): State<Arc<ServerContext>>,
     axum::Extension(location): axum::Extension<LocationContext>,
 ) -> Result<Response, ServerError> {
     let mut infos: Vec<ReferenceInfo> = Vec::new();
-    let params = alforria_core::LoadParams::new(location.directory.clone())
-        .paths(alforria_core::GlobalPaths::from_env());
+    let params = alforria_core::LoadParams::new(location.directory.clone(), ctx.paths.clone());
     let (config, _) = match alforria_core::ConfigLoader::new().load(&params) {
         Ok(loaded) => loaded,
         // Config load failures degrade to an empty list.
@@ -61,7 +62,7 @@ async fn list(
                         continue;
                     }
                 }
-                let paths = alforria_core::GlobalPaths::from_env();
+                let paths = ctx.paths.clone();
                 let path = alforria_core::repository::cache_path(
                     &paths.data.join("repos"),
                     &repository,

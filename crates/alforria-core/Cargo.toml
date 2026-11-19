@@ -46,7 +46,15 @@ rust_decimal = { workspace = true }
 tracing = { workspace = true }
 tempfile = "3"
 rquickjs = { workspace = true }
+croner = "4.0.3"
+chrono-tz = "0.10.4"
 
 [dev-dependencies]
 # `start_paused` for the M5.8 retry tests (deterministic clocks, no sleeps)
 tokio = { workspace = true, features = ["test-util"] }
+
+[features]
+# Test instrumentation only: `protect::fail_point`, a hook between the write
+# guard's judgement of a path and the write. Enabled by the test builds of
+# the crates that need it; never by a release build.
+fail-points = []

@@ -1,0 +1,13 @@
+{
+  "comment": "U2 — a turn that takes a moment to finish: a draining shutdown lets it complete",
+  "turns": [
+    {
+      "frames": [
+        { "text": "almost " },
+        { "sleep_ms": 1500 },
+        { "text": "done" },
+        { "finish": { "reason": "stop", "usage": { "input": 20, "output": 4 } } }
+      ]
+    }
+  ]
+}

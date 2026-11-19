@@ -3,6 +3,7 @@
 
 pub mod agents;
 pub mod background;
+pub mod caller;
 pub mod commands;
 pub mod compaction;
 pub mod error;
@@ -10,9 +11,11 @@ pub mod event_definitions;
 pub mod from_error;
 pub mod goal;
 pub mod ids;
+pub mod import;
 pub mod instruction;
 pub mod llm;
 pub mod r#loop;
+pub mod media;
 pub mod message;
 pub mod overflow;
 pub mod permission;
@@ -20,6 +23,7 @@ pub mod processor;
 pub mod prompt;
 pub mod prompt_input;
 pub mod question;
+pub mod recovery;
 pub mod reminders;
 pub mod render;
 pub mod retry;
@@ -33,12 +37,15 @@ pub mod summary;
 pub mod system;
 pub mod task_ops;
 pub mod tools;
+pub mod trigger_ops;
 pub mod trim_diffs;
 pub mod usage;
 pub mod workflow_ops;
 
 #[cfg(test)]
 pub(crate) mod e2e;
+#[cfg(test)]
+pub(crate) mod long_session;
 #[cfg(test)]
 pub(crate) mod test_support;
 
@@ -160,6 +167,22 @@ impl SessionServices {
         let status = Arc::new(SessionStatusService::new(events.clone()));
         let run_state = SessionRunState::new(background, status.clone());
         let permission = Arc::new(PermissionService::new(events.clone()));
+        // Whatever builds the engine on top, a session carrying outside
+        // text is held to its own rules (`set_untrusted_lookup`).
+        permission.set_untrusted_lookup(Some({
+            let sessions = sessions.clone();
+            Arc::new(move |session_id: &str| {
+                // Fail closed: a session that cannot be read — the lookup
+                // failed, or the row is gone — counts as carrying outside
+                // text, so its asks are denied rather than asked or
+                // answered by the unattended policy. Every ask is raised
+                // under the session of the turn that raised it (the tool
+                // context's and the processor's: `SessionAsk`,
+                // `AskPermission`), so an id that does not resolve is never
+                // the ordinary case.
+                sessions.started_by_outside_input(session_id)
+            })
+        }));
         let question = Arc::new(QuestionService::new(events.clone()));
         let credentials = Arc::new(crate::credential::CredentialStore::new(
             storage.clone(),
@@ -272,3 +295,6 @@ fn instance_error(err: RegistryError) -> SessionError {
         other => crate::CoreError::Storage(other.to_string()).into(),
     }
 }
+
+#[cfg(test)]
+mod trigger_reuse_tests;

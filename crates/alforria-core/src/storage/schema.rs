@@ -980,22 +980,29 @@ mod tests {
     #[test]
     fn schema_sql_statement_shape() {
         // Byte-compare sqlite_master against SCHEMA_SQL (spec §7). The
-        // journal table and the additive local query index are excluded;
-        // neither changes the pinned upstream table/index definitions.
+        // journal table (created afterwards by `migration::apply`) and the
+        // additive local query index are excluded, and so is everything
+        // alforria's own migrations created
+        // (`alforria_migration::OWN_TABLES`): those are not upstream's.
         let temp = TempDir::new("schema");
         let storage = crate::storage::Storage::open(temp.path().join("db.sqlite")).unwrap();
-        let actual = storage
-            .with_connection(|conn| -> rusqlite::Result<Vec<String>> {
+        let own = crate::storage::alforria_migration::OWN_TABLES;
+        let actual: Vec<String> = storage
+            .with_connection(|conn| -> rusqlite::Result<Vec<(String, String)>> {
                 let mut stmt = conn.prepare(
-                    "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL
-                     AND name NOT IN ('migration', ?1)",
+                    "SELECT tbl_name, sql FROM sqlite_master WHERE sql IS NOT NULL
+                     AND name NOT IN ('migration', ?1) ORDER BY rowid",
                 )?;
                 let rows = stmt.query_map([crate::storage::connection::TURN_INDEX], |row| {
-                    row.get::<_, String>(0)
+                    Ok((row.get(0)?, row.get(1)?))
                 })?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()
             })
-            .unwrap();
+            .unwrap()
+            .into_iter()
+            .filter(|(table, _)| !own.contains(&table.as_str()))
+            .map(|(_, sql)| sql)
+            .collect();
         // `sqlite_master` rows appear in creation order, so this also pins
         // the statement order.
         assert_eq!(actual, SCHEMA_SQL.to_vec());

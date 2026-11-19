@@ -2,16 +2,23 @@
 //! tagged-error wire envelopes, the CORS/compression/fence middleware quirks
 //! and the `serve` listener bootstrap.
 
+pub mod bearer;
+pub mod confine;
 pub mod engine;
 pub mod error;
 pub mod middleware;
 pub mod openapi;
+pub mod outbox;
+pub mod policy;
 pub mod provider;
 pub mod provider_runtime;
 pub mod pty;
+pub mod recovery;
 pub mod routes;
+pub mod shutdown;
 pub mod sse;
 pub mod state;
+pub mod ticket;
 pub mod workspace;
 
 use std::io;
@@ -20,6 +27,8 @@ use std::sync::Arc;
 use alforria_core::Storage;
 
 pub use error::{ApiError, ServerError};
+pub use policy::{ServerPolicy, ShutdownOptions};
+pub use shutdown::ShutdownReport;
 pub use state::{
     AuthConfig, EngineFactory, HeartbeatConfig, InstanceStore, ServerContext, SessionEngine,
     UiBackend,
@@ -44,6 +53,18 @@ pub struct ListenOptions {
     pub hosts: Vec<String>,
     /// Overrides `OPENCODE_SERVER_PASSWORD` (a password `serve` generated).
     pub password: Option<String>,
+    /// Run the trigger scheduler (alforria extension). On for the long-lived
+    /// servers (`serve`, `web`, the TUI's own); off for one-shot commands,
+    /// which would start a scheduled turn only to exit under it.
+    pub schedule: bool,
+    /// Run the restart sweep over what an earlier process left mid-turn
+    /// before serving. On by default; a caller that only wants a router
+    /// over someone else's data directory turns it off.
+    pub sweep: bool,
+    /// The global directories to serve. `None` resolves them from the
+    /// process environment — which only a process entry point may do; a
+    /// test passes its temporary home.
+    pub paths: Option<alforria_core::GlobalPaths>,
 }
 
 impl Default for ListenOptions {
@@ -54,19 +75,36 @@ impl Default for ListenOptions {
             cors: Vec::new(),
             hosts: Vec::new(),
             password: None,
+            schedule: false,
+            sweep: true,
+            paths: None,
         }
     }
 }
 
 /// A running listener (`server/server.ts:20-25`).
-#[derive(Debug)]
 pub struct Listener {
     pub hostname: String,
     pub port: u16,
     pub url: String,
+    /// What the operator should know about this configuration
+    /// ([`startup_warnings`]); `serve` prints them.
+    pub warnings: Vec<String>,
     websockets: state::WebSocketTracker,
     shutdown: tokio::sync::watch::Sender<bool>,
     task: tokio::task::JoinHandle<io::Result<()>>,
+    ctx: Arc<ServerContext>,
+}
+
+impl std::fmt::Debug for Listener {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Listener")
+            .field("hostname", &self.hostname)
+            .field("port", &self.port)
+            .field("url", &self.url)
+            .field("websockets", &self.websockets)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Listener {
@@ -75,11 +113,67 @@ impl Listener {
     /// before the listener shuts down so live sockets observe 1001).
     pub async fn stop(self) -> io::Result<()> {
         self.websockets.close_all();
+        (self.ctx.stop_background)();
+        self.ctx.outbox.shutdown().await;
         self.shutdown
             .send(true)
             .map_err(|_| io::Error::other("server task already stopped"))?;
         let _ = self.task.await;
         Ok(())
+    }
+
+    /// The shutdown the host config asks for (`server.shutdown`).
+    pub fn shutdown_options(&self) -> ShutdownOptions {
+        self.ctx.policy.shutdown
+    }
+
+    /// Stop for good, within `options.timeout` (see [`shutdown`]): unlike
+    /// [`Listener::stop`] this settles the running turns, kills what they
+    /// started, does not wait for event streams that never end, and leaves
+    /// the database checkpointed.
+    pub async fn shutdown(mut self, options: ShutdownOptions) -> ShutdownReport {
+        let started = std::time::Instant::now();
+        let deadline = started + options.timeout;
+        // Closing connections and checkpointing come out of the same budget.
+        let reserve = std::time::Duration::from_millis(500).min(options.timeout / 4);
+        let mut report = ShutdownReport::default();
+
+        // Stop accepting. In-flight requests keep running for now.
+        let _ = self.shutdown.send(true);
+        // Nothing starts by itself from here on: the trigger schedulers
+        // stop firing (a tick, a watch and a webhook call alike) and the
+        // transcript indexers end. A trigger's turn that is already running
+        // is a turn like any other and is settled below, aborted or
+        // drained as `server.shutdown.sessions` says; its run is then
+        // closed by the scheduler as completed or failed.
+        (self.ctx.stop_background)();
+        shutdown::settle_sessions(
+            &self.ctx,
+            options,
+            deadline.checked_sub(reserve).unwrap_or(deadline),
+            &mut report,
+        )
+        .await;
+        shutdown::kill_processes(&self.ctx, &mut report);
+        // What the turns just published (their `session.idle`) was written
+        // down as it was published; delivery resumes on the next start.
+        // Nothing here waits for a receiver.
+        self.ctx.outbox.shutdown().await;
+
+        // Whatever is still connected now is a stream: close the websockets
+        // with 1001, give in-flight responses the rest of the budget, then
+        // drop the event streams.
+        self.websockets.close_all();
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if tokio::time::timeout(remaining.min(reserve), &mut self.task)
+            .await
+            .is_err()
+        {
+            self.task.abort();
+            let _ = (&mut self.task).await;
+        }
+        shutdown::checkpoint(&self.ctx, &mut report);
+        report
     }
 }
 
@@ -97,6 +191,19 @@ async fn bind_with_port_fallback(opts: &ListenOptions) -> io::Result<tokio::net:
 
 /// Bind the server and spawn it on the current tokio runtime.
 pub async fn listen_with(opts: &ListenOptions, ctx: Arc<ServerContext>) -> io::Result<Listener> {
+    if let Some(error) = &ctx.policy.config_error {
+        return Err(io::Error::other(format!(
+            "refusing to listen: the host config could not be applied ({error})"
+        )));
+    }
+    if let Some(reason) = startup_refusal(&ctx) {
+        return Err(io::Error::other(format!("refusing to listen: {reason}")));
+    }
+    // A context built for one address and listened on at another: the
+    // shell environment's posture follows the address actually bound.
+    if !policy::is_loopback_bind(&opts.hostname) {
+        alforria_core::shell_env::tighten(policy::PostureReason::RemoteBind.as_str());
+    }
     let listener = bind_with_port_fallback(opts).await?;
     let port = listener.local_addr()?.port();
     let url = format!("http://{}:{}", opts.hostname, port);
@@ -107,22 +214,160 @@ pub async fn listen_with(opts: &ListenOptions, ctx: Arc<ServerContext>) -> io::R
         let _ = shutdown_rx.changed().await;
     });
     let task = tokio::spawn(async move { serve.await });
+    // Webhook deliveries, including whatever an earlier process left.
+    ctx.outbox.spawn();
 
+    let warnings = startup_warnings(&ctx);
+    for warning in &warnings {
+        tracing::warn!("{warning}");
+    }
     let hostname = opts.hostname.clone();
     Ok(Listener {
         hostname,
         port,
         url,
+        warnings,
         websockets: ctx.websockets.clone(),
         shutdown,
         task,
+        ctx,
     })
+}
+
+/// A configuration the server will not serve: bearer authentication with
+/// a directory a token may open that is, or contains, a place the host
+/// config is read from or the data directory.
+///
+/// The host config — who may connect, what the agent's shells see, the
+/// permission ceiling — is the global config directory and `~/.opencode`
+/// (unless `server.trust.host` is `"managed"`), and the data directory holds
+/// `auth.json` and the database. An agent working in a directory that
+/// contains one of them can write it with its ordinary tools: the project at
+/// `$HOME` is the usual way to get there.
+pub fn startup_refusal(ctx: &ServerContext) -> Option<String> {
+    ctx.policy.bearer.as_ref()?;
+    // The same protected set the write guard is built from
+    // (`alforria_core::protect`), compared both ways and with both sides
+    // resolved alike: a directory that contains a protected location, is
+    // one, or lies inside one.
+    let params = alforria_core::LoadParams::new(ctx.paths.home.clone(), ctx.paths.clone());
+    let protected = alforria_core::protect::Protected::host(
+        &ctx.paths,
+        &alforria_core::ConfigLoader::new().managed_dir(&params),
+        !ctx.policy.managed_only,
+    );
+    for root in ctx.policy.directories.roots() {
+        if let Some((what, location)) = protected.overlap(root) {
+            return Some(format!(
+                "{} is in server.directories (or is the working directory) and overlaps {what} \
+                 ({}): one contains the other, so the agent could rewrite the host config, read \
+                 the credentials or replace what the server runs. Serve a directory apart from \
+                 it; for the user's config files, moving the host config to the managed \
+                 directory with server.trust.host \"managed\" lifts this.",
+                root.display(),
+                location.display()
+            ));
+        }
+    }
+    None
+}
+
+/// Configurations that work but probably do not mean what the operator
+/// thinks.
+///
+/// Bearer authentication with a working directory outside
+/// `server.directories`: alforria's own routes (`/trigger`, `/memory`,
+/// `/workflow`, `/file/*`) fall back to the working directory when a request
+/// names none, and a credential below `admin` is refused there — every such
+/// request must name an allowed directory. The server still starts: the
+/// working directory is simply not available to those credentials.
+pub fn startup_warnings(ctx: &ServerContext) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let cwd = state::resolve_directory(&state::cwd());
+    if ctx.policy.bearer.is_some() && !ctx.policy.directories.allows(&cwd) {
+        warnings.push(format!(
+            "bearer authentication is configured and the working directory ({}) is not in \
+             server.directories: tokens below `admin` cannot use it, and requests to /trigger, \
+             /memory, /workflow and /file/* that name no directory are refused for them. Start \
+             the server in an allowed directory or have clients pass ?directory=.",
+            cwd.display()
+        ));
+    }
+    warnings
 }
 
 /// Bind a server with a fresh environment-derived context.
 pub async fn listen(opts: &ListenOptions) -> io::Result<Listener> {
     let ctx = default_context(opts)?;
+    if opts.schedule {
+        boot_scheduled(&ctx);
+    }
     listen_with(opts, ctx).await
+}
+
+/// The directories `serve` boots at startup so that their triggers fire
+/// without a client having to open them first. None unless triggers are in
+/// use: a server whose owner has no trigger starts as it did before
+/// triggers existed, and boots an instance when a client asks for one.
+///
+/// * `triggers.enabled: false` (or `OPENCODE_DISABLE_TRIGGERS`): none.
+/// * The config asks for triggers (`triggers.enabled: true`, or it declares
+///   one): the server's own directory, and every directory the trigger
+///   tables know — a config trigger runs in each directory that was opened.
+/// * Otherwise: the directories that have a stored trigger, and no other.
+pub fn scheduled_directories(ctx: &ServerContext) -> Vec<std::path::PathBuf> {
+    if !ctx.policy.triggers_enabled || engine::bool_env("OPENCODE_DISABLE_TRIGGERS") {
+        return Vec::new();
+    }
+    let configured = ctx.policy.triggers_configured;
+    let mut directories = Vec::new();
+    if configured {
+        directories.push(state::resolve_directory(&state::cwd()));
+    }
+    let known = ctx.storage.with_connection(|conn| {
+        let mut stmt = conn.prepare(if configured {
+            "SELECT directory FROM \"trigger\" UNION SELECT directory FROM trigger_state"
+        } else {
+            "SELECT DISTINCT directory FROM \"trigger\""
+        })?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok::<_, rusqlite::Error>(rows)
+    });
+    for directory in known.unwrap_or_default() {
+        let directory = std::path::PathBuf::from(directory);
+        if directory.is_dir() && !directories.contains(&directory) {
+            directories.push(directory);
+        }
+    }
+    directories
+}
+
+/// Boot the instances that have something scheduled
+/// ([`scheduled_directories`]). Runs in the background; a directory that
+/// fails to boot is logged and skipped.
+pub fn boot_scheduled(ctx: &Arc<ServerContext>) {
+    let ctx = ctx.clone();
+    tokio::spawn(async move {
+        let directories = scheduled_directories(&ctx);
+        for directory in directories {
+            let instances = ctx.clone();
+            let booted = tokio::task::spawn_blocking(move || {
+                instances.instances.load(&directory).map(|_| directory)
+            })
+            .await;
+            match booted {
+                Ok(Ok(directory)) => tracing::info!("triggers ready for {}", directory.display()),
+                Ok(Err(error)) => {
+                    tracing::warn!("could not boot an instance for its triggers: {error:?}")
+                }
+                Err(error) => {
+                    tracing::warn!("could not boot an instance for its triggers: {error}")
+                }
+            }
+        }
+    });
 }
 
 /// The server as a tower `Service`, with no listener: the router over a
@@ -151,8 +396,25 @@ fn ui_backend() -> Arc<dyn state::UiBackend> {
 }
 
 fn default_context(opts: &ListenOptions) -> io::Result<Arc<ServerContext>> {
-    let paths = alforria_core::GlobalPaths::from_env();
-    production_context(opts, paths, engine::EngineSeams::default())
+    // The one place a server resolves the process's own directories: the
+    // entry point of `serve`, `web`, `acp` and the TUI. (A test run that
+    // gets here without a sandbox panics in `from_env`.)
+    let paths = opts
+        .paths
+        .clone()
+        .unwrap_or_else(alforria_core::GlobalPaths::from_env);
+    // The entry point is also what turns the network on: the LibertAI
+    // model list and sign-in are offline in any other context.
+    let seams = engine::EngineSeams {
+        libertai_catalog: Some(alforria_core::libertai::LibertaiCatalog::from_env(
+            &paths.cache,
+        )),
+        libertai_endpoints: Some(alforria_core::libertai::auth::Endpoints::from_env_in(
+            &paths,
+        )),
+        ..engine::EngineSeams::default()
+    };
+    production_context(opts, paths, seams)
 }
 
 /// The production server context: shared storage + bus and the per-directory
@@ -164,9 +426,26 @@ pub fn production_context(
     paths: alforria_core::GlobalPaths,
     seams: engine::EngineSeams,
 ) -> io::Result<Arc<ServerContext>> {
+    // Every harness builds its server here: a test run over directories
+    // that are not a sandbox stops before the database is opened.
+    alforria_core::paths::sandbox::guard(&paths, "production_context");
+    let libertai_catalog = seams
+        .libertai_catalog
+        .clone()
+        .unwrap_or_else(alforria_core::libertai::LibertaiCatalog::offline);
+    let libertai_endpoints = seams.libertai_endpoints.clone().unwrap_or_else(|| {
+        alforria_core::libertai::auth::Endpoints::offline(paths.data.join("libertai-auth.json"))
+    });
     let storage = Storage::open_default(&paths.data)
         .map_err(|err| io::Error::other(format!("storage open failed: {err}")))?;
     let storage = Arc::new(storage);
+    // A server start: what the host's files say is remembered from here
+    // (`alforria_core::config::snapshot`), and frozen below if this turns
+    // out to be an unattended, reachable or project-restricted server.
+    let host_snapshot = alforria_core::config::HostSnapshot::install(&paths.config);
+    let global = global_config(&paths);
+    apply_synchronous(&storage, &global);
+    start_maintenance(&storage, &global, &paths.data);
     // The session durable manifest — required by the durable streams
     // (`/api/session/:id/event`, `/api/session/:id/history`).
     let manifest = Arc::new(alforria_core::session::event_definitions::SessionManifest::new());
@@ -180,8 +459,9 @@ pub fn production_context(
     // M7.7: the provider-runtime inputs — the models-dev catalog and the
     // `auth.json` store shared by the routes and every instance engine.
     let runtime = engine::EngineRuntime {
-        catalog: state::default_catalog(),
+        catalog: state::learning_catalog(state::catalog_in(paths.cache.clone(), libertai_catalog)),
         auth: Arc::new(state::FileAuthStore::new(paths.data.join("auth.json"))),
+        schedule: opts.schedule,
     };
     let instances = production_instance_factory(
         storage.clone(),
@@ -190,7 +470,60 @@ pub fn production_context(
         runtime.clone(),
         seams,
     );
-    let mut auth = AuthConfig::from_env();
+    let mut policy = ServerPolicy::load(&paths);
+    // The listener's address and the stored triggers complete the
+    // question of whether anybody is at this server's terminal; the shell
+    // environment's posture follows it, and is said once.
+    let outside_trigger = !engine::bool_env("OPENCODE_DISABLE_TRIGGERS")
+        && alforria_core::trigger::store::any_outside_trigger(&storage).unwrap_or_else(|error| {
+            tracing::warn!("could not read the stored triggers: {error}");
+            true
+        });
+    policy.observe(&opts.hostname, outside_trigger);
+    tracing::info!("{}", policy.posture_summary());
+    if policy.config_error.is_none() {
+        let mode = alforria_core::ConfigLoader::new().host_mode(&alforria_core::LoadParams::new(
+            paths.home.clone(),
+            paths.clone(),
+        ));
+        if let Some(warning) = policy.project_trust_warning(mode.restricted) {
+            tracing::warn!("{warning}");
+        }
+    }
+    if let Err(error) = freeze_host_config(&host_snapshot, &policy, &paths) {
+        tracing::warn!("host config not applied: {error}");
+        policy.config_error.get_or_insert(error);
+    }
+    // `hook.webhook`: the outbox captures from every instance's bus. A
+    // hook that does not resolve is a host config error like any other.
+    let outbox = match outbox::Outbox::new(storage.clone(), policy.hook.as_ref()) {
+        Ok(outbox) => outbox,
+        Err(error) => {
+            policy.config_error.get_or_insert(error);
+            outbox::Outbox::new(storage.clone(), None).map_err(io::Error::other)?
+        }
+    };
+    // Of the processes that share the data directory, one delivers.
+    outbox.deliver_as(outbox::outbox_lock(&paths.data));
+    let policy = Arc::new(policy);
+    // The unattended policy sits on each instance's ask services.
+    instances.set_on_boot({
+        let (policy, outbox) = (policy.clone(), outbox.clone());
+        move |services| {
+            services
+                .permission
+                .set_unattended(policy.unattended_permission);
+            services.question.set_unattended(policy.unattended_question);
+            services
+                .sessions
+                .set_upload_directories(policy.upload_directories.clone());
+            services
+                .sessions
+                .set_uploads_from_below_admin(policy.bearer.is_some());
+            outbox.attach(&services.events);
+        }
+    });
+    let mut auth = AuthConfig::from_env().with_bearer(policy.bearer.clone());
     if let Some(password) = &opts.password {
         auth.password = Some(password.clone());
     }
@@ -202,6 +535,19 @@ pub fn production_context(
         opts.cors.clone(),
         ui_backend(),
     );
+    ctx.policy = policy;
+    ctx.outbox = outbox;
+    alforria_core::shell_env::install(ctx.policy.shell_env.clone());
+    // The variables the catalog's providers read their keys from are kept
+    // from the agent's processes, whatever they are called: learned now,
+    // and again at every later read (`state::learning_catalog`). So are
+    // those of the providers already in use — in the host config, signed
+    // in to, or keyed from the server's environment — before any
+    // directory is opened (`provider::learn_catalog_names`, again at each
+    // instance's provider state).
+    if let Ok(catalog) = (runtime.catalog)() {
+        provider::learn_catalog_names(&catalog, &[&global], runtime.auth.as_ref());
+    }
     ctx.hosts = middleware::host::HostAllowlist::new(&opts.hostname, &opts.hosts, &opts.cors);
     ctx.engine_factory = engines.factory();
     ctx.tools = engines.tools();
@@ -210,7 +556,135 @@ pub fn production_context(
     ctx.vcs = Arc::new(state::CoreVcs::default());
     ctx.catalog = runtime.catalog;
     ctx.auth_store = runtime.auth;
-    Ok(Arc::new(ctx))
+    ctx.paths = paths.clone();
+    ctx.detached_paths = None;
+    ctx.provider_auth = Arc::new(state::ProviderAuthService::with_libertai(
+        libertai_endpoints,
+    ));
+    ctx.stop_background = Arc::new({
+        let engines = engines.clone();
+        move || engines.stop_background()
+    });
+    ctx.background_in_flight = Arc::new({
+        let engines = engines.clone();
+        move || engines.triggers_in_flight()
+    });
+    // Everything this context writes goes under the paths it was given:
+    // worktrees too, which defaulted to the process's own data directory.
+    ctx.worktree_deps = Arc::new(state::WorktreeDeps {
+        data_dir: paths.data.clone(),
+        global_bus: ctx.global_bus.clone(),
+        instances: ctx.instances.clone(),
+        projects: ctx.projects.clone(),
+    });
+    let ctx = Arc::new(ctx);
+    // Before the first request: no client sees a session a dead process
+    // left mid-turn.
+    if opts.sweep {
+        recovery::sweep(
+            &ctx,
+            &paths.data,
+            alforria_core::session::recovery::ResumePolicy::from_config(&global),
+        );
+    }
+    Ok(ctx)
+}
+
+/// `storage.synchronous`.
+fn apply_synchronous(storage: &Storage, config: &alforria_core::config::schema::Config) {
+    use alforria_core::config::schema::SynchronousMode;
+    let mode = config
+        .storage
+        .as_ref()
+        .and_then(|storage| storage.synchronous);
+    if let Some(mode) = mode {
+        if let Err(error) = storage.set_synchronous(mode == SynchronousMode::Full) {
+            tracing::warn!("could not set storage.synchronous: {error}");
+        }
+    }
+}
+
+/// Freeze the host config of an unattended, reachable or project-restricted
+/// server at what it is now: every later instance boot applies the host
+/// files as they were read at startup, with the access policy, and not as
+/// they are on disk by then. A developer's own server keeps reading them
+/// (and keeps the last reading that loaded). A host config that did not
+/// load — at all, or in one of the readings taken here — is not frozen:
+/// the error is the policy's `config_error`, and `listen` refuses to
+/// serve it.
+fn freeze_host_config(
+    snapshot: &alforria_core::config::HostSnapshot,
+    policy: &ServerPolicy,
+    paths: &alforria_core::GlobalPaths,
+) -> Result<(), String> {
+    if policy.config_error.is_some() {
+        return Ok(());
+    }
+    let loader = alforria_core::ConfigLoader::new();
+    let params = || {
+        alforria_core::LoadParams::new(paths.home.clone(), paths.clone()).flags(
+            alforria_core::ConfigFlags {
+                disable_project_config: true,
+                ..Default::default()
+            },
+        )
+    };
+    let mode = loader.host_mode(&params());
+    if !(policy.unattended_or_remote() || mode.restricted) {
+        return Ok(());
+    }
+    // Both readings of every host source, before anything the agent does
+    // can change the files: the merged one, and the one the permission
+    // ceiling is built from. One that fails is not frozen as if it were
+    // good: the server has a config error and does not listen.
+    loader.load(&params()).map_err(|error| error.to_string())?;
+    loader
+        .load_trusted(&params())
+        .map_err(|error| error.to_string())?;
+    if let Some(failed) = snapshot.failed().first() {
+        return Err(format!(
+            "the host config source {} could not be read",
+            failed.display()
+        ));
+    }
+    // What those loads found no directory for was not there.
+    snapshot.freeze(mode, loader.host_source_keys(&params()));
+    Ok(())
+}
+
+/// The merged global config, for what the server decides once rather than
+/// per directory. A config that does not load counts as empty here: the
+/// directory that needs it reports the error.
+pub(crate) fn global_config(
+    paths: &alforria_core::GlobalPaths,
+) -> alforria_core::config::schema::Config {
+    // `server.resume` and `storage` are host keys (`EXTENSION_KEYS`): read
+    // through the host loader, which consults no project file.
+    alforria_core::config::host::load_host_config(paths)
+        .unwrap_or_else(|_| serde_json::from_str("{}").expect("an empty config decodes"))
+}
+
+/// Event-log retention (`storage.retention`) and write-ahead-log
+/// checkpoints: now, then periodically for as long as the server runs.
+/// Without a runtime to run on (the in-process server is built before the
+/// TUI starts one) the startup pass still happens.
+fn start_maintenance(
+    storage: &Arc<Storage>,
+    config: &alforria_core::config::schema::Config,
+    data_dir: &std::path::Path,
+) {
+    use alforria_core::storage::maintenance;
+    let retention = maintenance::event_retention(config);
+    // Of the processes that share the data directory, one maintains it.
+    let role = maintenance::maintenance_lock(data_dir);
+    match tokio::runtime::Handle::try_current() {
+        Ok(_) => {
+            maintenance::spawn(storage, retention, Some(role));
+        }
+        Err(_) => {
+            maintenance::run_once_as(storage, &retention, &role);
+        }
+    }
 }
 
 /// The per-directory instance factory (TS `InstanceStore.boot` +
@@ -237,6 +711,26 @@ fn production_instance_factory(
     InstanceStore::new(factory)
 }
 
+/// Teach the shell environment policy the variables the configs of the
+/// instance at `params.directory` read a key or a secret from: the host's
+/// own (`provider.*.env[]`, `{env:NAME}`) as they are now, and this
+/// instance's — its merged config's providers (a project can declare one
+/// of its own) and the `{env:NAME}` of its project files. Added to what
+/// the process already withholds; nothing is taken out before it exits
+/// (`alforria_core::shell_env::learn`).
+fn learn_config_names(
+    params: &alforria_core::LoadParams,
+    config: &alforria_core::config::schema::Config,
+    host_config: &alforria_core::config::schema::Config,
+) {
+    let loader = alforria_core::ConfigLoader::new();
+    let mut names: Vec<String> = policy::provider_env_names(host_config).cloned().collect();
+    names.extend(policy::provider_env_names(config).cloned());
+    names.extend(loader.host_env_references(params));
+    names.extend(loader.project_env_references(params));
+    alforria_core::shell_env::learn(names);
+}
+
 /// One instance boot: config load + project resolution + service wiring
 /// (TS `InstanceStore.boot` + `InstanceBootstrap.run`,
 /// `project/instance-store.ts:45-61`).
@@ -248,8 +742,12 @@ fn instance_for_directory(
     seams: engine::EngineSeams,
     directory: &std::path::Path,
 ) -> Result<Arc<alforria_core::SessionServices>, ServerError> {
-    let params = alforria_core::LoadParams::new(directory.to_path_buf()).paths(paths.clone());
+    let params = alforria_core::LoadParams::new(directory.to_path_buf(), paths.clone());
     let (config, _opencode_dirs) = alforria_core::ConfigLoader::new().load(&params)?;
+    let host_config = alforria_core::ConfigLoader::new().load_trusted(&params)?;
+    // A boot is where a config is read again: what it has the shell
+    // environment policy withhold is added to what is already withheld.
+    learn_config_names(&params, &config, &host_config);
 
     // `skill.dirs()` — directory sources from the config (`skills.paths`);
     // http(s) entries are URL sources materialized through the discovery
@@ -337,6 +835,14 @@ fn instance_for_directory(
         data_dir: paths.data.clone(),
         tmp_dir: std::env::temp_dir().join("alforria"),
         home: paths.home.clone(),
+        // The host's own config is the ceiling of every agent's rules: a
+        // project's config narrows a permission, never widens one.
+        host_config: Some(host_config),
+        // What a restricted or outside-input session's tools may not
+        // write: everything the loaders consult for this instance.
+        protected: Some(Arc::new(alforria_core::protect::Protected::for_loaded(
+            &params, &config, &worktree,
+        ))),
     };
     // M7.2: the background-job service backs the run-state cancel seam.
     let background =
@@ -356,6 +862,12 @@ fn instance_for_directory(
         workspace_id: None,
     };
     services.set_instance_location(instance_location);
+    // Every turn leaves word that it is running, for the process that
+    // comes after one that dies mid-turn.
+    services.run_state.track_runs(
+        alforria_core::session::recovery::RunMarkers::new(&paths.data),
+        directory.to_path_buf(),
+    );
     // M7.2: the production engine for this instance — prompt facade,
     // revert/summary and the tool registry (`/experimental/tool`).
     engines.boot(&engine::EngineInput {
@@ -499,7 +1011,7 @@ mod tests {
     #[test]
     fn production_factory_builds_services_and_maps_config_errors() {
         let root = tempfile::tempdir().unwrap();
-        let paths = alforria_core::GlobalPaths::resolve(root.path().join("home"));
+        let paths = alforria_core::GlobalPaths::resolve_with(root.path().join("home"), |_| None);
         std::fs::create_dir_all(root.path().join("data")).unwrap();
         let storage = Arc::new(Storage::open(root.path().join("data/db.sqlite")).unwrap());
         let store = production_instance_factory(
@@ -507,8 +1019,12 @@ mod tests {
             paths,
             Arc::new(engine::EngineStore::default()),
             engine::EngineRuntime {
-                catalog: crate::state::default_catalog(),
+                catalog: crate::state::catalog_in(
+                    root.path().join("cache"),
+                    alforria_core::libertai::LibertaiCatalog::offline(),
+                ),
                 auth: Arc::new(crate::state::MemoryAuthStore::default()),
+                schedule: false,
             },
             engine::EngineSeams::default(),
         );

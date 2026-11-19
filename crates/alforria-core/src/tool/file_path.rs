@@ -111,7 +111,7 @@ mod tests {
             "session",
             "message",
             "call",
-            serde_json::from_value(json!([
+            serde_json::from_value::<crate::tool::permission::Ruleset>(json!([
                 {"permission":"edit", "pattern":"*", "action":"allow"},
                 {"permission":"edit", "pattern":denied, "action":"deny"}
             ]))

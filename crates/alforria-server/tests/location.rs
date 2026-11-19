@@ -38,6 +38,8 @@ fn test_services() -> SessionServices {
         data_dir: dir.path().to_path_buf(),
         tmp_dir: dir.path().to_path_buf(),
         home: dir.path().to_path_buf(),
+        host_config: None,
+        protected: None,
     };
     SessionServices::new(
         storage,

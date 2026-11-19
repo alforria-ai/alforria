@@ -37,11 +37,39 @@ pub trait PromptFacade: Send + Sync {
     fn cancel_count(&self, _session_id: &str) -> u64 {
         0
     }
-    /// `resolvePromptParts` (prompt.ts:157-191).
+    /// `resolvePromptParts` (prompt.ts:157-191), for a prompt the model
+    /// wrote for `agent`'s turn in `session_id`: a mentioned file is
+    /// attached only if it is inside the project and the session's policy
+    /// allows the agent to read it, and an attached file marks the session
+    /// as a `read` of it would; an `@agent` mention stays text
+    /// (`prompt_input::resolve_model_prompt_parts`).
     fn resolve_prompt_parts<'a>(
         &'a self,
+        session_id: &'a str,
+        agent: &'a str,
         template: &'a str,
     ) -> BoxFuture<'a, Result<Vec<crate::session::prompt_input::PromptPartInput>, SessionError>>;
+    /// The parts of a prompt the operator wrote (a trigger from the host
+    /// config or an `admin` request): like a prompt typed by the user, its
+    /// mentions attach files wherever they are. The default attaches
+    /// nothing — the text alone — so an implementation that does not say
+    /// otherwise reads no file.
+    fn resolve_operator_prompt_parts<'a>(
+        &'a self,
+        template: &'a str,
+    ) -> BoxFuture<'a, Result<Vec<crate::session::prompt_input::PromptPartInput>, SessionError>>
+    {
+        Box::pin(async move {
+            Ok(vec![crate::session::prompt_input::PromptPartInput::Text {
+                id: None,
+                text: template.to_string(),
+                synthetic: None,
+                ignored: None,
+                time: None,
+                metadata: None,
+            }])
+        })
+    }
     /// `prompt(input).pipe(Effect.catch(Effect.die))` (prompt.ts:1052-1071).
     fn prompt<'a>(
         &'a self,
@@ -124,8 +152,13 @@ impl TaskOps for ProductionTaskOps {
                     model_id: model.model_id.clone(),
                     provider_id: model.provider_id.clone(),
                 }),
+                // The agent's own rules as they are written: the task
+                // tool asks them only whether the agent says anything
+                // about `task` and `todowrite`
+                // (`derive_subagent_session_permission`).
                 permission: found
                     .permission
+                    .written()
                     .iter()
                     .map(|rule| Rule {
                         permission: rule.permission.clone(),
@@ -169,10 +202,11 @@ impl TaskOps for ProductionTaskOps {
             self.agents
                 .get(agent)
                 .map(|found| {
+                    // Every deny the policy holds, the ceilings' included.
                     found
                         .permission
+                        .denies()
                         .iter()
-                        .filter(|rule| rule.action == PermissionV1Action::Deny)
                         .map(|rule| Rule {
                             permission: rule.permission.clone(),
                             pattern: rule.pattern.clone(),
@@ -181,6 +215,24 @@ impl TaskOps for ProductionTaskOps {
                         .collect()
                 })
                 .unwrap_or_default()
+        })
+    }
+
+    /// Every ceiling the parent has now is set on the child: one of the
+    /// same name is replaced, and one the child has that the parent does
+    /// not is kept (a ceiling is never removed).
+    fn inherit_ceilings<'a>(
+        &'a self,
+        parent: &'a str,
+        child: &'a str,
+    ) -> BoxFuture<'a, Result<(), ToolError>> {
+        Box::pin(async move {
+            for ceiling in self.sessions.ceilings(parent).map_err(tool_error)? {
+                self.sessions
+                    .set_ceiling(child, &ceiling)
+                    .map_err(tool_error)?;
+            }
+            Ok(())
         })
     }
 
@@ -291,7 +343,7 @@ impl TaskOps for ProductionTaskOps {
         Box::pin(async move {
             let parts = self
                 .facade()?
-                .resolve_prompt_parts(prompt)
+                .resolve_prompt_parts(session_id, agent, prompt)
                 .await
                 .map_err(tool_error)?;
             self.run_prompt(session_id, agent, model, variant, parts)
@@ -354,20 +406,50 @@ impl TaskOps for ProductionTaskOps {
 
     /// `injectBackgroundResult` (task.ts:236-252) — a synthetic text prompt
     /// into the parent session, fire-and-forget.
+    ///
+    /// alforria extension: a subagent's result that arrives as a *message*
+    /// — a background task finishing, a subagent the user continued
+    /// directly — brings the subagent's provenance with it, as one that
+    /// arrives as the `task` tool's result does
+    /// (`SessionStore::note_tool_result`). A child that has seen outside
+    /// content, or whose marks cannot be read, marks the parent
+    /// (`SessionMark::OutsideContent`) before the text is delivered; if
+    /// the parent cannot be marked, the text is not delivered.
+    ///
+    /// The outside-start mark is not carried up. It says a run in the
+    /// session was *started* by outside input and puts the read-only
+    /// ceiling on it; a child is created with its parent's marks and
+    /// nothing sets that one on a session afterwards, so a child has it
+    /// only if its parent had it when the child was made — and if the
+    /// operator has cleared the parent's since, a result coming back is
+    /// not what puts a ceiling on it again.
     fn inject_background_result<'a>(
         &'a self,
         parent_session_id: &'a str,
+        child_session_id: &'a str,
         variant: Option<&'a str>,
         text: &'a str,
     ) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             let Ok(facade) = self.facade() else { return };
+            if self.sessions.seen_outside_content(child_session_id)
+                && self
+                    .sessions
+                    .mark(
+                        parent_session_id,
+                        crate::session::store::SessionMark::OutsideContent,
+                    )
+                    .is_err()
+            {
+                return;
+            }
             let agent = self
                 .sessions
                 .get(parent_session_id)
                 .ok()
                 .and_then(|session| session.agent.clone());
             let input = crate::session::prompt_input::PromptInput {
+                caller: crate::session::caller::Caller::Session,
                 session_id: parent_session_id.to_string(),
                 message_id: None,
                 model: None,
@@ -404,6 +486,7 @@ impl ProductionTaskOps {
     ) -> Result<PromptOutcome, ToolError> {
         let facade = self.facade()?;
         let input = crate::session::prompt_input::PromptInput {
+            caller: crate::session::caller::Caller::Session,
             session_id: session_id.to_string(),
             message_id: Some(crate::session::ids::MessageId::ascending(None).map_err(tool_error)?),
             model: Some(crate::session::prompt_input::ModelRef {
@@ -564,8 +647,8 @@ impl ProductionTaskOps {
         }
         let has_turns = self
             .messages
-            .stream(&parent_id)
-            .is_ok_and(|messages| !messages.is_empty());
+            .newest(&parent_id)
+            .is_ok_and(|newest| newest.is_some());
         if !has_turns {
             return;
         }
@@ -590,6 +673,7 @@ impl ProductionTaskOps {
         ));
         self.inject_background_result(
             &parent_id,
+            session_id,
             None,
             &render_output(RenderOutput {
                 session_id,
@@ -663,6 +747,115 @@ mod tests {
     use crate::session::test_support::{
         create_engine_session, create_session, engine, text_stream,
     };
+
+    /// A subagent's result that reaches its parent as a message — a
+    /// background task finishing, a subagent the user continued directly —
+    /// brings what the subagent read with it: the parent carries the
+    /// outside-content mark from then on. It used to arrive unmarked,
+    /// while the same result returned by the `task` tool marked the
+    /// parent.
+    #[tokio::test]
+    async fn a_background_subagents_result_marks_its_parent_with_what_the_subagent_read() {
+        use crate::session::store::{SessionMark, SessionMarks};
+        let e = engine(
+            "task-ops-background-provenance",
+            (0..3).map(|_| text_stream("noted")).collect(),
+        );
+        let sessions = &e.services.sessions;
+        let context = e.services.instance_context(&e.worktree, None).unwrap();
+        let child_of = |parent: &str, marks: SessionMarks| {
+            sessions
+                .create(
+                    &context,
+                    &CreateInput {
+                        parent_id: Some(parent.to_string()),
+                        marks,
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+        };
+        let delivered_to = |session: &str| {
+            e.services
+                .messages
+                .stream_without_diffs(session)
+                .unwrap()
+                .iter()
+                .flat_map(|message| message.parts.iter())
+                .any(
+                    |part| matches!(part, V1Part::Text { text, .. } if text.contains("its report")),
+                )
+        };
+
+        // A child that read nothing from outside: the parent stays clean.
+        let parent = create_engine_session(&e);
+        let quiet = child_of(&parent.id, SessionMarks::default());
+        e.ops
+            .inject_background_result(&parent.id, &quiet.id, None, "its report")
+            .await;
+        assert!(delivered_to(&parent.id));
+        assert!(!sessions.seen_outside_content(&parent.id));
+
+        // A child that fetched a page while it worked in the background.
+        let parent = create_engine_session(&e);
+        let reader = child_of(&parent.id, SessionMarks::default());
+        sessions
+            .note_tool_result(
+                &reader.id,
+                &crate::tool::outside::ToolResult {
+                    call_id: None,
+                    tool: "webfetch",
+                    external: false,
+                    input: &serde_json::json!({ "url": "https://example.com" }),
+                    metadata: None,
+                    output: "a page somebody else wrote",
+                },
+            )
+            .unwrap();
+        assert!(sessions.seen_outside_content(&reader.id));
+        assert!(!sessions.seen_outside_content(&parent.id));
+        e.ops
+            .inject_background_result(&parent.id, &reader.id, None, "its report")
+            .await;
+        assert!(delivered_to(&parent.id));
+        assert!(
+            sessions.seen_outside_content(&parent.id),
+            "the parent holds the subagent's words about a page from outside"
+        );
+        // Provenance only: no outside start, no ceiling.
+        assert!(!sessions.started_by_outside_input(&parent.id));
+        assert_eq!(sessions.ceilings(&parent.id).unwrap(), Vec::new());
+
+        // The outside-start mark is not carried up, even from a child that
+        // has it (its parent had it when the child was made, and the
+        // operator cleared the parent's since).
+        let parent = create_engine_session(&e);
+        let started = child_of(
+            &parent.id,
+            SessionMarks {
+                outside_content: true,
+                outside_start: true,
+            },
+        );
+        assert!(sessions.started_by_outside_input(&started.id));
+        e.ops
+            .inject_background_result(&parent.id, &started.id, None, "its report")
+            .await;
+        assert!(sessions
+            .has_mark(&parent.id, SessionMark::OutsideContent)
+            .unwrap());
+        assert!(!sessions
+            .has_mark(&parent.id, SessionMark::OutsideStart)
+            .unwrap());
+
+        // A child whose marks cannot be read counts as having read
+        // something: the parent is marked.
+        let parent = create_engine_session(&e);
+        e.ops
+            .inject_background_result(&parent.id, "ses_no_such_child", None, "its report")
+            .await;
+        assert!(sessions.seen_outside_content(&parent.id));
+    }
 
     #[tokio::test]
     async fn agent_lookup() {
@@ -770,6 +963,94 @@ mod tests {
         assert_eq!(session.parent_id, Some(parent.id));
         assert_eq!(session.title, "research stuff (@research subagent)");
         assert_eq!(session.agent, Some("research".to_string()));
+    }
+
+    /// A subagent's session takes its parent's ceilings when it is
+    /// created, and a resume compared only the two sessions' deny rules:
+    /// a parent whose ceiling had been narrowed since (a trigger's bounds
+    /// are replaced at each run) resumed a child still under the old,
+    /// wider one. A resume gives the child the parent's ceilings as they
+    /// stand now, before it is prompted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_resumed_subagent_is_under_its_parents_ceilings_as_they_stand_now() {
+        use crate::session::store::SessionCeiling;
+        use alforria_schema::permission_v1::PermissionV1Rule;
+        let e = engine(
+            "task-ops-resume-ceiling",
+            vec![text_stream("started"), text_stream("carried on")],
+        );
+        let sessions = &e.services.sessions;
+        let ceiling = |rules: &[(&str, PermissionV1Action)]| SessionCeiling {
+            name: crate::trigger::rules::CREATOR_CEILING.to_string(),
+            readings: vec![rules
+                .iter()
+                .map(|(permission, action)| PermissionV1Rule {
+                    permission: permission.to_string(),
+                    pattern: "*".to_string(),
+                    action: *action,
+                })
+                .collect()],
+        };
+        let parent = create_engine_session(&e);
+        let wide = ceiling(&[("*", PermissionV1Action::Allow)]);
+        sessions.set_ceiling(&parent.id, &wide).unwrap();
+        let user = crate::session::test_support::user_message(&parent.id, "msg_p1", 1.0);
+        sessions.update_message(&user).unwrap();
+        let assistant = crate::session::test_support::assistant_message(
+            &parent.id, "msg_a1", "msg_p1", 1, None, None,
+        );
+        sessions.update_message(&assistant).unwrap();
+        let (task, _) = e.registry.named();
+        let ask = crate::tool::ripgrep::test_support::RecordingAsk::new();
+        let extra = crate::tool::def::Extra::default();
+        let call = |task_id: Option<String>| {
+            (task.execute)(
+                serde_json::json!({
+                    "description": "research",
+                    "prompt": "carry on",
+                    "subagent_type": "general",
+                    "task_id": task_id,
+                }),
+                crate::tool::def::ToolCtxRef {
+                    session_id: &parent.id,
+                    message_id: "msg_a1",
+                    agent: "build",
+                    call_id: Some("cal_1"),
+                    abort: tokio_util::sync::CancellationToken::new(),
+                    messages: &[],
+                    extra: &extra,
+                    instance: &e.instance,
+                    ask: &ask,
+                    metadata: &ask,
+                },
+            )
+        };
+        call(None).await.unwrap();
+        let child = sessions.children(&parent.id).unwrap()[0].id.clone();
+        assert_eq!(sessions.ceilings(&child).unwrap(), vec![wide]);
+
+        // The parent's bounds are narrowed after the child was made.
+        let narrow = ceiling(&[
+            ("*", PermissionV1Action::Allow),
+            ("bash", PermissionV1Action::Deny),
+        ]);
+        sessions.set_ceiling(&parent.id, &narrow).unwrap();
+        let result = call(Some(child.clone())).await.unwrap();
+        assert!(result.output.contains("carried on"), "{}", result.output);
+        assert_eq!(
+            sessions.children(&parent.id).unwrap().len(),
+            1,
+            "the same session was resumed"
+        );
+        assert_eq!(sessions.ceilings(&child).unwrap(), vec![narrow]);
+        let general = e.services.agents.get("general").unwrap().permission.clone();
+        assert_eq!(
+            sessions
+                .policy(&child, &general)
+                .evaluate("bash", "ls")
+                .action,
+            PermissionV1Action::Deny
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

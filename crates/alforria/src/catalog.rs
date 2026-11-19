@@ -53,11 +53,11 @@ impl alforria_core::catalog::Fetcher for HttpFetcher {
     }
 }
 
-/// The process-wide catalog service over the global cache directory.
-pub fn catalog_service() -> Arc<CatalogService> {
-    let paths = GlobalPaths::from_env();
+/// The catalog service over `paths`' cache directory (a command resolves
+/// the process's paths once and passes them here).
+pub fn catalog_service_in(paths: &GlobalPaths) -> Arc<CatalogService> {
     Arc::new(CatalogService::new(
-        paths.cache,
+        paths.cache.clone(),
         CatalogConfig::from_env(),
         Arc::new(alforria_core::catalog::SystemClock),
         Arc::new(HttpFetcher),

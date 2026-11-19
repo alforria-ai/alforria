@@ -164,6 +164,19 @@ pub trait TaskOps: Send + Sync {
     fn agent_denies<'a>(&'a self, _agent: &'a str) -> BoxFuture<'a, Vec<Rule>> {
         Box::pin(async { Vec::new() })
     }
+    /// Bring a child session that is about to be resumed under its
+    /// parent's ceilings as they stand now (alforria extension). A child
+    /// takes them when it is created; a parent's can be replaced later (a
+    /// trigger's bounds, at each run), and the child is not to go on under
+    /// the ones it was made with. An error refuses the resume. The default
+    /// is for an implementation whose sessions have no ceilings.
+    fn inherit_ceilings<'a>(
+        &'a self,
+        _parent: &'a str,
+        _child: &'a str,
+    ) -> BoxFuture<'a, Result<(), ToolError>> {
+        Box::pin(async { Ok(()) })
+    }
     /// The parent session's permission ruleset (`parent.permission ?? []`,
     /// task.ts:138) — the production data path for
     /// [`derive_subagent_session_permission`]. Defaults to the M4
@@ -224,9 +237,14 @@ pub trait TaskOps: Send + Sync {
     /// `injectBackgroundResult` (task.ts:236-252) — a synthetic text prompt
     /// into the parent session (parent's agent, captured variant),
     /// fire-and-forget (`Effect.ignore`).
+    ///
+    /// alforria extension: `child_session_id` is the subagent whose result
+    /// this is. What it read comes with what it says: the parent gets the
+    /// child's outside-content mark before the text is delivered.
     fn inject_background_result<'a>(
         &'a self,
         parent_session_id: &'a str,
+        child_session_id: &'a str,
         variant: Option<&'a str>,
         text: &'a str,
     ) -> BoxFuture<'a, ()>;
@@ -551,10 +569,11 @@ async fn run(
 
     let existing_session = match &params.task_id {
         Some(task_id) if ops.owns_session(ctx.session_id, task_id).await => {
-            // A resumed child keeps the permissions it was created with. It
+            // A resumed child keeps the rules it was created with. It
             // must be the agent it was started as, and already carry every
             // deny the caller's agent has now (the user may have moved the
-            // parent to plan mode since).
+            // parent to plan mode since). Its ceilings are brought up to
+            // the parent's below.
             if let Some(agent) = ops.session_agent(task_id).await {
                 if agent != next.name {
                     return Err(ToolError::Failed(format!(
@@ -577,6 +596,9 @@ async fn run(
                     "Task {task_id} was started with wider permissions than this session now has; start a new task"
                 )));
             }
+            // And the bounds a child created now would be under: the
+            // parent's ceilings, which are not among its rules.
+            ops.inherit_ceilings(ctx.session_id, task_id).await?;
             Some(task_id.clone())
         }
         _ => None,
@@ -724,6 +746,7 @@ async fn run(
                     };
                     ops.inject_background_result(
                         &parent_session,
+                        &session_id,
                         variant.as_deref(),
                         &render_output(RenderOutput {
                             session_id: &session_id,
@@ -1034,6 +1057,7 @@ mod tests {
         fn inject_background_result<'a>(
             &'a self,
             _parent_session_id: &'a str,
+            _child_session_id: &'a str,
             _variant: Option<&'a str>,
             _text: &'a str,
         ) -> BoxFuture<'a, ()> {

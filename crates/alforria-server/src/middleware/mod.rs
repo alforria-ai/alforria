@@ -7,9 +7,11 @@
 pub mod auth;
 pub mod compression;
 pub mod cors;
+pub mod directory;
 pub mod fence;
 pub mod host;
 pub mod location;
+pub mod scope;
 
 use std::sync::Arc;
 
@@ -29,10 +31,11 @@ pub fn apply_stack(router: Router, ctx: &Arc<ServerContext>) -> Router {
         // inside authorization.
         .layer(location::LocationLayer::new(ctx.clone()))
         // authorizationLayer — TS bakes it into route handlers.
-        .layer(auth::AuthLayer::new(
-            ctx.auth.clone(),
-            ctx.pty_tickets.clone(),
-        ))
+        .layer(
+            auth::AuthLayer::new(ctx.auth.clone(), ctx.pty_tickets.clone())
+                .with_file_tickets(ctx.file_tickets.clone())
+                .with_directories(ctx.policy.directories.clone()),
+        )
         // cors — short-circuits every OPTIONS request.
         .layer(cors::CorsLayer::new(ctx.cors.clone()))
         // Host allowlist (no TS counterpart): a rebound name never reaches

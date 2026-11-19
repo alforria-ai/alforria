@@ -30,6 +30,9 @@ pub struct SystemRunner;
 
 impl CommandRunner for SystemRunner {
     fn run(&self, program: &str, args: &[&str]) -> std::io::Result<(i32, String)> {
+        // shell_env: not routed. `alforria pr` is typed by the user at their
+        // own terminal and runs their `gh` and `git` with their credentials
+        // (GH_TOKEN): the user's environment is the point.
         let output = StdCommand::new(program).args(args).output()?;
         let code = output.status.code().unwrap_or(-1);
         let text = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -47,6 +50,8 @@ pub struct SystemSpawn;
 
 impl OpencodeSpawn for SystemSpawn {
     fn spawn(&self, args: &[String]) -> std::io::Result<i32> {
+        // shell_env: not routed. alforria starting itself for the user, at the
+        // user's terminal: it needs the provider keys this process has.
         let status = StdCommand::new("alforria").args(args).status()?;
         Ok(status.code().unwrap_or(-1))
     }

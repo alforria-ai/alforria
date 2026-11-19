@@ -440,6 +440,132 @@ pub struct CreateInput {
     pub workspace_id: Option<String>,
     pub directory: Option<String>,
     pub path: Option<String>,
+    /// alforria extension: created by a caller below `admin`
+    /// (`session::caller`). The session is restricted for life. A child of
+    /// a restricted session and a fork of one are restricted whatever this
+    /// says.
+    pub restricted: bool,
+    /// alforria extension: marks the session starts with
+    /// ([`SessionMark`]). A child gets its parent's as well, whatever this
+    /// says.
+    pub marks: SessionMarks,
+    /// alforria extension: ceilings the session starts with
+    /// ([`SessionCeiling`]), beyond its parent's.
+    pub ceilings: Vec<SessionCeiling>,
+    /// alforria extension: a fork takes its source's ceilings, as a child
+    /// takes its parent's.
+    pub ceilings_from: Option<String>,
+}
+
+/// What the server records about where a session's text came from
+/// (alforria extension). Two marks with two causes and two effects; they
+/// live in the server's own `session_mark` table, never in the session's
+/// metadata, which a client can write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SessionMark {
+    /// **Provenance.** The session has seen content from outside: a tool
+    /// that returns such content answered in it
+    /// ([`crate::tool::outside`]), a prompt from a caller below `admin`
+    /// brought a file, or a trigger's run delivered a payload. What it
+    /// writes to memory is unverified and not injected, a trigger it
+    /// schedules carries the mark into its runs, and excerpts of it are
+    /// fenced. It changes no permission.
+    OutsideContent,
+    /// **Ceiling.** A run in the session was started by outside input (a
+    /// webhook or watch trigger). The read-only ceiling applies
+    /// (`trigger::rules`), standing approvals are ignored and an ask is a
+    /// deny at once. Implies [`SessionMark::OutsideContent`].
+    OutsideStart,
+}
+
+impl SessionMark {
+    /// The value in `session_mark.mark`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            SessionMark::OutsideContent => "outside_content",
+            SessionMark::OutsideStart => "outside_start",
+        }
+    }
+
+    /// **The one definition of "this session has this mark"**, as SQL over
+    /// the expression `session_id` (a column, or a parameter). The Rust
+    /// lookups run this same text.
+    pub fn sql(self, session_id: &str) -> String {
+        format!(
+            "EXISTS(SELECT 1 FROM session_mark WHERE session_mark.session_id = {session_id} \
+             AND session_mark.mark = '{}')",
+            self.as_str()
+        )
+    }
+}
+
+/// The marks a session is created with, beyond what it inherits.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SessionMarks {
+    pub outside_content: bool,
+    pub outside_start: bool,
+}
+
+impl SessionMarks {
+    /// Both: what an unreadable source counts as.
+    pub const ALL: SessionMarks = SessionMarks {
+        outside_content: true,
+        outside_start: true,
+    };
+
+    fn list(self) -> Vec<SessionMark> {
+        let mut out = Vec::new();
+        if self.outside_content || self.outside_start {
+            out.push(SessionMark::OutsideContent);
+        }
+        if self.outside_start {
+            out.push(SessionMark::OutsideStart);
+        }
+        out
+    }
+}
+
+/// A named permission ceiling stored for a session (alforria extension):
+/// readings of the rules that cap whatever policy is in force when a turn
+/// runs ([`SessionStore::bounded`]). Server-owned, inherited by children and
+/// forks, and sealed: a session's own rules and standing approvals do not
+/// reach it (`tool::permission::Ceiling::sealed`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionCeiling {
+    /// `trigger::rules::CREATOR_CEILING`, `trigger::rules::OUTSIDE_CEILING`.
+    pub name: String,
+    /// Each is a ceiling of its own: the strictest of all applies.
+    pub readings: Vec<PermissionV1Ruleset>,
+}
+
+/// A session's ceilings as read from the store: the argument
+/// `Policy::for_session` needs. Only [`SessionStore::policy`] makes one.
+pub struct StoredCeilings(Vec<SessionCeiling>);
+
+impl StoredCeilings {
+    /// `(name, reading)` for every reading of every ceiling.
+    pub(crate) fn readings(&self) -> impl Iterator<Item = (&str, &PermissionV1Ruleset)> {
+        self.0.iter().flat_map(|ceiling| {
+            ceiling
+                .readings
+                .iter()
+                .map(move |reading| (ceiling.name.as_str(), reading))
+        })
+    }
+}
+
+/// Session metadata keys the server keeps for itself. A client cannot set,
+/// change or remove them ([`SessionStore::set_client_metadata`],
+/// [`strip_reserved_metadata`]). `untrustedInput` is where the marks used
+/// to live; nothing reads it any more, and nothing a client sends can make
+/// it look as if something did.
+pub const RESERVED_METADATA_KEYS: [&str; 2] = ["untrustedInput", "triggerID"];
+
+/// Drop the server's keys from metadata a client supplied.
+pub fn strip_reserved_metadata(metadata: &mut JsonMap) {
+    for key in RESERVED_METADATA_KEYS {
+        metadata.remove(key);
+    }
 }
 
 /// `Session.Service` (session.ts:486-985).
@@ -450,7 +576,31 @@ pub struct SessionStore {
     background: Arc<dyn BackgroundJobs>,
     clock: Arc<dyn crate::Clock>,
     messages: MessageStore,
+    /// The upload area (`server.upload.directories`), shared by every
+    /// clone: files there were put by a client, and a tool that reads one
+    /// brings outside content into the session (`tool::outside`).
+    uploads: Arc<std::sync::RwLock<Vec<String>>>,
+    /// Whether callers below `admin` can upload there
+    /// ([`SessionStore::set_uploads_from_below_admin`]).
+    uploads_from_below_admin: Arc<std::sync::atomic::AtomicBool>,
+    /// What a file tool reported for a call, by `(session, call)`, from
+    /// the moment the tool finishes to the moment its result is appended
+    /// ([`SessionStore::report_returned_paths`]). In memory only.
+    returned_paths:
+        Arc<std::sync::Mutex<std::collections::HashMap<(String, String), ReturnedPathsReport>>>,
 }
+
+/// What a tool reported for one call, and the call it reported it for.
+struct ReturnedPathsReport {
+    tool: String,
+    input: Value,
+    /// `None`: two reports came in under one call id, and neither is used.
+    paths: Option<crate::tool::outside::ReturnedPaths>,
+}
+
+/// More unclaimed reports than this and all are dropped: the calls they
+/// belong to are then judged without one, which is the marking side.
+const MAX_RETURNED_PATHS_REPORTS: usize = 1024;
 
 impl SessionStore {
     pub fn new(
@@ -466,7 +616,174 @@ impl SessionStore {
             background,
             clock,
             messages,
+            uploads: Default::default(),
+            uploads_from_below_admin: Default::default(),
+            returned_paths: Default::default(),
         }
+    }
+
+    /// Tell the store where the upload area is (the server does, from its
+    /// policy). Unset: there is none.
+    pub fn set_upload_directories(&self, directories: Vec<String>) {
+        *self
+            .uploads
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = directories;
+    }
+
+    /// Tell the store whether credentials below `admin` exist that can
+    /// upload into the upload area (the server does: bearer tokens are
+    /// configured).
+    pub fn set_uploads_from_below_admin(&self, possible: bool) {
+        self.uploads_from_below_admin
+            .store(possible, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The upload directories a language server or a formatter must stay
+    /// out of (`lsp::Excluded`): all of them while callers below `admin`
+    /// can upload, none otherwise — a standalone project's own `uploads/`
+    /// is an ordinary directory.
+    pub fn untooled_upload_directories(&self) -> Vec<String> {
+        if !self
+            .uploads_from_below_admin
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Vec::new();
+        }
+        self.uploads
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// A tool's own report of what it opened and returned, for the call
+    /// `call_id` of `session_id` (alforria extension;
+    /// `tool::outside::ReturnedPaths`). Kept until the call's result is
+    /// appended, and used there only for a result of the same tool with the
+    /// same input.
+    pub fn report_returned_paths(
+        &self,
+        session_id: &str,
+        call_id: &str,
+        tool: &str,
+        input: &Value,
+        paths: crate::tool::outside::ReturnedPaths,
+    ) {
+        let mut reports = self
+            .returned_paths
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if reports.len() >= MAX_RETURNED_PATHS_REPORTS {
+            reports.clear();
+        }
+        let key = (session_id.to_string(), call_id.to_string());
+        let paths = match reports.contains_key(&key) {
+            // A call id used twice: which result the list belongs to cannot
+            // be told.
+            true => None,
+            false => Some(paths),
+        };
+        reports.insert(
+            key,
+            ReturnedPathsReport {
+                tool: tool.to_string(),
+                input: input.clone(),
+                paths,
+            },
+        );
+    }
+
+    /// The list reported for this result's call, if there is one and it is
+    /// this call's. Taken: a list is used once.
+    fn take_returned_paths(
+        &self,
+        session_id: &str,
+        result: &crate::tool::outside::ToolResult<'_>,
+    ) -> Option<crate::tool::outside::ReturnedPaths> {
+        let report = self
+            .returned_paths
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&(session_id.to_string(), result.call_id?.to_string()))?;
+        (report.tool == result.tool && &report.input == result.input)
+            .then_some(report.paths)
+            .flatten()
+    }
+
+    /// **The one place a tool's result marks its session** (alforria
+    /// extension): called by the processor for every result it is about to
+    /// append, before it appends it. A result that brings outside content
+    /// ([`crate::tool::outside`]) sets [`SessionMark::OutsideContent`], for
+    /// life. An error here is an error for the result: content is not
+    /// appended to a session that could not be marked for it.
+    ///
+    /// What it costs: nothing for a tool that never returns outside
+    /// content; otherwise one indexed read of `session_mark`, and for a
+    /// session that already has the mark nothing more — no filesystem
+    /// lookup and no write, so no wait for the database's write lock. The
+    /// row is written once per session. The read is of the table, not of a
+    /// cache in this process: a session id can be chosen by its creator and
+    /// used again after a delete, and other processes write the same
+    /// database. The row is written whether or not anything reads it yet
+    /// (memory and triggers are off by default): a session that read
+    /// outside content before memory was switched on must still count as
+    /// having read it afterwards.
+    pub fn note_tool_result(
+        &self,
+        session_id: &str,
+        result: &crate::tool::outside::ToolResult<'_>,
+    ) -> Result<(), SessionError> {
+        use crate::tool::outside::{
+            carries_outside_content, classify_result, Outside, SessionFacts,
+        };
+        let class = classify_result(result);
+        if class == Outside::Never {
+            return Ok(());
+        }
+        // Taken whatever follows, so that it does not stay behind.
+        let returned = match class {
+            Outside::ReadsPath | Outside::SearchesPath => {
+                self.take_returned_paths(session_id, result)
+            }
+            _ => None,
+        };
+        if self.has_mark(session_id, SessionMark::OutsideContent)? {
+            return Ok(());
+        }
+        let uploads = self
+            .uploads
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let directory = match class {
+            Outside::ReadsPath | Outside::SearchesPath if !uploads.is_empty() => {
+                PathBuf::from(self.get(session_id)?.directory)
+            }
+            _ => PathBuf::new(),
+        };
+        let child_marked = || {
+            let sql = format!(
+                "SELECT EXISTS(SELECT 1 FROM session child WHERE child.parent_id = ?1 AND {})",
+                SessionMark::OutsideContent.sql("child.id")
+            );
+            // A child whose marks cannot be read counts as marked.
+            self.storage
+                .with_connection(|conn| {
+                    conn.query_row(&sql, [session_id], |row| row.get::<_, bool>(0))
+                        .map_err(CoreError::from)
+                })
+                .unwrap_or(true)
+        };
+        let facts = SessionFacts {
+            directory: &directory,
+            uploads: &uploads,
+            child_marked: &child_marked,
+            returned: returned.as_ref(),
+        };
+        if carries_outside_content(result, &facts) {
+            self.mark(session_id, SessionMark::OutsideContent)?;
+        }
+        Ok(())
     }
 
     fn now(&self) -> u64 {
@@ -486,6 +803,7 @@ impl SessionStore {
         input: &CreateInput,
     ) -> Result<V1SessionInfo, SessionError> {
         let now = self.now();
+        let metadata = input.metadata.clone();
         let title = input.title.clone().unwrap_or_else(|| {
             format!(
                 "{}{}",
@@ -512,7 +830,7 @@ impl SessionStore {
             title,
             agent: input.agent.clone(),
             model: input.model.clone(),
-            metadata: input.metadata.clone(),
+            metadata,
             permission: input.permission.clone(),
             cost: Some(0.0),
             tokens: Some(empty_tokens()),
@@ -526,14 +844,377 @@ impl SessionStore {
             },
             revert: None,
         };
-        self.publish(
+        // alforria extension: marks, ceilings and restriction are inherited
+        // — every session is created here, so a child or fork cannot come
+        // out freer than its source because its creator did not think of
+        // it — and they are written in the transaction that inserts the
+        // session row (the event's commit hook): no reader, and no crash,
+        // finds the session without them. A parent whose marks cannot be
+        // read counts as carrying both; a source whose ceilings or
+        // restriction cannot be read fails the creation.
+        let mut marks = input.marks;
+        if let Some(parent_id) = &input.parent_id {
+            let inherited = self.inherited_marks(parent_id);
+            marks.outside_content |= inherited.outside_content;
+            marks.outside_start |= inherited.outside_start;
+        }
+        let mut ceilings: Vec<(String, String)> = Vec::new();
+        for source in [&input.parent_id, &input.ceilings_from]
+            .into_iter()
+            .flatten()
+        {
+            for ceiling in self.ceilings(source)? {
+                ceilings.push((ceiling.name, serde_json::to_string(&ceiling.readings)?));
+            }
+        }
+        for ceiling in &input.ceilings {
+            ceilings.push((
+                ceiling.name.clone(),
+                serde_json::to_string(&ceiling.readings)?,
+            ));
+        }
+        let restricted = input.restricted
+            || match &input.parent_id {
+                Some(parent) => self.is_restricted(parent)?,
+                None => false,
+            };
+        let session_id = info.id.clone();
+        let stamp = now as i64;
+        let with_session: crate::event::CommitHook = Box::new(move |conn, _seq| {
+            for mark in marks.list() {
+                Self::mark_on(conn, &session_id, mark, stamp)?;
+            }
+            for (name, readings) in &ceilings {
+                Self::set_ceiling_on(conn, &session_id, name, readings, stamp)?;
+            }
+            if restricted {
+                Self::restrict_on(conn, &session_id, stamp)?;
+            }
+            Ok(())
+        });
+        self.events.publish(
             &event_definitions::SESSION_CREATED,
             serde_json::to_value(SessionCreatedData {
                 session_id: info.id.clone(),
                 info: info.clone(),
             })?,
+            PublishOptions {
+                commit: Some(with_session),
+                ..PublishOptions::default()
+            },
         )?;
         Ok(info)
+    }
+
+    /// The session a message belongs to, if the message exists (alforria
+    /// extension): routes that take a session and a message check the two
+    /// go together before acting on the message.
+    pub fn message_session(&self, message_id: &str) -> Result<Option<String>, SessionError> {
+        self.storage
+            .with_connection(|conn| {
+                let mut statement = conn.prepare("SELECT session_id FROM message WHERE id = ?1")?;
+                let mut rows = statement.query([message_id])?;
+                match rows.next()? {
+                    Some(row) => Ok::<_, CoreError>(Some(row.get::<_, String>(0)?)),
+                    None => Ok(None),
+                }
+            })
+            .map_err(SessionError::from)
+    }
+
+    /// The session and message a part belongs to, if the part exists.
+    pub fn part_owner(&self, part_id: &str) -> Result<Option<(String, String)>, SessionError> {
+        self.storage
+            .with_connection(|conn| {
+                let mut statement =
+                    conn.prepare("SELECT session_id, message_id FROM part WHERE id = ?1")?;
+                let mut rows = statement.query([part_id])?;
+                match rows.next()? {
+                    Some(row) => Ok::<_, CoreError>(Some((row.get(0)?, row.get(1)?))),
+                    None => Ok(None),
+                }
+            })
+            .map_err(SessionError::from)
+    }
+
+    /// The marks stored for a session ([`SessionMark`]). An error is the
+    /// caller's to fail closed on; [`SessionStore::seen_outside_content`]
+    /// and [`SessionStore::started_by_outside_input`] do.
+    pub fn marks(&self, session_id: &str) -> Result<SessionMarks, SessionError> {
+        let sql = format!(
+            "SELECT {}, {}",
+            SessionMark::OutsideContent.sql("?1"),
+            SessionMark::OutsideStart.sql("?1")
+        );
+        self.storage
+            .with_connection(|conn| {
+                conn.query_row(&sql, [session_id], |row| {
+                    Ok(SessionMarks {
+                        outside_content: row.get::<_, bool>(0)?,
+                        outside_start: row.get::<_, bool>(1)?,
+                    })
+                })
+                .map_err(CoreError::from)
+            })
+            .map_err(SessionError::from)
+    }
+
+    /// What a child or a fork of `session_id` starts with: its marks, or
+    /// both when it does not exist or they cannot be read.
+    fn inherited_marks(&self, session_id: &str) -> SessionMarks {
+        let exists = self
+            .storage
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM session WHERE id = ?1)",
+                    [session_id],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(CoreError::from)
+            })
+            .unwrap_or(false);
+        match self.marks(session_id) {
+            Ok(marks) if exists => marks,
+            _ => SessionMarks::ALL,
+        }
+    }
+
+    /// Whether the session has `mark`.
+    pub fn has_mark(&self, session_id: &str, mark: SessionMark) -> Result<bool, SessionError> {
+        let sql = format!("SELECT {}", mark.sql("?1"));
+        self.storage
+            .with_connection(|conn| {
+                conn.query_row(&sql, [session_id], |row| row.get::<_, bool>(0))
+                    .map_err(CoreError::from)
+            })
+            .map_err(SessionError::from)
+    }
+
+    /// `has_mark`, failing closed: a session that does not exist, or whose
+    /// marks cannot be read, counts as marked.
+    fn marked_or_unknown(&self, session_id: &str, mark: SessionMark) -> bool {
+        let sql = format!(
+            "SELECT NOT EXISTS(SELECT 1 FROM session WHERE id = ?1) OR {}",
+            mark.sql("?1")
+        );
+        self.storage
+            .with_connection(|conn| {
+                conn.query_row(&sql, [session_id], |row| row.get::<_, bool>(0))
+                    .map_err(CoreError::from)
+            })
+            .unwrap_or(true)
+    }
+
+    /// Provenance ([`SessionMark::OutsideContent`]): the session has seen
+    /// content from outside. Fails closed.
+    pub fn seen_outside_content(&self, session_id: &str) -> bool {
+        self.marked_or_unknown(session_id, SessionMark::OutsideContent)
+    }
+
+    /// Ceiling ([`SessionMark::OutsideStart`]): a run in the session was
+    /// started by outside input. Fails closed.
+    pub fn started_by_outside_input(&self, session_id: &str) -> bool {
+        self.marked_or_unknown(session_id, SessionMark::OutsideStart)
+    }
+
+    /// Whether what runs for the session is held to the restricted
+    /// session's floor: the session is restricted
+    /// ([`SessionStore::is_restricted`]) or outside input started a run in
+    /// it ([`SessionMark::OutsideStart`]). The one predicate behind the
+    /// write guard of the session's tools and the restricted shell
+    /// environment of its bash tool, `shell` command and inline template
+    /// shell (`shell_env::apply_shell_for`). Fails closed: a restriction or
+    /// a mark that cannot be read counts as one.
+    pub fn runs_restricted(&self, session_id: &str) -> bool {
+        self.started_by_outside_input(session_id) || self.is_restricted(session_id).unwrap_or(true)
+    }
+
+    /// Set a mark, for life. Setting [`SessionMark::OutsideStart`] sets
+    /// [`SessionMark::OutsideContent`] too.
+    pub fn mark(&self, session_id: &str, mark: SessionMark) -> Result<(), SessionError> {
+        let now = self.now() as i64;
+        self.storage
+            .with_connection(|conn| Self::mark_on(conn, session_id, mark, now))
+            .map_err(SessionError::from)
+    }
+
+    /// [`SessionStore::mark`] on a connection the caller holds.
+    fn mark_on(
+        conn: &rusqlite::Connection,
+        session_id: &str,
+        mark: SessionMark,
+        now: i64,
+    ) -> Result<(), CoreError> {
+        let marks: &[SessionMark] = match mark {
+            SessionMark::OutsideContent => &[SessionMark::OutsideContent],
+            SessionMark::OutsideStart => &[SessionMark::OutsideContent, SessionMark::OutsideStart],
+        };
+        for mark in marks {
+            conn.execute(
+                "INSERT OR IGNORE INTO session_mark (session_id, mark, time_created) VALUES (?1, ?2, ?3)",
+                rusqlite::params![session_id, mark.as_str(), now],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The ceilings stored for a session, by name.
+    pub fn ceilings(&self, session_id: &str) -> Result<Vec<SessionCeiling>, SessionError> {
+        let rows = self
+            .storage
+            .with_connection(|conn| {
+                let mut statement = conn.prepare(
+                    "SELECT name, readings FROM session_ceiling WHERE session_id = ?1 ORDER BY name",
+                )?;
+                let rows = statement
+                    .query_map([session_id], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok::<_, CoreError>(rows)
+            })
+            .map_err(SessionError::from)?;
+        rows.into_iter()
+            .map(|(name, readings)| {
+                Ok(SessionCeiling {
+                    name,
+                    readings: serde_json::from_str(&readings)?,
+                })
+            })
+            .collect()
+    }
+
+    /// Set (replace) one of a session's ceilings.
+    pub fn set_ceiling(
+        &self,
+        session_id: &str,
+        ceiling: &SessionCeiling,
+    ) -> Result<(), SessionError> {
+        let now = self.now() as i64;
+        let readings = serde_json::to_string(&ceiling.readings)?;
+        self.storage
+            .with_connection(|conn| {
+                Self::set_ceiling_on(conn, session_id, &ceiling.name, &readings, now)
+            })
+            .map_err(SessionError::from)
+    }
+
+    /// [`SessionStore::set_ceiling`] on a connection the caller holds.
+    fn set_ceiling_on(
+        conn: &rusqlite::Connection,
+        session_id: &str,
+        name: &str,
+        readings: &str,
+        now: i64,
+    ) -> Result<(), CoreError> {
+        conn.execute(
+            "INSERT INTO session_ceiling (session_id, name, readings, time_updated)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (session_id, name) DO UPDATE SET
+                readings = excluded.readings, time_updated = excluded.time_updated",
+            rusqlite::params![session_id, name, readings, now],
+        )?;
+        Ok(())
+    }
+
+    /// **The policy a turn in `session_id` is judged by** — the one place
+    /// it is assembled, and the only way to combine an agent's policy with
+    /// a session's rules (`Policy::for_session` takes a value only this
+    /// store produces). The result, through the one `Policy::evaluate`, is
+    /// the strictest of: `agent`'s policy as it stands now (with the host's
+    /// ceiling it carries) read with the session's own rules, a trigger
+    /// creator's bounds, and the outside-input ceiling. A session or
+    /// ceilings that cannot be read give a policy that denies everything.
+    pub fn policy(
+        &self,
+        session_id: &str,
+        agent: &crate::tool::permission::Policy,
+    ) -> crate::tool::permission::Policy {
+        use alforria_schema::permission_v1::{PermissionV1Action, PermissionV1Rule};
+        match (self.get(session_id), self.ceilings(session_id)) {
+            (Ok(session), Ok(ceilings)) => agent.for_session(
+                &session.permission.unwrap_or_default(),
+                &StoredCeilings(ceilings),
+            ),
+            _ => agent.for_session(
+                &Vec::new(),
+                &StoredCeilings(vec![SessionCeiling {
+                    name: "unreadable".to_string(),
+                    readings: vec![vec![PermissionV1Rule {
+                        permission: "*".to_string(),
+                        pattern: "*".to_string(),
+                        action: PermissionV1Action::Deny,
+                    }]],
+                }]),
+            ),
+        }
+    }
+
+    /// Remove a session's marks. An operator's decision, like
+    /// [`SessionStore::lift_restriction`]: nothing in the engine calls it.
+    pub fn clear_marks(&self, session_id: &str) -> Result<bool, SessionError> {
+        self.storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "DELETE FROM session_mark WHERE session_id = ?1",
+                    [session_id],
+                )
+                .map(|rows| rows > 0)
+                .map_err(CoreError::from)
+            })
+            .map_err(SessionError::from)
+    }
+
+    /// Whether a session is restricted (alforria extension,
+    /// `session::caller`): created by a caller below `admin`, or descended
+    /// from such a session.
+    pub fn is_restricted(&self, session_id: &str) -> Result<bool, SessionError> {
+        self.storage
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM session_restriction WHERE session_id = ?1)",
+                    [session_id],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(CoreError::from)
+            })
+            .map_err(SessionError::from)
+    }
+
+    /// Restrict a session, for life.
+    pub fn restrict(&self, session_id: &str) -> Result<(), SessionError> {
+        let now = self.now() as i64;
+        self.storage
+            .with_connection(|conn| Self::restrict_on(conn, session_id, now))
+            .map_err(SessionError::from)
+    }
+
+    /// [`SessionStore::restrict`] on a connection the caller holds.
+    fn restrict_on(
+        conn: &rusqlite::Connection,
+        session_id: &str,
+        now: i64,
+    ) -> Result<(), CoreError> {
+        conn.execute(
+            "INSERT OR IGNORE INTO session_restriction (session_id, time_created) VALUES (?1, ?2)",
+            rusqlite::params![session_id, now],
+        )?;
+        Ok(())
+    }
+
+    /// Lift a session's restriction. The one way out, and an operator's
+    /// decision: nothing in the engine calls it.
+    pub fn lift_restriction(&self, session_id: &str) -> Result<bool, SessionError> {
+        self.storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "DELETE FROM session_restriction WHERE session_id = ?1",
+                    [session_id],
+                )
+                .map(|rows| rows > 0)
+                .map_err(CoreError::from)
+            })
+            .map_err(SessionError::from)
     }
 
     /// `create` (session.ts:667-689).
@@ -846,6 +1527,25 @@ impl SessionStore {
         )
     }
 
+    /// [`SessionStore::set_metadata`] with metadata a client sent
+    /// (alforria extension): the server's own keys
+    /// ([`RESERVED_METADATA_KEYS`]) are neither taken from it nor lost to
+    /// it.
+    pub fn set_client_metadata(
+        &self,
+        session_id: &str,
+        mut metadata: JsonMap,
+    ) -> Result<(), SessionError> {
+        strip_reserved_metadata(&mut metadata);
+        let kept = self.get(session_id)?.metadata.unwrap_or_default();
+        for key in RESERVED_METADATA_KEYS {
+            if let Some(value) = kept.get(key) {
+                metadata.insert(key.to_string(), value.clone());
+            }
+        }
+        self.set_metadata(session_id, metadata)
+    }
+
     /// `setMetadata` (session.ts:761-763).
     pub fn set_metadata(&self, session_id: &str, metadata: JsonMap) -> Result<(), SessionError> {
         self.patch(
@@ -1049,6 +1749,16 @@ impl SessionStore {
         Ok(result)
     }
 
+    /// `message_id` and every message after it, oldest first, with every
+    /// `summary.diffs` empty. Never write one back to the store.
+    pub fn messages_since(
+        &self,
+        session_id: &str,
+        message_id: &str,
+    ) -> Result<Vec<WithParts>, SessionError> {
+        self.messages.since(session_id, message_id)
+    }
+
     /// A turn's metadata and snapshot step parts, for computing its diff.
     pub(crate) fn turn_snapshots(
         &self,
@@ -1218,7 +1928,22 @@ impl SessionStore {
         session_id: &str,
         message_id: Option<&str>,
     ) -> Result<V1SessionInfo, SessionError> {
+        self.fork_as(ctx, session_id, message_id, false)
+    }
+
+    /// [`SessionStore::fork`] on behalf of a caller that is, or is not,
+    /// below `admin` (alforria extension). The fork is restricted when
+    /// either its source or the caller forking it is: a fork never has
+    /// more rights than whoever made it.
+    pub fn fork_as(
+        &self,
+        ctx: &SessionContext,
+        session_id: &str,
+        message_id: Option<&str>,
+        caller_restricted: bool,
+    ) -> Result<V1SessionInfo, SessionError> {
         let original = self.get(session_id)?;
+        let marks = self.inherited_marks(session_id);
         let title = get_forked_title(&original.title);
         let session = self.create_next(
             ctx,
@@ -1228,6 +1953,19 @@ impl SessionStore {
                 workspace_id: original.workspace_id.clone(),
                 title: Some(title),
                 metadata: original.metadata.clone(),
+                // alforria extension: a session whose runs outside input
+                // started is held to rules of its own (`trigger::rules`).
+                // Its fork holds the same text, so it keeps the same rules
+                // and the same marks; a source whose marks cannot be read
+                // counts as carrying both. Upstream's fork copies no
+                // rules, and for every other session neither does this one.
+                permission: marks
+                    .outside_start
+                    .then(|| original.permission.clone())
+                    .flatten(),
+                restricted: caller_restricted || self.is_restricted(session_id)?,
+                marks,
+                ceilings_from: Some(session_id.to_string()),
                 ..Default::default()
             },
         )?;
@@ -1251,7 +1989,53 @@ impl SessionStore {
                 self.update_part(&new_part)?;
             }
         }
-        Ok(session)
+        // alforria extension: the fork was created as its source then
+        // was, and the messages were read after that. A result that marks
+        // a session marks it before it is appended
+        // (`note_tool_result`), so whatever the copy holds, its source
+        // has the mark for by now: the source is read again and the fork
+        // brought up to it — marks, ceilings, restriction, and the rules
+        // an outside-start session's fork keeps. A fork that cannot be is
+        // not left behind holding the content without them.
+        match self.catch_up_with(&session.id, session_id, marks) {
+            Ok(false) => Ok(session),
+            Ok(true) => self.get(&session.id),
+            Err(error) => {
+                if let Err(removal) = self.remove(&session.id) {
+                    tracing::warn!("a fork that could not be marked was not removed: {removal}");
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// [`SessionStore::fork_as`]: give `fork` what `source` has now beyond
+    /// `inherited`, the marks it was created with. Whether the fork's own
+    /// rules changed.
+    fn catch_up_with(
+        &self,
+        fork: &str,
+        source: &str,
+        inherited: SessionMarks,
+    ) -> Result<bool, SessionError> {
+        let marks = self.inherited_marks(source);
+        for mark in marks.list() {
+            self.mark(fork, mark)?;
+        }
+        // A ceiling of the same name is replaced; none is removed.
+        for ceiling in self.ceilings(source)? {
+            self.set_ceiling(fork, &ceiling)?;
+        }
+        if self.is_restricted(source)? {
+            self.restrict(fork)?;
+        }
+        if marks.outside_start && !inherited.outside_start {
+            if let Some(permission) = self.get(source)?.permission {
+                self.set_permission(fork, permission)?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 }
 
@@ -2263,5 +3047,461 @@ mod integration_tests {
         assert_eq!(messages[0].parts.len(), 1);
         let title_should_bump = get_forked_title(&created.title);
         assert_eq!(fork.title, title_should_bump);
+    }
+
+    /// A fork read its source's marks, ceilings and restriction, created
+    /// itself with them, and only then copied the messages: a source
+    /// marked, bounded or restricted in between left a fork that holds the
+    /// content without what the content brought. Here the source changes
+    /// at the moment the fork's row is created — after the first read,
+    /// before the copy — and the fork still comes out as its source is.
+    #[test]
+    fn a_fork_of_a_session_marked_while_it_is_forked_carries_the_marks() {
+        use alforria_schema::permission_v1::{PermissionV1Action, PermissionV1Rule};
+        let dir = crate::storage::test_support::TempDir::new("store-fork-race");
+        let services = services(dir.path());
+        insert_project(&services, "proj_01");
+        let sessions = &services.sessions;
+        let context = ctx("proj_01");
+        let source = sessions.create(&context, &Default::default()).unwrap();
+        sessions
+            .update_message(&user_message(&source.id, "msg_01", 10.0))
+            .unwrap();
+        let ceiling = SessionCeiling {
+            name: crate::trigger::rules::OUTSIDE_CEILING.to_string(),
+            readings: vec![vec![PermissionV1Rule {
+                permission: "*".to_string(),
+                pattern: "*".to_string(),
+                action: PermissionV1Action::Deny,
+            }]],
+        };
+        let _listening = services.events.listen(Arc::new({
+            let (sessions, source, ceiling) =
+                (sessions.clone(), source.id.clone(), ceiling.clone());
+            move |event: &crate::event::Payload| {
+                let created = event.r#type == "session.created"
+                    && event.data["info"]["id"].as_str() != Some(source.as_str());
+                if created {
+                    sessions.mark(&source, SessionMark::OutsideStart).unwrap();
+                    sessions.set_ceiling(&source, &ceiling).unwrap();
+                    sessions.restrict(&source).unwrap();
+                }
+            }
+        }));
+
+        let fork = sessions.fork(&context, &source.id, None).unwrap();
+        assert_eq!(sessions.messages(&fork.id, None).unwrap().len(), 1);
+        assert_eq!(
+            sessions.marks(&source.id).unwrap(),
+            SessionMarks::ALL,
+            "the source was marked while it was being forked"
+        );
+        assert_eq!(sessions.marks(&fork.id).unwrap(), SessionMarks::ALL);
+        assert_eq!(sessions.ceilings(&fork.id).unwrap(), vec![ceiling]);
+        assert!(sessions.is_restricted(&fork.id).unwrap());
+    }
+
+    /// The two marks a session can carry are independent, and each is
+    /// inherited by children and forks whatever the other says. A fork of
+    /// a session that carries outside text keeps that session's rules
+    /// too: the text went with it.
+    #[test]
+    fn restriction_and_the_untrusted_mark_are_inherited_independently() {
+        use alforria_schema::permission_v1::{PermissionV1Action, PermissionV1Rule};
+        let dir = crate::storage::test_support::TempDir::new("store-two-marks");
+        let services = services(dir.path());
+        insert_project(&services, "proj_01");
+        let sessions = &services.sessions;
+        let context = ctx("proj_01");
+        let rules = vec![PermissionV1Rule {
+            permission: "*".to_string(),
+            pattern: "*".to_string(),
+            action: PermissionV1Action::Deny,
+        }];
+        let marked = |untrusted: bool| SessionMarks {
+            outside_content: untrusted,
+            outside_start: untrusted,
+        };
+        for (restricted, untrusted) in [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let root = sessions
+                .create(
+                    &context,
+                    &CreateInput {
+                        restricted,
+                        marks: marked(untrusted),
+                        permission: Some(rules.clone()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let child = sessions
+                .create(
+                    &context,
+                    &CreateInput {
+                        parent_id: Some(root.id.clone()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let grandchild = sessions
+                .create(
+                    &context,
+                    &CreateInput {
+                        parent_id: Some(child.id.clone()),
+                        // A creator that says otherwise is not believed.
+                        restricted: false,
+                        metadata: Some(JsonMap::new()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let fork = sessions.fork(&context, &root.id, None).unwrap();
+            let fork_of_fork = sessions.fork(&context, &fork.id, None).unwrap();
+            for (name, session) in [
+                ("root", &root),
+                ("child", &child),
+                ("grandchild", &grandchild),
+                ("fork", &fork),
+                ("fork of fork", &fork_of_fork),
+            ] {
+                let at = format!("{name} of restricted={restricted} untrusted={untrusted}");
+                assert_eq!(
+                    sessions.is_restricted(&session.id).unwrap(),
+                    restricted,
+                    "{at}"
+                );
+                assert_eq!(
+                    sessions.started_by_outside_input(&session.id),
+                    untrusted,
+                    "{at}"
+                );
+                assert_eq!(
+                    sessions.seen_outside_content(&session.id),
+                    untrusted,
+                    "{at}"
+                );
+            }
+            // Upstream's fork copies no rules; one that carries outside
+            // text keeps the rules that hold it.
+            assert_eq!(
+                fork.permission,
+                untrusted.then(|| rules.clone()),
+                "restricted={restricted} untrusted={untrusted}"
+            );
+            assert_eq!(fork_of_fork.permission, fork.permission);
+
+            // Replacing the metadata never clears the mark, and has no
+            // say over the restriction.
+            sessions.set_metadata(&root.id, JsonMap::new()).unwrap();
+            let mut cleared = JsonMap::new();
+            cleared.insert("untrustedInput".to_string(), serde_json::json!(false));
+            sessions.set_metadata(&child.id, cleared).unwrap();
+            for id in [&root.id, &child.id] {
+                assert_eq!(sessions.started_by_outside_input(id), untrusted);
+                assert_eq!(sessions.is_restricted(id).unwrap(), restricted);
+            }
+            // Lifting the restriction (the operator's act) leaves the
+            // other mark, and the children's own restriction, alone.
+            sessions.lift_restriction(&root.id).unwrap();
+            assert_eq!(sessions.started_by_outside_input(&root.id), untrusted);
+            assert_eq!(sessions.is_restricted(&child.id).unwrap(), restricted);
+        }
+    }
+
+    /// A session comes into being with its restriction, marks and ceilings
+    /// or not at all: whoever hears of it finds them set, and when one of
+    /// them cannot be written there is no session.
+    #[test]
+    fn a_session_is_created_with_its_restriction_marks_and_ceilings_or_not_at_all() {
+        let dir = crate::storage::test_support::TempDir::new("store-create-atomic");
+        let services = services(dir.path());
+        insert_project(&services, "proj_01");
+        let sessions = services.sessions.clone();
+        let context = ctx("proj_01");
+        let input = CreateInput {
+            restricted: true,
+            marks: SessionMarks::ALL,
+            ceilings: vec![SessionCeiling {
+                name: "test".to_string(),
+                readings: vec![vec![]],
+            }],
+            ..Default::default()
+        };
+
+        // What a reader sees at the moment the session is announced.
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let _subscription = services.events.listen({
+            let (sessions, seen) = (sessions.clone(), seen.clone());
+            Arc::new(move |event: &crate::event::Payload| {
+                if event.r#type != event_definitions::SESSION_CREATED.r#type {
+                    return;
+                }
+                let id = event.data["sessionID"].as_str().unwrap().to_string();
+                seen.lock().unwrap().push((
+                    sessions.is_restricted(&id).unwrap(),
+                    sessions.marks(&id).unwrap(),
+                    sessions.ceilings(&id).unwrap().len(),
+                ));
+            })
+        });
+        sessions.create(&context, &input).unwrap();
+        assert_eq!(*seen.lock().unwrap(), vec![(true, SessionMarks::ALL, 1)]);
+
+        // The restriction cannot be written: no session row is left behind,
+        // and nothing of it in the other tables.
+        let count = |table: &str| {
+            services.storage.with_connection(|conn| {
+                conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap()
+            })
+        };
+        let before = (
+            count("session"),
+            count("session_mark"),
+            count("session_ceiling"),
+        );
+        services.storage.with_connection(|conn| {
+            conn.execute_batch(
+                "ALTER TABLE session_restriction RENAME TO session_restriction_gone;
+                 CREATE TABLE session_restriction (elsewhere TEXT);",
+            )
+            .unwrap()
+        });
+        assert!(sessions.create(&context, &input).is_err());
+        assert_eq!(
+            (
+                count("session"),
+                count("session_mark"),
+                count("session_ceiling")
+            ),
+            before
+        );
+    }
+
+    /// A property a decision rests on is never derived from a lookup that
+    /// failed in the permissive direction. With the session table gone
+    /// (any storage error reads the same), and for a session that was
+    /// never there: asks are denied, the untrusted mark is presumed, and a
+    /// restriction that cannot be read is an error, not "unrestricted".
+    #[tokio::test]
+    async fn security_marks_fail_closed_when_a_lookup_fails() {
+        use alforria_schema::permission_v1::{
+            PermissionV1Action, PermissionV1AskInput, PermissionV1Rule,
+        };
+        let dir = crate::storage::test_support::TempDir::new("store-fail-closed");
+        let services = services(dir.path());
+        insert_project(&services, "proj_01");
+        let sessions = &services.sessions;
+        let context = ctx("proj_01");
+        let plain = sessions.create(&context, &Default::default()).unwrap();
+        let ask = |session: &str| PermissionV1AskInput {
+            id: None,
+            session_id: session.to_string(),
+            permission: "bash".to_string(),
+            patterns: vec!["ls".to_string()],
+            metadata: JsonMap::new(),
+            always: vec![],
+            tool: None,
+            ruleset: vec![PermissionV1Rule {
+                permission: "bash".to_string(),
+                pattern: "*".to_string(),
+                action: PermissionV1Action::Ask,
+            }],
+        };
+        // The widest unattended policy: were the ask raised, it would be
+        // allowed.
+        services
+            .permission
+            .set_unattended(Some(crate::session::permission::Unattended {
+                timeout: std::time::Duration::from_millis(10),
+                on_timeout: crate::session::permission::OnTimeout::Allow,
+            }));
+        // A readable, unmarked session is asked about (and allowed here).
+        services.permission.ask(ask(&plain.id)).await.unwrap();
+
+        // An id that is no session's.
+        assert!(sessions.started_by_outside_input("ses_never"));
+        assert!(sessions.seen_outside_content("ses_never"));
+        assert!(matches!(
+            services.permission.ask(ask("ses_never")).await,
+            Err(crate::session::permission::PermissionError::Denied { .. })
+        ));
+        assert!(!sessions.is_restricted("ses_never").unwrap());
+
+        // The mark survives a metadata replace on a row that is there.
+        let marked = sessions
+            .create(
+                &context,
+                &CreateInput {
+                    marks: SessionMarks::ALL,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        sessions.set_metadata(&marked.id, JsonMap::new()).unwrap();
+        assert!(sessions.started_by_outside_input(&marked.id));
+
+        // Now every lookup fails.
+        services.storage.with_connection(|conn| {
+            conn.execute_batch(
+                "ALTER TABLE session RENAME TO session_gone;
+                 ALTER TABLE session_restriction RENAME TO session_restriction_gone;",
+            )
+            .unwrap()
+        });
+        assert!(sessions.get(&plain.id).is_err());
+        assert!(sessions.started_by_outside_input(&plain.id));
+        assert!(matches!(
+            services.permission.ask(ask(&plain.id)).await,
+            Err(crate::session::permission::PermissionError::Denied { .. })
+        ));
+        assert!(services.permission.list().is_empty(), "nothing was asked");
+        assert!(
+            sessions.is_restricted(&plain.id).is_err(),
+            "an unreadable restriction is an error for the caller to refuse on"
+        );
+        // A child created now presumes the mark, and cannot be created
+        // unrestricted by default: its parent's restriction is unreadable.
+        assert!(sessions
+            .create(
+                &context,
+                &CreateInput {
+                    parent_id: Some(plain.id.clone()),
+                    ..Default::default()
+                },
+            )
+            .is_err());
+    }
+
+    /// M8: the marks are the server's. Nothing a client can put in a
+    /// session's metadata sets one, clears one, or makes Rust and SQL
+    /// disagree; the reserved keys are not a client's to write or remove;
+    /// and a mark that cannot be read counts as set.
+    #[test]
+    fn client_metadata_neither_sets_nor_clears_nor_confuses_the_marks() {
+        let dir = crate::storage::test_support::TempDir::new("store-marks-server-owned");
+        let services = services(dir.path());
+        insert_project(&services, "proj_01");
+        let sessions = &services.sessions;
+        let context = ctx("proj_01");
+        let plain = sessions.create(&context, &CreateInput::default()).unwrap();
+        let sql_marked = |id: &str| -> (bool, bool) {
+            services.storage.with_connection(|conn| {
+                conn.query_row(
+                    &format!(
+                        "SELECT {}, {} FROM session s WHERE s.id = ?1",
+                        SessionMark::OutsideContent.sql("s.id"),
+                        SessionMark::OutsideStart.sql("s.id")
+                    ),
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap()
+            })
+        };
+        for value in [
+            serde_json::json!(true),
+            serde_json::json!(1),
+            serde_json::json!("yes"),
+            serde_json::json!({ "x": 1 }),
+        ] {
+            let mut metadata = JsonMap::new();
+            metadata.insert("untrustedInput".to_string(), value.clone());
+            metadata.insert("triggerID".to_string(), serde_json::json!("forged"));
+            metadata.insert("mine".to_string(), serde_json::json!(1));
+            sessions
+                .set_client_metadata(&plain.id, metadata.clone())
+                .unwrap();
+            let stored = sessions.get(&plain.id).unwrap().metadata.unwrap();
+            assert_eq!(stored.len(), 1, "{value}: {stored:?}");
+            assert_eq!(stored["mine"], 1);
+            // Even written past the route, the key means nothing.
+            sessions.set_metadata(&plain.id, metadata).unwrap();
+            assert_eq!(sql_marked(&plain.id), (false, false), "{value}");
+            assert!(!sessions.seen_outside_content(&plain.id), "{value}");
+            assert!(!sessions.started_by_outside_input(&plain.id), "{value}");
+            assert_eq!(sessions.marks(&plain.id).unwrap(), SessionMarks::default());
+            sessions.set_metadata(&plain.id, JsonMap::new()).unwrap();
+        }
+
+        // A marked session: a client's metadata does not clear the marks,
+        // and does not take the server's own key away.
+        let mut own = JsonMap::new();
+        own.insert("triggerID".to_string(), serde_json::json!("deliveries"));
+        let run = sessions
+            .create(
+                &context,
+                &CreateInput {
+                    metadata: Some(own),
+                    marks: SessionMarks {
+                        outside_content: false,
+                        outside_start: true,
+                    },
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let mut cleared = JsonMap::new();
+        cleared.insert("untrustedInput".to_string(), serde_json::json!(false));
+        sessions.set_client_metadata(&run.id, cleared).unwrap();
+        assert_eq!(
+            sql_marked(&run.id),
+            (true, true),
+            "the ceiling implies provenance"
+        );
+        assert_eq!(sessions.marks(&run.id).unwrap(), SessionMarks::ALL);
+        let stored = sessions.get(&run.id).unwrap().metadata.unwrap();
+        assert_eq!(stored["triggerID"], "deliveries");
+        assert!(!stored.contains_key("untrustedInput"));
+
+        // Provenance alone is inherited alone, by children and forks.
+        let seen = sessions
+            .create(
+                &context,
+                &CreateInput {
+                    marks: SessionMarks {
+                        outside_content: true,
+                        outside_start: false,
+                    },
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let child = sessions
+            .create(
+                &context,
+                &CreateInput {
+                    parent_id: Some(seen.id.clone()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let fork = sessions.fork(&context, &child.id, None).unwrap();
+        for id in [&seen.id, &child.id, &fork.id] {
+            assert!(sessions.seen_outside_content(id));
+            assert!(!sessions.started_by_outside_input(id));
+        }
+
+        // The table alone unreadable: every lookup fails closed, and a
+        // child cannot be created unmarked.
+        services.storage.with_connection(|conn| {
+            conn.execute_batch("ALTER TABLE session_mark RENAME TO session_mark_gone;")
+                .unwrap()
+        });
+        assert!(sessions.marks(&plain.id).is_err());
+        assert!(sessions.seen_outside_content(&plain.id));
+        assert!(sessions.started_by_outside_input(&plain.id));
+        assert!(sessions
+            .create(
+                &context,
+                &CreateInput {
+                    parent_id: Some(plain.id.clone()),
+                    ..Default::default()
+                },
+            )
+            .is_err());
     }
 }

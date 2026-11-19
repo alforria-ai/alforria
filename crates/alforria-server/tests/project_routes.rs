@@ -46,6 +46,8 @@ fn fixture() -> Arc<ServerContext> {
             data_dir: std::env::temp_dir(),
             tmp_dir: std::env::temp_dir(),
             home: std::env::temp_dir(),
+            host_config: None,
+            protected: None,
         };
         Ok(Arc::new(SessionServices::new(
             factory_storage.clone(),

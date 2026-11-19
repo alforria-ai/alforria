@@ -210,6 +210,38 @@ pub struct ServerInfo {
     pub mdns_domain: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cors: Option<Vec<String>>,
+    // --- alforria extensions (`config::host`), read from the host config ---
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shutdown: Option<super::host::ShutdownInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<super::host::ServerAuthInfo>,
+    /// The project directories a token without the `admin` scope may open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directories: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upload: Option<super::host::UploadInfo>,
+    /// alforria extension: what to do, at startup, with a turn the last
+    /// process died in the middle of.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume: Option<ResumeMode>,
+    /// alforria extension: how far project config and which host files are
+    /// trusted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust: Option<super::host::TrustInfo>,
+}
+
+/// `server.resume`. Whatever it says, the interrupted turn's history is
+/// repaired first: its running tool calls are marked interrupted and its
+/// assistant message is completed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResumeMode {
+    /// Repair and leave it (the default).
+    None,
+    /// Repair, and leave a note the model reads with the next prompt.
+    Notify,
+    /// Repair, and prompt the model to carry on. A turn is resumed once.
+    Continue,
 }
 
 // ---------------------------------------------------------------------------
@@ -268,6 +300,57 @@ pub struct WorkflowsInfo {
         skip_serializing_if = "Option::is_none"
     )]
     pub claude_compat: Option<bool>,
+}
+
+// ---------------------------------------------------------------------------
+// storage (alforria extension)
+// ---------------------------------------------------------------------------
+
+/// A length of time written as a number and a unit: `45s`, `90m`, `12h`,
+/// `30d`, `2w`: the config's one duration type in its
+/// [`Calendar`](crate::config::duration::Calendar) notation.
+pub type ConfigDuration = crate::config::duration::DurationOf<crate::config::duration::Calendar>;
+
+/// `storage.retention.events` — which durable events the log may drop.
+/// Unset, nothing is dropped. An event is kept when either rule keeps it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct EventRetentionInfo {
+    /// Drop events older than this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_age: Option<ConfigDuration>,
+    /// Keep this many of each session's newest events whatever their age;
+    /// on its own, keep only these.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_last: Option<PositiveInt>,
+}
+
+/// `storage.retention` — what the database sheds as it ages.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RetentionInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub events: Option<EventRetentionInfo>,
+}
+
+/// `storage.synchronous` — how hard SQLite pushes a commit to disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SynchronousMode {
+    /// Upstream's setting, and the default. A crash never corrupts the
+    /// database, but a machine that loses power (or is killed by its host)
+    /// can lose the last few seconds of commits.
+    Normal,
+    /// Every commit is on disk before it returns: nothing acknowledged is
+    /// lost, for one `fsync` per commit.
+    Full,
+}
+
+/// `storage` — how the database is kept.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct StorageInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention: Option<RetentionInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synchronous: Option<SynchronousMode>,
 }
 
 // ---------------------------------------------------------------------------
@@ -356,11 +439,24 @@ const PERMISSION_ACTION_KEYS: &[&str] = &[
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct PermissionInfo {
     pub rules: BTreeMap<String, PermissionRule>,
+    /// alforria extension: the `unattended` key, when it holds a policy
+    /// object rather than a rule (`config::host`). Not a rule, and only
+    /// acted on from the host config.
+    pub unattended: Option<super::host::PermissionUnattendedInfo>,
 }
 
 impl Serialize for PermissionInfo {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.rules.serialize(serializer)
+        let Some(unattended) = &self.unattended else {
+            return self.rules.serialize(serializer);
+        };
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.rules.len() + 1))?;
+        for (key, rule) in &self.rules {
+            map.serialize_entry(key, rule)?;
+        }
+        map.serialize_entry("unattended", unattended)?;
+        map.end()
     }
 }
 
@@ -381,7 +477,10 @@ impl<'de> Deserialize<'de> for PermissionInfo {
                 .map_err(serde::de::Error::custom)?;
                 let mut rules = BTreeMap::new();
                 rules.insert("*".to_owned(), rule);
-                Ok(PermissionInfo { rules })
+                Ok(PermissionInfo {
+                    rules,
+                    unattended: None,
+                })
             }
 
             fn visit_map<A: serde::de::MapAccess<'de>>(
@@ -389,8 +488,22 @@ impl<'de> Deserialize<'de> for PermissionInfo {
                 mut map: A,
             ) -> Result<Self::Value, A::Error> {
                 let mut rules = BTreeMap::new();
+                let mut unattended = None;
                 while let Some(key) = map.next_key::<String>()? {
                     let value = map.next_value::<serde_json::Value>()?;
+                    // `unattended` with a policy object is the unattended
+                    // policy; with an action or a pattern record it is a
+                    // rule for a permission of that name, as upstream
+                    // would read it.
+                    if key == "unattended"
+                        && value.as_object().is_some_and(|object| {
+                            object.contains_key("timeout") || object.contains_key("on_timeout")
+                        })
+                    {
+                        unattended =
+                            Some(serde_json::from_value(value).map_err(serde::de::Error::custom)?);
+                        continue;
+                    }
                     let rule: PermissionRule = if PERMISSION_ACTION_KEYS.contains(&key.as_str()) {
                         // Typed as a bare `Action` — a record is invalid here.
                         let action: PermissionAction =
@@ -406,7 +519,7 @@ impl<'de> Deserialize<'de> for PermissionInfo {
                     };
                     rules.insert(key, rule);
                 }
-                Ok(PermissionInfo { rules })
+                Ok(PermissionInfo { rules, unattended })
             }
         }
         deserializer.deserialize_any(V)
@@ -467,7 +580,7 @@ impl AgentInfo {
     ];
 
     /// Keys exempt from the unknown-key → `options` migration (`KNOWN_KEYS`).
-    const KNOWN_KEYS: &'static [&'static str] = &[
+    pub(crate) const KNOWN_KEYS: &'static [&'static str] = &[
         "name",
         "model",
         "variant",
@@ -1144,6 +1257,10 @@ pub struct CompactionInfo {
     pub preserve_recent_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reserved: Option<u64>,
+    /// alforria extension: the context window, in tokens, assumed for a model
+    /// that declares none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_context: Option<PositiveInt>,
 }
 
 /// `core/policy.ts` `Effect`.
@@ -1218,6 +1335,8 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflows: Option<WorkflowsInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage: Option<StorageInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub references: Option<ReferenceInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reference: Option<ReferenceInfo>,
@@ -1277,6 +1396,29 @@ pub struct Config {
     pub compaction: Option<CompactionInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub experimental: Option<ExperimentalInfo>,
+    // --- alforria extensions (`config::host`), read from the host config ---
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell_env: Option<super::host::ShellEnvInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question: Option<super::host::QuestionInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook: Option<super::host::HookInfo>,
+
+    // -- alforria extensions (`config/extension.rs`) ------------------------
+    /// Scheduled and event-started turns, by id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<BTreeMap<String, crate::trigger::TriggerSpec>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub triggers: Option<crate::config::extension::TriggersInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<crate::config::extension::MemoryInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<crate::config::extension::PromptInfo>,
+    /// Tool description overrides, by tool name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<BTreeMap<String, crate::config::extension::ToolInfo>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub websearch: Option<crate::config::extension::WebsearchInfo>,
 }
 
 /// Decode + validate a raw config value against the full wire schema.
@@ -1347,6 +1489,7 @@ fn collect_issues(value: &serde_json::Value) -> Vec<crate::SchemaIssue> {
             "command" => check!(issues, key, BTreeMap<String, CommandInfo>),
             "skills" => check!(issues, key, SkillsInfo),
             "workflows" => check!(issues, key, WorkflowsInfo),
+            "storage" => check!(issues, key, StorageInfo),
             "references" => check!(issues, key, ReferenceInfo),
             "reference" => check!(issues, key, ReferenceInfo),
             "watcher" => check!(issues, key, WatcherInfo),
@@ -1377,6 +1520,15 @@ fn collect_issues(value: &serde_json::Value) -> Vec<crate::SchemaIssue> {
             "tool_output" => check!(issues, key, ToolOutputInfo),
             "compaction" => check!(issues, key, CompactionInfo),
             "experimental" => check!(issues, key, ExperimentalInfo),
+            "shell_env" => check!(issues, key, super::host::ShellEnvInfo),
+            "question" => check!(issues, key, super::host::QuestionInfo),
+            "hook" => check!(issues, key, super::host::HookInfo),
+            "trigger" => check!(issues, key, BTreeMap<String, crate::trigger::TriggerSpec>),
+            "triggers" => check!(issues, key, crate::config::extension::TriggersInfo),
+            "memory" => check!(issues, key, crate::config::extension::MemoryInfo),
+            "prompt" => check!(issues, key, crate::config::extension::PromptInfo),
+            "tool" => check!(issues, key, BTreeMap<String, crate::config::extension::ToolInfo>),
+            "websearch" => check!(issues, key, crate::config::extension::WebsearchInfo),
             _ => {}
         }
     }

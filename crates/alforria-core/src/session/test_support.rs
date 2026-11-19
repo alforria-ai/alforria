@@ -112,6 +112,7 @@ pub(crate) fn test_model() -> ResolvedModel {
             context_limit: 200_000.0,
             output_limit: 100.0,
             output_token_max: None,
+            family: None,
         },
         cost: ModelCost {
             input: 0.0,
@@ -129,6 +130,7 @@ pub(crate) fn test_model() -> ResolvedModel {
             output: 100.0,
         },
         output_token_max: None,
+        media: Default::default(),
     }
 }
 
@@ -187,6 +189,8 @@ pub(crate) fn harness_with_config(name: &str, script: MockScript, config: Value)
         data_dir: temp.path().to_path_buf(),
         tmp_dir: temp.path().to_path_buf(),
         home: temp.path().to_path_buf(),
+        host_config: None,
+        protected: None,
     };
     let services = SessionServices::new(
         Arc::new(crate::storage::Storage::open(temp.path().join("db.sqlite")).unwrap()),
@@ -597,6 +601,8 @@ pub(crate) struct Engine {
 pub(crate) enum EngineDefs {
     /// The real M4 `read` tool.
     Real,
+    /// The real `read`, and the real `grep` and `glob` beside it.
+    Search,
     /// A `read` tool whose execution never resolves — the abort tests'
     /// cancellation seam.
     HangingRead,
@@ -609,6 +615,7 @@ fn hanging_def(id: &'static str) -> crate::tool::def::ToolDef {
         description: "hanging".into(),
         parameters: serde_json::json!({ "type": "object" }),
         format_validation_error: None,
+        external: false,
         execute: Arc::new(|_args, _ctx| {
             Box::pin(async {
                 std::future::pending::<()>().await;
@@ -631,6 +638,17 @@ pub(crate) fn engine_with_flags(
     engine_build(name, script, config, session_permission, EngineDefs::Real)
 }
 
+/// An engine whose registry also holds the real `grep` and `glob`.
+pub(crate) fn engine_with_search(name: &str, script: MockScript) -> Engine {
+    engine_build(
+        name,
+        script,
+        serde_json::json!({}),
+        None,
+        EngineDefs::Search,
+    )
+}
+
 /// An engine whose compaction summary turn runs its own script (the
 /// compaction `DispatchLlm` script is otherwise a copy of the main one).
 pub(crate) fn engine_with_compaction_script(
@@ -645,7 +663,92 @@ pub(crate) fn engine_with_compaction_script(
         serde_json::json!({}),
         None,
         EngineDefs::Real,
+        EngineOverrides::default(),
     )
+}
+
+/// What an engine swaps out of the default harness.
+#[derive(Default)]
+pub(crate) struct EngineOverrides {
+    /// The model every lookup resolves to.
+    pub(crate) model: Option<ResolvedModel>,
+    /// One provider for both the turns and the compaction summaries, in
+    /// place of the scripted ones.
+    pub(crate) llm: Option<Arc<dyn LlmStream>>,
+    /// The connected MCP servers' tools.
+    pub(crate) mcp_tools: Option<Arc<dyn crate::session::tools::McpToolSource>>,
+}
+
+/// A scripted engine with the tools of `mcp` beside its own.
+pub(crate) fn engine_with_mcp_tools(
+    name: &str,
+    script: MockScript,
+    mcp: Arc<dyn crate::session::tools::McpToolSource>,
+) -> Engine {
+    engine_build_with(
+        name,
+        script.clone(),
+        script,
+        serde_json::json!({}),
+        None,
+        EngineDefs::Real,
+        EngineOverrides {
+            mcp_tools: Some(mcp),
+            ..Default::default()
+        },
+    )
+}
+
+/// An engine talking to `llm` as `model`.
+pub(crate) fn engine_with_provider(
+    name: &str,
+    llm: Arc<dyn LlmStream>,
+    model: ResolvedModel,
+    config: Value,
+) -> Engine {
+    engine_build_with(
+        name,
+        Vec::new(),
+        Vec::new(),
+        config,
+        None,
+        EngineDefs::Real,
+        EngineOverrides {
+            model: Some(model),
+            llm: Some(llm),
+            mcp_tools: None,
+        },
+    )
+}
+
+/// A scripted engine whose every model lookup resolves to `model`.
+pub(crate) fn engine_with_model(name: &str, script: MockScript, model: ResolvedModel) -> Engine {
+    engine_build_with(
+        name,
+        script.clone(),
+        script,
+        serde_json::json!({}),
+        None,
+        EngineDefs::Real,
+        EngineOverrides {
+            model: Some(model),
+            llm: None,
+            mcp_tools: None,
+        },
+    )
+}
+
+/// [`test_model`] with a context window of `context` tokens.
+pub(crate) fn test_model_with_context(context: f64, output: f64) -> ResolvedModel {
+    let mut model = test_model();
+    model.llm.context_limit = context;
+    model.llm.output_limit = output;
+    model.limits = ModelLimits {
+        context,
+        input: None,
+        output,
+    };
+    model
 }
 
 /// An engine whose `read` tool never resolves — the mid-flight
@@ -674,6 +777,7 @@ fn engine_build(
         config,
         session_permission,
         defs,
+        EngineOverrides::default(),
     )
 }
 
@@ -684,6 +788,7 @@ fn engine_build_with(
     config: Value,
     session_permission: Option<Value>,
     defs: EngineDefs,
+    overrides: EngineOverrides,
 ) -> Engine {
     let temp = crate::storage::test_support::TempDir::new(name);
     let worktree = temp.path().join("repo");
@@ -698,6 +803,8 @@ fn engine_build_with(
         data_dir: temp.path().to_path_buf(),
         tmp_dir: temp.path().to_path_buf(),
         home: temp.path().to_path_buf(),
+        host_config: None,
+        protected: None,
     };
     let services = SessionServices::new(
         Arc::new(crate::storage::Storage::open(temp.path().join("db.sqlite")).unwrap()),
@@ -721,6 +828,7 @@ fn engine_build_with(
     let instance = crate::tool::def::InstanceContext {
         directory: worktree.clone(),
         worktree: worktree.clone(),
+        write_guard: None,
     };
     let context = crate::session::store::SessionContext {
         project_id: "global".to_string(),
@@ -729,7 +837,7 @@ fn engine_build_with(
         workspace_id: None,
     };
     let models: Arc<dyn crate::session::r#loop::ModelSource> = Arc::new(StaticModels {
-        model: test_model(),
+        model: overrides.model.clone().unwrap_or_else(test_model),
     });
     let input_models: Arc<dyn crate::session::prompt_input::Models> = Arc::new(FixedInputModels);
     let snapshot = InMemorySnapshot::new(worktree.clone());
@@ -756,14 +864,27 @@ fn engine_build_with(
         None,
     );
     let read = match defs {
-        EngineDefs::Real => crate::tool::read::read_tool(truncate.clone(), agents.clone(), None),
+        EngineDefs::Real | EngineDefs::Search => {
+            crate::tool::read::read_tool(truncate.clone(), agents.clone(), None)
+        }
         EngineDefs::HangingRead => hanging_def("read"),
+    };
+    let search = match defs {
+        EngineDefs::Search => {
+            let ripgrep: Arc<dyn crate::tool::ripgrep::Ripgrep> =
+                Arc::new(crate::tool::ripgrep::RipgrepService);
+            vec![
+                crate::tool::grep::grep_tool(truncate.clone(), agents.clone(), ripgrep.clone()),
+                crate::tool::glob::glob_tool(truncate.clone(), agents.clone(), ripgrep),
+            ]
+        }
+        EngineDefs::Real | EngineDefs::HangingRead => Vec::new(),
     };
     let subagents =
         crate::tool::subagents::subagents_tool(truncate.clone(), agents.clone(), ops.clone());
     let write = crate::tool::write::write_tool(truncate.clone(), agents, None, None, None);
     let registry = crate::tool::registry::ToolRegistry::new(
-        vec![task, subagents, read, write],
+        [vec![task, subagents, read, write], search].concat(),
         Vec::new(),
         crate::tool::registry::RuntimeFlags::default(),
         Arc::new(RegistryStubAgents),
@@ -800,6 +921,8 @@ fn engine_build_with(
             summary: summary.clone(),
             state: services.run_state.clone(),
             data_dir: temp.path().to_path_buf(),
+            protected: services.agents.protected(),
+            worktree: worktree.clone(),
         },
     ));
     let compaction: Arc<dyn crate::session::r#loop::Compaction> =
@@ -811,7 +934,10 @@ fn engine_build_with(
                 status: services.status.clone(),
                 agents: services.agents.clone(),
                 snapshot: snapshot.clone(),
-                llm: DispatchLlm::new(compaction_script),
+                llm: match &overrides.llm {
+                    Some(llm) => llm.clone(),
+                    None => DispatchLlm::new(compaction_script),
+                },
                 permission: services.permission.clone(),
                 summary: summary.clone(),
                 models: models.clone(),
@@ -845,7 +971,10 @@ fn engine_build_with(
         services: services.clone(),
         models: models.clone(),
         input_models,
-        llm: llm.clone(),
+        llm: match &overrides.llm {
+            Some(provider) => provider.clone(),
+            None => llm.clone(),
+        },
         snapshot: snapshot.clone(),
         compaction,
         subtasks,
@@ -859,7 +988,7 @@ fn engine_build_with(
         clock,
         instance: instance.clone(),
         mcp: Arc::new(EmptyMcp),
-        mcp_tools: None,
+        mcp_tools: overrides.mcp_tools.clone(),
         truncate: std::sync::Arc::new(crate::tool::truncate::TruncateService::default_limits(
             temp.path().to_path_buf(),
         )),

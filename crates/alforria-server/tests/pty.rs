@@ -39,6 +39,8 @@ fn test_services(directory: &std::path::Path) -> Arc<alforria_core::SessionServi
         data_dir: directory.to_path_buf(),
         tmp_dir: directory.to_path_buf(),
         home: directory.to_path_buf(),
+        host_config: None,
+        protected: None,
     };
     Arc::new(alforria_core::SessionServices::new(
         storage,
@@ -608,6 +610,16 @@ async fn ws_close_1000_when_the_session_is_removed() {
         ),
     )
     .await;
+    // The handshake completes before the server attaches the socket to
+    // the terminal (the attach runs in the upgraded task). A removal that
+    // wins that race finds no attachment to end, and the attach that
+    // follows answers 4404 "session not found" — correct, and not what
+    // this test is about. Any frame from the server (the replay, the meta
+    // frame) is sent after the attachment is active: wait for one.
+    let first = tokio::time::timeout(Duration::from_secs(10), stream.next())
+        .await
+        .expect("a frame once attached");
+    assert!(matches!(first, Some(Ok(_))), "{first:?}");
 
     // Removing the session tears down the attachment with close 1000.
     let removed = fx

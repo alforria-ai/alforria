@@ -89,6 +89,10 @@ fn run(
             None => instance.directory.clone(),
         };
 
+        // alforria extension: a guarded session does not search the host's
+        // own locations, and is not asked whether it may.
+        // What is stat'ed and walked from here on is the judged path.
+        let requested = instance.about_to_read(&requested)?;
         let requested_info = tokio::fs::metadata(&requested).await.ok();
         assert_external_directory(
             &ctx,
@@ -110,6 +114,15 @@ fn run(
             _ => ts_dirname(&search),
         };
 
+        // alforria extension: what is walked, and then the files a line
+        // of which is returned, for the session's provenance mark
+        // (`tool::outside`). Both from `cwd`, the variable the walker
+        // gets — not `base` below, which follows the path as requested
+        // and differs when that is, or goes through, a link. The walked
+        // directory is reported before the walk, so a search that fails
+        // is judged by it; a result cut at the limit lists no files.
+        let reported = &ctx.extra.returned_paths;
+        reported.report(&cwd, std::iter::empty::<&str>(), false);
         let cancel = ctx.abort.child_token();
         let _cancel_on_drop = cancel.clone().drop_guard();
         let permit = tokio::select! {
@@ -120,15 +133,21 @@ fn run(
         let pattern = params.pattern.clone();
         let include = params.include.clone();
         let search_cancel = cancel.clone();
+        let walked = cwd.clone();
         let task = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            ripgrep.grep_with_cancel(&cwd, &pattern, include.as_deref(), LIMIT, &search_cancel)
+            ripgrep.grep_with_cancel(&walked, &pattern, include.as_deref(), LIMIT, &search_cancel)
         });
         let result = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(ToolError::Aborted),
             result = task => result.map_err(|error| ToolError::Failed(error.to_string()))?.map_err(ToolError::Failed)?,
         };
+        reported.report(
+            &cwd,
+            result.iter().map(|item| item.path.as_str()),
+            result.len() < LIMIT,
+        );
         if result.is_empty() {
             return empty_result(&params.pattern);
         }
@@ -140,7 +159,11 @@ fn run(
         let rows: Vec<(PathBuf, u64, String)> = result
             .iter()
             .map(|item| (ts_resolve(&base, &item.path), item.line, item.text.clone()))
+            // A walk from above a host location reaches into it.
+            .filter(|(path, _, _)| instance.may_return(path))
             .collect();
+        // And the walk was of the place that was judged.
+        instance.still_judged(&requested)?;
         if rows.is_empty() {
             return empty_result(&params.pattern);
         }

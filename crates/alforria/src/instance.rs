@@ -77,10 +77,15 @@ pub fn boot(directory: Option<&Path>) -> Result<Instance, TypedError> {
             raw: err.to_string(),
         })?,
     };
-    let paths = alforria_core::GlobalPaths::from_env();
-    let (config, config_dirs) = ConfigLoader::new()
-        .load(&LoadParams::new(directory.clone()).paths(paths.clone()))
-        .map_err(core_error)?;
+    // The one-shot commands' entry point (`run`, `debug`, `mcp`, …): the
+    // process's own directories, handed to the instance built below.
+    boot_in(directory, alforria_core::GlobalPaths::from_env())
+}
+
+/// [`boot`] with the global directories given.
+fn boot_in(directory: PathBuf, paths: alforria_core::GlobalPaths) -> Result<Instance, TypedError> {
+    let params = LoadParams::new(directory.clone(), paths.clone());
+    let (config, config_dirs) = ConfigLoader::new().load(&params).map_err(core_error)?;
 
     let storage = Arc::new(Storage::open_default(&paths.data).map_err(core_error)?);
     // Project resolution — the instance worktree is the git worktree root
@@ -103,6 +108,19 @@ pub fn boot(directory: Option<&Path>) -> Result<Instance, TypedError> {
         data_dir: paths.data.clone(),
         tmp_dir: std::env::temp_dir().join("alforria"),
         home: paths.home.clone(),
+        // The host's own config caps every agent's rules, as in a server.
+        host_config: Some(
+            ConfigLoader::new()
+                .load_trusted(&LoadParams::new(directory.clone(), paths.clone()))
+                .map_err(core_error)?,
+        ),
+        // What a restricted or outside-input session's tools may not
+        // write, built by the constructor the server's instances use: a
+        // guarded session continued with `alforria run --session` is held
+        // to the same set, resolved the same way, as on the server.
+        protected: Some(Arc::new(alforria_core::protect::Protected::for_loaded(
+            &params, &config, &worktree,
+        ))),
     };
     let background = BackgroundJobService::new(Arc::new(alforria_core::catalog::SystemClock));
     let services = Arc::new(SessionServices::new(
@@ -127,4 +145,58 @@ pub fn boot(directory: Option<&Path>) -> Result<Instance, TypedError> {
         location,
         services,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A guarded session run through the one-shot instance (`alforria run
+    /// --session` on a restricted or outside-started session) is held to
+    /// the resolver-based set the server's instances get: a host location
+    /// that carries no loader name — the global config directory — reached
+    /// through a symlink in the project is refused. The one-shot instance
+    /// used to have no set of its own, which left the name check alone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_one_shot_instance_guards_loader_locations_through_a_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let (home, project) = (root.join("home"), root.join("project"));
+        std::fs::create_dir_all(&project).unwrap();
+        let paths = alforria_core::GlobalPaths::resolve_with(home.clone(), |_| None);
+        std::fs::create_dir_all(paths.config.join("agent")).unwrap();
+        std::os::unix::fs::symlink(&paths.config, project.join("notes")).unwrap();
+        std::os::unix::fs::symlink(&paths.data, project.join("cache-link")).unwrap();
+
+        let instance = boot_in(project.clone(), paths.clone()).unwrap();
+        // The guard as the session loop builds it for a guarded session.
+        let guarded = alforria_core::tool::def::InstanceContext {
+            directory: instance.directory.clone(),
+            worktree: instance.worktree.clone(),
+            write_guard: Some(Arc::new(alforria_core::protect::WriteGuard {
+                protected: instance.services.agents.protected(),
+                policy: Default::default(),
+                worktree: instance.worktree.clone(),
+            })),
+        };
+        for target in ["notes/agent/helper.md", "cache-link/auth.json"] {
+            let refused = guarded
+                .write_file(&project.join(target), b"mine")
+                .await
+                .expect_err(target);
+            assert!(
+                matches!(refused, alforria_core::tool::def::ModifyError::Refused(_)),
+                "{target}: {refused:?}"
+            );
+        }
+        assert!(!paths.config.join("agent/helper.md").exists());
+        assert!(!paths.data.join("auth.json").exists());
+        // An ordinary file of the project is written.
+        guarded
+            .write_file(&project.join("src/main.rs"), b"fn main() {}")
+            .await
+            .unwrap();
+        assert!(project.join("src/main.rs").is_file());
+    }
 }

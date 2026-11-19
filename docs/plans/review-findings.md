@@ -804,3 +804,185 @@ Deliberate deviations from the pinned TS server:
   (open decision 1), at any depth; TS `mergeDeep` writes the `null`, so a
   setting could never be cleared. The rest of the payload is still
   validated. The web client's "Server default" model sends `null`.
+
+## Long sessions and restarts (deliberate deviations)
+
+Upstream assumes a session lasts an afternoon and a process is stopped
+politely. These hold for sessions that live for months on a machine that is
+stopped by being killed.
+
+- **A request is sized before it is sent.** TS compacts when the last
+  response's recorded tokens reach the budget (`isOverflow`), which says
+  nothing about a history no provider has counted (imported, or never
+  compacted). Here the request about to go out is estimated: recorded tokens
+  where the newest response has them, three bytes a token for what nothing
+  has counted (`overflow.rs`). `isOverflow` itself is unchanged. A model
+  with `limit.context: 0` is still "unknown" to it, but is sized against
+  `compaction.default_context` (128,000).
+- **Compaction summarises in pieces.** TS puts the whole history in one
+  summary request. Here a history that does not fit one request is folded:
+  each piece is summarised together with the summary so far, and only the
+  last request goes through the processor and is stored. A history that
+  fits is one request, byte for byte as before. A summary request refused
+  as too large is retried at half the size, down to a sixteenth.
+- **A turn reads back to the last compaction and no further**, and holds at
+  most 8 MiB of history (`HISTORY_WINDOW_BYTES`); beyond that the session
+  is compacted from the database a page at a time. With
+  `compaction.auto: false` the whole history is read, as in TS.
+- **Three compactions in a row without a model response end the turn** with
+  a `ContextOverflowError`. TS would compact again.
+- **A turn's HTTP requests are not retried below the retry policy.** The
+  native executor's two retries under each of the policy's attempts tripled
+  them. `StreamInput.retries` (unset for a turn, two for a title) is now
+  what the transport does. Not checked against the pinned `llm.ts`, which
+  is not in `fixtures/`.
+- **An image is not sent to a model without image input**; the request
+  carries a line saying one was there. A model takes images when it lists
+  the `image` input modality or sets `attachment: true`; a custom model
+  declaring neither is treated as text-only.
+- **The event log can be pruned** (`storage.retention.events`), off by
+  default. `GET /api/session/{id}/event` then starts with an `event.reset`
+  frame when the events after `after` are gone; without retention the
+  stream is as upstream's. Event ids are ULIDs, so an event's age is read
+  from its id and no schema change was needed.
+- **`GET /session/{id}/message` without `limit` is streamed** for 100
+  messages or more (chunked, uncompressed). The body is the same bytes;
+  upstream returns the whole history here, so no default limit was imposed.
+- **A restart repairs interrupted turns** (`session/recovery.rs`) and,
+  with `server.resume`, notes or resumes them. Running turns are recorded
+  in `<data>/running/`, files like `/goal`'s, not a table.
+- **`synchronous` stays `NORMAL`** (upstream's, `database.ts:27-32`) unless
+  `storage.synchronous: "full"`. In WAL mode `NORMAL` cannot corrupt the
+  database on a crash or power cut; it can lose the commits not yet synced.
+
+## Integration of the unattended server, session durability and assistant branches
+
+The three branches were built in parallel. What follows is what only shows
+once they are together, and how it was settled. Reference:
+`docs/unattended-server.md` and `docs/assistant.md`.
+
+- **One migration set.** Two branches each journaled their own tables in
+  `alforria_migration`. There is one list now
+  (`storage/alforria_migration.rs`); the five shipped ids are kept as
+  written so a database that ran either half is completed, not redone.
+- **One config trust table.** Host-only loading and `EXTENSION_KEYS` decided
+  the same question twice. `EXTENSION_KEYS` classifies every alforria key as
+  host, user or project, and the loader applies it to each source.
+  `server.resume` and `storage` were read from a load that walked up from
+  the config directory and could pick up project-style files; they are host
+  keys.
+- **Every engine-started turn has a caller.** A trigger run is
+  `Caller::Restricted` when a restricted caller created the trigger and
+  `Caller::Session` otherwise; a restart follow-up is `Caller::Session`.
+  The stricter of who scheduled the work and the session it lands in
+  applies, and the engine refuses at the point every turn passes through.
+- **A trigger's prompt was resolved with the operator's rights whoever wrote
+  it.** `@file` attached a file and `@agent` named a subagent with no
+  permission asked, for a prompt a model had written with the `schedule`
+  tool. Mentions are resolved only in a prompt the operator wrote.
+- **A trigger could name any session by id.** It must be the instance's own:
+  same project and same directory (every non-git directory shares the
+  `global` project, so the project alone was not a boundary).
+- **Standing approvals overrode the untrusted-run ceiling.** The permission
+  service evaluates the session's rules and then the project's `always`
+  approvals, last match wins, so an approval given in an ordinary session
+  handed an outside-text run what its ceiling withheld; and
+  `permission.unattended: allow` would have answered an ask raised there.
+  For a session carrying outside text approvals are ignored and an ask is a
+  deny at once. The lookup behind it fails closed.
+- **A fork dropped the rules that held outside text.** The mark was copied
+  with the metadata, the rules were not. A fork of a marked session keeps
+  them.
+- **A chat client's memory reached the operator's system prompt.** A record
+  written from a restricted session was verified and injected everywhere.
+  Records carry whether their writer was restricted and are injected into
+  restricted sessions only; `/memory` below `admin` writes `client` records
+  that never vouch for one.
+- **The new routes were admin-only or unconfined.** Scope rows were added for
+  `/trigger*`, `/memory*` and the durable event replay, with the handlers
+  holding a caller below `admin` to the tools' rules; the webhook entry has
+  a scope of its own, `hook`.
+- **A stopped trigger turn was recorded as completed** with the half answer
+  it had streamed. A cancelled turn is a failed run.
+- **`git` inherited the server's environment.** A repository's filters,
+  textconv and hooks are the agent's to write; git subprocesses get the
+  scrubbed environment.
+- **Tests could reach the developer's files.** `GlobalPaths::resolve` reads
+  `XDG_*`, so with `XDG_DATA_HOME` set several suites opened the real
+  database and `auth.json`; spawned binaries inherited the whole
+  environment. Tests resolve paths without the runner's variables and spawn
+  with a cleared environment.
+
+Known and left:
+
+- Restriction is a kind, not an identity: any `chat` token acts on any
+  restricted session or trigger in an allowed directory. Tokens of two
+  people on one server share them.
+- Memory is per project, and non-git directories share the `global` project.
+- Read-only config loads in a few v1/v2 routes (`/command`, `/skill`) still
+  resolve the global directories from the environment rather than from the
+  context they were built over.
+
+## 2026-11-19: security review of the unattended server — what stays as it is
+
+The fixes of this round are in the changelog. Recorded here: what the
+reviewers reproduced that is true **by design**, and the product decisions
+left open. The user-facing statement is "Known limits" in
+`docs/unattended-server.md`.
+
+True by design on a server **without bearer auth** (and without
+`server.trust.project: "restricted"`):
+
+- **A project's config substitutes the server's environment and outside
+  files.** `{env:NAME}` and `{file:/abs/path}` in a project `opencode.json`
+  are substituted as upstream does, for any name and any readable file — on
+  a server bound beyond loopback, with `permission.unattended`, a webhook,
+  Basic auth behind a proxy, or `alforria run` under a supervisor alike.
+  Project trust follows bearer auth / `server.trust.project` only. The
+  server now warns at startup when its shell posture is restricted and
+  project config is not; it cannot see the other cases.
+- **The standalone shell passes general-purpose credentials.**
+  `GITHUB_TOKEN`, `GH_TOKEN`, `AWS_*`, `HF_TOKEN`-style names reach the
+  agent's processes on a standalone server: they are the user's own tools'
+  credentials first. Only alforria's secrets and model-provider key
+  variables are withheld there.
+
+Open product decisions:
+
+- Whether a non-loopback bind **alone** should restrict the shell posture
+  (it does today) and whether it should also restrict project config (it
+  does not).
+- Whether `*_API_KEY` / `*_API_TOKEN` names are withheld from the agent's
+  processes for everyone, standalone included.
+- The general-purpose exemption list (`GITHUB_TOKEN`, `GH_TOKEN`, `AWS_*`
+  passed on a standalone server although the model catalog lists them):
+  which names belong on it.
+- Stored operator triggers loading as restricted after an upgrade.
+- Migration `0008_session_mark_backfill` over-marking.
+- The per-directory scheduler lock.
+- `memory.scope: "global"` spans directories, for tokens confined to one
+  directory by `server.directories` too.
+- Windows: guarded writes use the weaker by-name fallback
+  (`beneath::NoFollowDir`'s non-Unix half), and that configuration is not
+  compiled or tested as a whole in CI.
+
+New in this round and left (found while fixing, not fixed):
+
+- `alforria run` and the other one-shot commands still degrade an
+  unparseable global config to an empty one (upstream's behaviour); only
+  server processes keep or require a good host config.
+- No entry point passes `OPENCODE_CONFIG`, `OPENCODE_CONFIG_DIR`,
+  `OPENCODE_CONFIG_CONTENT`, `OPENCODE_PERMISSION` (or, for the config
+  load, `OPENCODE_DISABLE_PROJECT_CONFIG` / `_AUTOCOMPACT` / `_PRUNE`) to
+  the config loader: upstream honours them, alforria ignores them. Whether
+  to wire them is open; the loader already holds them under a frozen
+  snapshot if they are.
+- A guarded directory listing and `grep` / `glob` walk by name, checked
+  before and after: a link swapped in and back during the walk is not
+  detected (accepted; "Known limits").
+- A frozen server's `PATCH /global/config` applies the request to the
+  remembered config without `{env:}` / `{file:}` substitution until the
+  next start.
+- A guarded session reads no global skill's auxiliary files from the
+  global config directory unless an `external_directory` rule names the
+  directory.

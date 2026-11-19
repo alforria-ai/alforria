@@ -58,6 +58,24 @@ impl MockServer {
     }
 }
 
+/// What a spawned binary inherits from the test runner: where programs
+/// are, and what the platform needs to start one. No credential, no
+/// directory of the developer's.
+const PASSED_THROUGH: &[&str] = &[
+    "PATH",
+    "TMPDIR",
+    // The extra sandbox root of the isolation job (`paths::sandbox`).
+    "ALFORRIA_TEST_SANDBOX",
+    // Windows: process creation and the shell need these.
+    "SystemRoot",
+    "SYSTEMROOT",
+    "SystemDrive",
+    "TEMP",
+    "TMP",
+    "PATHEXT",
+    "COMSPEC",
+];
+
 /// One e2e environment, isolated HOME + XDG dirs and a project directory
 /// whose `opencode.json` wires the mock provider at the given LLM URL.
 pub struct Env {
@@ -146,10 +164,32 @@ impl Env {
         .expect("write opencode.json");
     }
 
+    /// The binary, with nothing of the developer's environment but `PATH`:
+    /// a temporary home and XDG directories, the model fixture, and no
+    /// inherited provider key, token or real directory. A spawned test
+    /// process must never read or write the owner's own files.
     pub fn command(&self, args: &[&str]) -> Command {
+        // Refuse to spawn over anything but a sandbox: the binary resolves
+        // its directories from the environment set below.
+        alforria_core::paths::sandbox::require(
+            &alforria_core::GlobalPaths::resolve_with(self.home.clone(), |_| None),
+            "e2e harness",
+        );
         let mut command = Command::new(env!("CARGO_BIN_EXE_alforria"));
+        command.env_clear();
+        // The spawned binary checks for itself too: it is a test run.
+        command.env(alforria_core::paths::sandbox::GUARD_ENV, "1");
+        for name in PASSED_THROUGH {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
         command
             .args(args)
+            // Anything that falls back to the OS home (a login shell, git,
+            // `~` expansion) lands in the temporary one.
+            .env("HOME", &self.home)
+            .env("USERPROFILE", &self.home)
             .env("OPENCODE_TEST_HOME", &self.home)
             .env("PWD", self.project_dir())
             .env("XDG_CONFIG_HOME", self.home.join(".config"))
@@ -229,11 +269,18 @@ impl Serve {
     // through the struct handle.
     #[allow(clippy::zombie_processes)]
     pub fn spawn(env: &Env) -> Serve {
+        Serve::spawn_with(env, |_| {})
+    }
+
+    /// `spawn`, with a last word on the command (extra environment).
+    #[allow(dead_code, clippy::zombie_processes)]
+    pub fn spawn_with(env: &Env, configure: impl FnOnce(&mut Command)) -> Serve {
         // An empty password is the explicit opt-out of the generated one:
         // the harness clients (and the TS parity side) talk without auth.
-        let mut child = env
-            .command(&["serve", "--port", "0"])
-            .env("OPENCODE_SERVER_PASSWORD", "")
+        let mut command = env.command(&["serve", "--port", "0"]);
+        command.env("OPENCODE_SERVER_PASSWORD", "");
+        configure(&mut command);
+        let mut child = command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -282,6 +329,33 @@ impl Serve {
     }
 }
 
+#[allow(dead_code)]
+impl Serve {
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Send the server a signal (unix).
+    #[cfg(unix)]
+    pub fn signal(&self, signal: i32) {
+        unsafe { libc::kill(self.child.id() as libc::pid_t, signal) };
+    }
+
+    /// Wait for the server to exit on its own; `None` on timeout.
+    pub fn wait_exit(&mut self, timeout: Duration) -> Option<std::process::ExitStatus> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Ok(Some(status)) = self.child.try_wait() {
+                return Some(status);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
 impl Drop for Serve {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -322,17 +396,25 @@ pub fn wait(child: &mut Child, timeout: Duration) -> ProcOutput {
     }
 }
 
-fn pump<R: Read + Send + 'static>(mut pipe: R) -> std::sync::Arc<std::sync::Mutex<String>> {
-    let buffer = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-    let shared = buffer.clone();
+/// Read a child's pipe to its end on a thread of its own; the text is
+/// handed over when the pipe closes.
+fn pump<R: Read + Send + 'static>(mut pipe: R) -> std::sync::mpsc::Receiver<String> {
+    let (done, text_of) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut text = String::new();
         pipe.read_to_string(&mut text).ok();
-        *shared.lock().unwrap() = text;
+        let _ = done.send(text);
     });
-    buffer
+    text_of
 }
 
-fn read_pump(buffer: std::sync::Arc<std::sync::Mutex<String>>) -> String {
-    std::mem::take(&mut *buffer.lock().unwrap())
+/// Everything the child wrote. The child having exited does not mean its
+/// reader has finished: the reader is waited for (it used to be read at
+/// once, and a reader that had not got there yet gave an empty string — a
+/// command "printed nothing" under load). Bounded, for a pipe a grandchild
+/// still holds open.
+fn read_pump(text_of: std::sync::mpsc::Receiver<String>) -> String {
+    text_of
+        .recv_timeout(Duration::from_secs(30))
+        .unwrap_or_default()
 }

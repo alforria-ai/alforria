@@ -35,6 +35,7 @@ use crate::error::{ApiError, ServerError};
 use crate::middleware::auth::query_param;
 use crate::middleware::location::LocationContext;
 use crate::state::{ServerContext, SessionEngine};
+use alforria_core::session::prompt_input::PromptError;
 
 // ---------------------------------------------------------------------------
 // wire payloads (groups/session.ts)
@@ -286,6 +287,58 @@ struct ShellPayload {
 // helpers
 // ---------------------------------------------------------------------------
 
+/// A message (and optionally one of its parts) named beside a session must
+/// belong to that session (alforria extension). The path's session is what
+/// the request was authorised for; the message or part is what gets acted
+/// on. One that exists elsewhere is answered like one that does not exist,
+/// so the route says nothing about other sessions; one that exists nowhere
+/// is left to the handler, whose behaviour for it is upstream's.
+fn require_owned(
+    location: &LocationContext,
+    session_id: &str,
+    message_id: &str,
+    part_id: Option<&str>,
+) -> Result<(), ServerError> {
+    let not_found = || {
+        ServerError::Api(ApiError::MessageNotFound {
+            session_id: session_id.to_string(),
+            message_id: message_id.to_string(),
+            message: format!("Message not found: {message_id}"),
+        })
+    };
+    let sessions = &location.services.sessions;
+    if let Some(owner) = sessions
+        .message_session(message_id)
+        .map_err(session_error)?
+    {
+        if owner != session_id {
+            return Err(not_found());
+        }
+    }
+    if let Some(part_id) = part_id {
+        if let Some((part_session, part_message)) =
+            sessions.part_owner(part_id).map_err(session_error)?
+        {
+            if part_session != session_id || part_message != message_id {
+                return Err(not_found());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A prompt or command the engine refused: 403 when the caller may not do
+/// it (alforria extension, `alforria_core::session::caller`), else the
+/// empty 400 upstream answers with.
+fn prompt_refusal(error: PromptError) -> Result<Response, ServerError> {
+    match error {
+        PromptError::Forbidden { message } => {
+            Err(ServerError::Api(ApiError::Forbidden { message }))
+        }
+        _ => Ok(bad_request_empty()),
+    }
+}
+
 fn json_ok(value: impl serde::Serialize) -> Response {
     let body = serde_json::to_string(&value).expect("serialization cannot fail");
     Response::builder()
@@ -320,6 +373,8 @@ fn defect(err: impl std::fmt::Display) -> ServerError {
 fn session_error(err: SessionError) -> ServerError {
     match err {
         SessionError::NotFound(e) => ApiError::not_found(e.message).into(),
+        // alforria extension (a revert refused in a guarded session).
+        SessionError::Refused(message) => ApiError::Forbidden { message }.into(),
         other => defect(other),
     }
 }
@@ -636,14 +691,20 @@ pub async fn messages(
     require_session(&location, &session_id)?;
     match limit {
         None | Some(0) => {
-            let items = location
-                .services
-                .sessions
-                .messages(&session_id, None)
+            // Upstream returns the whole history here, so no limit is
+            // imposed; a long one is written out a page at a time instead
+            // of being built in memory first. Clients that can should pass
+            // `limit` and page with `before`.
+            let store = location.services.messages.clone();
+            let first = store
+                .page_after_with_diffs(&session_id, None, MESSAGE_STREAM_PAGE)
                 .map_err(session_error)?;
-            Ok(json_ok(
-                items.iter().map(with_parts_json).collect::<Vec<_>>(),
-            ))
+            if first.len() < MESSAGE_STREAM_PAGE {
+                return Ok(json_ok(
+                    first.iter().map(with_parts_json).collect::<Vec<_>>(),
+                ));
+            }
+            Ok(stream_messages(store, session_id, first))
         }
         Some(limit) => {
             let page = location
@@ -679,6 +740,76 @@ pub async fn messages(
     }
 }
 
+/// Messages per chunk of an unpaginated history response; a session with
+/// fewer is answered in one buffered body, as before.
+const MESSAGE_STREAM_PAGE: usize = 100;
+
+/// The whole history as one JSON array, read and written page by page.
+fn stream_messages(
+    store: session::MessageStore,
+    session_id: String,
+    first: Vec<session::WithParts>,
+) -> Response {
+    struct State {
+        store: session::MessageStore,
+        session_id: String,
+        page: Option<Vec<session::WithParts>>,
+        started: bool,
+        closed: bool,
+    }
+    let state = State {
+        store,
+        session_id,
+        page: Some(first),
+        started: false,
+        closed: false,
+    };
+    let stream = futures::stream::unfold(state, |mut state| async move {
+        if state.closed {
+            return None;
+        }
+        let Some(page) = state.page.take() else {
+            state.closed = true;
+            let end: &'static [u8] = if state.started { b"]" } else { b"[]" };
+            return Some((Ok::<Bytes, std::io::Error>(Bytes::from_static(end)), state));
+        };
+        let mut out = Vec::new();
+        for message in &page {
+            out.push(if state.started { b',' } else { b'[' });
+            state.started = true;
+            serde_json::to_writer(&mut out, &with_parts_json(message))
+                .expect("serialization cannot fail");
+        }
+        if page.len() == MESSAGE_STREAM_PAGE {
+            let last = page.last().expect("a full page");
+            let after = session::Cursor {
+                id: session::message::message_id(&last.info).to_string(),
+                time: session::message::message_time_created(&last.info),
+            };
+            match state.store.page_after_with_diffs(
+                &state.session_id,
+                Some(&after),
+                MESSAGE_STREAM_PAGE,
+            ) {
+                Ok(next) if !next.is_empty() => state.page = Some(next),
+                Ok(_) => {}
+                // The status line is long gone: cut the body short so the
+                // client sees a broken response, not a truncated history.
+                Err(error) => {
+                    state.closed = true;
+                    return Some((Err(std::io::Error::other(error.to_string())), state));
+                }
+            }
+        }
+        Some((Ok(Bytes::from(out)), state))
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from_stream(stream))
+        .expect("static response parts are valid")
+}
+
 /// `message` (`handlers/session.ts:147-153`).
 pub async fn message(
     axum::Extension(location): axum::Extension<LocationContext>,
@@ -698,6 +829,7 @@ pub async fn message(
 pub async fn create(
     State(state): State<Arc<ServerContext>>,
     axum::Extension(location): axum::Extension<LocationContext>,
+    principal: Option<axum::Extension<crate::bearer::Principal>>,
     body: Bytes,
 ) -> Result<Response, ServerError> {
     let payload: Option<CreatePayload> = if String::from_utf8_lossy(&body).trim().is_empty() {
@@ -716,12 +848,43 @@ pub async fn create(
             }
         }
     };
+    // alforria extension: below `admin`, a session cannot be created with
+    // its own permission rules, a workspace, or an agent a client could not
+    // pick. The session is then restricted for life (`CreateInput::
+    // restricted`), which is what binds every later turn in it.
+    if let (true, Some(payload)) = (crate::confine::restricted(&principal), &payload) {
+        crate::confine::check_no_ruleset(payload.permission.is_some())?;
+        crate::confine::check_agent(&location, payload.agent.as_deref())?;
+        if payload.workspace_id.is_some() {
+            return Err(ServerError::Api(ApiError::Forbidden {
+                message: "selecting a workspace needs the admin scope".to_string(),
+            }));
+        }
+        // The session a request names in its body is a session it acts
+        // on, like one named in the path (`confine::guard_session_writes`):
+        // a child is listed under its parent, can be resumed by the
+        // parent's model as a task, and reports into it.
+        if let Some(parent) = &payload.parent_id {
+            crate::confine::may_act_on(&state, parent).map_err(|_| {
+                ServerError::Api(ApiError::Forbidden {
+                    message: format!(
+                        "session {parent}: it belongs to the operator, and this token can \
+                         read or fork it but not create a session under it"
+                    ),
+                })
+            })?;
+        }
+    }
     let input = match payload.map(|p| decode_create_payload(&p)) {
         Some(Ok(input)) => Some(input),
         Some(Err(())) => return Ok(bad_request_empty()),
         None => None,
     }
     .unwrap_or_default();
+    let input = session::CreateInput {
+        restricted: crate::confine::restricted(&principal),
+        ..input
+    };
     let ctx = session_ctx(&location)?;
     let info = location
         .services
@@ -752,7 +915,11 @@ fn decode_create_payload(payload: &CreatePayload) -> Result<session::CreateInput
         title: payload.title.clone(),
         agent: payload.agent.clone(),
         model: payload.model.clone(),
-        metadata: payload.metadata.clone(),
+        // The server's own keys are not a client's to set.
+        metadata: payload.metadata.clone().map(|mut metadata| {
+            session::store::strip_reserved_metadata(&mut metadata);
+            metadata
+        }),
         permission: payload.permission.clone(),
         workspace_id: payload.workspace_id.clone(),
         ..Default::default()
@@ -775,10 +942,14 @@ pub async fn remove(
 /// `update` (`handlers/session.ts:183-204`).
 pub async fn update(
     axum::Extension(location): axum::Extension<LocationContext>,
+    principal: Option<axum::Extension<crate::bearer::Principal>>,
     Path(session_id): Path<String>,
     body: Bytes,
 ) -> Result<Response, ServerError> {
     let payload: UpdatePayload = parse_payload(&body)?;
+    if crate::confine::restricted(&principal) {
+        crate::confine::check_no_ruleset(payload.permission.is_some())?;
+    }
     let current = require_session(&location, &session_id)?;
     if let Some(title) = &payload.title {
         location
@@ -791,7 +962,7 @@ pub async fn update(
         location
             .services
             .sessions
-            .set_metadata(&session_id, metadata)
+            .set_client_metadata(&session_id, metadata)
             .map_err(session_error)?;
     }
     if let Some(permission) = &payload.permission {
@@ -823,6 +994,7 @@ pub async fn update(
 pub async fn fork(
     State(ctx): State<Arc<ServerContext>>,
     axum::Extension(location): axum::Extension<LocationContext>,
+    principal: Option<axum::Extension<crate::bearer::Principal>>,
     Path(session_id): Path<String>,
     body: Bytes,
 ) -> Result<Response, ServerError> {
@@ -847,7 +1019,12 @@ pub async fn fork(
     let info = location
         .services
         .sessions
-        .fork(&session, &session_id, payload.message_id.as_deref())
+        .fork_as(
+            &session,
+            &session_id,
+            payload.message_id.as_deref(),
+            crate::confine::restricted(&principal),
+        )
         .map_err(session_error)?;
     // Best effort: the fork exists either way.
     if let Ok(engine) = engine(&ctx, &location) {
@@ -875,6 +1052,7 @@ pub async fn abort(
 pub async fn init(
     State(ctx): State<Arc<ServerContext>>,
     axum::Extension(location): axum::Extension<LocationContext>,
+    principal: Option<axum::Extension<crate::bearer::Principal>>,
     Path(session_id): Path<String>,
     body: Bytes,
 ) -> Result<Response, ServerError> {
@@ -892,11 +1070,12 @@ pub async fn init(
             arguments: String::new(),
             command: "init".to_string(),
             parts: Vec::new(),
+            caller: crate::confine::caller(&principal),
         })
         .await
     {
         Ok(_) => Ok(json_ok(true)),
-        Err(_) => Ok(bad_request_empty()),
+        Err(error) => prompt_refusal(error),
     }
 }
 
@@ -945,16 +1124,15 @@ pub async fn summarize(
 
     let session = require_session(&location, &session_id)?;
     engine.cleanup(&session).map_err(session_error)?;
-    let messages = location
+    let default_agent = location.services.agents.default_info().map_err(defect)?;
+    // Newest first, stopping at the first user message.
+    let current_agent = location
         .services
         .sessions
-        .messages(&session_id, None)
-        .map_err(session_error)?;
-    let default_agent = location.services.agents.default_info().map_err(defect)?;
-    let current_agent = messages
-        .iter()
-        .rev()
-        .find(|message| matches!(message.info, V1Message::User { .. }))
+        .find_message(&session_id, &|message| {
+            matches!(message.info, V1Message::User { .. })
+        })
+        .map_err(session_error)?
         .and_then(|message| match &message.info {
             V1Message::User { agent, .. } => Some(agent.clone()),
             _ => None,
@@ -1009,6 +1187,7 @@ pub async fn summarize(
 pub async fn prompt(
     State(ctx): State<Arc<ServerContext>>,
     axum::Extension(location): axum::Extension<LocationContext>,
+    principal: Option<axum::Extension<crate::bearer::Principal>>,
     Path(session_id): Path<String>,
     body: Bytes,
 ) -> Result<Response, ServerError> {
@@ -1020,6 +1199,7 @@ pub async fn prompt(
     let engine = engine(&ctx, &location)?;
     let message = match engine
         .prompt(PromptInput {
+            caller: crate::confine::caller(&principal),
             session_id: session_id.clone(),
             message_id: payload.message_id,
             model: payload.model.map(|m| session::prompt_input::ModelRef {
@@ -1041,7 +1221,7 @@ pub async fn prompt(
         .await
     {
         Ok(message) => message,
-        Err(_) => return Ok(bad_request_empty()),
+        Err(error) => return prompt_refusal(error),
     };
     Ok(json_ok(with_parts_json(&message)))
 }
@@ -1051,6 +1231,7 @@ pub async fn prompt(
 pub async fn prompt_async(
     State(ctx): State<Arc<ServerContext>>,
     axum::Extension(location): axum::Extension<LocationContext>,
+    principal: Option<axum::Extension<crate::bearer::Principal>>,
     Path(session_id): Path<String>,
     body: Bytes,
 ) -> Result<Response, ServerError> {
@@ -1062,6 +1243,7 @@ pub async fn prompt_async(
     let engine = engine(&ctx, &location)?;
     let services = location.services.clone();
     let input = PromptInput {
+        caller: crate::confine::caller(&principal),
         session_id: session_id.clone(),
         message_id: payload.message_id,
         model: payload.model.map(|m| session::prompt_input::ModelRef {
@@ -1104,6 +1286,7 @@ pub async fn prompt_async(
 pub async fn command(
     State(ctx): State<Arc<ServerContext>>,
     axum::Extension(location): axum::Extension<LocationContext>,
+    principal: Option<axum::Extension<crate::bearer::Principal>>,
     Path(session_id): Path<String>,
     body: Bytes,
 ) -> Result<Response, ServerError> {
@@ -1131,11 +1314,12 @@ pub async fn command(
                     url: part.url,
                 })
                 .collect(),
+            caller: crate::confine::caller(&principal),
         })
         .await
     {
         Ok(message) => message,
-        Err(_) => return Ok(bad_request_empty()),
+        Err(error) => return prompt_refusal(error),
     };
     Ok(json_ok(with_parts_json(&message)))
 }
@@ -1182,6 +1366,12 @@ pub async fn revert(
     let payload: RevertPayload = parse_payload(&body)?;
     require_payload_id("msg", &payload.message_id)?;
     require_session(&location, &session_id)?;
+    require_owned(
+        &location,
+        &session_id,
+        &payload.message_id,
+        payload.part_id.as_deref(),
+    )?;
     let engine = engine(&ctx, &location)?;
     match engine
         .revert(RevertInput {
@@ -1214,13 +1404,27 @@ pub async fn unrevert(
 
 /// `permissionRespond` (`handlers/session.ts:362-378`) — deprecated.
 pub async fn permission_respond(
+    State(ctx): State<Arc<ServerContext>>,
     axum::Extension(location): axum::Extension<LocationContext>,
+    principal: Option<axum::Extension<crate::bearer::Principal>>,
     Path((session_id, permission_id)): Path<(String, String)>,
     body: Bytes,
 ) -> Result<Response, ServerError> {
     require_param("per", &permission_id)?;
     require_session(&location, &session_id)?;
     let payload: PermissionResponsePayload = parse_payload(&body)?;
+    if crate::confine::restricted(&principal) {
+        crate::confine::check_reply(&ctx, payload.response)?;
+    }
+    // The ask must be this session's: the path names a session, the reply
+    // acts on an ask, and they are only the same thing if checked.
+    crate::confine::authorise_answer(
+        &ctx,
+        &principal,
+        crate::confine::Ask::Permission,
+        &permission_id,
+        Some(&session_id),
+    )?;
     match location.services.permission.reply(PermissionV1ReplyInput {
         request_id: permission_id,
         reply: payload.response,
@@ -1245,6 +1449,7 @@ pub async fn delete_message(
 ) -> Result<Response, ServerError> {
     require_param("msg", &message_id)?;
     require_session(&location, &session_id)?;
+    require_owned(&location, &session_id, &message_id, None)?;
     if let Err(err) = location.services.run_state.assert_not_busy(&session_id) {
         return Err(busy_error(&err.session_id).into());
     }
@@ -1264,6 +1469,7 @@ pub async fn delete_part(
     require_param("msg", &message_id)?;
     require_param("prt", &part_id)?;
     require_session(&location, &session_id)?;
+    require_owned(&location, &session_id, &message_id, Some(&part_id))?;
     location
         .services
         .sessions
@@ -1282,6 +1488,7 @@ pub async fn update_part(
     require_param("msg", &message_id)?;
     require_param("prt", &part_id)?;
     require_session(&location, &session_id)?;
+    require_owned(&location, &session_id, &message_id, Some(&part_id))?;
     let part: V1Part = parse_payload(&body)?;
     let ids_match = match &part {
         V1Part::Text {

@@ -169,6 +169,11 @@ struct Inner {
     /// change.
     catalog: alforria_core::catalog::Providers,
     config: alforria_core::config::schema::Config,
+    /// The config as the host's own sources alone have it: with `config`,
+    /// what `provider::in_use` is read from.
+    host_config: alforria_core::config::schema::Config,
+    /// The strings the host wrote: see [`interpolate_env`].
+    host_strings: alforria_core::config::HostStrings,
     auth: Arc<dyn AuthStore>,
     /// The provider state and the auth generation it was built against.
     state: RwLock<(u64, Arc<ProviderState>)>,
@@ -202,16 +207,29 @@ impl RuntimeModels {
     pub fn new(
         catalog: alforria_core::catalog::Providers,
         config: &alforria_core::config::schema::Config,
+        // The config as the host's own sources alone have it
+        // (`ConfigLoader::load_trusted`): with the catalog, the only origin
+        // of a base URL that `${VAR}` is expanded in.
+        host_config: &alforria_core::config::schema::Config,
         auth: Arc<dyn AuthStore>,
         paths: &alforria_core::GlobalPaths,
     ) -> Result<RuntimeModels, ServerError> {
+        let host_strings = alforria_core::config::HostStrings::collect([
+            &serde_json::to_value(&host_config.provider).unwrap_or_default(),
+            &serde_json::to_value(&catalog).unwrap_or_default(),
+        ]);
         // Read the generation first: a change racing the build moves it
         // past the recorded one, and the next lookup rebuilds.
         let generation = auth.generation();
         let state = build_state(&catalog, config, auth.as_ref())?;
+        // The key variables of the providers in use stay out of the
+        // agent's processes.
+        crate::provider::learn_catalog_names(&catalog, &[config, host_config], auth.as_ref());
         Ok(RuntimeModels(Arc::new(Inner {
             catalog,
+            host_strings,
             config: config.clone(),
+            host_config: host_config.clone(),
             auth,
             state: RwLock::new((generation, Arc::new(state))),
             config_model: config.model.clone(),
@@ -241,6 +259,12 @@ impl RuntimeModels {
         if current.0 >= generation {
             return current.1.clone();
         }
+        // A sign-in can have put another provider in use.
+        crate::provider::learn_catalog_names(
+            &self.0.catalog,
+            &[&self.0.config, &self.0.host_config],
+            self.0.auth.as_ref(),
+        );
         match build_state(&self.0.catalog, &self.0.config, self.0.auth.as_ref()) {
             Ok(state) => *current = (generation, Arc::new(state)),
             Err(err) => {
@@ -294,7 +318,11 @@ impl RuntimeModels {
     /// `getLanguage` (provider.ts:1898-1929) — the merged
     /// `provider.options` ← `model.options` record with the `apiKey` and
     /// `baseURL` legs the SDK factory consumes.
-    fn llm_options(provider: &Value, model: &Value) -> BTreeMap<String, Value> {
+    fn llm_options(
+        provider: &Value,
+        model: &Value,
+        origins: &alforria_core::config::HostStrings,
+    ) -> BTreeMap<String, Value> {
         let mut options = BTreeMap::new();
         for source in [provider, model] {
             if let Some(map) = source["options"].as_object() {
@@ -333,7 +361,7 @@ impl RuntimeModels {
             });
         match url {
             Some(base) => {
-                let base = interpolate_env(&base);
+                let base = interpolate_env(&base, origins);
                 options.insert("baseURL".to_string(), json!(base));
             }
             None => {
@@ -344,6 +372,10 @@ impl RuntimeModels {
     }
 
     fn resolve(&self, provider_id: &str, model_id: &str) -> Result<ResolvedModel, String> {
+        // A session selecting a provider's model puts the provider in
+        // use: its key variables stay out of the shells started from here
+        // on, whether or not the model resolves.
+        crate::provider::learn_provider(&self.0.catalog, provider_id);
         let state = self.state();
         let model = self.model_value_in(&state, provider_id, model_id)?;
         let provider = state
@@ -370,10 +402,20 @@ impl RuntimeModels {
                             .collect()
                     })
                     .unwrap_or_default(),
-                options: RuntimeModels::llm_options(provider, &model),
+                options: RuntimeModels::llm_options(provider, &model, &self.0.host_strings),
                 context_limit: model["limit"]["context"].as_f64().unwrap_or(0.0),
                 output_limit: model["limit"]["output"].as_f64().unwrap_or(0.0),
                 output_token_max: self.0.output_token_max,
+                // This instance's config alone says what its model is.
+                family: self
+                    .0
+                    .config
+                    .provider
+                    .as_ref()
+                    .and_then(|providers| providers.get(provider_id))
+                    .and_then(|provider| provider.models.as_ref())
+                    .and_then(|models| models.get(model_id))
+                    .and_then(|model| model.family.clone()),
             },
             cost: v1_cost(&model["cost"]),
             limits: ModelLimits {
@@ -382,6 +424,7 @@ impl RuntimeModels {
                 output: model["limit"]["output"].as_f64().unwrap_or(0.0),
             },
             output_token_max: self.0.output_token_max,
+            media: media_support(&model),
         })
     }
 
@@ -867,18 +910,53 @@ impl RouteLlmSender {
     }
 }
 
+/// Whether a model whose capabilities say nothing about image input is
+/// sent images: no. A model that reads images says so — the catalog's and
+/// the config's models always carry `capabilities.input.image`
+/// (`provider.rs`, false when a custom model lists no `image` input
+/// modality, as upstream) — so a model that declares neither that nor
+/// `attachment` is text-only, and an image for it is replaced by a line
+/// saying so rather than dropped by the provider without a word.
+const UNDECLARED_IMAGE_INPUT: bool = false;
+
+/// What media a runtime model takes. An image goes to a model that lists
+/// the image modality, or that is declared to take attachments at all:
+/// catalogs differ on which of the two they fill in. One that declares
+/// neither: [`UNDECLARED_IMAGE_INPUT`].
+fn media_support(model: &Value) -> alforria_core::session::media::MediaSupport {
+    let capabilities = &model["capabilities"];
+    let declared = [&capabilities["input"]["image"], &capabilities["attachment"]]
+        .into_iter()
+        .filter_map(Value::as_bool)
+        .reduce(|image, attachment| image || attachment);
+    alforria_core::session::media::MediaSupport {
+        image: declared.unwrap_or(UNDECLARED_IMAGE_INPUT),
+    }
+}
+
 impl RouteLlmSender {
     fn route_send(
         &self,
         request: alforria_llm::schema::messages::LlmRequest,
         cancel: tokio_util::sync::CancellationToken,
+        retries: u32,
     ) -> BoxFuture<
         'static,
         Result<alforria_core::session::llm::LlmEventStream, alforria_llm::LlmError>,
     > {
-        let executor = self.executor.clone();
+        // The executor's own default (two retries) would triple every
+        // attempt of the session's retry policy. The clone shares the
+        // sender's connection pool.
+        let shared =
+            self.executor
+                .clone()
+                .with_retry_config(alforria_llm::route::executor::RetryConfig {
+                    max_retries: retries as usize,
+                    ..Default::default()
+                });
         Box::pin(async move {
             let handle = request.model.route.clone();
+            let executor = || shared.clone();
             match handle.protocol_id.as_str() {
                 "anthropic-messages" => {
                     let route = Route {
@@ -886,7 +964,7 @@ impl RouteLlmSender {
                         protocol: Arc::new(
                             alforria_llm::protocols::anthropic_messages::AnthropicMessages,
                         ),
-                        executor,
+                        executor: executor(),
                     };
                     Ok(route.stream_with_halt(&request, cancel).await?)
                 }
@@ -894,7 +972,7 @@ impl RouteLlmSender {
                     let route = Route {
                         handle,
                         protocol: Arc::new(alforria_llm::protocols::openai_chat::OpenAiChat),
-                        executor,
+                        executor: executor(),
                     };
                     Ok(route.stream_with_halt(&request, cancel).await?)
                 }
@@ -904,7 +982,7 @@ impl RouteLlmSender {
                         protocol: Arc::new(
                             alforria_llm::protocols::openai_responses::OpenAiResponses,
                         ),
-                        executor,
+                        executor: executor(),
                     };
                     Ok(route.stream_with_halt(&request, cancel).await?)
                 }
@@ -912,7 +990,7 @@ impl RouteLlmSender {
                     let route = Route {
                         handle,
                         protocol: Arc::new(alforria_llm::protocols::gemini::Gemini),
-                        executor,
+                        executor: executor(),
                     };
                     Ok(route.stream_with_halt(&request, cancel).await?)
                 }
@@ -922,7 +1000,7 @@ impl RouteLlmSender {
                         protocol: Arc::new(
                             alforria_llm::protocols::bedrock_converse::BedrockConverse,
                         ),
-                        executor,
+                        executor: executor(),
                     };
                     Ok(route.stream_with_halt(&request, cancel).await?)
                 }
@@ -950,7 +1028,7 @@ impl LlmRequestSender for RouteLlmSender {
         'static,
         Result<alforria_core::session::llm::LlmEventStream, alforria_llm::LlmError>,
     > {
-        self.route_send(request, tokio_util::sync::CancellationToken::new())
+        self.route_send(request, tokio_util::sync::CancellationToken::new(), 0)
     }
 
     fn send_with_cancel(
@@ -961,31 +1039,37 @@ impl LlmRequestSender for RouteLlmSender {
         'static,
         Result<alforria_core::session::llm::LlmEventStream, alforria_llm::LlmError>,
     > {
-        self.route_send(request, cancel)
+        self.route_send(request, cancel, 0)
+    }
+
+    fn send_with_retries(
+        &self,
+        request: alforria_llm::schema::messages::LlmRequest,
+        cancel: tokio_util::sync::CancellationToken,
+        retries: u32,
+    ) -> BoxFuture<
+        'static,
+        Result<alforria_core::session::llm::LlmEventStream, alforria_llm::LlmError>,
+    > {
+        self.route_send(request, cancel, retries)
     }
 }
 
-/// `${VAR}` interpolation over the env (provider.ts:1734-1741).
-fn interpolate_env(url: &str) -> String {
-    let mut out = String::new();
-    let mut rest = url;
-    while let Some(start) = rest.find("${") {
-        out.push_str(&rest[..start]);
-        rest = &rest[start..];
-        if let Some(end) = rest.find('}') {
-            let key = &rest[2..end];
-            match std::env::var(key) {
-                Ok(value) => out.push_str(&value),
-                Err(_) => out.push_str(&rest[..end + 1]),
-            }
-            rest = &rest[end + 1..];
-        } else {
-            out.push_str(rest);
-            return out;
-        }
-    }
-    out.push_str(rest);
-    out
+/// `${VAR}` interpolation of a base URL over the env (provider.ts:1734-1741)
+/// — the only place anything is expanded after the config is loaded.
+///
+/// It expands a value the *host* wrote and no other: `origins` holds the
+/// strings of the host's own config and of the model catalog
+/// (`alforria_core::config::HostStrings`), and a URL that is not one of
+/// them is used as it stands, whatever key of whatever source carried it.
+/// Even the host's own URL never carries one of the server's or a
+/// provider's secrets, or a variable the host's `shell_env.deny` names
+/// (`ShellEnvPolicy::withheld_from_urls`).
+fn interpolate_env(url: &str, origins: &alforria_core::config::HostStrings) -> String {
+    let policy = alforria_core::shell_env::current();
+    origins.expand(url, &|key| !policy.withheld_from_urls(key), &|key| {
+        std::env::var(key).ok()
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -995,6 +1079,37 @@ fn interpolate_env(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A model takes images when it lists the image input or takes
+    /// attachments; one that declares neither is text-only (the CHANGELOG's
+    /// "a custom vision model must now say so").
+    #[test]
+    fn a_model_that_declares_no_image_input_is_text_only() {
+        let image = |model: Value| media_support(&model).image;
+        for (capabilities, expected) in [
+            (json!({ "input": { "image": true } }), true),
+            (json!({ "input": { "image": false } }), false),
+            (
+                json!({ "input": { "image": false }, "attachment": true }),
+                true,
+            ),
+            (
+                json!({ "input": { "image": true }, "attachment": false }),
+                true,
+            ),
+            (json!({ "attachment": true }), true),
+            (json!({ "attachment": false }), false),
+            (json!({ "input": { "text": true } }), false),
+            (json!({}), false),
+        ] {
+            assert_eq!(
+                image(json!({ "capabilities": capabilities })),
+                expected,
+                "{capabilities}"
+            );
+        }
+        assert_eq!(image(json!({})), UNDECLARED_IMAGE_INPUT);
+    }
 
     #[tokio::test]
     async fn consecutive_model_requests_reuse_the_http_connection() {
@@ -1088,6 +1203,49 @@ mod tests {
         );
     }
 
+    /// A session that selects a model of a provider nothing had put in
+    /// use — no config, no stored credentials, no key in the environment —
+    /// puts it in use: its token is withheld from the next shell, on a
+    /// standalone server too, whether or not the model resolves.
+    #[tokio::test]
+    async fn selecting_a_model_withholds_its_providers_key_variables() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = alforria_core::GlobalPaths {
+            home: dir.path().join("home"),
+            config: dir.path().join("config"),
+            data: dir.path().join("data"),
+            cache: dir.path().join("cache"),
+            state: dir.path().join("state"),
+        };
+        let catalog: alforria_core::catalog::Providers = serde_json::from_value(json!({
+            "fresh": {
+                "id": "fresh", "name": "Fresh", "models": {},
+                "env": ["FRESHTEST_TOKEN", "FRESHTEST_REGION", "GITHUB_TOKEN"]
+            },
+        }))
+        .unwrap();
+        let config: alforria_core::config::schema::Config =
+            serde_json::from_value(json!({})).unwrap();
+        let models = RuntimeModels::new(
+            catalog,
+            &config,
+            &config,
+            Arc::new(crate::state::MemoryAuthStore::default()),
+            &paths,
+        )
+        .unwrap();
+        let policy = alforria_core::shell_env::current;
+        assert!(!policy().is_restricted());
+        assert!(!policy().denied("FRESHTEST_TOKEN"));
+
+        let selected = ModelSource::get_model(&models, "fresh", "fresh-1", "ses_1").await;
+        assert!(selected.is_err(), "nothing connects the provider");
+        assert!(policy().denied("FRESHTEST_TOKEN"));
+        // The region is no credential, and `GITHUB_TOKEN` is the user's.
+        assert!(!policy().denied("FRESHTEST_REGION"));
+        assert!(!policy().denied("GITHUB_TOKEN"));
+    }
+
     #[test]
     fn parse_model_splits_at_first_slash() {
         assert_eq!(parse_model("a/b/c"), ("a".to_string(), "b/c".to_string()));
@@ -1116,18 +1274,83 @@ mod tests {
         assert_eq!(parse_release_date("bogus"), None);
     }
 
+    /// Only a value the host wrote is expanded — whatever key carried the
+    /// URL here — in one pass, and never with a variable the shell
+    /// environment policy withholds.
     #[test]
-    fn interpolate_env_replaces_vars() {
-        std::env::set_var("OPencode_RUNTIME_TEST", "value");
+    fn a_base_url_is_expanded_only_when_the_host_wrote_it() {
+        use alforria_core::config::HostStrings;
+        let lookup = |key: &str| match key {
+            "SERVER_SECRET" => Some("hunter2".to_string()),
+            "REGION" => Some("eu".to_string()),
+            "NESTED" => Some("${SERVER_SECRET}".to_string()),
+            _ => None,
+        };
+        let allowed = |key: &str| key != "SERVER_SECRET";
+        let host = HostStrings::collect([&json!({ "acme": {
+            "api": "https://${REGION}.x.example/v1",
+            "options": { "baseURL": "https://x.example/${UNSET}" },
+            "models": { "m": { "options": { "baseURL": "https://x.example/${NESTED}" } } },
+            "secret": "https://${REGION}.x.example/${SERVER_SECRET}",
+        } })]);
+        let expand = |url: &str| host.expand(url, &allowed, &lookup);
+        // The host's own URLs: today's behaviour.
         assert_eq!(
-            interpolate_env("https://api.example.com/${OPencode_RUNTIME_TEST}/v1"),
-            "https://api.example.com/value/v1"
+            expand("https://${REGION}.x.example/v1"),
+            "https://eu.x.example/v1"
         );
         assert_eq!(
-            interpolate_env("https://api.example.com/${MISSING_OPencode_VAR}/v1"),
-            "https://api.example.com/${MISSING_OPencode_VAR}/v1"
+            expand("https://x.example/${UNSET}"),
+            "https://x.example/${UNSET}"
         );
-        std::env::remove_var("OPencode_RUNTIME_TEST");
+        // A value holding a reference stays that text: one pass.
+        assert_eq!(
+            expand("https://x.example/${NESTED}"),
+            "https://x.example/${SERVER_SECRET}"
+        );
+        // Withheld: nothing of the URL is expanded.
+        assert_eq!(
+            expand("https://${REGION}.x.example/${SERVER_SECRET}"),
+            "https://${REGION}.x.example/${SERVER_SECRET}"
+        );
+        // Not the host's: never expanded, though every name in it is one
+        // the host's rule would allow.
+        for url in [
+            "https://attacker.example/${REGION}",
+            "https://${REGION}.x.example/v2",
+            "${REGION}",
+        ] {
+            assert_eq!(expand(url), url);
+        }
+
+        // The whole path: a model-level `options.baseURL` — a key no list
+        // of URL keys had — set by a project, with the host's provider
+        // beside it.
+        std::env::set_var("ALFORRIA_RUNTIME_TEST_REGION", "eu");
+        let host = HostStrings::collect([&json!({ "acme": {
+            "options": { "baseURL": "https://${ALFORRIA_RUNTIME_TEST_REGION}.host.example" },
+        } })]);
+        let provider = json!({ "options": {
+            "baseURL": "https://${ALFORRIA_RUNTIME_TEST_REGION}.host.example",
+        } });
+        let hosts = RuntimeModels::llm_options(&provider, &json!({}), &host);
+        assert_eq!(hosts["baseURL"], "https://eu.host.example");
+        let project_model = json!({ "options": {
+            "baseURL": "https://attacker.example/${ALFORRIA_RUNTIME_TEST_REGION}",
+        } });
+        let projects = RuntimeModels::llm_options(&provider, &project_model, &host);
+        assert_eq!(
+            projects["baseURL"],
+            "https://attacker.example/${ALFORRIA_RUNTIME_TEST_REGION}"
+        );
+        let api_url =
+            json!({ "api": { "url": "https://attacker.example/${ALFORRIA_RUNTIME_TEST_REGION}" } });
+        let lowered = RuntimeModels::llm_options(&json!({}), &api_url, &host);
+        assert_eq!(
+            lowered["baseURL"],
+            "https://attacker.example/${ALFORRIA_RUNTIME_TEST_REGION}"
+        );
+        std::env::remove_var("ALFORRIA_RUNTIME_TEST_REGION");
     }
 
     #[test]
@@ -1139,17 +1362,142 @@ mod tests {
             "options": {"apiKey": "", "baseURL": "https://api.example"},
             "models": {},
         });
-        let options = RuntimeModels::llm_options(&provider, &json!({}));
+        let options = RuntimeModels::llm_options(&provider, &json!({}), &Default::default());
         assert_eq!(options["apiKey"], json!("stored-key"));
 
         let provider = json!({"key": "stored-key", "options": {"apiKey": "config-key"}});
-        let options = RuntimeModels::llm_options(&provider, &json!({}));
+        let options = RuntimeModels::llm_options(&provider, &json!({}), &Default::default());
         assert_eq!(options["apiKey"], json!("config-key"));
 
         // No options at all — the stored credential applies (provider.ts:1781).
         let provider = json!({"key": "stored-key"});
-        let options = RuntimeModels::llm_options(&provider, &json!({}));
+        let options = RuntimeModels::llm_options(&provider, &json!({}), &Default::default());
         assert_eq!(options["apiKey"], json!("stored-key"));
+    }
+
+    /// B5. What a project's config declares a model to be
+    /// (`provider.<id>.models.<name>.family`) decides that project's system
+    /// prompt only. It used to be written to a process-wide table when the
+    /// instance was built, and every other project's model of the same name
+    /// got the prompt too.
+    #[tokio::test]
+    async fn a_declared_family_stays_with_the_instance_that_declared_it() {
+        use crate::engine::{build_engine, EngineInput, EngineRuntime, EngineSeams};
+        use crate::state::FileAuthStore;
+        use alforria_core::session::system;
+
+        let dir = tempfile::tempdir().unwrap();
+        let catalog: alforria_core::catalog::Providers = serde_json::from_value(json!({
+            "famco": {
+                "id": "famco",
+                "name": "Famco",
+                "env": ["ALFORRIA_TEST_FAMCO_API_KEY_UNSET"],
+                "npm": "@ai-sdk/openai-compatible",
+                "api": "https://famco.invalid/v1",
+                "models": {
+                    "house-1": {
+                        "id": "house-1",
+                        "name": "House 1",
+                        "release_date": "2026-01-01",
+                        "limit": {"context": 1000, "output": 100},
+                    },
+                },
+            },
+        }))
+        .unwrap();
+        let build = |name: &str, config: Value| {
+            let root = dir.path().join(name);
+            let worktree = root.join("repo");
+            std::fs::create_dir_all(&worktree).unwrap();
+            let paths = alforria_core::GlobalPaths {
+                home: root.join("home"),
+                config: root.join("config"),
+                data: root.join("data"),
+                cache: root.join("cache"),
+                state: root.join("state"),
+            };
+            let auth = Arc::new(FileAuthStore::new(paths.data.join("auth.json")));
+            auth.set("famco", json!({"type": "api", "key": "sk-test"}))
+                .unwrap();
+            let config: alforria_core::config::schema::Config =
+                serde_json::from_value(config).unwrap();
+            let storage = Arc::new(alforria_core::Storage::open(root.join("db.sqlite")).unwrap());
+            let clock = Arc::new(alforria_core::catalog::SystemClock);
+            let background = alforria_core::BackgroundJobService::new(clock.clone());
+            let services = Arc::new(alforria_core::SessionServices::new(
+                storage,
+                background.clone(),
+                clock,
+                &alforria_core::AgentRegistryInput {
+                    config: config.clone(),
+                    skill_dirs: Vec::new(),
+                    reference_dirs: Vec::new(),
+                    worktree: worktree.clone(),
+                    data_dir: paths.data.clone(),
+                    tmp_dir: root.clone(),
+                    home: paths.home.clone(),
+                    host_config: None,
+                    protected: None,
+                },
+            ));
+            let catalog = catalog.clone();
+            build_engine(&EngineInput {
+                services,
+                background,
+                config: Arc::new(config),
+                config_dirs: Vec::new(),
+                directory: worktree.clone(),
+                worktree,
+                paths,
+                runtime: EngineRuntime {
+                    catalog: Arc::new(move || Ok(catalog.clone())),
+                    auth,
+                    schedule: false,
+                },
+                seams: EngineSeams::default(),
+            })
+            .unwrap()
+        };
+        let prompt = |resolved: &ResolvedModel| {
+            system::provider_for_model(
+                resolved.llm.family.as_deref(),
+                &resolved.llm.id,
+                &resolved.llm.api_id,
+                &resolved.llm.provider_id,
+            )
+        };
+
+        // One project says what its model is; the other, built after it in
+        // the same process, says nothing.
+        let declaring = build(
+            "declaring",
+            json!({ "provider": { "famco": { "models": { "house-1": { "family": "anthropic" } } } } }),
+        );
+        let plain = build("plain", json!({}));
+        let declared = declaring
+            .models()
+            .get_model("famco", "house-1", "ses")
+            .await
+            .unwrap();
+        let undeclared = plain
+            .models()
+            .get_model("famco", "house-1", "ses")
+            .await
+            .unwrap();
+        assert_eq!(declared.llm.family.as_deref(), Some("anthropic"));
+        assert_eq!(
+            prompt(&declared),
+            vec![system::prompt_for(system::PromptFamily::Anthropic).to_string()]
+        );
+        assert_eq!(undeclared.llm.family, None);
+        assert_eq!(prompt(&undeclared), system::provider("house-1", "famco"));
+        assert_ne!(prompt(&undeclared), prompt(&declared));
+        // Nothing of it is process-wide.
+        assert_eq!(system::family_hint("famco", "house-1"), None);
+        assert_eq!(
+            system::provider_for("house-1", "house-1", "famco"),
+            system::provider("house-1", "famco")
+        );
     }
 
     /// A built engine resolves models with credentials set after it was
@@ -1208,6 +1556,8 @@ mod tests {
                 data_dir: paths.data.clone(),
                 tmp_dir: dir.path().to_path_buf(),
                 home: paths.home.clone(),
+                host_config: None,
+                protected: None,
             },
         ));
         let engine = build_engine(&EngineInput {
@@ -1221,6 +1571,7 @@ mod tests {
             runtime: EngineRuntime {
                 catalog: Arc::new(move || Ok(catalog.clone())),
                 auth: auth.clone(),
+                schedule: false,
             },
             seams: EngineSeams::default(),
         })

@@ -1,6 +1,7 @@
 //! `PATCH /global/config` clears a key on `null` (deviation: TS writes the
-//! null, so "Server default" could never remove `model`). Its own test
-//! binary: it points `XDG_CONFIG_HOME` at a temp dir for the whole process.
+//! null, so "Server default" could never remove `model`). The context is
+//! built over a temporary home: the route writes the config under the
+//! context's paths, never the process's.
 
 use std::sync::Arc;
 
@@ -32,9 +33,9 @@ async fn patch(router: &axum::Router, body: &str) -> (StatusCode, serde_json::Va
 #[tokio::test]
 async fn null_deletes_a_global_config_key() {
     let dir = tempfile::tempdir().unwrap();
-    std::env::set_var("XDG_CONFIG_HOME", dir.path());
-    let file = dir.path().join("alforria/opencode.jsonc");
-    let router = routes::build_router(Arc::new(ServerContext::for_tests()));
+    let paths = alforria_core::GlobalPaths::resolve_with(dir.path().to_path_buf(), |_| None);
+    let file = paths.config.join("opencode.jsonc");
+    let router = routes::build_router(Arc::new(ServerContext::for_tests().with_paths(paths)));
 
     let (status, _) = patch(
         &router,

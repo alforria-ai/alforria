@@ -30,15 +30,34 @@ use crate::state::ServerContext;
 // ---------------------------------------------------------------------------
 
 /// `Global.Path.state` (`global.ts:14`).
-fn global_state_path() -> PathBuf {
-    alforria_core::GlobalPaths::from_env().state
+fn global_state_path(ctx: &ServerContext) -> PathBuf {
+    ctx.global_paths().state
 }
 
 /// `FSUtil.contains` — whether `path` stays inside `directory`.
+///
+/// The frozen surface's own check, kept as upstream has it for the
+/// operator's clients: `..` is folded out of the spelling before links are
+/// followed, so `link/../x` counts as `x` while the kernel, handed the
+/// spelling, goes where `link` leads. It is therefore not what confines a
+/// credential below `admin` or a file ticket: those are judged by
+/// [`confined_read`], on the kernel's reading (`protect::resolve_path`).
 fn path_contains(directory: &Path, path: &Path) -> bool {
     let dir = crate::state::resolve_directory(directory);
     let path = crate::state::resolve_directory(path);
     path.starts_with(dir)
+}
+
+/// alforria extension: where a read on behalf of a credential below `admin`
+/// or of a file ticket lands — `target` (the spelling about to be handed
+/// to the kernel) resolved as the kernel resolves it, and inside the
+/// project. `None` when it is outside or cannot be resolved.
+fn confined_read(location: &LocationContext, target: &Path) -> Option<PathBuf> {
+    let resolved = crate::confine::resolve_for_access(target).ok()?;
+    crate::confine::project_roots(location)
+        .iter()
+        .any(|root| alforria_core::protect::within(&resolved, root))
+        .then_some(resolved)
 }
 
 /// Semver validation for `GlobalUpgradeInput` (`groups/global.ts:24-28`) —
@@ -79,8 +98,8 @@ fn publish(
 // ---------------------------------------------------------------------------
 
 /// `globalConfigFile` (config.ts:140-146).
-fn global_config_file() -> PathBuf {
-    let paths = alforria_core::GlobalPaths::from_env();
+fn global_config_file(ctx: &ServerContext) -> PathBuf {
+    let paths = ctx.global_paths();
     let candidates = [
         paths.config.join("opencode.jsonc"),
         paths.config.join("opencode.json"),
@@ -101,8 +120,10 @@ pub async fn global_health() -> Result<Response, ServerError> {
 }
 
 /// `configGet` (`handlers/global.ts:64-66`).
-pub async fn global_config_get() -> Result<Response, ServerError> {
-    let file = global_config_file();
+pub async fn global_config_get(
+    State(ctx): State<Arc<ServerContext>>,
+) -> Result<Response, ServerError> {
+    let file = global_config_file(&ctx);
     let value = match std::fs::read_to_string(&file) {
         Ok(text) if !text.trim().is_empty() => alforria_core::parse_jsonc(&text, &file)?,
         _ => json!({}),
@@ -123,7 +144,7 @@ pub async fn global_config_update(
     if !payload.is_object() {
         return Err(payload_error("Expected an object"));
     }
-    let file = global_config_file();
+    let file = global_config_file(&ctx);
     let before = std::fs::read_to_string(&file).unwrap_or_else(|_| "{}".to_string());
     let mut merged = if std::fs::exists(&file).unwrap_or(false) {
         alforria_core::parse_jsonc(&before, &file)?
@@ -143,6 +164,19 @@ pub async fn global_config_update(
     std::fs::create_dir_all(file.parent().unwrap_or(Path::new(".")))
         .map_err(|err| defect(format!("failed to create config dir: {err}")))?;
     std::fs::write(&file, &serialized).map_err(defect)?;
+    // The operator changed the host config through the server. A server
+    // that froze its host config (`config::snapshot`) applies exactly what
+    // was sent to what it remembers, and reads nothing back from disk: the
+    // file just written was merged with whatever stood there, and neither
+    // that nor any other host file is taken on trust now. The access
+    // policy and how far project config is believed stay as at startup.
+    if let Some(snapshot) = alforria_core::config::HostSnapshot::of(&ctx.global_paths().config) {
+        let mut patch = payload.clone();
+        if patch["shell"] == json!("") {
+            patch["shell"] = Value::Null;
+        }
+        snapshot.apply_patch(&ctx.global_paths().config, &patch);
+    }
     if changed {
         ctx.instances.dispose_all();
         ctx.global_bus.emit(crate::sse::GlobalEvent::injected(
@@ -332,12 +366,13 @@ pub async fn instance_dispose(
 
 /// `getPath` (`handlers/instance.ts:24-32`).
 pub async fn path_info(
+    State(ctx): State<Arc<ServerContext>>,
     axum::Extension(location): axum::Extension<LocationContext>,
 ) -> Result<Response, ServerError> {
-    let paths = alforria_core::GlobalPaths::from_env();
+    let paths = ctx.global_paths();
     Ok(json_ok(json!({
         "home": paths.home,
-        "state": global_state_path(),
+        "state": global_state_path(&ctx),
         "config": paths.config,
         "worktree": location.directory,
         "directory": location.directory,
@@ -433,10 +468,10 @@ fn hints(template: &str) -> Vec<String> {
 
 /// `getCommand` (`handlers/instance.ts:67-69`).
 pub async fn command_list(
+    State(ctx): State<Arc<ServerContext>>,
     axum::Extension(location): axum::Extension<LocationContext>,
 ) -> Result<Response, ServerError> {
-    let params = alforria_core::LoadParams::new(location.directory.clone())
-        .paths(alforria_core::GlobalPaths::from_env());
+    let params = alforria_core::LoadParams::new(location.directory.clone(), ctx.paths.clone());
     let (config, _) = alforria_core::ConfigLoader::new().load(&params)?;
     let mut commands: Vec<Value> = vec![
         json!({
@@ -494,7 +529,9 @@ pub async fn agent_list(
                     alforria_core::AgentMode::Subagent => "subagent",
                     alforria_core::AgentMode::All => "all",
                 },
-                "permission": agent.permission,
+                // The wire form is a flat rendering of the policy, never
+                // more permissive than it (`Policy::render`).
+                "permission": agent.permission.render(),
                 "options": agent.options,
             });
             if let Some(native) = agent.native {
@@ -692,6 +729,7 @@ pub async fn find_symbol() -> Result<Response, ServerError> {
 /// `list` (`handlers/file.ts:66-93`).
 pub async fn file_list(
     axum::Extension(location): axum::Extension<LocationContext>,
+    principal: Option<axum::Extension<crate::bearer::Principal>>,
     uri: Uri,
 ) -> Result<Response, ServerError> {
     let path = match query_param(uri.query(), "path") {
@@ -700,12 +738,32 @@ pub async fn file_list(
     };
     let directory = &location.directory;
     let target = directory.join(&path);
+    // A credential narrower than `admin` is confined to the project, like
+    // `content` below: where the path really lands, links followed.
+    // (A request the auth layer did not judge has no principal and is
+    // confined, not trusted: `confine::restricted`.)
+    let restricted = crate::confine::restricted(&principal);
+    let judged = match restricted {
+        true => {
+            let resolved =
+                confined_read(&location, &target).filter(|_| path_contains(directory, &target));
+            let Some(resolved) = resolved else {
+                return Err(ServerError::Api(crate::error::ApiError::Forbidden {
+                    message: "this token may only list files inside the project".to_string(),
+                }));
+            };
+            Some(resolved)
+        }
+        false => None,
+    };
     // Like `/file/content`: an absolute path or `..` must not list a
-    // directory outside the location.
+    // directory outside the location, for any caller.
     if !path_contains(directory, &target) {
         return Err(defect("Path escapes the location"));
     }
-    let entries = std::fs::read_dir(&target).map_err(defect)?;
+    // What is listed is the directory that was judged: the resolved one,
+    // not the spelling looked up again.
+    let entries = std::fs::read_dir(judged.as_deref().unwrap_or(&target)).map_err(defect)?;
     let ignore = CombinedIgnore::load(directory);
     let mut out: Vec<Value> = Vec::new();
     for entry in entries.flatten() {
@@ -763,7 +821,9 @@ impl CombinedIgnore {
 
 /// `content` (`handlers/file.ts:95-135`).
 pub async fn file_content(
+    State(ctx): State<Arc<ServerContext>>,
     axum::Extension(location): axum::Extension<LocationContext>,
+    principal: Option<axum::Extension<crate::bearer::Principal>>,
     uri: Uri,
 ) -> Result<Response, ServerError> {
     let path = match query_param(uri.query(), "path") {
@@ -775,10 +835,46 @@ pub async fn file_content(
     if !path_contains(directory, &file) {
         return Err(defect("Path escapes the location"));
     }
-    if !file.exists() {
-        return Ok(json_ok(json!({"type": "text", "content": ""})));
+    // alforria extension: a credential below `admin` reads inside the
+    // project, and a request admitted on a file ticket reads that ticket's
+    // file only (`routes::file_ext`) — both judged where the kernel lands
+    // the spelling, and the read is then made on that resolved path.
+    let confined = crate::confine::restricted(&principal)
+        || principal
+            .as_ref()
+            .is_some_and(|principal| principal.0.via == crate::bearer::Via::Ticket);
+    // Opened once and without waiting (a FIFO in the project would park
+    // the worker for ever), then everything is asked of the handle: a
+    // regular file, of at most `server.upload.max_bytes` — the response
+    // carries it whole — read off the async workers. A confined read is
+    // opened as it was judged, beneath the project root.
+    let opened = if confined {
+        let Some(resolved) = confined_read(&location, &file) else {
+            return Err(ServerError::Api(crate::error::ApiError::Forbidden {
+                message: "this token may only read files inside the project".to_string(),
+            }));
+        };
+        if let Err(refusal) =
+            crate::routes::file_ext::check_ticket(&ctx, &principal, &uri, &location, &resolved)
+        {
+            return Ok(axum::response::IntoResponse::into_response(refusal));
+        }
+        let location = location.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::routes::file_ext::open_judged(&location, &resolved)
+        })
+        .await
+    } else {
+        let file = file.clone();
+        tokio::task::spawn_blocking(move || alforria_core::beneath::open_nonblocking(&file)).await
     }
-    let bytes = std::fs::read(&file).map_err(defect)?;
+    .unwrap_or_else(|join| Err(std::io::Error::other(join.to_string())));
+    let bytes = match crate::routes::file_ext::read_whole(opened, ctx.policy.upload_max_bytes).await
+    {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return Ok(json_ok(json!({"type": "text", "content": ""}))),
+        Err(refusal) => return Ok(axum::response::IntoResponse::into_response(refusal)),
+    };
     if bytes.contains(&0) {
         use base64::Engine;
         return Ok(json_ok(json!({

@@ -237,6 +237,12 @@ pub struct ProductionEngine {
     llm: Arc<dyn LlmStream>,
     /// Saved workflows + run progress (alforria extension).
     workflows: Arc<WorkflowService>,
+    /// Scheduled and event-started turns (alforria extension).
+    triggers: Arc<alforria_core::trigger::TriggerService>,
+    /// Long-term memory records and transcript search (alforria extension).
+    memory: Arc<alforria_core::memory::MemoryService>,
+    /// The project `session_search` and `/memory` act for.
+    project_id: String,
 }
 
 /// The [`SessionEngine`] surface (`state.rs`) over the M5 services. The
@@ -386,6 +392,14 @@ impl SessionEngine for ProductionEngine {
 
     fn workflow_delete(&self, name: String) -> Result<bool, ServerError> {
         self.workflows.delete(&name).map_err(workflow_error)
+    }
+
+    fn triggers(&self) -> Option<Arc<alforria_core::trigger::TriggerService>> {
+        Some(self.triggers.clone())
+    }
+
+    fn memory(&self) -> Option<(Arc<alforria_core::memory::MemoryService>, String)> {
+        Some((self.memory.clone(), self.project_id.clone()))
     }
 }
 
@@ -644,11 +658,23 @@ struct EngineSystemPrompts {
     mcp: Arc<alforria_core::mcp::McpService>,
     directory: PathBuf,
     worktree: PathBuf,
+    memory: Arc<alforria_core::memory::MemoryService>,
+    sessions: alforria_core::session::store::SessionStore,
+    /// `prompt.*` from the config.
+    options: alforria_core::session::system::PromptOptions,
 }
 
 impl alforria_core::session::r#loop::SystemPrompts for EngineSystemPrompts {
+    fn memory(&self, session_id: &str) -> Option<String> {
+        // A session whose restriction cannot be read is shown what an
+        // unrestricted one is: the smaller set.
+        let restricted = self.sessions.is_restricted(session_id).unwrap_or(false);
+        self.memory.injection_for(restricted)
+    }
+
     fn environment(&self, model: &alforria_core::session::llm::LlmModel) -> Vec<String> {
-        alforria_core::session::system::environment(
+        alforria_core::session::system::environment_with(
+            &self.options,
             &alforria_core::session::system::EnvironmentModel {
                 provider_id: model.provider_id.clone(),
                 id: model.id.clone(),
@@ -675,7 +701,10 @@ impl alforria_core::session::r#loop::SystemPrompts for EngineSystemPrompts {
             return Box::pin(async move { None });
         };
         let available: Vec<_> = self.skills.all().into_iter().cloned().collect();
-        Box::pin(async move { alforria_core::session::system::skills(&info, &available) })
+        let options = self.options.clone();
+        Box::pin(
+            async move { alforria_core::session::system::skills_with(&options, &info, &available) },
+        )
     }
 
     fn mcp<'a>(
@@ -769,6 +798,9 @@ pub struct EngineInput {
 pub struct EngineRuntime {
     pub catalog: crate::state::CatalogSource,
     pub auth: Arc<dyn crate::state::AuthStore>,
+    /// Whether this process runs the trigger scheduler
+    /// ([`crate::ListenOptions::schedule`]).
+    pub schedule: bool,
 }
 
 /// Provider-runtime + share seams: `None` falls back to the unwired M7.7
@@ -779,6 +811,36 @@ pub struct EngineSeams {
     pub models: Option<Arc<dyn ModelSource>>,
     pub input_models: Option<Arc<dyn InputModels>>,
     pub share_http: Option<Arc<dyn alforria_core::share::ShareHttp>>,
+    /// Where the engine looks up ambient credentials (`LIBERTAI_API_KEY`
+    /// for the search backend). `None` is the process environment; a test
+    /// passes [`no_ambient_env`] so a key in the developer's shell cannot
+    /// change what the scripted model is offered.
+    pub env: Option<EnvLookup>,
+    /// The source of the built-in LibertAI model list. `None` is the
+    /// embedded snapshot — no cache file, no network — which is what every
+    /// fixture gets; the process entry point passes the real one.
+    pub libertai_catalog: Option<alforria_core::libertai::LibertaiCatalog>,
+    /// The LibertAI account endpoints and session sidecar the sign-in
+    /// routes use. `None` is offline, with the sidecar under the context's
+    /// data directory; the process entry point passes the real ones.
+    pub libertai_endpoints: Option<alforria_core::libertai::auth::Endpoints>,
+}
+
+/// See [`EngineSeams::env`].
+pub type EnvLookup = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+
+/// An [`EnvLookup`] that finds nothing.
+pub fn no_ambient_env() -> Option<EnvLookup> {
+    Some(Arc::new(|_| None))
+}
+
+impl EngineSeams {
+    fn env(&self, name: &str) -> Option<String> {
+        match &self.env {
+            Some(lookup) => lookup(name),
+            None => std::env::var(name).ok(),
+        }
+    }
 }
 
 /// `Shell.preferred` (core/shell.ts:205-208) — config value, else `$SHELL`,
@@ -809,6 +871,87 @@ fn bash_timeout_ms() -> u64 {
         .unwrap_or(2 * 60 * 1000)
 }
 
+/// `prompt.*` from the config, as the system-prompt builder takes it.
+fn prompt_options(
+    config: &alforria_core::config::schema::Config,
+) -> alforria_core::session::system::PromptOptions {
+    use alforria_core::config::extension::PromptEnvironment;
+    use alforria_core::session::system::{EnvironmentBlock, PromptOptions};
+    let prompt = config.prompt.clone().unwrap_or_default();
+    PromptOptions {
+        environment: match prompt.environment {
+            None | Some(PromptEnvironment::Switch(true)) => EnvironmentBlock::Standard,
+            Some(PromptEnvironment::Switch(false)) => EnvironmentBlock::Off,
+            Some(PromptEnvironment::Template(template)) => EnvironmentBlock::Template(template),
+        },
+        model_identity: prompt.model_identity.unwrap_or(true),
+        empty_skills: prompt.empty_skills.unwrap_or(true),
+    }
+}
+
+/// The search backend the `websearch` tool uses instead of upstream's
+/// providers: what `websearch.provider` in the config names — `"libertai"`
+/// (LibertAI search, with the libertai provider's key) or `"http"`. With
+/// no `websearch.provider` there is none, and the tool is upstream's:
+/// offered to the same models, answered by the same providers. A LibertAI
+/// key alone does not switch it (it used to: someone who already searched
+/// through Exa or Parallel was moved to LibertAI search by signing in).
+/// `websearch` is read from the user's own config only (`EXTENSION_KEYS`),
+/// so the address and headers are theirs.
+fn search_backend(
+    config: &alforria_core::config::schema::Config,
+    auth: &dyn crate::state::AuthStore,
+    seams: &EngineSeams,
+) -> Option<alforria_core::tool::websearch::HttpSearch> {
+    use alforria_core::tool::websearch::HttpSearch;
+    let websearch = config.websearch.clone().unwrap_or_default();
+    let libertai_key = || {
+        seams
+            .env("LIBERTAI_API_KEY")
+            .filter(|key| !key.is_empty())
+            .or_else(|| {
+                let stored = auth.all().ok()?;
+                let entry = stored.get(alforria_core::libertai::LIBERTAI_PROVIDER_ID)?;
+                entry
+                    .get("key")
+                    .or_else(|| entry.get("access"))
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|key| !key.is_empty())
+                    .map(String::from)
+            })
+    };
+    match websearch.provider.as_deref() {
+        Some("http") => {
+            let url = websearch
+                .url
+                .filter(|url| url.starts_with("https://") || url.starts_with("http://"));
+            let Some(url) = url else {
+                tracing::warn!(
+                    "websearch.provider is \"http\" but websearch.url is not an http(s) URL"
+                );
+                return None;
+            };
+            Some(HttpSearch {
+                id: "http".to_string(),
+                label: "Web Search".to_string(),
+                url,
+                headers: websearch.headers.unwrap_or_default().into_iter().collect(),
+            })
+        }
+        Some("libertai") => {
+            let backend = libertai_key().map(|key| HttpSearch::libertai(&key));
+            if backend.is_none() {
+                tracing::warn!(
+                    "websearch.provider is \"libertai\" but the libertai provider has no key"
+                );
+            }
+            backend
+        }
+        // Unset, or any other value (for example "exa"): upstream's choice.
+        None | Some(_) => None,
+    }
+}
+
 /// Build the per-instance engine (the M6 `SessionEngine` seam over the M5
 /// service graph). Mirrors the M5.7 test-support harness with production
 /// deps: the merged config, real tools and the background-job service.
@@ -818,6 +961,7 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
     let instance = InstanceContext {
         directory: input.directory.clone(),
         worktree: input.worktree.clone(),
+        write_guard: None,
     };
     let context = alforria_core::session::store::SessionContext {
         project_id: services
@@ -864,6 +1008,93 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
         workflow_ops.clone() as Arc<dyn WorkflowOps>,
         workflow_settings,
     );
+    // Memory (alforria extension): off unless the config turns it on.
+    let memory_config = input.config.memory.clone().unwrap_or_default();
+    let memory_inject = memory_config.inject.clone().unwrap_or_default();
+    let memory_global =
+        memory_config.scope == Some(alforria_core::config::extension::MemoryScope::Global);
+    let project_id = context.project_id.clone();
+    let memory = alforria_core::memory::MemoryService::new(
+        services.storage.clone(),
+        Some(services.events.clone()),
+        clock.clone(),
+        alforria_core::memory::MemorySettings {
+            enabled: memory_config.enabled == Some(true) && !bool_env("OPENCODE_DISABLE_MEMORY"),
+            project_id: if memory_global {
+                alforria_core::GLOBAL_ID.to_string()
+            } else {
+                project_id.clone()
+            },
+            global: memory_global,
+            // The key of a `global` project's records and sessions: the
+            // instance's directory, resolved as the allowlist resolved it
+            // (`state::resolve_directory`) and once more by the guard's
+            // resolver, so two spellings of one directory are one key and a
+            // link is the place it leads to.
+            directory: alforria_core::protect::resolve_path(&input.directory)
+                .unwrap_or_else(|_| input.directory.clone())
+                .display()
+                .to_string(),
+            inject_recent: memory_inject
+                .recent
+                .map(|value| value as usize)
+                .unwrap_or(alforria_core::memory::MemorySettings::DEFAULT_INJECT_RECENT),
+            inject_max_chars: memory_inject
+                .max_chars
+                .map(|value| value as usize)
+                .unwrap_or(alforria_core::memory::MemorySettings::DEFAULT_INJECT_MAX_CHARS),
+            inject_unverified: memory_inject.unverified == Some(true),
+            flush_before_compaction: memory_config.flush_before_compaction == Some(true),
+        },
+    );
+    // Triggers (alforria extension): the config's plus the stored ones.
+    let trigger_ops = alforria_core::session::trigger_ops::ProductionTriggerOps::new(
+        services.sessions.clone(),
+        services.agents.clone(),
+        context.clone(),
+    );
+    let trigger_config = input.config.triggers.clone().unwrap_or_default();
+    let triggers = alforria_core::trigger::TriggerService::new(
+        trigger_ops.clone(),
+        services.events.clone(),
+        services.storage.clone(),
+        clock.clone(),
+        alforria_core::trigger::TriggerSettings {
+            directory: input.directory.clone(),
+            project_id: context.project_id.clone(),
+            home: input.paths.home.clone(),
+            enabled: trigger_config.enabled.unwrap_or(true)
+                && !bool_env("OPENCODE_DISABLE_TRIGGERS"),
+            // Unless `triggers.enabled` says so, triggers wait for there to
+            // be one: no scheduler and no `schedule` tool for a directory
+            // that has none.
+            on_demand: trigger_config.enabled.is_none(),
+            concurrency: trigger_config
+                .concurrency
+                .map(|value| value.max(1) as usize)
+                .unwrap_or(alforria_core::trigger::TriggerSettings::DEFAULT_CONCURRENCY),
+            max_watched: trigger_config
+                .max_watched
+                .map(|value| value as usize)
+                .unwrap_or(alforria_core::trigger::TriggerSettings::DEFAULT_MAX_WATCHED),
+            // A turn writes here; a watch that saw it would fire itself.
+            ignore: vec![
+                input.paths.data.clone(),
+                input.paths.state.clone(),
+                input.paths.cache.clone(),
+            ],
+            config: input.config.trigger.clone().unwrap_or_default(),
+            webhook_min_interval_ms: trigger_config
+                .webhook_min_interval
+                .map(|interval| interval.get().as_millis() as u64)
+                .unwrap_or(
+                    alforria_core::trigger::TriggerSettings::DEFAULT_WEBHOOK_MIN_INTERVAL_MS,
+                ),
+            // One process schedules a directory's triggers, among those
+            // that share the data directory.
+            lock_dir: Some(input.paths.data.join("lock")),
+        },
+    );
 
     // Provider-runtime seams — the M7.7 production runtime (models +
     // route sender) unless the e2e tests script a mock LLM here.
@@ -873,6 +1104,10 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
     let runtime_models = crate::provider_runtime::RuntimeModels::new(
         crate::provider::load_catalog(&input.runtime.catalog)?,
         &input.config,
+        &alforria_core::ConfigLoader::new().load_trusted(&alforria_core::LoadParams::new(
+            input.directory.clone(),
+            input.paths.clone(),
+        ))?,
         input.runtime.auth.clone(),
         &input.paths,
     )?;
@@ -921,6 +1156,18 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
         paths: input.paths.clone(),
         events: Some(services.events.clone()),
         flags: alforria_core::lsp::server::Flags::from_env(),
+    });
+    // No language server on, or configured from, the upload area while
+    // tokens below `admin` can upload into it.
+    lsp.exclude({
+        let (sessions, directory) = (services.sessions.clone(), input.directory.clone());
+        Arc::new(move || {
+            sessions
+                .untooled_upload_directories()
+                .iter()
+                .map(|upload| directory.join(upload))
+                .collect()
+        })
     });
     let edit_lsp: Arc<dyn alforria_core::tool::edit::Lsp> = lsp.clone();
     // `FileSystem.Event.Edited` / `Watcher.Event.Updated` from the
@@ -1017,6 +1264,8 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
             home: input.paths.home.clone(),
         },
     ));
+    // alforria's own search backend, if one is configured.
+    let search_backend = search_backend(&input.config, input.runtime.auth.as_ref(), &input.seams);
     // Websearch env keys are read once at boot (WebSearchEnv::default).
     let websearch = alforria_core::tool::websearch::websearch_tool(
         truncate.clone(),
@@ -1028,7 +1277,10 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
                 || experimental_env("OPENCODE_EXPERIMENTAL_PARALLEL"),
         },
         Arc::new(alforria_core::tool::websearch::SystemYear),
-        alforria_core::tool::websearch::WebSearchEnv::default(),
+        alforria_core::tool::websearch::WebSearchEnv {
+            backend: search_backend.clone(),
+            ..Default::default()
+        },
     );
     // `Tool.init(shell)` — the def renders the bash prompt; `render` is
     // pure (no runtime needed), so a plain block_on suffices.
@@ -1108,6 +1360,49 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
     if !workflows.enabled() {
         builtin.retain(|tool| tool.id != "workflow");
     }
+    // -- always-on assistant tools (alforria extension): keep this block
+    //    contiguous, after the upstream tools ---------------------------------
+    if triggers.enabled() {
+        builtin.push(alforria_core::tool::schedule::schedule_tool(
+            truncate.clone(),
+            agents.clone(),
+            triggers.clone(),
+            Arc::new(alforria_core::tool::schedule::SessionTree {
+                sessions: services.sessions.clone(),
+                agents: services.agents.clone(),
+            }),
+        ));
+    }
+    if memory.enabled() {
+        let sessions = services.sessions.clone();
+        builtin.push(alforria_core::tool::memory::memory_tool(
+            truncate.clone(),
+            agents.clone(),
+            memory.clone(),
+            Arc::new({
+                let sessions = sessions.clone();
+                move |session_id: &str| sessions.seen_outside_content(session_id)
+            }),
+            // A restriction that cannot be read counts as one.
+            Arc::new({
+                let sessions = sessions.clone();
+                move |session_id: &str| sessions.is_restricted(session_id).unwrap_or(true)
+            }),
+            Arc::new({
+                let sessions = sessions.clone();
+                move |session_id: &str| sessions.started_by_outside_input(session_id)
+            }),
+        ));
+        builtin.push(alforria_core::tool::memory::session_search_tool(
+            truncate.clone(),
+            agents.clone(),
+            memory.clone(),
+            project_id.clone(),
+            // A restriction that cannot be read counts as one.
+            Arc::new(move |session_id: &str| sessions.is_restricted(session_id).unwrap_or(true)),
+        ));
+    }
+    // -- end of the always-on assistant tools ---------------------------------
     let registry = Arc::new(
         ToolRegistry::new(
             builtin,
@@ -1123,7 +1418,32 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
             },
             agents.clone(),
         )
-        .map_err(|err| ServerError::Core(CoreError::Storage(err.to_string())))?,
+        .map_err(|err| ServerError::Core(CoreError::Storage(err.to_string())))?
+        .with_websearch_backend(search_backend.is_some())
+        // `schedule` is offered while triggers are in use here: asked at
+        // each request, so the first trigger created over HTTP brings the
+        // tool with it.
+        .with_gate("schedule", {
+            let triggers = triggers.clone();
+            Arc::new(move || triggers.active())
+        })
+        .with_descriptions(
+            input
+                .config
+                .tool
+                .iter()
+                .flatten()
+                .map(|(name, tool)| {
+                    (
+                        name.clone(),
+                        alforria_core::tool::registry::DescriptionOverride {
+                            description: tool.description.clone(),
+                            append: tool.description_append.clone(),
+                        },
+                    )
+                })
+                .collect(),
+        ),
     );
 
     // Subtask driver + summary + revert + compaction.
@@ -1151,9 +1471,21 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
         summary: summary.clone(),
         state: services.run_state.clone(),
         data_dir: input.paths.data.clone(),
+        protected: services.agents.protected(),
+        worktree: input.worktree.clone(),
     }));
-    let compaction: Arc<dyn alforria_core::session::r#loop::Compaction> =
-        Arc::new(SessionCompaction::new(CompactionDeps {
+    let memory_flush: Option<Arc<dyn alforria_core::memory::flush::BeforeCompaction>> =
+        (memory.enabled() && memory.settings().flush_before_compaction).then(|| {
+            Arc::new(alforria_core::memory::flush::MemoryFlush {
+                memory: memory.clone(),
+                llm: llm.clone(),
+                sessions: services.sessions.clone(),
+                agents: services.agents.clone(),
+                client: client_env(),
+            }) as Arc<dyn alforria_core::memory::flush::BeforeCompaction>
+        });
+    let compaction: Arc<dyn alforria_core::session::r#loop::Compaction> = Arc::new(
+        SessionCompaction::new(CompactionDeps {
             sessions: services.sessions.clone(),
             messages: services.messages.clone(),
             events: services.events.clone(),
@@ -1170,7 +1502,9 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
             output_token_max: crate::provider_runtime::output_token_max(),
             project_id: None,
             client: client_env(),
-        }));
+        })
+        .with_before(memory_flush),
+    );
 
     let instruction = Arc::new(Instruction::new(
         InstructionFlags {
@@ -1199,11 +1533,14 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
         summary: summary.clone(),
         instruction,
         systems: Arc::new(EngineSystemPrompts {
+            sessions: services.sessions.clone(),
             agents: services.agents.clone(),
             skills: skill_service.clone(),
             mcp: mcp_service.clone(),
             directory: input.directory.clone(),
             worktree: input.worktree.clone(),
+            memory: memory.clone(),
+            options: prompt_options(&input.config),
         }),
         registry: (*registry).clone(),
         revert: revert.clone(),
@@ -1225,6 +1562,14 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
 
     ops.bind(prompt.clone());
     workflow_ops.bind(prompt.clone());
+    trigger_ops.bind(prompt.clone());
+    if input.runtime.schedule {
+        triggers.start();
+    }
+    // Index past sessions in the background, wherever a server lives on.
+    if input.runtime.schedule {
+        memory.start_indexer();
+    }
 
     // M7.5: the share network service (share-next.ts) behind its HTTP +
     // account seams, wrapped in the SessionShare gate/auto-share service
@@ -1273,6 +1618,9 @@ pub fn build_engine(input: &EngineInput) -> Result<Arc<ProductionEngine>, Server
         defaults: Arc::new(runtime_models),
         llm,
         workflows,
+        triggers,
+        memory,
+        project_id,
     }))
 }
 
@@ -1337,6 +1685,36 @@ impl EngineStore {
                 },
             );
         Ok(())
+    }
+
+    /// Stop what the engines run on their own (a server shutting down):
+    /// every trigger scheduler, so nothing fires any more, and every
+    /// transcript indexer. Turns already running are settled by the
+    /// shutdown itself.
+    pub fn stop_background(&self) {
+        let engines: Vec<Arc<ProductionEngine>> = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .map(|entry| entry.engine.clone())
+            .collect();
+        for engine in engines {
+            engine.triggers.stop();
+            engine.memory.stop_indexer();
+        }
+    }
+
+    /// How many trigger runs are past their shutdown check with their turn
+    /// not yet ended (`TriggerService::in_flight`). After
+    /// [`Self::stop_background`] it only goes down.
+    pub fn triggers_in_flight(&self) -> usize {
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .map(|entry| entry.engine.triggers.in_flight())
+            .sum()
     }
 
     /// The `EngineFactory` seam — resolves the engine for a request's
@@ -1467,6 +1845,67 @@ impl alforria_core::tool::mcp_websearch::McpHttpClient for ReqwestMcpHttpClient 
 
 #[cfg(test)]
 mod generate_name_tests {
+    /// P5.2. LibertAI search answers `websearch` only when the config names
+    /// it. A LibertAI key by itself — in the environment or stored by a
+    /// sign-in — leaves the tool as upstream has it.
+    #[test]
+    fn libertai_search_is_a_backend_only_when_the_config_names_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = |value: serde_json::Value| {
+            serde_json::from_value::<alforria_core::config::schema::Config>(value).unwrap()
+        };
+        let empty = crate::state::FileAuthStore::new(dir.path().join("none.json"));
+        let signed_in = crate::state::FileAuthStore::new(dir.path().join("auth.json"));
+        crate::state::AuthStore::set(
+            &signed_in,
+            alforria_core::libertai::LIBERTAI_PROVIDER_ID,
+            serde_json::json!({ "type": "api", "key": "ltai-stored" }),
+        )
+        .unwrap();
+        let with_env = EngineSeams {
+            env: Some(Arc::new(|name: &str| {
+                (name == "LIBERTAI_API_KEY").then(|| "ltai-env".to_string())
+            })),
+            ..EngineSeams::default()
+        };
+        let no_env = EngineSeams {
+            env: no_ambient_env(),
+            ..EngineSeams::default()
+        };
+
+        // A key and no `websearch.provider`: no backend of ours.
+        for value in [
+            serde_json::json!({}),
+            serde_json::json!({ "websearch": {} }),
+            serde_json::json!({ "websearch": { "provider": "exa" } }),
+        ] {
+            assert_eq!(
+                search_backend(&config(value.clone()), &empty, &with_env),
+                None,
+                "{value}"
+            );
+            assert_eq!(
+                search_backend(&config(value.clone()), &signed_in, &no_env),
+                None,
+                "{value}"
+            );
+        }
+        // Named: LibertAI search, with whichever key there is.
+        let named = config(serde_json::json!({ "websearch": { "provider": "libertai" } }));
+        let backend = search_backend(&named, &empty, &with_env).unwrap();
+        assert_eq!(backend.id, "libertai");
+        assert!(backend
+            .headers
+            .contains(&("authorization".to_string(), "Bearer ltai-env".to_string())));
+        let backend = search_backend(&named, &signed_in, &no_env).unwrap();
+        assert!(backend.headers.contains(&(
+            "authorization".to_string(),
+            "Bearer ltai-stored".to_string()
+        )));
+        // Named without a key: nothing to search with.
+        assert_eq!(search_backend(&named, &empty, &no_env), None);
+    }
+
     use super::*;
     use alforria_core::session::llm::{LlmEventStream, LlmModel, StreamInput};
     use alforria_core::session::prompt_input::Models;
@@ -1543,6 +1982,7 @@ mod generate_name_tests {
                 context_limit: 1000.0,
                 output_limit: 1000.0,
                 output_token_max: None,
+                family: None,
             },
             cost: alforria_core::session::usage::ModelCost::free(),
             limits: alforria_core::session::overflow::ModelLimits {
@@ -1551,6 +1991,7 @@ mod generate_name_tests {
                 output: 1000.0,
             },
             output_token_max: None,
+            media: Default::default(),
         }
     }
 

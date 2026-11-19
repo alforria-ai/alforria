@@ -14,6 +14,7 @@
 //! against Node 24): the "no-escape" set is `[A-Za-z0-9]` plus
 //! `!$&'()*+,-./:;=@_` — note `~`, `?` and `#` ARE escaped.
 
+use crate::session::caller::Caller;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -34,12 +35,16 @@ use crate::session::store::SessionStore;
 use crate::tool::def::{Ask, AskRequest, ExecuteResult, Extra, MetadataSink, ToolCtxRef, ToolDef};
 use crate::tool::error::ToolError;
 pub use crate::tool::lsp::LspServer;
-use crate::tool::permission::evaluate;
 use crate::CoreError;
 
 use crate::session::event_definitions::SESSION_ERROR;
 
 const MAX_MCP_RESOURCE_BLOB_BYTES: usize = 10 * 1024 * 1024;
+
+/// The largest file a prompt's file part inlines (alforria extension): the
+/// default of `server.upload.max_bytes`, the largest file the server
+/// takes. A sparse 50 GiB file named in a prompt is not read into memory.
+const MAX_FILE_PART_BYTES: u64 = 32 * 1024 * 1024;
 const SUPPORTED_MCP_RESOURCE_ATTACHMENT_MIMES: [&str; 5] = [
     "application/pdf",
     "image/gif",
@@ -131,6 +136,12 @@ pub struct PromptInput {
     pub system: Option<String>,
     pub variant: Option<String>,
     pub parts: Vec<PromptPartInput>,
+    /// Where the prompt comes from (alforria extension,
+    /// [`crate::session::caller`]): a request from the operator, a request
+    /// from a caller below `admin`, or the engine itself. Combined with the
+    /// session's own restriction in [`create_user_message`], where the
+    /// effective agent, tools and files are resolved.
+    pub caller: Caller,
 }
 
 // ---------------------------------------------------------------------------
@@ -217,6 +228,9 @@ pub struct PromptDeps<'a> {
     pub lsp: &'a dyn LspServer,
     pub images: &'a dyn ImageNormalizer,
     pub worktree: PathBuf,
+    /// The instance directory: with `worktree`, the project a restricted
+    /// caller's file parts are confined to.
+    pub directory: PathBuf,
     pub now_ms: u64,
 }
 
@@ -228,6 +242,9 @@ pub enum PromptError {
     Session(#[from] SessionError),
     #[error("{message}")]
     Unknown { message: String },
+    /// The caller may not do this ([`crate::session::caller::Caller`]).
+    #[error("{message}")]
+    Forbidden { message: String },
 }
 
 /// `NamedError.Unknown` — published as
@@ -467,7 +484,7 @@ fn is_file_name_char(c: char) -> bool {
 }
 
 /// All `matchAll` captures of `FILE_REGEX` — the group-1 strings, in order.
-fn file_matches(template: &str) -> Vec<String> {
+pub fn file_matches(template: &str) -> Vec<String> {
     let chars: Vec<(usize, char)> = template.char_indices().collect();
     let mut out = Vec::new();
     let mut idx = 0;
@@ -541,12 +558,116 @@ pub fn resolve_prompt_parts(
 /// permission check, which is right for what the user typed and wrong for
 /// the model: `@~/.ssh/id_rsa` would hand it any file. With `confine`, only
 /// files inside the project are attached; the mention stays in the text and
-/// the agent can read the file with its own tools and permissions.
+/// the agent can read the file with its own tools and permissions. An
+/// `@agent` mention stays text too: an agent part lets the turn start that
+/// agent with no `task` ask, as the user's own choice, and the model is not
+/// the user.
+///
+/// This is the project boundary only. The engine's seam is
+/// [`resolve_model_prompt_parts`], which also asks the session's policy.
 pub fn resolve_prompt_parts_within(
     agents: &AgentRegistry,
     worktree: &Path,
     template: &str,
     confine: Option<&crate::tool::def::InstanceContext>,
+) -> Vec<PromptPartInput> {
+    resolve_mentions(agents, worktree, template, confine, &mut |_| true)
+}
+
+/// The parts of a prompt the model wrote for `agent`'s turn in
+/// `session_id` (a subagent's, a workflow agent's): the text, and a file
+/// part for each mention the agent could have read itself.
+///
+/// - Inside the project ([`resolve_prompt_parts_within`]).
+/// - Allowed by the session's policy
+///   ([`crate::session::store::SessionStore::policy`]) for `read` on the
+///   path, as the `read` tool would ask it. An `ask` is not an allow: the
+///   mention stays text, and the agent's own `read` asks. An agent that is
+///   not registered has no policy, and nothing is attached.
+/// - Marked like a `read` result: an attached file from the upload area
+///   sets `SessionMark::OutsideContent` on `session_id` before the prompt
+///   that carries it is made
+///   ([`crate::session::store::SessionStore::note_tool_result`]).
+///
+/// No `@agent` mention becomes an agent part.
+pub fn resolve_model_prompt_parts(
+    agents: &AgentRegistry,
+    sessions: &crate::session::store::SessionStore,
+    instance: &crate::tool::def::InstanceContext,
+    session_id: &str,
+    agent: &str,
+    template: &str,
+) -> Result<Vec<PromptPartInput>, crate::session::error::SessionError> {
+    use alforria_schema::permission_v1::PermissionV1Action;
+    let policy = agents
+        .get(agent)
+        .map(|found| sessions.policy(session_id, &found.permission));
+    let mut failed = None;
+    let mut admit = |filepath: &Path| {
+        let Some(policy) = &policy else {
+            return false;
+        };
+        let pattern = crate::tool::ripgrep::ts_relative(&instance.worktree, filepath);
+        if policy.evaluate("read", &pattern).action != PermissionV1Action::Allow {
+            return false;
+        }
+        // What the `read` tool reports for the call, and the marking
+        // decision its result gets.
+        let call = format!("mention:{}", filepath.display());
+        let input = serde_json::json!({ "filePath": filepath.to_string_lossy() });
+        sessions.report_returned_paths(
+            session_id,
+            &call,
+            "read",
+            &input,
+            crate::tool::outside::ReturnedPaths {
+                searched: filepath.to_path_buf(),
+                files: Some(vec![filepath.to_path_buf()]),
+            },
+        );
+        let noted = sessions.note_tool_result(
+            session_id,
+            &crate::tool::outside::ToolResult {
+                call_id: Some(&call),
+                tool: "read",
+                external: false,
+                input: &input,
+                metadata: None,
+                output: "",
+            },
+        );
+        match noted {
+            Ok(()) => true,
+            // Content is not attached in a session that could not be
+            // marked for it.
+            Err(error) => {
+                failed.get_or_insert(error);
+                false
+            }
+        }
+    };
+    let parts = resolve_mentions(
+        agents,
+        &instance.worktree,
+        template,
+        Some(instance),
+        &mut admit,
+    );
+    match failed {
+        Some(error) => Err(error),
+        None => Ok(parts),
+    }
+}
+
+/// The text, and a part per mention. `confine`: the prompt is the model's
+/// — a file outside that project is not attached, nor one `admit` refuses,
+/// and no agent part is made.
+fn resolve_mentions(
+    agents: &AgentRegistry,
+    worktree: &Path,
+    template: &str,
+    confine: Option<&crate::tool::def::InstanceContext>,
+    admit: &mut dyn FnMut(&Path) -> bool,
 ) -> Vec<PromptPartInput> {
     let mut parts = vec![PromptPartInput::Text {
         id: None,
@@ -573,6 +694,9 @@ pub fn resolve_prompt_parts_within(
             continue;
         }
         let Ok(stat) = std::fs::metadata(&filepath) else {
+            if confine.is_some() {
+                continue;
+            }
             if let Some(found) = agents.get(&name) {
                 parts.push(PromptPartInput::Agent {
                     id: None,
@@ -582,6 +706,9 @@ pub fn resolve_prompt_parts_within(
             }
             continue;
         };
+        if confine.is_some() && !admit(&filepath) {
+            continue;
+        }
         parts.push(PromptPartInput::File {
             id: None,
             mime: if stat.is_dir() {
@@ -676,6 +803,41 @@ pub async fn create_user_message(
     deps: &PromptDeps<'_>,
     input: &PromptInput,
 ) -> Result<CreateUserMessage, PromptError> {
+    // alforria extension: ids are upserts. A message or part id of the
+    // caller's choosing could name one that already exists and replace it —
+    // a tool result, an earlier answer. A caller below `admin` does not
+    // choose ids; the server assigns them.
+    //
+    // What binds this turn: the caller of the request, and the session's
+    // own restriction — which is what binds a turn nobody is requesting.
+    let session_restricted = deps.sessions.is_restricted(&input.session_id)?;
+    input
+        .caller
+        .may_act_on(session_restricted)
+        .map_err(|message| PromptError::Forbidden { message })?;
+    let bounds = input.caller.bounds(session_restricted);
+    // alforria extension: a file a caller below `admin` sends with a prompt
+    // is outside content (`SessionMark::OutsideContent`): the operator did
+    // not pick it. Marked before the message exists.
+    if matches!(input.caller, Caller::Restricted)
+        && input
+            .parts
+            .iter()
+            .any(|part| matches!(part, PromptPartInput::File { .. }))
+    {
+        deps.sessions.mark(
+            &input.session_id,
+            crate::session::store::SessionMark::OutsideContent,
+        )?;
+    }
+    let assigned;
+    let input = if bounds.restricted && bounds.from_request {
+        assigned = without_caller_ids(input);
+        &assigned
+    } else {
+        input
+    };
+
     // 641-651 — agent resolution.
     let agent_name = input.agent.as_deref();
     let ag = match agent_name {
@@ -706,6 +868,52 @@ pub async fn create_user_message(
                 message: err.to_string(),
             })?,
     };
+
+    // alforria extension: what a restricted turn may be, judged on the
+    // values it will actually use — the agent just resolved (whether the
+    // request, the session or the default named it), the session being
+    // prompted, the tools map and the parts as they will be stored —
+    // before anything is written.
+    if bounds.restricted {
+        let forbid = |message: String| PromptError::Forbidden { message };
+        let child = deps.sessions.get(&input.session_id)?.parent_id.is_some();
+        // A subagent's session is driven by its parent's turn (the task
+        // tool, under the parent's `task` permission), not by a request.
+        if child && bounds.from_request {
+            return Err(forbid(
+                "a subagent's session may not be prompted directly here".to_string(),
+            ));
+        }
+        // The agent of the turn. Only the engine's own run of a subagent
+        // in its child session is exempt: there the task tool chose it.
+        if !(child && !bounds.from_request) {
+            bounds.check_agent(&ag).map_err(forbid)?;
+        }
+        bounds.check_tools(input.tools.as_ref()).map_err(forbid)?;
+        for part in &input.parts {
+            match part {
+                // An agent part makes the turn skip the `task` permission
+                // ask for that agent (`bypass_agent_check`); a subtask part
+                // starts a subagent with an agent, model and command of
+                // the sender's choosing. From a request, neither. The
+                // engine's own (a command's configured subtask) pass.
+                PromptPartInput::Agent { .. } if bounds.from_request => {
+                    return Err(forbid(
+                        "an agent part is not allowed in this session".to_string(),
+                    ))
+                }
+                PromptPartInput::Subtask { .. } if bounds.from_request => {
+                    return Err(forbid(
+                        "a subtask may not be started directly in this session".to_string(),
+                    ))
+                }
+                PromptPartInput::File { url, source, .. } => {
+                    check_restricted_file(deps, bounds, url, source).map_err(forbid)?
+                }
+                _ => {}
+            }
+        }
+    }
 
     // 653-663 — model resolution + variant fallback.
     let model = match (&input.model, &ag.model) {
@@ -887,6 +1095,7 @@ async fn exec_read(
     agent: &str,
     args: Value,
     extra_model: Option<Value>,
+    read_guard: Option<std::sync::Arc<crate::protect::WriteGuard>>,
 ) -> Result<ExecuteResult, String> {
     let ask = NoopAsk;
     let extra = Extra {
@@ -894,6 +1103,7 @@ async fn exec_read(
         bypass_agent_check: false,
         bypass_agents: Vec::new(),
         model: extra_model,
+        returned_paths: Default::default(),
     };
     let ctx = ToolCtxRef {
         session_id,
@@ -906,6 +1116,9 @@ async fn exec_read(
         instance: &crate::tool::def::InstanceContext {
             directory: deps.worktree.clone(),
             worktree: deps.worktree.clone(),
+            // A guarded session's attachment is read as its `read` tool
+            // reads: judged, and opened where it was judged.
+            write_guard: read_guard,
         },
         ask: &ask,
         metadata: &ask,
@@ -913,6 +1126,47 @@ async fn exec_read(
     (deps.read.execute)(args, ctx)
         .await
         .map_err(|err| err.to_string())
+}
+
+/// `input` with every caller-chosen message and part id dropped.
+fn without_caller_ids(input: &PromptInput) -> PromptInput {
+    let mut input = input.clone();
+    input.message_id = None;
+    for part in &mut input.parts {
+        match part {
+            PromptPartInput::Text { id, .. }
+            | PromptPartInput::File { id, .. }
+            | PromptPartInput::Agent { id, .. }
+            | PromptPartInput::Subtask { id, .. } => *id = None,
+        }
+    }
+    input
+}
+
+/// What a file part from a restricted caller may be: inline data, or a
+/// `file:` URL inside the project. Anything that would make the server (or
+/// the provider, on its behalf) fetch from somewhere of the caller's
+/// choosing — an MCP resource, `http(s):`, any other scheme — is refused.
+fn check_restricted_file(
+    deps: &PromptDeps<'_>,
+    bounds: crate::session::caller::Bounds,
+    url: &str,
+    source: &Option<V1FilePartSource>,
+) -> Result<(), String> {
+    if !bounds.restricted {
+        return Ok(());
+    }
+    if matches!(source, Some(V1FilePartSource::Resource { .. })) {
+        return Err("this token may not attach an MCP resource".to_string());
+    }
+    // Exactly the two spellings the resolver below acts on; any other
+    // (another scheme, another case, a bare path) is not something this
+    // caller gets to hand to the server or the provider.
+    match url.split(':').next().unwrap_or_default() {
+        "data" => Ok(()),
+        "file" => bounds.check_read(&file_url_to_path(url), &deps.directory, &deps.worktree),
+        _ => Err("this token may only attach inline data or files inside the project".to_string()),
+    }
 }
 
 /// `resolvePart` (prompt.ts:699-993): one input part to resolved parts.
@@ -1125,6 +1379,51 @@ async fn resolve_file_part(
         // 819-970 — file: URLs.
         ("file", _) => {
             let filepath = file_url_to_path(url);
+            // The read itself: a restricted caller's path is judged here,
+            // on the path about to be opened, whatever produced the part —
+            // and what is opened below is the resolved path that was
+            // judged, not the spelling again.
+            let filepath = input
+                .caller
+                .bounds(deps.sessions.is_restricted(session_id)?)
+                .judged_read(&filepath, &deps.directory, &deps.worktree)
+                .map_err(|message| PromptError::Forbidden { message })?;
+            // A guarded session — restricted, or one outside input started
+            // a run in — is attached nothing from the host's own locations,
+            // as its `read` tool is refused them (`protect`).
+            // What is read from here on is the resolved path that was
+            // judged, opened as judged (`read_guard`, `open_read_at`): a
+            // link swapped into the spelling afterwards changes nothing.
+            let guarded = deps.sessions.runs_restricted(session_id);
+            let filepath = if guarded {
+                let absolute = if filepath.is_absolute() {
+                    filepath.clone()
+                } else {
+                    deps.directory.join(&filepath)
+                };
+                match deps.agents.protected().judge_read(&absolute) {
+                    Ok(resolved) => resolved,
+                    Err(refusal) => {
+                        return Err(PromptError::Forbidden {
+                            message: format!(
+                                "{}. This session is restricted or was started by outside \
+                                 input, so nothing there is attached to it.",
+                                refusal.reason
+                            ),
+                        })
+                    }
+                }
+            } else {
+                filepath
+            };
+            // The guard the read tool runs under for this part.
+            let read_guard = guarded.then(|| {
+                std::sync::Arc::new(crate::protect::WriteGuard {
+                    protected: deps.agents.protected(),
+                    policy: ag.permission.clone(),
+                    worktree: deps.worktree.clone(),
+                })
+            });
             let part_mime = if filepath.is_dir() {
                 "application/x-directory".to_string()
             } else {
@@ -1197,6 +1496,7 @@ async fn resolve_file_part(
                     &agent,
                     args_value,
                     Some(full_value),
+                    read_guard.clone(),
                 )
                 .await
                 {
@@ -1250,7 +1550,17 @@ async fn resolve_file_part(
                 let (args_text, args_value) =
                     json_read_args(&filepath.to_string_lossy(), None, None);
                 let agent = input.agent.as_deref().unwrap_or(&ag.name).to_string();
-                match exec_read(deps, session_id, message_id, &agent, args_value, None).await {
+                match exec_read(
+                    deps,
+                    session_id,
+                    message_id,
+                    &agent,
+                    args_value,
+                    None,
+                    read_guard.clone(),
+                )
+                .await
+                {
                     Err(message) => {
                         publish_session_error(deps, session_id, &message)?;
                         return Ok(vec![synthetic_text(
@@ -1287,9 +1597,27 @@ async fn resolve_file_part(
             }
 
             // 939-970 — other mimes: inline base64 data URL.
-            let bytes = std::fs::read(&filepath).map_err(|err| PromptError::Unknown {
-                message: err.to_string(),
-            })?;
+            // Opened without waiting (a FIFO would park the worker for
+            // ever) and read off the async workers: a regular file, of a
+            // size a message can carry.
+            let bytes = {
+                let opened = filepath.clone();
+                tokio::task::spawn_blocking(move || {
+                    let file = match guarded {
+                        true => crate::protect::open_read_at(&opened),
+                        false => crate::beneath::open_nonblocking(&opened),
+                    }
+                    .map_err(crate::beneath::ReadRegularError::Io)?;
+                    crate::beneath::read_regular(file, MAX_FILE_PART_BYTES)
+                })
+                .await
+                .map_err(|join| PromptError::Unknown {
+                    message: join.to_string(),
+                })?
+                .map_err(|err| PromptError::Unknown {
+                    message: format!("{}: {err}", filepath.display()),
+                })?
+            };
             return Ok(vec![
                 synthetic_text(
                     session_id,
@@ -1334,7 +1662,7 @@ fn resolve_agent_part(
     let PromptPartInput::Agent { id, name, source } = part else {
         unreachable!("checked by caller");
     };
-    let perm = evaluate("task", name, &[&ag.permission]);
+    let perm = ag.permission.evaluate("task", name);
     let hint = if perm.action == alforria_schema::permission_v1::PermissionV1Action::Deny {
         " . Invoked by user; guaranteed to exist."
     } else {
@@ -1546,7 +1874,7 @@ mod tests {
                     name: "build".to_string(),
                     description: None,
                     mode: crate::tool::def::AgentMode::Primary,
-                    permission: Vec::new(),
+                    permission: Vec::new().into(),
                 })
             })
         }
@@ -1669,6 +1997,7 @@ mod tests {
         lsp: &'a dyn LspServer,
     ) -> PromptDeps<'a> {
         PromptDeps {
+            directory: std::path::PathBuf::from("/"),
             events: &h.services.events,
             sessions: &h.services.sessions,
             agents: &h.services.agents,
@@ -1684,6 +2013,7 @@ mod tests {
 
     fn input(session_id: &str, parts: Vec<PromptPartInput>) -> PromptInput {
         PromptInput {
+            caller: Caller::Operator,
             session_id: session_id.to_string(),
             message_id: Some("msg_user".to_string()),
             model: Some(ModelRef {
@@ -1901,6 +2231,7 @@ mod tests {
         let instance = crate::tool::def::InstanceContext {
             directory: worktree.clone(),
             worktree: worktree.clone(),
+            write_guard: None,
         };
         let template = format!("@inside.txt @{} @link.txt @../secret.txt", secret.display());
         let files = |confine| {
@@ -1915,6 +2246,147 @@ mod tests {
         assert_eq!(files(Some(&instance)), vec!["inside.txt".to_string()]);
         // What the user typed is attached as before.
         assert!(files(None).len() > 1);
+    }
+
+    /// The parts a model-written prompt resolves to for the default
+    /// subagent in a fresh session, and that session's id.
+    fn model_prompt(h: &Harness, template: &str) -> (String, Vec<PromptPartInput>) {
+        let session = session_id(h);
+        let instance = crate::tool::def::InstanceContext {
+            directory: h.worktree.clone(),
+            worktree: h.worktree.clone(),
+            write_guard: None,
+        };
+        let parts = resolve_model_prompt_parts(
+            &h.services.agents,
+            &h.services.sessions,
+            &instance,
+            &session,
+            "general",
+            template,
+        )
+        .unwrap();
+        (session, parts)
+    }
+
+    fn attached(parts: &[PromptPartInput]) -> Vec<String> {
+        parts
+            .iter()
+            .filter_map(|part| match part {
+                PromptPartInput::File { filename, .. } => filename.clone(),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A mention in a prompt the model wrote attached the file by reading
+    /// it with no permission asked: `@.env` handed a subagent what its
+    /// `read` rule (`*.env`: ask, by default; or a deny) keeps from its
+    /// own `read` tool. Only a file the session's policy allows the agent
+    /// to read is attached; the mention stays in the text.
+    #[test]
+    fn a_model_written_mention_is_attached_only_if_the_policy_allows_the_read() {
+        use alforria_schema::permission_v1::{PermissionV1Action, PermissionV1Rule};
+        let h = harness("prompt-model-mention-policy");
+        std::fs::write(h.worktree.join(".env"), "KEY=1").unwrap();
+        std::fs::write(h.worktree.join("notes.txt"), "n").unwrap();
+        std::fs::write(h.worktree.join("private.txt"), "p").unwrap();
+        let template = "Summarise @.env and @notes.txt and @private.txt";
+        let (_, parts) = model_prompt(&h, template);
+        assert_eq!(
+            attached(&parts),
+            ["notes.txt", "private.txt"],
+            "ask: not attached"
+        );
+        assert!(
+            matches!(&parts[0], PromptPartInput::Text { text, .. } if text == template),
+            "the mention stays in the text"
+        );
+
+        // A deny among the session's own rules (a subagent inherits its
+        // parent's) is read too: the policy is the session's.
+        let session = session_id(&h);
+        h.services
+            .sessions
+            .set_permission(
+                &session,
+                vec![PermissionV1Rule {
+                    permission: "read".to_string(),
+                    pattern: "private.txt".to_string(),
+                    action: PermissionV1Action::Deny,
+                }],
+            )
+            .unwrap();
+        let instance = crate::tool::def::InstanceContext {
+            directory: h.worktree.clone(),
+            worktree: h.worktree.clone(),
+            write_guard: None,
+        };
+        let parts = resolve_model_prompt_parts(
+            &h.services.agents,
+            &h.services.sessions,
+            &instance,
+            &session,
+            "general",
+            template,
+        )
+        .unwrap();
+        assert_eq!(attached(&parts), ["notes.txt"]);
+        // An agent that does not exist has no policy to allow anything.
+        let parts = resolve_model_prompt_parts(
+            &h.services.agents,
+            &h.services.sessions,
+            &instance,
+            &session,
+            "no-such-agent",
+            template,
+        )
+        .unwrap();
+        assert_eq!(attached(&parts), Vec::<String>::new());
+    }
+
+    /// A file from the upload area attached through a model-written
+    /// mention marks the session it is attached in, as the `read` tool's
+    /// result would: it used to arrive in the subagent unmarked, so neither
+    /// the subagent nor (through it) its parent was marked.
+    #[test]
+    fn a_model_written_mention_of_an_uploaded_file_marks_the_session() {
+        use crate::session::store::SessionMark;
+        let h = harness("prompt-model-mention-upload");
+        h.services
+            .sessions
+            .set_upload_directories(vec!["uploads".to_string()]);
+        std::fs::create_dir_all(h.worktree.join("uploads")).unwrap();
+        std::fs::write(h.worktree.join("uploads/x.txt"), "from a client").unwrap();
+        std::fs::write(h.worktree.join("notes.txt"), "n").unwrap();
+        let marked = |session: &str| {
+            h.services
+                .sessions
+                .has_mark(session, SessionMark::OutsideContent)
+                .unwrap()
+        };
+        let (session, parts) = model_prompt(&h, "Read @notes.txt");
+        assert_eq!(attached(&parts), ["notes.txt"]);
+        assert!(!marked(&session), "a project file does not mark");
+        let (session, parts) = model_prompt(&h, "Read @uploads/x.txt");
+        assert_eq!(attached(&parts), ["uploads/x.txt"]);
+        assert!(marked(&session), "an uploaded file does");
+    }
+
+    /// `@agent` in what the user typed becomes an agent part, which lets
+    /// the turn start that agent without the `task` ask and as the user's
+    /// choice. In a prompt the model wrote it is text.
+    #[test]
+    fn a_model_written_mention_of_an_agent_stays_text() {
+        let h = harness("prompt-model-mention-agent");
+        let (_, parts) = model_prompt(&h, "ask @plan and @build");
+        assert_eq!(parts.len(), 1, "{parts:?}");
+        assert!(
+            matches!(&parts[0], PromptPartInput::Text { text, .. } if text == "ask @plan and @build")
+        );
+        // What the user typed resolves as before.
+        let typed = resolve_prompt_parts(&h.services.agents, &h.worktree, "ask @plan");
+        assert!(matches!(&typed[1], PromptPartInput::Agent { name, .. } if name == "plan"));
     }
 
     // ------------------------------------------------------------------

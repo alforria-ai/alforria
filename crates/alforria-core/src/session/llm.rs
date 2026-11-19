@@ -34,7 +34,6 @@ use serde_json::Value;
 use crate::session::agents::AgentInfo;
 use crate::session::store::INSTALLATION_VERSION;
 use crate::tool::def::BoxFuture;
-use crate::tool::permission::{disabled as permission_disabled, merge as merge_rulesets};
 
 /// A provider event stream (TS `Stream.Stream<LLMEvent, unknown>`).
 pub type LlmEventStream = futures::stream::BoxStream<'static, Result<LlmEvent, LlmError>>;
@@ -59,6 +58,13 @@ pub struct LlmModel {
     pub output_limit: f64,
     /// `RuntimeFlags.outputTokenMax`.
     pub output_token_max: Option<f64>,
+    /// What the model really is, when the config of the instance that
+    /// resolved it says so (`provider.<id>.models.<name>.family`, an
+    /// alforria extension): it decides the system prompt
+    /// (`system::provider_for_model`). Carried by the model, so one
+    /// project's config never names the family of another project's model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub family: Option<String>,
 }
 
 /// One executable session tool handed to the runtime (the ai-sdk `Tool`
@@ -299,13 +305,11 @@ pub struct PrepareInput<'a> {
 /// `resolveTools` (request.ts:208-214): drop tools denied by the merged
 /// ruleset and tools the user message turned off.
 pub fn resolve_tools(input: &PrepareInput<'_>) -> Vec<LlmTool> {
-    let mut rulesets = vec![input.agent.permission.as_ref()];
-    if let Some(permission) = input.permission {
-        rulesets.push(permission);
-    }
-    let merged = merge_rulesets(&rulesets);
     let names: Vec<&str> = input.tools.iter().map(|tool| tool.name.as_str()).collect();
-    let disabled = permission_disabled(&names, &merged);
+    let disabled = input
+        .agent
+        .permission
+        .disabled_with(&names, input.permission);
     input
         .tools
         .iter()
@@ -331,7 +335,9 @@ pub fn prepare(input: &PrepareInput<'_>) -> Prepared {
     let mut system_blocks: Vec<String> = Vec::new();
     match &input.agent.prompt {
         Some(prompt) => system_blocks.push(prompt.clone()),
-        None => system_blocks.extend(crate::session::system::provider(
+        None => system_blocks.extend(crate::session::system::provider_for_model(
+            input.model.family.as_deref(),
+            &input.model.id,
             &input.model.api_id,
             &input.model.provider_id,
         )),
@@ -468,6 +474,21 @@ pub trait LlmRequestSender: Send + Sync {
         let _ = cancel;
         self.send(request)
     }
+
+    /// [`Self::send_with_cancel`], with the number of times the transport
+    /// itself may retry a failed request. The session's retry policy
+    /// ([`crate::session::retry::Policy`]) sits above this and counts
+    /// attempts, not requests: a transport that retries on its own turns
+    /// each of the policy's attempts into several requests.
+    fn send_with_retries(
+        &self,
+        request: LlmRequest,
+        cancel: tokio_util::sync::CancellationToken,
+        retries: u32,
+    ) -> BoxFuture<'static, Result<LlmEventStream, LlmError>> {
+        let _ = retries;
+        self.send_with_cancel(request, cancel)
+    }
 }
 
 /// The production [`LlmStream`]: prepare the request, stream it through
@@ -488,8 +509,14 @@ impl LlmStreamImpl {
     fn stream_with_sender(&self, input: StreamInput) -> LlmEventStream {
         let sender = self.sender.clone();
         let request = build_request(sender.as_ref(), &input);
+        // The transport retries as often as the caller asked, and not at
+        // all when it did not say.
+        let retries = input.retries.unwrap_or(0);
         futures::stream::once(async move {
-            match sender.send(request).await {
+            match sender
+                .send_with_retries(request, tokio_util::sync::CancellationToken::new(), retries)
+                .await
+            {
                 Ok(stream) => dispatch_tool_calls(stream, input.tools),
                 Err(error) => futures::stream::once(async move { Err(error) }).boxed(),
             }
@@ -511,8 +538,11 @@ impl LlmStream for LlmStreamImpl {
     ) -> LlmEventStream {
         let sender = self.sender.clone();
         let request = build_request(sender.as_ref(), &input);
+        // The transport retries as often as the caller asked, and not at
+        // all when it did not say.
+        let retries = input.retries.unwrap_or(0);
         futures::stream::once(async move {
-            match sender.send_with_cancel(request, cancel).await {
+            match sender.send_with_retries(request, cancel, retries).await {
                 Ok(stream) => dispatch_tool_calls(stream, input.tools),
                 Err(error) => futures::stream::once(async move { Err(error) }).boxed(),
             }
@@ -668,7 +698,7 @@ enum Dispatch {
 /// (processor.ts:436), and the default ai-sdk runtime likewise delays
 /// `finish-step` until the step's tool results are in — so the step's
 /// `patch` part and the turn diff see the tools' file edits.
-fn dispatch_tool_calls(stream: LlmEventStream, tools: Vec<LlmTool>) -> LlmEventStream {
+pub fn dispatch_tool_calls(stream: LlmEventStream, tools: Vec<LlmTool>) -> LlmEventStream {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let state = Dispatch::Streaming {
         stream,

@@ -12,7 +12,6 @@
 
 use std::sync::Arc;
 
-use alforria_schema::permission_v1::PermissionV1Ruleset;
 use alforria_schema::session_v1::{V1Part, V1SessionInfo, V1ToolState};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -49,12 +48,18 @@ pub struct ResolveInput<'a> {
     pub prompt_ops: Arc<dyn TaskOps>,
     /// The loop's abort signal (TS `options.abortSignal`).
     pub cancel: CancellationToken,
+    /// The session is restricted or has seen outside content: its edit
+    /// tools refuse loader paths (`PermissionAdapter::loader_guard`).
+    pub guard_loader_paths: bool,
 }
 
 pub struct ResolveDeps {
     pub registry: ToolRegistry,
     pub permission: Arc<dyn AskPermission>,
     pub instance: InstanceContext,
+    /// What a guarded session's tools may not write
+    /// (`AgentRegistry::protected`).
+    pub protected: Arc<crate::protect::Protected>,
     pub clock: Arc<dyn Clock>,
     /// TS `yield* mcp.tools()` — the engine's MCP tool seam
     /// (tools.ts:389). `None` in unit tests.
@@ -125,23 +130,34 @@ pub async fn resolve(
         | alforria_schema::session_v1::V1Message::Assistant { id, .. } => id,
     }
     .to_string();
-    let ruleset = {
-        let mut merged = vec![input.agent.permission.as_ref()];
-        if let Some(permission) = input.session.permission.as_ref() {
-            merged.push(permission);
-        }
-        crate::tool::permission::merge(&merged)
-    };
-    let messages: Vec<Value> = input
-        .messages
-        .iter()
-        .map(|msg| {
-            serde_json::json!({
-                "info": msg.info,
-                "parts": msg.parts,
-            })
+    // The loop hands in the agent as this session is held to it
+    // (`SessionStore::policy`): its rules, the session's, the ceilings.
+    let ruleset = input.agent.permission.clone();
+    // A restricted or outside-input session's tools do not write what the
+    // loaders (or the server) read. The guard is always on for such a
+    // session and decides at each write, for the path being written
+    // (`InstanceContext::about_to_modify`); a grant is looked up there.
+    let write_guard = input.guard_loader_paths.then(|| {
+        Arc::new(crate::protect::WriteGuard {
+            protected: deps.protected.clone(),
+            policy: ruleset.clone(),
+            worktree: deps.instance.worktree.clone(),
         })
-        .collect();
+    });
+    // Shared by every tool's closure: one copy of the history, not one per
+    // tool.
+    let messages: Arc<Vec<Value>> = Arc::new(
+        input
+            .messages
+            .iter()
+            .map(|msg| {
+                serde_json::json!({
+                    "info": msg.info,
+                    "parts": msg.parts,
+                })
+            })
+            .collect(),
+    );
     let model_value = serde_json::to_value(input.model.clone()).unwrap_or(Value::Null);
 
     let mut tools: ResolvedTools = Vec::new();
@@ -151,6 +167,7 @@ pub async fn resolve(
         let instance = InstanceContext {
             directory: deps.instance.directory.clone(),
             worktree: deps.instance.worktree.clone(),
+            write_guard: write_guard.clone(),
         };
         let clock = deps.clock.clone();
         let agent_name = input.agent.name.clone();
@@ -185,6 +202,11 @@ pub async fn resolve(
                 let session_id = session_id.clone();
                 let message_id = message_id.clone();
                 Box::pin(async move {
+                    // alforria extension: whose tool this call runs, for
+                    // the marking of its result (`tool::outside`).
+                    if tool.external {
+                        processor.report_external_tool(&call_id);
+                    }
                     let ask = PermissionAdapter {
                         permission: permission.clone(),
                         session_id: session_id.clone(),
@@ -203,6 +225,7 @@ pub async fn resolve(
                         bypass_agent_check,
                         bypass_agents: bypass_agents.clone(),
                         model: Some(model_value.clone()),
+                        returned_paths: Default::default(),
                     };
                     let ctx = ToolCtxRef {
                         session_id: &session_id,
@@ -216,7 +239,19 @@ pub async fn resolve(
                         ask: &ask,
                         metadata: &sink,
                     };
-                    let result = match (tool.execute)(args, ctx).await {
+                    let input = args.clone();
+                    let executed = (tool.execute)(args, ctx).await;
+                    // alforria extension: a file tool's own report of what
+                    // it opened and returned, kept for when the processor
+                    // appends the result or the failure's message
+                    // (`SessionStore::note_tool_result`). A rejection is
+                    // not appended as a result, and needs none.
+                    if !matches!(executed, Err(crate::tool::error::ToolError::Rejected(_))) {
+                        if let Some(paths) = extra.returned_paths.take() {
+                            processor.report_returned_paths(&call_id, tool.id, &input, paths);
+                        }
+                    }
+                    let result = match executed {
                         Ok(result) => result,
                         // TS: the native runtime surfaces tool failures as
                         // a ToolFailure value carrying the error class
@@ -319,6 +354,11 @@ pub async fn resolve(
                     let processor = processor.clone();
                     let key = key.clone();
                     Box::pin(async move {
+                        // alforria extension: this call runs an MCP
+                        // server's tool, whatever its key spells: its
+                        // answer, and the text of its failure, are outside
+                        // content (`tool::outside::classify_result`).
+                        processor.report_external_tool(&call_id);
                         // TS: `ctx.ask({ permission: key, metadata: {},
                         // patterns: ["*"], always: ["*"] })`
                         // (tools.ts:422).
@@ -526,7 +566,7 @@ struct PermissionAdapter {
     session_id: String,
     message_id: String,
     call_id: String,
-    ruleset: PermissionV1Ruleset,
+    ruleset: crate::tool::permission::Policy,
 }
 
 impl Ask for PermissionAdapter {
@@ -809,6 +849,7 @@ mod mcp_tests {
         fn inject_background_result<'a>(
             &'a self,
             _parent_session_id: &'a str,
+            _child_session_id: &'a str,
             _variant: Option<&'a str>,
             _text: &'a str,
         ) -> futures::future::BoxFuture<'a, ()> {
@@ -886,6 +927,7 @@ mod mcp_tests {
                 "properties": {},
             }),
             format_validation_error: None,
+            external: false,
             execute: Arc::new(|_args, _ctx| {
                 Box::pin(async {
                     Ok(crate::tool::def::ExecuteResult {
@@ -905,6 +947,7 @@ mod mcp_tests {
                 "properties": {},
             }),
             format_validation_error: None,
+            external: false,
             execute: Arc::new(|_args, _ctx| {
                 Box::pin(async {
                     Ok(crate::tool::def::ExecuteResult {
@@ -930,12 +973,14 @@ mod mcp_tests {
             instance: crate::tool::def::InstanceContext {
                 directory: h.worktree.clone(),
                 worktree: h.worktree.clone(),
+                write_guard: None,
             },
             clock: Arc::new(crate::session::test_support::FixedClock),
             mcp: Some(mcp),
             truncate: Arc::new(crate::tool::truncate::TruncateService::default_limits(
                 std::env::temp_dir().join("opencode-mcp-tool-tests"),
             )),
+            protected: Default::default(),
         };
         let agent = h.services.agents.get("build").cloned().unwrap();
         let input = ResolveInput {
@@ -948,6 +993,7 @@ mod mcp_tests {
             bypass_agents: Vec::new(),
             prompt_ops: Arc::new(NoTaskOps),
             cancel: CancellationToken::new(),
+            guard_loader_paths: false,
         };
         let tools = resolve(&deps, input).await.expect("resolve succeeds");
         let tool = tools

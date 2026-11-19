@@ -34,6 +34,9 @@ use crate::sse::{GlobalBus, GlobalEvent, INSTANCE_DISPOSED_TYPE};
 pub struct AuthConfig {
     pub username: String,
     pub password: Option<String>,
+    /// Bearer authentication (alforria extension, `server.auth.bearer`):
+    /// static tokens and Ed25519 JWTs with scopes, next to Basic.
+    pub bearer: Option<Arc<crate::bearer::BearerAuth>>,
 }
 
 impl AuthConfig {
@@ -41,7 +44,21 @@ impl AuthConfig {
         AuthConfig {
             username: username.into(),
             password,
+            bearer: None,
         }
+    }
+
+    /// The same config, also accepting bearer credentials.
+    pub fn with_bearer(mut self, bearer: Option<Arc<crate::bearer::BearerAuth>>) -> AuthConfig {
+        self.bearer = bearer;
+        self
+    }
+
+    /// Whether Basic auth has a password to check (`auth.ts:24-26`).
+    pub fn password_required(&self) -> bool {
+        self.password
+            .as_ref()
+            .is_some_and(|password| !password.is_empty())
     }
 
     pub fn from_env() -> AuthConfig {
@@ -52,6 +69,7 @@ impl AuthConfig {
             username: std::env::var("OPENCODE_SERVER_USERNAME")
                 .unwrap_or_else(|_| "alforria".to_string()),
             password: std::env::var("OPENCODE_SERVER_PASSWORD").ok(),
+            bearer: None,
         }
     }
 
@@ -61,20 +79,25 @@ impl AuthConfig {
         uuid::Uuid::new_v4().simple().to_string()
     }
 
-    /// Auth is enforced only when the password is present *and* non-empty
-    /// (`auth.ts:24-26`).
+    /// Auth is enforced when the password is present *and* non-empty
+    /// (`auth.ts:24-26`), or when bearer authentication is configured.
     pub fn required(&self) -> bool {
-        match &self.password {
-            Some(password) => !password.is_empty(),
-            None => false,
-        }
+        self.password_required() || self.bearer.is_some()
     }
 
-    /// `authorized` (`auth.ts:22-28`).
+    /// `authorized` (`auth.ts:22-28`). An empty password never authorizes:
+    /// upstream only gets here with one set, but with bearer authentication
+    /// configured a request can reach this check without.
     pub fn authorized(&self, username: &str, password: &str) -> bool {
         match &self.password {
-            Some(expected) => username == self.username && password == expected,
-            None => false,
+            // Both compared, in full, whatever the first says: the time
+            // taken tells nothing about which was wrong or how nearly
+            // right (`&`, not `&&`).
+            Some(expected) if !expected.is_empty() => {
+                crate::bearer::secret_eq(username, &self.username)
+                    & crate::bearer::secret_eq(password, expected)
+            }
+            _ => false,
         }
     }
 
@@ -199,6 +222,14 @@ pub trait SessionEngine: Send + Sync {
     fn workflow_delete(&self, _name: String) -> Result<bool, ServerError> {
         Err(workflows_unavailable())
     }
+    /// The instance's triggers (alforria extension), when the engine has them.
+    fn triggers(&self) -> Option<Arc<alforria_core::trigger::TriggerService>> {
+        None
+    }
+    /// The instance's memory and the id of its project (alforria extension).
+    fn memory(&self) -> Option<(Arc<alforria_core::memory::MemoryService>, String)> {
+        None
+    }
 }
 
 fn workflows_unavailable() -> ServerError {
@@ -231,7 +262,12 @@ pub struct InstanceStore {
     /// Disposal emissions feed the GlobalBus (`disposeContext`,
     /// `instance-store.ts:78-93`).
     global_bus: Arc<Mutex<Option<GlobalBus>>>,
+    /// Run on every instance right after it boots (alforria extension):
+    /// host policy that lives on per-instance services is applied here.
+    on_boot: Arc<Mutex<Option<BootHook>>>,
 }
+
+type BootHook = Arc<dyn Fn(&SessionServices) + Send + Sync>;
 
 impl InstanceStore {
     pub fn new(factory: InstanceFactory) -> InstanceStore {
@@ -239,7 +275,13 @@ impl InstanceStore {
             factory,
             entries: Arc::new(Mutex::new(HashMap::new())),
             global_bus: Arc::new(Mutex::new(None)),
+            on_boot: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Run `hook` on every instance booted from now on.
+    pub fn set_on_boot(&self, hook: impl Fn(&SessionServices) + Send + Sync + 'static) {
+        *self.on_boot.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(hook));
     }
 
     /// The GlobalBus to emit `server.instance.disposed` events into — wired
@@ -279,6 +321,14 @@ impl InstanceStore {
             return Ok(existing.clone());
         }
         let services = (self.factory)(&directory)?;
+        let on_boot = self
+            .on_boot
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        if let Some(on_boot) = on_boot {
+            on_boot(&services);
+        }
         // M7.1: the instance bus feeds the global bus so per-instance
         // events reach `/global/event` and `/event` with their location
         // (`event-v2-bridge.ts:26-62`).
@@ -327,6 +377,9 @@ impl InstanceStore {
             .remove(&directory)
             .is_some();
         if removed {
+            // What the instance's config had the shell environment policy
+            // withhold stays withheld: its turns, terminals and MCP
+            // servers can outlive the cache entry (`shell_env::learn`).
             self.emit_disposed(&directory.display().to_string());
         }
     }
@@ -350,6 +403,17 @@ impl InstanceStore {
 /// `FSUtil.resolve` (`core/src/fs-util.ts:247-258`): `path.resolve` against
 /// the process cwd, then realpath normalization; a directory that does not
 /// exist keeps its lexically normalized form.
+///
+/// This names an instance — the cache key, the directory in events, what a
+/// handler acts in — exactly as upstream does, and every caller without a
+/// confined credential depends on that (a directory that does not exist
+/// yet opens under its spelling). It is *not* a statement of where the
+/// kernel lands a spelling: `..` is folded before links are read, and a
+/// path that does not canonicalise keeps the links in it. No confinement
+/// decision may rest on it alone; the directory allowlist
+/// (`policy::DirectoryAllowlist::allows`) and the project boundary
+/// (`confine::project_roots`) resolve its answer with
+/// `alforria_core::protect::resolve_path`.
 pub fn resolve_directory(p: &Path) -> PathBuf {
     let resolved = if p.is_absolute() {
         lexical_normalize(p)
@@ -372,7 +436,7 @@ pub fn cwd() -> PathBuf {
 
 /// `path.resolve`-style lexical normalization — collapse `.`/`..` without
 /// touching the filesystem; `..` above the root clamps to the root.
-fn lexical_normalize(path: &Path) -> PathBuf {
+pub(crate) fn lexical_normalize(path: &Path) -> PathBuf {
     let mut parts: Vec<OsString> = Vec::new();
     let mut root = PathBuf::new();
     for component in path.components() {
@@ -1270,8 +1334,14 @@ impl Default for ProviderAuthService {
 }
 
 impl ProviderAuthService {
+    /// A service that reaches nothing: its LibertAI endpoints are
+    /// [`Endpoints::offline`](alforria_core::libertai::auth::Endpoints::offline)
+    /// with no session file to read. The process entry point installs the
+    /// real one ([`ProviderAuthService::with_libertai`]).
     pub fn new() -> ProviderAuthService {
-        ProviderAuthService::with_libertai(alforria_core::libertai::auth::Endpoints::from_env())
+        ProviderAuthService::with_libertai(alforria_core::libertai::auth::Endpoints::offline(
+            PathBuf::new(),
+        ))
     }
 
     /// A service whose LibertAI sign-in talks to `endpoints`.
@@ -1420,11 +1490,16 @@ impl alforria_core::catalog::Fetcher for NeverFetch {
     }
 }
 
-pub fn default_catalog() -> CatalogSource {
-    let paths = alforria_core::GlobalPaths::from_env();
+/// The catalog read from `cache`: a context built over explicit paths (a
+/// test's temporary ones) reads its own cache, not the user's. The built-in
+/// `libertai` provider is merged from `libertai` when the catalog has none.
+pub fn catalog_in(
+    cache: PathBuf,
+    libertai: alforria_core::libertai::LibertaiCatalog,
+) -> CatalogSource {
     let cfg = alforria_core::CatalogConfig::from_env();
     let service = alforria_core::CatalogService::new(
-        paths.cache,
+        cache,
         alforria_core::CatalogConfig {
             disable_fetch: true,
             ..cfg
@@ -1432,7 +1507,30 @@ pub fn default_catalog() -> CatalogSource {
         Arc::new(alforria_core::catalog::SystemClock),
         Arc::new(NeverFetch),
     );
-    Arc::new(move || service.get())
+    Arc::new(move || {
+        let mut providers = service.get()?;
+        libertai.merge(&mut providers);
+        Ok(providers)
+    })
+}
+
+/// `source`, with every read teaching the shell environment policy the
+/// variables the catalog's providers read their keys from
+/// (`alforria_core::shell_env::learn_catalog`): a provider that appears in
+/// the catalog after the server started is covered too. These are the
+/// names of every provider, used or not, and only a restricted server
+/// withholds them on that account; which of them a standalone server
+/// withholds is taught where the providers in use are known
+/// (`provider::learn_catalog_names`).
+pub fn learning_catalog(source: CatalogSource) -> CatalogSource {
+    Arc::new(move || {
+        let providers = source()?;
+        alforria_core::shell_env::learn_catalog(
+            providers.values().flat_map(|provider| provider.env.iter()),
+            false,
+        );
+        Ok(providers)
+    })
 }
 
 /// SSE heartbeat intervals. TS bakes `Stream.tick("10 seconds")` /
@@ -1548,6 +1646,24 @@ pub struct ServerContext {
     /// The worktree service (`worktree/index.ts`) + its dependencies.
     pub worktree: alforria_core::worktree::Worktree,
     pub worktree_deps: Arc<dyn alforria_core::worktree::Deps>,
+    /// Stops what the engines run by themselves (trigger schedulers,
+    /// transcript indexers). Called first in a shutdown, so nothing new
+    /// starts while the running turns are settled.
+    pub stop_background: Arc<dyn Fn() + Send + Sync>,
+    /// How many turns the background services have committed to that may
+    /// not have reached their session yet: after `stop_background`, a
+    /// shutdown waits for these to show up (or end) before it takes the
+    /// running turns to be all there are.
+    pub background_in_flight: Arc<dyn Fn() -> usize + Send + Sync>,
+    /// The global directories this context was built over, and the only
+    /// ones a handler may use: nothing behind a request resolves them from
+    /// the environment. The production context pins the ones it was given;
+    /// a context built without any ([`ServerContext::new`]) gets detached
+    /// temporary ones, so it never reads or writes the user's own.
+    pub paths: alforria_core::GlobalPaths,
+    /// Keeps the detached directories of [`ServerContext::new`] until the
+    /// last clone of the context drops.
+    pub detached_paths: Option<Arc<alforria_core::paths::DetachedPaths>>,
     /// `Skill.Service` status list.
     pub skills: Arc<dyn StatusSeam>,
     /// `LSP.Service.status`.
@@ -1577,6 +1693,14 @@ pub struct ServerContext {
     /// `Project.Service` (M7.1) — the project registry over the shared
     /// storage; its `project.updated` emissions feed the GlobalBus.
     pub projects: Arc<alforria_core::project::registry::ProjectRegistry>,
+    /// The unattended-server settings from the host config (alforria
+    /// extension, `policy.rs`). Defaults everywhere outside production.
+    pub policy: Arc<crate::policy::ServerPolicy>,
+    /// Read tickets for single files (alforria extension, `ticket.rs`).
+    pub file_tickets: crate::ticket::FileTickets,
+    /// Webhook deliveries (alforria extension, `outbox.rs`). Captures and
+    /// delivers nothing unless `hook.webhook` is configured.
+    pub outbox: Arc<crate::outbox::Outbox>,
 }
 
 impl ServerContext {
@@ -1621,6 +1745,10 @@ impl ServerContext {
             Arc::new(NoBackgroundJobs),
             Arc::new(alforria_core::catalog::SystemClock),
         );
+        let outbox = crate::outbox::Outbox::new(storage.clone(), None)
+            .expect("an outbox without hooks cannot fail");
+        let detached = alforria_core::GlobalPaths::detached();
+        let paths = detached.paths.clone();
         ServerContext {
             auth,
             instances,
@@ -1639,8 +1767,12 @@ impl ServerContext {
             auth_store: Arc::new(MemoryAuthStore::default()),
             vcs: Arc::new(NoVcs),
             worktree: alforria_core::worktree::Worktree::default(),
+            paths: paths.clone(),
+            detached_paths: Some(Arc::new(detached)),
+            stop_background: Arc::new(|| {}),
+            background_in_flight: Arc::new(|| 0),
             worktree_deps: Arc::new(WorktreeDeps {
-                data_dir: alforria_core::GlobalPaths::from_env().data,
+                data_dir: paths.data.clone(),
                 global_bus: global_bus_clone,
                 instances: instances_clone,
                 projects: projects.clone(),
@@ -1651,20 +1783,60 @@ impl ServerContext {
             tui: TuiControl::new(),
             tools: Arc::new(UnwiredTools),
             mcp: Arc::new(UnwiredMcp),
-            catalog: default_catalog(),
-            provider_auth: Arc::new(ProviderAuthService::new()),
+            catalog: catalog_in(
+                paths.cache.clone(),
+                alforria_core::libertai::LibertaiCatalog::offline(),
+            ),
+            provider_auth: Arc::new(ProviderAuthService::with_libertai(
+                alforria_core::libertai::auth::Endpoints::offline(
+                    paths.data.join("libertai-auth.json"),
+                ),
+            )),
             v2_permissions: Arc::new(crate::routes::v2::permission::PermissionRegistry::default()),
             pty_tickets: crate::pty::ticket::TicketCache::default(),
             hosts: crate::middleware::host::HostAllowlist::loopback(),
             ptys: crate::pty::PtyRegistry::default(),
             websockets: WebSocketTracker::default(),
             projects,
+            policy: Arc::new(crate::policy::ServerPolicy::default()),
+            file_tickets: crate::ticket::FileTickets::default(),
+            outbox,
         }
     }
 
     /// Context backed by an in-memory database and an instance factory that
     /// always fails — M6.1 routes never load instances; M6.3 replaces the
     /// factory.
+    /// See [`ServerContext::paths`].
+    pub fn global_paths(&self) -> alforria_core::GlobalPaths {
+        self.paths.clone()
+    }
+
+    /// Rebuild the context over `paths`: every default that was derived
+    /// from the detached ones follows (catalog cache, sign-in sidecar,
+    /// worktree base).
+    pub fn with_paths(mut self, paths: alforria_core::GlobalPaths) -> ServerContext {
+        alforria_core::paths::sandbox::guard(&paths, "ServerContext::with_paths");
+        self.catalog = catalog_in(
+            paths.cache.clone(),
+            alforria_core::libertai::LibertaiCatalog::offline(),
+        );
+        self.provider_auth = Arc::new(ProviderAuthService::with_libertai(
+            alforria_core::libertai::auth::Endpoints::offline(
+                paths.data.join("libertai-auth.json"),
+            ),
+        ));
+        self.worktree_deps = Arc::new(WorktreeDeps {
+            data_dir: paths.data.clone(),
+            global_bus: self.global_bus.clone(),
+            instances: self.instances.clone(),
+            projects: self.projects.clone(),
+        });
+        self.paths = paths;
+        self.detached_paths = None;
+        self
+    }
+
     pub fn for_tests() -> ServerContext {
         Self::for_tests_with_auth(AuthConfig::new("alforria", None))
     }
@@ -1846,6 +2018,8 @@ mod tests {
             data_dir: dir.path().to_path_buf(),
             tmp_dir: dir.path().to_path_buf(),
             home: dir.path().to_path_buf(),
+            host_config: None,
+            protected: None,
         };
         SessionServices::new(
             storage,
@@ -1867,6 +2041,44 @@ mod tests {
         }
         fn cancel(&self, _id: &str) -> Result<(), alforria_core::CoreError> {
             Ok(())
+        }
+    }
+
+    /// The Basic check compares the username and the password through the
+    /// constant-time comparison — both, whichever is wrong — and still
+    /// tells right from wrong.
+    #[test]
+    fn basic_credentials_are_compared_in_constant_time() {
+        let comparisons = || crate::bearer::COMPARISONS.with(std::cell::Cell::get);
+        let auth = AuthConfig {
+            username: "alforria".into(),
+            password: Some("hunter2".into()),
+            bearer: None,
+        };
+        for (username, password, expected) in [
+            ("alforria", "hunter2", true),
+            ("alforria", "hunter", false),
+            ("alforria", "hunter22", false),
+            ("alforria", "", false),
+            ("alforri", "hunter2", false),
+            ("", "hunter2", false),
+            ("x", "y", false),
+        ] {
+            let before = comparisons();
+            assert_eq!(
+                auth.authorized(username, password),
+                expected,
+                "{username}:{password}"
+            );
+            assert_eq!(comparisons() - before, 2, "{username}:{password}");
+        }
+        // No password, or an empty one, authorizes nobody.
+        for password in [None, Some(String::new())] {
+            let auth = AuthConfig {
+                password,
+                ..auth.clone()
+            };
+            assert!(!auth.authorized("alforria", ""));
         }
     }
 }

@@ -8,7 +8,7 @@
 
 use std::borrow::Cow;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -16,7 +16,6 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::tool::error::ToolError;
-use crate::tool::permission::Ruleset;
 use crate::tool::truncate::{Options, Truncate};
 
 /// Future alias — `futures::future::BoxFuture` without the `futures` dep
@@ -44,6 +43,11 @@ pub struct ToolDef {
     pub parameters: Value,
     pub format_validation_error: Option<FormatValidationError>,
     pub execute: ExecuteFn,
+    /// alforria extension: the tool is not one of the engine's own — a
+    /// plugin's, registered in the registry's custom slot
+    /// (`ToolRegistry::new` sets it). What it answers was written
+    /// elsewhere, whatever its id (`tool::outside::classify_result`).
+    pub external: bool,
 }
 
 impl std::fmt::Debug for ToolDef {
@@ -88,6 +92,10 @@ pub struct Extra {
     pub bypass_agents: Vec<String>,
     /// `extra.model` (websearch model name, spec M4.5).
     pub model: Option<Value>,
+    /// alforria extension: where `read`, `grep` and `glob` report what
+    /// they opened and returned, for the session's provenance mark
+    /// (`tool::outside::ReturnedPaths`). Not part of the result.
+    pub returned_paths: crate::tool::outside::ReturnedPathsSlot,
 }
 
 /// TS `InstanceState.context` (project/instance-context.ts:5-9).
@@ -95,6 +103,159 @@ pub struct Extra {
 pub struct InstanceContext {
     pub directory: PathBuf,
     pub worktree: PathBuf,
+    /// Set for a session that is restricted or that outside input started
+    /// (`SessionMark::OutsideStart`; not for one that has merely seen
+    /// outside content):
+    /// the guard its tools' writes go through (`protect::WriteGuard`).
+    /// `None`: no guard.
+    pub write_guard: Option<std::sync::Arc<crate::protect::WriteGuard>>,
+}
+
+impl InstanceContext {
+    /// **Every mutating file operation of a tool calls this with the path
+    /// it is about to create, overwrite, rename onto or delete**, as it
+    /// will pass it to the filesystem, before it does. Enforcement lives
+    /// here, at the write, and does not depend on what the tool put in a
+    /// permission ask; a grant is looked up here too, for this path.
+    ///
+    /// This is the check alone — what a tool uses to refuse a whole batch
+    /// before it applies any of it. The write itself goes through
+    /// [`InstanceContext::write_file`] or [`InstanceContext::remove_file`],
+    /// which judge again and, in a guarded session, write what they judged.
+    pub fn about_to_modify(&self, path: &Path) -> Result<(), ToolError> {
+        match &self.write_guard {
+            None => Ok(()),
+            Some(guard) => guard.check(path).map_err(ToolError::Permission),
+        }
+    }
+
+    /// **Every tool that returns a file's content, or searches a
+    /// directory, calls this with the path it is about to open**, before
+    /// it raises any ask: a guarded session does not read the host's own
+    /// locations (`protect::WriteGuard::admit_read`), and is not asked.
+    ///
+    /// The answer is the path to use for everything that follows — the
+    /// stat, the open ([`InstanceContext::open_for_read`]), the listing,
+    /// the walk: for a guarded session the resolved path that was judged,
+    /// so that a link swapped into the spelling afterwards changes nothing;
+    /// for any other session the path as given.
+    pub fn about_to_read(&self, path: &Path) -> Result<PathBuf, ToolError> {
+        match &self.write_guard {
+            None => Ok(path.to_path_buf()),
+            Some(guard) => guard.admit_read(path).map_err(ToolError::Permission),
+        }
+    }
+
+    /// Open the file at `judged` ([`InstanceContext::about_to_read`]'s
+    /// answer) for reading, without waiting on it (a FIFO opens at once
+    /// and is for the caller to refuse on the handle).
+    pub async fn open_for_read(&self, judged: &Path) -> std::io::Result<std::fs::File> {
+        let (guarded, judged) = (self.write_guard.is_some(), judged.to_path_buf());
+        tokio::task::spawn_blocking(move || match guarded {
+            true => crate::protect::open_read_at(&judged),
+            false => crate::beneath::open_nonblocking(&judged),
+        })
+        .await
+        .unwrap_or_else(|join| Err(std::io::Error::other(join.to_string())))
+    }
+
+    /// After a listing or a walk of `judged`: in a guarded session it must
+    /// still be the place that was judged — nothing on the way swapped for
+    /// a link since — and still one the session may read.
+    pub fn still_judged(&self, judged: &Path) -> Result<(), ToolError> {
+        let Some(guard) = &self.write_guard else {
+            return Ok(());
+        };
+        match guard.admit_read(judged) {
+            Ok(resolved) if resolved == judged => Ok(()),
+            Ok(_) => Err(ToolError::Permission(format!(
+                "{} changed while it was being read",
+                judged.display()
+            ))),
+            Err(reason) => Err(ToolError::Permission(reason)),
+        }
+    }
+
+    /// Whether a search result at `path` may be returned
+    /// ([`InstanceContext::about_to_read`]): a walk that started outside
+    /// a host location can still reach into one.
+    pub fn may_return(&self, path: &Path) -> bool {
+        self.about_to_read(path).is_ok()
+    }
+
+    /// Create or overwrite `path` with `contents`, creating its
+    /// directories: **the one way a tool writes a file.**
+    ///
+    /// Without a write guard this is `create_dir_all` and `write` on the
+    /// path as given, as it always was. With one, the guard judges where
+    /// the path lands and the write is made *there*, through the resolved
+    /// parent directory's handle with no link followed
+    /// (`protect::write_at`): there is no second lookup of the name between
+    /// the judgement and the write for a concurrent rename or link swap to
+    /// redirect.
+    pub async fn write_file(&self, path: &Path, contents: &[u8]) -> Result<(), ModifyError> {
+        let Some(guard) = &self.write_guard else {
+            if let Some(parent) = path.parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(|error| ModifyError::CreateDir(parent.to_path_buf(), error))?;
+            }
+            let (path, contents) = (path.to_path_buf(), contents.to_vec());
+            return tokio::task::spawn_blocking(move || {
+                crate::tool::bom::replace_file(&path, &contents)
+            })
+            .await
+            .unwrap_or_else(|join| Err(std::io::Error::other(join.to_string())))
+            .map_err(ModifyError::Io);
+        };
+        let landing = guard.admit(path).map_err(ModifyError::Refused)?;
+        let contents = contents.to_vec();
+        tokio::task::spawn_blocking(move || crate::protect::write_at(&landing, &contents))
+            .await
+            .unwrap_or_else(|join| Err(std::io::Error::other(join.to_string())))
+            .map_err(ModifyError::Io)
+    }
+
+    /// Remove the file `path`: the one way a tool deletes a file. Guarded
+    /// like [`InstanceContext::write_file`].
+    pub async fn remove_file(&self, path: &Path) -> Result<(), ModifyError> {
+        let Some(guard) = &self.write_guard else {
+            return tokio::fs::remove_file(path).await.map_err(ModifyError::Io);
+        };
+        let landing = guard.admit(path).map_err(ModifyError::Refused)?;
+        tokio::task::spawn_blocking(move || crate::protect::remove_at(&landing))
+            .await
+            .unwrap_or_else(|join| Err(std::io::Error::other(join.to_string())))
+            .map_err(ModifyError::Io)
+    }
+}
+
+/// Why [`InstanceContext::write_file`] or [`InstanceContext::remove_file`]
+/// did not go through. The caller words the I/O failures as it always did.
+#[derive(Debug)]
+pub enum ModifyError {
+    /// The write guard refused the path.
+    Refused(String),
+    /// A parent directory could not be created.
+    CreateDir(std::path::PathBuf, std::io::Error),
+    /// The write or the removal itself failed.
+    Io(std::io::Error),
+}
+
+impl ModifyError {
+    /// The tool error, with `io` wording a failed write or removal and
+    /// `create_dir` a failed directory creation.
+    pub fn into_tool_error(
+        self,
+        create_dir: impl FnOnce(&Path, &std::io::Error) -> String,
+        io: impl FnOnce(&std::io::Error) -> String,
+    ) -> ToolError {
+        match self {
+            ModifyError::Refused(reason) => ToolError::Permission(reason),
+            ModifyError::CreateDir(parent, error) => ToolError::Failed(create_dir(&parent, &error)),
+            ModifyError::Io(error) => ToolError::Failed(io(&error)),
+        }
+    }
 }
 
 /// `ctx.ask(...)` — permission requests flow through this seam; failures map
@@ -163,7 +324,7 @@ pub struct AgentInfo {
     pub name: String,
     pub description: Option<String>,
     pub mode: AgentMode,
-    pub permission: Ruleset,
+    pub permission: crate::tool::permission::Policy,
 }
 
 /// The `Agent.Service` seam (`agents.get` / `agents.list`).
@@ -259,6 +420,7 @@ where
         parameters,
         format_validation_error,
         execute: wrapped,
+        external: false,
     }
 }
 
@@ -326,7 +488,7 @@ mod tests {
                     name: "build".to_string(),
                     description: None,
                     mode: AgentMode::Primary,
-                    permission: Ruleset::new(),
+                    permission: Ruleset::new().into(),
                 })
             })
         }
@@ -385,6 +547,7 @@ mod tests {
         let instance = InstanceContext {
             directory: temp.path().to_path_buf(),
             worktree: temp.path().to_path_buf(),
+            write_guard: None,
         };
         let extra = Extra::default();
         let ctx = ctx(&ask, &instance, &extra);
@@ -424,6 +587,7 @@ mod tests {
         let instance = InstanceContext {
             directory: temp.path().to_path_buf(),
             worktree: temp.path().to_path_buf(),
+            write_guard: None,
         };
         let extra = Extra::default();
         let ctx = ctx(&ask, &instance, &extra);
@@ -461,6 +625,7 @@ mod tests {
         let instance = InstanceContext {
             directory: temp.path().to_path_buf(),
             worktree: temp.path().to_path_buf(),
+            write_guard: None,
         };
         let extra = Extra::default();
         let ctx = ctx(&ask, &instance, &extra);
@@ -503,6 +668,7 @@ mod tests {
         let instance = InstanceContext {
             directory: temp.path().to_path_buf(),
             worktree: temp.path().to_path_buf(),
+            write_guard: None,
         };
         let extra = Extra::default();
         let ctx = ctx(&ask, &instance, &extra);
@@ -540,6 +706,7 @@ mod tests {
         let instance = InstanceContext {
             directory: temp.path().to_path_buf(),
             worktree: temp.path().to_path_buf(),
+            write_guard: None,
         };
         let extra = Extra::default();
         let ctx = ctx(&ask, &instance, &extra);

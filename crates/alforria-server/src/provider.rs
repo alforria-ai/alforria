@@ -636,11 +636,7 @@ pub fn build_state(
                     .collect()
             })
             .unwrap_or_default();
-        let api_key = env
-            .iter()
-            .filter_map(|name| std::env::var(name).ok())
-            .find(|value| !value.is_empty());
-        let Some(api_key) = api_key else {
+        let Some(api_key) = env_key(&env) else {
             continue;
         };
         let mut patch = json!({"source": "env"});
@@ -684,6 +680,97 @@ pub fn build_state(
     Ok(state)
 }
 
+/// `isProviderAllowed` (provider.ts:1410-1413): `enabled_providers` when
+/// set, minus `disabled_providers`.
+fn allowed(config: &Config, id: &str) -> bool {
+    if let Some(enabled) = &config.enabled_providers {
+        if !enabled.iter().any(|item| item == id) {
+            return false;
+        }
+    }
+    !config
+        .disabled_providers
+        .iter()
+        .flatten()
+        .any(|item| item == id)
+}
+
+/// The first of a provider's `env` variables that is set and not empty:
+/// the key a provider is connected with from the environment
+/// (provider.ts:1583-1593).
+fn env_key<S: AsRef<str>>(env: &[S]) -> Option<String> {
+    env.iter()
+        .filter_map(|name| std::env::var(name.as_ref()).ok())
+        .find(|value| !value.is_empty())
+}
+
+/// The providers this server may authenticate with, as opposed to those
+/// the catalog merely lists — the set whose key variables are kept from
+/// the agent's processes:
+///
+/// * the ones a config declares (`provider.<id>`) or whose model it
+///   selects (`model`, `small_model`), in any of `configs` — an instance's
+///   merged config and the host's own, so that a project's config can add
+///   to the set and never take the host's out;
+/// * the ones with stored credentials (`AuthStore::ids`, what
+///   `GET /provider` reports as connected);
+/// * the catalog's providers one of whose variables is set in the
+///   server's environment — [`build_state`]'s `source: "env"`, by the same
+///   test ([`env_key`]).
+///
+/// `enabled_providers` / `disabled_providers` are not consulted: they
+/// decide what is offered for use ([`filter_providers`]), and a project's
+/// config can write them. What they switch off still has its key in the
+/// server's environment.
+pub fn in_use(
+    catalog: &alforria_core::catalog::Providers,
+    configs: &[&Config],
+    auth: &dyn AuthStore,
+) -> std::collections::BTreeSet<String> {
+    let mut ids = std::collections::BTreeSet::new();
+    for config in configs {
+        ids.extend(config.provider.iter().flatten().map(|(id, _)| id.clone()));
+        ids.extend(
+            [&config.model, &config.small_model]
+                .into_iter()
+                .flatten()
+                .map(|model| parse_model(model).0),
+        );
+    }
+    ids.extend(auth.ids());
+    ids.extend(
+        catalog
+            .iter()
+            .filter(|(_, provider)| env_key(&provider.env).is_some())
+            .map(|(id, _)| id.clone()),
+    );
+    ids
+}
+
+/// Teach the shell environment policy the catalog's variables of the
+/// providers in use ([`in_use`]): on a standalone server the
+/// credential-shaped ones among them are withheld from the agent's
+/// processes (`alforria_core::shell_env::learn_catalog`). Called whenever
+/// an instance's provider state is built, so a sign-in is covered from
+/// the next model lookup on.
+pub fn learn_catalog_names(
+    catalog: &alforria_core::catalog::Providers,
+    configs: &[&Config],
+    auth: &dyn AuthStore,
+) {
+    for id in in_use(catalog, configs, auth) {
+        learn_provider(catalog, &id);
+    }
+}
+
+/// [`learn_catalog_names`] for one provider: a session selected a model of
+/// it, which puts it in use whatever the configs say.
+pub fn learn_provider(catalog: &alforria_core::catalog::Providers, provider_id: &str) {
+    if let Some(provider) = catalog.get(provider_id) {
+        alforria_core::shell_env::learn_catalog(provider.env.iter(), true);
+    }
+}
+
 /// The final model loop (provider.ts:1671-1719): allowed filtering, model
 /// deletion rules and the config variant merge.
 fn filter_providers(
@@ -691,19 +778,7 @@ fn filter_providers(
     config: &Config,
     config_providers: &BTreeMap<String, alforria_core::config::schema::ProviderInfo>,
 ) {
-    let enabled = config.enabled_providers.clone();
-    let allowed = |id: &str| -> bool {
-        if let Some(enabled) = &enabled {
-            if !enabled.iter().any(|item| item == id) {
-                return false;
-            }
-        }
-        !config
-            .disabled_providers
-            .iter()
-            .flatten()
-            .any(|item| item == id)
-    };
+    let allowed = |id: &str| allowed(config, id);
     let enable_experimental = std::env::var("OPENCODE_ENABLE_EXPERIMENTAL_MODELS")
         .map(|value| matches!(value.as_str(), "1" | "true" | "yes"))
         .unwrap_or(false);
@@ -796,7 +871,9 @@ pub fn load_catalog(
 ) -> Result<alforria_core::catalog::Providers, ServerError> {
     let mut providers = catalog()
         .map_err(|err| ServerError::Core(alforria_core::CoreError::Catalog(err.to_string())))?;
-    alforria_core::libertai::merge_builtin_provider(&mut providers);
+    // The context's source merged its own (`state::catalog_in`); a source
+    // without one still lists the provider, from the embedded snapshot.
+    alforria_core::libertai::LibertaiCatalog::offline().merge(&mut providers);
     Ok(providers)
 }
 
@@ -916,6 +993,65 @@ mod tests {
         let provider = &state.providers["example"];
         assert_eq!(provider["source"], "api");
         assert_eq!(provider["key"], "sk-api");
+    }
+
+    /// A provider is in use when a config declares it or selects its
+    /// model, credentials are stored for it, or one of its catalog
+    /// variables is set in the server's environment. A project's config
+    /// adds to the host's and takes nothing out — not with
+    /// `disabled_providers` or `enabled_providers`, and not by selecting
+    /// another model.
+    #[test]
+    fn in_use_is_declared_selected_signed_in_or_keyed_from_the_environment() {
+        let catalog: alforria_core::catalog::Providers = serde_json::from_value(json!({
+            "envonly": {
+                "id": "envonly", "name": "Env", "models": {},
+                "env": ["ALFORRIA_TEST_INUSE_UNSET", "ALFORRIA_TEST_INUSE_TOKEN"]
+            },
+            "listed": {
+                "id": "listed", "name": "Listed", "models": {},
+                "env": ["ALFORRIA_TEST_INUSE_OTHER_UNSET"]
+            }
+        }))
+        .unwrap();
+        let config = |value: Value| serde_json::from_value::<Config>(value).unwrap();
+        let ids = |configs: &[&Config], auth: &dyn AuthStore| -> Vec<String> {
+            in_use(&catalog, configs, auth).into_iter().collect()
+        };
+        let empty = config(json!({}));
+        assert!(ids(&[&empty], &EmptyAuth).is_empty());
+        assert_eq!(ids(&[&empty], &ApiKeyAuth), ["example"]);
+
+        let host = config(json!({
+            "provider": { "declared": {} },
+            "model": "picked/model-a",
+            "small_model": "small/model-b/with-slash"
+        }));
+        let everything = ["declared", "example", "picked", "small"];
+        assert_eq!(ids(&[&host], &ApiKeyAuth), everything);
+
+        // What a project's config merged over the host's can do: switch
+        // providers off, narrow the enabled ones, select another model.
+        // None of it takes a provider out.
+        let merged = config(json!({
+            "provider": { "declared": {} },
+            "model": "theirs/model-z",
+            "disabled_providers": ["declared", "example", "picked", "envonly"],
+            "enabled_providers": ["theirs"]
+        }));
+        assert_eq!(
+            ids(&[&merged, &host], &ApiKeyAuth),
+            ["declared", "example", "picked", "small", "theirs"]
+        );
+
+        // A key in the environment alone, whatever the config says.
+        std::env::set_var("ALFORRIA_TEST_INUSE_TOKEN", "sk-env");
+        assert_eq!(ids(&[&empty], &EmptyAuth), ["envonly"]);
+        assert_eq!(
+            ids(&[&merged, &host], &EmptyAuth),
+            ["declared", "envonly", "picked", "small", "theirs"]
+        );
+        std::env::remove_var("ALFORRIA_TEST_INUSE_TOKEN");
     }
 
     struct ApiKeyAuth;

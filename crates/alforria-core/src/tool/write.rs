@@ -117,10 +117,10 @@ fn run(
             .await?;
 
         crate::tool::file_path::verify(&requested, &file_path)?;
-        bom::write_with_dirs(&file_path, &bom::join(&content_new, desired_bom)).await?;
+        bom::write_with_dirs(&instance, &file_path, &bom::join(&content_new, desired_bom)).await?;
         if let Some(formatter) = &format {
             if formatter.file(&file_path.to_string_lossy()).await {
-                bom::sync_file(&file_path, desired_bom).await?;
+                bom::sync_file(&instance, &file_path, desired_bom).await?;
             }
         }
         if let Some(events) = &events {

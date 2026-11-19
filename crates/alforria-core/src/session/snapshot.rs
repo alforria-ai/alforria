@@ -39,6 +39,32 @@ pub struct PatchPart {
     pub files: Vec<String>,
 }
 
+/// alforria extension: one file a guarded session's revert restores
+/// ([`Snapshot::write_checked`]). The write guard has judged `file` and
+/// `landing` is where it said the write lands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckedWrite {
+    /// The snapshot to take the file from.
+    pub hash: String,
+    /// The file as the patch listing names it (absolute, in the worktree).
+    pub file: String,
+    /// `protect::Protected::judge` of `file`: resolved, no link in it.
+    pub landing: PathBuf,
+    /// What to do when the snapshot does not hold the file: remove it
+    /// (rolling a patch back, as [`Snapshot::revert`] does) or leave it
+    /// (restoring a snapshot, as [`Snapshot::restore`] does).
+    pub delete_missing: bool,
+}
+
+/// What [`Snapshot::write_checked`] does for one file, once everything has
+/// been read.
+enum CheckedStep {
+    /// The snapshot does not hold the file: remove it.
+    Remove(CheckedWrite),
+    /// Write these bytes, executable or not.
+    Restore(CheckedWrite, Vec<u8>, bool),
+}
+
 /// `Snapshot.FileDiff` — the schema crate owns the wire shape.
 pub type FileDiff = alforria_schema::file_diff::SnapshotFileDiff;
 
@@ -59,6 +85,18 @@ pub trait Snapshot: Send + Sync {
     fn restore(&self, id: &str) -> BoxFuture<'static, Result<(), CoreError>>;
     /// Roll the listed files back to their snapshot contents.
     fn revert(&self, patches: Vec<PatchPart>) -> BoxFuture<'static, Result<(), CoreError>>;
+    /// alforria extension — how a *guarded* session's revert writes
+    /// (`session::revert`): exactly the listed files and nothing else, each
+    /// taken from its snapshot and written at the landing the write guard
+    /// judged, through that landing's directory handle
+    /// (`protect::restore_at` / `remove_at`). [`Snapshot::restore`] and
+    /// [`Snapshot::revert`] let git write whatever its own listing covers,
+    /// by name; here the list that was checked is the list that is
+    /// written. A listed path the snapshot holds as anything but a regular
+    /// file (a symlink, a submodule, a directory) is left as it is. The
+    /// first failure stops and is returned.
+    fn write_checked(&self, writes: Vec<CheckedWrite>)
+        -> BoxFuture<'static, Result<(), CoreError>>;
     /// Diff text of the worktree vs the snapshot.
     fn diff(&self, id: &str) -> BoxFuture<'static, Result<String, CoreError>>;
     /// Per-file diffs between two snapshots.
@@ -93,6 +131,13 @@ impl Snapshot for DisabledSnapshot {
     }
 
     fn revert(&self, _patches: Vec<PatchPart>) -> BoxFuture<'static, Result<(), CoreError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn write_checked(
+        &self,
+        _writes: Vec<CheckedWrite>,
+    ) -> BoxFuture<'static, Result<(), CoreError>> {
         Box::pin(async { Ok(()) })
     }
 
@@ -188,6 +233,8 @@ impl SnapshotRunner for SubprocessSnapshotRunner {
         stdin: Option<&str>,
     ) -> SnapshotOutput {
         let mut command = Command::new("git");
+        // See `git::SubprocessGit::run`.
+        crate::shell_env::apply_scrubbed(&mut command);
         command
             .args(args)
             .stdout(Stdio::piped())
@@ -799,6 +846,17 @@ impl GitSnapshot {
         if allow.is_empty() {
             return Ok(());
         }
+        // A path whose directory has become a symbolic link is no longer a
+        // file of this worktree: git refuses to stage it ("beyond a
+        // symbolic link") and fails the whole add with it. It leaves the
+        // index as a deletion; the link itself is staged like any file.
+        let (beyond, allow): (Vec<String>, Vec<String>) = allow
+            .into_iter()
+            .partition(|item| self.beyond_symlink(item));
+        self.drop_files(&beyond)?;
+        if allow.is_empty() {
+            return Ok(());
+        }
         let mut large = HashSet::new();
         for item in &allow {
             if let Ok(meta) = std::fs::metadata(self.worktree.join(item)) {
@@ -822,6 +880,23 @@ impl GitSnapshot {
             .cloned()
             .collect();
         self.stage(&stage)
+    }
+
+    /// Whether a directory on the way to `file` (worktree-relative) is a
+    /// symbolic link.
+    fn beyond_symlink(&self, file: &str) -> bool {
+        let mut path = self.worktree.clone();
+        let mut parts = Path::new(file).components().peekable();
+        while let Some(part) = parts.next() {
+            if parts.peek().is_none() {
+                break;
+            }
+            path.push(part);
+            if path.symlink_metadata().is_ok_and(|meta| meta.is_symlink()) {
+                return true;
+            }
+        }
+        false
     }
 
     /// `cleanup` (`snapshot/index.ts:300-316`).
@@ -1206,6 +1281,8 @@ impl GitSnapshot {
         let instance = crate::tool::def::InstanceContext {
             directory: self.worktree.clone(),
             worktree: self.worktree.clone(),
+            // Asked only whether a path is inside the worktree.
+            write_guard: None,
         };
         let mut seen = HashSet::new();
         let mut groups: Vec<(String, Vec<String>)> = Vec::new();
@@ -1257,6 +1334,88 @@ impl GitSnapshot {
             })
             .collect();
         recovery::apply(&self.worktree, changes)
+    }
+
+    /// [`Snapshot::write_checked`]: per file, what the snapshot holds
+    /// (`ls-tree`), its bytes (`cat-file`), and the write through the
+    /// judged landing's directory handle. git writes nothing here.
+    ///
+    /// All or nothing, as far as reading goes: every file is looked up and
+    /// every blob read before the first write or removal, so a snapshot
+    /// that cannot be listed or a blob that cannot be read leaves the
+    /// working tree as it was, not half reverted.
+    fn write_checked_impl(&self, writes: Vec<CheckedWrite>) -> Result<(), CoreError> {
+        let _guard = self.lock();
+        let failed = |what: &str, file: &str, why: &dyn std::fmt::Display| {
+            CoreError::Storage(format!("snapshot restore failed: {what} {file}: {why}"))
+        };
+        let mut steps: Vec<CheckedStep> = Vec::new();
+        for write in writes {
+            let rel = relative(&self.worktree, &write.file);
+            let args = self.args(&CFG, &["ls-tree", "-z", &write.hash, "--", &rel]);
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let tree = self.runner.run(Some(&self.worktree), &[], &args, None);
+            if tree.code != 0 {
+                return Err(failed("ls-tree", &write.file, &tree.stderr));
+            }
+            // `<mode> <type> <object>\t<path>\0`, the path verbatim.
+            let entry = tree
+                .stdout
+                .split(|byte| *byte == 0)
+                .filter_map(|line| {
+                    let tab = line.iter().position(|byte| *byte == b'\t')?;
+                    (line[tab + 1..] == *rel.as_bytes())
+                        .then(|| String::from_utf8_lossy(&line[..tab]).into_owned())
+                })
+                .next();
+            let Some(entry) = entry else {
+                if write.delete_missing {
+                    steps.push(CheckedStep::Remove(write));
+                }
+                continue;
+            };
+            let mut fields = entry.split(' ');
+            let (mode, kind, object) = (
+                fields.next().unwrap_or_default(),
+                fields.next().unwrap_or_default(),
+                fields.next().unwrap_or_default(),
+            );
+            if kind != "blob" || !matches!(mode, "100644" | "100755") {
+                tracing::info!(
+                    "not a regular file in the snapshot, keeping: file={} mode={mode}",
+                    write.file
+                );
+                continue;
+            }
+            let args = self.args(&CFG, &["cat-file", "blob", object]);
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let blob = self.runner.run(Some(&self.worktree), &[], &args, None);
+            if blob.code != 0 {
+                return Err(failed("cat-file", &write.file, &blob.stderr));
+            }
+            steps.push(CheckedStep::Restore(write, blob.stdout, mode == "100755"));
+        }
+        // Everything was found and read: now the working tree is touched.
+        for step in steps {
+            match step {
+                CheckedStep::Remove(write) => {
+                    tracing::info!(
+                        "file did not exist in snapshot, deleting: file={}",
+                        write.file
+                    );
+                    match crate::protect::remove_at(&write.landing) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(failed("remove", &write.file, &error)),
+                    }
+                }
+                CheckedStep::Restore(write, contents, executable) => {
+                    crate::protect::restore_at(&write.landing, &contents, executable)
+                        .map_err(|error| failed("write", &write.file, &error))?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// `diff` (`snapshot/index.ts:526-544`).
@@ -1595,6 +1754,18 @@ impl Snapshot for GitSnapshot {
         })
     }
 
+    fn write_checked(
+        &self,
+        writes: Vec<CheckedWrite>,
+    ) -> BoxFuture<'static, Result<(), CoreError>> {
+        let snapshot = self.clone();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || snapshot.write_checked_impl(writes))
+                .await
+                .map_err(|_| CoreError::Storage("snapshot task failed".to_string()))?
+        })
+    }
+
     fn diff(&self, id: &str) -> BoxFuture<'static, Result<String, CoreError>> {
         let snapshot = self.clone();
         let id = id.to_string();
@@ -1865,6 +2036,14 @@ impl Snapshot for InMemorySnapshot {
         Box::pin(async move { result })
     }
 
+    fn write_checked(
+        &self,
+        writes: Vec<CheckedWrite>,
+    ) -> BoxFuture<'static, Result<(), CoreError>> {
+        let result = self.write_checked_sync(writes);
+        Box::pin(async move { result })
+    }
+
     fn diff(&self, id: &str) -> BoxFuture<'static, Result<String, CoreError>> {
         let result = self.diff_sync(id);
         Box::pin(async move { result })
@@ -1960,6 +2139,44 @@ impl InMemorySnapshot {
                         let _ = std::fs::remove_file(&target);
                     }
                 }
+            }
+        }
+        Ok(())
+    }
+
+    fn write_checked_sync(&self, writes: Vec<CheckedWrite>) -> Result<(), CoreError> {
+        let failed =
+            |error: std::io::Error| CoreError::Storage(format!("snapshot restore failed: {error}"));
+        // Read everything first, as the git-backed one does.
+        let mut steps = Vec::new();
+        {
+            let state = self.lock_state();
+            for write in writes {
+                let Some(snapshot) = state.get(&write.hash) else {
+                    return Err(CoreError::Storage(format!(
+                        "snapshot {} not found",
+                        write.hash
+                    )));
+                };
+                let Ok(rel) = Path::new(&write.file).strip_prefix(&self.worktree) else {
+                    continue;
+                };
+                let content = snapshot.get(rel.to_string_lossy().as_ref()).cloned();
+                steps.push((write, content));
+            }
+        }
+        for (write, content) in steps {
+            match content {
+                Some(content) => {
+                    crate::protect::write_at(&write.landing, content.as_bytes()).map_err(failed)?
+                }
+                None if write.delete_missing => match crate::protect::remove_at(&write.landing) {
+                    Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                        return Err(failed(error))
+                    }
+                    _ => {}
+                },
+                None => {}
             }
         }
         Ok(())
@@ -2649,6 +2866,101 @@ mod git_tests {
             !dir.path().join("new.txt").exists(),
             "file absent from the snapshot is deleted"
         );
+    }
+
+    /// A guarded revert writes all of its files or none: every file is
+    /// looked up and every blob read before the first one is written. A
+    /// blob that is missing in the middle of the list (or a snapshot that
+    /// cannot be listed) used to leave the files before it restored and
+    /// the rest not.
+    #[tokio::test]
+    async fn a_checked_restore_with_an_unreadable_blob_writes_nothing() {
+        let dir = TempDir::new("snap-checked");
+        let root = dir.path().canonicalize().unwrap();
+        init_repo(&root);
+        std::fs::write(root.join("seed.txt"), "seed\n").unwrap();
+        commit_all(&root);
+        // Not committed: their blobs are the snapshot store's own.
+        std::fs::write(root.join("a.txt"), "a as snapshotted\n").unwrap();
+        std::fs::write(root.join("b.txt"), "b as snapshotted\n").unwrap();
+        let (snap, data) = snapshot(&root);
+        let base = snap.track().await.expect("snapshot hash");
+
+        std::fs::write(root.join("a.txt"), "a changed\n").unwrap();
+        std::fs::write(root.join("b.txt"), "b changed\n").unwrap();
+        std::fs::write(root.join("new.txt"), "made since\n").unwrap();
+        let write = |name: &str, hash: &str| CheckedWrite {
+            hash: hash.to_string(),
+            file: root.join(name).to_string_lossy().into_owned(),
+            landing: root.join(name),
+            delete_missing: true,
+        };
+        let untouched = || {
+            let read = |name: &str| std::fs::read_to_string(root.join(name)).unwrap();
+            assert_eq!(read("a.txt"), "a changed\n", "half a revert was applied");
+            assert_eq!(read("b.txt"), "b changed\n");
+            assert_eq!(read("new.txt"), "made since\n", "half a revert was applied");
+        };
+
+        // The second entry's snapshot cannot be listed.
+        let bogus = "0123456789abcdef0123456789abcdef01234567";
+        let listed = vec![
+            write("new.txt", &base),
+            write("a.txt", &base),
+            write("b.txt", bogus),
+        ];
+        assert!(snap.write_checked(listed).await.is_err());
+        untouched();
+
+        // The second entry's blob is gone from the store.
+        let object = {
+            let listing = SubprocessGit.run(
+                Some(&gitdir(data.path(), &root)),
+                &["ls-tree", &base, "--", "b.txt"],
+            );
+            assert_eq!(listing.exit_code, 0, "{}", listing.stderr);
+            listing.text.split_whitespace().nth(2).unwrap().to_string()
+        };
+        let loose = gitdir(data.path(), &root)
+            .join("objects")
+            .join(&object[..2])
+            .join(&object[2..]);
+        std::fs::remove_file(&loose).expect("the blob is a loose object of the store");
+        let all = || {
+            vec![
+                write("new.txt", &base),
+                write("a.txt", &base),
+                write("b.txt", &base),
+            ]
+        };
+        assert!(snap.write_checked(all()).await.is_err());
+        untouched();
+
+        // With everything readable, all of it is written.
+        let original = data.path().join("b-original");
+        std::fs::write(&original, "b as snapshotted\n").unwrap();
+        let store = gitdir(data.path(), &root);
+        let stored = SubprocessGit.run(
+            Some(&root),
+            &[
+                "--git-dir",
+                &store.to_string_lossy(),
+                "hash-object",
+                "-w",
+                &original.to_string_lossy(),
+            ],
+        );
+        assert_eq!(stored.text.trim(), object, "{}", stored.stderr);
+        snap.write_checked(all()).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "a as snapshotted\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("b.txt")).unwrap(),
+            "b as snapshotted\n"
+        );
+        assert!(!root.join("new.txt").exists());
     }
 
     #[tokio::test]

@@ -35,6 +35,8 @@ fn test_services() -> SessionServices {
         data_dir: dir.path().to_path_buf(),
         tmp_dir: dir.path().to_path_buf(),
         home: dir.path().to_path_buf(),
+        host_config: None,
+        protected: None,
     };
     SessionServices::new(
         storage,
@@ -496,6 +498,57 @@ async fn api_session_event_after_boundary_and_live_tail() {
     assert!(frame.contains("\"seq\":2"), "seq 2 after live publish");
 }
 
+/// With retention on, the events a client resumes from can be gone. The
+/// stream says so before anything else instead of skipping them silently.
+#[tokio::test]
+async fn api_session_event_marks_pruned_history_with_a_reset() {
+    let ctx = fixture();
+    create_session(&ctx, "ses_sse", "/repo").unwrap(); // seq 0
+    for _ in 0..5 {
+        publish_durable_session(&ctx, "ses_sse"); // seq 1..=5
+    }
+    // Retention keeps the newest two.
+    let report = alforria_core::storage::maintenance::prune_events(
+        &ctx.storage,
+        &alforria_core::event::sql::EventRetention {
+            max_age_ms: None,
+            keep_last: Some(2),
+        },
+        0,
+    )
+    .unwrap();
+    assert_eq!(report.events, 4);
+
+    // Resuming from before the cut: the marker, then what is left.
+    let (_status, _headers, mut frames) = open(&ctx, "/api/session/ses_sse/event?after=1").await;
+    let frame = frames.next().await.unwrap();
+    let marker: serde_json::Value =
+        serde_json::from_str(frame.trim_start_matches("data: ").trim()).unwrap();
+    assert_eq!(marker["type"], "event.reset");
+    assert_eq!(
+        marker["data"],
+        serde_json::json!({ "sessionID": "ses_sse", "after": 1, "earliest": 4, "latest": 5 })
+    );
+    assert!(marker.get("durable").is_none());
+    let frame = frames.next().await.unwrap();
+    assert!(frame.contains("\"seq\":4"), "{frame}");
+    let frame = frames.next().await.unwrap();
+    assert!(frame.contains("\"seq\":5"), "{frame}");
+
+    // From the start is from before the cut too.
+    let (_status, _headers, mut frames) = open(&ctx, "/api/session/ses_sse/event").await;
+    let frame = frames.next().await.unwrap();
+    assert!(frame.contains("\"type\":\"event.reset\""), "{frame}");
+
+    // Resuming where the log still reaches: no marker, as before.
+    let (_status, _headers, mut frames) = open(&ctx, "/api/session/ses_sse/event?after=3").await;
+    let frame = frames.next().await.unwrap();
+    assert!(
+        frame.contains("\"durable\":{\"aggregateID\":\"ses_sse\",\"seq\":4"),
+        "{frame}"
+    );
+}
+
 #[tokio::test]
 async fn api_session_event_errors() {
     let ctx = fixture();
@@ -579,6 +632,8 @@ fn located_fixture() -> Arc<ServerContext> {
             data_dir: std::env::temp_dir(),
             tmp_dir: std::env::temp_dir(),
             home: std::env::temp_dir(),
+            host_config: None,
+            protected: None,
         };
         let services = Arc::new(SessionServices::new(
             factory_storage.clone(),

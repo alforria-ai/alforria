@@ -967,9 +967,9 @@ mod tests {
     fn load_config(mcp_json: &str) -> (Config, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("opencode.json"), mcp_json).unwrap();
-        let paths = GlobalPaths::resolve(dir.path().join("home"));
+        let paths = GlobalPaths::resolve_with(dir.path().join("home"), |_| None);
         let (config, _) = ConfigLoader::new()
-            .load(&LoadParams::new(dir.path().to_path_buf()).paths(paths))
+            .load(&LoadParams::new(dir.path().to_path_buf(), paths))
             .unwrap();
         (config, dir)
     }
