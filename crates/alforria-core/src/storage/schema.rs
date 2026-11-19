@@ -988,9 +988,11 @@ mod tests {
             .with_connection(|conn| -> rusqlite::Result<Vec<String>> {
                 let mut stmt = conn.prepare(
                     "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL
-                     AND name NOT IN ('migration', 'alforria_message_session_parent_idx')",
+                     AND name NOT IN ('migration', ?1)",
                 )?;
-                let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+                let rows = stmt.query_map([crate::storage::connection::TURN_INDEX], |row| {
+                    row.get::<_, String>(0)
+                })?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()
             })
             .unwrap();

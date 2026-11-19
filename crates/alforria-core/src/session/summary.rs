@@ -731,7 +731,7 @@ mod tests {
         // the active context nor any requested turn should hydrate it.
         h.services.storage.with_connection(|conn| {
             conn.execute(
-                "UPDATE message SET data = '{}' WHERE id = 'msg_archived_000'",
+                "UPDATE message SET data = '{broken' WHERE id = 'msg_archived_000'",
                 [],
             )
             .unwrap();

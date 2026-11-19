@@ -510,14 +510,16 @@ const COLUMNS_WITHOUT_DIFFS: &str = "id, session_id, time_created, time_updated,
      ELSE json_set(data, '$.summary.diffs', json('[]')) END AS data";
 
 fn turn_query() -> String {
+    use crate::storage::connection::{TURN_ASSISTANT, TURN_PARENT};
+
     // Separate lookups avoid an OR predicate that can scan the session's
     // entire history. The second arm uses the local parent-ID index.
     format!(
         "SELECT {COLUMNS_WITHOUT_DIFFS} FROM message WHERE session_id = ?1 AND id = ?2
          UNION ALL
          SELECT {COLUMNS_WITHOUT_DIFFS} FROM message
-         WHERE session_id = ?1 AND json_extract(data, '$.role') = 'assistant'
-           AND json_extract(data, '$.parentID') = ?2 AND id != ?2
+         WHERE session_id = ?1 AND {TURN_ASSISTANT}
+           AND {TURN_PARENT} = ?2 AND id != ?2
          ORDER BY time_created, id"
     )
 }
@@ -957,7 +959,7 @@ mod tests {
         );
         assert!(
             plan.iter()
-                .any(|line| line.contains("alforria_message_session_parent_idx")
+                .any(|line| line.contains(crate::storage::connection::TURN_INDEX)
                     && line.contains("<expr>=?")),
             "{plan:?}"
         );

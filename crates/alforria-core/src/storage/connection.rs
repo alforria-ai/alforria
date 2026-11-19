@@ -17,11 +17,24 @@ const OPEN_PRAGMAS: &[&str] = &[
     "PRAGMA foreign_keys = ON",
 ];
 
-/// Additive local optimization; the pinned upstream tables and migration
-/// journal stay unchanged. Install on existing databases as well as new ones.
-const TURN_INDEX_SQL: &str = "CREATE INDEX IF NOT EXISTS alforria_message_session_parent_idx
-    ON message (session_id, json_extract(data, '$.parentID'), time_created, id)
-    WHERE json_extract(data, '$.role') = 'assistant'";
+// CASE keeps json_extract from seeing malformed JSON even if SQLite
+// reorders predicates or picks a different plan.
+pub(crate) const TURN_ASSISTANT: &str =
+    "json_extract(CASE WHEN json_valid(data) THEN data END, '$.role') = 'assistant'";
+pub(crate) const TURN_PARENT: &str =
+    "json_extract(CASE WHEN json_valid(data) THEN data END, '$.parentID')";
+pub(crate) const TURN_INDEX: &str = "alforria_valid_message_session_parent_idx";
+
+/// Install the local index without changing the upstream migration journal.
+fn install_turn_index(conn: &Connection) -> Result<(), CoreError> {
+    conn.execute_batch(&format!(
+        "CREATE INDEX IF NOT EXISTS {TURN_INDEX}
+         ON message (session_id, {TURN_PARENT}, time_created, id)
+         WHERE {TURN_ASSISTANT};
+         DROP INDEX IF EXISTS alforria_message_session_parent_idx;"
+    ))?;
+    Ok(())
+}
 
 /// A `rusqlite` connection behind a `Mutex`.
 ///
@@ -47,7 +60,7 @@ impl Storage {
         Self::configure(&conn)?;
         refuse_foreign_schema(&conn, path)?;
         migration::apply(&mut conn)?;
-        conn.execute_batch(TURN_INDEX_SQL)?;
+        install_turn_index(&conn)?;
         Ok(Storage {
             conn: Mutex::new(conn),
         })
@@ -63,7 +76,7 @@ impl Storage {
         let mut conn = Connection::open_in_memory()?;
         Self::configure(&conn)?;
         migration::apply(&mut conn)?;
-        conn.execute_batch(TURN_INDEX_SQL)?;
+        install_turn_index(&conn)?;
         Ok(Storage {
             conn: Mutex::new(conn),
         })
@@ -176,12 +189,23 @@ mod tests {
         let path = dir.path().join("db.sqlite");
         let mut connection = Connection::open(&path).unwrap();
         migration::apply(&mut connection).unwrap();
+        connection
+            .execute_batch(
+                r#"INSERT INTO project (id, worktree, time_created, time_updated, sandboxes)
+                   VALUES ('project', '/repo', 0, 0, '[]');
+                   INSERT INTO session (id, project_id, slug, directory, title, version, time_created, time_updated)
+                   VALUES ('session', 'project', 'test', '/repo', 'Test', '1', 0, 0);
+                   INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES
+                       ('bad', 'session', 1, 1, '{broken'),
+                       ('reply', 'session', 2, 2, '{"role":"assistant","parentID":"user"}');"#,
+            )
+            .unwrap();
         // This represents a database from before the local query index.
         assert_eq!(
             connection
                 .query_row(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE name = 'alforria_message_session_parent_idx'",
-                    [],
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name = ?1",
+                    [TURN_INDEX],
                     |row| row.get::<_, i64>(0),
                 )
                 .unwrap(),
@@ -192,8 +216,8 @@ mod tests {
             Storage::open(&path).unwrap().with_connection(|conn| {
                 assert_eq!(
                     conn.query_row(
-                        "SELECT COUNT(*) FROM pragma_index_list('message') WHERE name = 'alforria_message_session_parent_idx'",
-                        [],
+                        "SELECT COUNT(*) FROM pragma_index_list('message') WHERE name = ?1",
+                        [TURN_INDEX],
                         |row| row.get::<_, i64>(0),
                     )
                     .unwrap(),
@@ -201,9 +225,18 @@ mod tests {
                 );
                 // Additive indexes do not alter the upstream journal.
                 assert_eq!(
-                    conn.query_row("SELECT COUNT(*) FROM migration", [], |row| row.get::<_, usize>(0))
+                    conn.query_row("SELECT COUNT(*) FROM migration", [], |row| row
+                        .get::<_, usize>(0))
                         .unwrap(),
                     migration::MIGRATION_IDS.len()
+                );
+                assert_eq!(
+                    conn.query_row("SELECT data FROM message WHERE id = 'bad'", [], |row| {
+                        row.get::<_, String>(0)
+                    })
+                    .unwrap(),
+                    "{broken",
+                    "opening the database must leave existing rows intact"
                 );
             });
         }

@@ -43,9 +43,34 @@ impl SummarySummarize for ObservedSummary {
     }
 }
 
-#[tokio::test]
+#[test]
 #[ignore = "manual benchmark: cargo test -p alforria-core benchmark_completed_step --lib -- --ignored --nocapture"]
-async fn benchmark_completed_step_with_background_summary() {
+fn benchmark_completed_step_with_background_summary() {
+    let runtimes = [
+        (
+            "current_thread",
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        ),
+        (
+            "multi_thread",
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap(),
+        ),
+    ];
+    for (name, runtime) in runtimes {
+        runtime.block_on(async {
+            tokio::spawn(measure_completed_step(name)).await.unwrap();
+        });
+    }
+}
+
+async fn measure_completed_step(runtime: &str) {
     const SAMPLES: usize = 10;
     for archived in [100, 1000, 10_000] {
         let mut script = text_stream("hello");
@@ -179,7 +204,7 @@ async fn benchmark_completed_step_with_background_summary() {
         }
         elapsed.sort_unstable();
         println!(
-            "archived={archived}, active_messages=4, completed_step_and_summary_median_us={}",
+            "runtime={runtime}, archived={archived}, active_messages=4, completed_step_and_summary_median_us={}",
             elapsed[SAMPLES / 2]
         );
     }
