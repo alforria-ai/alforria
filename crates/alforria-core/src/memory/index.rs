@@ -62,6 +62,12 @@ pub struct SessionHit {
     /// may be what an outsider wrote.
     #[serde(default)]
     pub untrusted: bool,
+    /// The session is restricted (`session::caller`): a client's below
+    /// `admin`. For the `session_search` tool's marking decision
+    /// (`tool::outside`) — an excerpt of it is outside content to a session
+    /// that is not restricted itself. Not on the wire.
+    #[serde(skip)]
+    pub restricted: bool,
 }
 
 /// How far back [`recover_cursor`] looks for a part it recognises.
@@ -276,7 +282,9 @@ impl MemoryService {
                         "SELECT transcript_fts.session_id, s.title, transcript_fts.message_id,
                             transcript_fts.role, p.time_created,
                             snippet(transcript_fts, 0, '[', ']', '…', 32),
-                            {untrusted}
+                            {untrusted},
+                            EXISTS(SELECT 1 FROM session_restriction
+                                   WHERE session_restriction.session_id = s.id)
                      FROM transcript_fts
                      JOIN part p ON p.id = transcript_fts.part_id
                      JOIN session s ON s.id = transcript_fts.session_id
@@ -305,6 +313,7 @@ impl MemoryService {
                                     time: row.get::<_, i64>(4)?.max(0) as u64,
                                     snippet: row.get(5)?,
                                     untrusted: row.get::<_, i64>(6)? != 0,
+                                    restricted: row.get::<_, i64>(7)? != 0,
                                 })
                             },
                         )?

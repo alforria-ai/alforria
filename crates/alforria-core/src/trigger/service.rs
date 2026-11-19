@@ -161,6 +161,7 @@ impl Entry {
             session_id: self.state.session_id.clone(),
             origin_session_id: self.origin_session_id.clone(),
             restricted: self.restricted,
+            outside_content: self.outside_content,
             time_created: self.time_created,
             time_updated: self.time_updated,
             last_fired: self.state.last_fired,

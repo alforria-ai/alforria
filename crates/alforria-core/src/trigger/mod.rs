@@ -381,6 +381,10 @@ pub struct TriggerRecord {
     /// in restricted sessions only, and it is one of the triggers such a
     /// caller may change.
     pub restricted: bool,
+    /// Created or changed by a session that had seen outside content
+    /// (`StoredSpec::outside_content`): its prompt may be an outsider's
+    /// words. Not on the wire.
+    pub outside_content: bool,
     pub time_created: u64,
     pub time_updated: u64,
     pub last_fired: Option<u64>,
@@ -762,6 +766,7 @@ mod tests {
             session_id: Some("ses_1".to_string()),
             origin_session_id: None,
             restricted: false,
+            outside_content: false,
             time_created: 1,
             time_updated: 2,
             last_fired: None,

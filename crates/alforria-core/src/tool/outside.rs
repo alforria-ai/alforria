@@ -112,7 +112,11 @@ pub enum Outside {
     Always,
     /// It says so itself, result by result, with [`FLAG`] in its metadata:
     /// `memory` when it returns an unverified record, `session_search`
-    /// when a hit comes from a marked session.
+    /// when a hit comes from a marked session, `schedule` when it shows a
+    /// trigger written after outside content was seen — and each of them,
+    /// to a session that is not restricted itself, when what it returns is
+    /// a restricted caller's (a record it saved, an excerpt of its session,
+    /// a trigger it made).
     Flagged,
     /// It returns the file, or the names in the directory, that its input
     /// names: outside content when what it opened is in the upload area.
@@ -162,7 +166,8 @@ pub const BUILTIN: &[(&str, Outside)] = &[
     ("execute", Outside::Always),
     ("lsp", Outside::Never),
     ("plan_exit", Outside::Never),
-    ("schedule", Outside::Never),
+    // It prints triggers' titles and prompts, whoever wrote them.
+    ("schedule", Outside::Flagged),
     ("memory", Outside::Flagged),
     ("session_search", Outside::Flagged),
     // The structured-output tool: the model's own answer.

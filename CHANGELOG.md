@@ -244,6 +244,16 @@ pre-1.0, so minor releases may include breaking changes.
 
 ### Fixed
 
+- Three tools handed an operator's session what a client below `admin`
+  had written without marking the session as having seen outside content:
+  `memory` (`search`, `list`) returning a record a restricted writer
+  saved, `session_search` returning an excerpt of a restricted session,
+  and `schedule` (`list`, and the other actions' answers) printing the
+  prompt of a trigger a restricted caller made or one written after
+  outside content was seen. Each now flags such a result, and the session
+  is marked: what it then saves to memory is unverified, and a trigger it
+  schedules carries the mark. A restricted session reading its own kind's
+  records, excerpts and triggers is not marked by them.
 - A command configured to run as a subagent (`subtask: true`) stored the
   subagent's answer in the session without the outside-content check every
   other tool result gets: a subagent that had fetched a page or read an
