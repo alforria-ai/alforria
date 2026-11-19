@@ -8,6 +8,7 @@ use alforria_schema::session_status::SessionStatusInfo;
 use alforria_schema::session_v1::{V1Message, V1Part, V1SessionInfo};
 use serde_json::{json, Value};
 
+use crate::config::CopyMode;
 use crate::keymap::COMMAND_PALETTE_COMMAND;
 use crate::state::kv::keys;
 use crate::state::route::Route;
@@ -906,8 +907,18 @@ fn session_commands(app: &App) -> Vec<CommandInfo> {
         "Session",
     ));
     commands.push({
-        let mut command = CommandInfo::new("session.copy", "Copy session transcript", "Session");
+        let title = match app.config.copy_mode {
+            CopyMode::LastMessage => "Copy last assistant message",
+            CopyMode::Thread => "Copy session transcript",
+        };
+        let mut command = CommandInfo::new("session.copy", title, "Session");
         command.slash_name = Some("copy");
+        command
+    });
+    commands.push({
+        let mut command =
+            CommandInfo::new("session.copy.thread", "Copy whole conversation", "Session");
+        command.slash_name = Some("copythread");
         command
     });
     commands.push({
@@ -1322,7 +1333,10 @@ pub fn run(app: &mut App, name: &str) -> Vec<Effect> {
             clear_dialog(app);
         }
         "messages.copy" => return messages_copy(app),
-        "session.copy" => {
+        "session.copy" if app.config.copy_mode == CopyMode::LastMessage => {
+            return messages_copy(app)
+        }
+        "session.copy" | "session.copy.thread" => {
             clear_dialog(app);
             return vec![Effect::SessionCopyTranscript {
                 thinking: thinking_current(app) == "show",
@@ -1636,8 +1650,8 @@ fn messages_copy(app: &mut App) -> Vec<Effect> {
         clear_dialog(app);
         return Vec::new();
     }
-    let text = text_parts.join("\n").trim().to_string();
-    if text.is_empty() {
+    let text = text_parts.join("\n");
+    if text.trim().is_empty() {
         toast(
             app,
             ToastVariant::Error,

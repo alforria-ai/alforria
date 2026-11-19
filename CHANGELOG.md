@@ -14,6 +14,12 @@ pre-1.0, so minor releases may include breaking changes.
   select and review it. Suggestions come from the server's repository,
   including when attached remotely.
 
+### Changed
+
+- TUI: `/copy` now copies the last assistant message as Markdown. Use
+  `/copythread` for the full conversation, or set `"copy_mode": "thread"`
+  in `tui.json` to restore the old default.
+
 ### Fixed
 
 - Built-in `/review` and `/init` commands now work without a custom command

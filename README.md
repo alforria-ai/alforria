@@ -71,6 +71,16 @@ alforria attach http://localhost:4096
 See the [quickstart](https://alforria.ai/docs/quickstart.html) for provider
 setup, model selection, and the first session.
 
+In the TUI, `/copy` copies the last assistant message as Markdown.
+`/copythread` copies the full conversation. To restore whole-conversation
+copying for `/copy`, add this to your global or project `tui.json`:
+
+```json
+{ "copy_mode": "thread" }
+```
+
+The default `copy_mode` is `"last_message"`.
+
 ## What's inside
 
 - **Terminal UI.** A ratatui chat view with sessions, subagents, diffs,
