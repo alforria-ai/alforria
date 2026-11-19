@@ -96,21 +96,17 @@ pub fn get_forked_title(title: &str) -> String {
 }
 
 /// `sessionPath` (session.ts:171-173): relpath with `/` separators.
+///
+/// `path.relative` yields the empty string when both paths are equal — a
+/// session in the worktree root stores `""`, not `"."` (`path.relative`
+/// parity; opencode stores the same).
 pub fn session_path(worktree: &Path, cwd: &Path) -> String {
     let worktree = worktree
         .canonicalize()
         .unwrap_or_else(|_| worktree.to_path_buf());
     let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
     match cwd.strip_prefix(&worktree) {
-        Ok(relative) => {
-            let relative = relative.to_string_lossy().replace('\\', "/");
-            // `path.relative` yields "." for equal paths.
-            if relative.is_empty() {
-                ".".to_string()
-            } else {
-                relative
-            }
-        }
+        Ok(relative) => relative.to_string_lossy().replace('\\', "/"),
         Err(_) => cwd.to_string_lossy().replace('\\', "/"),
     }
 }
@@ -2619,7 +2615,7 @@ mod tests {
                 session_path(Path::new("/repo"), Path::new("/repo/a/b")),
                 "a/b"
             );
-            assert_eq!(session_path(Path::new("/repo"), Path::new("/repo")), ".");
+            assert_eq!(session_path(Path::new("/repo"), Path::new("/repo")), "");
         }
     }
 }

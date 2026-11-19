@@ -468,6 +468,10 @@ prompts, pin/quick-switch, paste, scrolling, resize, exit paths.
   yields `"."` — so the TUI's `path="."` session-list query matched nothing:
   the session list, quick switch (leader+1) and pin slots were always empty
   despite the sessions existing server-side.
+  - *Correction (post-0.4.4):* Node's `path.relative` returns `""` for equal
+    paths, not `"."`. The `"."` change broke interop with sessions opencode
+    stored with an empty path (`alforria -c` then showed a blank screen).
+    `session_path` and the TUI's `relative_path` are back to `""`.
 - **TUI state never persisted** — `cmd/tui.rs` passed `state_dir=None`, so
   pinned sessions, recent models, favorites and prompt history were dropped
   on every restart. Now wired to `GlobalPaths::from_env().state`
