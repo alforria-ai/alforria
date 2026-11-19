@@ -812,7 +812,7 @@ What it **cannot** cause, and what stops it:
 | Answer another project's asks | A reply looks its ask up by id across loaded projects only within `server.directories` |
 | Open another project, or a subdirectory as a project | `server.directories` is matched exactly |
 | Plant config, instructions, agents, commands, skills, workflows or git hooks | Uploads below `admin` go to the upload area only, and never to a name the loaders act on (see "Files for a browser") |
-| Read or change config, credentials or MCP servers | Those routes are `admin` |
+| Read or change config, credentials or MCP servers over HTTP or with the file tools | Those routes are `admin`, and its sessions' `read`, `grep` and `glob` refuse the host's locations ([Reads of host locations](#reads-of-host-locations)). A session whose agent may run `bash` reads them all the same: see [Known limits](#known-limits) |
 
 Refusals are `403` with a message, except on `POST …/prompt_async`, which
 answers `204` before the engine has looked at the prompt: there the refusal
@@ -993,7 +993,10 @@ which of the three it is, or it does not compile.
   `chat` token holder shell in the project, through the model. For an
   unattended agent that is usually the point; when it is not, set `bash`
   (and `edit`, `webfetch`, …) to `ask` or `deny` and decide who holds tokens
-  that can answer.
+  that can answer. **`bash: "deny"` alone does not stop code from the
+  project being run**: language servers execute what a project brings (an
+  ESLint config, a `build.rs`, a tsserver plugin, `node_modules/.bin`).
+  Write `"lsp": false` beside it when the project's content is not yours.
 - **The host's `permission` is a ceiling, not an earlier entry in a list.**
   Upstream evaluates one last-match-wins list in which a project's
   `agent.<name>.permission` comes after the host's rules — so a file in the
@@ -1614,6 +1617,79 @@ and the maintenance role: the others ask for it every few seconds and one
 has it when the holder stops or dies, so a delivery is not sent by two
 servers at once. A row another server recorded is picked up within about
 five seconds. `dropped` is counted per process.
+
+## Known limits
+
+What this page's controls do not do, in one place. Each is a decision or a
+gap that is known, not an oversight to be discovered.
+
+**Two conditions, and the gap between them.** The shell environment's
+posture and the trust in project config follow different inputs
+([the table](#what-selects-the-posture-unattended_or_remote)):
+
+| | Restricts the shell environment | Restricts project config |
+| --- | --- | --- |
+| `server.auth.bearer` | yes | yes |
+| `server.trust.project: "restricted"` | yes | yes |
+| A host config that does not load | (the server does not listen) | yes |
+| A listener beyond loopback | yes | **no** |
+| `permission.unattended`, `question.unattended`, `hook.webhook` | yes | **no** |
+| A `webhook` or `watch` trigger | yes | **no** |
+| Basic auth only, behind a reverse proxy; loopback with public `Host` / CORS names | no | no |
+| `cron`, `interval` or `at` triggers; `server.resume: "continue"` | no | no |
+| `alforria run` under a supervisor (cron, systemd, CI) | no | no |
+
+In every row that says "no" under project config, the server is treated as
+a developer's own: a project's `opencode.json` and `.opencode/` merge in
+full — permissions (under the host's ceiling), MCP servers, plugins,
+agents — and `{env:NAME}` / `{file:path}` in them substitute the server's
+environment and any file the server can read. **Any server that runs
+unattended or can be reached by others must configure bearer auth or set
+`"server": { "trust": { "project": "restricted" } }` in the host config.**
+When the shell posture is restricted and project config is not, the server
+says so at startup, in a warning that names the setting. In the rows where
+neither is restricted nothing is logged: the server cannot tell those
+deployments from a developer's laptop.
+
+**The ratchet does not reach what is already running.** When the posture
+tightens after startup (a `webhook` or `watch` trigger is created, a
+listener is bound beyond loopback), processes started from then on get the
+restricted environment. MCP stdio servers, language servers and open
+terminals that were started before keep the environment they were started
+with, until they are restarted. A server that is restricted from its start
+(bearer auth, or any input read at startup) is not affected.
+
+**Language servers run project code.** They are started for the project's
+files and execute its configuration and build scripts. `bash: "deny"` is
+not "no code execution" without `"lsp": false` (see
+[What stays with the operator](#what-stays-with-the-operator)).
+
+**Same user, same files.** The agent's shell runs as the server's user.
+When `bash` is allowed, any process it starts can read
+`/proc/<server pid>/environ` (every variable the shell policy withheld),
+`auth.json`, the host config and the database, and can write them. The
+write guard and the read guard above are on the file tools, not on the
+shell. The mitigations are: deny `bash` (and `lsp`); keep the policy in a
+managed config directory owned by another user
+(`server.trust.host: "managed"`), which protects the config from being
+changed, not from being read; or run the agent's shell as a different
+user, which alforria does not implement.
+
+**Marks and approvals.**
+
+- Files in the workspace carry no provenance. A file a marked session
+  wrote, or that arrived in a clone, is read by a later session like any
+  other project file; only the upload directories mark the session that
+  reads them (see [assistant.md](assistant.md#two-session-marks-what-causes-each-and-what-each-does)).
+- A session that carries the outside-content mark and is not restricted
+  (the operator's own, after it read a web page) has no write guard: it can
+  write loader files (`AGENTS.md`, `.opencode/`). The guard follows
+  restriction and the outside-*start* mark only.
+- `bash` output never marks a session, whatever the command fetched.
+- A standing approval (`always`) is for the whole project, not for the
+  session that was asked: it applies to every later session in that
+  directory that is not under a ceiling. Below `admin` it needs
+  `server.auth.bearer.reply_always`.
 
 ## Files for a browser: tickets, raw reads, uploads
 

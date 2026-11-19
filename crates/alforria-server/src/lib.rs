@@ -481,6 +481,15 @@ pub fn production_context(
         });
     policy.observe(&opts.hostname, outside_trigger);
     tracing::info!("{}", policy.posture_summary());
+    if policy.config_error.is_none() {
+        let mode = alforria_core::ConfigLoader::new().host_mode(&alforria_core::LoadParams::new(
+            paths.home.clone(),
+            paths.clone(),
+        ));
+        if let Some(warning) = policy.project_trust_warning(mode.restricted) {
+            tracing::warn!("{warning}");
+        }
+    }
     if let Err(error) = freeze_host_config(&host_snapshot, &policy, &paths) {
         tracing::warn!("host config not applied: {error}");
         policy.config_error.get_or_insert(error);

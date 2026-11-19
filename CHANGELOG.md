@@ -616,6 +616,15 @@ pre-1.0, so minor releases may include breaking changes.
 
 ### Changed
 
+- A server whose shell posture is restricted (bound beyond loopback,
+  `permission.unattended`, a webhook, a `webhook` or `watch` trigger) while
+  project config is still fully trusted — no bearer auth, no
+  `server.trust.project: "restricted"` — now logs a warning at startup
+  that names the setting. `docs/unattended-server.md` gains a "Known
+  limits" section: the two conditions and the deployments neither covers,
+  helpers that keep their environment when the posture tightens, language
+  servers running project code under `bash: deny`, and what a same-user
+  shell can read.
 Everything an existing install can notice, in three groups: (a) what
 changes for someone who configures none of the new features; (b) what
 changes for someone who ran an earlier build of this branch with triggers,

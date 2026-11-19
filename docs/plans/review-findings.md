@@ -918,3 +918,64 @@ Known and left:
 - Read-only config loads in a few v1/v2 routes (`/command`, `/skill`) still
   resolve the global directories from the environment rather than from the
   context they were built over.
+
+## 2026-11-19: security review of the unattended server — what stays as it is
+
+The fixes of this round are in the changelog. Recorded here: what the
+reviewers reproduced that is true **by design**, and the product decisions
+left open. The user-facing statement is "Known limits" in
+`docs/unattended-server.md`.
+
+True by design on a server **without bearer auth** (and without
+`server.trust.project: "restricted"`):
+
+- **A project's config substitutes the server's environment and outside
+  files.** `{env:NAME}` and `{file:/abs/path}` in a project `opencode.json`
+  are substituted as upstream does, for any name and any readable file — on
+  a server bound beyond loopback, with `permission.unattended`, a webhook,
+  Basic auth behind a proxy, or `alforria run` under a supervisor alike.
+  Project trust follows bearer auth / `server.trust.project` only. The
+  server now warns at startup when its shell posture is restricted and
+  project config is not; it cannot see the other cases.
+- **The standalone shell passes general-purpose credentials.**
+  `GITHUB_TOKEN`, `GH_TOKEN`, `AWS_*`, `HF_TOKEN`-style names reach the
+  agent's processes on a standalone server: they are the user's own tools'
+  credentials first. Only alforria's secrets and model-provider key
+  variables are withheld there.
+
+Open product decisions:
+
+- Whether a non-loopback bind **alone** should restrict the shell posture
+  (it does today) and whether it should also restrict project config (it
+  does not).
+- Whether `*_API_KEY` / `*_API_TOKEN` names are withheld from the agent's
+  processes for everyone, standalone included.
+- The general-purpose exemption list (`GITHUB_TOKEN`, `GH_TOKEN`, `AWS_*`
+  passed on a standalone server although the model catalog lists them):
+  which names belong on it.
+- Stored operator triggers loading as restricted after an upgrade.
+- Migration `0008_session_mark_backfill` over-marking.
+- The per-directory scheduler lock.
+- `memory.scope: "global"` spans directories, for tokens confined to one
+  directory by `server.directories` too.
+- Windows: guarded writes use the weaker by-name fallback
+  (`beneath::NoFollowDir`'s non-Unix half), and that configuration is not
+  compiled or tested as a whole in CI.
+
+New in this round and left (found while fixing, not fixed):
+
+- The `read` tool itself opens by name and will wait on a FIFO in a
+  blocking thread (not an async worker); only the HTTP read routes and the
+  inlined prompt file part were moved to the bounded, non-blocking read.
+- `alforria run` and the other one-shot commands still degrade an
+  unparseable global config to an empty one (upstream's behaviour); only
+  server processes keep or require a good host config.
+- The host-config snapshot is a registry keyed by the global config
+  directory inside the process; `OPENCODE_CONFIG*` environment sources are
+  not part of it (the server does not pass those flags to the loader).
+- A frozen server's `PATCH /global/config` applies the request to the
+  remembered config without `{env:}` / `{file:}` substitution until the
+  next start.
+- A guarded session reads no global skill's auxiliary files from the
+  global config directory unless an `external_directory` rule names the
+  directory.

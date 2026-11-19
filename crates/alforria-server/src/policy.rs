@@ -516,6 +516,29 @@ impl ServerPolicy {
         }
     }
 
+    /// What to tell the operator of a server whose shells are restricted
+    /// while a project's config is still fully trusted: the two follow
+    /// different conditions (`unattended_or_remote`, and
+    /// `HostMode::restricted` — bearer auth or `server.trust.project`), and
+    /// a server that is unattended or reachable without bearer auth is
+    /// treated as a developer's own as far as project config goes.
+    pub fn project_trust_warning(&self, project_restricted: bool) -> Option<String> {
+        if project_restricted || !self.unattended_or_remote() {
+            return None;
+        }
+        let reasons: Vec<&str> = self.posture.iter().map(|reason| reason.as_str()).collect();
+        Some(format!(
+            "this server is unattended or reachable from another machine ({}), but a \
+             project's config is fully trusted: an opencode.json or .opencode/ in a project \
+             can still set permissions, MCP servers and plugins, and substitute the server's \
+             environment ({{env:}}) and files ({{file:}}). Set \
+             `\"server\": {{ \"trust\": {{ \"project\": \"restricted\" }} }}` in the host \
+             config (or configure server.auth.bearer, which implies it) unless every project \
+             this server opens is your own.",
+            reasons.join(", ")
+        ))
+    }
+
     /// Load the host config under `paths` and resolve the policy. A config
     /// that does not load, or does not resolve, leaves the defaults in
     /// place with `config_error` set.
@@ -552,6 +575,27 @@ mod tests {
 
     fn config(value: serde_json::Value) -> Config {
         serde_json::from_value(value).unwrap()
+    }
+
+    /// The shell posture and project-config trust follow different
+    /// conditions; the operator is told when they disagree the unsafe way.
+    #[test]
+    fn a_restricted_posture_with_trusted_project_config_is_warned_about() {
+        let mut policy =
+            ServerPolicy::from_config_in(&config(serde_json::json!({})), Path::new("/home/u"))
+                .unwrap();
+        assert_eq!(policy.project_trust_warning(false), None, "standalone");
+        policy.observe("0.0.0.0", false);
+        assert!(policy.unattended_or_remote());
+        let warning = policy.project_trust_warning(false).unwrap();
+        assert!(warning.contains("non-loopback-bind"), "{warning}");
+        assert!(warning.contains("server"), "{warning}");
+        assert!(warning.contains(r#""project": "restricted""#), "{warning}");
+        assert_eq!(
+            policy.project_trust_warning(true),
+            None,
+            "already restricted"
+        );
     }
 
     /// The policy is logged and carried in errors: `{:?}` of it shows no
