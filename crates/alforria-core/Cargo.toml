@@ -30,6 +30,7 @@ tree-sitter-bash = { workspace = true }
 shlex = { workspace = true }
 similar = { workspace = true }
 grep-regex = { workspace = true }
+grep-matcher = { workspace = true }
 grep-searcher = { workspace = true }
 base64 = { workspace = true }
 tokio-util = { workspace = true }

@@ -13,6 +13,8 @@ use crate::tool::ripgrep::{ts_dirname, ts_resolve, Ripgrep};
 use crate::tool::truncate::Truncate;
 
 const LIMIT: usize = 250;
+static SEARCH_SLOTS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(4)));
 
 #[derive(Debug, Deserialize)]
 pub struct GrepParameters {
@@ -108,9 +110,25 @@ fn run(
             _ => ts_dirname(&search),
         };
 
-        let result = ripgrep
-            .grep(&cwd, &params.pattern, params.include.as_deref(), LIMIT)
-            .map_err(ToolError::Failed)?;
+        let cancel = ctx.abort.child_token();
+        let _cancel_on_drop = cancel.clone().drop_guard();
+        let permit = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(ToolError::Aborted),
+            permit = SEARCH_SLOTS.clone().acquire_owned() => permit.map_err(|error| ToolError::Failed(error.to_string()))?,
+        };
+        let pattern = params.pattern.clone();
+        let include = params.include.clone();
+        let search_cancel = cancel.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            ripgrep.grep_with_cancel(&cwd, &pattern, include.as_deref(), LIMIT, &search_cancel)
+        });
+        let result = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(ToolError::Aborted),
+            result = task => result.map_err(|error| ToolError::Failed(error.to_string()))?.map_err(ToolError::Failed)?,
+        };
         if result.is_empty() {
             return empty_result(&params.pattern);
         }
@@ -246,6 +264,73 @@ mod tests {
         .unwrap();
         let golden: serde_json::Value = serde_json::from_str(&golden).unwrap();
         assert_eq!(parameters(), golden);
+    }
+
+    #[tokio::test]
+    async fn search_runs_off_the_runtime_and_cancellation_releases_it() {
+        use crate::tool::ripgrep::GrepMatch;
+        use tokio_util::sync::CancellationToken;
+        struct SlowSearch(std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>);
+        impl Ripgrep for SlowSearch {
+            fn grep(
+                &self,
+                _: &Path,
+                _: &str,
+                _: Option<&str>,
+                _: usize,
+            ) -> Result<Vec<GrepMatch>, String> {
+                unreachable!()
+            }
+            fn grep_with_cancel(
+                &self,
+                _: &Path,
+                _: &str,
+                _: Option<&str>,
+                _: usize,
+                cancel: &CancellationToken,
+            ) -> Result<Vec<GrepMatch>, String> {
+                self.0.lock().unwrap().take().unwrap().send(()).unwrap();
+                while !cancel.is_cancelled() {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err("cancelled".into())
+            }
+            fn glob(&self, _: &Path, _: &str, _: usize) -> Vec<PathBuf> {
+                vec![]
+            }
+            fn find(&self, _: &Path, _: &str, _: bool, _: bool, _: usize) -> Vec<PathBuf> {
+                vec![]
+            }
+        }
+        let temp = crate::storage::test_support::TempDir::new("grep-cancel");
+        let ask = RecordingAsk::new();
+        let inst = instance(temp.path());
+        let extra = Extra::default();
+        let context = ctx(&ask, &inst, &extra);
+        let cancel = context.abort.clone();
+        let (started, running) = tokio::sync::oneshot::channel();
+        let def = grep_tool(
+            Arc::new(TruncateService::default_limits(temp.path().join("output"))),
+            fixed_agents(),
+            Arc::new(SlowSearch(std::sync::Mutex::new(Some(started)))),
+        );
+        let canceller = async {
+            running.await.unwrap();
+            cancel.cancel();
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!((def.execute)(json!({"pattern":"x"}), context), canceller)
+        })
+        .await
+        .expect("the runtime stays responsive while the search is running");
+        assert!(matches!(result, Err(ToolError::Aborted)));
+        let _slots = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            SEARCH_SLOTS.acquire_many(4),
+        )
+        .await
+        .expect("the cancelled search returned its permit")
+        .unwrap();
     }
 
     #[tokio::test]
