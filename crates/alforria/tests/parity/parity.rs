@@ -1,4 +1,4 @@
-//! Scenario parity tests (gated): the dual-binary drivers compared under
+//! Scenario parity tests (explicitly ignored by default): the dual-binary drivers compared under
 //! normalization. P1–P9 — the scenario matrix (spec PARITY §5), each
 //! diffing named HTTP captures, the recorded mock-LLM requests, and the
 //! SSE event streams in both envelopes (spec PARITY §3.1).
@@ -11,7 +11,7 @@ use crate::normal::{
     check_v2_envelope, drop_control_plane, drop_envelope_id, event_types, normalize_events,
     normalize_requests, normalize_v2_events, sort_events, Normalizer,
 };
-use crate::parity_harness::gated;
+use crate::parity_harness::require_enabled;
 use crate::report::Report;
 use crate::scenarios::{self, Capture, Named};
 use crate::transcript::Transcript;
@@ -248,10 +248,9 @@ fn setup_none() -> impl Fn(&std::path::Path) {
 }
 
 #[tokio::test]
+#[ignore = "requires the pinned reference; run with OPENCODE_PARITY=1 and --ignored"]
 async fn p1_file_mutation_parity() {
-    if !gated() {
-        return;
-    }
+    require_enabled();
     let (ts, rs) = scenarios::scenario(
         "p1_file_mutation",
         scenarios::A1_FILE_MUTATION,
@@ -283,10 +282,9 @@ async fn p1_file_mutation_parity() {
 }
 
 #[tokio::test]
+#[ignore = "requires the pinned reference; run with OPENCODE_PARITY=1 and --ignored"]
 async fn p2_multi_step_parity() {
-    if !gated() {
-        return;
-    }
+    require_enabled();
     let setup = |project: &std::path::Path| {
         std::fs::write(project.join("a.txt"), "alpha\n").expect("seed a.txt");
         std::fs::write(project.join("b.txt"), "beta\n").expect("seed b.txt");
@@ -302,9 +300,7 @@ async fn p2_multi_step_parity() {
 }
 
 async fn p3_parity(check: &str, reply: scenarios::Reply) {
-    if !gated() {
-        return;
-    }
+    require_enabled();
     let setup = |project: &std::path::Path| {
         std::fs::write(project.join("secret.env"), "TOKEN=1\n").expect("seed secret.env");
     };
@@ -325,25 +321,27 @@ async fn p3_parity(check: &str, reply: scenarios::Reply) {
 }
 
 #[tokio::test]
+#[ignore = "requires the pinned reference; run with OPENCODE_PARITY=1 and --ignored"]
 async fn p3_permission_gate_once_parity() {
     p3_parity("p3_permission_gate_once", scenarios::Reply::Once).await;
 }
 
 #[tokio::test]
+#[ignore = "requires the pinned reference; run with OPENCODE_PARITY=1 and --ignored"]
 async fn p3_permission_gate_always_parity() {
     p3_parity("p3_permission_gate_always", scenarios::Reply::Always).await;
 }
 
 #[tokio::test]
+#[ignore = "requires the pinned reference; run with OPENCODE_PARITY=1 and --ignored"]
 async fn p3_permission_gate_reject_parity() {
     p3_parity("p3_permission_gate_reject", scenarios::Reply::Reject).await;
 }
 
 #[tokio::test]
+#[ignore = "requires the pinned reference; run with OPENCODE_PARITY=1 and --ignored"]
 async fn p4_subagent_parity() {
-    if !gated() {
-        return;
-    }
+    require_enabled();
     let (ts, rs) = scenarios::scenario(
         "p4_subagent",
         scenarios::A4_SUBAGENT,
@@ -368,10 +366,9 @@ async fn p4_subagent_parity() {
 }
 
 #[tokio::test]
+#[ignore = "requires the pinned reference; run with OPENCODE_PARITY=1 and --ignored"]
 async fn p5_compaction_parity() {
-    if !gated() {
-        return;
-    }
+    require_enabled();
     let setup = |project: &std::path::Path| {
         std::fs::write(project.join("a.txt"), "x\n").expect("seed a.txt");
     };
@@ -406,10 +403,9 @@ fn git(project: &std::path::Path, args: &[&str]) {
 }
 
 #[tokio::test]
+#[ignore = "requires the pinned reference; run with OPENCODE_PARITY=1 and --ignored"]
 async fn p6_revert_unrevert_parity() {
-    if !gated() {
-        return;
-    }
+    require_enabled();
     let setup = |project: &std::path::Path| {
         git(project, &["init", "--quiet"]);
         git(project, &["config", "user.email", "e2e@opencode.test"]);
@@ -439,10 +435,9 @@ async fn p6_revert_unrevert_parity() {
 }
 
 #[tokio::test]
+#[ignore = "requires the pinned reference; run with OPENCODE_PARITY=1 and --ignored"]
 async fn p7_cancel_mid_stream_parity() {
-    if !gated() {
-        return;
-    }
+    require_enabled();
     let (ts, rs) = scenarios::scenario(
         "p7_cancel_mid_stream",
         scenarios::A8_CANCEL_MID_STREAM,
@@ -487,10 +482,9 @@ async fn p7_cancel_mid_stream_parity() {
 }
 
 #[tokio::test]
+#[ignore = "requires the pinned reference; run with OPENCODE_PARITY=1 and --ignored"]
 async fn p8_structured_output_parity() {
-    if !gated() {
-        return;
-    }
+    require_enabled();
     let (ts, rs) = scenarios::scenario(
         "p8_structured_output",
         scenarios::A9_STRUCTURED_OUTPUT,
@@ -511,10 +505,9 @@ async fn p8_structured_output_parity() {
 }
 
 #[tokio::test]
+#[ignore = "requires the pinned reference; run with OPENCODE_PARITY=1 and --ignored"]
 async fn p9_session_lifecycle_parity() {
-    if !gated() {
-        return;
-    }
+    require_enabled();
     let (ts, rs) = scenarios::scenario(
         "p9_session_lifecycle",
         scenarios::A1_FILE_MUTATION,

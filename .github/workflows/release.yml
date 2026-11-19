@@ -105,26 +105,48 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - uses: oven-sh/setup-bun@v2
+        if: runner.os == 'Linux'
+        with:
+          bun-version: 1.4.4
+      - name: Verify web source and embedded bundle
+        if: runner.os == 'Linux'
+        working-directory: web
+        run: |
+          bun install --frozen-lockfile
+          bun run check
+          bun run build
+          bun run verify:bundle
+
       - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
 
       - name: Install nextest
         run: cargo install cargo-nextest --locked || true
 
-      # The alforria-core unit tests hardcode POSIX path expectations and
-      # have never run on Windows (CI never reached them before 2026-10);
-      # the pty tests shell out to /bin/sh. Both are tracked as windows
-      # test debt. Everything else — the CLI e2e and wire-scenario suites,
-      # the server and TUI test binaries — runs in full on every OS.
+      # Legacy core tests still contain POSIX path expectations. The portable
+      # recovery/storage/permission suites run explicitly below; real PTY
+      # tests now use Python processes and run on all three platforms.
       - name: Run tests
         if: runner.os != 'Windows'
         run: cargo nextest run --retries 2 || cargo test --workspace
 
-      - name: Run tests (windows, core unit + pty tests deferred)
+      - name: Run tests (windows, legacy core tests deferred)
         if: runner.os == 'Windows'
         # No cargo-test fallback here: it would re-run everything the
-        # deferral excludes (posix-hardcoded expectations, /bin/sh pty
-        # fixtures) and bury the real signal.
-        run: cargo nextest run --retries 2 -E 'not (package(alforria-core) or binary(pty) or test(pty::tests))'
+        # legacy POSIX assertions and bury the real signal.
+        run: cargo nextest run --retries 2 -E 'not package(alforria-core)'
+
+      - name: Run portable core regressions (windows)
+        if: runner.os == 'Windows'
+        run: |
+          cargo test -p alforria-core session::snapshot::git_tests --lib
+          cargo test -p alforria-core move_authorizes_both_endpoints --lib
+          cargo test -p alforria-core storage::connection::tests --lib
+          cargo test -p alforria-core active_context_stops --lib
 
   # 4. Cross-build and attach binaries + sha256 sidecars.
   build-binaries:

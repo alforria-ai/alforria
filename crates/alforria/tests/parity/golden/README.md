@@ -12,7 +12,7 @@ TS re-pin.
 capture against the stored goldens:
 
 ```sh
-OPENCODE_PARITY=1 OPENCODE_PARITY_GOLDEN=1 cargo nextest run -p opencode parity
+OPENCODE_PARITY=1 OPENCODE_PARITY_GOLDEN=1 cargo test -p alforria --test parity p8_ -- --ignored
 ```
 
 ## Refresh procedure
@@ -21,9 +21,16 @@ On a machine with the pinned TS clone (`/tmp/opencode-src` at the commit in
 `fixtures/PINNED.md`), re-record the goldens from a live dual run:
 
 ```sh
-OPENCODE_PARITY=1 OPENCODE_PARITY_RECORD=1 cargo nextest run -p opencode parity
+OPENCODE_PARITY=1 OPENCODE_PARITY_RECORD=1 cargo test -p alforria --test parity p8_ -- --ignored
 ```
 
 Review the golden diff in the PR: golden churn means the TS side or the
 normalizer changed and must be explained. Never re-generate goldens to make a
 failing live run pass — a divergence there is a deviation to triage.
+
+The committed capture currently covers P8 structured output. CI compares P0 API,
+schema and event inventories and P8 against the live pinned reference, and also
+runs P8 offline. The other strict scenarios remain available with `--ignored`;
+they currently expose differences in repeated summary notifications, child-session
+permission policy, and the revert driver. They are not claimed as passing parity.
+Unexecuted live comparisons are reported as ignored, never as successful tests.

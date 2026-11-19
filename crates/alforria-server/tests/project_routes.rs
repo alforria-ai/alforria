@@ -1,6 +1,8 @@
 //! M7.1 acceptance: the v1 `/project` family — `current` golden, `list`,
 //! `git/init` bootstrap, `update` + `ProjectNotFoundError`, `directories`.
 
+mod support;
+
 use std::path::Path;
 use std::sync::Arc;
 
@@ -102,7 +104,10 @@ async fn request_json(
 }
 
 fn q(directory: &Path) -> String {
-    format!("?directory={}", directory.display())
+    format!(
+        "?directory={}",
+        support::encode_query_value(&directory.to_string_lossy())
+    )
 }
 
 #[tokio::test]

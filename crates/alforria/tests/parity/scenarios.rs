@@ -136,12 +136,16 @@ impl Capture {
 
 /// The committed golden file of one scenario's TS capture.
 fn golden_path(check: &str) -> PathBuf {
-    Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/parity/golden/ts"))
-        .join(format!("{check}.json"))
+    Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/parity/golden/ts"
+    ))
+    .join(format!("{check}.json"))
 }
 
 fn store_golden(check: &str, capture: &Capture) {
     let path = golden_path(check);
+    std::fs::create_dir_all(path.parent().unwrap()).expect("create parity golden directory");
     std::fs::write(
         &path,
         serde_json::to_string_pretty(&capture.to_golden()).expect("serialize golden"),

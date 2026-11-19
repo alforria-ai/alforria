@@ -2,6 +2,8 @@
 //! the OAuth-unsupported 400 (flat `{"error": ...}`), the
 //! `McpServerNotFoundError` 404 matrix and `GET /experimental/resource`.
 
+mod support;
+
 use std::sync::Arc;
 
 use alforria_core::mcp::{McpService, McpServiceInput};
@@ -164,7 +166,10 @@ async fn request_json(
 }
 
 fn q(directory: &std::path::Path) -> String {
-    format!("?directory={}", directory.display())
+    format!(
+        "?directory={}",
+        support::encode_query_value(&directory.to_string_lossy())
+    )
 }
 
 #[tokio::test]

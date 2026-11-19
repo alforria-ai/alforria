@@ -11,10 +11,14 @@ use crate::harness::Env;
 /// The pinned TS reference commit (see `fixtures/PINNED.md`).
 pub const PINNED_COMMIT: &str = "88c6c7abc7f320b6aabed2634ac0b2d6e6ecea67";
 
-/// `OPENCODE_PARITY=1` gates every parity test; without it the tests
-/// early-return in <1s.
-pub fn gated() -> bool {
-    std::env::var("OPENCODE_PARITY").ok().as_deref() == Some("1")
+/// Ignored parity tests require explicit opt-in; a missing flag must never
+/// make an unexecuted comparison appear to pass.
+pub fn require_enabled() {
+    assert_eq!(
+        std::env::var("OPENCODE_PARITY").ok().as_deref(),
+        Some("1"),
+        "set OPENCODE_PARITY=1 to run reference comparisons"
+    );
 }
 
 /// `OPENCODE_PARITY_RECORD=1` — live TS runs also rewrite the golden

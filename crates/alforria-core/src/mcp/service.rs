@@ -1081,7 +1081,8 @@ for line in sys.stdin:
             "off".to_string(),
             McpEntry::Server(McpInfo::Remote(McpRemote {
                 url: "https://mcp.example.invalid".to_string(),
-                enabled: None,
+                // Validate OAuth policy without initializing a remote transport.
+                enabled: Some(false),
                 headers: None,
                 oauth: Some(McpOAuthSetting::Disabled(false)),
                 timeout: None,
@@ -1117,7 +1118,8 @@ for line in sys.stdin:
             "remote".to_string(),
             McpEntry::Server(McpInfo::Remote(McpRemote {
                 url: "https://mcp.example.invalid".to_string(),
-                enabled: None,
+                // The missing-flow check must be entirely offline.
+                enabled: Some(false),
                 headers: None,
                 oauth: None,
                 timeout: None,
@@ -1126,7 +1128,7 @@ for line in sys.stdin:
         let service = new_service(entries);
         assert!(matches!(
             service.finish_auth("remote", "code").await,
-            Err(FinishAuthError::Failed(_))
+            Err(FinishAuthError::Failed(message)) if message == "No pending OAuth flow for MCP server: remote"
         ));
     }
 }
