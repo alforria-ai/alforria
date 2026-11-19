@@ -68,6 +68,19 @@ the parse error instead of running on defaults. `alforria run` and the other one
 are one load and are unchanged. The code is
 `crates/alforria-core/src/config/snapshot.rs`.
 
+**`OPENCODE_CONFIG`, `OPENCODE_CONFIG_DIR`, `OPENCODE_CONFIG_CONTENT` and
+`OPENCODE_PERMISSION` are not read.** The config loader knows these
+sources (and treats them as your own, wherever this page or
+[assistant.md](assistant.md) says "the `OPENCODE_CONFIG*` environment"),
+but no alforria entry point — `serve`, `web`, the TUI's server, `run` —
+passes the environment to it today: setting them changes nothing
+(`crates/alforria-server/tests/config_env_ignored.rs` holds a server to
+that). They are therefore not a host source that can change under a
+running server. Should an entry point start passing them, the loader holds
+them like the other host sources on a frozen server: read once at startup,
+never again, and an error if they name something the startup did not read.
+Put a server's policy in the host config files.
+
 Which key is read from where is one table for every alforria key,
 `EXTENSION_KEYS` in `crates/alforria-core/src/config/precedence.rs`; the
 whole of it is in [assistant.md](assistant.md#which-config-may-set-what).

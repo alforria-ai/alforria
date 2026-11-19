@@ -244,6 +244,14 @@ pre-1.0, so minor releases may include breaking changes.
 
 ### Fixed
 
+- Documented, and held by a test, that no alforria entry point reads
+  `OPENCODE_CONFIG`, `OPENCODE_CONFIG_DIR`, `OPENCODE_CONFIG_CONTENT` or
+  `OPENCODE_PERMISSION`: the loader supports them, nothing passes the
+  environment to it, and the documentation said otherwise. In the loader,
+  a file named by `OPENCODE_CONFIG` is now held by a server's frozen host
+  config like every other host source (the `OPENCODE_CONFIG_DIR` directory
+  already was), so wiring the variables later cannot reopen a source that
+  is re-read while the server runs.
 - An MCP OAuth sign-in started the desktop's URL handler (`xdg-open`,
   `open`, `cmd /c start`) on whatever authorization URL the MCP server's
   metadata named, with the server's whole environment, on any server. It

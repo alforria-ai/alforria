@@ -1117,7 +1117,15 @@ impl ConfigLoader {
 
         // 4. OPENCODE_CONFIG env file (failures are fatal).
         if let Some(flag) = flags_value(&params.flags.config) {
-            let next = self.load_file(Path::new(flag), &auth_env, &rules(ConfigOrigin::Own))?;
+            // The user's own file is a host source to a server process
+            // like the others: read once under a frozen snapshot, and an
+            // error — not a fresh read — when the freeze did not read it.
+            // (`OPENCODE_CONFIG_DIR` goes through the directory loop
+            // below, which remembers every directory that is not a
+            // project's.)
+            let next = remembered(&snapshot, (PathBuf::from(flag), reading), || {
+                self.load_file(Path::new(flag), &auth_env, &rules(ConfigOrigin::Own))
+            })?;
             let next = apply_trust(next, flag, ConfigOrigin::Own, &mode);
             note_agent_names(&next, &mut host_agents);
             merge_config_concat_arrays(&mut result, &next);
@@ -3432,6 +3440,66 @@ mod tests {
         }
         assert!(standalone.get("build").is_none());
         assert_eq!(standalone.get("ops").unwrap().mode, AgentMode::Primary);
+    }
+
+    /// No entry point passes `OPENCODE_CONFIG` / `OPENCODE_CONFIG_DIR` to
+    /// the loader today. A caller that does gets the same treatment as
+    /// every other host source under a frozen snapshot: what the freeze
+    /// read is what stands, a file rewritten afterwards is not read again,
+    /// and a source the freeze did not read is an error — never a fresh
+    /// read, never an empty config.
+    #[test]
+    fn a_frozen_snapshot_holds_the_environment_named_sources_too() {
+        let mut f = Fixture::new();
+        let file = f.root.join("env.json");
+        let dir = f.root.join("env-dir");
+        let deny = json!({ "permission": { "bash": "deny" } }).to_string();
+        let allow = json!({ "permission": { "bash": "allow", "edit": "allow" } }).to_string();
+        write(&file, &deny);
+        write(
+            &dir.join("opencode.json"),
+            &json!({ "permission": { "edit": "deny" } }).to_string(),
+        );
+        let flags = || ConfigFlags {
+            config: Some(file.to_string_lossy().into_owned()),
+            config_dir: Some(dir.to_string_lossy().into_owned()),
+            ..ConfigFlags::default()
+        };
+        f.params.flags = flags();
+        let snapshot = HostSnapshot::install(&f.params.paths.config);
+        let permission = |f: &Fixture| {
+            let trusted = ConfigLoader.load_trusted(&f.params).unwrap();
+            let (merged, _) = f.load().unwrap();
+            assert_eq!(
+                serde_json::to_value(&trusted.permission).unwrap(),
+                serde_json::to_value(&merged.permission).unwrap()
+            );
+            serde_json::to_value(&merged.permission).unwrap()
+        };
+        let before = permission(&f);
+        assert_eq!(before, json!({ "bash": "deny", "edit": "deny" }));
+        snapshot.freeze(
+            ConfigLoader.host_mode(&f.params),
+            ConfigLoader.host_source_keys(&f.params),
+        );
+
+        write(&file, &allow);
+        write(&dir.join("opencode.json"), &allow);
+        assert_eq!(permission(&f), before, "a rewritten source was read again");
+
+        // Sources the freeze never saw: another file, another directory.
+        let other = f.root.join("other.json");
+        write(&other, &allow);
+        f.params.flags.config = Some(other.to_string_lossy().into_owned());
+        assert!(f.load().is_err(), "a source not read at startup was loaded");
+        f.params.flags = flags();
+        let other_dir = f.root.join("other-dir");
+        write(&other_dir.join("opencode.json"), &allow);
+        f.params.flags.config_dir = Some(other_dir.to_string_lossy().into_owned());
+        assert!(
+            f.load().is_err(),
+            "a directory not read at startup was loaded"
+        );
     }
 
     /// `load_trusted` is the host's reading: the managed directory and the
