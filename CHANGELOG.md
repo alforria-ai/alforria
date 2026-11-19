@@ -244,6 +244,11 @@ pre-1.0, so minor releases may include breaking changes.
 
 ### Fixed
 
+- A process whose shell posture was restricted from startup (bearer auth,
+  `permission.unattended`, a webhook) could be put back in the standalone
+  posture by a later policy install in the same process: only a posture
+  tightened after startup was kept. Installing a policy now never relaxes
+  the posture, however it became restricted.
 - An MCP tool whose key spelled a built-in tool's name (a server `apply`
   with a tool `patch` is `apply_patch`) was classified as that built-in
   when deciding whether its answer is outside content, and could leave the

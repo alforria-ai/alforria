@@ -557,11 +557,13 @@ static CURRENT: RwLock<Option<Arc<ShellEnvPolicy>>> = RwLock::new(None);
 static TIGHTENED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 /// Make `policy` the process-wide policy. Names the process has already
-/// learned stay learned, and a posture that was tightened stays
-/// restricted.
+/// learned stay learned, and the posture never relaxes: once restricted —
+/// from the first install or by [`tighten`] — it stays restricted while
+/// the process lives, whatever a later install asks for.
 pub fn install(mut policy: ShellEnvPolicy) {
     let mut current = CURRENT.write().unwrap_or_else(|p| p.into_inner());
     if let Some(previous) = current.as_deref() {
+        policy.restricted |= previous.restricted;
         policy.named.extend(previous.named.iter().cloned());
         policy.catalog.extend(previous.catalog.iter().cloned());
         policy
