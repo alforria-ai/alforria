@@ -182,6 +182,17 @@ pub struct RequestExecutor<S = TokioSleeper, J = XorshiftJitter> {
     jitter: Arc<J>,
 }
 
+impl<S, J> Clone for RequestExecutor<S, J> {
+    fn clone(&self) -> Self {
+        Self {
+            client: self.client.clone(),
+            retry: self.retry.clone(),
+            sleeper: self.sleeper.clone(),
+            jitter: self.jitter.clone(),
+        }
+    }
+}
+
 /// Follow a redirect only within the origin the request was sent to. A
 /// provider request carries the API key, and reqwest strips `Authorization`
 /// when a redirect changes host but not `x-api-key` or `x-goog-api-key`: a

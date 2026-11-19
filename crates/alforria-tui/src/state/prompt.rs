@@ -9,10 +9,12 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use alforria_schema::vcs::CommitInfo;
 use serde_json::{json, Value};
 
 use crate::state::route::{PromptMode, Route};
 use crate::state::{App, Toast, ToastVariant};
+use crate::transport::api::Location;
 use crate::ui::textarea::Textarea;
 
 // ------------------------------------------------------------- part inputs
@@ -679,6 +681,8 @@ pub struct AutocompleteOption {
     /// A TUI command name for `/` completions (dispatched on select,
     /// `useCommandSlashes` → `keymap.dispatchCommand`).
     pub tui_command: Option<&'static str>,
+    /// A full commit hash, or empty for uncommitted changes.
+    pub review_target: Option<String>,
     /// A file, directory or MCP resource mention, inserted as a `file`
     /// part.
     pub file: Option<FileMention>,
@@ -705,6 +709,10 @@ pub struct FoundEntry {
 /// The model half of `prompt/autocomplete.tsx`.
 #[derive(Debug, Default)]
 pub struct Autocomplete {
+    pub review_request: Option<Location>,
+    review_requested: Option<Location>,
+    review_commits: Option<Vec<CommitInfo>>,
+    review_selected: bool,
     /// The `fs.find` query last asked for, and the one waiting to be sent.
     pub files_requested: Option<String>,
     pub file_request: Option<String>,
@@ -854,6 +862,25 @@ fn text_range(value: &str, start: usize, end: usize) -> String {
 }
 
 impl Autocomplete {
+    fn clear_review(&mut self) {
+        self.review_request = None;
+        self.review_requested = None;
+        self.review_commits = None;
+        self.review_selected = false;
+    }
+
+    pub fn reviewing(&self) -> bool {
+        self.review_requested.is_some()
+    }
+
+    pub fn review_loading(&self) -> bool {
+        self.reviewing() && self.review_commits.is_none()
+    }
+
+    pub fn highlights_selection(&self) -> bool {
+        !self.reviewing() || self.review_selected
+    }
+
     pub fn visible(&self) -> bool {
         self.visible.is_some()
     }
@@ -871,6 +898,12 @@ impl Autocomplete {
     /// `onInput` (`autocomplete.tsx:676-708`) — hides when the trigger
     /// is invalidated, shows on `/` at position 0 or an `@` mention.
     fn on_input(&mut self, value: &str, cursor: usize) {
+        if review_query(value, cursor).is_some() {
+            if self.visible != Some('/') {
+                self.show('/', 0);
+            }
+            return;
+        }
         if self.visible.is_some() {
             let between = text_range(value, self.index, cursor);
             if cursor <= self.index
@@ -899,10 +932,21 @@ impl Autocomplete {
         self.visible = Some(visible);
         self.index = index;
         self.selected = 0;
+        self.review_selected = false;
     }
 
     fn move_selection(&mut self, direction: i32) {
         if self.options.is_empty() {
+            return;
+        }
+        if self.reviewing() && !self.review_selected {
+            self.review_selected = true;
+            self.selected = if direction < 0 {
+                self.options.len() - 1
+            } else {
+                0
+            };
+            self.clamp_scroll();
             return;
         }
         let mut selected = self.selected as i64 + direction as i64;
@@ -938,6 +982,87 @@ fn slash_not_sole(value: &str) -> bool {
         }
         None => false,
     }
+}
+
+fn review_query(value: &str, cursor: usize) -> Option<&str> {
+    if cursor != value.chars().count() {
+        return None;
+    }
+    let rest = value.strip_prefix("/review ")?;
+    if rest.contains(['\n', '\r']) {
+        return None;
+    }
+    Some(rest.trim())
+}
+
+fn review_location(app: &App) -> Location {
+    Location {
+        directory: app
+            .state
+            .project
+            .instance_path
+            .directory
+            .clone()
+            .or_else(|| app.state.project.main_dir.clone()),
+        workspace: app.state.project.workspace.current.clone(),
+    }
+}
+
+pub fn review_commits_found(app: &mut App, location: &Location, commits: Vec<CommitInfo>) {
+    if app.ui.prompt.autocomplete.review_requested.as_ref() != Some(location)
+        || review_location(app) != *location
+        || review_query(app.ui.prompt.input(), app.ui.prompt.textarea.cursor()).is_none()
+    {
+        return;
+    }
+    app.ui.prompt.autocomplete.review_commits = Some(commits);
+    rebuild_options(app);
+}
+
+fn rebuild_review_options(app: &mut App, query: &str) {
+    let location = review_location(app);
+    let auto = &mut app.ui.prompt.autocomplete;
+    if auto.review_requested.as_ref() != Some(&location) {
+        auto.review_request = Some(location.clone());
+        auto.review_requested = Some(location);
+        auto.review_commits = None;
+    }
+    let mut options = vec![AutocompleteOption {
+        display: "Uncommitted changes".to_string(),
+        description: Some("Review staged and working-tree changes".to_string()),
+        review_target: Some(String::new()),
+        ..Default::default()
+    }];
+    options.extend(
+        auto.review_commits
+            .iter()
+            .flatten()
+            .map(|commit| AutocompleteOption {
+                display: commit.short_hash.clone(),
+                description: Some(commit.subject.clone()),
+                review_target: Some(commit.hash.clone()),
+                ..Default::default()
+            }),
+    );
+    auto.options = if query.is_empty() {
+        options
+    } else if query.len() >= 4 && query.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        let query = query.to_ascii_lowercase();
+        options
+            .into_iter()
+            .filter(|option| {
+                option
+                    .review_target
+                    .as_ref()
+                    .is_some_and(|hash| hash.starts_with(&query))
+            })
+            .collect()
+    } else {
+        fuzzy_filter(options, query)
+    };
+    auto.selected = 0;
+    auto.scroll = 0;
+    auto.review_selected = false;
 }
 
 // ------------------------------------------------------------- prompt state
@@ -1011,6 +1136,7 @@ impl PromptState {
         self.parts.clear();
         self.extmark_to_part.clear();
         self.autocomplete.visible = None;
+        self.autocomplete.clear_review();
     }
 
     /// `restoreExtmarksFromParts` (`prompt/index.tsx:658-700`).
@@ -1758,10 +1884,22 @@ fn rebuild_options(app: &mut App) {
         // A reopened popup asks again (the TS resource refetches).
         auto.files_requested = None;
         auto.files = None;
+        auto.clear_review();
         return;
     };
     let value = app.ui.prompt.input().to_owned();
     let cursor = app.ui.prompt.textarea.cursor();
+    if let Some(query) = review_query(&value, cursor) {
+        if app.ui.prompt.mode == PromptMode::Normal {
+            rebuild_review_options(app, query);
+        } else {
+            app.ui.prompt.autocomplete.visible = None;
+            app.ui.prompt.autocomplete.options.clear();
+            app.ui.prompt.autocomplete.clear_review();
+        }
+        return;
+    }
+    app.ui.prompt.autocomplete.clear_review();
     let auto = &mut app.ui.prompt.autocomplete;
     let search = auto.search(&value);
     let mut options: Vec<AutocompleteOption> = Vec::new();
@@ -1921,7 +2059,16 @@ fn fuzzy_filter(options: Vec<AutocompleteOption>, search: &str) -> Vec<Autocompl
         let mut matched: Vec<(f64, AutocompleteOption)> = options
             .into_iter()
             .filter_map(|option| {
-                let target = remove_line_range(&option.display);
+                let target = if option.review_target.is_some() {
+                    format!(
+                        "{} {}",
+                        option.display,
+                        option.description.as_deref().unwrap_or_default()
+                    )
+                } else {
+                    option.display.clone()
+                };
+                let target = remove_line_range(&target);
                 let score = fuzzy_score(&target.to_ascii_lowercase(), &search.to_ascii_lowercase());
                 score.map(|score| (score * start_bonus(&target, &search), option))
             })
@@ -1987,6 +2134,23 @@ pub fn autocomplete_key(
         hide_autocomplete(app);
         return (true, Vec::new());
     }
+    if app.ui.prompt.autocomplete.reviewing() && matches("prompt.autocomplete.select") {
+        if !app.ui.prompt.autocomplete.review_selected
+            || app
+                .ui
+                .prompt
+                .autocomplete
+                .options
+                .get(app.ui.prompt.autocomplete.selected)
+                .is_none()
+        {
+            hide_autocomplete(app);
+            return (false, Vec::new());
+        }
+        let mut effects = select_autocomplete(app);
+        effects.extend(submit(app));
+        return (true, effects);
+    }
     if matches("prompt.autocomplete.complete") {
         let selected = app
             .ui
@@ -2015,7 +2179,10 @@ pub fn hide_autocomplete(app: &mut App) {
     if visible == Some('/') {
         let text = app.ui.prompt.input().to_string();
         let cursor = app.ui.prompt.textarea.cursor();
-        if !text.ends_with(' ') && text.starts_with('/') {
+        if !text.ends_with(' ')
+            && text.starts_with('/')
+            && review_query(&text, text.chars().count()).is_none()
+        {
             app.ui.prompt.textarea.delete_range(0, cursor);
         }
     }
@@ -2024,6 +2191,7 @@ pub fn hide_autocomplete(app: &mut App) {
     app.ui.prompt.autocomplete.options.clear();
     app.ui.prompt.autocomplete.files_requested = None;
     app.ui.prompt.autocomplete.files = None;
+    app.ui.prompt.autocomplete.clear_review();
 }
 
 /// `select()` (`autocomplete.tsx:553-558` + `insertPart`).
@@ -2043,6 +2211,15 @@ fn select_autocomplete(app: &mut App) -> Vec<crate::state::Effect> {
         return Vec::new();
     };
     hide_autocomplete(app);
+    if let Some(target) = option.review_target {
+        let text = if target.is_empty() {
+            "/review".to_string()
+        } else {
+            format!("/review {target}")
+        };
+        app.ui.prompt.textarea.set_text(&text);
+        return Vec::new();
+    }
     if let Some(command) = option.tui_command {
         // `useCommandSlashes` (`keymap.tsx:270-288`): the slash entry's
         // `onSelect` dispatches the TUI command directly.
@@ -2053,6 +2230,9 @@ fn select_autocomplete(app: &mut App) -> Vec<crate::state::Effect> {
         app.ui.prompt.textarea.set_text(&text);
         app.ui.prompt.parts.clear();
         app.ui.prompt.extmark_to_part.clear();
+        if command == "review" {
+            after_content_change(app);
+        }
         return Vec::new();
     }
     if let Some(agent) = option.agent {
@@ -2514,6 +2694,238 @@ mod tests {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         for char in text.chars() {
             text_input(app, &KeyEvent::new(KeyCode::Char(char), KeyModifiers::NONE));
+        }
+    }
+
+    fn review_app() -> App {
+        let mut app = App::new(
+            crate::config::TuiConfig::default(),
+            crate::state::Args {
+                model: Some("anthropic/claude".into()),
+                ..Default::default()
+            },
+            None,
+        );
+        app.ui.prompt_focused = true;
+        app.state.sync.agent = vec![json!({"name": "build", "mode": "primary"})];
+        app.state.sync.provider =
+            vec![json!({"id": "anthropic", "models": {"claude": {"id": "claude"}}})];
+        app.state.sync.command = vec![json!({"name": "review", "source": "command"})];
+        app
+    }
+
+    fn review_key(app: &mut App, code: crossterm::event::KeyCode) -> Vec<crate::state::Effect> {
+        crate::state::update(
+            app,
+            crate::state::Msg::Key(crossterm::event::KeyEvent::new(
+                code,
+                crossterm::event::KeyModifiers::NONE,
+            )),
+        )
+    }
+
+    fn review_commit(hash: &str, subject: &str) -> CommitInfo {
+        CommitInfo {
+            hash: hash.to_string(),
+            short_hash: hash[..7].to_string(),
+            subject: subject.to_string(),
+        }
+    }
+
+    fn submitted_review(effects: &[crate::state::Effect]) -> &str {
+        effects
+            .iter()
+            .find_map(|effect| match effect {
+                crate::state::Effect::PromptSubmit { payload } => match &payload.dispatch {
+                    SubmitDispatch::Command {
+                        command, arguments, ..
+                    } if command == "review" => Some(arguments.as_str()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("a review command was submitted")
+    }
+
+    #[test]
+    fn review_completion_selects_a_recent_commit_explicitly() {
+        use crossterm::event::KeyCode;
+        let mut app = review_app();
+        app.state.project.instance_path.directory = Some("/remote/repo".into());
+        app.state.project.workspace.current = Some("wrk_one".into());
+        type_text(&mut app, "/review ");
+        let location = app.ui.prompt.autocomplete.review_request.take().unwrap();
+        assert_eq!(location.directory.as_deref(), Some("/remote/repo"));
+        assert_eq!(location.workspace.as_deref(), Some("wrk_one"));
+        let first = "a".repeat(40);
+        let second = "b".repeat(40);
+        review_commits_found(
+            &mut app,
+            &location,
+            vec![
+                review_commit(&first, "First commit"),
+                review_commit(&second, "Second commit"),
+            ],
+        );
+        assert_eq!(app.ui.prompt.autocomplete.options.len(), 3);
+        assert!(!app.ui.prompt.autocomplete.highlights_selection());
+        for _ in 0..3 {
+            review_key(&mut app, KeyCode::Down);
+        }
+        let effects = review_key(&mut app, KeyCode::Enter);
+        assert_eq!(submitted_review(&effects), second);
+        assert!(!app.ui.prompt.autocomplete.visible());
+    }
+
+    #[test]
+    fn review_completion_tab_fills_hash_and_subject_matches_without_submitting() {
+        use crossterm::event::KeyCode;
+        let hash = "a".repeat(40);
+        for query in ["aaaa", "wrapping", "Fix wrapping"] {
+            let mut app = review_app();
+            type_text(&mut app, &format!("/review {query}"));
+            let location = app.ui.prompt.autocomplete.review_request.take().unwrap();
+            review_commits_found(
+                &mut app,
+                &location,
+                vec![review_commit(&hash, "Fix wrapping")],
+            );
+            let effects = review_key(&mut app, KeyCode::Tab);
+            assert!(!effects
+                .iter()
+                .any(|effect| matches!(effect, crate::state::Effect::PromptSubmit { .. })));
+            assert_eq!(app.ui.prompt.input(), format!("/review {hash}"));
+            assert!(!app.ui.prompt.autocomplete.visible());
+        }
+    }
+
+    #[test]
+    fn review_completion_enter_preserves_typed_hashes_branches_and_pr_references() {
+        use crossterm::event::KeyCode;
+        for target in [
+            "aaaaaaa",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "deadbeef",
+            "main",
+            "17",
+            "https://github.com/example/repo/pull/17",
+        ] {
+            let mut app = review_app();
+            type_text(&mut app, &format!("/review {target}"));
+            let location = app.ui.prompt.autocomplete.review_request.take().unwrap();
+            review_commits_found(
+                &mut app,
+                &location,
+                vec![review_commit(&"a".repeat(40), "Merge main")],
+            );
+            let effects = review_key(&mut app, KeyCode::Enter);
+            assert_eq!(submitted_review(&effects), target);
+        }
+    }
+
+    #[test]
+    fn review_completion_escape_preserves_input_and_ignores_the_late_reply() {
+        use crossterm::event::KeyCode;
+        let mut app = review_app();
+        type_text(&mut app, "/review abc1234");
+        let location = app.ui.prompt.autocomplete.review_request.take().unwrap();
+        review_key(&mut app, KeyCode::Esc);
+        assert_eq!(app.ui.prompt.input(), "/review abc1234");
+        review_commits_found(
+            &mut app,
+            &location,
+            vec![review_commit(&"a".repeat(40), "Late reply")],
+        );
+        assert!(!app.ui.prompt.autocomplete.visible());
+        assert!(app.ui.prompt.autocomplete.options.is_empty());
+    }
+
+    #[test]
+    fn review_completion_ignores_results_from_a_previous_location() {
+        let mut app = review_app();
+        app.state.project.instance_path.directory = Some("/first".into());
+        type_text(&mut app, "/review ");
+        let old = app.ui.prompt.autocomplete.review_request.take().unwrap();
+        app.state.project.instance_path.directory = Some("/second".into());
+        app.state.project.workspace.current = Some("wrk_other".into());
+        after_content_change(&mut app);
+        let current = app.ui.prompt.autocomplete.review_request.take().unwrap();
+        review_commits_found(
+            &mut app,
+            &old,
+            vec![review_commit(&"a".repeat(40), "Wrong repository")],
+        );
+        assert!(app.ui.prompt.autocomplete.review_loading());
+        review_commits_found(
+            &mut app,
+            &current,
+            vec![review_commit(&"b".repeat(40), "Correct repository")],
+        );
+        assert!(!app.ui.prompt.autocomplete.review_loading());
+        assert_eq!(
+            app.ui.prompt.autocomplete.options[1].description.as_deref(),
+            Some("Correct repository")
+        );
+    }
+
+    #[test]
+    fn review_completion_opens_after_selecting_the_command() {
+        use crossterm::event::KeyCode;
+        let mut app = review_app();
+        type_text(&mut app, "/review");
+        review_key(&mut app, KeyCode::Tab);
+        assert_eq!(app.ui.prompt.input(), "/review ");
+        assert!(app.ui.prompt.autocomplete.reviewing());
+    }
+
+    #[test]
+    fn review_completion_repaints_without_cursor_blinking() {
+        let mut app = review_app();
+        app.config.cursor = Some(crate::config::CursorConfig {
+            blinking: false,
+            style: crate::config::CursorStyle::Block,
+        });
+        app.ui.startup_ready = true;
+        type_text(&mut app, "/review ");
+        let location = app.ui.prompt.autocomplete.review_request.take().unwrap();
+        assert!(crate::state::next_tick_in(&app, 0).is_some());
+        review_commits_found(&mut app, &location, Vec::new());
+        assert_eq!(crate::state::next_tick_in(&app, 0), None);
+    }
+
+    #[test]
+    fn review_completion_keeps_selection_visible_above_a_short_prompt() {
+        use crossterm::event::KeyCode;
+        for (width, height) in [(32, 16), (56, 24)] {
+            let mut app = review_app();
+            app.ui.terminal_width = width;
+            app.ui.terminal_height = height;
+            type_text(&mut app, "/review ");
+            let location = app.ui.prompt.autocomplete.review_request.take().unwrap();
+            let commits: Vec<CommitInfo> = (0..30)
+                .map(|index| {
+                    let hash = format!("{index:07x}{}", "a".repeat(33));
+                    review_commit(&hash, &format!("Commit {index}"))
+                })
+                .collect();
+            let expected = commits.last().unwrap().short_hash.clone();
+            review_commits_found(&mut app, &location, commits);
+            for _ in 0..31 {
+                review_key(&mut app, KeyCode::Down);
+            }
+            let backend = ratatui::backend::TestBackend::new(width, height);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| crate::ui::view(&mut app, frame))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let screen: String = (0..height)
+                .flat_map(|y| (0..width).map(move |x| buffer[(x, y)].symbol()))
+                .collect();
+            assert!(
+                screen.contains(&expected),
+                "selected commit is visible at {width}x{height}"
+            );
         }
     }
 

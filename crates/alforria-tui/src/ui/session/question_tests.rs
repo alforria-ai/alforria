@@ -116,6 +116,108 @@ fn question_replies(effects: Vec<Effect>) -> Vec<Effect> {
         .collect()
 }
 
+fn render_screen(app: &mut App, width: u16, height: u16) -> Vec<String> {
+    app.ui.terminal_width = width;
+    app.ui.terminal_height = height;
+    let backend = ratatui::backend::TestBackend::new(width, height);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal.draw(|frame| crate::ui::view(app, frame)).unwrap();
+    let buffer = terminal.backend().buffer();
+    let width = width.saturating_sub(if crate::command::sidebar_visible(app) {
+        super::SIDEBAR_WIDTH
+    } else {
+        0
+    });
+    (0..height)
+        .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+        .collect()
+}
+
+fn visible_answer(app: &App, screen: &[String]) -> String {
+    let start = app
+        .ui
+        .question
+        .clicks
+        .iter()
+        .find(|(_, click)| matches!(click, question::Click::Other))
+        .map_or(0, |(row, _)| *row as usize + 1);
+    screen
+        .iter()
+        .skip(start)
+        .filter_map(|line| line.split_once('┃').map(|(_, text)| text))
+        .take_while(|text| !text.trim_start().starts_with(['↑', '⇆']))
+        .flat_map(|text| text.chars().filter(|char| *char != ' '))
+        .collect()
+}
+
+#[test]
+fn custom_answer_wraps_when_the_terminal_is_resized() {
+    for input in [
+        "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ",
+        "firstline\nsecondlinelongerthanthefirst\nlastline",
+        "abc界def🦀ghi界jkl🦀mno",
+    ] {
+        let mut app = app_with_request(vec![info("plan", &["A", "B"], false, true)]);
+        app.config.prompt_max_height = Some(100);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        enter(&mut app);
+        assert!(app.ui.question.editing);
+        app.ui.question.input = input.to_string();
+        for width in [80, 32, 16, 48, 12, 140] {
+            let screen = render_screen(&mut app, width, 128);
+            assert_eq!(
+                visible_answer(&app, &screen),
+                input.replace('\n', ""),
+                "width={width}, input={input:?}"
+            );
+            assert_eq!(app.ui.question.input, input);
+        }
+    }
+}
+
+#[test]
+fn custom_answer_keeps_its_end_visible_on_short_screens() {
+    for (width, height) in [(40, 12), (24, 10), (16, 8)] {
+        let mut app = app_with_request(vec![info("plan", &["A"], false, true)]);
+        press(&mut app, KeyCode::Down);
+        enter(&mut app);
+        let input = format!("{}Z!", "x".repeat(400));
+        app.ui.question.input = input.clone();
+        let screen = render_screen(&mut app, width, height);
+        assert!(
+            visible_answer(&app, &screen).ends_with("Z!"),
+            "width={width}, height={height}: {screen:?}"
+        );
+        assert_eq!(app.ui.question.input, input);
+        assert!(app.ui.question.clicks.iter().all(|(row, _)| *row < height));
+    }
+}
+
+#[test]
+fn saved_custom_answer_wraps_without_changing_the_submitted_text() {
+    let mut app = app_with_request(vec![info("plan", &["A"], true, true)]);
+    app.config.prompt_max_height = Some(100);
+    press(&mut app, KeyCode::Down);
+    enter(&mut app);
+    let input = "custom-ABCDEFGHIJKLMNOPQRSTUVWXYZ-0123456789-abcdefghijklmnopqrstuvwxyz";
+    for char in input.chars() {
+        press(&mut app, KeyCode::Char(char));
+    }
+    enter(&mut app);
+    assert!(!app.ui.question.editing);
+    let screen = render_screen(&mut app, 24, 128);
+    assert_eq!(visible_answer(&app, &screen), input);
+    press(&mut app, KeyCode::Right);
+    assert_eq!(
+        question_replies(enter(&mut app)),
+        vec![Effect::QuestionReply {
+            request_id: "que_1".into(),
+            answers: vec![vec![input.to_string()]],
+        }]
+    );
+}
+
 #[test]
 fn single_question_submits_immediately() {
     let mut app = app_with_request(vec![info("plan", &["Option A", "Option B"], false, false)]);

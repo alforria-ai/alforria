@@ -7,6 +7,13 @@ pre-1.0, so minor releases may include breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- TUI: `/review ` offers recent commits with their subjects and an
+  uncommitted-changes option. Tab completes a target; arrow keys and Enter
+  select and review it. Suggestions come from the server's repository,
+  including when attached remotely.
+
 ### Changed
 
 - TUI: `/copy` now copies the last assistant message as Markdown. Use
@@ -15,6 +22,15 @@ pre-1.0, so minor releases may include breaking changes.
 
 ### Fixed
 
+- Built-in `/review` and `/init` commands now work without a custom command
+  configuration. Review arguments, including short and full commit hashes,
+  reach the built-in review prompt.
+- `alforria -c` on a project whose sessions were created by opencode showed a
+  blank screen: a session in the worktree root stores an empty path (`""`,
+  like `path.relative`), but alforria stored and queried `"."`, so the
+  session list matched nothing and the `--continue` route never left its
+  placeholder. Both now use the empty path. `-c` with no session at all lands
+  on home instead of the placeholder.
 - Two alforria processes starting at the same moment on a fresh install could
   both try to create the database, and the second failed with `table
   workspace already exists`. The second now waits and uses the database the
