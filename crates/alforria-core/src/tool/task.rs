@@ -158,11 +158,22 @@ pub trait TaskOps: Send + Sync {
     fn session_agent<'a>(&'a self, _session_id: &'a str) -> BoxFuture<'a, Option<String>> {
         Box::pin(async { None })
     }
-    /// The deny rules of the agent the caller runs as. A child session
-    /// inherits them, so a subagent cannot do what its parent's agent is
-    /// forbidden (plan mode's edit ban, say).
-    fn agent_denies<'a>(&'a self, _agent: &'a str) -> BoxFuture<'a, Vec<Rule>> {
-        Box::pin(async { Vec::new() })
+    /// Cap a child session by the policy of the agent that starts or
+    /// resumes it (alforria extension): every reading of that agent's
+    /// policy becomes a sealed ceiling on the child, so a subagent cannot
+    /// do what its parent's agent is forbidden (plan mode's edit ban, say),
+    /// and the exceptions that policy makes stay exceptions. The agent's
+    /// deny rules used to be copied into the child's own rules instead;
+    /// read after them, last match winning, `bash *: deny` closed what the
+    /// policy's later `bash nb-sandbox *: allow` had opened, and a host
+    /// that allows one command left its subagents none. An error refuses
+    /// the task. The default is for an implementation without ceilings.
+    fn bound_by_agent<'a>(
+        &'a self,
+        _child: &'a str,
+        _agent: &'a str,
+    ) -> BoxFuture<'a, Result<(), ToolError>> {
+        Box::pin(async { Ok(()) })
     }
     /// Bring a child session that is about to be resumed under its
     /// parent's ceilings as they stand now (alforria extension). A child
@@ -581,15 +592,14 @@ async fn run(
                     )));
                 }
             }
-            // The same denies a child created now would inherit.
+            // The same session denies a child created now would inherit.
             let held = ops.session_permission(task_id).await;
-            let mut inherited: Vec<Rule> = ops
+            let inherited: Vec<Rule> = ops
                 .session_permission(ctx.session_id)
                 .await
                 .into_iter()
                 .filter(|rule| rule.action == "deny")
                 .collect();
-            inherited.extend(ops.agent_denies(ctx.agent).await);
             let missing = inherited.iter().any(|deny| !held.contains(deny));
             if missing {
                 return Err(ToolError::Failed(format!(
@@ -599,6 +609,9 @@ async fn run(
             // And the bounds a child created now would be under: the
             // parent's ceilings, which are not among its rules.
             ops.inherit_ceilings(ctx.session_id, task_id).await?;
+            // And the policy of the agent resuming it, as it stands now
+            // (the user may have moved the parent to plan mode since).
+            ops.bound_by_agent(task_id, ctx.agent).await?;
             Some(task_id.clone())
         }
         _ => None,
@@ -606,20 +619,23 @@ async fn run(
     let session_id = match existing_session {
         Some(session) => session,
         None => {
-            let mut parent_permission = ops.session_permission(ctx.session_id).await;
-            parent_permission.extend(ops.agent_denies(ctx.agent).await);
+            let parent_permission = ops.session_permission(ctx.session_id).await;
             let child_permission = derive_subagent_session_permission(
                 &parent_permission,
                 &next.permission,
                 &primary_tools,
             );
-            ops.create_session(
-                ctx.session_id,
-                &format!("{} (@{} subagent)", params.description, next.name),
-                &next.name,
-                child_permission,
-            )
-            .await?
+            let child = ops
+                .create_session(
+                    ctx.session_id,
+                    &format!("{} (@{} subagent)", params.description, next.name),
+                    &next.name,
+                    child_permission,
+                )
+                .await?;
+            // Under its parent's agent before it runs a single step.
+            ops.bound_by_agent(&child, ctx.agent).await?;
+            child
         }
     };
 

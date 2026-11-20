@@ -197,24 +197,52 @@ impl TaskOps for ProductionTaskOps {
         })
     }
 
-    fn agent_denies<'a>(&'a self, agent: &'a str) -> BoxFuture<'a, Vec<Rule>> {
+    fn bound_by_agent<'a>(
+        &'a self,
+        child: &'a str,
+        agent: &'a str,
+    ) -> BoxFuture<'a, Result<(), ToolError>> {
         Box::pin(async move {
-            self.agents
-                .get(agent)
-                .map(|found| {
-                    // Every deny the policy holds, the ceilings' included.
-                    found
-                        .permission
-                        .denies()
-                        .iter()
-                        .map(|rule| Rule {
-                            permission: rule.permission.clone(),
-                            pattern: rule.pattern.clone(),
-                            action: "deny",
-                        })
-                        .collect()
-                })
-                .unwrap_or_default()
+            // Every reading of the agent's policy, whole and in order: the
+            // written list and each of its ceilings. An agent the registry
+            // does not know allows nothing.
+            let readings: Vec<_> = match self.agents.get(agent) {
+                Some(found) => std::iter::once(found.permission.written().clone())
+                    .chain(found.permission.ceilings().iter().map(|c| c.rules.clone()))
+                    .collect(),
+                None => vec![vec![PermissionV1Rule {
+                    permission: "*".to_string(),
+                    pattern: "*".to_string(),
+                    action: PermissionV1Action::Deny,
+                }]],
+            };
+            // Added to the readings the child already holds, never in their
+            // place: a child takes its parent's ceilings when it is made, so a
+            // subagent of a subagent stays under every agent above it (a plan
+            // session's grandchild under plan's edit ban), and a resumed one
+            // under every agent it ran for. The strictest reading applies.
+            let mut all = self
+                .sessions
+                .ceilings(child)
+                .map_err(tool_error)?
+                .into_iter()
+                .find(|ceiling| ceiling.name == PARENT_AGENT_CEILING)
+                .map(|ceiling| ceiling.readings)
+                .unwrap_or_default();
+            for reading in readings {
+                if !all.contains(&reading) {
+                    all.push(reading);
+                }
+            }
+            self.sessions
+                .set_ceiling(
+                    child,
+                    &crate::session::store::SessionCeiling {
+                        name: PARENT_AGENT_CEILING.to_string(),
+                        readings: all,
+                    },
+                )
+                .map_err(tool_error)
         })
     }
 
@@ -687,6 +715,10 @@ impl ProductionTaskOps {
 }
 
 /// How long a finished session gets to go idle; past that, more work is queued.
+/// The ceiling a subagent's session is held under: the policy of the agent
+/// that started it (see [`TaskOps::bound_by_agent`]).
+pub const PARENT_AGENT_CEILING: &str = "parent-agent";
+
 const REPORT_IDLE_POLL: std::time::Duration = std::time::Duration::from_millis(25);
 const REPORT_IDLE_POLLS: usize = 80;
 
@@ -867,11 +899,145 @@ mod tests {
         assert!(build.primary);
         assert!(!e.ops.agent("general").await.unwrap().unwrap().primary);
         // The plan agent's edit ban is what a child of a plan session inherits.
-        let denies = e.ops.agent_denies("plan").await;
-        assert!(denies
-            .iter()
-            .any(|rule| rule.permission == "edit" && rule.pattern == "*" && rule.action == "deny"));
-        assert!(denies.iter().all(|rule| rule.action == "deny"));
+        let parent = create_engine_session(&e);
+        let child = e
+            .ops
+            .create_session(&parent.id, "t", "general", Vec::new())
+            .await
+            .unwrap();
+        e.ops.bound_by_agent(&child, "plan").await.unwrap();
+        let general = e.ops.agents.get("general").unwrap().permission.clone();
+        let policy = e.services.sessions.policy(&child, &general);
+        assert_eq!(
+            policy.evaluate("edit", "src/lib.rs").action,
+            PermissionV1Action::Deny
+        );
+        // An agent the registry does not know allows nothing.
+        let orphan = e
+            .ops
+            .create_session(&parent.id, "t", "general", Vec::new())
+            .await
+            .unwrap();
+        e.ops.bound_by_agent(&orphan, "nope").await.unwrap();
+        let policy = e.services.sessions.policy(&orphan, &general);
+        assert_eq!(
+            policy.evaluate("read", "src/lib.rs").action,
+            PermissionV1Action::Deny
+        );
+    }
+
+    /// A subagent of a subagent stays under every agent above it: a plan
+    /// session's grandchild, started by a general subagent, still may not
+    /// edit. Binding the same agent again adds nothing.
+    #[tokio::test]
+    async fn a_subagents_subagent_stays_under_every_agent_above_it() {
+        let e = engine("task-ops-nested-ceiling", vec![]);
+        let parent = create_engine_session(&e);
+        let child = e
+            .ops
+            .create_session(&parent.id, "t", "general", Vec::new())
+            .await
+            .unwrap();
+        e.ops.bound_by_agent(&child, "plan").await.unwrap();
+        let grandchild = e
+            .ops
+            .create_session(&child, "t", "general", Vec::new())
+            .await
+            .unwrap();
+        e.ops.bound_by_agent(&grandchild, "general").await.unwrap();
+        let general = e.ops.agents.get("general").unwrap().permission.clone();
+        let policy = e.services.sessions.policy(&grandchild, &general);
+        assert_eq!(
+            policy.evaluate("edit", "src/lib.rs").action,
+            PermissionV1Action::Deny
+        );
+
+        let readings = |id: &str| {
+            e.services
+                .sessions
+                .ceilings(id)
+                .unwrap()
+                .into_iter()
+                .find(|c| c.name == PARENT_AGENT_CEILING)
+                .unwrap()
+                .readings
+                .len()
+        };
+        let before = readings(&grandchild);
+        e.ops.bound_by_agent(&grandchild, "general").await.unwrap();
+        assert_eq!(readings(&grandchild), before);
+    }
+
+    /// A host that allows one shell command and edits in one place lets its
+    /// agents' subagents do the same — and nothing more. The parent agent's
+    /// deny rules used to be copied into the child's own rules; read after
+    /// them, `bash *: deny` closed the `nb-sandbox *` exception, and every
+    /// subagent of such a host could only read.
+    #[tokio::test]
+    async fn a_subagent_keeps_the_exceptions_its_parents_policy_makes() {
+        let e = crate::session::test_support::engine_with_config(
+            "task-ops-parent-agent-ceiling",
+            vec![],
+            serde_json::json!({
+                "permission": {
+                    "bash": { "*": "deny", "nb-sandbox *": "allow" },
+                    "edit": { "*": "deny", "*/runs/*/findings/*": "allow" },
+                    "webfetch": "deny"
+                }
+            }),
+        );
+        let parent = create_engine_session(&e);
+        let child = e
+            .ops
+            .create_session(&parent.id, "hunt", "general", Vec::new())
+            .await
+            .unwrap();
+        e.ops.bound_by_agent(&child, "build").await.unwrap();
+        let general = e.ops.agents.get("general").unwrap().permission.clone();
+        let policy = e.services.sessions.policy(&child, &general);
+        let action = |permission: &str, pattern: &str| policy.evaluate(permission, pattern).action;
+        assert_eq!(
+            action("bash", "nb-sandbox --run t/runs/1 -- cargo test"),
+            PermissionV1Action::Allow
+        );
+        assert_eq!(action("bash", "ls -la"), PermissionV1Action::Deny);
+        assert_eq!(
+            action("edit", "/w/t/runs/1/findings/A.md"),
+            PermissionV1Action::Allow
+        );
+        assert_eq!(
+            action("edit", "/w/t/runs/1/src/lib.rs"),
+            PermissionV1Action::Deny
+        );
+        assert_eq!(
+            action("webfetch", "https://example.com"),
+            PermissionV1Action::Deny
+        );
+
+        // Its own agent can still narrow it: an explore subagent of the same
+        // parent may not start subagents, though the parent may. (The host's
+        // rules apply to every agent, explore included: they let it edit the
+        // findings and refuse it `ls` by themselves.)
+        let explorer = e
+            .ops
+            .create_session(&parent.id, "look", "explore", Vec::new())
+            .await
+            .unwrap();
+        e.ops.bound_by_agent(&explorer, "build").await.unwrap();
+        let explore = e.ops.agents.get("explore").unwrap().permission.clone();
+        let policy = e.services.sessions.policy(&explorer, &explore);
+        assert_eq!(
+            policy.evaluate("task", "general").action,
+            PermissionV1Action::Deny
+        );
+        assert_eq!(
+            policy.evaluate("bash", "nb-sandbox --images").action,
+            PermissionV1Action::Allow
+        );
+        assert_eq!(
+            policy.evaluate("bash", "ls").action,
+            PermissionV1Action::Deny
+        );
     }
 
     #[tokio::test]
@@ -1025,9 +1191,23 @@ mod tests {
                 },
             )
         };
+        // The parent's ceilings, beside the one its agent's policy sets.
+        let inherited = |child: &str| -> Vec<_> {
+            sessions
+                .ceilings(child)
+                .unwrap()
+                .into_iter()
+                .filter(|c| c.name != PARENT_AGENT_CEILING)
+                .collect()
+        };
         call(None).await.unwrap();
         let child = sessions.children(&parent.id).unwrap()[0].id.clone();
-        assert_eq!(sessions.ceilings(&child).unwrap(), vec![wide]);
+        assert_eq!(inherited(&child), vec![wide]);
+        assert!(sessions
+            .ceilings(&child)
+            .unwrap()
+            .iter()
+            .any(|c| c.name == PARENT_AGENT_CEILING));
 
         // The parent's bounds are narrowed after the child was made.
         let narrow = ceiling(&[
@@ -1042,7 +1222,7 @@ mod tests {
             1,
             "the same session was resumed"
         );
-        assert_eq!(sessions.ceilings(&child).unwrap(), vec![narrow]);
+        assert_eq!(inherited(&child), vec![narrow]);
         let general = e.services.agents.get("general").unwrap().permission.clone();
         assert_eq!(
             sessions
