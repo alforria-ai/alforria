@@ -1837,7 +1837,13 @@ fn ensure_gitignore(dir: &Path) -> Result<(), CoreError> {
     let gitignore = dir.join(".gitignore");
     if !gitignore.exists() {
         if let Err(err) = fs::write(&gitignore, GITIGNORE_CONTENTS) {
-            if err.kind() != ErrorKind::PermissionDenied {
+            // A config directory the process may not write is not an error: a host may keep it
+            // root-owned (PermissionDenied) or mount it read-only for the service (systemd's
+            // ProtectHome/ProtectSystem: ReadOnlyFilesystem). The file is a convenience.
+            if !matches!(
+                err.kind(),
+                ErrorKind::PermissionDenied | ErrorKind::ReadOnlyFilesystem
+            ) {
                 return Err(CoreError::invalid(dir, err.to_string()));
             }
         }
