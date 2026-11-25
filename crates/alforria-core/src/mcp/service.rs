@@ -942,7 +942,7 @@ for line in sys.stdin:
         out({"jsonrpc": "2.0", "id": rid, "result": {"roots": []}})
     elif method == "tools/call":
         out({"jsonrpc": "2.0", "id": rid, "result": {"content": [
-            {"type": "text", "text": "fixture output"},
+            {"type": "text", "text": json.dumps(msg.get("params", {}).get("_meta"))},
         ]}})
 "#;
 
@@ -1010,6 +1010,47 @@ for line in sys.stdin:
         assert_eq!(instructions[0].name, "srv");
         assert_eq!(instructions[0].instructions, "fixture instructions");
         assert_eq!(instructions[0].tools, vec!["srv_echo".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn tools_call_carries_the_engine_meta_and_nothing_from_the_model() {
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            "srv".to_string(),
+            local_entry(local_fixture_command(), None),
+        );
+        let service = new_service(entries);
+        let tools = service.tools().await;
+        let tool = tools.get("srv_echo").expect("tool name is {client}_{tool}");
+        let meta = json!({
+            "alforria": {
+                "sessionID": "ses_x",
+                "turnID": "msg_turn",
+                "messageID": "msg_answer",
+                "callID": "call_1",
+                "agent": "build",
+                "directory": "/repo",
+            }
+        });
+        let raw = tool
+            .client
+            .call_tool_with_meta(
+                "echo",
+                json!({ "_meta": { "forged": true } }),
+                Some(meta.clone()),
+            )
+            .await
+            .unwrap();
+        let text = raw["content"][0]["text"].as_str().unwrap();
+        let got: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(got, meta, "the engine's _meta is beside the arguments");
+
+        let raw = tool.client.call_tool("echo", json!({})).await.unwrap();
+        assert_eq!(
+            raw["content"][0]["text"].as_str().unwrap(),
+            "null",
+            "a call without engine context sends no _meta"
+        );
     }
 
     #[tokio::test]

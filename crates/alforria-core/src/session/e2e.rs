@@ -3061,7 +3061,7 @@ mod tests {
                         key: key.to_string(),
                         description: "A server's tool".to_string(),
                         input_schema: json!({ "type": "object", "properties": {} }),
-                        execute: std::sync::Arc::new(|_args| {
+                        execute: std::sync::Arc::new(|_args, _ctx| {
                             Box::pin(async {
                                 Ok(McpRawResult {
                                     content: vec![json!({

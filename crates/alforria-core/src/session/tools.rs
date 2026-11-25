@@ -86,10 +86,32 @@ pub struct McpToolEntry {
 }
 
 pub type McpToolExecute = Arc<
-    dyn Fn(Value) -> crate::tool::def::BoxFuture<'static, Result<McpRawResult, String>>
+    dyn Fn(Value, McpToolCallContext)
+            -> crate::tool::def::BoxFuture<'static, Result<McpRawResult, String>>
         + Send
         + Sync,
 >;
+
+/// What the engine tells an MCP server about the call, outside the model's
+/// `arguments` (alforria extension). A product bridge uses this to pin a
+/// channel tool to the conversation that asked for it. The engine builds
+/// it; a model can never set or override it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpToolCallContext {
+    /// The conversation the call belongs to.
+    pub session_id: String,
+    /// The user message that started the turn (stable across tool
+    /// iterations).
+    pub turn_id: String,
+    /// The assistant message the tool call belongs to.
+    pub message_id: String,
+    /// The provider's tool-call id.
+    pub call_id: String,
+    /// The agent the turn runs as.
+    pub agent: String,
+    /// The instance directory (`tool::def::InstanceContext::directory`).
+    pub directory: String,
+}
 
 /// The raw `tools/call` result fields the session maps onto tool output
 /// (`catalog.ts:53-81`, `tools.ts:445-470`).
@@ -316,12 +338,26 @@ pub async fn resolve(
     // MCP tools (tools.ts:389-482) — one LLM tool per connected-server
     // tool, keyed `{sanitized client}_{tool}`.
     if let Some(mcp) = deps.mcp.clone() {
+        // The user message that started this turn. The engine builds it
+        // into `_meta`; the model's arguments cannot name a session.
+        let turn_id = input
+            .messages
+            .iter()
+            .rev()
+            .find_map(|message| match &message.info {
+                alforria_schema::session_v1::V1Message::User { id, .. } => Some(id.clone()),
+                alforria_schema::session_v1::V1Message::Assistant { .. } => None,
+            })
+            .unwrap_or_else(|| message_id.clone());
+        let directory = deps.instance.directory.to_string_lossy().into_owned();
         for entry in mcp.mcp_tools().await {
             let entry = Arc::new(entry);
             let permission = deps.permission.clone();
             let ruleset = ruleset.clone();
             let session_id = session_id.clone();
             let message_id = message_id.clone();
+            let turn_id = turn_id.clone();
+            let directory = directory.clone();
             let agent = ToolAgentInfo {
                 name: input.agent.name.clone(),
                 description: input.agent.description.clone(),
@@ -348,6 +384,8 @@ pub async fn resolve(
                     let ruleset = ruleset.clone();
                     let session_id = session_id.clone();
                     let message_id = message_id.clone();
+                    let turn_id = turn_id.clone();
+                    let directory = directory.clone();
                     let agent = agent.clone();
                     let cancel = cancel.clone();
                     let truncate = truncate.clone();
@@ -380,7 +418,19 @@ pub async fn resolve(
                             crate::session::llm::ToolFailure::Rejected(err.to_string())
                         })?;
 
-                        let result = match (entry.execute)(args).await {
+                        let result = match (entry.execute)(
+                            args,
+                            McpToolCallContext {
+                                session_id: session_id.clone(),
+                                turn_id: turn_id.clone(),
+                                message_id: message_id.clone(),
+                                call_id: call_id.clone(),
+                                agent: agent.name.clone(),
+                                directory: directory.clone(),
+                            },
+                        )
+                        .await
+                        {
                             Ok(result) => result,
                             Err(message) => {
                                 return Err(crate::session::llm::ToolFailure::Message(message))
@@ -745,7 +795,9 @@ mod mcp_tests {
         }
     }
 
-    fn mcp_entry() -> McpToolEntry {
+    fn mcp_entry(
+        captured: Arc<std::sync::Mutex<Option<McpToolCallContext>>>,
+    ) -> McpToolEntry {
         McpToolEntry {
             key: "srv_echo".to_string(),
             description: "Echo".to_string(),
@@ -754,7 +806,8 @@ mod mcp_tests {
                 "properties": {},
                 "additionalProperties": false,
             }),
-            execute: Arc::new(|_args| {
+            execute: Arc::new(move |_args, ctx| {
+                *captured.lock().unwrap() = Some(ctx);
                 Box::pin(async move {
                     Ok(McpRawResult {
                         content: vec![
@@ -966,7 +1019,9 @@ mod mcp_tests {
             Arc::new(RegistryAgents),
         )
         .expect("valid registry");
-        let mcp: Arc<dyn McpToolSource> = Arc::new(FixedMcp(vec![mcp_entry()]));
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let mcp: Arc<dyn McpToolSource> =
+            Arc::new(FixedMcp(vec![mcp_entry(captured.clone())]));
         let deps = ResolveDeps {
             registry,
             permission: Arc::new(crate::session::test_support::AllowAll),
@@ -983,12 +1038,16 @@ mod mcp_tests {
             protected: Default::default(),
         };
         let agent = h.services.agents.get("build").cloned().unwrap();
+        let messages = vec![WithParts {
+            info: user_message(&session.id, "msg_p1", 1.0),
+            parts: Vec::new(),
+        }];
         let input = ResolveInput {
             agent: &agent,
             model: &model.llm,
             session: &session,
             processor: &processor,
-            messages: &[],
+            messages: &messages,
             bypass_agent_check: false,
             bypass_agents: Vec::new(),
             prompt_ops: Arc::new(NoTaskOps),
@@ -1016,5 +1075,17 @@ mod mcp_tests {
             .as_str()
             .expect("attachment url")
             .starts_with("data:application/octet-stream;base64,"));
+
+        let ctx = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the MCP call carries its engine context");
+        assert_eq!(ctx.session_id, session.id);
+        assert_eq!(ctx.turn_id, "msg_p1", "the user message, not the answer");
+        assert_eq!(ctx.message_id, "msg_a1");
+        assert_eq!(ctx.call_id, "call_1");
+        assert_eq!(ctx.agent, "build");
+        assert_eq!(ctx.directory, h.worktree.to_string_lossy());
     }
 }

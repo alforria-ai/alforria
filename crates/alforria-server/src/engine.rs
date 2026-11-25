@@ -98,31 +98,46 @@ impl alforria_core::session::tools::McpToolSource for EngineMcp {
                         key,
                         description: tool.def.description.clone().unwrap_or_default(),
                         input_schema: tool.def.input_schema.clone(),
-                        execute: std::sync::Arc::new(move |args: serde_json::Value| {
-                            let client = client.clone();
-                            let name = name.clone();
-                            Box::pin(async move {
-                                let raw = client
-                                    .call_tool(&name, args)
-                                    .await
-                                    .map_err(|err| err.to_string())?;
-                                let content = raw
-                                    .get("content")
-                                    .and_then(|value| value.as_array())
-                                    .cloned()
-                                    .unwrap_or_default();
-                                let structured = raw.get("structuredContent").cloned();
-                                let metadata = match raw.get("metadata") {
-                                    Some(value @ serde_json::Value::Object(_)) => value.clone(),
-                                    _ => serde_json::json!({}),
-                                };
-                                Ok(alforria_core::session::tools::McpRawResult {
-                                    content,
-                                    structured_content: structured,
-                                    metadata,
+                        execute: std::sync::Arc::new(
+                            move |args: serde_json::Value,
+                                  ctx: alforria_core::session::tools::McpToolCallContext| {
+                                let client = client.clone();
+                                let name = name.clone();
+                                Box::pin(async move {
+                                    let meta = serde_json::json!({
+                                        "alforria": {
+                                            "sessionID": ctx.session_id,
+                                            "turnID": ctx.turn_id,
+                                            "messageID": ctx.message_id,
+                                            "callID": ctx.call_id,
+                                            "agent": ctx.agent,
+                                            "directory": ctx.directory,
+                                        }
+                                    });
+                                    let raw = client
+                                        .call_tool_with_meta(&name, args, Some(meta))
+                                        .await
+                                        .map_err(|err| err.to_string())?;
+                                    let content = raw
+                                        .get("content")
+                                        .and_then(|value| value.as_array())
+                                        .cloned()
+                                        .unwrap_or_default();
+                                    let structured = raw.get("structuredContent").cloned();
+                                    let metadata = match raw.get("metadata") {
+                                        Some(value @ serde_json::Value::Object(_)) => {
+                                            value.clone()
+                                        }
+                                        _ => serde_json::json!({}),
+                                    };
+                                    Ok(alforria_core::session::tools::McpRawResult {
+                                        content,
+                                        structured_content: structured,
+                                        metadata,
+                                    })
                                 })
-                            })
-                        }),
+                            },
+                        ),
                     }
                 })
                 .collect()

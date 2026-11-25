@@ -232,12 +232,24 @@ impl McpClient {
 
     /// `callTool` (client/index.js:496-542).
     pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, McpError> {
+        self.call_tool_with_meta(name, arguments, None).await
+    }
+
+    /// `tools/call` with the engine's `_meta` beside the model's
+    /// `arguments` (alforria extension). `_meta` is what tells a bridge
+    /// which conversation the call belongs to; it is never model input.
+    pub async fn call_tool_with_meta(
+        &self,
+        name: &str,
+        arguments: Value,
+        meta: Option<Value>,
+    ) -> Result<Value, McpError> {
         self.assert_capability("tools", "tools/call")?;
-        self.request(
-            "tools/call",
-            Some(json!({"name": name, "arguments": arguments})),
-        )
-        .await
+        let mut params = json!({"name": name, "arguments": arguments});
+        if let Some(meta) = meta {
+            params["_meta"] = meta;
+        }
+        self.request("tools/call", Some(params)).await
     }
 
     /// `McpCatalog.prompts` (catalog.ts:121-127).
