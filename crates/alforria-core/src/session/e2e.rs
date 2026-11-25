@@ -3191,6 +3191,65 @@ mod tests {
         );
     }
 
+    /// A restricted caller is the bridge passing channel text and tool
+    /// results. Even a turn that calls no tool is outside content, so its
+    /// own earlier answers are fenced on the next request.
+    #[tokio::test]
+    async fn a_restricted_text_prompt_marks_the_session_outside_content() {
+        use crate::session::caller::Caller;
+        use crate::session::store::SessionMark;
+
+        let e = engine("restricted-mark", vec![text_stream("done")]);
+        let session = create_engine_session(&e);
+        e.services.sessions.restrict(&session.id).unwrap();
+        let mut input = prompt_input_for("msg_restricted_text", &session.id, "hello");
+        input.caller = Caller::Restricted;
+        run_prompt(&e, input).await;
+        assert!(
+            e.services
+                .sessions
+                .has_mark(&session.id, SessionMark::OutsideContent)
+                .unwrap(),
+            "a restricted text prompt is outside content even without a tool call"
+        );
+    }
+
+    /// Message ids are global primary keys. A restricted caller may not
+    /// take an id that belongs to another session; the projector would
+    /// otherwise overwrite that session's message data.
+    #[tokio::test]
+    async fn a_restricted_caller_cannot_take_another_sessions_message_id() {
+        use crate::session::caller::Caller;
+
+        let e = engine("foreign-turn-id", vec![text_stream("done")]);
+        let a = create_engine_session(&e);
+        let b = create_engine_session(&e);
+        e.services
+            .sessions
+            .update_message(&crate::session::test_support::user_message(
+                &a.id,
+                "msg_foreign",
+                1.0,
+            ))
+            .unwrap();
+        e.services.sessions.restrict(&b.id).unwrap();
+        let mut input = prompt_input_for("msg_foreign", &b.id, "steal");
+        input.caller = Caller::Restricted;
+        let error = e
+            .prompt
+            .prompt(input)
+            .await
+            .expect_err("a foreign message id is refused");
+        assert!(
+            error.to_string().contains("already exists"),
+            "the refusal says why: {error}"
+        );
+        assert!(
+            e.services.messages.get(&a.id, "msg_foreign").is_ok(),
+            "the other session's message is untouched"
+        );
+    }
+
     /// A restricted caller (the bridge) needs a stable turn id for MCP
     /// `_meta`. It may name a new user message id, but never replace one
     /// that already exists.

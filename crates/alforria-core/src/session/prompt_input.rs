@@ -221,7 +221,6 @@ impl ImageNormalizer for NoResize {
 pub struct PromptDeps<'a> {
     pub events: &'a EventBus,
     pub sessions: &'a SessionStore,
-    pub messages: &'a crate::session::message::MessageStore,
     pub agents: &'a AgentRegistry,
     pub models: &'a dyn Models,
     pub read: &'a ToolDef,
@@ -817,15 +816,13 @@ pub async fn create_user_message(
         .may_act_on(session_restricted)
         .map_err(|message| PromptError::Forbidden { message })?;
     let bounds = input.caller.bounds(session_restricted);
-    // alforria extension: a file a caller below `admin` sends with a prompt
-    // is outside content (`SessionMark::OutsideContent`): the operator did
-    // not pick it. Marked before the message exists.
-    if matches!(input.caller, Caller::Restricted)
-        && input
-            .parts
-            .iter()
-            .any(|part| matches!(part, PromptPartInput::File { .. }))
-    {
+    // alforria extension: every prompt from a caller below `admin` is
+    // outside content. The bridge passes channel text, tool results and
+    // third-party content through a restricted caller; marking the session
+    // here means its own earlier answers are fenced even when the turn never
+    // called an MCP or web tool. Marked before the message exists. (A file
+    // part is still outside content for the same reason; this is a superset.)
+    if matches!(input.caller, Caller::Restricted) {
         deps.sessions.mark(
             &input.session_id,
             crate::session::store::SessionMark::OutsideContent,
@@ -835,10 +832,20 @@ pub async fn create_user_message(
     let input = if bounds.restricted && bounds.from_request {
         assigned = without_caller_ids(input);
         if let Some(id) = assigned.message_id.as_deref() {
-            if deps.messages.get(&assigned.session_id, id).is_ok() {
+            // Message ids are global primary keys. A check scoped to this
+            // session would miss another session's message and the projector
+            // would overwrite its data. Also keep the documented `msg_` shape.
+            if !id.starts_with("msg_") {
                 return Err(PromptError::Forbidden {
                     message: format!(
-                        "message id {id} already exists in this session; a turn may not replace one"
+                        "message id {id} must start with msg_; a restricted caller may name only a new turn id"
+                    ),
+                });
+            }
+            if deps.sessions.message_session(id)?.is_some() {
+                return Err(PromptError::Forbidden {
+                    message: format!(
+                        "message id {id} already exists; a turn may not replace a message"
                     ),
                 });
             }
@@ -2012,7 +2019,6 @@ mod tests {
             directory: std::path::PathBuf::from("/"),
             events: &h.services.events,
             sessions: &h.services.sessions,
-            messages: &h.services.messages,
             agents: &h.services.agents,
             models: &FixedModels,
             read,

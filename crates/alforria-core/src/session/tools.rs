@@ -42,6 +42,10 @@ pub struct ResolveInput<'a> {
     pub processor: &'a ProcessorHandle,
     /// `msgs` from the current loop step.
     pub messages: &'a [WithParts],
+    /// The user message that started the turn, captured when the loop
+    /// started. It stays the same across synthetic continuation/compaction
+    /// user messages and every tool iteration.
+    pub turn_id: String,
     pub bypass_agent_check: bool,
     /// The agents the last user message mentions (see `Extra::bypass_agents`).
     pub bypass_agents: Vec<String>,
@@ -340,17 +344,9 @@ pub async fn resolve(
     // MCP tools (tools.ts:389-482) — one LLM tool per connected-server
     // tool, keyed `{sanitized client}_{tool}`.
     if let Some(mcp) = deps.mcp.clone() {
-        // The user message that started this turn. The engine builds it
-        // into `_meta`; the model's arguments cannot name a session.
-        let turn_id = input
-            .messages
-            .iter()
-            .rev()
-            .find_map(|message| match &message.info {
-                alforria_schema::session_v1::V1Message::User { id, .. } => Some(id.clone()),
-                alforria_schema::session_v1::V1Message::Assistant { .. } => None,
-            })
-            .unwrap_or_else(|| message_id.clone());
+        // The user message that started this turn, captured by the loop;
+        // synthetic continuation/compaction messages must not change it.
+        let turn_id = input.turn_id.clone();
         let directory = deps.instance.directory.to_string_lossy().into_owned();
         for entry in mcp.mcp_tools().await {
             let entry = Arc::new(entry);
@@ -1047,6 +1043,7 @@ mod mcp_tests {
             session: &session,
             processor: &processor,
             messages: &messages,
+            turn_id: "msg_p1".to_string(),
             bypass_agent_check: false,
             bypass_agents: Vec::new(),
             prompt_ops: Arc::new(NoTaskOps),

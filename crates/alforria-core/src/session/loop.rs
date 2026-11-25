@@ -676,6 +676,7 @@ pub async fn run_loop(
                     session: &session,
                     processor: &processor,
                     messages: &msgs,
+                    turn_id: last_user_id.clone(),
                     bypass_agent_check,
                     bypass_agents,
                     prompt_ops: deps.prompt_ops.clone(),

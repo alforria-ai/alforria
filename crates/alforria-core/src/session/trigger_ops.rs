@@ -583,7 +583,7 @@ mod tests {
             ops.target(&first.session_id),
             SessionTarget::Found {
                 restricted: true,
-                outside_content: false,
+                outside_content: true,
             }
         );
 
@@ -698,7 +698,7 @@ mod tests {
             ops.target(&moved.session_id),
             SessionTarget::Found {
                 restricted: false,
-                outside_content: false,
+                outside_content: true,
             }
         );
         let failure = ops

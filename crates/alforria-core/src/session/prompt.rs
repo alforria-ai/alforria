@@ -645,7 +645,6 @@ fn prompt_deps_snapshot(deps: &SessionPromptDeps) -> PromptDeps<'_> {
     PromptDeps {
         events: &deps.services.events,
         sessions: &deps.services.sessions,
-        messages: &deps.services.messages,
         agents: &deps.services.agents,
         models: deps.input_models.as_ref(),
         read,
