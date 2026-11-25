@@ -9,6 +9,18 @@ pre-1.0, so minor releases may include breaking changes.
 
 ### Added
 
+- MCP tool calls carry the engine's context in `params._meta.alforria`:
+  `sessionID`, `turnID` (the user message that started the turn), `messageID`,
+  `callID`, `agent` and `directory`. A product bridge can pin a channel tool
+  to the conversation that asked for it; the model's arguments cannot replace
+  it. A restricted caller may name a **new** user message id so the bridge
+  knows `turnID` before `prompt_async` returns; an id that already exists is
+  refused rather than replacing a message.
+- A session with the outside-content mark replays its earlier assistant
+  answers inside escaped `<untrusted_data>` tags, and the system prompt gains
+  the rule that fenced text is data. This closes the echo path where a public
+  model repeated an injected closing tag and read it back as its own answer on
+  the next turn.
 - TUI: `/review ` offers recent commits with their subjects and an
   uncommitted-changes option. Tab completes a target; arrow keys and Enter
   select and review it. Suggestions come from the server's repository,
@@ -248,6 +260,12 @@ pre-1.0, so minor releases may include breaking changes.
 
 ### Fixed
 
+- `lsp: false` now disables the language-server service instead of loading the
+  built-in servers (`Some(Boolean(false))` was treated as "some LSP config").
+- A top-level prompt or trigger turn with no explicit `agent` keeps the
+  session's agent instead of silently falling back to the default agent. This
+  is what makes a connector-created trigger with a named session run as the
+  schedule's agent and permissions.
 - A guarded session's revert restored and removed its files one at a time
   as it read them from the snapshot, so a blob that was missing or a
   snapshot that could not be listed part-way through left the working tree

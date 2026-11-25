@@ -381,6 +381,37 @@ Once in use, a directory stays so until its instance is rebuilt, even if
 its last trigger is deleted. Two servers on one data directory: a server
 that started with no trigger does not notice one created through the
 other until it is restarted, unless `triggers.enabled` is `true`.
+## MCP call context
+
+Every `tools/call` an alforria session sends carries the engine's context
+beside the model's arguments:
+
+```json
+"_meta": {
+  "alforria": {
+    "sessionID": "ses_…",
+    "turnID": "msg_…",
+    "messageID": "msg_…",
+    "callID": "call_…",
+    "agent": "teammate-public",
+    "directory": "/…"
+  }
+}
+```
+
+`turnID` is the user message that started the turn (the same across every
+tool iteration); `messageID` is the current assistant message. The engine
+builds this object: a `_meta` inside the model's `arguments` is just an
+argument and never replaces it. A connector token may name a **new** user
+message id in `prompt_async` (so a bridge knows `turnID` before the request
+returns); an id that already exists in the session is refused rather than
+replacing a message.
+
+A session that carries the `OutsideContent` mark also receives the
+`UNTRUSTED_HISTORY_RULE` system block and replays its earlier assistant text
+inside escaped `<untrusted_data>` tags. Trigger runs, resumes and subagent
+turns get the same treatment.
+
 
 ## Memory
 
