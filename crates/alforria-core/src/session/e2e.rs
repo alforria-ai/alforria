@@ -3117,4 +3117,40 @@ mod tests {
             );
         }
     }
+
+    /// A named top-level session keeps the agent it was created with when a
+    /// turn arrives without one. A connector-created trigger cannot set
+    /// `agent`, so without this the run would silently use the default
+    /// agent (and its permissions/model) instead of the schedule's.
+    #[tokio::test]
+    async fn a_top_level_turn_stays_the_sessions_agent() {
+        let e = engine("agent-inherit", vec![text_stream("done")]);
+        let session = e
+            .services
+            .sessions
+            .create(
+                &crate::session::store::SessionContext {
+                    project_id: "global".to_string(),
+                    directory: e.worktree.clone(),
+                    worktree: e.worktree.clone(),
+                    workspace_id: None,
+                },
+                &crate::session::store::CreateInput {
+                    agent: Some("plan".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        e.services
+            .sessions
+            .set_title(&session.id, "Custom")
+            .unwrap();
+        let mut input = prompt_input(&session.id, "hi");
+        input.agent = None;
+        let out = run_prompt(&e, input).await;
+        match out.info {
+            V1Message::Assistant { agent, .. } => assert_eq!(agent, "plan"),
+            other => panic!("expected an assistant message, got {other:?}"),
+        }
+    }
 }

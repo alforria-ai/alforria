@@ -137,9 +137,13 @@ impl SessionPrompt {
     /// `prompt` (prompt.ts:1052-1071).
     pub async fn prompt(&self, mut input: PromptInput) -> Result<WithParts, PromptError> {
         let session = self.deps.services.sessions.get(&input.session_id)?;
-        // A subagent stays the agent it was started as unless told otherwise;
-        // the default agent is for sessions a person started.
-        if input.agent.is_none() && session.parent_id.is_some() {
+        // A session stays the agent it was started as unless told otherwise.
+        // The default agent is for a session that never chose one. This is
+        // what makes a trigger or a restart turn in a named session run as
+        // that session's agent: a connector-created trigger cannot set
+        // `agent` on the prompt, and the session's agent must win over the
+        // global default.
+        if input.agent.is_none() {
             input.agent = session.agent.clone();
         }
         self.deps.revert.cleanup(&session)?;
