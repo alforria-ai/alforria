@@ -3153,4 +3153,41 @@ mod tests {
             other => panic!("expected an assistant message, got {other:?}"),
         }
     }
+
+    /// A public session's own earlier answer is data on the next request.
+    /// Otherwise a reply that echoed an injected closing tag would be
+    /// replayed as an ordinary assistant answer.
+    #[tokio::test]
+    async fn outside_content_replays_the_earlier_answer_as_data() {
+        use crate::session::r#loop::UNTRUSTED_HISTORY_RULE;
+        use crate::session::store::SessionMark;
+
+        let e = engine(
+            "history-fence",
+            vec![text_stream("first answer"), text_stream("second answer")],
+        );
+        let session = create_engine_session(&e);
+        e.services
+            .sessions
+            .mark(&session.id, SessionMark::OutsideContent)
+            .unwrap();
+        run_prompt(&e, prompt_input_for("msg_user1", &session.id, "one")).await;
+        run_prompt(&e, prompt_input_for("msg_user2", &session.id, "two")).await;
+        assert_eq!(e.llm.calls(), 2);
+
+        let first = e.llm.input(0);
+        assert!(
+            first
+                .system
+                .iter()
+                .any(|block| block.contains(UNTRUSTED_HISTORY_RULE)),
+            "the engine explains the fence on a marked session"
+        );
+        let second = e.llm.input(1);
+        let rendered = serde_json::to_string(&second.messages).unwrap();
+        assert!(
+            rendered.contains("<untrusted_data>\\nfirst answer\\n</untrusted_data>"),
+            "the prior answer is fenced: {rendered}"
+        );
+    }
 }
