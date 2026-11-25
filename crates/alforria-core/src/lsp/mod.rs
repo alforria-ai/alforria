@@ -149,10 +149,7 @@ impl LspService {
         // `false` disables the service outright; it is not "some LSP
         // configuration". Loading the built-ins for `Some(Boolean(false))`
         // would run language servers on a host that asked for none.
-        let enabled = !matches!(
-            input.lsp.as_ref(),
-            None | Some(LspInfo::Boolean(false))
-        );
+        let enabled = !matches!(input.lsp.as_ref(), None | Some(LspInfo::Boolean(false)));
         if enabled {
             servers = builtin_servers();
             // `filterExperimentalServers` (lsp.ts:98-108).

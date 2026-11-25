@@ -3211,7 +3211,11 @@ mod tests {
 
         let mut again = prompt_input_for("msg_m0_turn", &session.id, "again");
         again.caller = Caller::Restricted;
-        let error = e.prompt.prompt(again).await.expect_err("a taken id is refused");
+        let error = e
+            .prompt
+            .prompt(again)
+            .await
+            .expect_err("a taken id is refused");
         assert!(
             error.to_string().contains("already exists"),
             "the refusal says why: {error}"
