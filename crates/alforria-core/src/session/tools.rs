@@ -86,8 +86,10 @@ pub struct McpToolEntry {
 }
 
 pub type McpToolExecute = Arc<
-    dyn Fn(Value, McpToolCallContext)
-            -> crate::tool::def::BoxFuture<'static, Result<McpRawResult, String>>
+    dyn Fn(
+            Value,
+            McpToolCallContext,
+        ) -> crate::tool::def::BoxFuture<'static, Result<McpRawResult, String>>
         + Send
         + Sync,
 >;
@@ -795,9 +797,7 @@ mod mcp_tests {
         }
     }
 
-    fn mcp_entry(
-        captured: Arc<std::sync::Mutex<Option<McpToolCallContext>>>,
-    ) -> McpToolEntry {
+    fn mcp_entry(captured: Arc<std::sync::Mutex<Option<McpToolCallContext>>>) -> McpToolEntry {
         McpToolEntry {
             key: "srv_echo".to_string(),
             description: "Echo".to_string(),
@@ -1020,8 +1020,7 @@ mod mcp_tests {
         )
         .expect("valid registry");
         let captured = Arc::new(std::sync::Mutex::new(None));
-        let mcp: Arc<dyn McpToolSource> =
-            Arc::new(FixedMcp(vec![mcp_entry(captured.clone())]));
+        let mcp: Arc<dyn McpToolSource> = Arc::new(FixedMcp(vec![mcp_entry(captured.clone())]));
         let deps = ResolveDeps {
             registry,
             permission: Arc::new(crate::session::test_support::AllowAll),
