@@ -146,7 +146,14 @@ impl LspService {
     /// (`lsp.ts:145-189`).
     pub fn new(input: LspInput) -> Arc<LspService> {
         let mut servers: Vec<ServerInfo> = Vec::new();
-        if input.lsp.is_some() {
+        // `false` disables the service outright; it is not "some LSP
+        // configuration". Loading the built-ins for `Some(Boolean(false))`
+        // would run language servers on a host that asked for none.
+        let enabled = !matches!(
+            input.lsp.as_ref(),
+            None | Some(LspInfo::Boolean(false))
+        );
+        if enabled {
             servers = builtin_servers();
             // `filterExperimentalServers` (lsp.ts:98-108).
             if input.flags.experimental_lsp_ty {

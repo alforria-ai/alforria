@@ -439,6 +439,39 @@ async fn call_hierarchy_two_step() {
 }
 
 #[tokio::test]
+async fn boolean_false_disables_the_service_entirely() {
+    let (dir, a_rs) = temp();
+    let service = LspService::new(LspInput {
+        lsp: Some(LspInfo::Boolean(false)),
+        directory: dir.path().to_path_buf(),
+        worktree: dir.path().to_path_buf(),
+        paths: GlobalPaths::resolve_with(dir.path().to_path_buf(), |_| None),
+        events: None,
+        flags: Flags::default(),
+    });
+    let a_rs = a_rs.to_string_lossy().into_owned();
+    assert!(
+        !service.has_clients(&a_rs).await,
+        "`lsp: false` must not load the built-in servers"
+    );
+    assert!(service.status().is_empty());
+
+    let enabled = LspService::new(LspInput {
+        lsp: Some(LspInfo::Boolean(true)),
+        directory: dir.path().to_path_buf(),
+        worktree: dir.path().to_path_buf(),
+        paths: GlobalPaths::resolve_with(dir.path().to_path_buf(), |_| None),
+        events: None,
+        flags: Flags::default(),
+    });
+    assert!(
+        enabled.has_clients(&a_rs).await,
+        "`lsp: true` still means the built-in servers"
+    );
+    drop(dir);
+}
+
+#[tokio::test]
 async fn status_list_shape() {
     let (dir, a_rs) = temp();
     let log = dir.path().join("double.log");
