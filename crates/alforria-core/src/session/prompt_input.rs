@@ -221,6 +221,7 @@ impl ImageNormalizer for NoResize {
 pub struct PromptDeps<'a> {
     pub events: &'a EventBus,
     pub sessions: &'a SessionStore,
+    pub messages: &'a crate::session::message::MessageStore,
     pub agents: &'a AgentRegistry,
     pub models: &'a dyn Models,
     pub read: &'a ToolDef,
@@ -833,6 +834,15 @@ pub async fn create_user_message(
     let assigned;
     let input = if bounds.restricted && bounds.from_request {
         assigned = without_caller_ids(input);
+        if let Some(id) = assigned.message_id.as_deref() {
+            if deps.messages.get(&assigned.session_id, id).is_ok() {
+                return Err(PromptError::Forbidden {
+                    message: format!(
+                        "message id {id} already exists in this session; a turn may not replace one"
+                    ),
+                });
+            }
+        }
         &assigned
     } else {
         input
@@ -1128,10 +1138,12 @@ async fn exec_read(
         .map_err(|err| err.to_string())
 }
 
-/// `input` with every caller-chosen message and part id dropped.
+/// `input` with every caller-chosen part id dropped. A restricted caller
+/// may name the turn's user message id (the bridge needs a stable turn id
+/// for MCP `_meta`); `create_user_message` refuses one that already exists,
+/// so it cannot replace a tool result or an earlier answer.
 fn without_caller_ids(input: &PromptInput) -> PromptInput {
     let mut input = input.clone();
-    input.message_id = None;
     for part in &mut input.parts {
         match part {
             PromptPartInput::Text { id, .. }
@@ -2000,6 +2012,7 @@ mod tests {
             directory: std::path::PathBuf::from("/"),
             events: &h.services.events,
             sessions: &h.services.sessions,
+            messages: &h.services.messages,
             agents: &h.services.agents,
             models: &FixedModels,
             read,

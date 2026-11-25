@@ -3190,4 +3190,31 @@ mod tests {
             "the prior answer is fenced: {rendered}"
         );
     }
+
+    /// A restricted caller (the bridge) needs a stable turn id for MCP
+    /// `_meta`. It may name a new user message id, but never replace one
+    /// that already exists.
+    #[tokio::test]
+    async fn a_restricted_caller_may_name_a_new_turn_id_but_not_replace_one() {
+        use crate::session::caller::Caller;
+
+        let e = engine("turn-id", vec![text_stream("done")]);
+        let session = create_engine_session(&e);
+        e.services.sessions.restrict(&session.id).unwrap();
+        let mut input = prompt_input_for("msg_m0_turn", &session.id, "hi");
+        input.caller = Caller::Restricted;
+        let out = run_prompt(&e, input).await;
+        match out.info {
+            V1Message::Assistant { parent_id, .. } => assert_eq!(parent_id, "msg_m0_turn"),
+            other => panic!("expected an assistant message, got {other:?}"),
+        }
+
+        let mut again = prompt_input_for("msg_m0_turn", &session.id, "again");
+        again.caller = Caller::Restricted;
+        let error = e.prompt.prompt(again).await.expect_err("a taken id is refused");
+        assert!(
+            error.to_string().contains("already exists"),
+            "the refusal says why: {error}"
+        );
+    }
 }
